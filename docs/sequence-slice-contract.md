@@ -100,7 +100,9 @@ Owner ruling 2026-10-31 (#536, on #531): hidden incidental steps do not consume 
   most 2000 steps of one body, and a callee body is not expanded when the steps the view
   keeps (the seed's, after its visible cut, and every admitted body), its own included,
   would exceed 2000. Each target's body is built at most once, so a refused body costs no
-  more than one build. Depth 24 and 20 participants are unchanged.
+  more than one build. A Rust chain group is a step too: grouping is presentational and
+  stops, with a warning and nothing measured lost, before a body would pass 2000 steps.
+  Depth 24 and 20 participants are unchanged.
 - **Show all respects the visible bound.** With `showAll` nothing is incidental-hidden, so
   every step counts: the seed stops at its 200th step and a callee body that does not fit
   is not expanded, exactly as above.

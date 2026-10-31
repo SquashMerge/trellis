@@ -340,20 +340,20 @@ pub(crate) fn hidden_count(steps: &[SequenceStep]) -> usize {
 }
 
 /// Keeps the view within [`MAX_STEPS`] shown steps (#536). Steps are kept in pre-order (a
-/// step, its children, then its alternate) until a shown step would exceed the bound; it
-/// and everything after it, hidden steps included, are omitted. Hidden steps before it are
-/// kept and do not count.
+/// step, its children, then its alternate) up to the bound's last shown step; everything
+/// after it, hidden steps included, is omitted. Hidden steps before it are kept and do not
+/// count.
 pub(crate) fn cap_visible(view: &mut SequenceView) {
     /// Keeps a prefix of `steps` within `room` shown steps; true when it cut.
     fn cap(steps: &mut Vec<SequenceStep>, room: &mut usize) -> bool {
         for at in 0..steps.len() {
-            let step = &mut steps[at];
-            if step.hidden {
-                continue;
-            }
             if *room == 0 {
                 steps.truncate(at);
                 return true;
+            }
+            let step = &mut steps[at];
+            if step.hidden {
+                continue;
             }
             *room -= 1;
             if cap(&mut step.children, room) {

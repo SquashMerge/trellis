@@ -562,7 +562,10 @@ fn receiver_call(n: Node<'_>) -> Option<Node<'_>> {
 }
 // Presentation only: no claim about purity, builder types, or object identity.
 // Run after measurement so grouping cannot change step IDs, limits, or guards.
+// Each group is a step: grouping stops, losing nothing, before the view's steps would
+// pass the work bound (#536).
 fn group_chains(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -> bool {
+    let mut room = MAX_STEPS.saturating_sub(crate::behavior::step_count(steps));
     let mut cursor = n.walk();
     let mut depth = 0;
     let mut budget = MAX_STEPS * MAX_DEPTH;
@@ -579,7 +582,12 @@ fn group_chains(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -
                 "macro_invocation" | "unsafe_block" | "const_block" | "async_block"
             );
         if !opaque {
-            wrap_syntax_chain(node, file, steps);
+            if room == 0 {
+                return true;
+            }
+            if wrap_syntax_chain(node, file, steps) {
+                room -= 1;
+            }
             if depth < MAX_DEPTH {
                 if cursor.goto_first_child() {
                     depth += 1;
@@ -601,13 +609,14 @@ fn group_chains(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -
         }
     }
 }
-fn wrap_syntax_chain(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) {
+/// Wraps the call chain at `n` into one group step; true when it did.
+fn wrap_syntax_chain(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -> bool {
     if n.kind() == "call_expression" {
         let mut chain = vec![n];
         let mut receiver = n;
         while let Some(next) = receiver_call(receiver) {
             if chain.len() >= MAX_DEPTH {
-                return;
+                return false;
             }
             chain.push(next);
             receiver = next;
@@ -643,12 +652,13 @@ fn wrap_syntax_chain(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceSte
                 })
                 .collect();
             let label = format!("{} ({} calls)", labels.join(" → "), labels.len());
-            wrap_chain(n, &chain, &label, steps);
+            return wrap_chain(n, &chain, &label, steps);
         }
     }
+    false
 }
 
-fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<SequenceStep>) {
+fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<SequenceStep>) -> bool {
     // Only a flat, fully measured evaluation is eligible. Branches, opaque
     // boundaries, writes, suspension, and transfers conservatively prevent it.
     let first = steps
@@ -680,16 +690,17 @@ fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<Sequ
             group.call_id = None;
             group.children = steps.drain(first..end).collect();
             steps.insert(first, group);
-            return;
+            return true;
         }
     }
-    for step in steps {
-        // Do not wrap shorter subchains inside an already collapsed chain.
-        if step.kind != "group" {
-            wrap_chain(n, chain, label, &mut step.children);
-            wrap_chain(n, chain, label, &mut step.alternate);
-        }
-    }
+    // Do not wrap shorter subchains inside an already collapsed chain.
+    steps
+        .iter_mut()
+        .filter(|step| step.kind != "group")
+        .any(|step| {
+            wrap_chain(n, chain, label, &mut step.children)
+                || wrap_chain(n, chain, label, &mut step.alternate)
+        })
 }
 pub fn build(
     revision: IndexPin,

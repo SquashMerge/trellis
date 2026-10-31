@@ -942,6 +942,44 @@ fn sequence_callee_incidental_steps_use_no_visible_room() {
     );
 }
 
+/// #541 review: Rust chain groups are steps too, so grouping 600 incidental three-call
+/// chains (1800 calls) stops at the work bound instead of retaining 2400 steps; nothing
+/// measured is lost.
+#[test]
+fn sequence_chain_groups_count_toward_the_work_bound() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let chains: String = (0..600).map(|n| format!("obj{n}.a().b().c();")).collect();
+    let source = format!("fn run() {{ {chains} }}\n");
+    let mut spec = Spec::new(&[("a.rs", &source)]);
+    spec.bindings = (0..1800).map(|nth| bind_external("run", nth)).collect();
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "run");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts(&view.steps), (2000, 0));
+    assert_eq!(
+        sequence_steps(&view.steps).len(),
+        1800,
+        "every call is kept"
+    );
+    assert_eq!(
+        view.steps
+            .iter()
+            .filter(|step| step.kind == "group")
+            .count(),
+        200
+    );
+    assert!(
+        view.warnings
+            .iter()
+            .any(|w| w.contains("Chain grouping traversal truncated"))
+    );
+}
+
 /// #536: hidden steps use no visible room but still count toward the hard work bound, so
 /// hostile input stays bounded: a seed is built to at most 2000 steps, and a callee body
 /// that would take the view past them is not expanded.
