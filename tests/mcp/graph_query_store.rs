@@ -1716,3 +1716,32 @@ fn rejoined_binding_on_edited_workspace_is_a_stale_boundary_with_its_binding() {
 fn child_test_name(test: &str) -> String {
     format!("{}::{test}", module_path!().split_once("::").unwrap().1)
 }
+
+/// #544 review: a stored coverage reason count that does not decode is selected-index
+/// corruption, so the read fails typed and schedules a rebuild.
+#[test]
+fn corrupt_stored_coverage_reason_count_schedules_a_rebuild() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[("src/lib.rs", "fn a(){b();} fn b(){}")]);
+    spec.bindings = vec![bind("a", 0, "b")];
+    let pin = publisher.publish_with_semantic(&spec, |semantic, _| {
+        for row in &mut semantic.coverage {
+            row.state = CoverageState::Partial;
+            row.diagnostic = Some("unsupported_native_gap".into());
+            row.reasons = Some(s::CoverageReasons::new([1, 0, 0, 0], false, false, false));
+        }
+    });
+    drop(publisher);
+    sql(
+        state.path(),
+        "PRAGMA ignore_check_constraints=ON; UPDATE semantic_coverage_reasons SET macro_invocation=-1;",
+    );
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let error = store.semantic_at(pin).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid stored coverage reason count"),
+        "{error:#}"
+    );
+    assert!(store.recovery_pending_for_tests());
+}

@@ -486,8 +486,10 @@ impl LanguageReasons {
         let entry = serde_json::json!({
             "path": row.document_path, "diagnostic": row.diagnostic, "reasons": reasons,
         });
+        // The serialized array is `[` + entries joined by `,` + `]`: each entry plus its
+        // separator or opening bracket, plus the closing bracket, must fit the bound.
         let bytes = entry.to_string().len() + 1;
-        if self.listed_bytes + bytes <= REPORT_PARTIAL_DOCUMENT_BYTES {
+        if self.listed_bytes + bytes < REPORT_PARTIAL_DOCUMENT_BYTES {
             self.listed_bytes += bytes;
             self.listed.push(entry);
         } else {
@@ -4921,5 +4923,24 @@ mod language_reason_tests {
         assert_eq!(json["nativeGapsOnly"], 2000);
         assert_eq!(json["unsupportedOccurrences"]["macroInvocation"], 4000);
         assert_eq!(json["unsupportedOccurrences"]["attributeItem"], 2000);
+    }
+
+    /// The bound counts the array's brackets and commas: 316 entries whose separators and
+    /// opening bracket total exactly the bound would serialize one byte over it with the
+    /// closing bracket, so the last one is left unlisted.
+    #[test]
+    fn report_listing_bound_counts_array_framing() {
+        let mut reasons = LanguageReasons::default();
+        for i in 0..316 {
+            let mut path = format!("src/module_{i:04}.rs");
+            if i == 315 {
+                path = format!("src/module_{i:04}{}.rs", "x".repeat(124));
+            }
+            reasons.add(&partial(path));
+        }
+        let json = reasons.json();
+        assert!(json["listed"].to_string().len() <= REPORT_PARTIAL_DOCUMENT_BYTES);
+        assert_eq!(json["listed"].as_array().unwrap().len(), 315);
+        assert_eq!(json["unlisted"], 1);
     }
 }

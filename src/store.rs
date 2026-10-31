@@ -6822,7 +6822,9 @@ fn read_coverage_reasons(
     row.map(|(gaps, [capped, omitted, diagnostics])| {
         let mut counts = [0u64; 4];
         for (count, stored) in counts.iter_mut().zip(gaps) {
-            *count = u64::try_from(stored)?;
+            *count = u64::try_from(stored).context(SelectedIntegrity(
+                "incompatible_index: invalid stored coverage reason count".into(),
+            ))?;
         }
         Ok(crate::semantic_evidence::CoverageReasons::new(
             counts,
