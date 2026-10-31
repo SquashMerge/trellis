@@ -526,7 +526,8 @@ test("pinned metadata adds one-click callable declarations without changing sour
   const actions=inlineActions(p);assert.equal(actions.length,1);
   assert.equal(actions[0].parentNode,p.rows[1]);assert.equal(actions[0].getAttribute("data-symbol-id"),method.id);
   assert.equal(actions[0].getAttribute("data-source-action"),"sequence");
-  assert.equal(actions[0].textContent,"");assert.match(actions[0].getAttribute("aria-label"),/exact#λ/);
+  assert.equal(actions[0].textContent,"");assert.equal(actions[0].getAttribute("aria-label"),`Sequence for ${method.name} · syntax`);
+  assert.ok(!actions[0].getAttribute("aria-label").includes(method.id)&&!actions[0].getAttribute("title").includes(method.id),"labels carry no symbol ID (#451)");
   assert.deepEqual(p.rows.map(row=>row.children[1].textContent),original);
   assert.equal(h.selected.length,0);await actions[0].fire("click").done;
   assert.equal(h.selected[0],method);assert.equal(h.callbackPins[0].indexRevision,1);assert.equal(p.pre.dataset.navigationLine,"5");assert.equal(h.calls.length,0);

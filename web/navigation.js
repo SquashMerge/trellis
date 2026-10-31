@@ -233,8 +233,9 @@
         action.setAttribute("data-source-action", "sequence");
         // A CSS label keeps controls out of source text and native copy/selection.
         action.setAttribute("data-label", "Sequence");
-        action.setAttribute("aria-label", `Sequence for ${text(symbol.name)} · syntax · ${text(symbol.id)}`);
-        action.setAttribute("title", `Sequence · syntax · ${text(symbol.name)} · ${text(symbol.id)}`);
+        // Labels name the declaration, never its opaque ID (#451); data-symbol-id keeps the identity.
+        action.setAttribute("aria-label", `Sequence for ${text(symbol.name)} · syntax`);
+        action.setAttribute("title", `Sequence · syntax · ${text(symbol.name)}`);
         action.addEventListener("click", event => {
           event.stopPropagation();
           if (usable()) { activate(lines.indexOf(symbol.range.startLine)); serial++; return owner.selectMethod(symbol, revision); }

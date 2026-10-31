@@ -40,7 +40,8 @@ layout or interactions. Use these dark-theme tokens:
   with ink text. Heat uses line → gold → amber → orange, with ink text on warm fills and a legend;
   reverse the ramp for Maintainability. This does not add a metric view or decide its thresholds.
 - Cool colors: lavender `#ABA5FF`, purple `#7770DC`, deep purple `#5D55C8`.
-  Selection uses purple fill with ink text. Links are lavender and underlined.
+  Selection uses purple fill with ink text; a selected source range is quieter, the raised
+  surface with a lavender left bar (#451). Links are lavender and underlined.
   Keyboard focus uses a 2px lavender outline with a 3px offset.
 - Status: success `#57D6A0`, error `#FF8E9A`, info `#85C7FF`; caution uses gold.
   Always pair status with a word and a shape, never color alone. Where diff markers exist,

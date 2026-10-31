@@ -67,12 +67,17 @@ native geometry/font slots; unlabelled tiny tiles remain unlabelled.
 
 The generated-source, SVG and DOM limits remain 512 KiB, 8 MiB and 12000 nodes.
 No `font-size` appears in treemap classDefs. The layout fills the diagram box's
-measured size, at least 640×360 px. When that leaves a positive-area file less
-than 2500 px² on average, it grows in the box's aspect ratio, up to 4000 px per
-side; Pele's nodeWidth/nodeHeight use one tenth of those pixel dimensions. A
+measured client size (excluding any scrollbar), at least 640×360 px. Its width never exceeds
+the box, so it does not scroll sideways (#451). When the box leaves a positive-area file less
+than 2500 px² on average, only the height grows, up to 4000 px; Pele's nodeWidth/nodeHeight
+use one tenth of those pixel dimensions. A
 resize relayouts the same admitted files once it settles, only when the layout
 size changes, keeping the selection and without another metrics read. Large
-diagrams scroll within the canvas rather than shrinking all text. Desktop panes
+diagrams scroll down within the canvas rather than shrinking all text. The toolbar is one row;
+the ready summary (file and line counts, population, exclusions and warnings) sits behind the
+view's ⓘ, while loading, empty and error states, and a rules warning, stay visible (#451).
+Below a 640 px box (narrow windows and mobile) the 640 px minimum still scrolls sideways
+inside the canvas. Desktop panes
 and mobile Explorer/Inspector drawers keep existing ownership.
 
 The root section and its breadcrumb show the checkout directory's name from the
