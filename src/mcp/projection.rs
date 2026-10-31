@@ -187,6 +187,31 @@ mod tests {
         tiers
     }
 
+    /// #528: `syntaxOnly` names, in #22 order, only the answer's languages without
+    /// available semantic evidence, and is dropped when all of them have it.
+    #[test]
+    fn syntax_only_names_only_languages_without_available_semantic_evidence() {
+        let tiers = rust_semantic("fresh", [3, 3, 0, 0, 0]);
+        assert_eq!(syntax_only(&tiers, ["rust"]), None);
+        assert_eq!(
+            syntax_only(&tiers, ["rust", "javascript", "java", "rust"]).unwrap()["message"],
+            "This answer is syntax-derived; no fresh semantic evidence is selected for java, javascript"
+        );
+        assert_eq!(
+            syntax_only(&tiers, Vec::<&str>::new()).unwrap()["message"],
+            "This answer is syntax-derived"
+        );
+        for (freshness, counts) in [
+            ("possiblyStale", [3, 3, 0, 0, 0]),
+            ("stale", [3, 3, 0, 0, 0]),
+            ("unavailable", [2, 0, 0, 2, 0]),
+        ] {
+            let warning = syntax_only(&rust_semantic(freshness, counts), ["rust"]).unwrap();
+            assert_eq!(warning["code"], "syntaxOnly");
+            assert_eq!(warning["provenanceId"], Value::Null);
+        }
+    }
+
     /// #528: a fresh selected import reports the semantic tier beside native coverage;
     /// partial semantic coverage stays partial, and stale evidence stays syntax.
     #[test]
@@ -1629,11 +1654,18 @@ pub fn outgoing(
         return Ok(None);
     }
     let mut last = build(count, &shown)?;
+    // #528: optional hints fill only to the page target, not the whole cap, so a default
+    // page of calls stays agent-sized; hints left out are counted in `omitted`.
+    let fits_page = |envelope: &Value| -> bool {
+        let frame = json!({"jsonrpc":"2.0","id":id,
+            "result":super::tools::result("trellis_outgoing_calls", envelope.clone(), modern)});
+        serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() < super::architecture::PAGE_BYTES)
+    };
     'candidate: for (index, item) in result.calls[..count].iter().enumerate() {
         for _ in 0..item.selected.candidates.len().min(8) {
             shown[index] += 1;
             let next = build(count, &shown)?;
-            if !fits(&next) {
+            if !fits_page(&next) {
                 shown[index] -= 1;
                 break 'candidate;
             }
@@ -3130,9 +3162,9 @@ mod size_tests {
     }
 
     #[test]
-    fn the_basis_table_more_than_halves_a_full_caller_page() {
+    fn the_basis_table_cuts_a_full_caller_page_by_over_30_percent() {
         // Before #528 each caller and proof repeated the whole basis: re-inline it to
-        // compare against the same 20 callers.
+        // compare against the same emitted prefix (the old shape would not even fit it).
         let page = project(20, false);
         let mut inlined = page.clone();
         let basis = basis();

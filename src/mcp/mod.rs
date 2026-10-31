@@ -547,7 +547,7 @@ pub const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(
 
 /// Outgoing and incoming calls emit this many items unless `limit` says otherwise (#528):
 /// six semantic bindings with their proofs measured about 23.5 KB on this repository's
-/// widest caller list (`index_workspace`); `compact` fits 50 in well under the cap.
+/// wide caller list (`index_workspace`); twenty `compact` callers measured about 18 KB.
 pub const CALL_DEFAULT_LIMIT: usize = 6;
 
 /// Keep mandatory lexical/projection work inside the original call deadline.
@@ -2281,7 +2281,7 @@ fn coordinate(
                             modern,
                         ))
                     };
-                    // #528: say which concurrency limit refused the call.
+                    // #528: the daemon-wide worker limit names itself.
                     let busy = |message: String| {
                         let mut failure = tools::admission_failure(
                             &admission.id,
@@ -2309,9 +2309,8 @@ fn coordinate(
                             .response,
                         )
                     } else if live_calls(&session, &in_flight) >= MAX_CONNECTION_CALLS {
-                        busy(format!(
-                            "Too many concurrent tool calls on this connection (limit {MAX_CONNECTION_CALLS}); wait for one to finish"
-                        ))
+                        // The message names the per-connection limit (#528).
+                        refuse("too_many_requests")
                     } else if let Some(permit) = WorkerPermit::acquire() {
                         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let resolved: Resolved = Default::default();

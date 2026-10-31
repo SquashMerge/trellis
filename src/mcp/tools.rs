@@ -426,9 +426,17 @@ pub fn selection_failure(id: &Value, error: SelectionError, value: &Value) -> Va
 /// A `too_many_requests` or `deadline_exceeded` decided before read admission
 /// sampled `catchingUp` (Decision 0009 §7): no answering workspace, only the
 /// bounded attempted one (the selection, or the launch workspace path).
+/// A `too_many_requests` refusal names the per-connection call limit (#528), whether
+/// the relay or the daemon session refuses; the daemon-wide worker limit overrides it.
 pub fn admission_failure(id: &Value, code: &str, attempted_workspace: &Value) -> Value {
     debug_assert!(matches!(code, "too_many_requests" | "deadline_exceeded"));
     let mut envelope = failure(id, code);
+    if code == "too_many_requests" {
+        envelope["error"]["message"] = json!(format!(
+            "Too many concurrent tool calls on this connection (limit {}); wait for one to finish",
+            super::MAX_CONNECTION_CALLS
+        ));
+    }
     envelope["error"]["attemptedWorkspace"] = attempted(attempted_workspace);
     envelope
 }
@@ -1266,6 +1274,30 @@ mod tests {
                 valid["semanticProducerId"] = producer;
                 check(name, &valid, "invalid_request");
             }
+        }
+    }
+    /// #528: `compact` is an optional boolean on the two call tools only.
+    #[test]
+    fn compact_is_a_closed_boolean_on_the_call_tools() {
+        for name in ["trellis_outgoing_calls", "trellis_incoming_calls"] {
+            let mut valid = good(name);
+            for compact in [json!(true), json!(false)] {
+                valid["compact"] = compact;
+                assert_eq!(validate(name, Some(&valid)), Ok(()), "{name}");
+            }
+            for compact in [Value::Null, json!(1), json!("true"), json!([true])] {
+                valid["compact"] = compact;
+                check(name, &valid, "invalid_request");
+            }
+        }
+        for name in [
+            "trellis_find_symbols",
+            "trellis_declaration",
+            "trellis_call_graph",
+        ] {
+            let mut other = good(name);
+            other["compact"] = json!(true);
+            check(name, &other, "invalid_request");
         }
     }
     #[test]

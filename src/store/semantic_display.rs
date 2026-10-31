@@ -743,9 +743,15 @@ impl EvidenceResponse {
             if tier.counts[1] + tier.counts[2] == 0 {
                 continue;
             }
+            // Publication derives a proof's freshness from its document and that document's
+            // captured basis only, so every proof of one tuple shares it: one proof per
+            // tuple is exact for what Trellis published (#261), and avoids scanning the
+            // hundreds of thousands of proofs a language can hold on every read.
             let worst: i64 = self.db.query_row(
-                "SELECT coalesce(max(CASE p.freshness WHEN 'stale' THEN 2 WHEN 'possiblyStale' THEN 1 ELSE 0 END),0)
-                 FROM semantic_coverage c JOIN semantic_provenance p ON p.tuple_id=c.tuple_id
+                "SELECT coalesce(max(CASE (SELECT p.freshness FROM semantic_provenance p
+                                           WHERE p.tuple_id=c.tuple_id LIMIT 1)
+                     WHEN 'stale' THEN 2 WHEN 'possiblyStale' THEN 1 ELSE 0 END),0)
+                 FROM semantic_coverage c
                  WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
                    AND c.state IN ('complete','partial')",
                 params![selected.key, producer, language],
