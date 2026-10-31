@@ -20,6 +20,4 @@
 #treemap-inspector-title { margin-top: 0; font: 13px/1.6 var(--mono); }
 #treemap-inspector-content button { font-size: 12px; min-height: 34px; }
 #treemap-state[data-state="error"] { color: var(--error); }
-/* The ⓘ sits near the toolbar's right end: open its card leftward, inside the panel (#451). */
-#treemap-panel .view-about .popover-body { left: auto; right: 0; }
 #treemap-summary:empty { display: none; }

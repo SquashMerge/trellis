@@ -652,6 +652,8 @@ test("Treemap keeps to its panel's width, grows only downward, and keeps its sum
   const summary = page.locator("#treemap-summary");
   assert.equal(await summary.isVisible(), true);
   assert.match(await summary.textContent(), /^\d+ of \d+ indexed files · \d+ physical file lines · max · production callables · test files hidden/);
+  // #499 places toolbar popovers on toggle, clamped to the panel; wait for that placement.
+  await page.waitForFunction(() => document.querySelector("#treemap-panel .view-about .popover-body")?.style.left);
   const card = await page.locator("#treemap-panel .view-about .popover-body").evaluate(node => { const r = node.getBoundingClientRect(); return {left:r.left, right:r.right}; });
   assert.ok(card.left >= 0 && card.right <= 1440, `ⓘ opens inside the viewport: ${JSON.stringify(card)}`);
   await capture(page, "treemap-fit-about");
