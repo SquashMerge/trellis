@@ -533,6 +533,7 @@ function checkoutOption(label, value) { const option = element("option", label);
 function resetCheckout() {
   // Advance the generation before aborting or awaiting any request. Equal revision pairs are not identity.
   epoch++; clearNavigationHistory(); gitSerial++; section = "diagrams"; sectionSerial++; filesGitStatus = null; selectedRootKey = null; selectedWorkspaceRoot = null; selectedGit = null; checkoutBusy = false;
+  classSupport = null;
   for (const controller of pendingRequests) controller.abort();
   clearTimeout(pollTimer); pollTimer = null; statusSerial++;
   pairRefreshPending = false; pairRefreshQueued = null;
@@ -2023,7 +2024,9 @@ async function refreshDependencies() {
     renderDependencyPackages();
   } catch (error) {
     if ((!current() && !/Library catalog belongs/.test(error.message)) || error.name === "AbortError") return;
+    const wasOpen = !!dependencyChoice;
     clearDependencyCatalog();
+    if (wasOpen) $("dependency-state").textContent = `Library catalog unavailable. ${error.message} Refresh status (⋯ → Refresh) to retry.`;
   }
 }
 function renderDependencyPackages() {
@@ -2037,11 +2040,13 @@ function renderDependencyPackages() {
     pick.append(element("span", `${pkg.ecosystem} · ${pkg.source} · source: ${pkg.sourceState} · index: ${pkg.indexState}`, "detail"));
     li.append(pick);
     // Package notes stay folded so the definitions remain in view.
-    const notes = element("details");
-    notes.append(element("summary", `Package notes (${(pkg.warnings || []).length})`));
-    if (pkg.aliases?.length) notes.append(element("p", `Aliases: ${pkg.aliases.join(", ")}`, "detail"));
-    for (const warning of pkg.warnings || []) notes.append(element("p", warning, "detail"));
-    li.append(notes);
+    if (pkg.aliases?.length || pkg.warnings?.length) {
+      const notes = element("details");
+      notes.append(element("summary", `Package notes (${(pkg.warnings || []).length})`));
+      if (pkg.aliases?.length) notes.append(element("p", `Aliases: ${pkg.aliases.join(", ")}`, "detail"));
+      for (const warning of pkg.warnings || []) notes.append(element("p", warning, "detail"));
+      li.append(notes);
+    }
     $("dependency-packages").append(li);
   }
 }
@@ -2063,7 +2068,7 @@ async function loadDependencySymbols(offset = 0, query = dependencyQuery) {
     const data = await api(`/api/dependencies/symbols?catalogId=${encodeURIComponent(catalogId)}&packageId=${encodeURIComponent(pkg.id)}&q=${encodeURIComponent(query)}&offset=${offset}&limit=100`);
     if (!current()) return;
     if (!IndexPin.equal(data.workspaceRevision, status.revision)) { unexpectedPair(undefined, data.workspaceRevision); throw new Error("Library definition revision changed. Refresh workspace status."); }
-    if (data.catalogId !== catalogId || data.items.some(item => item.packageId !== pkg.id)) throw new Error("Library definition provenance mismatch. Refresh library status.");
+    if (data.catalogId !== catalogId || data.items.some(item => item.packageId !== pkg.id)) throw new Error("Library definition provenance mismatch. Refresh status (⋯ → Refresh), then open the library again.");
     dependencyOffset = offset; dependencyNext = data.nextOffset; dependencyQuery = query;
     for (const symbol of data.items) {
       const li = element("li"), pick = externalButton(`${symbol.qualifiedName || symbol.name} · ${symbol.kind}`, () => {
@@ -2078,7 +2083,7 @@ async function loadDependencySymbols(offset = 0, query = dependencyQuery) {
     $("dependency-next").disabled = data.nextOffset == null;
   } catch (error) {
     if ((!current() && !/Library definition revision/.test(error.message)) || error.name === "AbortError") return;
-    $("dependency-symbol-state").textContent = `${error.message} Use Filter to retry or Refresh library status if the catalog changed.`;
+    $("dependency-symbol-state").textContent = `${error.message} Use Filter to retry, or refresh status (⋯ → Refresh) and open the library again if the catalog changed.`;
   }
 }
 async function loadDependencySource(symbol) {
@@ -2103,7 +2108,7 @@ async function loadDependencySource(symbol) {
     renderExternalDefinitions(); renderExternalSource(symbol.range);
   } catch (error) {
     if (current() && error.name !== "AbortError") {
-      const message = `${error.message} Refresh library status before selecting the definition again.`;
+      const message = `${error.message} Refresh status (⋯ → Refresh), then open the library again from its call or reference.`;
       $("external-source-path").textContent = message; $("dependency-symbol-state").textContent = message;
     }
   }
@@ -2115,7 +2120,7 @@ function libraryPackages(reference) {
   const ecosystem = libraryEcosystems[reference?.ecosystem], name = reference?.name;
   if (!ecosystem || typeof name !== "string" || !name || dependencyCatalog?.state !== "ready" || !dependencyCatalog.catalogId) return [];
   const crate = value => value.replaceAll("-", "_");
-  const matches = dependencyCatalog.packages.filter(pkg => pkg.ecosystem === ecosystem && pkg.indexState !== "missing" &&
+  const matches = dependencyCatalog.packages.filter(pkg => pkg.ecosystem === ecosystem && ["complete", "partial"].includes(pkg.indexState) &&
     (pkg.name === name || crate(pkg.name) === crate(name) || (pkg.aliases || []).includes(crate(name))));
   const exact = reference.version ? matches.filter(pkg => pkg.version === reference.version) : [];
   return exact.length ? exact : matches;
@@ -2164,9 +2169,16 @@ async function refreshClassSupport(pin) {
   try {
     const query = new URLSearchParams({q:"", limit:"1", indexGeneration:pin.indexGeneration, indexRevision:String(pin.indexRevision)});
     const data = await api(`/api/classes?${query}`);
-    if (!guard() || classSupport !== attempt || !IndexPin.equal(data?.revision, pin) || !Array.isArray(data.supportedLanguages)) return;
+    if (classSupport !== attempt) return;
+    // A superseded read is forgotten so the next projection asks again; a real failure
+    // keeps the null record for this pin, which bounds requests.
+    if (!guard()) { classSupport = null; return; }
+    if (!IndexPin.equal(data?.revision, pin) || !Array.isArray(data.supportedLanguages)) return;
     attempt.languages = new Set(data.supportedLanguages.filter(language => typeof language === "string"));
-  } catch (_) { return; }
+  } catch (error) {
+    if (error?.name === "AbortError" && classSupport === attempt) classSupport = null;
+    return;
+  }
   updateViewAvailability();
 }
 function updateViewAvailability() {
@@ -2202,8 +2214,8 @@ async function openCallableSequence(row, pin) {
   const data = await api("/api/sequence", "POST", {seed:row.sid, expectedRevision:pin, showAll:false}, current);
   if (!current()) return;
   if (!IndexPin.equal(data?.revision, pin) || data?.seed?.id !== row.sid) throw new Error("Sequence provenance mismatch. Nothing displayed.");
-  $("all-steps").checked = false;
-  await selectMethod(data.seed, data, current);
+  // The shared navigation owner records history and returns to Diagrams.
+  await navigateDiagram(data.seed, pin, "sequence", data);
 }
 
 // Class diagrams are an independent, cached-source projection. They never infer

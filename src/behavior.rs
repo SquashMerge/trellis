@@ -98,6 +98,9 @@ impl ExternalPackage {
                     }
                     let present =
                         |value: &str| (!value.is_empty() && value != ".").then(|| value.to_owned());
+                    if fields[0].is_empty() {
+                        return None;
+                    }
                     return Some(Self {
                         manager: present(&fields[1])?,
                         name: present(&fields[2])?,
@@ -158,6 +161,7 @@ mod external_package_tests {
             "rust-analyzer cargo serde 1.0 ",
             "rust-analyzer . serde 1.0 x().",
             "rust-analyzer cargo . 1.0 x().",
+            " cargo serde 1.0 x().",
             "",
         ] {
             assert_eq!(ExternalPackage::from_scip(symbol), None, "{symbol:?}");

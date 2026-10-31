@@ -165,7 +165,7 @@ test("newer catalog status wins over obsolete failures",async()=>{
 test("source conflicts remain local and require status refresh; no implicit request",async()=>{
  const h=harness();await select(h);let requests=0;h.context.fetch=async()=>{requests++;return {ok:false,status:409,json:async()=>({error:{message:"Source changed"}})};};
  await h.run(`loadDependencySource(${JSON.stringify(symbol)})`);assert.equal(requests,1);assert.equal(h.run("externalSnapshot"),null);
- assert.match(h.get("external-source-path").textContent,/Source changed.*Refresh library status/);assert.equal(h.get("error").hidden,true);assert.equal(h.run("selectedMethod"),null);
+ assert.match(h.get("external-source-path").textContent,/Source changed.*Refresh status.*open the library again/);assert.equal(h.get("error").hidden,true);assert.equal(h.run("selectedMethod"),null);
 });
 test("mismatched declaration/source provenance never paints",async()=>{
  const h=harness();await ready(h);h.context.fetch=async()=>response(symbols([symbol],null,"other"));await h.run(`selectDependencyPackage(${JSON.stringify(pkg)})`);
@@ -314,7 +314,8 @@ const many = [
  {...pkg,id:"cargo:serde@1",name:"serde",version:"1.0.1",aliases:[]},
  {...pkg,id:"cargo:serde@2",name:"serde",version:"1.0.2",aliases:[]},
  {...pkg,id:"cargo:renamed@1",name:"actual-name",version:"2.0.0",aliases:["renamed_dep"]},
- {...pkg,id:"npm:left-pad@1",ecosystem:"npm",name:"left-pad",version:"1.0.0",aliases:[]}];
+ {...pkg,id:"npm:left-pad@1",ecosystem:"npm",name:"left-pad",version:"1.0.0",aliases:[]},
+ {...pkg,id:"cargo:skipped@1",name:"skipped",version:"1.0.0",aliases:[],sourceState:"missing",indexState:"skipped"}];
 async function readyMany(h,extra={}) {h.context.fetch=async()=>response({...catalog(),packages:many,...extra});await h.run("refreshDependencies()");}
 const ids = (h, reference) => JSON.parse(h.run(`JSON.stringify(libraryPackages(${JSON.stringify(reference)}).map(p=>p.id))`));
 test("library matching uses exact Cargo names, crate spellings, aliases and prefers the named version",async()=>{
@@ -327,6 +328,7 @@ test("library matching uses exact Cargo names, crate spellings, aliases and pref
  assert.deepEqual(ids(h,{ecosystem:"rust",name:"serd"}),[],"no substring guesses");
  assert.deepEqual(ids(h,{ecosystem:"javascript",name:"left-pad"}),[],"ecosystems without a catalog adapter");
  assert.deepEqual(ids(h,{ecosystem:"npm",name:"left-pad"}),[]);
+ assert.deepEqual(ids(h,{ecosystem:"rust",name:"skipped"}),[],"a package the catalog never indexed offers no library");
  assert.equal(h.run("libraryButton({ecosystem:'rust',name:'nothing',origin:'x'})"),null);
  const button=h.run("libraryButton({ecosystem:'rust',name:'serde',origin:'x'})");
  assert.equal(button.tagName,"button");assert.equal(button.textContent,"Open in library");

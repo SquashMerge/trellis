@@ -18,11 +18,12 @@ Owner decisions of 2026-10-29:
 
 - **Classes** appears only when the checkout has production code in a language the class
   catalog extracts. The browser joins the current metrics projection's stored roles (files
-  with production callables, outside vendored, fixture and hidden-layer exclusions) with
+  with production callables outside that projection's exclusions; with **Include tests and
+  fixtures**, production-role fixture files count, as they do in heat) with
   `GET /api/classes` `supportedLanguages`, read once per pin after production code is known.
   While either is unknown, or if either read fails, the tab stays hidden. An explicit class
   menu or **Class diagram** action still opens Classes; its tab then shows while it is active.
-  Test-only code never earns the tab, including with **Include tests and fixtures in metrics**.
+  Test-role code never earns the tab, including with **Include tests and fixtures in metrics**.
 - **Sequence** opens from a method: the tree, the source margin, or the inspector (resolved call
   targets and the metric inspector's highest-cognitive callables). With no method selected it
   lists up to five named highest-cognitive callables of the current metrics projection
@@ -32,14 +33,15 @@ Owner decisions of 2026-10-29:
   reached in context: **Open in library** appears on an Architecture reference pair whose target
   is an external package, and in the step inspector for an `external` call whose
   `callEvidence.externalPackage` (the package field of the binding's SCIP symbol) names it. The
-  action appears only when the ready catalog indexes a package of that ecosystem with that exact
+  action appears only when the ready catalog has indexed (complete or partial) a package of that ecosystem with that exact
   name, Cargo crate spelling (`-`/`_`) or alias; a named version is preferred, and several
   matching versions offer a choice. Standard-library identities and unsupported ecosystems get
   no action. It opens the source dock's **Library** tab (hidden until first used) with the
   package's indexed definitions and explicit candidate source; the selected method, diagram and
   inspection stay. Library candidate IDs never seed workspace sequences or navigation. The
   manual Rust source-root browser was Libraries-tab-only UI and is removed from the browser;
-  its endpoints remain.
+  its endpoints remain. The action is decided when a step or pair is shown: if the catalog
+  becomes ready later, select the call or reference again.
 
 ## Checkout observation
 

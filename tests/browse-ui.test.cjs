@@ -1691,6 +1691,25 @@ test("Classes stays hidden without production code and never asks the class cata
     assert.equal(classRequests.length, 0, JSON.stringify(files)); assert.equal(h.get("view-classes").hidden, true);
   }
 });
+test("an aborted class-support read is forgotten and asked again at the same pin; a checkout reset forgets support", async () => {
+  const h = harness({}, true), classRequests = [];
+  h.context.fetch = async request => {
+    if (request.startsWith("/api/metrics?")) return response({payload:{...metricPin,workbench:true,metricsVersion:"metrics:v1",scope:"revision",aggregate:"max",role:"production",files:[languageFile("java")],directories:[],topCognitive:[]},catchingUp:false});
+    if (request.startsWith("/api/classes?")) {
+      classRequests.push(request);
+      if (classRequests.length === 1) throw new DOMException("Superseded request", "AbortError");
+      return response({revision:metricPin, items:[], supportedLanguages:["java"]});
+    }
+    throw new Error("Unexpected " + request);
+  };
+  await h.run("viewerMetrics.refresh()"); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(classRequests.length, 1); assert.equal(h.get("view-classes").hidden, true);
+  assert.equal(h.run("classSupport"), null, "an aborted read does not pin the tab hidden");
+  await h.run("viewerMetrics.refresh()"); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(classRequests.length, 2); assert.equal(h.get("view-classes").hidden, false);
+  h.run("resetCheckout()");
+  assert.equal(h.run("classSupport"), null);
+});
 test("an unavailable class catalog keeps Classes hidden", async () => {
   const h = harness({}, true);
   h.context.fetch = async request => {

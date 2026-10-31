@@ -1003,6 +1003,11 @@ test("Architecture opens an external package reference in the library catalog, w
   assert.match(await page.locator("#external-source").textContent(), /pub fn candidate_only\(\) \{\}/);
   assert.equal(await page.locator("#external-source img").count(), 0);
   assert.equal(await page.evaluate(() => globalThis.libraryExecuted), undefined);
+  assert.match(await page.locator("#external-source-hint").textContent(), /Workspace diagrams are unavailable/);
+  assert.equal(await page.locator("#external-source .source-diagram-action").count(), 0);
+  await page.locator("#external-source").focus(); await page.keyboard.press("Shift+F10");
+  assert.equal(await page.locator(".classes-context-menu").count(), 0, "external source has no workspace action menu");
+  await page.keyboard.press("Escape");
   assert.equal(await page.locator("#architecture-inspector").isVisible(), true, "the reference inspection stays open");
   assert.ok(!requests.some(row => /\/(sequence|navigation)$/.test(row.url.pathname)), "library candidates never seed workspace sequences");
 }, libraryFiles));
