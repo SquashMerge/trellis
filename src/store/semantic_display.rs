@@ -713,23 +713,46 @@ impl EvidenceResponse {
                 continue;
             };
             tier.producer_id = Some(producer.to_owned());
+            // Closed enums decode strictly: a malformed stored value is typed corruption,
+            // never healthy availability (#528 review).
+            let corrupt = |what: &str| -> anyhow::Error {
+                SelectedIntegrity(format!(
+                    "store_unavailable: invalid selected semantic {what}"
+                ))
+                .into()
+            };
             let mut statement = self.db.prepare_cached(
                 "SELECT selected,state,count(*) FROM semantic_coverage
                  WHERE revision_id=?1 AND producer_id=?2 AND language=?3 GROUP BY selected,state",
             )?;
             for row in statement.query_map(params![selected.key, producer, language], |row| {
                 Ok((
-                    row.get::<_, bool>(0)?,
+                    row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                 ))
             })? {
                 let (chosen, state, count) = row?;
-                let count = u64::try_from(count).unwrap_or(0);
+                let count = u64::try_from(count).map_err(|_| corrupt("coverage count"))?;
+                if !matches!(chosen, 0 | 1)
+                    || !matches!(
+                        state.as_str(),
+                        "notRequested"
+                            | "omitted"
+                            | "unsupported"
+                            | "failed"
+                            | "partial"
+                            | "complete"
+                    )
+                {
+                    return Err(corrupt("coverage state"));
+                }
+                // Unselected tuples, and selected ones not requested or unsupported, count as
+                // unselected, as native `scopeCoverage` does.
                 let bucket = match (chosen, state.as_str()) {
-                    (true, "complete") => Some(1),
-                    (true, "partial") => Some(2),
-                    (true, "failed") => Some(3),
+                    (1, "complete") => Some(1),
+                    (1, "partial") => Some(2),
+                    (1, "failed") => Some(3),
                     _ => None,
                 };
                 match bucket {
@@ -746,17 +769,28 @@ impl EvidenceResponse {
             // Publication derives a proof's freshness from its document and that document's
             // captured basis only, so every proof of one tuple shares it: one proof per
             // tuple is exact for what Trellis published (#261), and avoids scanning the
-            // hundreds of thousands of proofs a language can hold on every read.
-            let worst: i64 = self.db.query_row(
-                "SELECT coalesce(max(CASE (SELECT p.freshness FROM semantic_provenance p
-                                           WHERE p.tuple_id=c.tuple_id LIMIT 1)
-                     WHEN 'stale' THEN 2 WHEN 'possiblyStale' THEN 1 ELSE 0 END),0)
+            // hundreds of thousands of proofs a language can hold on every read. A tuple
+            // without proofs (an empty fact set) is valid and adds nothing.
+            let mut statement = self.db.prepare_cached(
+                "SELECT (SELECT p.freshness FROM semantic_provenance p
+                         WHERE p.tuple_id=c.tuple_id LIMIT 1)
                  FROM semantic_coverage c
                  WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
                    AND c.state IN ('complete','partial')",
-                params![selected.key, producer, language],
-                |row| row.get(0),
             )?;
+            let mut worst = 0;
+            for freshness in statement
+                .query_map(params![selected.key, producer, language], |row| {
+                    row.get::<_, Option<String>>(0)
+                })?
+            {
+                worst = worst.max(match freshness?.as_deref() {
+                    None | Some("fresh") => 0,
+                    Some("possiblyStale") => 1,
+                    Some("stale") => 2,
+                    Some(_) => return Err(corrupt("proof freshness")),
+                });
+            }
             tier.freshness = match worst {
                 2 => "stale",
                 1 => "possiblyStale",

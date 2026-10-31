@@ -14138,6 +14138,29 @@ impl GraphMcp {
         envelope
     }
 
+    /// A successful call of any tool; validated against the catalog schema in `finish`.
+    fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        writeln!(
+            self.client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":name,"arguments":arguments})
+            )
+        )
+        .unwrap();
+        let reply = next_reply(&mut self.reader);
+        assert_eq!(reply["id"], id);
+        tool(&reply, None, true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        self.pairs
+            .push(json!({"name":name,"structuredContent":envelope}));
+        envelope
+    }
+
     /// A successful call; the envelope is validated against the catalog schema in `finish`.
     fn graph(&mut self, arguments: Value) -> Value {
         let id = self.send(arguments);
@@ -14333,6 +14356,122 @@ fn with_bindings(
     let mut spec = graph_fixtures::Spec::new(files);
     spec.bindings = bindings;
     spec
+}
+
+/// #528 review: compact changes presentation, never the optional evidence chosen for the
+/// same required prefix. Six bound calls, each with eight long-path native hints: full and
+/// compact show the same hints and documents for the same six calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_outgoing_keeps_the_full_answers_hints_for_the_same_calls() {
+    let mut files = vec![(
+        "src/lib.rs".to_owned(),
+        "fn run() { foo(); foo(); foo(); foo(); foo(); foo(); }\n".to_owned(),
+    )];
+    for i in 0..8 {
+        files.push((
+            format!(
+                "src/candidate{i}/{}/a.rs",
+                vec!["x".repeat(70); 5].join("/")
+            ),
+            "pub fn foo() {}\n".to_owned(),
+        ));
+    }
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let spec = with_bindings(
+        &files,
+        (0..6)
+            .map(|i| graph_fixtures::bind("run", i, "foo"))
+            .collect(),
+    );
+    let mut mcp = GraphMcp::start(528, &[spec], Default::default()).await;
+    let full = mcp.call_tool(
+        "trellis_outgoing_calls",
+        mcp.args("run", json!({"limit":6})),
+    );
+    let compact = mcp.call_tool(
+        "trellis_outgoing_calls",
+        mcp.args("run", json!({"limit":6,"compact":true})),
+    );
+    let calls = |v: &Value| v["data"]["calls"].as_array().unwrap().clone();
+    assert_eq!(calls(&full).len(), 6, "{full}");
+    assert_eq!(calls(&compact).len(), 6, "{compact}");
+    let hints = |v: &Value| {
+        calls(v)
+            .iter()
+            .map(|c| c["nativeCandidates"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(hints(&full), hints(&compact));
+    assert_eq!(full["data"]["documents"], compact["data"]["documents"]);
+    assert_eq!(full["warnings"], compact["warnings"]);
+    assert_eq!(full["partial"], compact["partial"]);
+    // The page target bounds the optional hints of the full answer.
+    assert!(
+        hints(&full)
+            .iter()
+            .any(|h| h["omitted"].as_u64().unwrap_or(0) > 0),
+        "{full}"
+    );
+    mcp.finish();
+}
+
+/// #528 review: a malformed stored semantic enum is typed corruption, never healthy
+/// availability. The store is reopened after the edit, as accidental corruption would be.
+#[test]
+fn malformed_semantic_freshness_or_state_fails_language_tiers() {
+    fn index_db(dir: &Path) -> Option<PathBuf> {
+        for entry in fs::read_dir(dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                if let Some(found) = index_db(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|name| name == "index.db") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    for corruption in [
+        "UPDATE semantic_provenance SET freshness='garbage'",
+        "UPDATE semantic_coverage SET state='garbage'",
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut publisher = graph_fixtures::Publisher::open(state.path(), root.path());
+        let mut spec = graph_fixtures::Spec::new(&[("src/lib.rs", "fn a(){b();} fn b(){}")]);
+        spec.bindings = vec![graph_fixtures::bind("a", 0, "b")];
+        publisher.publish(&spec);
+        drop(publisher);
+        // Healthy first: rust has fresh selected semantic evidence.
+        let store = trellis::store::Store::open_for_tests(state.path(), root.path()).unwrap();
+        let tiers = store
+            .evidence_response()
+            .unwrap()
+            .mcp_language_tiers()
+            .unwrap();
+        assert!(tiers[1].semantic(), "{tiers:?}");
+        drop(store);
+        let db = rusqlite::Connection::open(index_db(state.path()).unwrap()).unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA ignore_check_constraints=ON; {corruption};"
+        ))
+        .unwrap();
+        drop(db);
+        let store = trellis::store::Store::open_for_tests(state.path(), root.path()).unwrap();
+        let error = store
+            .evidence_response()
+            .unwrap()
+            .mcp_language_tiers()
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("store_unavailable:"),
+            "{corruption}: {error:#}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1475,7 +1475,7 @@ pub fn outgoing(
             "result":super::tools::result("trellis_outgoing_calls", envelope.clone(), modern)});
         serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() < super::wire::RESPONSE_BYTES)
     };
-    let build = |count: usize, shown: &[usize]| -> Result<Value, &'static str> {
+    let build = |count: usize, shown: &[usize], compacted: bool| -> Result<Value, &'static str> {
         let versions = result.calls[..count]
             .iter()
             .enumerate()
@@ -1626,7 +1626,7 @@ pub fn outgoing(
         let mut data = json!({"symbolId":result.owner.selected.declaration.syntax_id,
             "displayKey":owner_display,"calls":calls,"documents":documents,
             "semanticBases":bases,"coverage":coverage,"provenance":provenance});
-        if compact {
+        if compacted {
             compact_data(&mut data, "calls");
         }
         Ok(
@@ -1638,13 +1638,14 @@ pub fn outgoing(
     };
     let mut count = 0;
     let mut shown = Vec::new();
-    let empty = build(0, &[])?;
+    let empty = build(0, &[], compact)?;
     if !fits(&empty) {
         return Ok(None);
     }
+    // Compact may fit more required calls than the full answer.
     while count < result.calls.len() {
         shown.push(0);
-        if !fits(&build(count + 1, &shown)?) {
+        if !fits(&build(count + 1, &shown, compact)?) {
             shown.pop();
             break;
         }
@@ -1653,9 +1654,10 @@ pub fn outgoing(
     if count == 0 && !result.calls.is_empty() {
         return Ok(None);
     }
-    let mut last = build(count, &shown)?;
     // #528: optional hints fill only to the page target, not the whole cap, so a default
-    // page of calls stays agent-sized; hints left out are counted in `omitted`.
+    // page of calls stays agent-sized; hints left out are counted in `omitted`. They are
+    // chosen on the full answer whatever the mode, so compact shows the same optional
+    // evidence as the full answer for the same call prefix.
     let fits_page = |envelope: &Value| -> bool {
         let frame = json!({"jsonrpc":"2.0","id":id,
             "result":super::tools::result("trellis_outgoing_calls", envelope.clone(), modern)});
@@ -1664,15 +1666,13 @@ pub fn outgoing(
     'candidate: for (index, item) in result.calls[..count].iter().enumerate() {
         for _ in 0..item.selected.candidates.len().min(8) {
             shown[index] += 1;
-            let next = build(count, &shown)?;
-            if !fits_page(&next) {
+            if !fits_page(&build(count, &shown, false)?) {
                 shown[index] -= 1;
                 break 'candidate;
             }
-            last = next;
         }
     }
-    Ok(Some(last))
+    Ok(Some(build(count, &shown, compact)?))
 }
 
 /// Project one rooted call-graph answer inside the response cap (D1, #40).
