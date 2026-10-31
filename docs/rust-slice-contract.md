@@ -13,7 +13,8 @@ language=rust; callable Symbol ranges are whole AST function_item/closure_expres
 Impl methods are Method; free functions Function; containers use existing Module/Class kinds.
 Trait signatures without bodies must not acquire fabricated behavior. Closures have independent
 ownership; their bodies do not run at definition. Macro token trees are opaque boundaries,
-not ordinary calls. Attributes/cfg/module ambiguity must remain explicit. Async function body
+not ordinary calls. (Native measurement, and the graph calls derived from it, measure the
+arguments of allowlisted expression macros such as `assert!` and `format!`: Decision 0019.) Attributes/cfg/module ambiguity must remain explicit. Async function body
 models possible execution when polled, not future construction. No compiler/type/trait-resolution
 claims. Prefer unresolved calls to unsafe name matching. IDs, ranges, owners, provenance retained.
 Call ordinal is source order, NOT execution order.

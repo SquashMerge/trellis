@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        31
+        32
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -739,9 +739,9 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // Check exact schema-31 names before comparing evidence and the logical
+    // Check exact schema-32 names before comparing evidence and the logical
     // search corpus. FTS shadow bytes depend on publication/merge history.
-    const REQUIRED_V28_TABLES: [&str; 74] = [
+    const REQUIRED_V28_TABLES: [&str; 75] = [
         "class_projections",
         "class_relations",
         "classes",
@@ -779,6 +779,7 @@ fn sqlite_snapshot(
         "native_version_declarations",
         "native_version_header_items",
         "native_version_headers",
+        "native_version_macro_expansions",
         "native_version_own_signature_types",
         "native_version_parameters",
         "native_version_references",
@@ -820,7 +821,7 @@ fn sqlite_snapshot(
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
         REQUIRED_V28_TABLES,
-        "exact schema-31 evidence and search table inventory"
+        "exact schema-32 evidence and search table inventory"
     );
     if tables.contains(&"native_binding_epoch".to_string()) {
         let (first, bound): (i64, i64) = db
@@ -903,7 +904,7 @@ fn sqlite_snapshot(
                 name if name.starts_with("native_version_") =>
                     ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("semantic_") => ("?1 IS NOT NULL", ""),
-                _ => panic!("unhandled schema-31 evidence table: {table}"),
+                _ => panic!("unhandled schema-32 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {
@@ -3481,6 +3482,69 @@ fn canonical_medium_java_prefix_literal_local_matches_independent_cold_and_retai
     assert_eq!(
         store.source_at(relative, Some(old_pin)).unwrap().unwrap().1,
         old_source
+    );
+}
+
+/// Decision 0019: measured macro spans are stored with the document version, so a reused
+/// document keeps its late macro ordinals through LOCAL validation and matches a cold index.
+#[test]
+fn rust_macro_expansions_survive_local_reuse_and_match_independent_cold() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    let (state, workspace) = fixture();
+    // Macro calls precede the owner's ordinary calls, so their ordinals are not source order.
+    fs::write(
+        workspace.path().join("a.rs"),
+        "fn g(x: i32) -> i32 { x }\nfn f() -> i32 { assert_eq!(g(1), 1, \"{}\", g(2)); let h = |y: i32| g(y); h(g(3)) }\n",
+    )
+    .unwrap();
+    let leaf = workspace.path().join("b.rs");
+    fs::write(&leaf, "pub fn b()->i32{100}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let old_pin = job.run(&options, &cancel, |_| {}).unwrap();
+    fs::write(&leaf, "pub fn b()->i32{1100}\n").unwrap();
+    let phases = std::sync::Mutex::new(Vec::new());
+    let local_pin = IndexJobCoordinator::prepare_with_session(&store, Some(old_pin), session)
+        .unwrap()
+        .run(&options, &cancel, |progress| {
+            phases.lock().unwrap().push(progress.phase)
+        })
+        .unwrap();
+    assert!(
+        phases
+            .into_inner()
+            .unwrap()
+            .iter()
+            .any(|phase| phase == "mode:local")
+    );
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    let spans: Vec<(i64, i64)> = db
+        .prepare("SELECT e.start_byte,e.end_byte FROM native_version_macro_expansions e JOIN revision_documents d ON d.vid=e.vid AND d.path='a.rs' ORDER BY d.vid,e.ordinal")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(!spans.is_empty());
+    let cold_state = tempfile::tempdir().unwrap();
+    fs::set_permissions(cold_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let cold = Store::open_for_tests(cold_state.path(), workspace.path()).unwrap();
+    let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
+    let _cold_session = cold_job.session();
+    let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
+    assert_eq!(
+        sqlite_snapshot(&index_dir(state.path()).join("index.db"), local_pin, true),
+        sqlite_snapshot(
+            &index_dir(cold_state.path()).join("index.db"),
+            cold_pin,
+            true
+        ),
     );
 }
 
