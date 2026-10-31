@@ -1666,6 +1666,7 @@ impl EvidenceResponse {
         let references = crate::references::project(&snapshot, &[], 5, check)?;
         let evaluated =
             crate::rules::evaluate_with_layers(config, &snapshot, &references, &[], check)?;
+        payload["evidenceTier"] = references.data["evidenceTier"].clone();
         let references_coverage = &references.coverage;
         let rules = evaluated.data;
         let assignments = evaluated.layers;
@@ -1804,7 +1805,7 @@ impl EvidenceResponse {
                         serde_json::json!({
                             "sourceLayer": source, "destinationLayer": destination, "role": role,
                             "status": status, "excepted": excepted, "exceptionReason": reason,
-                            "count": 0, "pairs": []
+                            "count": 0, "semanticSites": 0, "pairs": []
                         })
                     });
                 summary["count"] = serde_json::json!(
@@ -1812,6 +1813,12 @@ impl EvidenceResponse {
                         + pair["count"]
                             .as_u64()
                             .context("store_unavailable: reference count")?
+                );
+                summary["semanticSites"] = serde_json::json!(
+                    summary["semanticSites"].as_u64().unwrap_or(0)
+                        + pair["semanticSites"]
+                            .as_u64()
+                            .context("store_unavailable: reference semantic count")?
                 );
                 summary["pairs"]
                     .as_array_mut()
@@ -1836,14 +1843,43 @@ impl EvidenceResponse {
             row.sites += counted.sites;
             row.mapped += counted.mapped;
             row.unresolved += counted.unresolved;
+            row.semantic += counted.semantic;
+        }
+        let coverage_row = |row: &crate::references::SiteCoverage| {
+            serde_json::json!({
+                "sites": row.sites, "mappedSites": row.mapped, "unresolvedSites": row.unresolved,
+                "semanticSites": row.semantic
+            })
+        };
+        // Each arrow carries its evidence tier and its source layer's coverage: its count is
+        // exact (`complete`) only when no site of that layer and role stayed unresolved (#523).
+        for summary in summaries.values_mut() {
+            check()?;
+            let test = summary["role"] == "test";
+            let row = coverage
+                .get(&(summary["sourceLayer"].as_str(), test))
+                .copied()
+                .unwrap_or_default();
+            let count = summary["count"].as_u64().unwrap_or(0);
+            let semantic = summary["semanticSites"].as_u64().unwrap_or(0);
+            summary["evidenceTier"] = serde_json::json!(match semantic {
+                0 => "syntax",
+                n if n == count => "semantic",
+                _ => "mixed",
+            });
+            let mut covered = coverage_row(&row);
+            covered["complete"] = serde_json::json!(row.unresolved == 0);
+            summary["coverage"] = covered;
         }
         references["coverage"] = serde_json::json!(
             coverage
                 .into_iter()
-                .map(|((layer, test), row)| serde_json::json!({
-                    "layer": layer, "role": if test { "test" } else { "production" },
-                    "sites": row.sites, "mappedSites": row.mapped, "unresolvedSites": row.unresolved
-                }))
+                .map(|((layer, test), row)| {
+                    let mut value = coverage_row(&row);
+                    value["layer"] = serde_json::json!(layer);
+                    value["role"] = serde_json::json!(if test { "test" } else { "production" });
+                    value
+                })
                 .collect::<Vec<_>>()
         );
         drop(assignments);
@@ -2044,6 +2080,7 @@ impl EvidenceResponse {
                     file: fetched.file,
                     declarations: fetched.declarations,
                     calls: fetched.calls,
+                    semantic: Default::default(),
                 });
             }
         }
@@ -2154,6 +2191,7 @@ impl EvidenceResponse {
                 label
             );
         }
+        semantic_display::architecture_semantic(&self.db, &selected.key, &mut documents, check)?;
         check()?;
         Ok(crate::references::Snapshot {
             pin: selected.pin,

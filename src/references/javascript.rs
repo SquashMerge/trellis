@@ -1517,6 +1517,7 @@ mod tests {
                     .key
                     .clone();
                 DocumentInput {
+                    semantic: Default::default(),
                     declarations: native
                         .declarations
                         .iter()
@@ -1673,6 +1674,7 @@ mod tests {
 
     fn hazards_for(text: &str) -> (Hazards, usize) {
         let doc = DocumentInput {
+            semantic: Default::default(),
             key: DocumentKey {
                 source_set_id: "source".into(),
                 language: "javascript".into(),

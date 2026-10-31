@@ -48,6 +48,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
                 .cloned()
                 .collect();
             DocumentInput {
+                semantic: Default::default(),
                 key,
                 file,
                 declarations,
