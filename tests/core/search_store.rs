@@ -418,6 +418,7 @@ fn omitted_semantics(
                 supported_roles: vec![s::Role::Definition],
                 observed_roles: vec![],
                 diagnostic: Some(diagnostic.into()),
+                reasons: None,
             })
             .collect(),
         provenance: vec![],

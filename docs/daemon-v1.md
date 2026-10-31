@@ -89,7 +89,7 @@ freshness. There is **no watcher**: the source may have changed since indexing.
 head revision's published semantic producers per language (owner ruling 2026-10-30, #483,
 amending #392/#409): each language uses the sole published producer whose profile covers
 it. `semanticLanguages` lists every indexed language as `{language, semanticProducerId,
-semanticNote, semanticState, calls, internal, external, ambiguous, unresolved}` from that
+semanticNote, semanticState, calls, internal, external, ambiguous, unresolved, coverage}` from that
 producer's selected bindings. `semanticState` is `fresh`, or `stale` when any selected proof
 is not fresh. It is `unavailable` when no selected complete or partial coverage exists.
 `internal` counts calls resolved to an internal declaration, `external` external calls, and
@@ -105,6 +105,25 @@ showing syntax`), `unavailable` and syntax-only counts. `stats` is the combined 
 says why, `semanticState` is `unavailable` and the counts stay syntax-only.
 `GET /api/methods` and `trellis symbols` mark each symbol's `provenance.semantic` with its
 document language's producer state.
+
+**Coverage reasons (#520).** A language with a selected producer also has `coverage`: that
+producer's tuples at the head revision as `{complete, partial, failed, unselected,
+partialReasons, summary}`. `partialReasons` counts the partial documents with each reason,
+from the reasons the import recorded per document ([contract](semantic-evidence/contract-v1.md#coverage-reasons-520)):
+`nativeGaps` (any unsupported occurrence under a native gap), `nativeGapsOnly` (no other
+reason), `capped`, `omitted`, `capturedDiagnostics` and `unrecorded` (partial tuples without
+recorded reasons). One document can count under several reasons.
+`unsupportedOccurrences` sums the occurrences by gap kind: `{macroInvocation, attributeItem,
+macroDefinition, other}`. `summary` is one line, present when any tuple is partial, for example
+`partial: 243 · native macro/attribute gaps only` (or `native gaps only` when some gap is of
+kind `other`). When the partial documents have other reasons,
+it lists each reason with its document count, such as
+`partial: 3 · native gaps 2, occurrence cap 1`.
+
+The `trellis semantic import` report gives each language's `partialReasons` with the same
+document counts and `unsupportedOccurrences`. It also gives `listed`, the partial documents in
+coverage order as `{path, diagnostic, reasons}`, up to 64 KiB of JSON per language, and
+`unlisted`, the count of partial documents left out.
 
 ## Data and identity contract
 

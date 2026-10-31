@@ -40,7 +40,75 @@ macro_rules! record {
 record!(Producer { id: String, version: String, executable_hash: String, kind: SemanticKind, languages: Vec<Language>, position_encoding: PositionEncoding });
 closed!(SemanticKind { Semantic => "semantic" });
 record!(SemanticBasis { producer_id: String, producer_version: String, producer_hash: String, artifact_hash: String, language: Language, source_set_id: String, revision_id: String, source_manifest_hash: String, toolchain_hash: String, config_hash: String, dependency_hash: String, lookup_dependencies: Vec<String> });
-record!(Coverage { producer_id: String, language: Language, source_set_id: String, document_path: String, revision_id: String, requested: bool, selected: bool, state: CoverageState, supported_roles: Vec<Role>, observed_roles: Vec<Role>, #[serde(deserialize_with = "nullable")] diagnostic: Option<String> });
+record!(Coverage { producer_id: String, language: Language, source_set_id: String, document_path: String, revision_id: String, requested: bool, selected: bool, state: CoverageState, supported_roles: Vec<Role>, observed_roles: Vec<Role>, #[serde(deserialize_with = "nullable")] diagnostic: Option<String>,
+    /// Why a `partial` tuple is partial, recorded by the import that derived it (#520). It is
+    /// absent on every other state and on rows no import derived, and no graph result returns it.
+    #[serde(default, skip_serializing_if = "Option::is_none")] reasons: Option<CoverageReasons> });
+// Every reason a semantic import made one document's coverage `partial` (#520). The single
+// `Coverage.diagnostic` keeps only the reason of highest precedence; this keeps them all.
+// The four counts are the document's unsupported occurrences by the kind of native gap that
+// hid them. The flags are the per-document occurrence cap, a dependent fact omitted for an
+// unverified internal target, and a diagnostic the captured join reported.
+record!(CoverageReasons { macro_invocation: u64, attribute_item: u64, macro_definition: u64, other: u64, capped: bool, omitted: bool, captured_diagnostics: bool });
+/// The native gap kinds an unsupported occurrence is counted under, in `CoverageReasons` order.
+pub const GAP_KINDS: [&str; 4] = [
+    "macroInvocation",
+    "attributeItem",
+    "macroDefinition",
+    "other",
+];
+impl CoverageReasons {
+    /// The index into [`GAP_KINDS`] of the native gap whose diagnostic hid an occurrence. The
+    /// native index names the opaque Rust construct it skipped (`opaque Rust <kind> skipped`);
+    /// a format string or named format argument is a gap inside a macro invocation. Anything
+    /// else, including a wholly unavailable family, is `other`.
+    pub fn gap_kind(diagnostic: Option<&str>) -> usize {
+        let kind = diagnostic
+            .and_then(|text| text.strip_prefix("opaque Rust "))
+            .and_then(|text| text.split_once(" skipped"))
+            .map(|(kind, _)| kind);
+        match kind {
+            Some("macro_invocation" | "format string" | "named format argument") => 0,
+            Some("attribute_item" | "inner_attribute_item") => 1,
+            Some("macro_definition") => 2,
+            _ => 3,
+        }
+    }
+
+    /// The reasons of a `partial` tuple from the operands of its partial decision.
+    pub fn new(gaps: [u64; 4], capped: bool, omitted: bool, captured_diagnostics: bool) -> Self {
+        Self {
+            macro_invocation: gaps[0],
+            attribute_item: gaps[1],
+            macro_definition: gaps[2],
+            other: gaps[3],
+            capped,
+            omitted,
+            captured_diagnostics,
+        }
+    }
+
+    /// The unsupported occurrence counts in [`GAP_KINDS`] order.
+    pub fn gaps(&self) -> [u64; 4] {
+        [
+            self.macro_invocation,
+            self.attribute_item,
+            self.macro_definition,
+            self.other,
+        ]
+    }
+
+    /// Unsupported occurrences under any native gap, saturating.
+    pub fn native_gaps(&self) -> u64 {
+        self.gaps()
+            .iter()
+            .fold(0u64, |total, count| total.saturating_add(*count))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.native_gaps() == 0 && !self.capped && !self.omitted && !self.captured_diagnostics
+    }
+}
 record!(DerivedFrom {
     provenance_id: String,
     record_kind: RecordKind,
@@ -1101,7 +1169,34 @@ fn validate_coverage_row(
             "unselected coverage observed roles"
         );
     }
+    if let Some(reasons) = &row.reasons {
+        validate_coverage_reasons(row, reasons)?;
+    }
     Ok(lang)
+}
+
+/// Reasons belong to a `partial` tuple, name at least one cause, stay JSON-safe, and agree with
+/// the single diagnostic's precedence: a native gap, then the cap, then an unmeasurable target.
+fn validate_coverage_reasons(row: &Coverage, reasons: &CoverageReasons) -> Result<()> {
+    ensure!(
+        row.state == CoverageState::Partial && !reasons.is_empty(),
+        "coverage reasons outside a partial tuple"
+    );
+    let gaps = reasons.native_gaps();
+    ensure!(
+        gaps <= 9_007_199_254_740_991,
+        "coverage reason count out of range"
+    );
+    ensure!(
+        match row.diagnostic.as_deref() {
+            Some("unsupported_native_gap") => gaps > 0,
+            Some(crate::scip_raw::OCCURRENCE_CAP_EXCEEDED) => gaps == 0 && reasons.capped,
+            Some("unmeasurable_internal_target") => gaps == 0 && !reasons.capped,
+            _ => false,
+        },
+        "coverage reasons contradict the diagnostic"
+    );
+    Ok(())
 }
 
 /// The capture identity a derived proof must agree with.

@@ -2416,6 +2416,7 @@ mod call_graph_tests {
                 supported_roles: vec![],
                 observed_roles: vec![],
                 diagnostic: None,
+                reasons: None,
             },
             native_provenance: sem::Provenance {
                 id: "native:doc".into(),

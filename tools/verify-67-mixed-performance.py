@@ -661,7 +661,7 @@ native_version_calls native_version_control_regions native_version_call_regions
 native_revision_release_debt native_release_candidate_versions native_release_candidate_graphs
 native_release_candidate_classes semantic_producers semantic_producer_languages
 semantic_revision_producers semantic_requested_producers semantic_requested_producer_languages
-semantic_coverage semantic_coverage_roles semantic_basis
+semantic_coverage semantic_coverage_roles semantic_coverage_reasons semantic_basis
 semantic_basis_lookup_dependencies semantic_provenance semantic_symbols
 semantic_symbol_targets semantic_declaration_bindings semantic_declaration_binding_symbols
 semantic_declaration_join_candidates semantic_references semantic_reference_roles
@@ -720,7 +720,8 @@ def selected_where(table):
         return "gid IN (SELECT gid FROM revision_documents WHERE revision_id=?)"
     elif table in {"class_projections", "classes", "class_relations"}:
         return "cid IN (SELECT cid FROM revision_documents WHERE revision_id=?)"
-    elif table in {"semantic_coverage_roles", "semantic_basis", "semantic_provenance",
+    elif table in {"semantic_coverage_roles", "semantic_coverage_reasons", "semantic_basis",
+                   "semantic_provenance",
                    "semantic_symbols", "semantic_declaration_bindings", "semantic_references",
                    "semantic_call_bindings", "semantic_type_relationships"}:
         return f"tuple_id IN ({selected})"

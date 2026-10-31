@@ -237,6 +237,7 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
                 s::Role::Type,
             ],
             diagnostic: None,
+            reasons: None,
         }],
         provenance: vec![
             proof("bind", s::EvidenceKind::DeclarationBinding),
@@ -597,6 +598,7 @@ fn captured_manifest_contract_order_and_current_coverage() {
         supported_roles: vec![],
         observed_roles: vec![],
         diagnostic: None,
+        reasons: None,
     });
     // Producer language order must itself follow contract order (rust before javascript).
     s::validate_evidence(&semantic, &native, &captured).unwrap();
@@ -619,6 +621,7 @@ fn captured_manifest_contract_order_and_current_coverage() {
         supported_roles: vec![],
         observed_roles: vec![],
         diagnostic: None,
+        reasons: None,
     });
     semantic.coverage[1].document_path = "captured-only.js".into();
     assert!(

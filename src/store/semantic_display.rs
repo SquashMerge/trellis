@@ -358,6 +358,7 @@ pub(super) fn status_semantics(
             external: 0,
             ambiguous: 0,
             unresolved: calls,
+            coverage: None,
         };
         if let Some(producer) = producer {
             language_counts(db, &key, &producer, &mut row)?;
@@ -446,7 +447,67 @@ fn language_counts(
     row.external = counts[1];
     row.ambiguous = counts[2];
     row.unresolved = row.calls.saturating_sub(counts[0] + counts[1] + counts[2]);
+    row.coverage = Some(coverage_summary(db, key, producer, &row.language)?);
     Ok(())
+}
+
+/// One language's coverage tuples under `producer` at revision `key`, by state, with the
+/// import-time reasons of its partial tuples (#520).
+pub(super) fn coverage_summary(
+    db: &Connection,
+    key: &str,
+    producer: &str,
+    language: &str,
+) -> Result<crate::model::SemanticCoverageSummary> {
+    use crate::model::{GapOccurrences, PartialReasons, SemanticCoverageSummary};
+    let mut summary = SemanticCoverageSummary::default();
+    let mut statement = db.prepare_cached(
+        "SELECT c.state, count(*), count(r.tuple_id),
+                coalesce(sum(r.macro_invocation+r.attribute_item+r.macro_definition+r.other>0),0),
+                coalesce(sum(r.macro_invocation+r.attribute_item+r.macro_definition+r.other>0
+                             AND r.capped=0 AND r.omitted=0 AND r.captured_diagnostics=0),0),
+                coalesce(sum(r.capped),0), coalesce(sum(r.omitted),0),
+                coalesce(sum(r.captured_diagnostics),0),
+                coalesce(sum(r.macro_invocation),0), coalesce(sum(r.attribute_item),0),
+                coalesce(sum(r.macro_definition),0), coalesce(sum(r.other),0)
+         FROM semantic_coverage c LEFT JOIN semantic_coverage_reasons r ON r.tuple_id=c.tuple_id
+         WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3
+         GROUP BY c.state",
+    )?;
+    let mut rows = statement.query(params![key, producer, language])?;
+    while let Some(row) = rows.next()? {
+        let state: String = row.get(0)?;
+        let count = row.get::<_, i64>(1)? as usize;
+        match state.as_str() {
+            "complete" => summary.complete += count,
+            "failed" => summary.failed += count,
+            "partial" => {
+                let documents = |index| -> rusqlite::Result<usize> {
+                    Ok(row.get::<_, i64>(index)? as usize)
+                };
+                let occurrences =
+                    |index| -> rusqlite::Result<u64> { Ok(row.get::<_, i64>(index)? as u64) };
+                summary.partial += count;
+                summary.partial_reasons = PartialReasons {
+                    native_gaps: documents(3)?,
+                    native_gaps_only: documents(4)?,
+                    capped: documents(5)?,
+                    omitted: documents(6)?,
+                    captured_diagnostics: documents(7)?,
+                    unrecorded: count - documents(2)?,
+                    unsupported_occurrences: GapOccurrences {
+                        macro_invocation: occurrences(8)?,
+                        attribute_item: occurrences(9)?,
+                        macro_definition: occurrences(10)?,
+                        other: occurrences(11)?,
+                    },
+                };
+            }
+            _ => summary.unselected += count,
+        }
+    }
+    summary.summary = summary.describe();
+    Ok(summary)
 }
 
 /// A CLI query's traversal: its nodes, calls, regions and selected bindings.
