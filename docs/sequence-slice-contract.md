@@ -45,8 +45,8 @@ represent only their first measured call, not a guessed terminal target.
 
 `semanticWarnings` carries the engine's structured warnings (omitted when empty); their
 messages also appear in `warnings`. Existing syntax warnings are preserved. No warning
-code or resolution is invented by the browser. Bounds remain 200 steps, 20 participants
-and depth 24. If a resolved target cannot fit, its boundary is `nodeLimit`, its target is
+code or resolution is invented by the browser. Bounds remain 200 shown steps, 20 participants
+and depth 24, with a separate 2000-step work bound (#536, below). If a resolved target cannot fit, its boundary is `nodeLimit`, its target is
 absent, and the view is truncated with an explicit participant-limit warning.
 
 ### Participants, expansion and incidental calls (#522)
@@ -70,8 +70,8 @@ it adds is read from the same selected snapshot.
   belong to; absent for the seed's own steps) and IDs prefixed by the expanding step's ID.
   They are enriched by the same engine rules, recursively. A target already on the expansion
   path (recursion) or already expanded is drawn as an arrow only. A body that would exceed
-  200 steps or depth 24 in the whole view is not expanded, the view is truncated and a
-  warning names it. Other dispatch, ambiguous (#466, one edge), unresolved, external and
+  the shown-step, work or depth bound in the whole view (#536, below) is not expanded
+  (all or nothing), the view is truncated and a warning names it. Other dispatch, ambiguous (#466, one edge), unresolved, external and
   stale calls stay boundaries.
 - A syntax heuristic never hides a call with a fresh exact internal target (for example a
   repository-defined JavaScript `console.log`); it and its expanded body stay visible.
@@ -83,6 +83,38 @@ it adds is read from the same selected snapshot.
   on the 24th level that still nests becomes one `boundary` ("Depth limit: behavior
   omitted.") at its own range. The Rust adapter bounds its syntax
   recursion separately, at 96 levels, so deep syntax that adds no steps keeps its calls.
+
+### Visible and work step bounds (#536)
+
+Owner ruling 2026-10-31 (#536, on #531): hidden incidental steps do not consume the
+200-step bound. This amends the #522 bullets above, where hidden steps counted.
+
+- **Visible bound: 200 shown steps.** A step counts only if it is shown; a `hidden` step
+  (an incidental call, a hidden logging wrapper) and anything it nests do not. The seed's
+  incidental calls are hidden first, then the seed is kept in pre-order (a step, its
+  `children`, then its `alternate`) up to its 200th shown step; everything after that,
+  hidden steps included, is omitted. A callee body is hidden the same way before it is
+  admitted, and is expanded only if its shown steps fit in what is left.
+- **Work bound: 2000 steps, hidden ones included.** It bounds computation, so hostile
+  input stays bounded however many of its steps are hidden. A language adapter builds at
+  most 2000 steps of one body, and a callee body is not expanded when the steps the view
+  keeps (the seed's, after its visible cut, and every admitted body), its own included,
+  would exceed 2000. Each target's body is built at most once, so a refused body costs no
+  more than one build. A Rust chain group is a step too: grouping is presentational and
+  stops, with a warning and nothing measured lost, before a body would pass 2000 steps.
+  Depth 24 and 20 participants are unchanged.
+- **Show all respects the visible bound.** With `showAll` nothing is incidental-hidden, so
+  every step counts: the seed stops at its 200th step and a callee body that does not fit
+  is not expanded, exactly as above.
+- **Typed truncation.** `truncatedBy` lists, in this order, the bounds that truncated the
+  view: `visibleSteps`, `workSteps`, `depth`, `participants`. It is omitted when none did
+  (`truncated` may still be set by an adapter's other limits, which keep their warnings).
+  The visible bound's warning is "Sequence step limit reached (200 shown steps); later
+  behavior is not shown."; a refused body names itself ("Sequence step limit reached; the
+  body of X is not expanded.", "Sequence work limit reached; …").
+- A syntax-only view (any `semantic.tier=syntax`) applies the same visible and work
+  bounds; only the adapter's own hidden steps are hidden there.
+- `incidentalSteps` and `hiddenSteps` count the steps the view keeps.
 
 The browser draws an expanded step's arrows and notes from its `lane`, shows the tier and
 reason in the sequence status line, and offers a "Show/Hide N incidental calls" toggle

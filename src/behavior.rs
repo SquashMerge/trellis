@@ -23,6 +23,31 @@ pub struct SequenceView {
     #[serde(default)]
     pub incidental_steps: usize,
     pub truncated: bool,
+    /// The bounds that truncated this view (#536), when known: omitted when none did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub truncated_by: Vec<SequenceLimit>,
+}
+/// A bound that truncated a sequence view (#536).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub enum SequenceLimit {
+    /// [`MAX_STEPS`] shown steps: hidden steps do not count.
+    VisibleSteps,
+    /// [`MAX_WORK_STEPS`] steps built or expanded, hidden ones included.
+    WorkSteps,
+    /// [`MAX_STEP_DEPTH`] step levels.
+    Depth,
+    /// 20 resolved participants.
+    Participants,
+}
+impl SequenceView {
+    /// Marks the view truncated by `limit`.
+    pub(crate) fn limit(&mut self, limit: SequenceLimit) {
+        self.truncated = true;
+        if let Err(at) = self.truncated_by.binary_search(&limit) {
+            self.truncated_by.insert(at, limit);
+        }
+    }
 }
 /// The evidence tier of a sequence view (#522). `semantic` names the selected producer
 /// whose fresh bindings built the participants; `syntax` carries the reason it fell back.
@@ -218,7 +243,24 @@ fn scip_descriptors(tail: &str) -> bool {
     }
     at > 0
 }
+/// Builds the syntax view of `seed` within the work bound and depth, and then within the
+/// visible step bound: the view a sequence without semantic enrichment shows.
 pub fn build_sequence(
+    revision: IndexPin,
+    seed: &Symbol,
+    file: &SourceFile,
+    calls: &[CallSite],
+    show_all: bool,
+) -> Result<SequenceView> {
+    let mut view = build_sequence_work(revision, seed, file, calls, show_all)?;
+    cap_visible(&mut view);
+    Ok(view)
+}
+
+/// Builds the syntax view of `seed` within [`MAX_WORK_STEPS`] and [`MAX_STEP_DEPTH`], but
+/// not yet within [`MAX_STEPS`]: semantic enrichment hides incidental calls first (#536),
+/// then applies the visible bound with [`cap_visible`].
+pub(crate) fn build_sequence_work(
     revision: IndexPin,
     seed: &Symbol,
     file: &SourceFile,
@@ -238,10 +280,24 @@ pub fn build_sequence(
 
 /// The step levels a view may carry: top-level steps are at depth 0, the deepest at 23.
 pub const MAX_STEP_DEPTH: usize = 24;
-/// The step bound of one view, expanded callee bodies included.
+/// The visible step bound of one view, expanded callee bodies included. Hidden steps (an
+/// incidental call, a hidden logging wrapper) do not count (#536).
 pub const MAX_STEPS: usize = 200;
-pub(crate) const BOUNDS_WARNING: &str =
-    "Sequence bounds reached (200 steps, 20 participants, depth 24); omitted behavior is unknown.";
+/// The hard work bound: the steps an adapter builds for one body, and the steps one view
+/// builds and expands in all, hidden ones included (#536). It keeps hostile input bounded
+/// however many of its steps are hidden.
+pub const MAX_WORK_STEPS: usize = 2000;
+pub(crate) const BOUNDS_WARNING: &str = "Sequence bounds reached (2000 steps of work, 20 participants, depth 24); omitted behavior is unknown.";
+pub(crate) const VISIBLE_WARNING: &str =
+    "Sequence step limit reached (200 shown steps); later behavior is not shown.";
+
+/// Marks an adapter's view truncated, typed as the work bound when `count` reached it.
+pub(crate) fn adapter_limit(view: &mut SequenceView, count: usize) {
+    view.truncated = true;
+    if count >= MAX_WORK_STEPS {
+        view.limit(SequenceLimit::WorkSteps);
+    }
+}
 
 /// The deepest nesting below `steps`, counting `steps` themselves as depth 0.
 pub(crate) fn tree_depth(steps: &[SequenceStep]) -> usize {
@@ -259,6 +315,68 @@ pub(crate) fn step_count(steps: &[SequenceStep]) -> usize {
         .iter()
         .map(|step| 1 + step_count(&step.children) + step_count(&step.alternate))
         .sum()
+}
+
+/// The steps in `steps` that are shown: a hidden step is not, nor is anything it nests.
+pub(crate) fn visible_count(steps: &[SequenceStep]) -> usize {
+    steps
+        .iter()
+        .filter(|step| !step.hidden)
+        .map(|step| 1 + visible_count(&step.children) + visible_count(&step.alternate))
+        .sum()
+}
+
+/// The hidden steps in `steps`, as `hiddenSteps` counts them: a hidden group of hidden
+/// calls counts its calls, not itself.
+pub(crate) fn hidden_count(steps: &[SequenceStep]) -> usize {
+    steps
+        .iter()
+        .map(|step| {
+            usize::from(step.hidden && step.kind != "group")
+                + hidden_count(&step.children)
+                + hidden_count(&step.alternate)
+        })
+        .sum()
+}
+
+/// Keeps the view within [`MAX_STEPS`] shown steps (#536). Steps are kept in pre-order (a
+/// step, its children, then its alternate) up to the bound's last shown step; everything
+/// after it, hidden steps included, is omitted. Hidden steps before it are kept and do not
+/// count.
+pub(crate) fn cap_visible(view: &mut SequenceView) {
+    /// Keeps a prefix of `steps` within `room` shown steps; true when it cut.
+    fn cap(steps: &mut Vec<SequenceStep>, room: &mut usize) -> bool {
+        for at in 0..steps.len() {
+            if *room == 0 {
+                steps.truncate(at);
+                return true;
+            }
+            let step = &mut steps[at];
+            if step.hidden {
+                continue;
+            }
+            *room -= 1;
+            if cap(&mut step.children, room) {
+                step.alternate.clear();
+                steps.truncate(at + 1);
+                return true;
+            }
+            if cap(&mut step.alternate, room) {
+                steps.truncate(at + 1);
+                return true;
+            }
+        }
+        false
+    }
+    let mut room = MAX_STEPS;
+    if !cap(&mut view.steps, &mut room) {
+        return;
+    }
+    view.limit(SequenceLimit::VisibleSteps);
+    if !view.warnings.iter().any(|w| w == VISIBLE_WARNING) {
+        view.warnings.push(VISIBLE_WARNING.into());
+    }
+    view.hidden_steps = hidden_count(&view.steps);
 }
 
 /// Keeps the step tree within [`MAX_STEP_DEPTH`]: a step at the bound that still nests
@@ -289,7 +407,7 @@ pub(crate) fn cap_depth(view: &mut SequenceView) {
         capped
     }
     if cap(&mut view.steps, 0) {
-        view.truncated = true;
+        view.limit(SequenceLimit::Depth);
         for warning in ["Depth limit: behavior omitted.", BOUNDS_WARNING] {
             if !view.warnings.iter().any(|w| w == warning) {
                 view.warnings.push(warning.into());

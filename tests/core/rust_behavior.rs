@@ -544,7 +544,8 @@ fn deep_opaque_macro_is_not_traversed_for_grouping() {
 fn grouping_work_budget_is_independent_and_keeps_measured_steps() {
     let source = format!(
         "fn run() {{ {} A::new().a().b(); }}",
-        "use std::fs::File;".repeat(2000)
+        // Beyond the grouping budget, which scales with the 2000-step work bound (#536).
+        "use std::fs::File;".repeat(20000)
     );
     let (graph, view) = fixture(&source, "run");
     assert!(!view.truncated); // No measured behavior was lost.

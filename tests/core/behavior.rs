@@ -229,6 +229,35 @@ fn malformed_source_and_unsupported_language_fail_soft() {
     f.language = "unsupported-language".into();
     assert!(build_sequence(test_pin(1), &seed, &f, &[], false).is_err());
 }
+/// #536: hidden steps do not count toward the 200 shown steps, and the work bound holds
+/// every step built, hidden ones included.
+#[test]
+fn hidden_steps_use_no_visible_room_but_count_as_work() {
+    let (_, view) = fixture(
+        &format!(
+            "function run() {{ {} work(); }}",
+            "console.log(1);".repeat(250)
+        ),
+        "run",
+    );
+    assert!(!view.truncated, "{:?}", view.warnings);
+    assert_eq!(flatten(&view.steps).len(), 251);
+    assert_eq!(view.hidden_steps, 250);
+    assert!(
+        flatten(&view.steps)
+            .iter()
+            .any(|step| step.label == "work" && !step.hidden)
+    );
+    let (_, hostile) = fixture(
+        &format!("function run() {{ {} }}", "console.log(1);".repeat(2500)),
+        "run",
+    );
+    assert_eq!(flatten(&hostile.steps).len(), 2000);
+    assert_eq!(
+        hostile.truncated_by,
+        [trellis::behavior::SequenceLimit::WorkSteps]
+    );
+}
 #[test]
 fn bounded_output_and_honest_visual_grouping() {
     let (_, view) = fixture(
@@ -236,7 +265,11 @@ fn bounded_output_and_honest_visual_grouping() {
         "run",
     );
     assert!(view.truncated);
-    assert!(flatten(&view.steps).len() <= 200);
+    assert_eq!(flatten(&view.steps).len(), 200);
+    assert_eq!(
+        view.truncated_by,
+        [trellis::behavior::SequenceLimit::VisibleSteps]
+    );
     assert!(view.participants.len() <= 20);
     assert!(view.steps.iter().all(|step| step.target.is_none()));
     assert_eq!(view.participants[1].kind, "receiver");
