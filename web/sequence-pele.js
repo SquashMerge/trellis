@@ -64,8 +64,11 @@
       const marker = `[${String(ordinal).padStart(3, "0")}]`;
       const display = `${marker} ${step.kind} ${displayLabel}`;
       const evidence = preview || step, target = targetFor(evidence), lane = target && laneFor(target, evidence);
+      // An expanded callee body runs on the callee's lane, opened by the call before it (#522).
+      const owner = step.lane == null ? lanes[0] : lanes.find(item => item.id === step.lane);
+      if (!owner) unsupported("Unknown sequence lane");
       const message = lane && evidence.kind === "call", type = message ? "message" : "note";
-      lines.push(message ? `S->>${lane.alias}: ${encode(display)}` : `Note right of S: ${encode(display)}`);
+      lines.push(message ? `${owner.alias}->>${lane.alias}: ${encode(display)}` : `Note right of ${owner.alias}: ${encode(display)}`);
       const row = {ordinal, marker, display, step, id:step.id, callId:step.callId, path:step.path, range:step.range, revision:view.revision, previewEntryCallId:preview?.callId, preview, evidence, target, type};
       rows.push(row); if (!message) noteOrder.push(row);
     };
@@ -135,9 +138,10 @@
     for (const line of lines) {
       if (line === "sequenceDiagram" || line.startsWith("participant ")) continue;
       const id = `i${statement++}`;
+      const message = /^(?:S|P[0-9]+)->>/.test(line), row = message || /^Note right of (?:S|P[0-9]+):/.test(line);
       if (line.startsWith("Note ")) noteIds.push(id);
-      if (line.startsWith("S->>")) messageIds.push(id);
-      if (line.startsWith("Note right of S:") || line.startsWith("S->>")) rows[rowIndex++].statementId = id;
+      if (message) messageIds.push(id);
+      if (row) rows[rowIndex++].statementId = id;
     }
     return {source, rows, lanes, intro, frames, frameHeaders, closeFrames, closeHeaders, noteIds, messageIds, separators, noteOrder};
   }

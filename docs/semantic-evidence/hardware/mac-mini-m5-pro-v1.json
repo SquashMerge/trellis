@@ -57,6 +57,17 @@
       "runtime": "trellis.native.syntax@native-v10 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
     },
     {
+      "name": "trellis-native-v12-javascript-test-support",
+      "status": "recorded",
+      "version": "native-v12",
+      "installedAtCapture": true,
+      "capturedOn": "2026-10-31",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; feature/519-macro-calls from main cbb32684; descriptor and both captures retained in the 519 evidence (js-recapture); pinned Rust 1.99.1 aarch64-apple-darwin",
+      "artifactDigest": "sha256:bc3f08d161f930264f534db8beb56fd608a0985e8bfcef32fb6db496af0bc393",
+      "executableHash": "bc3f08d161f930264f534db8beb56fd608a0985e8bfcef32fb6db496af0bc393",
+      "runtime": "trellis.native.syntax@native-v12 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
+    },
+    {
       "name": "trellis-native-v11-javascript-test-support",
       "status": "recorded",
       "version": "native-v11",

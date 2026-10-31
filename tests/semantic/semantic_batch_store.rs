@@ -6180,19 +6180,80 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
             })
             .collect()
     }
-    let evidence = |label: &str| {
+    let find = |view: &trellis::behavior::SequenceView, label: &str| {
         let found: Vec<_> = steps(&view.steps)
             .into_iter()
-            .filter(|s| s.call_evidence.is_some() && s.label.contains(label))
+            .filter(|s| {
+                s.call_evidence.is_some()
+                    && (s.label == label || s.label.ends_with(&format!("::{label}")))
+            })
+            .cloned()
             .collect();
         assert_eq!(found.len(), 1, "{label}");
+        found.into_iter().next().unwrap()
+    };
+    let evidence = |label: &str| {
+        let step = find(&view, label);
         (
-            found[0].target.clone(),
-            found[0].call_evidence.as_ref().unwrap().boundary_reason,
+            step.target.clone(),
+            step.call_evidence.as_ref().unwrap().boundary_reason,
         )
     };
-    assert_eq!(evidence("double"), (Some(double), BoundaryReason::None));
+    assert_eq!(
+        evidence("double"),
+        (Some(double.clone()), BoundaryReason::None)
+    );
     assert_eq!(evidence("add"), (None, BoundaryReason::Dispatch));
+    assert_eq!(evidence("new"), (None, BoundaryReason::Unresolved));
+
+    // #522: participants come from the resolved targets, and each direct callee's own
+    // body is expanded beneath its call on the callee's lane: `run` -> `double` ->
+    // `saturating`, whose `saturating_add` is a standard-library call and so incidental.
+    assert_eq!(
+        view.semantic.tier,
+        trellis::behavior::EvidenceTier::Semantic
+    );
+    assert_eq!(
+        view.semantic.producer_id.as_deref(),
+        Some(producer.as_str())
+    );
+    let lanes: Vec<_> = view.participants.iter().map(|p| p.id.clone()).collect();
+    assert_eq!(lanes, [run.clone(), double.clone(), saturating.clone()]);
+    let into_double = find(&view, "double");
+    assert!(into_double.lane.is_none());
+    let into_saturating = find(&view, "saturating");
+    assert_eq!(into_saturating.lane.as_deref(), Some(double.as_str()));
+    assert_eq!(into_saturating.target.as_deref(), Some(saturating.as_str()));
+    assert!(
+        into_double
+            .children
+            .iter()
+            .any(|s| s.id == into_saturating.id)
+    );
+    let std_call = find(&view, "saturating_add");
+    assert_eq!(std_call.lane.as_deref(), Some(saturating.as_str()));
+    let std_evidence = std_call.call_evidence.as_ref().unwrap();
+    assert_eq!(std_evidence.boundary_reason, BoundaryReason::External);
+    assert_eq!(
+        std_evidence
+            .semantic_basis
+            .as_ref()
+            .map(|b| b.producer_id.as_str()),
+        Some("rust-analyzer")
+    );
+    assert!(std_call.hidden);
+    assert_eq!((view.hidden_steps, view.incidental_steps), (1, 1));
+    // Show all keeps the same evidence but hides nothing.
+    let all = world.store.sequence_at(&run, pin, true).unwrap().unwrap();
+    assert!(!find(&all, "saturating_add").hidden);
+    assert_eq!((all.hidden_steps, all.incidental_steps), (0, 1));
+
+    // A recursive call names its own lane but is never re-entered.
+    let spin = id_of("spin");
+    let recursive = world.store.sequence_at(&spin, pin, false).unwrap().unwrap();
+    let call = find(&recursive, "spin");
+    assert_eq!(call.target.as_deref(), Some(spin.as_str()));
+    assert!(call.children.is_empty());
 }
 
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the

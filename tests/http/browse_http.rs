@@ -475,3 +475,126 @@ async fn published_sequence_api_names_the_scip_package_of_external_calls() {
             )
     );
 }
+
+// #522: the sequence API builds participants from fresh exact bindings and expands each
+// direct callee's own body on its lane. Standard-library calls are incidental: counted,
+// hidden unless `showAll`. Without fresh evidence it is the syntax view, with the reason.
+#[tokio::test]
+async fn published_sequence_api_expands_direct_callees_and_hides_incidental_calls() {
+    use graph_fixtures::{Publisher, Spec, bind, syntax_id};
+    use trellis::semantic_evidence::{Dispatch, Resolution};
+    let files = [
+        (
+            "a.rs",
+            "fn a() { std_call(); helper(); }\nfn std_call() {}\n",
+        ),
+        (
+            "helper.rs",
+            "pub fn helper() { inner(); std_other(); }\npub fn inner() {}\npub fn std_other() {}\n",
+        ),
+    ];
+    let external = |caller: &str, nth| {
+        let mut binding = bind(caller, nth, "std_call");
+        binding.resolution = Resolution::External;
+        binding.dispatch = Dispatch::Unknown;
+        binding
+    };
+    for stale in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let mut publisher = Publisher::open(&dir.path().join("state"), &workspace);
+        let mut spec = Spec::new(&files);
+        spec.external_symbol = "rust-analyzer cargo std 1.98.1 vec/Vec#new().".into();
+        if stale {
+            spec.requested_version = "v2".into();
+        }
+        spec.bindings = vec![
+            external("a", 0),
+            bind("a", 1, "helper"),
+            bind("helper", 0, "inner"),
+            external("helper", 1),
+        ];
+        let pin = publisher.publish(&spec);
+        let (seed, helper, inner) = (
+            syntax_id(publisher.native(), "a"),
+            syntax_id(publisher.native(), "helper"),
+            syntax_id(publisher.native(), "inner"),
+        );
+        let app = http::router(
+            http::new(
+                publisher.store.clone(),
+                IndexOptions::new(workspace.clone()),
+                TOKEN.into(),
+                "127.0.0.1:7331".parse().unwrap(),
+            )
+            .unwrap(),
+        );
+        let sequence = |show_all: bool| {
+            let app = app.clone();
+            let body = json!({"seed":seed,"expectedRevision":pin,"showAll":show_all});
+            async move { call(&app, "POST", "/api/sequence", body).await }
+        };
+        let (status, view) = sequence(false).await;
+        assert_eq!(status, 200, "{view}");
+        let steps = view["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2, "{view}");
+        if stale {
+            assert_eq!(view["semantic"]["tier"], "syntax");
+            assert_eq!(
+                view["semantic"]["reason"],
+                "Semantic evidence for a.rs is stale: it was imported for an earlier version of the file. Showing syntax."
+            );
+            assert!(steps.iter().all(|step| step.get("callEvidence").is_none()
+                && step.get("target").is_none()
+                && step["children"].as_array().unwrap().is_empty()
+                && step["hidden"] == false));
+            assert_eq!(view["incidentalSteps"], 0);
+            continue;
+        }
+        assert_eq!(
+            view["semantic"],
+            json!({"tier":"semantic","producerId":graph_fixtures::PRODUCER})
+        );
+        let lanes: Vec<_> = view["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|participant| participant["id"].clone())
+            .collect();
+        assert_eq!(lanes, [json!(seed), json!(helper), json!(inner)]);
+        // The std call: kept with its evidence and basis, hidden as incidental.
+        assert_eq!(steps[0]["callEvidence"]["boundaryReason"], "external");
+        assert_eq!(steps[0]["callEvidence"]["externalPackage"]["name"], "std");
+        assert_eq!(
+            steps[0]["callEvidence"]["semanticBasis"]["producerId"],
+            graph_fixtures::PRODUCER
+        );
+        assert_eq!(steps[0]["hidden"], true);
+        // The direct call names `helper` and carries its expanded body on `helper`'s lane.
+        assert_eq!(steps[1]["target"], json!(helper));
+        assert!(steps[1].get("lane").is_none());
+        let body = steps[1]["children"].as_array().unwrap();
+        assert_eq!(body.len(), 2, "{view}");
+        assert!(body.iter().all(|step| step["lane"] == json!(helper)));
+        assert_eq!(body[0]["target"], json!(inner));
+        assert_eq!(body[0]["callEvidence"]["dispatch"], "direct");
+        assert_eq!(body[1]["callEvidence"]["boundaryReason"], "external");
+        assert_eq!(body[1]["hidden"], true);
+        assert_ne!(body[0]["id"], steps[0]["id"]);
+        assert_eq!(
+            (view["hiddenSteps"].clone(), view["incidentalSteps"].clone()),
+            (json!(2), json!(2))
+        );
+        // Show all: the same steps and evidence, none hidden.
+        let (status, all) = sequence(true).await;
+        assert_eq!(status, 200, "{all}");
+        assert_eq!(
+            (all["hiddenSteps"].clone(), all["incidentalSteps"].clone()),
+            (json!(0), json!(2))
+        );
+        let all_steps = all["steps"].as_array().unwrap();
+        assert_eq!(all_steps[0]["hidden"], false);
+        assert_eq!(all_steps[1]["children"][1]["hidden"], false);
+    }
+}

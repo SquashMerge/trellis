@@ -38,6 +38,20 @@ function sequenceEvidenceLabel(step, view) {
 function sequenceTargetActionLabel(declaration) {
   return ["function", "method"].includes(declaration.kind) ? "Open callee sequence" : "Read declaration source";
 }
+// The evidence tier of a view (#522): the producer whose fresh bindings built its lanes,
+// or why it shows syntax only. Server text, never inferred here.
+function sequenceEvidenceSummary(view) {
+  const semantic = view?.semantic;
+  if (semantic?.tier === "semantic" && typeof semantic.producerId === "string" && semantic.producerId)
+    return `Semantic bindings · ${semantic.producerId}`;
+  return typeof semantic?.reason === "string" && semantic.reason ? `Syntax only · ${semantic.reason}` : "Syntax only";
+}
+// The captured basis of a call's selected binding, as MCP reports it (#522).
+function sequenceBasisLabel(evidence) {
+  const basis = evidence?.semanticBasis;
+  if (!basis || typeof basis.producerId !== "string") return "";
+  return `basis ${basis.producerId}${typeof basis.producerVersion === "string" ? " " + basis.producerVersion : ""}`;
+}
 function sequenceEntry(step) {
   const children = step?.children || [];
   return step?.kind === "group" && !step.alternate?.length && children.length &&
@@ -91,6 +105,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   svg.append(make("title", {}, `${view.seed.name}: measured source steps, not a runtime trace${view.revision?.indexGeneration ? ` · revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}` : ""}`));
   const positions = new Map(participants.map((p, i) => [p.id, 130 + i * 210]));
   const origin = positions.get(view.seed.id) || 130;
+  // Steps of an expanded callee body run on that callee's lane (#522); the seed's own
+  // steps carry no lane.
+  const laneX = step => (step?.lane != null && positions.get(step.lane)) || origin;
   const lines = make("g", {class:"sequence-lifelines"}); svg.append(lines);
   const kindLabels = {externalCandidate:"External type · candidate", unresolvedReceiver:"Receiver · type unresolved", unresolvedCallee:"Callee · unresolved", boundary:"Unknown target", builtin:"Built-in name", import:"Imported binding", receiver:"Receiver hint", internal:"Indexed target", method:"Selected method"};
   const compactKinds = {externalCandidate:"candidate", unresolvedReceiver:"unresolved", unresolvedCallee:"unresolved", boundary:"unknown", builtin:"source hint", import:"source hint", receiver:"source hint", internal:"indexed", method:"selected"};
@@ -269,14 +286,14 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     }
     const target = sequenceTarget(view, evidence);
     if (target && evidence.kind === "call" && positions.has(target.id)) {
-      const end = positions.get(target.id), arrowY = top + extra + 10;
-      const d = end === origin ? `M ${origin} ${arrowY} h 48 v 18 h -48` : `M ${origin} ${arrowY} H ${end}`;
+      const end = positions.get(target.id), arrowY = top + extra + 10, from = laneX(evidence);
+      const d = end === from ? `M ${from} ${arrowY} h 48 v 18 h -48` : `M ${from} ${arrowY} H ${end}`;
       group.append(make("path", {d, class:"sequence-arrow", fill:"none", "data-trellis-call-id":evidence.callId, "data-trellis-target-id":target.id}));
-      const direction = end === origin ? -1 : end > origin ? 1 : -1, headY = arrowY + (end === origin ? 18 : 0);
+      const direction = end === from ? -1 : end > from ? 1 : -1, headY = arrowY + (end === from ? 18 : 0);
       group.append(make("path", {d:`M ${end-direction*7} ${headY-4} L ${end} ${headY} L ${end-direction*7} ${headY+4}`, class:"sequence-arrow", fill:"none"}));
     }
     group.append(control);
-    return extra + (target?.id === view.seed.id ? 20 : 0);
+    return extra + (target && target.id === (evidence.lane ?? view.seed.id) ? 20 : 0);
   }
   function draw(steps, parent, depth) {
     for (const step of steps || []) {
@@ -338,7 +355,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       } else {
         const note = analysisKinds.has(step.kind);
         if (note && !options.showDetails) group.setAttribute("data-presentation", "quiet-note");
-        const labelX = note ? Math.max(30+depth*10, origin-90) : 30+depth*10;
+        const labelX = note ? Math.max(30+depth*10, laneX(step)-90) : 30+depth*10;
         const box = note && options.showDetails ? make("rect", {x:labelX, y:y-15, width:width-labelX-24, height:24, class:"sequence-note"}) : null;
         if (box) group.append(box);
         const extra = sourceControl(group, step, labelX, y); y += extra;
@@ -355,4 +372,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, entry:sequenceEntry, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel};

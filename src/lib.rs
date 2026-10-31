@@ -36,6 +36,7 @@ pub mod model;
 pub mod native_capture;
 pub mod native_evidence;
 pub mod native_ids;
+mod native_rust_macros;
 pub mod navigation;
 mod parallel;
 pub mod producer;

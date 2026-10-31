@@ -2903,6 +2903,7 @@ mod native_index_tests {
                     family(native::MeasurementKind::Invocation, vec![]),
                     family(native::MeasurementKind::Reference, vec![]),
                 ],
+                macro_expansions: vec![],
             }],
             search_cards: vec![],
         };

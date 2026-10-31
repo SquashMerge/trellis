@@ -14,8 +14,46 @@ pub struct SequenceView {
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub semantic_warnings: Vec<crate::graph_query::Warning>,
+    /// Which evidence built the participants and targets, and why syntax was used (#522).
+    #[serde(default)]
+    pub semantic: SequenceSemantic,
     pub hidden_steps: usize,
+    /// Calls bound to standard-library or other external declarations (#522). They are
+    /// hidden (and counted in `hidden_steps`) unless `showAll` is set.
+    #[serde(default)]
+    pub incidental_steps: usize,
     pub truncated: bool,
+}
+/// The evidence tier of a sequence view (#522). `semantic` names the selected producer
+/// whose fresh bindings built the participants; `syntax` carries the reason it fell back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SequenceSemantic {
+    pub tier: EvidenceTier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+impl Default for SequenceSemantic {
+    fn default() -> Self {
+        Self::syntax(None)
+    }
+}
+impl SequenceSemantic {
+    pub fn syntax(reason: Option<String>) -> Self {
+        Self {
+            tier: EvidenceTier::Syntax,
+            producer_id: None,
+            reason,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EvidenceTier {
+    Syntax,
+    Semantic,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +84,10 @@ pub struct SequenceStep {
     pub children: Vec<SequenceStep>,
     pub alternate: Vec<SequenceStep>,
     pub hidden: bool,
+    /// The participant whose body this step belongs to, when it is not the seed's: steps of
+    /// an expanded direct/constructor callee (#522). Absent for the seed's own steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +105,9 @@ pub struct CallEvidence {
     /// for in-context library lookup, never a resolved library declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_package: Option<ExternalPackage>,
+    /// The captured basis of the selected binding's provenance (#522), as MCP reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_basis: Option<crate::semantic_evidence::SemanticBasis>,
 }
 /// The `<manager> <name> <version>` package of a global SCIP symbol.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,12 +225,76 @@ pub fn build_sequence(
     calls: &[CallSite],
     show_all: bool,
 ) -> Result<SequenceView> {
-    match file.language.as_str() {
+    let mut view = match file.language.as_str() {
         "javascript" => crate::behavior_js::build(revision, seed, file, calls, show_all),
         "rust" => crate::behavior_rust::build(revision, seed, file, calls, show_all),
         "java" => crate::behavior_java::build(revision, seed, file, calls, show_all),
         "python" => crate::behavior_python::build(revision, seed, file, calls, show_all),
         _ => bail!("unsupported sequence language: {}", file.language),
+    }?;
+    cap_depth(&mut view);
+    Ok(view)
+}
+
+/// The step levels a view may carry: top-level steps are at depth 0, the deepest at 23.
+pub const MAX_STEP_DEPTH: usize = 24;
+/// The step bound of one view, expanded callee bodies included.
+pub const MAX_STEPS: usize = 200;
+pub(crate) const BOUNDS_WARNING: &str =
+    "Sequence bounds reached (200 steps, 20 participants, depth 24); omitted behavior is unknown.";
+
+/// The deepest nesting below `steps`, counting `steps` themselves as depth 0.
+pub(crate) fn tree_depth(steps: &[SequenceStep]) -> usize {
+    steps
+        .iter()
+        .filter(|step| !step.children.is_empty() || !step.alternate.is_empty())
+        .map(|step| 1 + tree_depth(&step.children).max(tree_depth(&step.alternate)))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Every step in `steps`, nested ones included.
+pub(crate) fn step_count(steps: &[SequenceStep]) -> usize {
+    steps
+        .iter()
+        .map(|step| 1 + step_count(&step.children) + step_count(&step.alternate))
+        .sum()
+}
+
+/// Keeps the step tree within [`MAX_STEP_DEPTH`]: a step at the bound that still nests
+/// becomes one explicit boundary at its own source range, and the view is truncated.
+/// Adapters bound their syntax recursion separately; this bounds the DTO they produce.
+pub(crate) fn cap_depth(view: &mut SequenceView) {
+    fn cap(steps: &mut [SequenceStep], depth: usize) -> bool {
+        let mut capped = false;
+        for step in steps {
+            if step.children.is_empty() && step.alternate.is_empty() {
+                continue;
+            }
+            if depth + 1 == MAX_STEP_DEPTH {
+                step.kind = "boundary".into();
+                step.label = "Depth limit: behavior omitted.".into();
+                step.call_id = None;
+                step.target = None;
+                step.resolution = None;
+                step.call_evidence = None;
+                step.children.clear();
+                step.alternate.clear();
+                capped = true;
+            } else {
+                capped |= cap(&mut step.children, depth + 1);
+                capped |= cap(&mut step.alternate, depth + 1);
+            }
+        }
+        capped
+    }
+    if cap(&mut view.steps, 0) {
+        view.truncated = true;
+        for warning in ["Depth limit: behavior omitted.", BOUNDS_WARNING] {
+            if !view.warnings.iter().any(|w| w == warning) {
+                view.warnings.push(warning.into());
+            }
+        }
     }
 }
 

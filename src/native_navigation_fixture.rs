@@ -19,6 +19,9 @@ pub fn publish(root: &Path, mode: &str) -> Result<Value> {
     let identity = WorkspaceIdentity::discover(Some(root), root)?;
     let store = Store::open(TopologyRoots::production()?, identity)?;
     let mut publisher = Publisher::from_store(store, root);
+    if mode == "sequence-expand" {
+        return expand(&mut publisher);
+    }
     let sequence = mode.starts_with("sequence-");
     let mode = mode.strip_prefix("sequence-").unwrap_or(mode);
     let caller = if sequence {
@@ -78,5 +81,49 @@ pub fn publish(root: &Path, mode: &str) -> Result<Value> {
         "decoy": syntax_id(publisher.native(), "lexical_decoy"),
         "calls": calls_of(publisher.native(), "measured")
             .iter().map(|call| &call.id).collect::<Vec<_>>()
+    }))
+}
+
+/// #522: `measured` calls a standard-library function and the direct internal
+/// `actual_target`, whose own body calls the direct `inner` and another std function.
+fn expand(publisher: &mut Publisher) -> Result<Value> {
+    let files = [
+        (
+            "flow.rs",
+            "fn measured() {\n    std_call();\n    actual_target();\n}\nfn std_call() {}\n",
+        ),
+        (
+            "target.rs",
+            "pub fn actual_target() {\n    inner();\n    std_other();\n}\npub fn inner() {}\npub fn std_other() {}\n",
+        ),
+    ];
+    let mut spec = Spec::new(&files);
+    spec.external_symbol = "rust-analyzer cargo std 1.98.1 vec/Vec#new().".into();
+    let external = |caller: &str, nth| {
+        let mut binding = bind(caller, nth, "std_call");
+        binding.resolution = Resolution::External;
+        binding.dispatch = Dispatch::Unknown;
+        binding
+    };
+    spec.bindings = vec![
+        external("measured", 0),
+        bind("measured", 1, "actual_target"),
+        bind("actual_target", 0, "inner"),
+        external("actual_target", 1),
+    ];
+    let pin = publisher.publish(&spec);
+    let ids = |owner: &str| {
+        calls_of(publisher.native(), owner)
+            .iter()
+            .map(|call| call.id.clone())
+            .collect::<Vec<_>>()
+    };
+    Ok(json!({
+        "revision": pin,
+        "caller": syntax_id(publisher.native(), "measured"),
+        "callee": syntax_id(publisher.native(), "actual_target"),
+        "inner": syntax_id(publisher.native(), "inner"),
+        "calls": ids("measured"),
+        "calleeCalls": ids("actual_target"),
     }))
 }

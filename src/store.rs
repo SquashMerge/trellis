@@ -670,15 +670,17 @@ SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.available AS BLOB))+COALESC
 UNION ALL
 SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.ordinal AS BLOB))+length(CAST(x.start_byte AS BLOB))+length(CAST(x.end_byte AS BLOB))+length(CAST(x.diagnostic AS BLOB)) AS row_bytes FROM native_version_capability_gaps x WHERE x.vid=?1
 UNION ALL
+SELECT ?3+length(CAST(x.ordinal AS BLOB))+length(CAST(x.start_byte AS BLOB))+length(CAST(x.end_byte AS BLOB)) AS row_bytes FROM native_version_macro_expansions x WHERE x.vid=?1
+UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(SELECT length(graph_hash)+9 FROM graph_projections WHERE gid=x.gid)+39+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.qualified_name AS BLOB)),0)+COALESCE(length(CAST(x.path AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM classes x WHERE x.cid=?2
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 31;
+const DATABASE_SCHEMA_VERSION: u32 = 32;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V31: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=31), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V32: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=32), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -738,6 +740,7 @@ CREATE TABLE native_version_parameters(vid INTEGER NOT NULL,syntax_id BLOB NOT N
 CREATE TABLE native_version_references(vid INTEGER NOT NULL,id BLOB NOT NULL,owner_syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,spelling TEXT NOT NULL,lookup_key TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(vid,owner_syntax_id,ordinal),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED) WITHOUT ROWID;
 CREATE TABLE native_version_capability_families(vid INTEGER NOT NULL REFERENCES document_versions(vid) DEFERRABLE INITIALLY DEFERRED,kind TEXT NOT NULL CHECK(kind IN ('declarationName','callee','invocation','reference')),available INTEGER NOT NULL CHECK(available IN (0,1)),diagnostic TEXT,ordinal INTEGER NOT NULL CHECK(ordinal>=0),CHECK((available=1 AND diagnostic IS NULL) OR (available=0 AND length(diagnostic)>0)),PRIMARY KEY(vid,kind),UNIQUE(vid,ordinal));
 CREATE TABLE native_version_capability_gaps(vid INTEGER NOT NULL,kind TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,diagnostic TEXT NOT NULL CHECK(length(diagnostic)>0),CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(vid,kind,ordinal),FOREIGN KEY(vid,kind) REFERENCES native_version_capability_families(vid,kind) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_macro_expansions(vid INTEGER NOT NULL REFERENCES document_versions(vid) DEFERRABLE INITIALLY DEFERRED,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(vid,ordinal));
 CREATE TABLE native_version_calls(vid INTEGER NOT NULL,id BLOB NOT NULL,owner_syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,callee_start INTEGER,callee_end INTEGER,spelling TEXT,language TEXT NOT NULL,callee_lookup_key TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),CHECK((callee_start IS NULL)=(callee_end IS NULL)),CHECK(callee_start IS NULL OR (callee_start>=start_byte AND callee_end<=end_byte AND callee_end>callee_start)),PRIMARY KEY(vid,id),UNIQUE(vid,owner_syntax_id,ordinal),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX native_version_calls_incoming ON native_version_calls(language,callee_lookup_key);
 CREATE TABLE native_version_control_regions(vid INTEGER NOT NULL,id BLOB NOT NULL,owner_syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),kind TEXT NOT NULL,start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,parent_id BLOB,arm TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(vid,id),UNIQUE(vid,owner_syntax_id,ordinal),UNIQUE(vid,id,owner_syntax_id),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(vid,parent_id,owner_syntax_id) REFERENCES native_version_control_regions(vid,id,owner_syntax_id) DEFERRABLE INITIALLY DEFERRED);
@@ -1663,6 +1666,7 @@ impl EvidenceResponse {
         let references = crate::references::project(&snapshot, &[], 5, check)?;
         let evaluated =
             crate::rules::evaluate_with_layers(config, &snapshot, &references, &[], check)?;
+        payload["evidenceTier"] = references.data["evidenceTier"].clone();
         let references_coverage = &references.coverage;
         let rules = evaluated.data;
         let assignments = evaluated.layers;
@@ -1801,7 +1805,7 @@ impl EvidenceResponse {
                         serde_json::json!({
                             "sourceLayer": source, "destinationLayer": destination, "role": role,
                             "status": status, "excepted": excepted, "exceptionReason": reason,
-                            "count": 0, "pairs": []
+                            "count": 0, "semanticSites": 0, "pairs": []
                         })
                     });
                 summary["count"] = serde_json::json!(
@@ -1809,6 +1813,12 @@ impl EvidenceResponse {
                         + pair["count"]
                             .as_u64()
                             .context("store_unavailable: reference count")?
+                );
+                summary["semanticSites"] = serde_json::json!(
+                    summary["semanticSites"].as_u64().unwrap_or(0)
+                        + pair["semanticSites"]
+                            .as_u64()
+                            .context("store_unavailable: reference semantic count")?
                 );
                 summary["pairs"]
                     .as_array_mut()
@@ -1833,14 +1843,43 @@ impl EvidenceResponse {
             row.sites += counted.sites;
             row.mapped += counted.mapped;
             row.unresolved += counted.unresolved;
+            row.semantic += counted.semantic;
+        }
+        let coverage_row = |row: &crate::references::SiteCoverage| {
+            serde_json::json!({
+                "sites": row.sites, "mappedSites": row.mapped, "unresolvedSites": row.unresolved,
+                "semanticSites": row.semantic
+            })
+        };
+        // Each arrow carries its evidence tier and its source layer's coverage: its count is
+        // exact (`complete`) only when no site of that layer and role stayed unresolved (#523).
+        for summary in summaries.values_mut() {
+            check()?;
+            let test = summary["role"] == "test";
+            let row = coverage
+                .get(&(summary["sourceLayer"].as_str(), test))
+                .copied()
+                .unwrap_or_default();
+            let count = summary["count"].as_u64().unwrap_or(0);
+            let semantic = summary["semanticSites"].as_u64().unwrap_or(0);
+            summary["evidenceTier"] = serde_json::json!(match semantic {
+                0 => "syntax",
+                n if n == count => "semantic",
+                _ => "mixed",
+            });
+            let mut covered = coverage_row(&row);
+            covered["complete"] = serde_json::json!(row.unresolved == 0);
+            summary["coverage"] = covered;
         }
         references["coverage"] = serde_json::json!(
             coverage
                 .into_iter()
-                .map(|((layer, test), row)| serde_json::json!({
-                    "layer": layer, "role": if test { "test" } else { "production" },
-                    "sites": row.sites, "mappedSites": row.mapped, "unresolvedSites": row.unresolved
-                }))
+                .map(|((layer, test), row)| {
+                    let mut value = coverage_row(&row);
+                    value["layer"] = serde_json::json!(layer);
+                    value["role"] = serde_json::json!(if test { "test" } else { "production" });
+                    value
+                })
                 .collect::<Vec<_>>()
         );
         drop(assignments);
@@ -2041,6 +2080,7 @@ impl EvidenceResponse {
                     file: fetched.file,
                     declarations: fetched.declarations,
                     calls: fetched.calls,
+                    semantic: Default::default(),
                 });
             }
         }
@@ -2151,6 +2191,7 @@ impl EvidenceResponse {
                 label
             );
         }
+        semantic_display::architecture_semantic(&self.db, &selected.key, &mut documents, check)?;
         check()?;
         Ok(crate::references::Snapshot {
             pin: selected.pin,
@@ -3694,7 +3735,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V31)?;
+    expected.execute_batch(CACHE_SCHEMA_V32)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -3718,7 +3759,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V31).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V32).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -3867,6 +3908,7 @@ fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Res
                 "native_version_call_regions",
                 "native_version_references",
                 "native_version_capability_gaps",
+                "native_version_macro_expansions",
                 "native_version_capability_families",
                 "native_version_calls",
                 "native_version_control_regions",
@@ -5385,6 +5427,7 @@ impl ImmutableAppend {
                     | "native_version_references"
                     | "native_version_capability_families"
                     | "native_version_capability_gaps"
+                    | "native_version_macro_expansions"
                     | "native_version_calls"
                     | "native_version_control_regions"
                     | "native_version_call_regions"
@@ -5427,6 +5470,7 @@ impl ImmutableAppend {
             | "native_version_references"
             | "native_version_capability_families"
             | "native_version_capability_gaps"
+            | "native_version_macro_expansions"
             | "native_version_calls"
             | "native_version_control_regions"
             | "native_version_call_regions" => Some(Self::key(db, values, 0)?),
@@ -5605,6 +5649,7 @@ impl ImmutableAppend {
                     ("native_version_references", "vid"),
                     ("native_version_capability_families", "vid"),
                     ("native_version_capability_gaps", "vid"),
+                    ("native_version_macro_expansions", "vid"),
                     ("native_version_calls", "vid"),
                     ("native_version_control_regions", "vid"),
                     ("native_version_call_regions", "vid"),
@@ -10558,6 +10603,13 @@ fn write_native(
                 )?;
             }
         }
+        for (ordinal, range) in report.macro_expansions.iter().enumerate() {
+            immutable.insert(
+                db,
+                "INSERT INTO native_version_macro_expansions VALUES(?1,?2,?3,?4)",
+                params![vid, ordinal as i64, range.start as i64, range.end as i64],
+            )?;
+        }
     }
     for reference in &a.references {
         check_cancel(cancel)?;
@@ -10696,7 +10748,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V31 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V32 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -10717,6 +10769,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         "native_version_call_regions",
         "native_version_references",
         "native_version_capability_gaps",
+        "native_version_macro_expansions",
         "native_version_capability_families",
         "native_version_calls",
         "native_version_control_regions",
@@ -12684,10 +12737,19 @@ fn read_native_capability_report(
         selected_ensure!(family.available && start >= 0 && end > start && !diagnostic.is_empty(), "invalid native capability gap");
         family.gaps.push(MeasurementGap { range: Range { start: start as usize, end: end as usize }, diagnostic });
     }
+    let mut macro_expansions = vec![];
+    for row in db.prepare("SELECT ordinal,start_byte,end_byte FROM native_version_macro_expansions WHERE vid=?1 ORDER BY ordinal")?
+        .query_map([scope.vid], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))? {
+        let (ordinal, start, end) = row?;
+        contiguous(ordinal, macro_expansions.len(), "macro expansion")?;
+        selected_ensure!(start >= 0 && end > start, "invalid native macro expansion");
+        macro_expansions.push(Range { start: start as usize, end: end as usize });
+    }
     Ok(CapabilityReport {
         document: scope.key.clone(),
         revision_id: scope.native_revision_id.clone(),
         families,
+        macro_expansions,
     })
 }
 
@@ -13351,7 +13413,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V31)?;
+                db.execute_batch(CACHE_SCHEMA_V32)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -18540,7 +18602,7 @@ impl Store {
                 // An incompatible/corrupt generation is explicitly replaced, never served.
                 // Only compatible same-generation publication appends history.
                 tx.execute_batch("DELETE FROM semantic_reference_roles; DELETE FROM semantic_reference_candidates; DELETE FROM semantic_symbol_targets; DELETE FROM semantic_declaration_binding_symbols; DELETE FROM semantic_declaration_join_candidates; DELETE FROM semantic_call_candidates; DELETE FROM semantic_call_possible_dispatch; DELETE FROM semantic_call_join_candidates; DELETE FROM semantic_type_relationships; DELETE FROM semantic_references; DELETE FROM semantic_symbols; DELETE FROM semantic_declaration_bindings; DELETE FROM semantic_call_bindings; DELETE FROM semantic_provenance; DELETE FROM semantic_revision_raw_selections; DELETE FROM semantic_raw_proofs; DELETE FROM semantic_raw_captures; DELETE FROM semantic_raw_exclusions; DELETE FROM semantic_raw_batches; DELETE FROM semantic_import_reports; DELETE FROM semantic_basis_lookup_dependencies; DELETE FROM semantic_basis; DELETE FROM semantic_coverage_roles; DELETE FROM semantic_coverage; DELETE FROM semantic_requested_producer_languages; DELETE FROM semantic_requested_producers; DELETE FROM semantic_revision_producers; DELETE FROM semantic_producer_languages; DELETE FROM semantic_producers; DELETE FROM revision_documents; DELETE FROM revision_capture_inputs;
-                DELETE FROM native_version_references; DELETE FROM native_version_capability_gaps;
+                DELETE FROM native_version_references; DELETE FROM native_version_capability_gaps; DELETE FROM native_version_macro_expansions;
                 DELETE FROM native_version_capability_families;
                 DELETE FROM native_version_call_regions; DELETE FROM native_version_calls;
                 DELETE FROM native_version_control_regions; DELETE FROM native_version_own_signature_types;
@@ -20094,6 +20156,7 @@ impl Store {
             "native_version_call_regions",
             "native_version_references",
             "native_version_capability_gaps",
+            "native_version_macro_expansions",
             "native_version_capability_families",
             "native_version_calls",
             "native_version_control_regions",
@@ -20307,11 +20370,12 @@ impl Store {
             (SELECT count(*) FROM native_version_call_regions WHERE vid=?3),
             (SELECT count(*) FROM native_version_references WHERE vid=?3),
             (SELECT count(*) FROM native_version_capability_families WHERE vid=?3),
-            (SELECT count(*) FROM native_version_capability_gaps WHERE vid=?3)";
+            (SELECT count(*) FROM native_version_capability_gaps WHERE vid=?3),
+            (SELECT count(*) FROM native_version_macro_expansions WHERE vid=?3)";
         let counts: Vec<i64> =
             db.prepare_cached(counts_sql)?
                 .query_row(params![gid, cid, vid], |r| {
-                    (0..18)
+                    (0..19)
                         .map(|i| r.get(i))
                         .collect::<rusqlite::Result<Vec<_>>>()
                 })?;
@@ -22137,7 +22201,7 @@ impl Store {
         calls.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
         let file = document.file;
         let mut view = crate::behavior::build_sequence(revision, symbol, &file, &calls, show_all)?;
-        graph_read::sequence_calls(self, tx, &selected_revision, &mut view)?;
+        graph_read::sequence_calls(self, tx, &selected_revision, &mut view, show_all)?;
         Ok(Some(view))
     }
 
@@ -22306,7 +22370,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V31).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V32).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -22442,7 +22506,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V31).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V32).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];

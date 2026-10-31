@@ -9,6 +9,10 @@ use tree_sitter::Node;
 const MAX_STEPS: usize = 200;
 const MAX_PARTICIPANTS: usize = 20;
 const MAX_DEPTH: usize = 24;
+/// Bounds the recursion over nested Rust syntax. The step tree it produces is bounded to
+/// `MAX_DEPTH` levels separately by `behavior::cap_depth` (#522): counting syntax levels
+/// against 24 dropped the main loop of a long function long before its steps nested.
+const MAX_AST_DEPTH: usize = 96;
 fn bounded(s: &str) -> String {
     let mut out: String = s.chars().take(180).collect();
     if s.chars().count() > 180 {
@@ -88,6 +92,7 @@ impl Builder<'_> {
             children: vec![],
             alternate: vec![],
             hidden: false,
+            lane: None,
         })
     }
     fn boundary(&mut self, n: Node<'_>, message: &str) -> Flow {
@@ -121,7 +126,7 @@ impl Builder<'_> {
             }
             if f.exits && i + 1 < nodes.len() {
                 // Do not draw the suffix after a return/throw alternative as unconditional.
-                if depth >= MAX_DEPTH {
+                if depth >= MAX_AST_DEPTH {
                     self.limit();
                     break;
                 }
@@ -180,7 +185,7 @@ impl Builder<'_> {
             self.limit();
             return Flow::empty();
         }
-        if depth > MAX_DEPTH {
+        if depth > MAX_AST_DEPTH {
             self.limit();
             return self.unknown(n, "Depth limit: behavior omitted.");
         }
@@ -416,6 +421,13 @@ impl Builder<'_> {
                 n.kind()
             ),
         ) {
+            // Reserve the body guard before the body: a body that reaches the step bound
+            // keeps its first steps instead of losing them all to a missing guard (#522).
+            let guard = self.step(
+                n,
+                "branch",
+                "body only if condition is true / next item exists (loop: each iteration)",
+            );
             let cond = self.field(n, "condition", depth);
             let body = self.field(n, "body", depth);
             // `loop` always enters its body. An unconditional return cannot reach
@@ -429,11 +441,7 @@ impl Builder<'_> {
             if n.kind() == "loop_expression" && !body.continues && !has_boundary(&body.steps) {
                 f.continues = false;
             }
-            if let Some(mut g) = self.step(
-                n,
-                "branch",
-                "body only if condition is true / next item exists (loop: each iteration)",
-            ) {
+            if let Some(mut g) = guard {
                 g.children = body.steps;
                 s.children = self
                     .then(
@@ -720,7 +728,7 @@ pub fn build(
             None => break,
         }
     }
-    let mut b = Builder { file, seed, calls, count: 0, view: SequenceView { semantic_warnings: vec![],
+    let mut b = Builder { file, seed, calls, count: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
         revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Rust types, traits, dispatch, cfg/attributes, implicit drops, coercions and iterator protocols are not resolved. Async bodies describe possible execution when polled, not future construction. Calls may panic or diverge; those implicit paths are not expanded.".into()], hidden_steps: 0, truncated: false,
     }};

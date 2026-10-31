@@ -10977,7 +10977,7 @@ async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_i
     assert_eq!(data["unresolved"][0]["source"], modules[0]["identity"]);
     assert_eq!(
         data["counts"],
-        json!({"scannedDocuments":1,"mappedSites":2,"unresolvedSites":1})
+        json!({"scannedDocuments":1,"mappedSites":2,"unresolvedSites":1,"semanticSites":0})
     );
     assert_eq!(envelope["truncated"], false);
     let empty = ask(
@@ -10991,7 +10991,7 @@ async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_i
     }
     assert_eq!(
         empty_data["counts"],
-        json!({"scannedDocuments":0,"mappedSites":0,"unresolvedSites":0})
+        json!({"scannedDocuments":0,"mappedSites":0,"unresolvedSites":0,"semanticSites":0})
     );
     assert_eq!(empty_data["semanticComplete"], false);
     let isolated = ask(

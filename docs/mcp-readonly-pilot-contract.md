@@ -430,18 +430,23 @@ native measured syntax provenance or library member/API resolution. Browser sour
 and metric joins use genuine native modules only. These DTOs add no fabricated
 snapshot or semantic relationship proof. Code comes only
 from captured bytes/native rows in that admitted snapshot. Structural mapping is
-syntax, not compiler resolution; `semanticComplete:false` is invariant. Stored
+syntax, not compiler resolution; `semanticComplete:false` is invariant. Where a
+language has a selected producer (#483), fresh call and type bindings also map
+sites, each marked `mapping:"semantic"` with its binding's provenance, and each edge
+reports its `evidenceTier` and `semanticSites` (#523; see
+[rules](rules.md#semantic-bindings-523)). Stored
 Decision 0011 roles separate production and tests: feature-only `test-support`
-remains production. Current call/type constraints are unknown-only, never invented
-positive bindings. Peer/shared-outbound policy must be explicit reviewed rules,
-not inferred defaults.
+remains production. Call/type constraints use only fresh selected bindings and stay
+unknown without them, never invented positive bindings. Peer/shared-outbound policy
+must be explicit reviewed rules, not inferred defaults.
 
 The three tools retain the resolved envelope/selection/admission failure forms,
 `structuredContent` and deterministic at-most-512-byte summary. References counts
 both emitted production and test edges, using `edges`/`edge`; check/explain counts
 production `instances`/`instance`. New successful results always have
-`partial:true,truncated:false,truncationReason:null` and `syntaxOnly` with null
-provenance. Bounded site samples retain exact counts/omissions in the payload;
+`partial:true,truncated:false,truncationReason:null`. They warn `syntaxOnly` with null
+provenance unless the payload's `evidenceTier` is `mixed` (references with semantic
+sites, #523). Bounded site samples retain exact counts/omissions in the payload;
 this is not top-level verdict truncation or proof of semantic completeness.
 
 Only these new output schemas add nonretryable codes `invalid_rules`,

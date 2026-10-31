@@ -25,6 +25,7 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/model.rs",
     "src/native_evidence.rs",
     "src/native_ids.rs",
+    "src/native_rust_macros.rs",
     "src/parallel.rs",
     "src/search_card.rs",
     "src/search_capture.rs",
