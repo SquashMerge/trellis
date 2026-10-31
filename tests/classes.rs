@@ -1777,3 +1777,93 @@ fn rust_type_parameter_limits_are_enforced_and_reported() {
         "the over-limit method's return type is omitted"
     );
 }
+#[test]
+fn rust_method_type_parameter_text_is_detail_text_not_registry_text() {
+    use trellis::{
+        classes::Limits,
+        model::{DetailValue, FileExtraction},
+    };
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let extract = |source: &str| {
+        let (g, _) = index(&[("src/lib.rs", source)]);
+        let file = g
+            .files
+            .iter()
+            .find(|f| f.path == "src/lib.rs")
+            .unwrap()
+            .clone();
+        let f = FileExtraction::extract_file(&file, &g.nodes, &cancel, Limits::default()).unwrap();
+        (g, f)
+    };
+    for (long, short, owner) in [
+        (
+            "pub struct Host;\nimpl Host {\n    fn generic<Alpha, Beta>(&self) {}\n}\npub struct Later;\n",
+            "pub struct Host;\nimpl Host {\n    fn generic<A, B>(&self) {}\n}\npub struct Later;\n",
+            "Host",
+        ),
+        (
+            "pub trait Show {\n    fn show<Alpha, Beta>(&self);\n}\npub struct Later;\n",
+            "pub trait Show {\n    fn show<A, B>(&self);\n}\npub struct Later;\n",
+            "Show",
+        ),
+    ] {
+        let (g, f) = extract(long);
+        let (_, short_f) = extract(short);
+        assert_eq!(
+            f.registry_bytes, short_f.registry_bytes,
+            "{owner}: method parameter names are not registry text"
+        );
+        let scope: Vec<usize> = f
+            .items
+            .iter()
+            .map(|i| (&i.value, i.text, i.records))
+            .chain(f.impls.iter().map(|i| (&i.value, i.text, i.records)))
+            .filter(|(v, _, _)| matches!(v, DetailValue::ScopeText))
+            .map(|(_, text, records)| {
+                assert_eq!(records, 0);
+                text
+            })
+            .collect();
+        assert_eq!(scope, ["Alpha".len() + "Beta".len()], "{owner}");
+        let total: usize = f
+            .items
+            .iter()
+            .map(|i| i.text)
+            .chain(f.impls.iter().map(|i| i.text))
+            .sum();
+        let build = |output_text| {
+            Catalog::build_with_limits(
+                &g.files,
+                &g.nodes,
+                &cancel,
+                Limits {
+                    output_text,
+                    ..Limits::default()
+                },
+            )
+            .unwrap()
+        };
+        let fits = build(total);
+        assert!(!fits.truncated, "{owner}: {:?}", fits.warnings);
+        assert!(!class(&fits, owner).truncated);
+        // One byte short: the scope text (charged last) closes detail output.
+        let cut = build(total - 1);
+        assert!(cut.truncated);
+        assert!(
+            cut.warnings
+                .iter()
+                .any(|w| w.starts_with("Class detail text limit reached"))
+        );
+        let boxed = class(&cut, owner);
+        assert!(boxed.truncated, "{owner}");
+        assert_eq!(
+            boxed.methods.len(),
+            1,
+            "the method member was admitted first"
+        );
+        assert!(
+            cut.classes.iter().any(|k| k.qualified_name == "Later"),
+            "declarations remain"
+        );
+    }
+}

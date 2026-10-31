@@ -214,11 +214,16 @@ impl Extractor<'_, '_> {
     /// when a parameter list or the resulting scope exceeds the Decision 0004
     /// type-parameter limits (`members` per declaration and per scope); the
     /// caller reports that and omits what depends on the scope.
+    ///
+    /// Decision 0004 text accounting: a declaration's (type, trait, impl)
+    /// parameter text is registry text; a method's own parameter text (`detail`)
+    /// is a zero-record detail item of the method's class or impl contribution.
     fn type_params(
         &mut self,
         n: Node<'_>,
         scope: &BTreeSet<String>,
         depth: usize,
+        detail: Option<&Owner>,
     ) -> Result<Option<BTreeSet<String>>> {
         let limit = self.b.limits.members;
         let Some(params) = n.child_by_field_name("type_parameters") else {
@@ -239,8 +244,29 @@ impl Extractor<'_, '_> {
         if self.exhausted || inherited.saturating_add(own.len()) > limit {
             return Ok(None);
         }
-        self.b
-            .reserve_text(own.iter().map(String::len).sum::<usize>() * 2);
+        let text = own.iter().map(String::len).sum::<usize>();
+        match detail {
+            None => {
+                self.b.reserve_text(text * 2);
+            }
+            Some(owner) => {
+                self.b.reserve_detail_text(text);
+                match owner {
+                    Owner::Class(index) => self.b.items.push(DetailItem {
+                        class_index: *index,
+                        records: 0,
+                        text,
+                        value: DetailValue::ScopeText,
+                    }),
+                    Owner::Impl(target) => self.b.impls.push(ImplItem {
+                        target: target.clone(),
+                        records: 0,
+                        text,
+                        value: DetailValue::ScopeText,
+                    }),
+                }
+            }
+        }
         let mut all = scope.clone();
         all.extend(own);
         Ok(Some(all))
@@ -525,7 +551,8 @@ impl Extractor<'_, '_> {
                 .registry_limit("Class qualified name exceeds 2048 bytes");
             return Ok(());
         }
-        let Some(blocked) = self.type_params(n, &BTreeSet::from(["Self".to_owned()]), depth + 1)?
+        let Some(blocked) =
+            self.type_params(n, &BTreeSet::from(["Self".to_owned()]), depth + 1, None)?
         else {
             self.b.registry_limit(&format!(
                 "Class type parameter limit reached ({}/declaration)",
@@ -660,7 +687,8 @@ impl Extractor<'_, '_> {
         if n.children(&mut cursor).any(|c| c.kind() == "!") {
             return Ok(()); // A negative impl declares nothing.
         }
-        let Some(blocked) = self.type_params(n, &BTreeSet::from(["Self".to_owned()]), depth + 1)?
+        let Some(blocked) =
+            self.type_params(n, &BTreeSet::from(["Self".to_owned()]), depth + 1, None)?
         else {
             // The impl cannot be attributed without its parameter scope.
             self.b.registry_limit(&format!(
@@ -731,7 +759,7 @@ impl Extractor<'_, '_> {
             .map(|s| s.id);
         let hint = ret.map(|r| self.text(r).to_owned());
         self.rust_member(owner, n, self.text(name).to_owned(), hint, symbol, true)?;
-        let Some(blocked) = self.type_params(n, outer, depth + 1)? else {
+        let Some(blocked) = self.type_params(n, outer, depth + 1, Some(owner))? else {
             match owner {
                 Owner::Class(index) => self.b.catalog.classes[*index].truncated = true,
                 // Composition marks the target class truncated.
@@ -739,7 +767,7 @@ impl Extractor<'_, '_> {
                     target: target.clone(),
                     records: 0,
                     text: 0,
-                    value: DetailValue::ScopeText,
+                    value: DetailValue::Truncated,
                 }),
             }
             self.b.limit(&format!(

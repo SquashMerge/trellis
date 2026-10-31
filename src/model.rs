@@ -160,6 +160,9 @@ pub enum DetailValue {
     Method(ClassMember),
     Relation(ClassRelation),
     ScopeText,
+    /// A Rust impl contribution that was omitted by a per-file limit: its
+    /// target class is truncated when composition attaches it (#452).
+    Truncated,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DetailItem {

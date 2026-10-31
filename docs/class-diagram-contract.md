@@ -49,7 +49,7 @@ module of the same file. Unbound names, other globs, re-exports, aliases and ext
 resolution steps are capped per file (10,000), so glob graphs cannot blow up; a self type that is a generic parameter, a reference, tuple or trait object is a blanket/non-path impl
 and adds the per-file notice `"{path}: blanket or non-path impl not attributed to a class"`. Negative
 impls declare nothing; macro-generated items and derived impls are not attributed. `F` therefore still
-depends only on its own file, and impl items charge the same per-file and detail budgets.
+depends only on its own file, and impl items charge the same per-file and detail budgets. Type, trait and impl parameter names are registry text; a method's own parameter names are a zero-record `ScopeText` detail item of its class or impl contribution, as for Java/Python. An impl item omitted by a per-file limit is a `Truncated` marker that truncates its target class.
 
 Composition (the global step) charges a file's impl items after that file's own class items, in source
 order, under the Decision 0004 detail rules; a refused item marks its target class `truncated`. It then attaches each admitted item to the one admitted Rust class whose qualified name equals

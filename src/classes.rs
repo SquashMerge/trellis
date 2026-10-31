@@ -315,6 +315,7 @@ impl CatalogComposer {
                     DetailValue::Method(value) => c.methods.push(value.clone()),
                     DetailValue::Relation(value) => self.result.relations.push(value.clone()),
                     DetailValue::ScopeText => (),
+                    DetailValue::Truncated => c.truncated = true,
                 }
             }
             self.result.classes.push(c);
@@ -326,7 +327,7 @@ impl CatalogComposer {
             } else {
                 // Decision 0004: a class that loses an item is truncated.
                 self.merged
-                    .push((item.target.clone(), DetailValue::ScopeText));
+                    .push((item.target.clone(), DetailValue::Truncated));
             }
         }
         true
@@ -429,7 +430,10 @@ fn attach_impls(result: &mut Catalog, merged: Vec<(String, DetailValue)>, member
                 result.relations.push(relation);
             }
             // A contribution refused by a detail cap.
-            DetailValue::ScopeText => class.truncated = true,
+            // Charged detail text without a member (method type parameters).
+            DetailValue::ScopeText => {}
+            // Omitted by a per-file limit, or refused by a detail cap.
+            DetailValue::Truncated => class.truncated = true,
             DetailValue::Field(_) => {}
         }
     }
@@ -545,6 +549,7 @@ pub(crate) fn complete_file_catalog(extraction: &FileExtraction) -> Catalog {
                 DetailValue::Method(value) => class.methods.push(value.clone()),
                 DetailValue::Relation(value) => result.relations.push(value.clone()),
                 DetailValue::ScopeText => (),
+                DetailValue::Truncated => class.truncated = true,
             }
         }
         result.classes.push(class);
