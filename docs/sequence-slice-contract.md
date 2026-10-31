@@ -97,9 +97,10 @@ Owner ruling 2026-10-31 (#536, on #531): hidden incidental steps do not consume 
   admitted, and is expanded only if its shown steps fit in what is left.
 - **Work bound: 2000 steps, hidden ones included.** It bounds computation, so hostile
   input stays bounded however many of its steps are hidden. A language adapter builds at
-  most 2000 steps of one body, and a callee body is not expanded when the steps built for
-  the view, its own included, would exceed 2000. Depth 24 and 20 participants are
-  unchanged.
+  most 2000 steps of one body, and a callee body is not expanded when the steps the view
+  keeps (the seed's, after its visible cut, and every admitted body), its own included,
+  would exceed 2000. Each target's body is built at most once, so a refused body costs no
+  more than one build. Depth 24 and 20 participants are unchanged.
 - **Show all respects the visible bound.** With `showAll` nothing is incidental-hidden, so
   every step counts: the seed stops at its 200th step and a callee body that does not fit
   is not expanded, exactly as above.

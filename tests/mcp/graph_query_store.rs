@@ -893,6 +893,55 @@ fn sequence_show_all_truncates_at_the_visible_bound() {
     assert_eq!(json["truncatedBy"], serde_json::json!(["visibleSteps"]));
 }
 
+/// #536: a callee body is hidden before it is admitted, so a body of 250 incidental calls
+/// expands; with Show all those calls are shown, so the same body does not fit and is
+/// refused with the typed `visibleSteps` reason.
+#[test]
+fn sequence_callee_incidental_steps_use_no_visible_room() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let std: String = (0..250).map(|n| format!("x{n}(); ")).collect();
+    let source = format!("fn a() {{ big(); }}\nfn big() {{ {std}leaf(); }}\nfn leaf() {{}}\n");
+    let mut spec = Spec::new(&[("a.rs", &source)]);
+    spec.bindings = (0..250).map(|nth| bind_external("big", nth)).collect();
+    spec.bindings.push(bind("big", 250, "leaf"));
+    spec.bindings.push(bind("a", 0, "big"));
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let leaf = syntax_id(publisher.native(), "leaf");
+
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    assert!(!view.truncated, "{:?}", view.warnings);
+    assert_eq!(counts(&view.steps), (252, 2));
+    assert_eq!(view.steps[0].children.len(), 251);
+    assert_eq!(
+        view.steps[0].children[250].target.as_deref(),
+        Some(leaf.as_str())
+    );
+    assert_eq!((view.incidental_steps, view.hidden_steps), (250, 250));
+
+    let all = publisher
+        .store
+        .sequence_at(&seed, pin, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts(&all.steps), (1, 1));
+    assert!(all.steps[0].children.is_empty());
+    assert_eq!(
+        all.truncated_by,
+        [trellis::behavior::SequenceLimit::VisibleSteps]
+    );
+    assert!(
+        all.warnings
+            .iter()
+            .any(|w| w == "Sequence step limit reached; the body of big is not expanded.")
+    );
+}
+
 /// #536: hidden steps use no visible room but still count toward the hard work bound, so
 /// hostile input stays bounded: a seed is built to at most 2000 steps, and a callee body
 /// that would take the view past them is not expanded.
