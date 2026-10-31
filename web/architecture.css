@@ -2,7 +2,7 @@
 #architecture-panel { display: flex; flex-direction: column; overflow: hidden; }
 .architecture-controls { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 8px; padding: 4px 18px 8px; font-size: 12px; }
 .architecture-controls select { max-width: 100%; }
-.architecture-basis, #architecture-state, .architecture-edge-legend, .architecture-display-note { flex: none; margin: 4px 18px 8px; font-size: 12px; color: var(--secondary); }
+.architecture-basis, #architecture-state, .architecture-edge-legend { flex: none; margin: 4px 18px 8px; font-size: 12px; color: var(--secondary); }
 #architecture-state[data-state="error"], #architecture-state[data-state="stale"] { color: var(--error); }
 #architecture-legend { flex: none; padding: 0 18px 8px; font-size: 12px; }
 #architecture-diagram { flex: 1; min-height: 120px; min-width: 0; overflow: auto; overscroll-behavior: contain; padding: 12px; }
@@ -45,7 +45,6 @@
 #architecture-confirm { min-height: 44px; background: var(--primary); color: var(--sm-ink); }
 #architecture-preview-result pre { max-height: 30vh; overflow: auto; font-size: 12px; }
 
-.architecture-display-note:empty { display: none; }
 .architecture-display-footer { display: flex; flex: none; align-items: baseline; gap: 10px; padding: 4px 18px; font-size: 12px; min-width: 0; }
 .architecture-display-footer[hidden] { display: none; }
 .architecture-display-footer button { flex: none; font-size: 12px; }
@@ -58,3 +57,22 @@
 #architecture-legend p { margin: 0; }
 .architecture-display-footers { display: flex; flex: none; flex-wrap: wrap; min-width: 0; }
 .architecture-display-footers > div { flex: 1 1 auto; max-width: 100%; }
+
+/* Compact arrow key and measured coverage under the canvas (#449). */
+.architecture-edge-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; }
+.architecture-key { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.architecture-key b { color: var(--ink); font-weight: 600; }
+.architecture-key[data-tone="error"] b { color: var(--error); }
+.architecture-key[data-tone="dim"] { opacity: 0.75; }
+.architecture-key-line { display: inline-block; width: 18px; border-top: 2px solid var(--secondary); }
+.architecture-key-line[data-dash="true"] { border-top-style: dashed; }
+.architecture-coverage { flex-basis: 100%; color: var(--secondary); }
+.architecture-coverage:empty { display: none; }
+
+/* Counted review chips at the head of every Architecture inspection (#449). */
+.architecture-review-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+#architecture-inspector-content .architecture-chip { min-height: 30px; padding: 3px 10px; border-radius: 999px; font: 12px/1.4 var(--mono); }
+.architecture-chip[data-tone="error"] { border-color: var(--error); color: var(--error); }
+#architecture-diagram .pele-edges path { pointer-events: none; }
+/* Summary chips are display only: a click falls through to their band header toggle. */
+#architecture-diagram [data-trellis-summary-chip] { pointer-events: none; }

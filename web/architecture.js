@@ -81,7 +81,7 @@
       get("architecture-diagram").replaceChildren(); get("architecture-diagram").setAttribute("aria-busy", "false");
       get("architecture-legend").replaceChildren(); get("architecture-notice-content").replaceChildren();
       get("architecture-notices").open = false;
-      get("architecture-quiet").hidden = true; get("architecture-hidden").hidden = true; get("architecture-focus-state").textContent = "";
+      get("architecture-hidden").hidden = true; get("architecture-coverage").textContent = ""; get("architecture-exclusions").textContent = "";
       state(message, "empty");
     }
     function payloadOf(data, c) {
@@ -154,8 +154,11 @@
           }
         } catch (error) {
           if (!active() || error.name === "AbortError") return;
-          footer.replaceChildren(make("p", error.code === "rules_conflict" ? "Rules changed since this diagram was loaded. Refresh Architecture." :
-            error.message || "Details unavailable. Refresh Architecture.", "detail"));
+          // The view re-reads on a new revision; a rules edit on disk needs this explicit reload.
+          footer.replaceChildren(make("p", error.code === "rules_conflict" ? "Rules changed since this diagram was loaded." :
+            error.message || "Details unavailable.", "detail"));
+          const reload = make("button", "Reload Architecture"); reload.type = "button";
+          reload.addEventListener("click", () => { if (!editBusy) return refresh(); }); footer.append(reload);
           if (error.status === 409 && ["revision_conflict", "pin_expired", "root_changed"].includes(error.code)) onConflict();
         }
       }
@@ -175,7 +178,7 @@
       const max = values.length ? String(values.reduce((most, value) => Math.max(most, value), -Infinity)) : "—";
       // The narrow shared box stacks its header; ordered bands keep one line.
       const parts = [`${layer.shared ? "Shared" : layer.order} · ${layer.name}`, `${plural(modules.length, "file")}${packages.length ? ` · ${packages.length} external packages` : ""}`];
-      if (metric !== "layer") parts.push(`max ${metric} (${aggregate}) ${max}`);
+      if (metric !== "layer") parts.push(`max ${max}`);
       return parts.join(layer.shared ? "\n" : " · ");
     }
     // Outgoing production reference sites by verdict: the same summary edges the arrows draw.
@@ -195,9 +198,9 @@
     }
     // Only non-zero counts become chips; deviations carry the error tone and a glyph.
     function layerStats(layer) {
-      const counts = layerCounts(layer);
+      const counts = layerCounts(layer), bound = lowerBound(layer.name, "production") ? "≥" : "";
       return STATS.filter(([key]) => counts[key] > 0).map(([key, glyph, words, error]) =>
-        ({key, count:counts[key], text:`${glyph}${counts[key]}`, label:`${counts[key]} outgoing production reference sites · ${words}`, tone:error ? "error" : "neutral"}));
+        ({key, count:counts[key], text:`${glyph}${bound}${counts[key]}`, label:`${bound ? "at least " : ""}${counts[key]} outgoing production reference sites · ${words}`, tone:error ? "error" : "neutral"}));
     }
     // Summary-first display (#391): presentation state only, remembered per checkout.
     let shown = null, shownRoot = null;
@@ -206,19 +209,18 @@
     const storageKey = rootKey => `trellis.architecture.display.v1:${rootKey}`;
     function loadDisplay(rootKey) {
       if (shown && rootKey === shownRoot) return;
-      shownRoot = rootKey; shown = {open:new Map(), drilled:new Set(), unassigned:false, quiet:false, hidden:false, deviationsOnly:null};
+      shownRoot = rootKey; shown = {open:new Map(), drilled:new Set(), unassigned:false, hidden:false};
       try {
         const saved = JSON.parse(window.localStorage.getItem(storageKey(rootKey)) || "null");
         if (saved && typeof saved === "object") shown = {
           open:new Map((Array.isArray(saved.open) ? saved.open : []).filter(pair => Array.isArray(pair) && typeof pair[0] === "string" && typeof pair[1] === "boolean")),
-          drilled:new Set(strings(saved.drilled)), unassigned:saved.unassigned === true, quiet:saved.quiet === true, hidden:saved.hidden === true,
-          deviationsOnly:typeof saved.deviationsOnly === "boolean" ? saved.deviationsOnly : null};
+          drilled:new Set(strings(saved.drilled)), unassigned:saved.unassigned === true, hidden:saved.hidden === true};
       } catch { /* Browser storage is a convenience; the defaults stay usable. */ }
     }
     function saveDisplay() {
       try {
         window.localStorage.setItem(storageKey(shownRoot), JSON.stringify({open:[...shown.open], drilled:[...shown.drilled],
-          unassigned:shown.unassigned, quiet:shown.quiet, hidden:shown.hidden, deviationsOnly:shown.deviationsOnly}));
+          unassigned:shown.unassigned, hidden:shown.hidden}));
       } catch { /* Not remembered; the current page still applies it. */ }
     }
     // Authored rules.toml presentation hint (#391 ruling); absent leaves the choice to the browser.
@@ -233,25 +235,36 @@
       const empty = module => !module.excludedReason && module.roleCounts?.production === 0 && module.roleCounts?.test === 0;
       return members.some(test) && members.every(module => test(module) || empty(module));
     }
+    // Deviations are highlighted and allowed references dimmed; no layer is dropped for it (#449).
     const flagged = edge => (edge.status === "deviates" && !edge.excepted) || edge.status === "unknown";
+    const edgeTone = edge => edge.role === "test" ? "neutral" : edge.status === "unknown" ? "unknown" : flagged(edge) ? "deviation" : "allowed";
+    // Exact mapped-site coverage of one source layer and role, from the summary (#449).
+    function coverageOf(layerName, siteRole) {
+      return (view?.references?.coverage || []).find(row => row.layer === layerName && row.role === siteRole) || null;
+    }
+    const percent = (part, whole) => {
+      if (!whole) return "—";
+      const value = part / whole * 100;
+      return part > 0 && value < 1 ? "<1%" : part < whole && value > 99 ? ">99%" : `${Math.round(value)}%`;
+    };
+    // A count is a lower bound when any site of its source layer and role stayed unresolved.
+    const lowerBound = (layerName, siteRole) => (coverageOf(layerName, siteRole)?.unresolvedSites ?? 1) > 0;
+    function edgeText(edge) {
+      const covered = coverageOf(edge.sourceLayer, edge.role), bound = lowerBound(edge.sourceLayer, edge.role);
+      if (!covered) return {bound};
+      const share = percent(covered.mappedSites, covered.sites);
+      const label = `${bound ? "lower bound; " : ""}${share} of ${covered.sites} ${edge.role} reference sites from ${edge.sourceLayer} mapped to a module`;
+      return {bound, label, note:bound && ["deviation", "unknown"].includes(edgeTone(edge)) ? `${share} mapped` : ""};
+    }
     function summary(payload) {
-      const production = payload.edges.filter(edge => edge.role === "production"), focusEdges = production.filter(flagged);
-      const active = new Set(production.flatMap(edge => [edge.sourceLayer, edge.destinationLayer]));
-      const focusLayers = new Set(focusEdges.flatMap(edge => [edge.sourceLayer, edge.destinationLayer]));
-      const involved = new Set(focusEdges.flatMap(edge => edge.pairs || []).flatMap(pair => [pair.source, pair.target])
-        .filter(identity => identity && !external(identity)).map(moduleKey));
-      const deviates = production.some(edge => edge.status === "deviates" && !edge.excepted);
-      const focus = focusEdges.length > 0 && (shown.deviationsOnly ?? deviates);
+      const production = payload.edges.filter(edge => edge.role === "production");
       // Unhinted test and fixture layers join the hidden footer until tests and fixtures are included;
-      // an authored display hint always wins.
+      // an authored display hint always wins. Every other layer is drawn: the full stack (#449).
       const tests = new Set(role === "production" ? payload.layers.filter(layer => hint(layer) === null && testLayer(layer, payload.modules)).map(layer => layer.name) : []);
       const hidden = payload.layers.filter(layer => hint(layer) === "hidden" || tests.has(layer.name));
-      // Automatic quiet collapse applies only to layers without an authored display hint.
-      const quiet = payload.layers.filter(layer => hint(layer) === null && !hidden.includes(layer) && !active.has(layer.name));
-      const layers = new Set(payload.layers.filter(layer => hidden.includes(layer) ? shown.hidden : quiet.includes(layer) ? shown.quiet :
-        !focus || focusLayers.has(layer.name)).map(layer => layer.name));
+      const layers = new Set(payload.layers.filter(layer => !hidden.includes(layer) || shown.hidden).map(layer => layer.name));
       const hiddenEdges = production.filter(edge => hidden.some(layer => layer.name === edge.sourceLayer || layer.name === edge.destinationLayer)).length;
-      return {focusEdges, focus, quiet, hidden, tests, hiddenEdges, layers, involved};
+      return {hidden, tests, hiddenEdges, layers};
     }
     function worst(modules) {
       if (metric === "layer") return undefined;
@@ -293,34 +306,45 @@
       return [...kept, {type:"note", layerKey, label:`${plural(omitted, "file")} not drawn · diagram size cap\nselect to list ${layerKey === null ? "unassigned" : "this layer's"} files`,
         shown:`${plural(omitted, "file")}\nnot drawn (cap)`}];
     }
-    function entries(layerKey, modules, layout, scale, budget) {
-      const involved = module => layout.involved.has(moduleKey(module.identity));
-      const visible = layout.focus ? modules.filter(involved) : modules;
-      const measured = visible.filter(module => module.declarationCount > 0 || involved(module));
-      // Names come from every band member, so focus never renames a module.
+    function entries(layerKey, modules, scale, budget) {
+      const measured = modules.filter(module => module.declarationCount > 0);
       const result = capped(layerKey, level(layerKey, commonDirectory(modules.map(module => module.identity.path)), measured, scale), budget);
       // Notes are chip-sized: a short drawn label, the full sentence as the accessible name.
-      const unmeasured = visible.length - measured.length, hidden = modules.length - visible.length;
-      const note = entry => { if (budget.left > 0) { budget.left -= 1; result.push(entry); } };
-      if (unmeasured) note({type:"note", layerKey, label:`${plural(unmeasured, "file")} · metrics unavailable\nno ${callables()}`, shown:`${plural(unmeasured, "file")}\nno metrics`});
-      if (hidden) note({type:"note", layerKey, label:`${plural(hidden, "file")} outside deviations`, shown:`${plural(hidden, "file")}\nnot deviating`});
+      const unmeasured = modules.length - measured.length;
+      if (unmeasured && budget.left > 0) {
+        budget.left -= 1;
+        result.push({type:"note", layerKey, label:`${plural(unmeasured, "file")} · metrics unavailable\nno ${callables()}`, shown:`${plural(unmeasured, "file")}\nno metrics`});
+      }
       return result;
     }
-    function footer(id, layers, open, text) {
-      get(`architecture-${id}`).hidden = !layers.length;
-      const toggle = get(`architecture-${id}-toggle`);
-      toggle.textContent = `${open ? "▾" : "▸"} ${text}`; toggle.setAttribute("aria-expanded", String(open));
-      get(`architecture-${id}-names`).textContent = layers.map(layer => layer.name).join(", ");
+    // A collapsed band's one row of module chips, hottest first (#449). Display only: the
+    // band header opens it. The last chip says how many modules the row leaves out.
+    function summaryChips(layerKey, modules, columns, scale, budget) {
+      const measured = modules.filter(module => module.declarationCount > 0);
+      const groups = groupModules(measured, commonDirectory(modules.map(module => module.identity.path))).map(([name, files]) => ({name, files, value:worst(files)}));
+      const severity = value => !finite(value) ? -Infinity : metric === "maintainabilityIndex" ? -value : value;
+      if (metric !== "layer") groups.sort((a, b) => severity(b.value) - severity(a.value) || a.name.localeCompare(b.name));
+      const room = Math.min(columns, ENTRY_CAP, budget.left), kept = groups.length > room ? groups.slice(0, Math.max(Math.min(1, room), room - 1)) : groups;
+      budget.left -= kept.length;
+      const chips = kept.map(({name, files, value}) => {
+        const amount = value === undefined ? "" : `${display(value)}`;
+        return {type:"chip", layerKey, band:value === undefined ? null : scale.band(value),
+          label:`${name} · ${plural(files.length, "file")}${amount ? ` · ${metric} ${amount}` : ""}`, shown:`${name}${amount ? `\n${amount}` : ""}`};
+      });
+      const rest = groups.length - kept.length;
+      if (rest > 0 && budget.left > 0) {
+        budget.left -= 1;
+        chips.push({type:"chip", layerKey, band:null, label:`${plural(rest, "more module")} · open the band to see them`, shown:`+${rest} more\nopen band`});
+      }
+      return chips;
     }
     function displayState(payload, layout) {
       const files = layers => payload.modules.filter(module => layers.some(layer => layer.name === module.layer)).length;
-      footer("quiet", layout.quiet, shown.quiet, `${plural(layout.quiet.length, "quiet layer")} · ${plural(files(layout.quiet), "file")} · 0 production edges`);
-      footer("hidden", layout.hidden, shown.hidden, `${plural(layout.hidden.length, "hidden layer")} · ${plural(files(layout.hidden), "file")} · ${plural(layout.hiddenEdges, "production edge")}`);
+      get("architecture-hidden").hidden = !layout.hidden.length;
+      const toggle = get("architecture-hidden-toggle");
+      toggle.textContent = `${shown.hidden ? "▾" : "▸"} ${plural(layout.hidden.length, "hidden layer")} · ${plural(files(layout.hidden), "file")} · ${plural(layout.hiddenEdges, "production edge")}`;
+      toggle.setAttribute("aria-expanded", String(shown.hidden));
       get("architecture-hidden-names").textContent = layout.hidden.map(layer => layout.tests.has(layer.name) ? `${layer.name} (tests/fixtures; include them to show)` : layer.name).join(", ");
-      const box = get("architecture-deviations-only");
-      box.disabled = !layout.focusEdges.length; box.checked = layout.focus;
-      get("architecture-focus-state").textContent = !layout.focusEdges.length ? "No deviating or unknown production references." :
-        layout.focus ? `Showing ${plural(layout.layers.size, "layer")} and ${plural(layout.involved.size, "file")} in deviating or unknown production references.` : "";
     }
     function refocus(target) {
       for (const node of get("architecture-diagram").querySelectorAll?.("[role=button]") || []) {
@@ -338,39 +362,52 @@
     function legend(scale) {
       const target = get("architecture-legend"); target.replaceChildren();
       if (metric === "layer") { paragraph(target, "Layer membership · neutral chips; no metric heat."); return; }
-      paragraph(target, `${scale.label} · ${metric} · ${aggregate} · visible layer file modules (collapsed summaries included) · ${population()}`);
+      paragraph(target, `${scale.label} · ${metric} · ${aggregate} · ${population()}`);
       for (const {label, band} of scale.entries) {
         const entry = make("span", undefined, "metric-legend-entry");
         entry.append(make("span", undefined, `metric-swatch${band === null ? " neutral" : ` heat-${band}`}`), make("span", label)); target.append(entry);
       }
       if (relative) target.append(make("span", "Low heat → high heat · ties stay together · — unavailable"));
     }
+    // Measured coverage beside the arrow key: drawn counts are lower bounds (#449).
+    function coverageSummary(payload) {
+      const rows = payload.references?.coverage || [];
+      const sites = rows.reduce((sum, row) => sum + row.sites, 0), mapped = rows.reduce((sum, row) => sum + row.mappedSites, 0);
+      const counts = payload.rules?.counts;
+      const parts = [`${mapped.toLocaleString("en-US")} of ${sites.toLocaleString("en-US")} reference sites mapped to a module (${percent(mapped, sites)})`];
+      if (rows.some(row => row.unresolvedSites > 0)) parts.push("≥ counts are lower bounds");
+      if (counts && Number.isSafeInteger(counts.unknown)) parts.push(`${counts.unknown.toLocaleString("en-US")} of ${counts.comparable.toLocaleString("en-US")} production rule instances unknown`);
+      return parts.join(" · ");
+    }
     async function render() {
       if (!usable() || view.state !== "ready") return false;
       const c = basis, payload = view, ticket = ++renderSerial;
       const active = () => current(c) && view === payload && ticket === renderSerial && payload.rulesFile.contentHash === c.rulesHash;
-      clearInspection(); get("architecture-diagram").replaceChildren();
+      // The inspector's review overview opens before measuring, so the drawing fits the width it gets.
+      clearInspection(); overview(); get("architecture-diagram").replaceChildren();
       const layout = summary(payload);
       // Collapsing layers or directories changes representation, not their module population.
       const visible = payload.modules.filter(module =>
-        (module.layer === null ? !layout.focus && shown.unassigned : layout.layers.has(module.layer)) &&
-        (!layout.focus || layout.involved.has(moduleKey(module.identity))) &&
-        (module.declarationCount > 0 || layout.involved.has(moduleKey(module.identity))));
+        (module.layer === null ? shown.unassigned : layout.layers.has(module.layer)) && module.declarationCount > 0);
       const values = visible.map(module => metricValue(module.metrics, metric));
       const scale = createScale(metric, aggregate, values, relative);
       legend(scale);
       displayState(payload, layout);
+      get("architecture-coverage").textContent = coverageSummary(payload);
       const unassigned = payload.modules.filter(module => module.layer === null).length, budget = {left:BOX_CAP, truncated:0};
+      // The canvas's inner width; the adapter fits that many chip columns.
+      const canvas = get("architecture-diagram"), style = window.getComputedStyle?.(canvas), padding = style ? parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) : 0;
       try {
         if (!window.TrellisArchitecturePele) throw new Error("Architecture renderer unavailable. Nothing displayed.");
-        const outcome = await window.TrellisArchitecturePele.render(get("architecture-diagram"), payload, {
-          showTests, metric, aggregate, isCurrent:active,
+        const outcome = await window.TrellisArchitecturePele.render(canvas, payload, {
+          showTests, metric, aggregate, isCurrent:active, width:canvas.clientWidth - (padding || 0),
           moduleValue:module => metric === "layer" ? undefined : metricValue(module.metrics, metric),
           moduleBand:module => metric === "layer" ? null : scale.band(metricValue(module.metrics, metric)),
-          layerLabel, layerStats,
-          display:{layers:layout.layers, expanded:name => budget.left > 0 && expanded(payload.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, layout, scale, budget),
-            edge:edge => !layout.focus || flagged(edge),
-            unassigned:layout.focus ? null : {label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, get expanded() { return shown.unassigned && budget.left > 0; }}},
+          layerLabel, layerStats, edgeText, edgeTone,
+          display:{layers:layout.layers, expanded:name => budget.left > 0 && expanded(payload.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, scale, budget), reset:() => { budget.left = BOX_CAP; budget.truncated = 0; },
+            summary:(key, modules, columns) => summaryChips(key, modules, columns, scale, budget),
+            edge:() => true,
+            unassigned:{label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, get expanded() { return shown.unassigned && budget.left > 0; }}},
           onSelectModule:module => { if (active() && payload.modules.includes(module)) inspect("module", module); },
           onSelectEdge:edge => { if (active() && payload.edges.includes(edge)) inspect("edge", edge); },
           onSelectLayer:layer => { if (active() && payload.layers.includes(layer)) inspect("layer", layer); },
@@ -394,7 +431,9 @@
         if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
         const production = payload.edges.filter(edge => edge.role === "production").reduce((sum, edge) => sum + edge.count, 0);
         const tests = payload.edges.filter(edge => edge.role === "test").reduce((sum, edge) => sum + edge.count, 0);
-        state(`${payload.modules.length} native file modules · ${production} production / ${tests} test-only cross-layer reference sites${showTests ? " · tests shown" : " · tests hidden"}${layout.focus ? " · deviations only" : ""}${budget.truncated ? ` · ${plural(budget.truncated, "file")} not drawn (size cap ${BOX_CAP} chips)` : ""}. Metrics: ${aggregate}, ${population()} · ${exclusions(payload.modules)}.`, "ready");
+        // One status line; heat exclusions move to the coverage notices (#449).
+        state(`${payload.modules.length} file modules · ${production} production / ${tests} test-only cross-layer sites${showTests ? "" : " (tests hidden)"}${budget.truncated ? ` · ${plural(budget.truncated, "file")} not drawn (size cap ${BOX_CAP} chips)` : ""} · Metrics: ${aggregate}, ${population()}`, "ready");
+        get("architecture-exclusions").textContent = `Heat: ${exclusions(payload.modules)}.`;
         return true;
       } catch (error) {
         if (!active()) return false;
@@ -418,13 +457,13 @@
           state("No reviewed rules file. Create or review .trellis/rules.toml. The trellis_propose_layers MCP prompt can help propose layers; this browser does not call it.", "empty"); return;
         }
         view = payload; basis = {...c, rulesHash:payload.rulesFile.contentHash}; coverage();
-        if (payload.state === "no_layers") state("No authored layers are configured. Existing authored exceptions can still be edited or removed. Review .trellis/rules.toml to configure layers.", "empty");
+        if (payload.state === "no_layers") { state("No authored layers are configured. Existing authored exceptions can still be edited or removed. Review .trellis/rules.toml to configure layers.", "empty"); overview(); }
         else await render();
         if (options.keepDraft === true) { get("architecture-review-panel").hidden = false; renderReview(); }
       } catch (error) {
         if (!current(c) || error.name === "AbortError") return;
         const diagnostic = error.diagnostic;
-        state(diagnostic ? `${diagnostic.code || "invalid_rules"} · ${diagnostic.path}:${diagnostic.line}:${diagnostic.column} · ${diagnostic.kind} · ${diagnostic.message}` : error.message || "Architecture unavailable. Refresh to try again.", "error");
+        state(diagnostic ? `${diagnostic.code || "invalid_rules"} · ${diagnostic.path}:${diagnostic.line}:${diagnostic.column} · ${diagnostic.kind} · ${diagnostic.message}` : error.message || "Architecture unavailable. Select the Architecture tab again to retry.", "error");
         if (diagnostic) disclosure(get("architecture-notice-content"), "Located rules diagnostic", diagnostic);
         if (error.status === 409 && ["revision_conflict", "pin_expired", "root_changed"].includes(error.code)) onConflict();
       } finally { if (current(c)) get("architecture-diagram").setAttribute("aria-busy", "false"); }
@@ -466,12 +505,46 @@
       }
       visit(metrics, ""); target.append(list);
     }
+    function openReview(mode) {
+      if (!usable()) return;
+      reviewScope = null; reviewMode = mode;
+      // The deviations chip counts unexcepted production deviations; its list shows exactly those.
+      if (mode === "rules") { get("architecture-review-role").value = "production"; get("architecture-review-state").value = "deviates"; }
+      get("architecture-review-panel").hidden = false; renderReview();
+    }
+    // Counted review chips head every Architecture inspection (#449); each opens its list.
+    // Counts come from the summary: rule-check counts, unassigned files, authored exceptions.
+    function reviewChips(target) {
+      const chips = make("div", undefined, "architecture-review-chips"), counts = view.rules?.counts;
+      chips.setAttribute("role", "group"); chips.setAttribute("aria-label", "Review counts");
+      const chip = (id, count, word, open, tone) => {
+        const button = make("button", `${count.toLocaleString("en-US")} ${word}`, "architecture-chip"); button.type = "button"; button.id = id;
+        if (tone) button.dataset.tone = tone;
+        button.addEventListener("click", () => { if (usable() && !editBusy) return open(); }); chips.append(button);
+      };
+      if (view.state === "ready" && Number.isSafeInteger(counts?.deviates)) chip("architecture-review", counts.deviates, counts.deviates === 1 ? "deviation" : "deviations", () => openReview("rules"), counts.deviates ? "error" : null);
+      if (view.state === "ready" && Number.isSafeInteger(view.rules?.unassignedCount)) chip("architecture-unassigned", view.rules.unassignedCount, "unassigned", () => openReview("unassigned"));
+      if (Number.isSafeInteger(view.exceptionCount)) chip("architecture-authored", view.exceptionCount, view.exceptionCount === 1 ? "exception" : "exceptions", showAuthored);
+      target.append(chips);
+    }
+    // The inspector's resting content once a snapshot is shown: review chips and coverage.
+    // It opens the desktop column but never the narrow-screen drawer.
+    function overview() {
+      if (!usable() || !["ready", "no_layers"].includes(view.state)) return;
+      clearInspection(); window.TrellisShell?.showArchitectureInspector({drawer:false});
+      get("architecture-inspector-title").textContent = "Architecture review";
+      const target = get("architecture-inspector-content"); target.replaceChildren();
+      reviewChips(target);
+      if (view.state === "ready") paragraph(target, coverageSummary(view), "detail");
+      paragraph(target, view.state === "ready" ? "Select a band, module chip or arrow to inspect its evidence." : "Authored exceptions stay editable without layers.", "detail");
+    }
     function inspect(kind, record) {
       if (!usable() || view.state !== "ready") return;
       clearInspection(); const ticket = selectionSerial, payload = view, c = basis;
       const active = () => usable() && current(c) && view === payload && ticket === selectionSerial && !get("architecture-inspector").hidden;
       onInspect(); window.TrellisShell?.showArchitectureInspector();
       const target = get("architecture-inspector-content"), title = get("architecture-inspector-title"); target.replaceChildren();
+      reviewChips(target);
       paragraph(target, `Syntax evidence · not compiler-resolved calls · code ${window.TrellisIndexPin.label(payload)} · rules ${c.rulesHash}.`);
       const references = payload.references;
       if (kind === "module") {
@@ -579,6 +652,7 @@
       onInspect(); window.TrellisShell?.showArchitectureInspector();
       const r = row.instance, target = get("architecture-inspector-content"); target.replaceChildren();
       get("architecture-inspector-title").textContent = `${r.rule} · ${targetLabel(r.target)}`;
+      reviewChips(target);
       paragraph(target, `${row.role} · ${r.status} · ${r.excepted ? `excepted: ${r.exceptionReason}` : "not excepted"} · ${r.referenceCount ?? 0} exact reference sites.`);
       paragraph(target, `Code ${window.TrellisIndexPin.label(payload)} · rules ${c.rulesHash}. Captured spelling and source-owner identities are syntax evidence, not destination symbol bindings.`);
       disclosure(target, "Captured rule evidence and constraints", r);
@@ -710,7 +784,7 @@
         const now = context();
         if (now.rootKey !== c.rootKey || now.session !== c.session || !window.TrellisIndexPin.equal(now.pin, c.pin)) return;
         if (usable() && basis.rulesHash === p.rulesFile.contentHash) { state(message + "Rechecked at the same code snapshot."); }
-        else { state(message + "Recheck failed or rules changed again. Refresh before reviewing; no old graph is current.", "stale"); }
+        else { state(message + "Recheck failed or rules changed again. Select the Architecture tab again before reviewing; no old graph is current.", "stale"); }
       } catch (error) {
         if (active()) {
           invalidatePreview();
@@ -733,7 +807,7 @@
       invalidatePreview(); const busy = setBusy(true);
       try {
         await refresh({keepDraft:true});
-        if (!usable() || draft !== owned) { editState("Draft kept, but rules recheck failed. Refresh before authoring.", "error"); return; }
+        if (!usable() || draft !== owned) { editState("Draft kept, but rules recheck failed. Reload rules before authoring.", "error"); return; }
         await loadDescriptor();
         if (!usable() || draft !== owned) return;
         const changed = owned.baseHash !== basis.rulesHash;
@@ -803,9 +877,6 @@
       })();
     }
     get("architecture-review-role").value = "all"; get("architecture-review-state").value = "deviates";
-    get("architecture-review").addEventListener("click", () => { if (usable()) { reviewScope = null; reviewMode = "rules"; get("architecture-review-panel").hidden = false; renderReview(); } });
-    get("architecture-unassigned").addEventListener("click", () => { if (usable()) { reviewScope = null; reviewMode = "unassigned"; get("architecture-review-panel").hidden = false; renderReview(); } });
-    get("architecture-authored").addEventListener("click", showAuthored);
     get("architecture-review-close").addEventListener("click", () => { get("architecture-review-panel").hidden = true; });
     for (const id of ["architecture-review-role","architecture-review-state"]) get(id).addEventListener("change", renderReview);
     get("architecture-select-scope").addEventListener("click", selectScope);
@@ -825,14 +896,9 @@
       if (next === role) return;
       role = next; return refresh();
     });
-    get("architecture-refresh").addEventListener("click", refresh);
-    get("architecture-deviations-only").addEventListener("change", event => {
+    get("architecture-hidden-toggle").addEventListener("click", () => {
       if (!usable()) return;
-      shown.deviationsOnly = event.target.checked; saveDisplay(); return render();
-    });
-    for (const id of ["quiet", "hidden"]) get(`architecture-${id}-toggle`).addEventListener("click", () => {
-      if (!usable()) return;
-      shown[id] = !shown[id]; saveDisplay(); return rerender({});
+      shown.hidden = !shown.hidden; saveDisplay(); return rerender({});
     });
     get("architecture-color").addEventListener("change", event => { metric = event.target.value; return render(); });
     get("architecture-tests").addEventListener("change", event => { showTests = event.target.checked; return render(); });

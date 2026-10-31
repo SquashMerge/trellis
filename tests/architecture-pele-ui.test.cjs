@@ -78,3 +78,24 @@ test("display projection: module chips, a folded band as a short composite, stat
   const raw=pele.render(p.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
   for(const id of p.nodes.keys()) assert.equal((raw.match(new RegExp(`data-id="${id}"`,"g"))||[]).length,1);
 });
+test("#449: collapsed bands draw summary chips, width sets chip columns, arrows carry lower bounds and coverage",()=>{
+  const {adapter,pele}=setup(), view=fixture(); let resets=0;
+  const summary=(key,modules,columns)=>modules.slice(0,columns).map((module,i)=>({type:"chip",band:i%4,label:`${module.identity.path} · chip`,shown:`m${i}\n${i}`}));
+  const display={layers:new Set(view.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[],summary,reset:()=>{resets++;}};
+  const edgeText=edge=>({bound:true,label:"lower bound; 9% of 100 production reference sites mapped",note:edge.status==="deviates"?"9% mapped":""});
+  const edgeTone=edge=>edge.status==="deviates"?"deviation":"allowed";
+  const options={display,edgeText,edgeTone,measureText:text=>Array.from(text).length*7};
+  const narrow=adapter.project(view,{...options,width:600}), wide=adapter.project(view,{...options,width:1800});
+  assert.equal(resets,2,"each projection resets the caller's chip budget");
+  const chips=p=>[...p.nodes.values()].filter(n=>n.kind==="C");
+  assert.ok(chips(narrow).length>0,"no band says only 'N files folded' when it has measured modules");
+  assert.equal([...narrow.nodes.values()].some(n=>n.kind==="S"),false);
+  assert.ok(chips(wide).length>chips(narrow).length,"a wider canvas holds more chips per row");
+  assert.ok(adapter.project(view,{...options,columns:3}).source.includes("columns 3"),"an explicit column count wins");
+  const up=[...wide.edges.values()].find(e=>e.record.status==="deviates"&&e.record.role==="production");
+  assert.match(up.display[0],/^↑≥\d+ · 9% mapped$/); assert.match(up.full,/lower bound; 9% of 100 production reference sites mapped$/); assert.equal(up.tone,"deviation");
+  const allowed=[...wide.edges.values()].find(e=>e.record.status==="conforms");
+  assert.match(allowed.display[0],/^.≥\d+$/,"allowed arrows keep the bound but not the coverage note"); assert.equal(allowed.tone,"allowed");
+  const raw=pele.render(wide.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
+  for(const id of wide.nodes.keys()) assert.equal((raw.match(new RegExp(`data-id="${id}"`,"g"))||[]).length,1);
+});
