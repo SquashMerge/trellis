@@ -1848,6 +1848,7 @@ mod cache_tests {
     fn export_cache_separates_follow_depth_and_external_waiver_mode() {
         let packages = external::RustPackages::default();
         let document = DocumentInput {
+            semantic: Default::default(),
             key: DocumentKey {
                 source_set_id: "fixture".into(),
                 language: "rust".into(),

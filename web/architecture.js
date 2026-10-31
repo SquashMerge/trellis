@@ -97,7 +97,7 @@
       }
       if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || payload.aggregate !== c.aggregate || payload.role !== c.role ||
           payload.workbench !== true || payload.metricsVersion !== "metrics:v1" ||
-          payload.evidenceTier !== "syntax" || payload.semanticComplete !== false ||
+          !["syntax", "mixed"].includes(payload.evidenceTier) || payload.semanticComplete !== false ||
           !Array.isArray(payload.layers) || !Array.isArray(payload.modules) || !Array.isArray(payload.edges) ||
           (["ready", "no_layers"].includes(payload.state) && (typeof payload.rulesFile?.contentHash !== "string" || !payload.rulesFile.contentHash))) {
         throw new Error("Invalid Architecture response. Nothing displayed.");
@@ -112,7 +112,7 @@
       const target = get("architecture-notice-content"); target.replaceChildren();
       paragraph(target, `Code ${window.TrellisIndexPin.label(view)} · rules ${view.rulesFile.contentHash} · ${aggregate} · ${population()}.`);
       const references = view.references;
-      paragraph(target, `${references?.counts?.mappedSites ?? 0} structurally mapped reference sites · ${references?.counts?.unresolvedSites ?? 0} unresolved. Missing sites do not prove absence.`);
+      paragraph(target, `${references?.counts?.mappedSites ?? 0} mapped reference sites · ${references?.counts?.semanticSites ?? 0} bound by semantic evidence · ${references?.counts?.unresolvedSites ?? 0} unresolved. Missing sites do not prove absence.`);
       if (ruleCounts(view)) paragraph(target, ruleCounts(view));
       for (const limitation of references?.limitations || []) paragraph(target, limitation);
       const unassigned = view.modules.filter(module => module.layer === null);
@@ -256,11 +256,15 @@
     };
     // A count is a lower bound when any site of its source layer and role stayed unresolved.
     const lowerBound = (layerName, siteRole) => (coverageOf(layerName, siteRole)?.unresolvedSites ?? 1) > 0;
+    // An arrow's own coverage says whether its count is exact; it loses the "≥" when no site
+    // of its source layer and role stayed unresolved (#523).
+    const edgeTier = edge => ({semantic:"; semantic bindings", mixed:"; syntax and semantic bindings"})[edge.evidenceTier] || "";
     function edgeText(edge) {
-      const covered = coverageOf(edge.sourceLayer, edge.role), bound = lowerBound(edge.sourceLayer, edge.role);
+      const covered = edge.coverage || coverageOf(edge.sourceLayer, edge.role);
+      const bound = edge.coverage ? edge.coverage.complete !== true : lowerBound(edge.sourceLayer, edge.role);
       if (!covered) return {bound};
       const share = percent(covered.mappedSites, covered.sites);
-      const label = `${bound ? "lower bound; " : ""}${share} of ${covered.sites} ${edge.role} reference sites from ${edge.sourceLayer} mapped to a module`;
+      const label = `${bound ? "lower bound; " : ""}${share} of ${covered.sites} ${edge.role} reference sites from ${edge.sourceLayer} mapped to a module${edgeTier(edge)}`;
       return {bound, label, note:bound && ["deviation", "unknown"].includes(edgeTone(edge)) ? `${share} mapped` : ""};
     }
     function summary(payload) {
@@ -532,7 +536,7 @@
       for (const pair of values) {
         const details = make("details"); details.append(make("summary", `${targetLabel(pair.source)} → ${targetLabel(pair.target)} · ${pair.count} reference sites`));
         paragraph(details, `${pair.sites.length} sampled sites · ${pair.omittedSites} omitted sites. Counts remain exact; samples are not exhaustive.`);
-        disclosure(details, "Exact reference-pair identity", {source:pair.source, target:pair.target, mapping:pair.mapping});
+        disclosure(details, "Exact reference-pair identity", {source:pair.source, target:pair.target, evidenceTier:pair.evidenceTier, semanticSites:pair.semanticSites});
         if (external(pair.target)) {
           const descriptor = view.references.externalPackages.find(item => same(item.identity, pair.target));
           disclosure(details, "External package evidence", descriptor);
@@ -589,6 +593,24 @@
       reviewChips(target);
       paragraph(target, view.state === "ready" ? "Select a band, module chip or arrow to inspect its evidence." : "Authored exceptions stay editable without layers.", "detail");
     }
+    // Evidence wording follows what the selection rests on (#523); never semantically complete.
+    function evidenceSummary(payload) {
+      return payload.evidenceTier === "mixed"
+        ? "Syntax evidence and fresh semantic bindings · not semantically complete"
+        : "Syntax evidence · not compiler-resolved calls";
+    }
+    function edgeSites(edge) {
+      if (edge.evidenceTier === "semantic") return "reference sites, all bound by semantic evidence";
+      if (edge.evidenceTier === "mixed") return `reference sites, ${edge.semanticSites} bound by semantic evidence`;
+      return "structural reference sites";
+    }
+    function ruleEvidence(row) {
+      const semantic = (row.evidence || []).concat(...(row.constraints || []).map(c => c.evidence || []))
+        .some(item => item.kind === "semanticBinding" || item.kind === "typeRelationship");
+      return semantic
+        ? "Semantic evidence names a fresh producer binding and its proof; structural spelling and source-owner identities remain syntax evidence."
+        : "Captured spelling and source-owner identities are syntax evidence, not destination symbol bindings.";
+    }
     function inspect(kind, record) {
       if (!usable() || view.state !== "ready") return;
       clearInspection(); const ticket = selectionSerial, payload = view, c = basis;
@@ -596,7 +618,7 @@
       onInspect(); window.TrellisShell?.showArchitectureInspector();
       const target = get("architecture-inspector-content"), title = get("architecture-inspector-title"); target.replaceChildren();
       reviewChips(target);
-      paragraph(target, `Syntax evidence · not compiler-resolved calls · code ${window.TrellisIndexPin.label(payload)} · rules ${c.rulesHash}.`);
+      paragraph(target, `${evidenceSummary(payload)} · code ${window.TrellisIndexPin.label(payload)} · rules ${c.rulesHash}.`);
       const references = payload.references;
       if (kind === "module") {
         title.textContent = record.identity.path;
@@ -620,7 +642,7 @@
         detailList(target, {kind:"instances", path:record.identity.path}, active, instanceItems(active), "No rule instances name this file.");
       } else if (kind === "edge") {
         title.textContent = `${record.sourceLayer} → ${record.destinationLayer}`;
-        paragraph(target, `${record.count} exact ${record.role} structural reference sites · ${record.status}${record.excepted ? ` · excepted: ${record.exceptionReason}` : " · not excepted"}${record.role === "test" ? " · hypothetical policy only; never a production violation" : ""}.`);
+        paragraph(target, `${record.count} exact ${record.role} ${edgeSites(record)} · ${record.status}${record.excepted ? ` · excepted: ${record.exceptionReason}` : " · not excepted"}${record.role === "test" ? " · hypothetical policy only; never a production violation" : ""}.`);
         reviewScope = record; reviewMode = "rules"; get("architecture-review-state").value = "all"; get("architecture-review-panel").hidden = false; renderReview();
         detailList(target, {kind:"instances", ...edgeFilters(record)}, active, instanceItems(active), "No rule instances match this review scope.");
         pairs(target, record.pairs, active);
@@ -705,7 +727,7 @@
       get("architecture-inspector-title").textContent = `${r.rule} · ${targetLabel(r.target)}`;
       reviewChips(target);
       paragraph(target, `${row.role} · ${r.status} · ${r.excepted ? `excepted: ${r.exceptionReason}` : "not excepted"} · ${r.referenceCount ?? 0} exact reference sites.`);
-      paragraph(target, `Code ${window.TrellisIndexPin.label(payload)} · rules ${c.rulesHash}. Captured spelling and source-owner identities are syntax evidence, not destination symbol bindings.`);
+      paragraph(target, `Code ${window.TrellisIndexPin.label(payload)} · rules ${c.rulesHash}. ${ruleEvidence(r)}`);
       disclosure(target, "Captured rule evidence and constraints", r);
       if (r.destination && r.target?.path) {
         const params = {kind:"pairs", role:row.role, source:JSON.stringify(r.target), target:JSON.stringify(r.destination)};

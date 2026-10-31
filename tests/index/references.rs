@@ -49,6 +49,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
                 .cloned()
                 .collect();
             DocumentInput {
+                semantic: Default::default(),
                 key,
                 file,
                 declarations,
@@ -277,13 +278,15 @@ fn opaque() { some_macro!(crate::store::inside()); }
         edge(&data, "tests", "src/lib.rs", "src/store.rs")["count"],
         1
     );
-    assert_eq!(production["mapping"], "structural");
+    assert_eq!(production["evidenceTier"], "syntax");
     assert_eq!(data["semanticComplete"], false);
     for site in production["sites"].as_array().unwrap() {
         assert_eq!(site["role"], "production");
         assert!(site["callId"].as_str().unwrap().starts_with("occ:v2:"));
         assert!(site["lines"]["start"].as_u64().unwrap() > 0);
-        assert!(site.get("provenanceId").is_none());
+        // Structural sites carry no binding proof (#523).
+        assert_eq!(site["mapping"], "structural");
+        assert!(site["provenanceId"].is_null());
     }
 }
 
@@ -2994,7 +2997,7 @@ fn assert_java_review_maven_projection(paths: &[String], all: bool) {
                 format!("src/main/java/com/example/p{target:03}/Service{target:03}.java");
             let pair = edge(&data, "production", &source, &target_path);
             assert_eq!(pair["count"], 1);
-            assert_eq!(pair["mapping"], "structural");
+            assert_eq!(pair["evidenceTier"], "syntax");
             assert_eq!(pair["omittedSites"], 0);
             assert_eq!(pair["sites"].as_array().unwrap().len(), 1);
             let site = &pair["sites"][0];
@@ -3861,7 +3864,7 @@ fn references_python_fanout_clipping_preserves_counts_roles_ranges_and_native_pr
             for target in ["left.py", "right.py"] {
                 let pair = edge(data, section, path, target);
                 assert_eq!(pair["count"], count);
-                assert_eq!(pair["mapping"], "structural");
+                assert_eq!(pair["evidenceTier"], "syntax");
                 for site in pair["sites"].as_array().unwrap() {
                     let start = site["range"]["start"].as_u64().unwrap() as usize;
                     let end = site["range"]["end"].as_u64().unwrap() as usize;
@@ -5564,6 +5567,7 @@ fn snapshot_javascript_manifest(files: &[(&str, &str)], manifest: &str) -> Snaps
                 .key
                 .clone();
             DocumentInput {
+                semantic: Default::default(),
                 declarations: native
                     .declarations
                     .iter()

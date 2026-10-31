@@ -713,3 +713,264 @@ impl EvidenceResponse {
         })
     }
 }
+
+/// At most this many semantic rows are admitted into one architecture snapshot (#523).
+const ARCHITECTURE_SEMANTIC_ROWS: usize = 2_000_000;
+
+/// Fresh bindings of each document under its language's default producer (#483), for
+/// architecture references and rules (#523). Only rows of a selected, complete or partial
+/// coverage tuple whose proof is fresh are read; anything else stays syntax-only. An
+/// internal call target must also be confirmed current (`stale_target = 0`), and an
+/// internal target outside the snapshot's documents is left out.
+pub(super) fn architecture_semantic(
+    db: &Connection,
+    revision_key: &str,
+    documents: &mut [crate::references::DocumentInput],
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    use crate::references::{SemanticAnchor, SemanticOutcome, SemanticRelationship};
+    let defaults = default_producers(db, revision_key)?;
+    // Snapshot documents by language, then path.
+    // A revision has one source set; its documents are keyed by language and path.
+    let mut index: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for (i, doc) in documents.iter().enumerate() {
+        ensure!(
+            index
+                .entry(doc.key.language.clone())
+                .or_default()
+                .insert(doc.key.path.clone(), i)
+                .is_none(),
+            SelectedIntegrity("duplicate architecture document".into())
+        );
+    }
+    let locate = |language: Option<&str>, path: Option<&str>| {
+        index
+            .get(language?)
+            .and_then(|paths| paths.get(path?))
+            .copied()
+    };
+    let mut rows = 0usize;
+    let mut admit = || -> Result<()> {
+        rows += 1;
+        ensure!(
+            rows <= ARCHITECTURE_SEMANTIC_ROWS,
+            "bounded_work: architecture semantic evidence"
+        );
+        Ok(())
+    };
+    let sid = |bytes: Option<&[u8]>| -> Result<Option<String>> {
+        bytes
+            .map(|bytes| {
+                id_codec::decode_sid(bytes).map_err(|_| {
+                    anyhow::Error::from(SelectedIntegrity("invalid semantic target ID".into()))
+                })
+            })
+            .transpose()
+    };
+    // Stored offsets are nonnegative and ordered; anything else is a corrupt row.
+    let range = |start: i64, end: i64| -> Result<crate::native_evidence::Range> {
+        match (usize::try_from(start), usize::try_from(end)) {
+            (Ok(start), Ok(end)) if start <= end => {
+                Ok(crate::native_evidence::Range { start, end })
+            }
+            _ => Err(SelectedIntegrity("corrupt semantic offset".into()).into()),
+        }
+    };
+    // The closed dispatch enum: direct and constructor calls are direct.
+    let direct = |dispatch: &str| -> Result<bool> {
+        match dispatch {
+            "direct" | "constructor" => Ok(true),
+            "virtual" | "interface" | "dynamic" | "unknown" => Ok(false),
+            _ => Err(SelectedIntegrity("corrupt semantic call dispatch".into()).into()),
+        }
+    };
+    let mut tuples = Vec::new();
+    for language in defaults.by_language.keys() {
+        let Some(producer) = defaults.producer(language) else {
+            continue;
+        };
+        check()?;
+        let mut statement = db.prepare_cached(
+            "SELECT tuple_id,path,state='complete' FROM semantic_coverage
+             WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND selected=1
+               AND state IN ('complete','partial')",
+        )?;
+        for row in statement.query_map(params![revision_key, producer, language], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })? {
+            let (tuple, path, complete) = row?;
+            if let Some(i) = locate(Some(language), Some(&path)) {
+                tuples.push((tuple, i, producer.to_owned(), complete));
+            }
+        }
+    }
+    let mut calls = db.prepare_cached(
+        "SELECT b.call_id,b.join_start,b.join_end,b.resolution,b.declared_kind,
+                b.declared_internal_syntax_id,b.declared_internal_language,b.declared_internal_path,
+                b.dispatch,b.stale_target,b.provenance_id
+         FROM semantic_call_bindings b
+         JOIN semantic_provenance p ON p.tuple_id=b.tuple_id AND p.provenance_id=b.provenance_id
+         WHERE b.tuple_id=?1 AND b.call_id IS NOT NULL AND p.freshness='fresh'
+           AND b.join_document_language=?2 AND b.join_document_path=?3",
+    )?;
+    let mut references = db.prepare_cached(
+        "SELECT r.start_byte,r.end_byte,r.resolution,r.declared_internal_syntax_id,
+                r.declared_internal_language,r.declared_internal_path,r.provenance_id,
+                EXISTS(SELECT 1 FROM semantic_reference_roles o
+                       WHERE o.tuple_id=r.tuple_id AND o.reference_id=r.reference_id AND o.role='type')
+         FROM semantic_references r
+         JOIN semantic_provenance p ON p.tuple_id=r.tuple_id AND p.provenance_id=r.provenance_id
+         WHERE r.tuple_id=?1 AND r.site='use' AND p.freshness='fresh'
+           AND ((r.resolution='resolved' AND r.declared_kind='internal') OR r.resolution='external')",
+    )?;
+    let mut relationships = db.prepare_cached(
+        "SELECT t.kind,t.source_internal_syntax_id,t.target_kind,t.target_internal_syntax_id,
+                t.target_internal_language,t.target_internal_path,t.provenance_id
+         FROM semantic_type_relationships t
+         JOIN semantic_provenance p ON p.tuple_id=t.tuple_id AND p.provenance_id=t.provenance_id
+         WHERE t.tuple_id=?1 AND p.freshness='fresh' AND t.source_kind='internal'
+           AND t.kind IN ('extends','implements')
+         ORDER BY t.ordinal",
+    )?;
+    for (tuple, i, producer, complete) in tuples {
+        check()?;
+        let (language, path) = (
+            documents[i].key.language.clone(),
+            documents[i].key.path.clone(),
+        );
+        // One binding per measured call: the lowest provenance, as the call graph selects.
+        // The lowest provenance represents a call, as in the call graph; an unusable one
+        // (stale, or outside this snapshot) leaves the call without a binding.
+        let mut by_call: BTreeMap<String, (String, Option<SemanticAnchor>)> = BTreeMap::new();
+        let mut cursor = calls.query(params![tuple, language, path])?;
+        while let Some(row) = cursor.next()? {
+            admit()?;
+            let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
+                .map_err(|_| SelectedIntegrity("invalid semantic call ID".into()))?;
+            let provenance_id: String = row.get(10)?;
+            // Every row's offsets and dispatch decode strictly, used or not.
+            let anchor_range = range(row.get(1)?, row.get(2)?)?;
+            let is_direct = direct(row.get_ref(8)?.as_str()?)?;
+            if by_call
+                .get(&call_id)
+                .is_some_and(|(kept, _)| *kept <= provenance_id)
+            {
+                continue;
+            }
+            let outcome = match (
+                row.get_ref(3)?.as_str()?,
+                row.get_ref(4)?.as_str_or_null()?,
+                sid(row.get_ref(5)?.as_blob_or_null()?)?,
+            ) {
+                ("resolved", Some("internal"), Some(target)) => {
+                    let target_doc = locate(
+                        row.get_ref(6)?.as_str_or_null()?,
+                        row.get_ref(7)?.as_str_or_null()?,
+                    );
+                    // A target not confirmed current, or outside this snapshot, is stale.
+                    match (row.get::<_, Option<i64>>(9)?, target_doc) {
+                        (Some(0), Some(target_doc)) => {
+                            SemanticOutcome::Internal(target_doc, target)
+                        }
+                        _ => {
+                            by_call.insert(call_id, (provenance_id, None));
+                            continue;
+                        }
+                    }
+                }
+                ("external", ..) => SemanticOutcome::External,
+                ("ambiguous", ..) => SemanticOutcome::Ambiguous,
+                ("unresolved", ..) => SemanticOutcome::Unresolved,
+                _ => {
+                    return Err(SelectedIntegrity("corrupt semantic call binding".into()).into());
+                }
+            };
+            let anchor = SemanticAnchor {
+                range: anchor_range,
+                call_id: Some(call_id.clone()),
+                type_role: false,
+                direct: is_direct,
+                outcome,
+                provenance_id: provenance_id.clone(),
+            };
+            by_call.insert(call_id, (provenance_id, Some(anchor)));
+        }
+        drop(cursor);
+        let mut anchors: Vec<SemanticAnchor> = by_call
+            .into_values()
+            .filter_map(|(_, anchor)| anchor)
+            .collect();
+        // Resolved and external use-site references: the names a site spells.
+        let mut cursor = references.query([tuple])?;
+        while let Some(row) = cursor.next()? {
+            admit()?;
+            let outcome = match (
+                row.get_ref(2)?.as_str()?,
+                sid(row.get_ref(3)?.as_blob_or_null()?)?,
+            ) {
+                ("resolved", Some(target)) => match locate(
+                    row.get_ref(4)?.as_str_or_null()?,
+                    row.get_ref(5)?.as_str_or_null()?,
+                ) {
+                    Some(target_doc) => SemanticOutcome::Internal(target_doc, target),
+                    None => continue,
+                },
+                ("external", _) => SemanticOutcome::External,
+                _ => return Err(SelectedIntegrity("corrupt semantic reference".into()).into()),
+            };
+            anchors.push(SemanticAnchor {
+                range: range(row.get(0)?, row.get(1)?)?,
+                call_id: None,
+                type_role: row.get(7)?,
+                direct: false,
+                outcome,
+                provenance_id: row.get(6)?,
+            });
+        }
+        drop(cursor);
+        // A stable order independent of the storage plan.
+        anchors.sort_by(|a, b| {
+            (a.range.start, a.range.end, &a.provenance_id).cmp(&(
+                b.range.start,
+                b.range.end,
+                &b.provenance_id,
+            ))
+        });
+        let mut found = Vec::new();
+        let mut cursor = relationships.query([tuple])?;
+        while let Some(row) = cursor.next()? {
+            admit()?;
+            let source = sid(row.get_ref(1)?.as_blob_or_null()?)?.context(SelectedIntegrity(
+                "corrupt semantic type relationship".into(),
+            ))?;
+            let target = match (
+                row.get_ref(2)?.as_str()?,
+                sid(row.get_ref(3)?.as_blob_or_null()?)?,
+            ) {
+                ("internal", Some(target)) => locate(
+                    row.get_ref(4)?.as_str_or_null()?,
+                    row.get_ref(5)?.as_str_or_null()?,
+                )
+                .map(|target_doc| (target_doc, target)),
+                _ => None,
+            };
+            found.push(SemanticRelationship {
+                kind: row.get(0)?,
+                source_syntax_id: source,
+                target,
+                provenance_id: row.get(6)?,
+            });
+        }
+        drop(cursor);
+        let semantic = &mut documents[i].semantic;
+        semantic.producer_id = Some(producer);
+        semantic.complete = complete;
+        semantic.anchors = anchors;
+        semantic.relationships = found;
+    }
+    Ok(())
+}

@@ -219,13 +219,37 @@ target role. Arrays are conjunctive. Unknown keys/references, duplicate rule IDs
 invalid identities and malformed input are located errors, never ignored fields.
 No annotations, recursive Boolean DSL or transitive-path syntax is supported here.
 
-**Existing calls have no resolved callee binding; existing header bases are not
-semantic type relationships.** Consequently semantic `calls` constraints return
-`unknown` with `call_binding_unavailable`, and semantic `extends`/`implements`
-constraints return `unknown` with `type_relationship_unavailable`. They retain
-actual measured call/header evidence. Same-name candidates, import spelling and
-legacy class candidates cannot become positive bindings. Absence of a required
-edge never establishes a violation.
+**Constraints use only fresh, selected semantic bindings (#523).** Header bases,
+same-name candidates, import spelling and legacy class candidates never become
+positive bindings. A document whose language has no selected producer (#483), or
+no usable coverage tuple, has no bindings: its `calls` constraints return `unknown`
+with `call_binding_unavailable` and its `extends`/`implements` constraints return
+`unknown` with `type_relationship_unavailable`. They retain actual measured
+call/header evidence.
+
+With a selected producer, a measured call of the declaration counts when its fresh
+binding is resolved, direct (or a constructor) and its internal target is a
+declaration of this snapshot that the target role selects; the binding is added as
+`semanticBinding` evidence. A type relationship counts when it is a fresh
+`extends`/`implements` relationship of the declaration whose internal target the
+role selects (`typeRelationship` evidence). Then:
+
+- `require` **conforms** with one counted binding, and otherwise stays `unknown`:
+  absence of a required edge never establishes a violation (`required_call_absent`,
+  `type_relationship_absent`, or `…_incomplete` while bindings are missing).
+- `forbid` **deviates** with one counted binding. A forbidden call **conforms** only
+  when every measured call of the declaration has a fresh binding that is external
+  or direct to a declaration outside the role, in a document the producer covers
+  completely; otherwise it stays `unknown` with `call_binding_incomplete`. Forbidden
+  type relationships never conform by absence.
+
+Unbound, stale, ambiguous, unresolved and dispatched (virtual, interface, dynamic or
+unknown dispatch) calls, and targets a role selects only by `extends`/`implements`
+selector, are uncertain. A rule instance whose declaration is certainly selected
+deviates when any constraint deviates and conforms when every constraint conforms;
+otherwise, including whenever its selection is uncertain, it is unknown. A forbidden
+type relationship without a counted one stays unknown with
+`type_relationship_absence_unproven`.
 
 An instance is `conforms`, `deviates` or `unknown`. A proven deviation wins over
 uncertainty, but uncertainty remains in the details. Instances deduplicate by
@@ -537,10 +561,11 @@ is invented for a package. A config descriptor is exactly
 
 ```text
 {referencesVersion:"references:v2",indexGeneration,indexRevision,
- evidenceTier:"syntax",semanticComplete:false,
+ evidenceTier:"syntax"|"mixed",semanticComplete:false,
+ semanticProducers:{language,producerId}[],
  modules:Module[],externalPackages:ExternalPackage[],
  production:Edge[],tests:Edge[],unresolved:Unresolved[],
- counts:{scannedDocuments:UInt,mappedSites:UInt,unresolvedSites:UInt},
+ counts:{scannedDocuments:UInt,mappedSites:UInt,unresolvedSites:UInt,semanticSites:UInt},
  limitations:string[]}
 Module = {identity:Target,revisionId,contentHash,provenanceId}
 ExternalPackage = {identity:ExternalIdentity,ecosystem:"cargo"|"rust"|"java"|"python"|"npm"|"node",evidence:PackageEvidence[]}
@@ -557,12 +582,55 @@ CatalogEvidence = {kind:"standardLibraryCatalog",catalog:"rust-standard-library:
                 | {kind:"standardLibraryCatalog",catalog:"node-standard-library:v1",
                    entry:"fs"|"path"}
 Edge = {source:Target,target:Destination,count:UInt,sites:Site[],
-        omittedSites:UInt,mapping:"structural"}
+        omittedSites:UInt,evidenceTier:"syntax"|"semantic"|"mixed",semanticSites:UInt}
 Unresolved = {source:Target,site:Site,reason:string}
 Site = {ownerSyntaxId:string|null,role:"production"|"test"|null,
-        range:Range,lines:Lines,relationKind:"reference"|"import",
-        spelling:string,callId:string|null}
+        range:Range,lines:Lines,relationKind:"reference"|"import"|"call"|"type",
+        spelling:string,callId:string|null,
+        mapping:"structural"|"semantic",provenanceId:string|null}
 ```
+
+#### Semantic bindings (#523)
+
+Where a document's language has a selected producer (the per-language default of
+#483: the sole published producer covering it), the projection also reads that
+producer's **fresh** evidence for the document, from a selected `complete` or
+`partial` coverage tuple: call bindings of measured calls, resolved or external
+use-site semantic references, and `extends`/`implements` relationships. Rows whose
+proof is not `fresh`, and internal call targets not confirmed current
+(`staleTarget` not `false`), are left out, so stale evidence reverts to structural
+evidence. A call is represented by its lowest-provenance binding, as in the call
+graph; when that one is unusable the call has no binding. Any internal target must
+be a declaration of this snapshot (semantic references carry no separate
+current-target flag); its module is the declaration's file.
+
+- A structural site takes in every binding inside its range, and a call joined on a
+  whole invocation that starts with it. It is bound by the binding that ends where
+  it ends (its callee or final name; a call binding wins over a name), else by such
+  an invocation. A resolved internal binding maps the site to its target's module;
+  an external binding resolves the site without a destination unless structural
+  evidence proved a package. An ambiguous or unresolved binding keeps the
+  structural result.
+- A measured call with a resolved internal binding that no structural site covers
+  (a method call, say) becomes a `call` site, and a resolved internal `type`
+  reference likewise a `type` site; one site per range, a call first. A target in
+  the site's own module adds no site. Calls whose binding is external, ambiguous,
+  unresolved, stale or missing add no site: they are not counted, as without an
+  import.
+- A site an external binding resolved is neither mapped nor unresolved, so `sites`
+  can exceed `mappedSites + unresolvedSites`.
+- A site mapped or resolved by a binding has `mapping:"semantic"` and its binding's
+  `provenanceId`; other sites are `structural` with a null `provenanceId`.
+  `counts.semanticSites` counts semantic sites with no residual. An edge's
+  `semanticSites` counts its semantic sites, and its `evidenceTier` is `syntax`,
+  `semantic` or `mixed` accordingly. The payload's `evidenceTier` is `mixed` once
+  any site is semantic, and `semanticProducers` lists each language's selected
+  producer.
+
+Semantic bindings do not make the view complete: `semanticComplete` stays false,
+unbound calls are not counted, and bindings outside the checkout name no package.
+At most 2,000,000 semantic rows are admitted per snapshot (`bounded_work`), and
+semantic sites count against the same site bound as structural ones.
 
 Each external descriptor has nonempty `evidence`. Rust derives
 `ecosystem:"cargo"` for declared packages and `ecosystem:"rust"` for the reviewed
@@ -697,16 +765,25 @@ Instance = {rule:string,target:Target,destination:Destination|null,
             exceptionReason:string|null,constraints:ConstraintResult[],
             evidence:Evidence[],unresolved:string[],referenceCount:UInt}
 ConstraintResult = {mode:"require"|"forbid",kind:"calls"|"extends"|"implements",
-                    targetRole:string,status:"unknown",
+                    targetRole:string,status:"conforms"|"deviates"|"unknown",
                     evidence:Evidence[],unresolved:string[]}
 Evidence = {document:DocumentKey,revisionId:string,range:Range,
-            kind:"declaration"|"call"|"structuralReference",
+            kind:"declaration"|"call"|"structuralReference"|"semanticBinding"|"typeRelationship",
             syntaxId:string|null,callId:string|null,provenanceId:string}
 Counts = {comparable:UInt,conforms:UInt,deviates:UInt,unknown:UInt,excepted:UInt}
 ```
 
-`ConstraintResult.status` is currently **only unknown**: no call or type binding
-producer exists. Layer instances have no constraints; declaration instances have
+`ConstraintResult.status` follows the [constraint rules](#roles-and-constraints):
+`unknown` unless a fresh selected binding settles it. A `semanticBinding` evidence
+item is the call's binding (its range is the binding's anchor, `syntaxId` the bound
+target and `provenanceId` the semantic proof); a `typeRelationship` item names the
+relationship's target and proof. A `$layers` instance's evidence for a semantic
+site is `semanticBinding` with the site's owner `syntaxId` and the binding's
+provenance; a structural site stays `structuralReference` with the source module's
+native provenance. The second limitation says whether any
+bindings were admitted: "Calls and type relationships have no admitted bindings and
+remain unknown." appears only when no document has a selected producer.
+Layer instances have no constraints; declaration instances have
 null layer/destination fields and `referenceCount:0`. An unresolved reference
 produces a `$layers` unknown instance with null destination, aggregated by source.
 Unassigned module identities are listed even when no reference exists, using
