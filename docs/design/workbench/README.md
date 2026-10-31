@@ -118,6 +118,13 @@ Reviewed in the running app at `localhost:8877` on 2026-10-31 (`cbb32684`, index
 
 Items are ordered by impact.
 
+
+**Corrections after review (2026-10-31, Prime's review of PR #521; accepted by the owner):**
+
+- **Item 1 (Sequence):** `/sequence` already enriched exact semantic targets. The single lifeline came from the Rust syntax adapter's depth bound, which cut `coordinate`'s loop, and `semantic: unavailable` is display metadata, not enrichment status. Fixed in #531.
+- **Item 7 (Classes):** Rust became a supported Classes language with #506, so Classes showing on this repo is correct. The real defect is that `tools/*.py` alone counted. Fixed in #530.
+- **Item 12 (MCP):** the `syntax` tier labels describe each native answer (for example, `find_symbols` returns native declarations). The gap is that per-language semantic availability wasn't reported. Addressed in #534.
+
 ### A. Data: use the semantic evidence that's already imported
 
 1. **Sequence ignores the semantic bindings.**
