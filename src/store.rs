@@ -21947,14 +21947,37 @@ impl Store {
             truncated: false,
             warnings: vec![],
         };
-        for symbol in nodes.into_iter().skip(offset).take(limit) {
+        // Bindings and impl blocks are read from the parsed cached file (#526), only when the
+        // page has one.
+        let page: Vec<_> = nodes.into_iter().skip(offset).take(limit).collect();
+        let syntax = if page.iter().any(|symbol| {
+            metadata
+                .get(&symbol.id)
+                .is_some_and(|(kind, _)| kind == "variable" || kind == "implementation")
+        }) {
+            self.selected_source_row_for(tx, path, &selected)?
+                .and_then(|file| crate::files_view::outline_syntax(&file))
+        } else {
+            None
+        };
+        for symbol in page {
             let (native_kind, header) = metadata.remove(&symbol.id).context(SelectedIntegrity(
                 "incompatible_index: outline native declaration missing".into(),
             ))?;
+            let range = (symbol.range.start_byte, symbol.range.end_byte);
+            let callable_initializer = native_kind == "variable"
+                && syntax
+                    .as_ref()
+                    .is_some_and(|syntax| syntax.callable_initializers.contains(&range));
+            let impl_target = (native_kind == "implementation")
+                .then(|| syntax.as_ref()?.impl_targets.get(&range).cloned())
+                .flatten();
             result.items.push(OutlineItem {
                 symbol,
                 native_kind,
                 header,
+                callable_initializer,
+                impl_target,
             });
             let next = offset + result.items.len();
             result.next_offset = (next < count).then_some(next);

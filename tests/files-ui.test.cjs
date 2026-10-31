@@ -572,9 +572,9 @@ test("outline tree keeps types and callables, nests members and lends Rust impl 
     item("file", "module", null, 1, "src/watch.rs"),
     item("LIMIT", "variable", "file", 2),
     item("Budget", "type", "file", 3), item("Budget.held", "field", "Budget", 4, "held"),
-    item("impl1", "implementation", "file", 6, "<implementation@60>"), item("reserve", "method", "impl1", 7), item("bits", "parameter", "reserve", 7),
+    {...item("impl1", "implementation", "file", 6, "<implementation@60>"), implTarget:"Budget"}, item("reserve", "method", "impl1", 7), item("bits", "parameter", "reserve", 7),
     item("closure", "anonymousFunction", "reserve", 8, "<anonymousFunction@80>"),
-    item("impl2", "implementation", "file", 10, "<implementation@100>"), item("fmt", "method", "impl2", 11),
+    {...item("impl2", "implementation", "file", 10, "<implementation@100>"), implTarget:"Remote"}, item("fmt", "method", "impl2", 11),
     item("impl3", "implementation", "file", 13, "<implementation@130>"), item("unreadable", "method", "impl3", 14),
     item("release", "function", "file", 16), item("Alias", "alias", "file", 17),
     item("tests", "namespace", "file", 18), item("works", "function", "tests", 19),
@@ -582,7 +582,7 @@ test("outline tree keeps types and callables, nests members and lends Rust impl 
   const lines = Array.from({length:20}, () => "");
   lines[5] = "impl Budget {"; lines[9] = "impl<T> fmt::Display for crate::other::Remote<T> {"; lines[12] = "#[cfg(test)]";
   h.context.items = items; h.context.sourceText = lines.join("\n"); h.context.toggled = [];
-  const tree = h.run("window.TrellisFiles.outlineTree(items, sourceText)");
+  const tree = h.run("window.TrellisFiles.outlineTree(items)");
   const shape = entries => entries.map(entry => [entry.label || entry.item.symbol.name, shape(entry.children)]);
   assert.deepEqual(JSON.parse(JSON.stringify(shape(tree))), [
     ["Budget", [["held", []], ["reserve", []]]],
@@ -594,7 +594,7 @@ test("outline tree keeps types and callables, nests members and lends Rust impl 
   const render = (selected, expanded) => {
     h.context.selected = selected; h.context.expanded = new Set(expanded);
     const list = h.run("document.createElement('ul')"); h.context.list = list;
-    h.run("window.TrellisFiles.outline(list, items, selected, () => {}, () => true, {expanded, sourceText, reveal:!!selected, toggle:(key, open) => toggled.push([key, open])})");
+    h.run("window.TrellisFiles.outline(list, items, selected, () => {}, () => true, {expanded, reveal:!!selected, toggle:(key, open) => toggled.push([key, open])})");
     return list;
   };
   const labels = list => all(list).filter(node => node.className === "files-symbol-pick").map(node => node.attrs["aria-label"]);
@@ -609,27 +609,25 @@ test("outline tree keeps types and callables, nests members and lends Rust impl 
   assert.equal(all(open).find(node => node.attrs["data-symbol-id"] === "works").attrs["aria-pressed"], "true");
 });
 
-test("outline tree keeps function-valued bindings without source by initializer extent and attaches an impl to the type beside it", () => {
+test("outline tree lists a binding only on the daemon's initializer evidence and attaches an impl to the type beside it", () => {
   const h = harness();
   const item = (id, nativeKind, parent, startLine, name = id) => ({symbol:{id, name, kind:"function", path:"src/a.rs", parent, range:{startByte:startLine * 10, endByte:startLine * 10 + 5, startLine, startColumn:1, endLine:startLine, endColumn:2}}, nativeKind, header:{}});
   h.context.items = [
     item("handler", "variable", null, 1), item("arrow", "anonymousFunction", "handler", 1, "<anonymousFunction@10>"),
     item("LIMIT", "variable", null, 2),
     item("a", "namespace", null, 3), item("a.X", "type", "a", 4, "X"),
-    item("b", "namespace", null, 5), item("b.X", "type", "b", 6, "X"), item("implB", "implementation", "b", 7, "<implementation@70>"), item("run", "method", "implB", 8),
+    item("b", "namespace", null, 5), item("b.X", "type", "b", 6, "X"), {...item("implB", "implementation", "b", 7, "<implementation@70>"), implTarget:"X"}, item("run", "method", "implB", 8),
   ];
   const lines = Array.from({length:10}, () => ""); lines[6] = "    impl X {";
   h.context.sourceText = lines.join("\n");
-  const tree = h.run("window.TrellisFiles.outlineTree(items, sourceText)");
+  const tree = h.run("window.TrellisFiles.outlineTree(items)");
   const shape = entries => entries.map(entry => [entry.label || entry.item.symbol.id, shape(entry.children)]);
   assert.deepEqual(JSON.parse(JSON.stringify(shape(tree))), [
     ["a", [["a.X", []]]],
     ["b", [["b.X", [["run", []]]]]],
-  ], "without an initializer in the source, no variable is a callable; impl methods join the same-module type");
-  // Without source, a function child that ends where the binding ends is its initializer;
-  // a closure passed as an argument ends earlier and does not make the binding a callable.
-  h.context.withoutSource = [...h.context.items,
-    item("callback", "variable", null, 9), {...item("wrapped", "anonymousFunction", "callback", 9, "<anonymousFunction@90>"), symbol:{...item("wrapped", "anonymousFunction", "callback", 9).symbol, range:{startByte:92, endByte:94, startLine:9, startColumn:3, endLine:9, endColumn:5}}}];
-  const fallback = h.run("window.TrellisFiles.outlineTree(withoutSource, undefined)").map(entry => entry.item.symbol.id);
-  assert.deepEqual(JSON.parse(JSON.stringify(fallback)), ["handler", "a", "b", "run"], "a bound arrow is a callable; a value holding a closure argument is not (an unread impl lends its method to the top level)");
+  ], "without the daemon's initializer evidence no variable is a callable, even with a function child; impl methods join the same-module type");
+  // The daemon marks a binding whose parsed initializer is a function.
+  h.context.marked = h.context.items.map(entry => entry.symbol.id === "handler" ? {...entry, callableInitializer:true} : entry);
+  const marked = h.run("window.TrellisFiles.outlineTree(marked)").map(entry => entry.item.symbol.id);
+  assert.deepEqual(JSON.parse(JSON.stringify(marked)), ["handler", "a", "b"]);
 });

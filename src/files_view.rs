@@ -36,6 +36,110 @@ pub struct OutlineItem {
     pub symbol: Symbol,
     pub native_kind: String,
     pub header: Header,
+    /// A measured binding whose whole initializer is a function, from the cached file's
+    /// syntax (#526). Absent when false or when the file could not be parsed in budget.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub callable_initializer: bool,
+    /// The type a Rust `impl` block implements, by its last path segment, from the cached
+    /// file's syntax (#526). Absent for other declarations or without a parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impl_target: Option<String>,
+}
+
+/// Outline facts read from the parsed cached file, keyed by a declaration's native byte range.
+#[derive(Debug, Default)]
+pub(crate) struct OutlineSyntax {
+    /// Bindings whose initializer is a function: a JavaScript `variable_declarator` whose value
+    /// is a function or arrow expression, or a Python assignment whose right side is a `lambda`.
+    pub callable_initializers: std::collections::BTreeSet<(usize, usize)>,
+    /// Rust `impl` blocks and the last path segment of the type each implements.
+    pub impl_targets: std::collections::BTreeMap<(usize, usize), String>,
+}
+
+/// `None` when the language has no such facts or the cached file cannot be parsed within the
+/// Files budget; callers then list no binding as callable and leave impl blocks unnamed.
+pub(crate) fn outline_syntax(file: &SourceFile) -> Option<OutlineSyntax> {
+    let language: tree_sitter::Language = match file.language.as_str() {
+        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        _ => return None,
+    };
+    if file.text.len() > FILE_INPUT_LIMIT {
+        return None;
+    }
+    let started = Instant::now();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+    let mut progress = |_: &tree_sitter::ParseState| {
+        if started.elapsed() >= FILE_TIME_LIMIT {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let tree = parser.parse_with_options(
+        &mut |offset, _| &file.text.as_bytes()[offset..],
+        None,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+    )?;
+    let text = file.text.as_bytes();
+    let mut found = OutlineSyntax::default();
+    let mut cursor = tree.walk();
+    loop {
+        if started.elapsed() >= FILE_TIME_LIMIT {
+            return None;
+        }
+        let node = cursor.node();
+        let range = (node.start_byte(), node.end_byte());
+        let value = match node.kind() {
+            "variable_declarator" => node.child_by_field_name("value"),
+            "assignment" => node.child_by_field_name("right"),
+            _ => None,
+        };
+        if value.is_some_and(|value| {
+            matches!(
+                value.kind(),
+                "function_expression"
+                    | "function"
+                    | "arrow_function"
+                    | "generator_function"
+                    | "lambda"
+            )
+        }) {
+            found.callable_initializers.insert(range);
+        }
+        if node.kind() == "impl_item"
+            && let Some(name) = node.child_by_field_name("type").and_then(type_name)
+            && let Ok(name) = name.utf8_text(text)
+        {
+            found.impl_targets.insert(range, name.to_owned());
+        }
+        if cursor.goto_first_child() || cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                return Some(found);
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+/// The identifier naming a Rust type: `Foo`, `a::Foo`, `Foo<T>`, `&Foo`, `&mut a::Foo<T>`.
+fn type_name(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let mut node = node;
+    for _ in 0..16 {
+        node = match node.kind() {
+            "type_identifier" => return Some(node),
+            "generic_type" | "reference_type" => node.child_by_field_name("type")?,
+            "scoped_type_identifier" => node.child_by_field_name("name")?,
+            _ => return None,
+        };
+    }
+    None
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -306,6 +410,63 @@ fn snippet(text: &str, start: usize, end: usize) -> String {
         &text[from..to],
         if to < line_end { "…" } else { "" }
     )
+}
+
+#[cfg(test)]
+mod outline_syntax_tests {
+    use super::*;
+
+    fn syntax(language: &str, text: &str) -> Option<OutlineSyntax> {
+        outline_syntax(&SourceFile {
+            path: "fixture".into(),
+            hash: String::new(),
+            language: language.into(),
+            text: text.into(),
+        })
+    }
+    fn bindings(language: &str, text: &str) -> Vec<String> {
+        syntax(language, text)
+            .expect("parsed in budget")
+            .callable_initializers
+            .into_iter()
+            .map(|(start, end)| text[start..end].split([' ', '=']).next().unwrap().into())
+            .collect()
+    }
+
+    #[test]
+    fn only_bindings_whose_whole_initializer_is_a_function_are_marked() {
+        let javascript = "const anon = function () { return /[}]/.test(1); };\n\
+             const arrow = (value = load()) => value;\n\
+             const named = function inner() { return `}${x}{`; };\n\
+             const result = function () { return 2; }();\n\
+             const callback = wrap(() => 4);\n\
+             const ratio = 4 / 2 / 1;\n";
+        assert_eq!(
+            bindings("javascript", javascript),
+            ["anon", "arrow", "named"]
+        );
+        assert_eq!(
+            bindings(
+                "python",
+                "f = lambda value: value\ng = wrap(lambda: 1)\nh = 3\n"
+            ),
+            ["f"]
+        );
+        assert!(syntax("java", "class A {}").is_none());
+    }
+
+    #[test]
+    fn rust_impl_blocks_name_the_type_they_implement() {
+        let text = "impl Budget { fn a() {} }\n\
+             impl<T> fmt::Display for crate::other::Remote<T> { fn b() {} }\n\
+             impl Trait for &mut Holder { fn c() {} }\n";
+        let targets: Vec<_> = syntax("rust", text)
+            .expect("parsed in budget")
+            .impl_targets
+            .into_values()
+            .collect();
+        assert_eq!(targets, ["Budget", "Remote", "Holder"]);
+    }
 }
 
 #[cfg(test)]

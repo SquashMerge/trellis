@@ -436,16 +436,29 @@ const arrow = (value) => value + 1;
 const callback = wrap(() => 4);
 const plain = 5;
 function wrap(f) { return f; }
+const matches = function(value) { return /[}]/.test(value); };
+const closing = function(value) { return /}/.test(value) ? 1 / 2 : 0; };
+const templated = function(name) { return \`}\${name}{\`; };
+const ratio = 4 / 2 / 1;
 `;
-test("Files outlines function-valued bindings from the real producer, not values that contain a closure", {timeout:240000}, async () => published({files:{"bindings.js":bindings}}, async selected => {
+test("Files outlines function-valued bindings and Rust impl targets from the parsed file, not values that contain a closure", {timeout:240000}, async () => published({files:{"bindings.js":bindings, "budget.rs":"pub struct Budget { held: usize }\nimpl Budget {\n    pub fn reserve(&self) -> bool { self.held > 0 }\n}\nimpl std::fmt::Display for crate::other::Remote {\n    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) }\n}\n"}}, async selected => {
   const {page} = selected;
   await enterFiles(selected); await openFile(selected, "bindings.js");
   const dto = await outline(selected, "bindings.js");
   const byName = name => dto.items.find(item => item.symbol.name === name);
-  for (const name of ["handler", "result", "anon", "named", "inner", "arrow", "callback", "plain", "wrap"]) assert.ok(byName(name), `producer emits ${name}: ${JSON.stringify(dto.items.map(item => [item.symbol.name, item.nativeKind]))}`);
+  for (const name of ["handler", "result", "anon", "named", "inner", "arrow", "callback", "plain", "wrap", "matches", "closing", "templated", "ratio"]) assert.ok(byName(name), `producer emits ${name}: ${JSON.stringify(dto.items.map(item => [item.symbol.name, item.nativeKind]))}`);
   await page.locator(`.files-symbol-pick[data-symbol-id="${byName("anon").symbol.id}"]`).waitFor();
   const rows = await page.locator(".files-symbol-pick").evaluateAll(nodes => nodes.map(node => node.querySelector(".files-symbol-name").textContent));
-  assert.deepEqual(rows, ["handler", "anon", "named", "arrow", "wrap"], "function-valued bindings and declarations; no inner name, invoked function, closure-holding value or plain value");
+  assert.deepEqual(rows, ["handler", "anon", "named", "arrow", "wrap", "matches", "closing", "templated"], "function-valued bindings (regex and template braces included) and declarations; no inner name, invoked function, closure-holding value or plain value");
+  // Rust impl blocks: the daemon names the implemented type from the parsed file.
+  await openFile(selected, "budget.rs");
+  const rust = await outline(selected, "budget.rs");
+  const type = rust.items.find(item => item.nativeKind === "type" && item.symbol.name === "Budget");
+  assert.deepEqual(rust.items.filter(item => item.nativeKind === "implementation").map(item => item.implTarget), ["Budget", "Remote"]);
+  await page.locator(`.files-symbol-pick[data-symbol-id="${type.symbol.id}"]`).waitFor();
+  assert.deepEqual(await page.locator(".files-symbol-pick .files-symbol-name").allTextContents(), ["Budget", "Remote"], "no <impl> rows; an impl of a type declared elsewhere is named by that type");
+  await page.locator(".files-symbol-row").filter({has:page.locator(`.files-symbol-pick[data-symbol-id="${type.symbol.id}"]`)}).locator(".files-symbol-toggle").click();
+  assert.deepEqual(await page.locator(".files-symbol-pick .files-symbol-name").allTextContents(), ["Budget", "held", "reserve", "Remote"]);
 }));
 
 // #426: icon plus name on one line, with kind and line right-aligned.

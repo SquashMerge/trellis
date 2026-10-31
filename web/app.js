@@ -1066,12 +1066,11 @@ function appendFilesOutline(li, file) {
   else {
     // Types and callables; a container's members show when it is expanded (#526).
     state.outlineExpanded ||= new Set();
-    const text = status?.revision ? sourceCache.get(`${IndexPin.key(status.revision)}:${file.path}`)?.file.text : undefined;
-    // A newly selected member opens its containers once, when its outline has its source.
-    const reveal = !!filesSymbol && state.outlineRevealed !== filesSymbol && text !== undefined;
+    // A newly selected member opens its containers once; the reader may close them again.
+    const reveal = !!filesSymbol && state.outlineRevealed !== filesSymbol;
     if (reveal) state.outlineRevealed = filesSymbol;
     const shown = window.TrellisFiles?.outline(list, state.outlineItems || [], filesSymbol, selectFilesSymbol, current, {
-      expanded:state.outlineExpanded, sourceText:text, reveal,
+      expanded:state.outlineExpanded, reveal,
       toggle:(key, open) => {
         if (open) state.outlineExpanded.add(key); else state.outlineExpanded.delete(key);
         renderFiles();
@@ -1113,8 +1112,6 @@ async function selectFilesFile(file) {
     showCachedSource(file.path, null, pin, current).catch(error => filesFailure(error, "source-path", current)),
     loadFilesOutline(file),
   ]);
-  // The outline names Rust impl rows from the cached source; render once both are in.
-  if (current()) renderFiles();
 }
 function renderFilesSymbolHeader(item) {
   const symbol = item.symbol, pin = status.revision;
