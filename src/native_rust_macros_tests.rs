@@ -541,3 +541,46 @@ fn items_in_measured_macros_get_their_own_search_cards() {
         expanded.search_cards
     );
 }
+
+/// Items in a macro are not members of a module around it, and format strings are not charged
+/// to the card walk's visit bound: measurement never visits them, so a document it accepted
+/// must not fail there (Decision 0019).
+#[test]
+fn macro_contents_reach_no_outer_card_and_cannot_fail_the_card_walk() {
+    let text = "mod holder {\n    fn member() {}\n    assert!({ fn inner() {} true });\n}\n";
+    let file = rust("src/a.rs", text);
+    let cards = |artifact: &Artifact, name: &str| {
+        let declaration = artifact
+            .declarations
+            .iter()
+            .find(|d| d.name.as_deref() == Some(name))
+            .unwrap();
+        let id = &declaration.syntax_id;
+        let card = artifact.search_cards.iter().find(|c| &c.syntax_id == id);
+        card.unwrap().facts.members.clone()
+    };
+    let expanded = measure(&file, true);
+    assert_eq!(expanded.capability_reports[0].macro_expansions.len(), 1);
+    assert_eq!(cards(&expanded, "holder"), ["member"]);
+
+    let literal = "\\nx".repeat(180_000);
+    let call = format!("    assert!(x, \"{literal}\");\n");
+    let large = format!("fn f(x: bool) {{\n{call}{call}{call}}}\n");
+    let file = rust("src/large.rs", &large);
+    assert_eq!(
+        measure(&file, true).capability_reports[0]
+            .macro_expansions
+            .len(),
+        3
+    );
+}
+
+/// A long macro path is outside the allowlist, whatever its length, and never overflows.
+#[test]
+fn a_very_long_macro_path_stays_an_opaque_gap() {
+    let path = "a::".repeat(650_000);
+    let file = rust("src/path.rs", &format!("fn f() {{ {path}assert!(1); }}\n"));
+    let artifact = measure(&file, true);
+    assert!(artifact.capability_reports[0].macro_expansions.is_empty());
+    assert_eq!(gaps(&artifact).len(), 1);
+}

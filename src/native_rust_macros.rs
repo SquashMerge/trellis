@@ -31,8 +31,7 @@ pub(crate) fn expression_macro(n: Node<'_>, text: &str) -> Option<MacroForm> {
         return None;
     }
     // Match parsed path components, so whitespace or comments between segments do not matter.
-    let mut segments = Vec::new();
-    path_segments(path, text, &mut segments)?;
+    let segments = path_segments(path, text)?;
     let (name, prefix) = segments.split_last()?;
     let prefix = (!prefix.is_empty()).then_some(prefix);
     let std = prefix.is_none_or(|p| matches!(p, ["std" | "core" | "alloc"]));
@@ -56,24 +55,32 @@ pub(crate) fn expression_macro(n: Node<'_>, text: &str) -> Option<MacroForm> {
     }
 }
 
-/// The identifier segments of a macro path; a leading `::` adds none. `None` for any
-/// other path form (`crate`, `self`, `super`, generics), which stays outside the allowlist.
-fn path_segments<'t>(n: Node<'_>, text: &'t str, out: &mut Vec<&'t str>) -> Option<()> {
-    match n.kind() {
-        "identifier" => out.push(text.get(n.byte_range())?),
-        "scoped_identifier" => {
-            if let Some(path) = n.child_by_field_name("path") {
-                path_segments(path, text, out)?;
+/// The identifier segments of a macro path; a leading `::` adds none. `None` for any other
+/// path form (`crate`, `self`, `super`, generics), or one longer than the allowlist's two
+/// segments. Iterative, so a hostile path cannot exhaust the stack.
+fn path_segments<'t>(n: Node<'_>, text: &'t str) -> Option<Vec<&'t str>> {
+    let mut segments = Vec::new();
+    let mut next = Some(n);
+    while let Some(node) = next {
+        let name = match node.kind() {
+            "identifier" => {
+                next = None;
+                node
             }
-            let name = n.child_by_field_name("name")?;
-            if name.kind() != "identifier" {
-                return None;
+            "scoped_identifier" => {
+                next = node.child_by_field_name("path");
+                node.child_by_field_name("name")
+                    .filter(|name| name.kind() == "identifier")?
             }
-            out.push(text.get(name.byte_range())?);
+            _ => return None,
+        };
+        segments.push(text.get(name.byte_range())?);
+        if segments.len() > 2 {
+            return None;
         }
-        _ => return None,
     }
-    Some(())
+    segments.reverse();
+    Some(segments)
 }
 
 /// The macro's delimited token tree.
@@ -194,12 +201,16 @@ impl Expansion {
     }
 }
 
-type MacroSite = (MacroForm, (usize, usize));
+/// An allowlisted macro's form and token tree range.
+type TokenTreeSite = (MacroForm, (usize, usize));
 
 /// The re-parses of a document's allowlisted macros, for readers that start from the plain
-/// tree, where a token tree has no expression nodes. Each macro is parsed once, under the same
-/// byte budget as measurement, through [`parse`] and [`arguments`], so a reader sees what
+/// tree, where a token tree has no expression nodes. Each macro is parsed once, in measurement's
+/// order and under its byte budget, through [`parse`] and [`arguments`], so a reader sees what
 /// measurement saw at the same byte offsets. Node positions are real document positions too.
+/// [`Self::root_for`] reaches only macros on the way to a measured declaration; a macro
+/// [`Self::expand_all`] reaches may have stayed opaque to measurement, so what it yields must
+/// add facts, never bounds that can fail.
 pub(crate) struct Expansions<'s> {
     text: &'s str,
     parser: Option<Parser>,
@@ -254,8 +265,10 @@ impl<'s> Expansions<'s> {
         plain: Node<'_>,
         mut proceed: impl FnMut() -> bool,
     ) -> bool {
+        // A stack in reverse document order: outermost macros in order, each before its nested.
         let mut pending = Vec::new();
         allowlisted_macros(plain, self.text, &mut pending);
+        pending.reverse();
         while let Some((form, key)) = pending.pop() {
             if !proceed() {
                 return false;
@@ -263,7 +276,9 @@ impl<'s> Expansions<'s> {
             if self.expand(form, key)
                 && let Some(arguments) = self.expansion(key).and_then(Expansion::arguments)
             {
+                let nested = pending.len();
                 allowlisted_macros(arguments, self.text, &mut pending);
+                pending[nested..].reverse();
             }
         }
         true
@@ -290,10 +305,10 @@ impl<'s> Expansions<'s> {
     }
 
     fn parse(&mut self, form: MacroForm, (start, end): (usize, usize)) -> Option<Expansion> {
-        self.bytes = self.bytes.saturating_add(end - start);
-        if self.bytes > byte_budget(self.text.len()) {
+        if self.bytes.saturating_add(end - start) > byte_budget(self.text.len()) {
             return None;
         }
+        self.bytes += end - start;
         if self.line_starts.is_empty() {
             self.line_starts.push(0);
             self.line_starts.extend(
@@ -322,7 +337,7 @@ impl<'s> Expansions<'s> {
     }
 }
 
-fn allowlisted(node: Node<'_>, text: &str) -> Option<MacroSite> {
+fn allowlisted(node: Node<'_>, text: &str) -> Option<TokenTreeSite> {
     let form = expression_macro(node, text)?;
     let tree = token_tree(node)?;
     Some((form, (tree.start_byte(), tree.end_byte())))
@@ -330,7 +345,7 @@ fn allowlisted(node: Node<'_>, text: &str) -> Option<MacroSite> {
 
 /// The allowlisted macro directly in this tree whose token tree holds `start..end`, if any:
 /// the first macro on the path from `root` to the range.
-fn enclosing_macro(root: Node<'_>, text: &str, start: usize, end: usize) -> Option<MacroSite> {
+fn enclosing_macro(root: Node<'_>, text: &str, start: usize, end: usize) -> Option<TokenTreeSite> {
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
@@ -348,7 +363,7 @@ fn enclosing_macro(root: Node<'_>, text: &str, start: usize, end: usize) -> Opti
 
 /// The allowlisted macros under `root`, outermost only: a nested one has no syntax here, and
 /// turns up in its parent's expansion. A cursor walk, so nesting cannot exhaust the stack.
-fn allowlisted_macros(root: Node<'_>, text: &str, out: &mut Vec<MacroSite>) {
+fn allowlisted_macros(root: Node<'_>, text: &str, out: &mut Vec<TokenTreeSite>) {
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();

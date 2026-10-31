@@ -1537,3 +1537,27 @@ require=[{calls="any"}]
         "{data}"
     );
 }
+
+/// A macro left opaque by measurement's bounds is no reason to fail: 200 chained terms parse
+/// flat as tokens but deep as an expression.
+#[test]
+fn rules_evaluate_beside_a_macro_measurement_left_opaque() {
+    let terms = vec!["1"; 200].join("+");
+    let input = snapshot(&[(
+        "src/lib.rs",
+        &format!("trait Port {{}}\nfn f() {{ assert!({terms}); }}\n"),
+    )]);
+    let text = r#"version=1
+[roles.implementing]
+select={implements="Port"}
+[roles.any]
+select={paths=["**"]}
+[[rules]]
+id="implements-check"
+for_each="implementing"
+require=[{calls="any"}]
+"#;
+    let config = rules::parse(text).unwrap();
+    let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+}

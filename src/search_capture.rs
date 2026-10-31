@@ -292,9 +292,11 @@ fn attached_doc(node: Node<'_>, file: &SourceFile) -> String {
 }
 
 impl Collector<'_> {
-    /// Every eligible declaration needs a card, including one measured inside a macro. A
-    /// macro's contents give facts only to declarations inside it, so a card outside the
-    /// macro reads the same as if the macro stayed opaque.
+    /// Every eligible declaration needs a card, including one measured inside a macro. This
+    /// walk gives a macro's contents to declarations inside it only; a call measured in a
+    /// macro still reaches its owner's card, through the owner's calls. Measurement bounded
+    /// these nodes, and they include format strings it never visits, so they are not charged
+    /// to the visit bound: expansion never fails a document (Decision 0019).
     fn walk_macro(
         &mut self,
         node: Node<'_>,
@@ -309,8 +311,10 @@ impl Collector<'_> {
             return Ok(());
         };
         let floor = std::mem::replace(&mut self.macro_floor, stack.len());
+        let visits = self.visits;
         let walked = self.walk(arguments, stack, None, depth + 1, false);
         self.macro_floor = floor;
+        self.visits = visits;
         walked
     }
 
