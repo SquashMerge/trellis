@@ -83,8 +83,7 @@ jobs:
           key: ${{ matrix.job }}
           workspaces: ${{ matrix.workspaces }}
           cache-directories: ${{ matrix.job == 'checks' && env.COMPOSITION_TARGET || '' }}
-          # TEMPORARY (#489): prime this PR's mold-keyed caches for a warm measurement; reverted before review.
-          save-if: true
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature-')) }}
       - name: Mark the start of this job's builds
         if: runner.os == 'Linux'
         run: touch "$RUNNER_TEMP/build-start"
