@@ -715,6 +715,41 @@ fn sequence_constructor_can_target_exact_class_declaration() {
     );
 }
 
+/// #522: a step the syntax adapter already hid (a standalone `console.log`) that is also
+/// bound external is incidental once, not hidden twice.
+#[test]
+fn sequence_incidental_step_already_hidden_is_counted_once() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[(
+        "a.js",
+        "function a() { console.log(1); b(); }\nfunction b() {}\n",
+    )]);
+    spec.languages = vec![s::Language::Javascript];
+    spec.bindings = vec![
+        Bind {
+            resolution: s::Resolution::External,
+            dispatch: Dispatch::Unknown,
+            ..bind("a", 0, "b")
+        },
+        bind("a", 1, "b"),
+    ];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    let steps = sequence_steps(&view.steps);
+    assert!(steps[0].hidden);
+    assert_eq!(
+        steps[0].call_evidence.as_ref().unwrap().boundary_reason,
+        BoundaryReason::External
+    );
+    assert_eq!((view.hidden_steps, view.incidental_steps), (1, 1));
+}
+
 #[test]
 fn sequence_source_hints_do_not_consume_resolved_lane_budget() {
     let (state, root) = workspace();

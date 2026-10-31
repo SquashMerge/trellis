@@ -783,13 +783,15 @@ impl Enrichment<'_, '_> {
             });
             // Only a standalone call is incidental: one that already nests steps (an
             // expanded body or a chain) keeps them visible.
+            // A measured call the syntax adapter drew as a boundary (its source-hint lanes
+            // were full) is still a call here: those hint lanes are not drawn.
             if reason == BoundaryReason::External
-                && step.kind == "call"
+                && matches!(step.kind.as_str(), "call" | "boundary")
                 && step.children.is_empty()
                 && step.alternate.is_empty()
             {
                 self.incidental += 1;
-                if !self.show_all {
+                if !self.show_all && !step.hidden {
                     step.hidden = true;
                     self.hidden += 1;
                 }

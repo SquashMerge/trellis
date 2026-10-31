@@ -906,3 +906,16 @@ test("resolved noncallable declaration keeps lane and source action, not a calle
   lane.listeners.click(); assert.equal(opened[0],target);
   assert.equal(peleProjector().project(view).lanes.length,2);
 });
+
+// #522: the server allows a leaf step at depth 24 (the DTO bound); only a deeper step is
+// unsupported.
+test("Pele projects a leaf at the depth-24 bound and refuses a deeper step", () => {
+  const adapter = peleProjector(), base = peleFixture("rust");
+  const nest = levels => {
+    let steps = [{...base.steps[0], id:"leaf", children:[], alternate:[]}];
+    for (let i = levels; i > 0; i--) steps = [{...base.steps[0], id:`n${i}`, kind:"branch", label:"if a", callId:null, children:steps, alternate:[]}];
+    return {...base, steps};
+  };
+  assert.equal(adapter.project(nest(24)).rows.length, 25);
+  assert.throws(() => adapter.project(nest(25)), /Unsupported sequence depth/);
+});
