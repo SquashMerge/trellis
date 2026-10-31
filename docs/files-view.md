@@ -7,7 +7,7 @@ not authorization for Herdr controls, future tabs or gated actions.
 
 ## One checkout and one indexed basis
 
-Files is a real section of the existing shell. Diagrams retains Sequence, Classes, Libraries
+Files is a real section of the existing shell. Diagrams retains Sequence, Classes (when earned, #450)
 and its source dock. Files reuses the same checkout/session/full-pin owner and the existing
 cached workspace-source cache and navigation. It does not create a second source cache or
 independent checkout selection. Entering Files selects no file; arrival after Connect may select the

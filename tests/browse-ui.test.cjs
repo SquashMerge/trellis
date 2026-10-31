@@ -23,6 +23,7 @@ function harness(windowOptions = {}, withMetrics = false) {
       addEventListener(type, handler) { this.listeners[type] = handler; },
       replaceChildren(...items) { this.children = items; },
       append(...items) { this.children.push(...items); },
+      prepend(...items) { this.children.unshift(...items); },
       querySelector() { return null; },
       attrs: {}, setAttribute(key, value) { this.attrs[key] = String(value); }, remove() {},
       click() { downloads.push(this.download); }};
@@ -1575,4 +1576,147 @@ test("selected Git starts while index status is still pending", async () => {
   statusRead.resolve({ok:false,status:409,json:async()=>({error:{code:"storage_busy",message:"Index is unavailable"}})});
   await selection;
   assert.match(h.get("workspace-git").textContent,/independent.*7 uncommitted/);
+});
+
+// #450: in-context library entry from a sequence step, Sequence starting points and
+// the Classes tab gate.
+const libraryCatalog = {state:"ready",catalogId:"catalog-1",workspaceRevision:metricPin,packages:[{id:"cargo:thing@1",ecosystem:"cargo",name:"thing",version:"1.0.0",source:"registry",aliases:["thing"],sourceState:"present",indexState:"complete",warnings:[]}],symbolCount:1,warnings:[]};
+const externalStep = (id, evidence) => ({id,callId:id,kind:"call",label:`${id}()`,path:"src/a.js",range:{startLine:2,endLine:2},children:[],alternate:[],callEvidence:evidence});
+async function selectStepWith(evidence) {
+  const h = harness({}, true);
+  const data = {...view("root"),steps:[externalStep("call", evidence)]};
+  h.context.fetch = async request => {
+    if (request === "/api/dependencies") return response(libraryCatalog);
+    if (request === "/api/sequence") return response(data);
+    if (request.startsWith("/api/dependencies/symbols?")) return response({catalogId:"catalog-1",workspaceRevision:metricPin,items:[],nextOffset:null});
+    throw new Error("Unexpected " + request);
+  };
+  await h.run("refreshDependencies()");
+  await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
+  const pick = descendants(h.get("sequence-diagram")).find(node => node.attrs?.class?.split(" ").includes("sequence-source"));
+  pick.listeners.click();
+  return h;
+}
+const libraryButtons = h => h.get("inspector-detail").children.filter(node => node.textContent === "Open in library");
+test("an external call step into a catalogued package offers Open in library first in the inspector", async () => {
+  const h = await selectStepWith({boundaryReason:"external",resolution:"external",dispatch:"direct",freshness:"fresh",provenanceId:"p",externalPackage:{manager:"cargo",name:"thing",version:"1.0.0"}});
+  assert.equal(h.get("inspector-title").textContent, "call()");
+  assert.equal(libraryButtons(h).length, 1); assert.equal(h.get("inspector-detail").children[0].textContent, "Open in library");
+  await libraryButtons(h)[0].listeners.click(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.run("dependencyPackage.id"), "cargo:thing@1");
+  assert.match(h.get("dependency-state").textContent, /thing 1.0.0 · .*from external call call\(\)/);
+  assert.ok(h.networkUrls.some(url => /\/dependencies\/symbols\?.*packageId=cargo%3Athing%401/.test(url)));
+});
+for (const [name, evidence] of [
+  ["a non-external boundary", {boundaryReason:"unresolved",resolution:"unresolved",externalPackage:{manager:"cargo",name:"thing",version:"1.0.0"}}],
+  ["an uncatalogued package", {boundaryReason:"external",resolution:"external",externalPackage:{manager:"cargo",name:"other",version:"1.0.0"}}],
+  ["an unsupported manager", {boundaryReason:"external",resolution:"external",externalPackage:{manager:"npm",name:"thing",version:"1.0.0"}}],
+  ["no named package", {boundaryReason:"external",resolution:"external"}],
+]) test(`a step with ${name} offers no library entry`, async () => {
+  const h = await selectStepWith(evidence);
+  assert.equal(h.get("inspector-title").textContent, "call()");
+  assert.equal(libraryButtons(h).length, 0);
+});
+
+const topRow = (name, cognitive, extra = {}) => ({sourceSetId:"main",language:"javascript",path:`src/${name || "anon"}.js`,sid:`sid:v1:${name || "anon"}`,range:{start:0,end:10},name,kind:"function",role:"production",metrics:{cognitive,cyclomatic:1,maxNesting:1},...extra});
+const topRows = [topRow("one",9),topRow(null,8),topRow("two",7),topRow("three",6),topRow("four",5),topRow("five",4),topRow("six",3)];
+async function startHarness(sequence) {
+  const h = harness({}, true), posts = [];
+  h.context.fetch = async (request, options) => {
+    if (request.startsWith("/api/metrics?")) return response({payload:{...metricPin,workbench:true,metricsVersion:"metrics:v1",scope:"revision",aggregate:"max",role:"production",files:[],directories:[],topCognitive:topRows},catchingUp:false});
+    if (request === "/api/sequence") { posts.push(JSON.parse(options.body)); return response(sequence(JSON.parse(options.body))); }
+    throw new Error("Unexpected " + request);
+  };
+  await h.run("viewerMetrics.refresh()");
+  return {h, posts};
+}
+test("with no method selected Sequence lists at most five named highest-cognitive callables as text", async () => {
+  const {h} = await startHarness(() => { throw new Error("no sequence yet"); });
+  assert.equal(new URL(h.networkUrls.find(url => url.includes("/metrics?")), "http://test").searchParams.get("topCognitive"), "8");
+  assert.equal(h.get("sequence-start").hidden, false);
+  const buttons = h.get("sequence-start-list").children.map(item => item.children[0]);
+  assert.deepEqual(buttons.map(button => button.textContent), ["one", "two", "three", "four", "five"], "anonymous rows skipped, five at most");
+  assert.equal(buttons[0].children[0].textContent, "src/one.js · function · cognitive 9");
+  assert.match(h.get("sequence-start-note").textContent, /Highest cognitive complexity · production callables/);
+  h.run("viewerMetrics.reset()");
+  assert.equal(h.get("sequence-start").hidden, true, "no usable projection, no list");
+});
+test("a starting callable opens its sequence at the exact sid and pin, then the list hides", async () => {
+  const {h, posts} = await startHarness(body => ({...view(body.seed), seed:{...symbol(body.seed), id:body.seed}}));
+  await h.get("sequence-start-list").children[1].children[0].listeners.click();
+  assert.deepEqual(posts, [{seed:"sid:v1:two",expectedRevision:metricPin,showAll:false}]);
+  assert.equal(h.run("selectedMethod.id"), "sid:v1:two");
+  assert.equal(h.get("sequence-start").hidden, true);
+  assert.equal(h.get("sequence-start-list").children.length, 0);
+});
+test("a starting callable whose sequence names another seed displays nothing", async () => {
+  const {h} = await startHarness(() => view("other"));
+  await h.get("sequence-start-list").children[0].children[0].listeners.click();
+  assert.equal(h.run("selectedMethod"), null);
+  assert.match(h.get("error").textContent, /provenance mismatch/); assert.equal(h.get("error").hidden, false);
+  assert.equal(h.get("sequence-start").hidden, false);
+});
+
+const languageFile = (language, extra = {}) => ({path:`src/x.${language}`,sourceSetId:"main",language,declarationCount:1,roleCounts:{production:1,test:0},metrics:{cognitive:1},...extra});
+async function classGate(files, supportedLanguages = ["java","python","javascript"]) {
+  const h = harness({}, true), classRequests = [];
+  h.context.fetch = async request => {
+    if (request.startsWith("/api/metrics?")) return response({payload:{...metricPin,workbench:true,metricsVersion:"metrics:v1",scope:"revision",aggregate:"max",role:"production",files,directories:[],topCognitive:[]},catchingUp:false});
+    if (request.startsWith("/api/classes?")) { classRequests.push(request); return response({revision:metricPin,items:[],nextOffset:null,truncated:false,warnings:[],requireIndex:false,supportedLanguages}); }
+    throw new Error("Unexpected " + request);
+  };
+  await h.run("viewerMetrics.refresh()"); await new Promise(resolve => setImmediate(resolve));
+  return {h, classRequests};
+}
+test("Classes shows when production code is in a class-catalog language, read once per pin", async () => {
+  const {h, classRequests} = await classGate([languageFile("javascript"), languageFile("rust")]);
+  assert.equal(classRequests.length, 1);
+  const query = new URL(classRequests[0], "http://test").searchParams;
+  assert.equal(query.get("indexGeneration"), metricPin.indexGeneration); assert.equal(query.get("indexRevision"), "1"); assert.equal(query.get("limit"), "1");
+  assert.equal(h.get("view-classes").hidden, false);
+  await h.run("viewerMetrics.refresh()"); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(classRequests.length, 1, "supported languages are read once per pin");
+  h.run("viewerMetrics.reset()");
+  assert.equal(h.get("view-classes").hidden, true, "unknown languages hide Classes");
+});
+test("Classes stays hidden for production code outside the catalog's supported languages", async () => {
+  const {h, classRequests} = await classGate([languageFile("rust")]);
+  assert.equal(classRequests.length, 1); assert.equal(h.get("view-classes").hidden, true);
+  const later = await classGate([languageFile("rust")], ["java","python","javascript","rust"]);
+  assert.equal(later.h.get("view-classes").hidden, false, "the gate follows the API, not a fixed list");
+});
+test("Classes stays hidden without production code and never asks the class catalog", async () => {
+  for (const files of [[], [languageFile("java", {roleCounts:{production:0,test:3}})], [languageFile("java", {excludedReason:"fixture"})]]) {
+    const {h, classRequests} = await classGate(files);
+    assert.equal(classRequests.length, 0, JSON.stringify(files)); assert.equal(h.get("view-classes").hidden, true);
+  }
+});
+test("an aborted class-support read is forgotten and asked again at the same pin; a checkout reset forgets support", async () => {
+  const h = harness({}, true), classRequests = [];
+  h.context.fetch = async request => {
+    if (request.startsWith("/api/metrics?")) return response({payload:{...metricPin,workbench:true,metricsVersion:"metrics:v1",scope:"revision",aggregate:"max",role:"production",files:[languageFile("java")],directories:[],topCognitive:[]},catchingUp:false});
+    if (request.startsWith("/api/classes?")) {
+      classRequests.push(request);
+      if (classRequests.length === 1) throw new DOMException("Superseded request", "AbortError");
+      return response({revision:metricPin, items:[], supportedLanguages:["java"]});
+    }
+    throw new Error("Unexpected " + request);
+  };
+  await h.run("viewerMetrics.refresh()"); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(classRequests.length, 1); assert.equal(h.get("view-classes").hidden, true);
+  assert.equal(h.run("classSupport"), null, "an aborted read does not pin the tab hidden");
+  await h.run("viewerMetrics.refresh()"); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(classRequests.length, 2); assert.equal(h.get("view-classes").hidden, false);
+  h.run("resetCheckout()");
+  assert.equal(h.run("classSupport"), null);
+});
+test("an unavailable class catalog keeps Classes hidden", async () => {
+  const h = harness({}, true);
+  h.context.fetch = async request => {
+    if (request.startsWith("/api/metrics?")) return response({payload:{...metricPin,workbench:true,metricsVersion:"metrics:v1",scope:"revision",aggregate:"max",role:"production",files:[languageFile("java")],directories:[],topCognitive:[]},catchingUp:false});
+    if (request.startsWith("/api/classes?")) return {ok:false,status:503,json:async()=>({error:{code:"unavailable",message:"down"}})};
+    throw new Error("Unexpected " + request);
+  };
+  await h.run("viewerMetrics.refresh()"); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.get("view-classes").hidden, true);
 });

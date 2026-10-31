@@ -56,6 +56,8 @@ pub struct Spec {
     pub declaration_bindings: Vec<String>,
     /// Provenance IDs for declaration bindings, by declaration name; the default is `decl-<name>`.
     pub declaration_proofs: BTreeMap<String, String>,
+    /// SCIP symbol of every external binding target.
+    pub external_symbol: String,
 }
 
 impl Spec {
@@ -72,6 +74,7 @@ impl Spec {
             bindings: vec![],
             declaration_bindings: vec![],
             declaration_proofs: BTreeMap::new(),
+            external_symbol: "pkg outside".into(),
         }
     }
     pub fn syntax_only(files: &[(&str, &str)]) -> Self {
@@ -211,11 +214,11 @@ fn canonical_target(target: &s::Target) -> Vec<u8> {
     native_ids::canonical(&serde_json::to_value(target).unwrap())
 }
 
-fn external() -> s::Target {
+fn external(symbol: &str) -> s::Target {
     s::Target::External {
         symbol: s::SymbolKey {
             scheme: s::SymbolScheme::Scip,
-            symbol: "pkg outside".into(),
+            symbol: symbol.into(),
             scope: s::SymbolScope::Global,
             document: None,
         },
@@ -369,8 +372,8 @@ fn evidence(
         let target = || target_of(native, b.target.as_deref().unwrap());
         let (declared_target, mut candidates) = match b.resolution {
             s::Resolution::Resolved => (Some(target()), vec![]),
-            s::Resolution::External => (Some(external()), vec![]),
-            s::Resolution::Ambiguous => (None, vec![target(), external()]),
+            s::Resolution::External => (Some(external(&spec.external_symbol)), vec![]),
+            s::Resolution::Ambiguous => (None, vec![target(), external(&spec.external_symbol)]),
             s::Resolution::Unresolved => (None, vec![]),
         };
         candidates.sort_by_key(canonical_target);

@@ -25,6 +25,10 @@ A measured call step may contain `callEvidence`:
   `dispatch`, `stale`, `nodeLimit`, or `missingEvidence`.
 - Optional `resolution`, `dispatch`, `freshness`, and `provenanceId`: the selected semantic
   binding/provenance fields, not the older graph-model resolution enum.
+- Optional `externalPackage` `{manager,name,version}` (#450): only for `external`, the package
+  field of the selected binding's SCIP symbol (`version` null for `.`); absent for local or
+  malformed symbols. It is a producer claim for in-context library lookup, never a target,
+  lane or resolved library declaration.
 - `target`: present only for a fresh exact resolved internal direct/constructor target
   located in this snapshot. It is the exact participant ID, not lexical receiver text.
 

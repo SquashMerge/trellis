@@ -72,6 +72,9 @@ test("published JavaScript classes render through Pele with members, menus and m
     const catalog = await read("GET", `classes?${new URLSearchParams({q:"", offset:"0", limit:"100", ...pin})}`);
     assert.ok(catalog.supportedLanguages.includes("javascript"), JSON.stringify(catalog.supportedLanguages));
     assert.deepEqual(catalog.items.map(item => item.qualifiedName).sort(), ["view.View", "widgets.Panel", "widgets.Widget"]);
+    // #450: production JavaScript is class-catalog code, so the Classes tab earns its place.
+    await page.locator("#view-classes").waitFor({state:"visible"});
+    assert.deepEqual(await page.getByRole("tablist", {name:"Workspace views"}).getByRole("tab").allTextContents(), ["Architecture", "Treemap", "Sequence", "Classes"]);
     const widget = catalog.items.find(item => item.qualifiedName === "widgets.Widget");
     assert.equal(widget.language, "javascript");
 
@@ -186,5 +189,24 @@ test("published Rust types merge impl methods across files and render through Pe
     const sequence = requests.filter(row => row.url.pathname.endsWith("/sequence")).at(-1);
     assert.equal(sequence.body.seed, balance.symbolId);
     assert.deepEqual(sequence.body.expectedRevision, pin);
+  });
+});
+
+// #450: the class catalog indexes test classes too, but only production code in a
+// supported language shows the tab, with or without tests in the metric population.
+test("Classes stays hidden when the checkout's class-catalog code is test-only", {timeout:240000}, async () => {
+  await withApp([["widgets.test.js", widgets], ["view.test.js", view]], async ({page, pin, read, requests}) => {
+    const catalog = await read("GET", `classes?${new URLSearchParams({q:"", offset:"0", limit:"100", ...pin})}`);
+    assert.ok(catalog.supportedLanguages.includes("javascript"));
+    assert.ok(catalog.items.length > 0, "test classes are catalogued");
+    const tabs = page.getByRole("tablist", {name:"Workspace views"}).getByRole("tab");
+    await page.waitForFunction(() => /Indexed snapshot/.test(document.querySelector("#metrics-state")?.textContent || ""));
+    assert.equal(await page.locator("#view-classes").isVisible(), false);
+    assert.deepEqual(await tabs.allTextContents(), ["Architecture", "Treemap", "Sequence"]);
+    assert.equal(requests.some(row => row.url.pathname.endsWith("/classes")), false, "no production code: the class catalog is not asked");
+    await H.reveal(page, "#metric-include-tests");
+    await page.locator("#metric-include-tests").check();
+    await page.waitForFunction(() => /all indexed callables/.test(document.querySelector("#metrics-state")?.textContent || ""));
+    assert.equal(await page.locator("#view-classes").isVisible(), false, "test code never earns the tab");
   });
 });

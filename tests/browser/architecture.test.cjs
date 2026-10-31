@@ -110,7 +110,8 @@ async function published(config, callback, extra = new Map()) {
         assert.ok(Array.isArray(row.body.operations));
       }
     }
-    for (const row of requests.filter(row => row.url.pathname.endsWith("/source"))) {
+    // Library candidate source is catalog-bound, not a workspace pin read.
+    for (const row of requests.filter(row => row.url.pathname.endsWith("/source") && !row.url.pathname.endsWith("/dependencies/source"))) {
       assert.equal(row.url.searchParams.get("indexGeneration"), pin.indexGeneration);
       assert.equal(row.url.searchParams.get("indexRevision"), String(pin.indexRevision));
     }
@@ -953,3 +954,60 @@ test("Architecture malformed rules preserve the typed located error and no parti
   assert.ok(message.includes(error.path)); assert.ok(message.includes(String(error.line)));
   assert.equal(await selected.page.locator("#architecture-diagram svg, #architecture-diagram [data-trellis-module-id], #architecture-diagram [data-trellis-edge-id]").count(), 0);
 }));
+
+// #450: Libraries is no tab; a reference into a catalogued external package opens it in context.
+// A registry dependency is a proven external package; its source comes from the local
+// Cargo cache, which the catalog reads only on refresh.
+const libraryFiles = new Map([
+  ["Cargo.toml", "[package]\nname='browser-app'\nversion='0.1.0'\n[dependencies]\nlocal-library='0.1'\n"],
+  ["Cargo.lock", "version=4\n[[package]]\nname='browser-app'\nversion='0.1.0'\ndependencies=['local-library']\n[[package]]\nname='local-library'\nversion='0.1.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\n"],
+  ["src/uses_library.rs", "use local_library::candidate_only;\npub fn uses_library() { candidate_only(); }\n"],
+  ["src/lib.rs", `${sources.get("src/lib.rs")}pub mod uses_library;\n`],
+]);
+test("Architecture opens an external package reference in the library catalog, without a Libraries tab", {timeout:240000}, async () => published(rules, async selected => {
+  const {page, paths, server, requests} = selected;
+  assert.equal(await page.locator("#view-libraries, #dependency-library").count(), 0, "the Libraries tab and its route are gone");
+  assert.equal(await page.locator("#dock-library").isVisible(), false, "no library dock tab before an in-context open");
+  const cached = join(paths.cargoHome, "registry/src/cache/local-library-0.1.0");
+  mkdirSync(join(cached, "src"), {recursive:true});
+  writeFileSync(join(cached, "Cargo.toml"), "[package]\nname='local-library'\nversion='0.1.0'\n");
+  writeFileSync(join(cached, "src/lib.rs"), "// <img src=x onerror='globalThis.libraryExecuted=true'>\npub fn candidate_only() {}\n");
+  // Serve registration can leave the automatic catalog loading; request it and wait.
+  const started = await H.api(server.base, paths.token, "POST", H.scoped(server.rootKey, "dependencies/refresh"), {});
+  assert.equal(started.status, 202, JSON.stringify(started.data));
+  for (const deadline = Date.now() + 30000; ;) {
+    const catalog = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "dependencies"));
+    if (catalog.data.state === "ready") { assert.ok(catalog.data.packages.some(pkg => pkg.name === "local-library"), JSON.stringify(catalog.data)); break; }
+    assert.ok(Date.now() < deadline && !["failed", "disabled"].includes(catalog.data.state), JSON.stringify(catalog.data));
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  const catalogRead = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/dependencies"));
+  await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
+  assert.equal((await (await catalogRead).json()).state, "ready");
+  await ready(page);
+  await page.locator("#architecture-notices > summary").click();
+  await page.getByRole("button", {name:"Inspect same-layer and unassigned references", exact:true}).click(); await settled(page);
+  const pair = page.locator("#architecture-inspector-content details").filter({has:page.locator(":scope > summary", {hasText:/src\/uses_library\.rs → local[-_]library \(rust package\)/})}).first();
+  await pair.locator(":scope > summary").click();
+  const open = pair.getByRole("button", {name:"Open in library", exact:true});
+  assert.equal(await open.count(), 1);
+  assert.equal(await page.locator("#architecture-inspector-content button").filter({hasText:"Open in library"}).count(), 1, "only the catalogued package offers the library");
+  await open.click();
+  await page.locator("#library-source-panel").waitFor();
+  assert.equal(await page.locator("#dock-library").getAttribute("aria-selected"), "true");
+  await page.waitForFunction(() => /local-library 0\.1\.0.*Architecture reference/.test(document.querySelector("#dependency-state")?.textContent || ""));
+  const definition = page.locator("#dependency-symbols button").filter({hasText:"candidate_only"});
+  await definition.waitFor();
+  await definition.click();
+  await page.waitForFunction(() => /immutable candidate snapshot/.test(document.querySelector("#external-source-path")?.textContent || ""));
+  assert.match(await page.locator("#external-source").textContent(), /pub fn candidate_only\(\) \{\}/);
+  assert.equal(await page.locator("#external-source img").count(), 0);
+  assert.equal(await page.evaluate(() => globalThis.libraryExecuted), undefined);
+  assert.match(await page.locator("#external-source-hint").textContent(), /Workspace diagrams are unavailable/);
+  assert.equal(await page.locator("#external-source .source-diagram-action").count(), 0);
+  await page.locator("#external-source").focus(); await page.keyboard.press("Shift+F10");
+  assert.equal(await page.locator(".classes-context-menu").count(), 0, "external source has no workspace action menu");
+  await page.keyboard.press("Escape");
+  assert.equal(await page.locator("#architecture-inspector").isVisible(), true, "the reference inspection stays open");
+  assert.ok(!requests.some(row => /\/(sequence|navigation)$/.test(row.url.pathname)), "library candidates never seed workspace sequences");
+}, libraryFiles));

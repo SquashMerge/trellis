@@ -396,6 +396,11 @@ async fn published_sequence_api_pairs_every_call_and_target_with_exact_pin() {
         .find(|participant| participant["id"] == target)
         .unwrap();
     assert_eq!(participant["declaration"]["path"], "target.rs");
+    assert!(
+        steps
+            .iter()
+            .all(|step| step["callEvidence"].get("externalPackage").is_none())
+    );
     std::fs::remove_file(workspace.join("target.rs")).unwrap();
     assert_eq!(
         call(
@@ -407,5 +412,66 @@ async fn published_sequence_api_pairs_every_call_and_target_with_exact_pin() {
         .await
         .1,
         view
+    );
+}
+
+// #450: an external binding names its SCIP package for in-context library lookup; it
+// still creates no target, lane or declaration.
+#[tokio::test]
+async fn published_sequence_api_names_the_scip_package_of_external_calls() {
+    use graph_fixtures::{Publisher, Spec, bind, syntax_id};
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut publisher = Publisher::open(&dir.path().join("state"), &workspace);
+    let mut spec = Spec::new(&[
+        ("a.rs", "fn a() { decoy(); decoy(); }\nfn decoy() {}\n"),
+        ("target.rs", "fn actual_target() {}\n"),
+    ]);
+    spec.external_symbol = "rust-analyzer cargo local-library 0.1.0 candidate_only().".into();
+    let mut bound = bind("a", 0, "actual_target");
+    bound.resolution = trellis::semantic_evidence::Resolution::External;
+    spec.bindings = vec![bound];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let app = http::router(
+        http::new(
+            publisher.store.clone(),
+            IndexOptions::new(workspace.clone()),
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let (status, view) = call(
+        &app,
+        "POST",
+        "/api/sequence",
+        json!({"seed":seed,"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    let steps = view["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2, "{view}");
+    assert_eq!(steps[0]["callEvidence"]["boundaryReason"], "external");
+    assert_eq!(
+        steps[0]["callEvidence"]["externalPackage"],
+        json!({"manager":"cargo","name":"local-library","version":"0.1.0"})
+    );
+    assert!(steps[0].get("target").is_none());
+    // The unbound second call has no binding and so no package.
+    assert_eq!(
+        steps[1]["callEvidence"]["boundaryReason"],
+        "missingEvidence"
+    );
+    assert!(steps[1]["callEvidence"].get("externalPackage").is_none());
+    assert!(
+        view["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(
+                |participant| participant.get("declaration").is_none() || participant["id"] == seed
+            )
     );
 }

@@ -20,7 +20,9 @@
     halstead:"Halstead", fanIn:"Fan-in", fanOut:"Fan-out (call sites)", parameters:"Parameters", exits:"Exits"};
   const colorNames = {cognitive:"Cognitive", cyclomatic:"Cyclomatic", maxNesting:"Max nesting", maintainabilityIndex:"Maintainability",
     "halstead.volume":"Halstead volume", fanOut:"Fan-out"};
-  function create({request, context, onConflict = () => {}, onChange = () => {}}) {
+  // Sequence starts from these highest-cognitive callables (#450); the API allows 1..10.
+  const START_CALLABLES = 8;
+  function create({request, context, onConflict = () => {}, onChange = () => {}, onOpenCallable = null}) {
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, epoch = 0, refreshSerial = 0, inspectionSerial = 0;
     let projection = null, projectionGuard = null, selected = null, loading = false;
     let decorations = [];
@@ -71,7 +73,7 @@
         query.set("path", row.path); query.set("sourceSetId", row.sourceSetId);
         if (scope === "file") query.set("language", row.language);
         query.set("topCognitive", "3");
-      }
+      } else query.set("topCognitive", String(START_CALLABLES));
       return `/api/metrics?${query}`;
     }
     function payloadOf(data, guard, scope) {
@@ -139,8 +141,16 @@
       target?.append(make("li", `Highest cognitive complexity · ${population()} · raw callable scores`));
       if (!top?.length) { target?.append(make("li", `No ${callables()}.`)); return; }
       for (const row of top) {
-        const item = make("li");
-        item.append(make("strong", row.name ?? "Anonymous function"),
+        const item = make("li"), guard = capture();
+        // A named callable's exact sid opens its sequence at this pin; anonymous rows stay text.
+        const openable = row.name != null && typeof onOpenCallable === "function";
+        const name = openable ? make("button", row.name) : make("strong", row.name ?? "Anonymous function");
+        if (openable) {
+          name.type = "button"; name.className = "metric-top-open";
+          name.title = "Open this method's sequence";
+          name.addEventListener("click", () => { if (current(guard)) onOpenCallable(row, guard.pin); });
+        }
+        item.append(name,
           make("span", ` · ${row.role} · ${row.kind} · ${row.sourceSetId} · ${row.language} · ${row.path} · UTF-8 bytes [${row.range?.start}, ${row.range?.end})`),
           make("span", ` · Cognitive ${display(row.metrics?.cognitive)} · Cyclomatic ${display(row.metrics?.cyclomatic)} · Max nesting ${display(row.metrics?.maxNesting)}`));
         target?.append(item);
@@ -244,7 +254,17 @@
       if (!["max", "sum", "mean"].includes(event.target.value) || aggregate === event.target.value) return;
       aggregate = event.target.value; void refresh();
     });
-    return {reset, refresh, inspect, clearInspection, decorate, renderLegend, indexedDirectory};
+    // Languages with production callables outside excluded paths, from the current
+    // projection's stored roles; null until that projection is usable.
+    function productionLanguages() {
+      if (!usable()) return null;
+      return new Set(projection.files.filter(row => !row.excludedReason && row.roleCounts?.production > 0).map(row => row.language));
+    }
+    // The projection's highest-cognitive callables with their pin; null until usable.
+    function topCallables() {
+      return usable() && Array.isArray(projection.topCognitive) ? {rows:projection.topCognitive, pin:projectionGuard.pin, population:population()} : null;
+    }
+    return {reset, refresh, inspect, clearInspection, decorate, renderLegend, indexedDirectory, productionLanguages, topCallables};
   }
   window.TrellisMetrics = {create, quartiles, band, metricValue};
 })();

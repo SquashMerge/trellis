@@ -79,12 +79,15 @@ test("automatic workspace status refresh requests only catalog metadata; optiona
  h.context.fetch=async url=>{requests.push(url);if(url==="/api/status")return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},stats:{}});if(url==="/api/dependencies")return response(catalog());if(url.startsWith("/api/tree?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},path:"",root:"/synthetic",items:[],nextOffset:null});throw Error(url);};
  await h.run("refreshStatus()"); await new Promise(setImmediate);
  assert.deepEqual(requests,["/api/status","/api/tree?path=&offset=0&limit=200","/api/dependencies"]);
- assert.match(text(h.get("dependency-packages")),/thing 1.2.3.*source: present.*index: partial.*thing_alias/s);
+ // No tab lists packages (#450); status refresh only records the catalog for in-context entry.
+ assert.equal(h.get("dependency-packages").children.length,0);
+ assert.equal(h.run("dependencyCatalog.catalogId"),"catalog-1");
  assert.match(text(h.get("dependency-warnings")),/<b>not semantic<\/b>/);
  assert.equal(descendants(h.get("dependency-warnings")).some(n=>n.tagName==="b"),false);
  h.context.fetch=async url=>{if(url==="/api/status")return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},stats:{}});if(url.startsWith("/api/tree?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},path:"",root:"/synthetic",items:[],nextOffset:null});throw Error("old daemon");};
  await h.run("refreshStatus()"); await new Promise(setImmediate);
- assert.match(h.get("dependency-state").textContent,/unavailable/); assert.equal(h.get("error").hidden,true);
+ assert.equal(h.run("dependencyCatalog"),null); assert.equal(h.get("error").hidden,true);
+ assert.equal(h.run("libraryAction({ecosystem:'rust',name:'thing',origin:'test'})"),null,"an unavailable catalog offers no library entry");
 });
 test("package, paged declaration filter, and explicit source browsing preserve the primary workspace",async()=>{
  const h=harness(), requests=[];
@@ -94,8 +97,8 @@ test("package, paged declaration filter, and explicit source browsing preserve t
  const params=new URL(url,"http://local").searchParams;
  if(params.get("offset")==="100")return response(symbols([{...symbol,id:"second",name:"Second",qualifiedName:"thing::Second"}]));
  return response(symbols([symbol],100));};
- await h.get("dependency-refresh").listeners.click();
- await click(h.get("dependency-packages"),"thing 1.2.3");
+ await h.run("refreshDependencies()");
+ await h.run("openLibrary(libraryPackages({ecosystem:'rust',name:'thing'}),{name:'thing',origin:'test'})");
  assert.equal(requests.length,2); assert.match(requests[1],/packageId=cargo%3Athing%401.*offset=0&limit=100/);
  assert.equal(h.get("dependency-next").disabled,false);
  await h.get("dependency-next").listeners.click(); assert.match(requests.at(-1),/offset=100/);
@@ -117,16 +120,17 @@ test("package, paged declaration filter, and explicit source browsing preserve t
  assert.equal(h.get("sequence-diagram").textContent,"diagram");assert.equal(h.get("source").textContent,"workspace source");
  assert.ok(requests.every(url=>url.startsWith("/api/dependencies")));
 });
-for(const state of ["loading","failed","disabled"]) test(`${state} status remains honest with manual refresh and no background polling`,async()=>{
+for(const state of ["loading","failed","disabled"]) test(`${state} catalog offers no library entry and no background polling`,async()=>{
  const h=harness(); let count=0;
- h.context.fetch=async()=>{count++;return response({...catalog(),state,catalogId:null,packages:[],symbolCount:0});};
- await h.run("refreshDependencies()"); assert.match(h.get("dependency-state").textContent,new RegExp(state));
+ h.context.fetch=async()=>{count++;return response({...catalog(),state,catalogId:null,symbolCount:0});};
+ await h.run("refreshDependencies()");
  assert.equal(h.timers.size,0);assert.equal(count,1);assert.equal(h.get("dependency-packages").children.length,0);
- await h.get("dependency-refresh").listeners.click();assert.equal(count,2);
+ assert.equal(h.run("libraryPackages({ecosystem:'rust',name:'thing'}).length"),0);
+ assert.equal(h.run("libraryAction({ecosystem:'rust',name:'thing',origin:'test'})"),null);
 });
 test("empty catalog and missing package declarations show source and index limitations",async()=>{
  const h=harness();h.context.fetch=async()=>response({...catalog(),packages:[]});await h.run("refreshDependencies()");
- assert.match(text(h.get("dependency-packages")),/No supported library packages/);
+ assert.equal(h.run("libraryAction({ecosystem:'rust',name:'thing',origin:'test'})"),null);
  await ready(h);h.context.fetch=async()=>response(symbols([]));await h.run(`selectDependencyPackage(${JSON.stringify({...pkg,sourceState:"missing",indexState:"skipped"})})`);
  assert.match(h.get("dependency-symbol-state").textContent,/No indexed definitions.*missing.*skipped/);
 });
@@ -161,7 +165,7 @@ test("newer catalog status wins over obsolete failures",async()=>{
 test("source conflicts remain local and require status refresh; no implicit request",async()=>{
  const h=harness();await select(h);let requests=0;h.context.fetch=async()=>{requests++;return {ok:false,status:409,json:async()=>({error:{message:"Source changed"}})};};
  await h.run(`loadDependencySource(${JSON.stringify(symbol)})`);assert.equal(requests,1);assert.equal(h.run("externalSnapshot"),null);
- assert.match(h.get("external-source-path").textContent,/Source changed.*Refresh library status/);assert.equal(h.get("error").hidden,true);assert.equal(h.run("selectedMethod"),null);
+ assert.match(h.get("external-source-path").textContent,/Source changed.*Refresh status.*open the library again/);assert.equal(h.get("error").hidden,true);assert.equal(h.run("selectedMethod"),null);
 });
 test("mismatched declaration/source provenance never paints",async()=>{
  const h=harness();await ready(h);h.context.fetch=async()=>response(symbols([symbol],null,"other"));await h.run(`selectDependencyPackage(${JSON.stringify(pkg)})`);
@@ -169,19 +173,19 @@ test("mismatched declaration/source provenance never paints",async()=>{
  await select(h);h.context.fetch=async()=>response({...snapshot(),definitions:[]});await h.run(`loadDependencySource(${JSON.stringify(symbol)})`);
  assert.equal(h.run("externalSnapshot"),null);assert.match(h.get("external-source-path").textContent,/provenance mismatch/);
 });
-test("package changes and manual file clicks supersede pending catalog source",async()=>{
+test("package changes supersede pending catalog source",async()=>{
  const h=harness();await select(h);const old=deferred();h.context.fetch=()=>old.promise;const pending=h.run(`loadDependencySource(${JSON.stringify(symbol)})`);
  h.context.fetch=async()=>response(symbols());await h.run(`selectDependencyPackage(${JSON.stringify(pkg)})`);old.resolve(response(snapshot()));await pending;
  assert.equal(h.run("externalSnapshot"),null);
- const late=deferred();h.context.fetch=()=>late.promise;const p=h.run(`loadDependencySource(${JSON.stringify(symbol)})`);
- h.context.fetch=async()=>response({...snapshot(),rootId:"manual",path:"manual.rs",hash:"manual"});await h.run("loadExternalFile({id:'manual',label:'Manual'},'manual.rs')");
- late.resolve(response(snapshot()));await p;assert.equal(h.run("externalSnapshot.hash"),"manual");
 });
-test("UI keeps catalog visible and manual roots collapsed; flags do not claim semantic resolution",()=>{
+test("no Libraries tab or manual roots; the in-context library dock does not claim semantic resolution (#450)",()=>{
  const html=fs.readFileSync("web/index.html","utf8");
- assert.match(html,/<section id="dependency-library"/);assert.doesNotMatch(html,/<details id="external-sources"[^>]*\bopen/);
+ for(const removed of ['id="dependency-library"','id="view-libraries"','id="external-sources"','id="external-load"','id="dependency-refresh"']) assert.ok(!html.includes(removed),removed);
  assert.match(html,/Syntax candidates/);assert.match(html,/Terminal library boundary/);assert.match(html,/do not prove resolved types/);
- assert.ok(html.indexOf('id="sequence-diagram"')<html.indexOf('id="dependency-library"'));
+ const panel=html.indexOf('id="library-source-panel"');
+ assert.ok(panel>html.indexOf('id="source-dock"'));
+ for(const id of ["dependency-state","dependency-symbols","dependency-packages","external-source"]) assert.ok(html.indexOf(`id="${id}"`)>panel,id);
+ assert.match(html,/<button id="dock-library"[^>]*\bhidden/);
 });
 
 test("connect and completed workspace index automatically refresh metadata, never source",async()=>{
@@ -210,11 +214,10 @@ test("old package results cannot replace a new filter page",async()=>{
  old.resolve(response(symbols()));await pending;assert.match(text(h.get("dependency-symbols")),/Fresh/);assert.doesNotMatch(text(h.get("dependency-symbols")),/Client/);
 });
 
-test("catalog readiness tells an existing method selection to refresh without replacing its diagram",async()=>{
+test("catalog readiness never replaces an existing method diagram",async()=>{
  const h=harness(),requests=[];h.run("selectedMethod={id:'keep'}; $('sequence-diagram').textContent='keep diagram'");
  h.context.fetch=async url=>{requests.push(url);return response({...catalog(),state:'loading',catalogId:null});};await h.run("refreshDependencies()");
  h.context.fetch=async url=>{requests.push(url);return response(catalog());};await h.run("refreshDependencies()");
- assert.match(h.get("dependency-state").textContent,/Reselect the workspace method.*syntax-candidate lanes/);
  assert.equal(h.get("sequence-diagram").textContent,"keep diagram");assert.equal(h.run("selectedMethod.id"),"keep");
  assert.deepEqual(requests,["/api/dependencies","/api/dependencies"]);
 });
@@ -225,7 +228,7 @@ test("dependency catalog with reused revision and old generation is rejected",as
   h.context.fetch=async url=>{if(url==='/api/dependencies')return response(catalog());throw Error(url);};
   await h.run('refreshDependencies()');
   assert.equal(h.run('dependencyCatalog'),null);
-  assert.match(h.get('dependency-state').textContent,/another workspace revision/);
+  assert.equal(h.run("libraryAction({ecosystem:'rust',name:'thing',origin:'test'})"),null);
 });
 
 test("library status and definition pages reject reused numeric revisions, clear stale panels, and refresh status",async()=>{
@@ -303,4 +306,58 @@ test("finished indexing states its published revision rather than borrowing the 
  assert.equal(h.get("job").textContent,"Indexing · parse · 5/9");
  h.run('job={id:"bad",state:"failed",error:"disk full"};waitingForJob=false;showJob()');
  assert.match(h.get("job").textContent,/^Index failed · /);
+});
+
+// In-context library entry (#450): exact Cargo name, crate spelling or alias; ready catalog only.
+const many = [
+ {...pkg,id:"cargo:tree-sitter@1",name:"tree-sitter",version:"0.24.0",aliases:["tree_sitter"]},
+ {...pkg,id:"cargo:serde@1",name:"serde",version:"1.0.1",aliases:[]},
+ {...pkg,id:"cargo:serde@2",name:"serde",version:"1.0.2",aliases:[]},
+ {...pkg,id:"cargo:renamed@1",name:"actual-name",version:"2.0.0",aliases:["renamed_dep"]},
+ {...pkg,id:"npm:left-pad@1",ecosystem:"npm",name:"left-pad",version:"1.0.0",aliases:[]},
+ {...pkg,id:"cargo:skipped@1",name:"skipped",version:"1.0.0",aliases:[],sourceState:"missing",indexState:"skipped"}];
+async function readyMany(h,extra={}) {h.context.fetch=async()=>response({...catalog(),packages:many,...extra});await h.run("refreshDependencies()");}
+const ids = (h, reference) => JSON.parse(h.run(`JSON.stringify(libraryPackages(${JSON.stringify(reference)}).map(p=>p.id))`));
+test("library matching uses exact Cargo names, crate spellings, aliases and prefers the named version",async()=>{
+ const h=harness();await readyMany(h);
+ assert.deepEqual(ids(h,{ecosystem:"rust",name:"tree-sitter"}),["cargo:tree-sitter@1"]);
+ assert.deepEqual(ids(h,{ecosystem:"rust",name:"tree_sitter"}),["cargo:tree-sitter@1"],"underscore crate spelling");
+ assert.deepEqual(ids(h,{ecosystem:"cargo",name:"renamed_dep"}),["cargo:renamed@1"],"Cargo alias");
+ assert.deepEqual(ids(h,{ecosystem:"cargo",name:"serde",version:"1.0.2"}),["cargo:serde@2"],"named version wins");
+ assert.deepEqual(ids(h,{ecosystem:"cargo",name:"serde",version:"9.9.9"}),["cargo:serde@1","cargo:serde@2"],"unknown version keeps every name match");
+ assert.deepEqual(ids(h,{ecosystem:"rust",name:"serd"}),[],"no substring guesses");
+ assert.deepEqual(ids(h,{ecosystem:"javascript",name:"left-pad"}),[],"ecosystems without a catalog adapter");
+ assert.deepEqual(ids(h,{ecosystem:"npm",name:"left-pad"}),[]);
+ assert.deepEqual(ids(h,{ecosystem:"rust",name:"skipped"}),[],"a package the catalog never indexed offers no library");
+ assert.equal(h.run("libraryButton({ecosystem:'rust',name:'nothing',origin:'x'})"),null);
+ const button=h.run("libraryButton({ecosystem:'rust',name:'serde',origin:'x'})");
+ assert.equal(button.tagName,"button");assert.equal(button.textContent,"Open in library");
+ for(const state of ["loading","failed","disabled"]) {
+   const other=harness();await readyMany(other,{state});
+   assert.equal(other.run("libraryAction({ecosystem:'rust',name:'serde',origin:'x'})"),null,state);
+ }
+});
+test("one matching package opens the library dock and loads its definitions; several render a version chooser",async()=>{
+ const h=harness(),requests=[];await readyMany(h);
+ h.context.fetch=async url=>{requests.push(url);return response(symbols([{...symbol,packageId:"cargo:tree-sitter@1"}]));};
+ await h.run("libraryAction({ecosystem:'rust',name:'tree_sitter',origin:'Architecture reference'})()");
+ assert.equal(h.get("source-dock").hidden,false);assert.equal(h.get("library-source-panel").hidden,false);assert.equal(h.get("dock-library").hidden,false);
+ assert.equal(h.run("dependencyPackage.id"),"cargo:tree-sitter@1");
+ assert.equal(requests.length,1);assert.match(requests[0],/packageId=cargo%3Atree-sitter%401/);
+ assert.match(h.get("dependency-state").textContent,/tree-sitter 0.24.0.*from Architecture reference/);
+ const chooser=harness(),calls=[];await readyMany(chooser);
+ chooser.context.fetch=async url=>{calls.push(url);return response(symbols([{...symbol,packageId:"cargo:serde@1"}]));};
+ await chooser.run("libraryAction({ecosystem:'rust',name:'serde',origin:'external call x'})()");
+ assert.equal(calls.length,0,"several versions wait for a choice");assert.equal(chooser.run("dependencyPackage"),null);
+ assert.match(chooser.get("dependency-state").textContent,/2 indexed packages match serde/);
+ assert.match(text(chooser.get("dependency-packages")),/serde 1.0.1.*serde 1.0.2/s);
+ await click(chooser.get("dependency-packages"),"serde 1.0.1");
+ assert.equal(chooser.run("dependencyPackage.id"),"cargo:serde@1");assert.equal(calls.length,1);
+});
+test("a library entry captured before a catalog change is inert",async()=>{
+ const h=harness();await readyMany(h);
+ const open=h.run("libraryAction({ecosystem:'rust',name:'tree-sitter',origin:'x'})");
+ h.context.fetch=async()=>response({...catalog("catalog-2"),packages:many});await h.run("refreshDependencies()");
+ h.context.fetch=async url=>{throw Error(`unexpected ${url}`);};
+ await open();assert.equal(h.run("dependencyPackage"),null);assert.equal(h.get("dock-library").hidden,true);
 });

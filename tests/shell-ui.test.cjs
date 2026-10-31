@@ -47,7 +47,7 @@ test("the shell lands on Architecture and explorer heat options stay in the rail
   const h = harness();
   assert.equal(h.get("view-architecture").attrs["aria-selected"], "true", "arrival lands on Architecture");
   assert.equal(h.get("architecture-panel").hidden, false); assert.equal(h.get("sequence-panel").hidden, true);
-  for (const view of ["architecture", "treemap", "sequence", "classes", "libraries"]) {
+  for (const view of ["architecture", "treemap", "sequence", "classes"]) {
     h.shell.showView(view);
     assert.equal(h.get("diagram-metrics").hidden, false, `${view} keeps the rail heat options`);
   }
@@ -61,7 +61,7 @@ test("without a usable index the view tabs and Files are greyed out and inert", 
   const h = harness();
   h.shell.setConnected(true);
   h.shell.setIndexAvailable(false);
-  for (const view of ["architecture", "treemap", "sequence", "classes", "libraries"]) assert.equal(h.get(`view-${view}`).disabled, true, view);
+  for (const view of ["architecture", "treemap", "sequence", "classes"]) assert.equal(h.get(`view-${view}`).disabled, true, view);
   assert.equal(h.get("section-files").disabled, true);
   h.get("view-sequence").listeners.click();
   assert.equal(h.get("sequence-panel").hidden, true, "a greyed tab cannot be clicked through");
@@ -72,35 +72,51 @@ test("without a usable index the view tabs and Files are greyed out and inert", 
   assert.equal(h.get("sequence-panel").hidden, false);
 });
 
-test("five workspace tabs have roving keyboard focus and never request source",()=>{
+test("four workspace tabs have roving keyboard focus, skip a hidden Classes tab and never request source",()=>{
   const h=harness();
-  assert.equal(h.get("architecture-panel").hidden,false);assert.equal(h.get("dependency-library").hidden,true);assert.equal(h.get("sequence-panel").hidden,true);
+  assert.equal(h.get("architecture-panel").hidden,false);assert.equal(h.get("sequence-panel").hidden,true);
+  assert.equal(h.get("view-classes").hidden,true,"Classes starts hidden until the checkout is shown to have class-catalog code");
   h.shell.showView("sequence");
+  assert.equal(key(h.get("view-sequence"),"ArrowRight"),true);
+  assert.equal(h.get("architecture-panel").hidden,false,"a hidden Classes tab is skipped");assert.ok(h.get("view-architecture").focused);
+  key(h.get("view-architecture"),"ArrowLeft");assert.equal(h.get("sequence-panel").hidden,false);
+  key(h.get("view-sequence"),"End");assert.equal(h.get("sequence-panel").hidden,false,"End is the last shown tab");
+  h.shell.setViewAvailable("classes",true);assert.equal(h.get("view-classes").hidden,false);
   assert.equal(key(h.get("view-sequence"),"ArrowRight"),true);
   assert.equal(h.get("view-classes").attrs["aria-selected"],"true");
   assert.equal(h.get("classes-panel").hidden,false);
   assert.ok(h.get("view-classes").focused);
-  assert.equal(key(h.get("view-classes"),"ArrowRight"),true);
-  assert.equal(h.get("view-libraries").attrs["aria-selected"],"true");assert.equal(h.get("view-libraries").tabIndex,0);assert.equal(h.get("view-sequence").tabIndex,-1);
-  assert.equal(h.get("dependency-library").hidden,false);assert.ok(h.get("view-libraries").focused);
-  key(h.get("view-classes"),"End");assert.equal(h.get("dependency-library").hidden,false);
-  key(h.get("view-libraries"),"ArrowRight");assert.equal(h.get("architecture-panel").hidden,false);assert.ok(h.get("view-architecture").focused);
+  assert.equal(h.get("view-classes").tabIndex,0);assert.equal(h.get("view-sequence").tabIndex,-1);
+  key(h.get("view-classes"),"ArrowRight");assert.equal(h.get("architecture-panel").hidden,false);assert.ok(h.get("view-architecture").focused);
   key(h.get("view-architecture"),"ArrowRight");assert.equal(h.get("treemap-panel").hidden,false);
   key(h.get("view-treemap"),"ArrowRight");assert.equal(h.get("sequence-panel").hidden,false);
   key(h.get("view-sequence"),"ArrowLeft");assert.equal(h.get("treemap-panel").hidden,false);
-  key(h.get("view-libraries"),"Home");assert.equal(h.get("architecture-panel").hidden,false);
-  for (const name of ["tools", "terminal"]) h.shell.showView(name);
-  assert.equal(h.get("architecture-panel").hidden,false);
-  for (const name of ["architecture", "treemap", "sequence", "classes", "libraries"]) {
+  key(h.get("view-treemap"),"End");assert.equal(h.get("classes-panel").hidden,false);
+  key(h.get("view-classes"),"Home");assert.equal(h.get("architecture-panel").hidden,false);
+  for (const name of ["tools", "terminal", "libraries"]) h.shell.showView(name);
+  assert.equal(h.get("architecture-panel").hidden,false,"retired views are not routes");
+  for (const name of ["architecture", "treemap", "sequence", "classes"]) {
     assert.equal(h.get(`view-${name}`).attrs["aria-selected"],String(name === "architecture"));
     assert.equal(h.get(`view-${name}`).tabIndex,name === "architecture" ? 0 : -1);
   }
   assert.deepEqual(h.requests,[]);
 });
-test("workspace tabs have exactly five valid ARIA panel relationships",()=>{
+test("an explicitly opened unavailable view keeps its tab only while active",()=>{
+  const h=harness();
+  h.shell.setViewAvailable("classes",false);
+  h.shell.showView("classes");
+  assert.equal(h.get("view-classes").hidden,false,"a class menu still shows its diagram and tab");
+  assert.equal(h.get("classes-panel").hidden,false);
+  h.shell.showView("architecture");assert.equal(h.get("view-classes").hidden,true);
+  h.shell.setViewAvailable("classes",true);assert.equal(h.get("view-classes").hidden,false);
+  h.shell.setViewAvailable("classes",false);assert.equal(h.get("view-classes").hidden,true);
+  h.shell.setViewAvailable("libraries",true);assert.equal(h.get("view-libraries").hidden,false,"unknown names are ignored");
+});
+test("workspace tabs have exactly four valid ARIA panel relationships",()=>{
   const html=fs.readFileSync(path.join(__dirname,"../web/index.html"),"utf8");
   const tabs=[...html.matchAll(/<button id="view-([^"]+)" role="tab"[^>]*aria-controls="([^"]+)"/g)];
-  assert.deepEqual(tabs.map(match=>match[1]),["architecture","treemap","sequence","classes","libraries"]);
+  assert.deepEqual(tabs.map(match=>match[1]),["architecture","treemap","sequence","classes"]);
+  assert.match(html,/<button id="view-classes"[^>]*\bhidden/);
   for(const [,name,panel] of tabs) {
     assert.match(html,new RegExp(`<section id="${panel}"[^>]*role="tabpanel"[^>]*aria-labelledby="view-${name}"`));
   }
@@ -108,6 +124,10 @@ test("workspace tabs have exactly five valid ARIA panel relationships",()=>{
 test("source dock only changes presentation and can switch/close by keyboard",()=>{
   const h=harness();assert.equal(h.get("source-dock").hidden,true);
   h.shell.showSource("workspace");assert.equal(h.get("workspace-source-panel").hidden,false);
+  assert.equal(h.get("dock-library").hidden,true,"no Library dock tab before a library is opened in context");
+  key(h.get("dock-workspace"),"ArrowRight");assert.equal(h.get("library-source-panel").hidden,true);
+  h.shell.showSource("library");assert.equal(h.get("dock-library").hidden,false);
+  h.shell.showSource("workspace");
   key(h.get("dock-workspace"),"ArrowRight");assert.equal(h.get("library-source-panel").hidden,false);
   assert.equal(h.get("workspace-source-panel").hidden,true);
   h.document.listeners.keydown({key:"Escape"});assert.equal(h.get("source-dock").hidden,true);
@@ -266,29 +286,29 @@ test("in-flight call source cannot reopen the dock after a new method clears it"
   assert.equal(h.get("source-dock").hidden,true);assert.doesNotMatch(text(h.get("source")),/obsolete/);
 });
 test("successful candidate source opens the library dock without changing method or active view",async()=>{
-  const h=harness(true),root={id:"rust",label:"Rust"};
-  h.run(`selectedMethod={id:"kept"};`);h.shell.showView("libraries");
-  h.context.fetch=async()=>response({rootId:"rust",rootLabel:"Rust",path:"lib.rs",hash:"hash",file:{text:"candidate"},definitions:[],warnings:[]});
-  await h.run(`loadExternalFile(${JSON.stringify(root)},"lib.rs")`);
-  assert.equal(h.get("library-source-panel").hidden,false);assert.equal(h.get("source-dock").hidden,false);
-  assert.equal(h.get("dependency-library").hidden,false);assert.equal(h.run("selectedMethod.id"),"kept");
+  const h=harness(true);
+  h.run(`selectedMethod={id:"kept"};dependencyCatalog={catalogId:"catalog",state:"ready",packages:[]};dependencyPackage={id:"pkg"};`);h.shell.showView("sequence");
+  h.context.fetch=async()=>response({id:"ref",rootId:"pkg",rootLabel:"Rust",path:"lib.rs",hash:"hash",file:{text:"candidate"},definitions:[{id:"symbol",name:"open",kind:"function",range:{startLine:1,endLine:1}}],warnings:[]});
+  await h.run(`loadDependencySource({id:"symbol",packageId:"pkg",name:"open",sourceRef:"ref",path:"lib.rs"})`);
+  assert.equal(h.get("library-source-panel").hidden,false);assert.equal(h.get("source-dock").hidden,false);assert.equal(h.get("dock-library").hidden,false);
+  assert.equal(h.get("sequence-panel").hidden,false);assert.equal(h.run("selectedMethod.id"),"kept");
 });
 
-for (const mode of ["manual", "catalog"]) test(`${mode} source loading/failure stays visible when source dock is closed`,async()=>{
-  const h=harness(true);h.shell.showView("libraries");let resolve;
+test("catalog source loading/failure stays visible when source dock is closed",async()=>{
+  const h=harness(true);h.shell.showView("sequence");let resolve;
   h.context.fetch=()=>new Promise(done=>{resolve=done;});
-  if(mode==="catalog")h.run(`dependencyCatalog={catalogId:"catalog",state:"ready"};dependencyPackage={id:"pkg"};`);
-  const pending=h.run(mode==="manual" ? `loadExternalFile({id:"rust",label:"Rust"},"lib.rs")` : `loadDependencySource({id:"symbol",packageId:"pkg",name:"open",sourceRef:"ref",path:"lib.rs"})`);
-  const state=h.get(mode==="manual"?"external-state":"dependency-symbol-state");
+  h.run(`dependencyCatalog={catalogId:"catalog",state:"ready"};dependencyPackage={id:"pkg"};`);
+  const pending=h.run(`loadDependencySource({id:"symbol",packageId:"pkg",name:"open",sourceRef:"ref",path:"lib.rs"})`);
+  const state=h.get("dependency-symbol-state");
   assert.match(state.textContent,/Loading candidate/);assert.equal(h.get("source-dock").hidden,true);
   resolve({ok:false,status:409,json:async()=>({error:{message:"Candidate expired"}})});await pending;
-  assert.match(state.textContent,/Candidate expired/);assert.equal(h.get("source-dock").hidden,true);assert.equal(h.get("dependency-library").hidden,false);
+  assert.match(state.textContent,/Candidate expired/);assert.equal(h.get("source-dock").hidden,true);assert.equal(h.get("sequence-panel").hidden,false);
 });
 
 test("closing a library dock restores invoking control or active tab, not disabled method source",()=>{
-  const h=harness(),invoker=h.get("definition");h.shell.showView("libraries");h.get("method-source").disabled=true;
+  const h=harness(),invoker=h.get("definition");h.shell.showView("sequence");h.get("method-source").disabled=true;
   h.document.activeElement=invoker;h.shell.showSource("library");h.get("source-dock-close").listeners.click();assert.ok(invoker.focused);
-  invoker.hidden=true;h.shell.showSource("library");h.get("source-dock-close").listeners.click();assert.ok(h.get("view-libraries").focused);
+  invoker.hidden=true;h.shell.showSource("library");h.get("source-dock-close").listeners.click();assert.ok(h.get("view-sequence").focused);
   h.shell.selectStep(call(),view(),()=>{});h.shell.showSource("library");h.document.listeners.keydown({key:"Escape"});assert.equal(h.get("source-dock").hidden,true);
 });
 
@@ -383,7 +403,7 @@ test("Git header uses measured counts independently of branch, upstream and inde
 test("Files is a primary source section without automatic reads or drawers and preserves the diagram view", () => {
   const h = harness();
   h.context.window.matchMedia = () => ({matches:true});
-  h.shell.showView("libraries");
+  h.shell.showView("treemap");
   h.shell.showMetricInspector();
   h.get("section-files").listeners.click();
   assert.equal(h.get("file-filter").focused,true);
@@ -391,7 +411,7 @@ test("Files is a primary source section without automatic reads or drawers and p
   assert.equal(h.document.body.classList.contains("explorer-open"),false);
   assert.equal(h.document.body.classList.contains("inspector-open"),false);
   assert.equal(h.get("section-files").attrs["aria-current"],"page");
-  for (const id of ["diagram-tabs", "diagram-metrics", "sequence-panel", "classes-panel", "dependency-library", "metric-inspector"]) {
+  for (const id of ["diagram-tabs", "diagram-metrics", "sequence-panel", "classes-panel", "treemap-panel", "metric-inspector"]) {
     assert.equal(h.get(id).hidden,true,`${id} is not shown over Files`);
   }
   assert.equal(h.get("source-dock").hidden,false);
@@ -403,8 +423,8 @@ test("Files is a primary source section without automatic reads or drawers and p
   h.get("section-diagrams").listeners.click();
   assert.equal(h.document.body.classList.contains("files-section"),false);
   assert.equal(h.get("section-diagrams").attrs["aria-current"],"page");
-  assert.equal(h.get("dependency-library").hidden,false);
-  assert.equal(h.get("view-libraries").focused,true);
+  assert.equal(h.get("treemap-panel").hidden,false);
+  assert.equal(h.get("view-treemap").focused,true);
   assert.equal(h.get("files-inspector").hidden,true);
   assert.deepEqual(h.requests,[]);
 });

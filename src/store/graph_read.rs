@@ -604,6 +604,14 @@ pub(super) fn sequence_calls(
                         dispatch: selected.map(|(binding, _)| binding.dispatch),
                         freshness: selected.map(|(_, proof)| proof.freshness),
                         provenance_id: selected.map(|(binding, _)| binding.provenance_id.clone()),
+                        external_package: selected
+                            .filter(|_| reason == BoundaryReason::External)
+                            .and_then(|(binding, _)| match &binding.declared_target {
+                                Some(sem::Target::External { symbol }) => {
+                                    crate::behavior::ExternalPackage::from_scip(&symbol.symbol)
+                                }
+                                _ => None,
+                            }),
                     });
                     self.edges.push(GraphEdge {
                         call_site_count: 1,

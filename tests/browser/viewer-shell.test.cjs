@@ -58,7 +58,7 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(callback, signal, {library = false, rules = null, git = false, additionalRootKeys = []} = {}) {
+async function published(callback, signal, {rules = null, git = false, additionalRootKeys = []} = {}) {
   const paths = H.fixture("function anchor() { return 0; }\n", "anchor.js");
   mkdirSync(join(paths.workspace, "src", "nested"), {recursive:true});
   writeFileSync(join(paths.workspace, "src", "flow.js"), flowSource);
@@ -76,13 +76,6 @@ async function published(callback, signal, {library = false, rules = null, git =
   writeFileSync(join(paths.workspace, ".tool-cache", "state.txt"), "cache\n");
   mkdirSync(join(paths.workspace, "assets"));
   writeFileSync(join(paths.workspace, "assets", "notes.txt"), "not source\n");
-  if (library) {
-    mkdirSync(join(paths.workspace, "vendor", "local-library", "src"), {recursive:true});
-    writeFileSync(join(paths.workspace, "Cargo.toml"), "[package]\nname='browser-app'\nversion='0.1.0'\n[dependencies]\nlocal-library={path='vendor/local-library'}\n");
-    writeFileSync(join(paths.workspace, "Cargo.lock"), "version=4\n[[package]]\nname='browser-app'\nversion='0.1.0'\ndependencies=['local-library']\n[[package]]\nname='local-library'\nversion='0.1.0'\n");
-    writeFileSync(join(paths.workspace, "vendor", "local-library", "Cargo.toml"), "[package]\nname='local-library'\nversion='0.1.0'\n");
-    writeFileSync(join(paths.workspace, "vendor", "local-library", "src", "lib.rs"), "// <img src=x onerror='globalThis.libraryExecuted=true'>\npub fn candidate_only() { unknown_external(); }\n");
-  }
   if (rules !== null) {
     mkdirSync(join(paths.workspace, ".trellis"), {recursive:true});
     writeFileSync(join(paths.workspace, ".trellis/rules.toml"), rules);
@@ -144,7 +137,7 @@ async function metrics(server, paths, pin, aggregate, scope = "revision", row, r
   if (row) {
     query.set("sourceSetId", row.sourceSetId); query.set("path", row.path); query.set("topCognitive", "3");
     if (scope === "file") query.set("language", row.language);
-  }
+  } else query.set("topCognitive", "8");
   const response = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, `metrics?${query}`));
   assert.equal(response.status, 200, JSON.stringify(response.data));
   assert.equal(response.data.payload.workbench, true); assert.equal(response.data.payload.role, role);
@@ -462,8 +455,6 @@ test("390px drawers and explicit Files section retain selected evidence without 
   const diagram = await page.locator("#sequence-diagram").textContent();
   await page.locator("#view-classes").click();
   assert.equal(await page.locator("#classes-panel").isVisible(), true);
-  await page.locator("#view-libraries").click();
-  assert.equal(await page.locator("#dependency-library").isVisible(), true);
   await page.locator("#view-sequence").click();
   assert.equal(await page.locator(".method-pick.selected").textContent(), selectedMethod);
   assert.equal(await page.locator("#sequence-diagram").textContent(), diagram);
@@ -558,81 +549,43 @@ test("Sequence URLs wait for authentication and checkout, use the returned seed,
   await authenticateRoute(new URLSearchParams());
 }));
 
-test("Libraries candidate source never sends candidate IDs to workspace sequence or navigation", {timeout:240000}, async () => published(async ({page, paths, server, requests}) => {
-  await expandSources(page); await page.locator('.file-pick[title="src/flow.js"]').click();
-  await page.locator(".method-pick").filter({hasText:"measured"}).click();
-  await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
-  const selection = await page.locator(".method-pick.selected").textContent();
-  const diagram = await page.locator("#sequence-diagram").textContent();
-  await page.locator("#view-libraries").click();
-  // Explicit fixture setup: serve registration can leave the automatic catalog
-  // loading without a worker (tracked separately from #392 source actions).
-  const started = await H.api(server.base, paths.token, "POST", H.scoped(server.rootKey, "dependencies/refresh"), {});
-  assert.equal(started.status, 202, JSON.stringify(started.data));
-  // Wait for that requested producer, then bind the browser status refresh to
-  // its own new request rather than an older in-flight response.
-  const readyCatalog = await page.evaluate(async ({rootKey, token}) => {
-    const deadline = Date.now() + 30000;
-    for (;;) {
-      const response = await fetch(`/api/checkouts/${rootKey}/dependencies`, {cache:"no-store", headers:{Authorization:`Bearer ${token}`}});
-      const data = await response.json();
-      if (!response.ok || ["failed", "disabled"].includes(data.state)) throw new Error(`Catalog unavailable: ${JSON.stringify(data)}`);
-      if (data.state === "ready") return data;
-      if (Date.now() >= deadline) throw new Error(`Catalog readiness timed out: ${JSON.stringify(data)}`);
-      await new Promise(resolve => setTimeout(resolve, 250));
-    }
-  }, {rootKey:server.rootKey, token:paths.token});
-  assert.equal(readyCatalog.state, "ready", JSON.stringify(readyCatalog));
-  const catalogRequest = page.waitForRequest(request => new URL(request.url()).pathname.endsWith("/dependencies"));
-  await page.locator("#dependency-refresh").click();
-  const refreshRequest = await catalogRequest;
-  assert.equal(refreshRequest.method(), "GET");
-  const catalogReply = await refreshRequest.response();
-  assert.ok(catalogReply, "the explicit catalog refresh must return a response");
-  const catalog = await catalogReply.json();
-  assert.equal(catalogReply.status(), 200, JSON.stringify(catalog));
-  assert.equal(catalog.state, "ready", JSON.stringify(catalog));
-  const localPackage = catalog.packages.find(pkg => pkg.name === "local-library");
-  const libraryPresentation = async () => page.evaluate(() => ({state:document.querySelector("#dependency-state")?.textContent,
-    warnings:document.querySelector("#dependency-warnings")?.textContent,
-    buttons:[...document.querySelectorAll("#dependency-packages button")].map(button => ({text:button.textContent, disabled:button.disabled}))}));
-  assert.ok(localPackage, `Missing local path dependency: catalog=${JSON.stringify(catalog)}; UI=${JSON.stringify(await libraryPresentation())}`);
-  assert.equal(localPackage.version, "0.1.0", JSON.stringify(localPackage));
-  assert.equal(localPackage.sourceState, "present", JSON.stringify(localPackage));
-  const pkg = page.locator("#dependency-packages button").filter({hasText:`${localPackage.name} ${localPackage.version}`});
-  try { await pkg.waitFor(); }
-  catch (error) { assert.fail(`Native package not displayed: package=${JSON.stringify(localPackage)}; catalog=${JSON.stringify(catalog)}; UI=${JSON.stringify(await libraryPresentation())}; ${error.message}`); }
-  await pkg.click();
-  const symbolResponse = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/dependencies/source"));
-  await page.locator("#dependency-symbols button").filter({hasText:"candidate_only"}).click();
-  const response = await symbolResponse, snapshot = await response.json();
-  assert.equal(response.status(), 200, JSON.stringify(snapshot));
-  assert.ok(snapshot.id && snapshot.hash && snapshot.rootId);
-  assert.equal(new URL(response.url()).searchParams.get("sourceRef"), snapshot.id);
-  assert.ok(snapshot.definitions.some(item => item.name === "candidate_only"));
-  await page.waitForFunction(hash => document.querySelector("#external-source-path")?.textContent.includes(hash), snapshot.hash);
-  assert.match(await page.locator("#external-source-path").textContent(), /immutable candidate snapshot.*terminal library boundary/);
-  assert.equal(await page.locator("#external-source").isVisible(), true);
-  assert.equal(await page.locator("#external-source .source-diagram-action").count(), 0);
-  assert.equal(await page.locator("#external-source-hint").isVisible(), true);
-  assert.match(await page.locator("#external-source-hint").textContent(), /Workspace diagrams are unavailable/);
-  assert.doesNotMatch(await page.locator("#external-source").textContent(), /Workspace diagrams are unavailable/);
-  assert.equal(await page.locator("#external-source .source-line").evaluateAll(lines => lines.map(line =>
-    [...line.childNodes].filter(node => !node.classList?.contains("line-number")).map(node => node.textContent).join("")).join("\n")), snapshot.file.text);
-  assert.equal(await page.locator("#external-source img").count(), 0);
-  assert.equal(await page.evaluate(() => globalThis.libraryExecuted), undefined);
-  const before = requests.filter(row => /\/(sequence|navigation)$/.test(row.url.pathname)).length;
-  await page.locator("#external-source .source-line").filter({hasText:"pub fn candidate_only"}).click();
-  await page.locator("#external-source").focus(); await page.keyboard.press("Shift+F10");
-  assert.equal(await page.locator(".classes-context-menu").count(), 0, "external source has no workspace action menu");
-  await page.keyboard.press("Escape");
-  assert.equal(requests.filter(row => /\/(sequence|navigation)$/.test(row.url.pathname)).length, before);
-  const ids = new Set(snapshot.definitions.map(item => item.id).filter(Boolean));
-  assert.ok(!requests.some(row => row.body && ids.has(row.body.seed)), "candidate IDs are never workspace sequence seeds");
-  assert.equal(await page.locator(".method-pick.selected").textContent(), selection);
+// #450: with no method selected, Sequence starts from the most complex methods of the
+// metrics projection; those rows and the metric inspector's open the exact sid's sequence.
+test("Sequence starts from the most complex named methods and the inspector opens a method's sequence", {timeout:240000}, async () => published(async ({page, paths, server, requests}) => {
+  const pin = (await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "status"))).data.revision;
+  const projection = await metrics(server, paths, pin, "max", "revision");
+  const named = projection.topCognitive.filter(row => row.name).slice(0, 5);
+  assert.ok(named.length >= 2, JSON.stringify(projection.topCognitive));
   await page.locator("#view-sequence").click();
-  assert.equal(await page.locator("#sequence-diagram").textContent(), diagram);
-}, undefined, {library:true}));
+  const starts = page.locator("#sequence-start-list button");
+  await starts.first().waitFor();
+  const revisionRead = requests.find(row => row.url.pathname.endsWith("/metrics") && row.url.searchParams.get("scope") === "revision");
+  assert.equal(revisionRead.url.searchParams.get("topCognitive"), "8");
+  assert.deepEqual(await starts.evaluateAll(nodes => nodes.map(node => node.firstChild.textContent)), named.map(row => row.name));
+  for (const [index, row] of named.entries()) assert.match(await starts.nth(index).textContent(), new RegExp(`${row.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} · ${row.kind} · cognitive ${row.metrics.cognitive}`));
+  assert.match(await page.locator("#sequence-start-note").textContent(), /Highest cognitive complexity · production callables/);
+  assert.equal(await page.locator("#sequence-start img").count(), 0);
+  await capture(page, "sequence-start");
+  const sequenceRead = page.waitForRequest(request => new URL(request.url()).pathname.endsWith("/sequence"));
+  await starts.first().click();
+  const body = (await sequenceRead).postDataJSON();
+  assert.equal(body.seed, named[0].sid); assert.deepEqual(body.expectedRevision, pin);
+  await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+  assert.match(await page.locator("#sequence-state").textContent(), new RegExp(`^${named[0].name} · ${named[0].path}`));
+  assert.equal(await page.locator("#sequence-start").isVisible(), false, "the start list leaves once a method is open");
+  // The metric inspector's highest-cognitive callables open the same way.
+  await expandSources(page);
+  await page.locator('.file-pick[title="src/flow.js"]').click();
+  const measured = page.locator("#metric-inspector-top button.metric-top-open").filter({hasText:/^measured$/});
+  await measured.waitFor();
+  const fileRow = projection.files.find(row => row.path === "src/flow.js");
+  const fileMetrics = await metrics(server, paths, pin, "max", "file", fileRow);
+  const inspectorRead = page.waitForRequest(request => new URL(request.url()).pathname.endsWith("/sequence"));
+  await measured.click();
+  assert.equal((await inspectorRead).postDataJSON().seed, fileMetrics.topCognitive.find(row => row.name === "measured").sid);
+  await page.waitForFunction(() => /^measured · src\/flow\.js .*Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
+  assert.equal(await page.locator("#sequence-panel").isVisible(), true);
+}));
 
 async function assertExactSource(page, text) {
   await page.waitForFunction(expected => [...document.querySelectorAll("#source .source-line")].map(line =>
@@ -1116,7 +1069,7 @@ test("selected status reconciles jobs, catch-up and stale evidence while raw err
     await fixture.select();
     await page.locator("#index").waitFor({state:"visible"});
     assert.ok((await page.locator("#index").boundingBox()).height >= 44, "Index workspace is a primary action of at least 44px");
-    for (const view of ["architecture", "treemap", "sequence", "classes", "libraries"]) assert.equal(await page.locator(`#view-${view}`).isDisabled(), true, `${view} is greyed out`);
+    for (const view of ["architecture", "treemap", "sequence", "classes"]) assert.equal(await page.locator(`#view-${view}`).isDisabled(), true, `${view} is greyed out`);
     assert.equal(await page.locator("#section-files").isDisabled(), true);
     await capture(page, "chrome-no-index");
     fixture.job = {...job, state:"running", error:null, finishedAt:null, progress:{phase:"capture", completed:0, total:0}};
