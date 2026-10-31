@@ -29,11 +29,65 @@ pub struct DocumentInput {
     pub file: SourceFile,
     pub declarations: Vec<Declaration>,
     pub calls: Vec<Call>,
+    /// The fresh semantic evidence of this document's selected producer (#523).
+    pub semantic: DocumentSemantic,
 }
 pub struct Snapshot {
     pub pin: IndexPin,
     pub documents: Vec<DocumentInput>,
     pub manifests: Vec<external::ManifestInput>,
+}
+
+/// Fresh bindings of one document under its language's selected producer (#483, #523).
+/// Only fresh rows of a selected, complete or partial coverage tuple are admitted; stale
+/// evidence is left out, so the document falls back to structural syntax evidence.
+#[derive(Debug, Default, Clone)]
+pub struct DocumentSemantic {
+    /// The selected producer, when the document has a usable coverage tuple.
+    pub producer_id: Option<String>,
+    /// The selected coverage tuple is complete, not partial.
+    pub complete: bool,
+    /// Call bindings of measured calls and resolved semantic references, by source range.
+    pub anchors: Vec<SemanticAnchor>,
+    /// Fresh `extends`/`implements` relationships whose source is declared here.
+    pub relationships: Vec<SemanticRelationship>,
+}
+
+/// One bound name or call in a document.
+#[derive(Debug, Clone)]
+pub struct SemanticAnchor {
+    /// The producer's joined source range: a callee or invocation, or a referenced name.
+    pub range: crate::native_evidence::Range,
+    /// The measured call of a call binding; `None` for a semantic reference.
+    pub call_id: Option<String>,
+    /// A semantic reference with the `type` role.
+    pub type_role: bool,
+    /// A call binding whose dispatch is direct or a constructor.
+    pub direct: bool,
+    pub outcome: SemanticOutcome,
+    pub provenance_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticOutcome {
+    /// A declared internal target: its document's index in `Snapshot::documents` and its
+    /// syntax ID.
+    Internal(usize, String),
+    /// Bound outside the checkout.
+    External,
+    Ambiguous,
+    Unresolved,
+}
+
+/// A fresh semantic type relationship from a declaration of this document.
+#[derive(Debug, Clone)]
+pub struct SemanticRelationship {
+    /// `extends` or `implements`.
+    pub kind: String,
+    pub source_syntax_id: String,
+    /// The internal target, or `None` for an external one.
+    pub target: Option<(usize, String)>,
+    pub provenance_id: String,
 }
 #[derive(Debug)]
 pub struct Projection {
@@ -50,6 +104,8 @@ pub(crate) struct SiteCoverage {
     pub sites: usize,
     pub mapped: usize,
     pub unresolved: usize,
+    /// Sites mapped or bound outside the checkout by a fresh semantic binding (#523).
+    pub semantic: usize,
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +125,10 @@ struct Site {
     relation_kind: &'static str,
     spelling: String,
     call_id: Option<String>,
+    /// `structural` (captured syntax conventions) or `semantic` (a fresh producer binding).
+    mapping: &'static str,
+    /// The semantic binding's provenance; null for structural sites.
+    provenance_id: Option<String>,
 }
 #[derive(Clone, Serialize)]
 struct Lines {
@@ -187,8 +247,14 @@ fn project_inner(
         );
     }
     let globs = globs.build()?;
-    let mut docs: Vec<_> = snapshot.documents.iter().collect();
-    docs.sort_by(|a, b| a.key.cmp(&b.key));
+    let mut order: Vec<usize> = (0..snapshot.documents.len()).collect();
+    order.sort_by(|&a, &b| snapshot.documents[a].key.cmp(&snapshot.documents[b].key));
+    let docs: Vec<_> = order.iter().map(|&i| &snapshot.documents[i]).collect();
+    // The sorted position of each snapshot document: semantic targets name the latter.
+    let mut sorted = vec![0; order.len()];
+    for (position, &i) in order.iter().enumerate() {
+        sorted[i] = position;
+    }
     let mut identities = Vec::new();
     let mut modules = Vec::new();
     let mut total_bytes = 0usize;
@@ -321,13 +387,39 @@ fn project_inner(
     };
     let javascript = *javascript;
     rust.work = work;
+    // Exact internal targets of semantic bindings: every declaration of the snapshot by
+    // document, so a binding whose target is not in this snapshot is not used (#523).
+    let mut declared: BTreeSet<(usize, &str)> = BTreeSet::new();
+    let mut producers: BTreeMap<&str, &str> = BTreeMap::new();
+    for doc in &docs {
+        if let Some(producer) = &doc.semantic.producer_id {
+            producers.insert(&doc.key.language, producer);
+        }
+    }
+    if !producers.is_empty() {
+        for (index, doc) in docs.iter().enumerate() {
+            for declaration in &doc.declarations {
+                owner_step(&mut rust.work, check)?;
+                declared.insert((index, declaration.syntax_id.as_str()));
+            }
+        }
+    }
+    let locate = |document: usize, sid: &str| {
+        sorted
+            .get(document)
+            .copied()
+            .filter(|&index| declared.contains(&(index, sid)))
+    };
     let mut external_packages = BTreeMap::new();
-    let mut edges: BTreeMap<(usize, Target, bool), (usize, Vec<Site>)> = BTreeMap::new();
+    // (source, target, test) -> (sites, semantic sites, samples)
+    type Edges = BTreeMap<(usize, Target, bool), (usize, usize, Vec<Site>)>;
+    let mut edges = Edges::new();
     let mut emitted_modules = BTreeSet::new();
     let mut unresolved = Vec::new();
     let mut site_count = 0usize;
     let mut scanned = 0usize;
     let mut mapped = 0usize;
+    let mut semantic_sites = 0usize;
     let mut coverage: BTreeMap<(String, bool), SiteCoverage> = BTreeMap::new();
     for batch in selected.chunks(workers) {
         let remaining = rust.work.remaining();
@@ -353,36 +445,72 @@ fn project_inner(
             ensure!(site_count <= SITES, "bounded_work: reference site count");
             emitted_modules.insert(source);
             scanned += 1;
-            for (item, site) in sites {
+            for PreparedSite {
+                raw,
+                mut site,
+                anchor,
+            } in sites
+            {
                 check()?;
+                let anchor = anchor.map(|index| &doc.semantic.anchors[index]);
+                let structural = match &raw {
+                    None => None,
+                    Some(_) if site.owner_syntax_id.is_none() => {
+                        Some(SiteResolution::unknown("reference_owner_ambiguous"))
+                    }
+                    Some(item) if doc.key.language == "rust" => Some(rust.resolve(
+                        source,
+                        item,
+                        &packages,
+                        &mut external_packages,
+                        &docs,
+                        check,
+                    )?),
+                    Some(item) if doc.key.language == "java" => Some(java.resolve(
+                        source,
+                        item,
+                        &mut external_packages,
+                        &mut rust.work,
+                        check,
+                    )?),
+                    Some(item) if doc.key.language == "python" => Some(python.resolve(
+                        source,
+                        item,
+                        &mut external_packages,
+                        &mut rust.work,
+                        check,
+                    )?),
+                    Some(item) if doc.key.language == "javascript" => Some(
+                        javascript
+                            .as_ref()
+                            .expect("selected JavaScript catalog")
+                            .resolve(source, item, &mut external_packages, &mut rust.work, check)?,
+                    ),
+                    Some(_) => Some(SiteResolution::unknown("module_mapping_unavailable")),
+                };
+                let semantic = anchor
+                    .and_then(|anchor| semantic_resolution(anchor, structural.as_ref(), &locate));
+                let resolution = match (semantic, structural) {
+                    (Some(resolution), _) => {
+                        let anchor = anchor.expect("semantic resolution has an anchor");
+                        site.mapping = "semantic";
+                        site.provenance_id = Some(anchor.provenance_id.clone());
+                        resolution
+                    }
+                    (None, Some(resolution)) => resolution,
+                    // A semantic-only site whose binding is not usable here is not a site.
+                    (None, None) => continue,
+                };
                 let role = site.role;
                 let covered = coverage
                     .entry((doc.key.path.clone(), role == Some("test")))
                     .or_default();
                 covered.sites += 1;
-                let resolution = if site.owner_syntax_id.is_none() {
-                    SiteResolution::unknown("reference_owner_ambiguous")
-                } else if doc.key.language == "rust" {
-                    rust.resolve(
-                        source,
-                        &item,
-                        &packages,
-                        &mut external_packages,
-                        &docs,
-                        check,
-                    )?
-                } else if doc.key.language == "java" {
-                    java.resolve(source, &item, &mut external_packages, &mut rust.work, check)?
-                } else if doc.key.language == "python" {
-                    python.resolve(source, &item, &mut external_packages, &mut rust.work, check)?
-                } else if doc.key.language == "javascript" {
-                    javascript
-                        .as_ref()
-                        .expect("selected JavaScript catalog")
-                        .resolve(source, &item, &mut external_packages, &mut rust.work, check)?
-                } else {
-                    SiteResolution::unknown("module_mapping_unavailable")
-                };
+                let bound = site.mapping == "semantic";
+                if bound && resolution.residual.is_none() {
+                    semantic_sites += 1;
+                    covered.semantic += 1;
+                }
                 if !resolution.targets.is_empty() {
                     mapped += 1;
                     covered.mapped += 1;
@@ -394,8 +522,9 @@ fn project_inner(
                         .entry((source, target, role == Some("test")))
                         .or_default();
                     edge.0 += 1;
-                    if edge.1.len() < sample_limit {
-                        edge.1.push(site.clone());
+                    edge.1 += usize::from(bound);
+                    if edge.2.len() < sample_limit {
+                        edge.2.push(site.clone());
                     }
                 }
                 if let Some(reason) = resolution.residual {
@@ -419,7 +548,7 @@ fn project_inner(
     );
     let mut production = Vec::new();
     let mut tests = Vec::new();
-    for ((source, target, test), (count, sites)) in edges {
+    for ((source, target, test), (count, semantic, sites)) in edges {
         check()?;
         let target = match target {
             Target::Native(target) => {
@@ -429,8 +558,13 @@ fn project_inner(
             Target::External(identity) => json!(identity),
         };
         let omitted = count - sites.len();
+        let tier = match semantic {
+            0 => "syntax",
+            n if n == count => "semantic",
+            _ => "mixed",
+        };
         let edge = json!({"source":identities[source],"target":target,"count":count,
-            "sites":sites,"omittedSites":omitted,"mapping":"structural"});
+            "sites":sites,"omittedSites":omitted,"evidenceTier":tier,"semanticSites":semantic});
         if test {
             tests.push(edge);
         } else {
@@ -438,27 +572,66 @@ fn project_inner(
         }
     }
     let emitted_modules: Vec<_> = emitted_modules.into_iter().map(|i| &modules[i]).collect();
+    let mut limitations = vec![
+        "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
+        "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
+        "JavaScript expands captured named ESM exports through bounded relative forwarding; stars exclude default. Ambiguous names, dynamic namespaces and unproved bindings remain uncertain. Static sources retain module evidence; declared npm roots and the partial pinned Node catalog identify packages only.",
+        "Python expands proved checkout-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
+        "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability.",
+    ];
+    if producers.is_empty() {
+        limitations.push("No selected semantic producer has fresh bindings for these documents; every site is structural syntax evidence.");
+    } else {
+        limitations.push("Semantic sites use fresh bindings of each language's selected producer: a site's final name or callee, measured calls and type references with an exact internal target in this snapshot. Bindings outside the checkout resolve a site without naming a package; stale, unselected or missing bindings fall back to structural evidence, and calls the producer did not bind are not counted.");
+    }
+    let semantic_producers: Vec<_> = producers
+        .iter()
+        .map(|(language, producer)| json!({"language":language,"producerId":producer}))
+        .collect();
     request.check()?;
     Ok((
         Projection {
             data: json!({
                 "referencesVersion":"references:v2","indexGeneration":snapshot.pin.index_generation.to_string(),
-                "indexRevision":snapshot.pin.index_revision,"evidenceTier":"syntax","semanticComplete":false,
+                "indexRevision":snapshot.pin.index_revision,"evidenceTier":if semantic_sites > 0 { "mixed" } else { "syntax" },"semanticComplete":false,
+                "semanticProducers":semantic_producers,
                 "modules":emitted_modules,"externalPackages":external_packages.into_values().collect::<Vec<_>>(),"production":production,"tests":tests,"unresolved":unresolved,
-                "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len()},
-                "limitations":[
-                    "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
-                    "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
-                    "JavaScript expands captured named ESM exports through bounded relative forwarding; stars exclude default. Ambiguous names, dynamic namespaces and unproved bindings remain uncertain. Static sources retain module evidence; declared npm roots and the partial pinned Node catalog identify packages only.",
-                    "Python expands proved checkout-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
-                    "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability."
-                ]
+                "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len(),"semanticSites":semantic_sites},
+                "limitations":limitations
             }),
             modules,
             coverage,
         },
         rust.work.used,
     ))
+}
+
+/// How a fresh semantic binding resolves a site, or `None` to keep its structural result
+/// (`structural` is `None` for a semantic-only site, which is then dropped).
+fn semantic_resolution(
+    anchor: &SemanticAnchor,
+    structural: Option<&SiteResolution>,
+    locate: &impl Fn(usize, &str) -> Option<usize>,
+) -> Option<SiteResolution> {
+    match &anchor.outcome {
+        // A target outside this snapshot is stale: the structural result stands.
+        SemanticOutcome::Internal(document, sid) => {
+            locate(*document, sid).map(|target| SiteResolution {
+                targets: BTreeSet::from([Target::Native(target)]),
+                ..SiteResolution::default()
+            })
+        }
+        // A proved package target says more than a binding outside the checkout.
+        SemanticOutcome::External => structural
+            .is_none_or(|resolution| resolution.targets.is_empty())
+            .then(SiteResolution::default),
+        SemanticOutcome::Ambiguous => structural
+            .is_none()
+            .then(|| SiteResolution::unknown("call_binding_ambiguous")),
+        SemanticOutcome::Unresolved => structural
+            .is_none()
+            .then(|| SiteResolution::unknown("call_binding_unresolved")),
+    }
 }
 
 enum CatalogJob {
@@ -471,7 +644,69 @@ enum CatalogJob {
 struct PreparedFile {
     source: usize,
     work: Work,
-    sites: Vec<(RawSite, Site)>,
+    sites: Vec<PreparedSite>,
+}
+
+/// One site of a document: a structural syntax site (`raw`), possibly bound by a
+/// semantic anchor, or a semantic-only call or type site (#523).
+struct PreparedSite {
+    raw: Option<RawSite>,
+    site: Site,
+    anchor: Option<usize>,
+}
+
+/// The declaration, enclosing call and lines of one site range.
+struct SiteContext<'a> {
+    doc: &'a DocumentInput,
+    declarations: RangeIndex<'a>,
+    calls: RangeIndex<'a>,
+    newlines: Vec<usize>,
+}
+impl SiteContext<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn site(
+        &self,
+        start: usize,
+        end: usize,
+        kind: &'static str,
+        spelling: String,
+        call_id: Option<String>,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Site> {
+        let doc = self.doc;
+        let owner = owner(doc, self.declarations.enclosing(start, end, work, check)?);
+        let role = owner.map(|d| match d.role {
+            DeclarationRole::Test => "test",
+            DeclarationRole::Production => "production",
+        });
+        let call_id = match call_id {
+            Some(id) => Some(id),
+            None => self
+                .calls
+                .enclosing(start, end, work, check)?
+                .into_iter()
+                .min()
+                .map(|index| doc.calls[index].id.clone()),
+        };
+        Ok(Site {
+            owner_syntax_id: owner.map(|d| d.syntax_id.clone()),
+            role,
+            range: crate::native_evidence::Range { start, end },
+            lines: (!doc.file.text.is_empty()).then(|| Lines {
+                start: self.newlines.partition_point(|&p| p < start) + 1,
+                end: self
+                    .newlines
+                    .partition_point(|&p| p < end.saturating_sub(1))
+                    + 1,
+            }),
+            relation_kind: kind,
+            spelling,
+            call_id,
+            mapping: "structural",
+            provenance_id: None,
+        })
+    }
 }
 
 fn merge_work(work: &mut Work, used: usize, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
@@ -489,16 +724,40 @@ fn prepare_file(
 ) -> Result<PreparedFile> {
     let mut work = Work::new(limit);
     let raw = extract(doc, tree, &mut work, check)?;
-    let declarations =
-        RangeIndex::new(doc.declarations.iter().map(|d| &d.range), &mut work, check)?;
-    let calls = RangeIndex::new(doc.calls.iter().map(|c| &c.range), &mut work, check)?;
-    let newlines: Vec<_> = doc
-        .file
-        .text
-        .bytes()
-        .enumerate()
-        .filter_map(|(i, b)| (b == b'\n').then_some(i))
-        .collect();
+    let context = SiteContext {
+        doc,
+        declarations: RangeIndex::new(doc.declarations.iter().map(|d| &d.range), &mut work, check)?,
+        calls: RangeIndex::new(doc.calls.iter().map(|c| &c.range), &mut work, check)?,
+        newlines: doc
+            .file
+            .text
+            .bytes()
+            .enumerate()
+            .filter_map(|(i, b)| (b == b'\n').then_some(i))
+            .collect(),
+    };
+    // Semantic anchors by end offset: a structural site is bound by an anchor that ends
+    // where it ends, i.e. its final name or its callee (#523).
+    let anchors = &doc.semantic.anchors;
+    let usable = |anchor: &SemanticAnchor| {
+        anchor.range.start < anchor.range.end
+            && doc
+                .file
+                .text
+                .get(anchor.range.start..anchor.range.end)
+                .is_some()
+    };
+    let mut anchors_by_end: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (index, anchor) in anchors.iter().enumerate() {
+        owner_step(&mut work, check)?;
+        if usable(anchor) {
+            anchors_by_end
+                .entry(anchor.range.end)
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut consumed = vec![false; anchors.len()];
     let mut seen = BTreeSet::new();
     let mut sites = Vec::new();
     for item in raw {
@@ -506,34 +765,69 @@ fn prepare_file(
         if !seen.insert((item.start, item.end, item.kind, item.spelling.clone())) {
             continue;
         }
-        let owner = owner(
-            doc,
-            declarations.enclosing(item.start, item.end, &mut work, check)?,
-        );
-        let role = owner.map(|d| match d.role {
-            DeclarationRole::Test => "test",
-            DeclarationRole::Production => "production",
+        let site = context.site(
+            item.start,
+            item.end,
+            item.kind,
+            item.spelling.clone(),
+            None,
+            &mut work,
+            check,
+        )?;
+        // A call binding wins over a name binding at the same end; then the innermost name.
+        let mut anchor: Option<usize> = None;
+        for &index in anchors_by_end.get(&item.end).into_iter().flatten() {
+            owner_step(&mut work, check)?;
+            let candidate = &anchors[index];
+            if candidate.range.start < item.start {
+                continue;
+            }
+            consumed[index] = true;
+            if anchor.is_none_or(|best| {
+                let best = &anchors[best];
+                (candidate.call_id.is_some(), candidate.range.start)
+                    > (best.call_id.is_some(), best.range.start)
+            }) {
+                anchor = Some(index);
+            }
+        }
+        sites.push(PreparedSite {
+            raw: Some(item),
+            site,
+            anchor,
         });
-        let site = Site {
-            owner_syntax_id: owner.map(|d| d.syntax_id.clone()),
-            role,
-            range: crate::native_evidence::Range {
-                start: item.start,
-                end: item.end,
-            },
-            lines: (!doc.file.text.is_empty()).then(|| Lines {
-                start: newlines.partition_point(|&p| p < item.start) + 1,
-                end: newlines.partition_point(|&p| p < item.end.saturating_sub(1)) + 1,
-            }),
-            relation_kind: item.kind,
-            spelling: item.spelling.clone(),
-            call_id: calls
-                .enclosing(item.start, item.end, &mut work, check)?
-                .into_iter()
-                .min()
-                .map(|index| doc.calls[index].id.clone()),
+    }
+    // Calls and internal type references no structural site covers are sites of their own.
+    // A binding outside the checkout adds no module site.
+    for (index, anchor) in anchors.iter().enumerate() {
+        check()?;
+        let own = match (&anchor.call_id, &anchor.outcome) {
+            (_, SemanticOutcome::External) => false,
+            (Some(_), _) => true,
+            (None, SemanticOutcome::Internal(..)) => anchor.type_role,
+            (None, _) => false,
         };
-        sites.push((item, site));
+        if consumed[index] || !own || !usable(anchor) {
+            continue;
+        }
+        let site = context.site(
+            anchor.range.start,
+            anchor.range.end,
+            if anchor.call_id.is_some() {
+                "call"
+            } else {
+                "type"
+            },
+            doc.file.text[anchor.range.start..anchor.range.end].to_owned(),
+            anchor.call_id.clone(),
+            &mut work,
+            check,
+        )?;
+        sites.push(PreparedSite {
+            raw: None,
+            site,
+            anchor: Some(index),
+        });
     }
     Ok(PreparedFile {
         source,
@@ -979,6 +1273,7 @@ mod parallel_tests {
                     .cloned()
                     .collect();
                 DocumentInput {
+                    semantic: Default::default(),
                     key,
                     file,
                     declarations,

@@ -1,8 +1,10 @@
 # Architecture view
 
 Architecture is a tab in Diagrams for reviewing dependencies and authoring reviewed
-exceptions in the checkout. It shows authored layer bands and directed
-**structural references · syntax evidence**, not compiler-resolved calls. A native module is one
+exceptions in the checkout. It shows authored layer bands and directed module references:
+**structural references · syntax evidence**, plus fresh call and type bindings of each
+language's selected semantic producer where one is imported
+([#523](rules.md#semantic-bindings-523)). A native module is one
 indexed file with its full `(sourceSetId, language, path, sid)` identity. Paths are labels,
 not inferred package names or identities; module chips (below) only group them for display.
 
@@ -75,6 +77,12 @@ reference that maps to no module draws no arrow. A bounded count reads `↑≥10
 highlighted (deviating or unknown) arrow also shows the share of its source layer's sites
 that map to a module (`↑≥102 · 9% mapped`). The accessible name says the same in words.
 These figures come from the summary's measured `references.coverage`, never estimates. Unknown-verdict arrows are drawn in neutral grey.
+Each summary edge carries its own `coverage` (#523): its source layer and role's
+`{sites, mappedSites, unresolvedSites, semanticSites, complete}`, where `complete` means no
+site stayed unresolved. The arrow drops the `≥` exactly when `complete` is true, and its
+accessible name says when the count rests on semantic bindings (`evidenceTier`
+`semantic` or `mixed`). Semantic bindings resolve sites that structural conventions
+cannot, so an imported producer is what usually turns a lower bound into an exact count.
 A compact arrow key sits under the canvas with the whole snapshot's coverage
 (`3,727 of 40,219 reference sites mapped to a module (9%) · 740 of 1,095 production rule
 instances unknown`); the longer prose lives under the coverage notices.
@@ -109,15 +117,20 @@ the displayed revision. They never fall back to the live file.
 detail. On this repository it went from about 35 MB to about 0.75 MB. Its fields are:
 
 - `layers`, `modules` and summary `edges` (each edge keeps its contributing pairs and
-  their bounded site samples);
-- `references`: `referencesVersion`, `counts` (`scannedDocuments`, `mappedSites`,
-  `unresolvedSites`), `limitations` and `externalPackages`, each descriptor with the
+  their bounded site samples). Each edge also has `semanticSites` (the sum of its pairs'),
+  `evidenceTier` (`syntax`, `semantic` or `mixed`) and `coverage`, its source layer and
+  role's coverage row plus `complete` (no unresolved site) (#523);
+- `evidenceTier` (`syntax` or `mixed`) at the top level, as in the references payload;
+- `references`: `referencesVersion`, `evidenceTier`, `semanticComplete`,
+  `semanticProducers`, `counts` (`scannedDocuments`, `mappedSites`,
+  `unresolvedSites`, `semanticSites`), `limitations` and `externalPackages`, each descriptor with the
   display `layer` its `$layers` instances report (null when unassigned);
 - `references.coverage` (#449): one row per source layer (null when unassigned) and
-  stored site role, `{layer, role, sites, mappedSites, unresolvedSites}`. `sites` counts
-  every scanned reference site once; a site with at least one mapped target is mapped,
-  and one with a residual reason is unresolved, so a site can be both. The rows sum to
-  `counts.mappedSites` and `counts.unresolvedSites`, and there are at most two per layer;
+  stored site role, `{layer, role, sites, mappedSites, unresolvedSites, semanticSites}`. `sites` counts
+  every scanned reference site once, structural or semantic; a site with at least one mapped target is mapped,
+  and one with a residual reason is unresolved, so a site can be both. `semanticSites`
+  counts sites a fresh binding mapped or bound outside the checkout. The rows sum to
+  `counts.mappedSites`, `counts.unresolvedSites` and `counts.semanticSites`, and there are at most two per layer;
 - `exceptionCount`: the authored `[[exceptions]]` entries (null without a rules file);
 - `rules`: `rulesVersion`, `rulesFile`, `counts`, `testCounts`, `unassignedCount` and
   `limitations`.
@@ -171,8 +184,9 @@ text in details is inserted with `textContent`.
 
 The review list pages rule instances from `architecture/details` with source/destination files, layers, production or
 test role, underlying verdict and exception reason. Filters do not change the indexed
-metric population. Evidence remains syntax-tier: captured source-owner identities and
-spellings are not resolved destination-symbol bindings. Site samples and omitted counts
+metric population. Structural evidence is syntax-tier: captured source-owner identities and
+spellings are not resolved destination-symbol bindings. Semantic sites name their
+binding's provenance, and rule evidence calls them `semanticBinding`. Site samples and omitted counts
 stay explicit. The Unassigned list includes files with no observed references.
 
 An exception needs a nonblank reason. Select one pair or several witnessed pairs and apply
@@ -249,7 +263,8 @@ or partial mapping is installed. Local assets and the existing CSP remain in for
 Natural-size diagrams scroll inside their canvas instead of shrinking text to fit.
 Desktop panes scroll independently; narrow screens reuse Explorer/Inspector drawers.
 
-Architecture remains syntax-tier evidence with `semanticComplete:false`. Coverage and
+Architecture evidence is syntax-tier (`evidenceTier:"syntax"`), or `mixed` once fresh
+semantic bindings map any site; `semanticComplete` stays false either way. Coverage and
 limitations are visible; missing references do not prove there is no dependency.
 Module-level Flow is deferred to [#324](https://github.com/SquashMerge/trellis/issues/324).
 The module inspector's **Open in Treemap** action opens the exact source-set/language/path

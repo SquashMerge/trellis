@@ -91,7 +91,7 @@
       }
       if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || payload.aggregate !== c.aggregate || payload.role !== c.role ||
           payload.workbench !== true || payload.metricsVersion !== "metrics:v1" ||
-          payload.evidenceTier !== "syntax" || payload.semanticComplete !== false ||
+          !["syntax", "mixed"].includes(payload.evidenceTier) || payload.semanticComplete !== false ||
           !Array.isArray(payload.layers) || !Array.isArray(payload.modules) || !Array.isArray(payload.edges) ||
           (["ready", "no_layers"].includes(payload.state) && (typeof payload.rulesFile?.contentHash !== "string" || !payload.rulesFile.contentHash))) {
         throw new Error("Invalid Architecture response. Nothing displayed.");
@@ -106,7 +106,7 @@
       const target = get("architecture-notice-content"); target.replaceChildren();
       paragraph(target, `Code ${window.TrellisIndexPin.label(view)} · rules ${view.rulesFile.contentHash} · ${aggregate} · ${population()}.`);
       const references = view.references;
-      paragraph(target, `${references?.counts?.mappedSites ?? 0} structurally mapped reference sites · ${references?.counts?.unresolvedSites ?? 0} unresolved. Missing sites do not prove absence.`);
+      paragraph(target, `${references?.counts?.mappedSites ?? 0} mapped reference sites · ${references?.counts?.semanticSites ?? 0} bound by semantic evidence · ${references?.counts?.unresolvedSites ?? 0} unresolved. Missing sites do not prove absence.`);
       for (const limitation of references?.limitations || []) paragraph(target, limitation);
       const unassigned = view.modules.filter(module => module.layer === null);
       paragraph(target, view.state === "no_layers" ? "No layer graph or file assignment inventory is available until layers are configured." : `${unassigned.length} unassigned native file modules remain unknown.`);
@@ -249,11 +249,15 @@
     };
     // A count is a lower bound when any site of its source layer and role stayed unresolved.
     const lowerBound = (layerName, siteRole) => (coverageOf(layerName, siteRole)?.unresolvedSites ?? 1) > 0;
+    // An arrow's own coverage says whether its count is exact; it loses the "≥" when no site
+    // of its source layer and role stayed unresolved (#523).
+    const edgeTier = edge => ({semantic:"; semantic bindings", mixed:"; syntax and semantic bindings"})[edge.evidenceTier] || "";
     function edgeText(edge) {
-      const covered = coverageOf(edge.sourceLayer, edge.role), bound = lowerBound(edge.sourceLayer, edge.role);
+      const covered = edge.coverage || coverageOf(edge.sourceLayer, edge.role);
+      const bound = edge.coverage ? edge.coverage.complete !== true : lowerBound(edge.sourceLayer, edge.role);
       if (!covered) return {bound};
       const share = percent(covered.mappedSites, covered.sites);
-      const label = `${bound ? "lower bound; " : ""}${share} of ${covered.sites} ${edge.role} reference sites from ${edge.sourceLayer} mapped to a module`;
+      const label = `${bound ? "lower bound; " : ""}${share} of ${covered.sites} ${edge.role} reference sites from ${edge.sourceLayer} mapped to a module${edgeTier(edge)}`;
       return {bound, label, note:bound && ["deviation", "unknown"].includes(edgeTone(edge)) ? `${share} mapped` : ""};
     }
     function summary(payload) {
@@ -484,7 +488,7 @@
       for (const pair of values) {
         const details = make("details"); details.append(make("summary", `${targetLabel(pair.source)} → ${targetLabel(pair.target)} · ${pair.count} reference sites`));
         paragraph(details, `${pair.sites.length} sampled sites · ${pair.omittedSites} omitted sites. Counts remain exact; samples are not exhaustive.`);
-        disclosure(details, "Exact reference-pair identity", {source:pair.source, target:pair.target, mapping:pair.mapping});
+        disclosure(details, "Exact reference-pair identity", {source:pair.source, target:pair.target, evidenceTier:pair.evidenceTier, semanticSites:pair.semanticSites});
         if (external(pair.target)) {
           const descriptor = view.references.externalPackages.find(item => same(item.identity, pair.target));
           disclosure(details, "External package evidence", descriptor);

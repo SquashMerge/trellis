@@ -113,6 +113,7 @@ mod tests {
                 index_revision: 1,
             },
             documents: vec![super::super::DocumentInput {
+                semantic: Default::default(),
                 key: crate::native_evidence::DocumentKey {
                     source_set_id: "source".into(),
                     language: "rust".into(),

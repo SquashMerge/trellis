@@ -1028,9 +1028,15 @@ fn counts(rows: &[Value]) -> Value {
     }
     json!({"comparable":rows.len(),"conforms":conforms,"deviates":deviates,"unknown":unknown,"excepted":excepted})
 }
+/// A reference site as rule evidence: a semantic site carries its binding's proof (#523).
 fn reference_evidence(module: &Value, site: &Value) -> Value {
+    let (kind, provenance) = if site["mapping"] == "semantic" {
+        ("semanticBinding", &site["provenanceId"])
+    } else {
+        ("structuralReference", &module["provenanceId"])
+    };
     json!({"document":{"sourceSetId":module["identity"]["sourceSetId"],"language":module["identity"]["language"],"path":module["identity"]["path"]},
-        "revisionId":module["revisionId"],"range":site["range"],"kind":"structuralReference","syntaxId":site["ownerSyntaxId"],"callId":site["callId"],"provenanceId":module["provenanceId"]})
+        "revisionId":module["revisionId"],"range":site["range"],"kind":kind,"syntaxId":site["ownerSyntaxId"],"callId":site["callId"],"provenanceId":provenance})
 }
 #[derive(Default)]
 struct Bases {
@@ -1260,8 +1266,13 @@ fn package_closure(
     );
     Ok(retained)
 }
+/// Every declaration of the snapshot by `(document index, syntax ID)`: semantic binding
+/// targets are selected by role against these (#523).
+type Targets<'a> = BTreeMap<(usize, &'a str), &'a Declaration>;
+
 struct DocumentEvaluation<'a> {
     config: &'a Config,
+    targets: &'a Targets<'a>,
     inheritance: bool,
     source_set: Option<&'a str>,
     #[cfg(test)]
@@ -1290,6 +1301,7 @@ impl DocumentEvaluation<'_> {
                     }
                     evaluate_document(
                         self.config,
+                        self.targets,
                         doc,
                         self.inheritance,
                         self.source_set,
@@ -1322,6 +1334,7 @@ struct DocumentRows {
 
 fn evaluate_document(
     config: &Config,
+    targets: &Targets<'_>,
     doc: &crate::references::DocumentInput,
     inheritance: bool,
     source_set: Option<&str>,
@@ -1336,6 +1349,15 @@ fn evaluate_document(
     } else {
         BTreeMap::new()
     };
+    let mut anchors = BTreeMap::new();
+    if !config.rules.is_empty() {
+        for anchor in &doc.semantic.anchors {
+            ensure!(work.charge(1), "bounded_work: rule constraint budget");
+            if let Some(call) = &anchor.call_id {
+                anchors.insert(call.as_str(), anchor);
+            }
+        }
+    }
     for d in &doc.declarations {
         check()?;
         for rule in &config.rules {
@@ -1353,45 +1375,44 @@ fn evaluate_document(
                 unresolved.push("selector_relationship_unavailable".to_owned());
             }
             let mut constraints = Vec::new();
+            let mut statuses = Vec::new();
             for c in &rule.constraints {
                 ensure!(
                     work.charge(
                         1 + if c.kind == "calls" {
                             doc.calls.len()
                         } else {
-                            0
+                            doc.semantic.relationships.len()
                         },
                     ),
                     "bounded_work: rule constraint budget"
                 );
                 check()?;
-                let reason = if c.kind == "calls" {
-                    "call_binding_unavailable"
-                } else {
-                    "type_relationship_unavailable"
-                };
-                let mut evidence = vec![native_evidence(d)];
-                if c.kind == "calls" {
-                    for call in doc
-                        .calls
-                        .iter()
-                        .filter(|call| call.owner_syntax_id == d.syntax_id)
-                    {
-                        ensure!(work.charge(1), "bounded_work: rule evidence budget");
-                        check()?;
-                        evidence.push(json!({"document":call.document,"revisionId":call.revision_id,"range":call.range,"kind":"call","syntaxId":call.owner_syntax_id,"callId":call.id,"provenanceId":call.provenance_id}));
-                    }
-                }
-                constraints.push(json!({"mode":c.mode,"kind":c.kind,"targetRole":c.role,"status":"unknown","evidence":evidence,"unresolved":[reason]}));
-                if !unresolved.iter().any(|r| r == reason) {
+                let (status, reason, evidence) =
+                    constraint(config, targets, &anchors, doc, d, c, &mut work, check)?;
+                statuses.push(status);
+                constraints.push(json!({"mode":c.mode,"kind":c.kind,"targetRole":c.role,"status":status,"evidence":evidence,"unresolved":reason.into_iter().collect::<Vec<_>>()}));
+                if let Some(reason) = reason
+                    && !unresolved.iter().any(|r| r == reason)
+                {
                     unresolved.push(reason.to_owned());
                 }
             }
+            // A proven deviation wins over uncertainty; conformance needs every constraint.
+            let status = if selected != Some(true) || statuses.is_empty() {
+                "unknown"
+            } else if statuses.contains(&"deviates") {
+                "deviates"
+            } else if statuses.iter().all(|status| *status == "conforms") {
+                "conforms"
+            } else {
+                "unknown"
+            };
             let test = d.role == DeclarationRole::Test;
             if test {
                 unresolved.push("test_only".into());
             }
-            let mut row = json!({"rule":rule.id,"target":identity(d),"destination":null,"sourceLayer":null,"destinationLayer":null,"status":"unknown","excepted":false,"exceptionReason":null,
+            let mut row = json!({"rule":rule.id,"target":identity(d),"destination":null,"sourceLayer":null,"destinationLayer":null,"status":status,"excepted":false,"exceptionReason":null,
                     "constraints":constraints,"evidence":[native_evidence(d)],"unresolved":unresolved,"referenceCount":0});
             ensure!(
                 work.charge(config.exceptions.len()),
@@ -1410,6 +1431,112 @@ fn evaluate_document(
         test_only,
         work,
     })
+}
+
+/// One semantic constraint of a selected declaration (#523): its status, the reason it is
+/// unknown, and its evidence. A call counts when its fresh binding is direct (or a
+/// constructor) to a declaration the target role selects; a type relationship counts when
+/// its target is such a declaration. A required edge is proven by one counted binding; a
+/// forbidden one deviates on one. A forbidden call conforms only when every measured call
+/// of the declaration is bound, in a document the producer covers completely. Absence of a
+/// required edge never establishes a violation.
+#[allow(clippy::too_many_arguments)]
+fn constraint(
+    config: &Config,
+    targets: &Targets<'_>,
+    anchors: &BTreeMap<&str, &crate::references::SemanticAnchor>,
+    doc: &crate::references::DocumentInput,
+    d: &Declaration,
+    c: &Constraint,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<(&'static str, Option<&'static str>, Vec<Value>)> {
+    use crate::references::SemanticOutcome;
+    let role = &config.roles[&c.role];
+    let bound = doc.semantic.producer_id.is_some();
+    let calls = c.kind == "calls";
+    let mut evidence = vec![native_evidence(d)];
+    let (mut hits, mut uncertain) = (0usize, 0usize);
+    let select = |document: &usize, sid: &str| {
+        targets
+            .get(&(*document, sid))
+            .and_then(|target| selection(role, target, None))
+    };
+    if calls {
+        for call in doc
+            .calls
+            .iter()
+            .filter(|call| call.owner_syntax_id == d.syntax_id)
+        {
+            ensure!(work.charge(1), "bounded_work: rule evidence budget");
+            check()?;
+            evidence.push(json!({"document":call.document,"revisionId":call.revision_id,"range":call.range,"kind":"call","syntaxId":call.owner_syntax_id,"callId":call.id,"provenanceId":call.provenance_id}));
+            if !bound {
+                continue;
+            }
+            let Some(anchor) = anchors.get(call.id.as_str()) else {
+                uncertain += 1;
+                continue;
+            };
+            match &anchor.outcome {
+                SemanticOutcome::Internal(key, sid) if anchor.direct => match select(key, sid) {
+                    Some(true) => {
+                        hits += 1;
+                        evidence.push(json!({"document":call.document,"revisionId":call.revision_id,"range":anchor.range,"kind":"semanticBinding","syntaxId":sid,"callId":call.id,"provenanceId":anchor.provenance_id}));
+                    }
+                    Some(false) => {}
+                    None => uncertain += 1,
+                },
+                SemanticOutcome::External => {}
+                _ => uncertain += 1,
+            }
+        }
+    } else if bound {
+        for relationship in doc
+            .semantic
+            .relationships
+            .iter()
+            .filter(|r| r.source_syntax_id == d.syntax_id && r.kind == c.kind)
+        {
+            ensure!(work.charge(1), "bounded_work: rule evidence budget");
+            check()?;
+            let Some((key, sid)) = &relationship.target else {
+                continue;
+            };
+            match select(key, sid) {
+                Some(true) => {
+                    hits += 1;
+                    evidence.push(json!({"document":d.document,"revisionId":d.revision_id,"range":d.range,"kind":"typeRelationship","syntaxId":sid,"callId":null,"provenanceId":relationship.provenance_id}));
+                }
+                Some(false) => {}
+                None => uncertain += 1,
+            }
+        }
+    }
+    let (unavailable, incomplete, absent) = if calls {
+        (
+            "call_binding_unavailable",
+            "call_binding_incomplete",
+            "required_call_absent",
+        )
+    } else {
+        (
+            "type_relationship_unavailable",
+            "type_relationship_incomplete",
+            "type_relationship_absent",
+        )
+    };
+    let (status, reason) = match (c.mode, bound, hits > 0) {
+        (_, false, _) => ("unknown", Some(unavailable)),
+        ("require", _, true) => ("conforms", None),
+        ("forbid", _, true) => ("deviates", None),
+        ("forbid", _, false) if calls && uncertain == 0 && doc.semantic.complete => {
+            ("conforms", None)
+        }
+        _ if uncertain > 0 || (calls && !doc.semantic.complete) => ("unknown", Some(incomplete)),
+        _ => ("unknown", Some(absent)),
+    };
+    Ok((status, reason, evidence))
 }
 
 pub fn evaluate(
@@ -1677,8 +1804,23 @@ fn evaluate_with_layers_workers<'a>(
         );
         documents.push(doc);
     }
+    let mut targets: Targets<'_> = BTreeMap::new();
+    let semantic = snapshot
+        .documents
+        .iter()
+        .any(|doc| doc.semantic.producer_id.is_some());
+    if semantic && !config.rules.is_empty() {
+        for (index, doc) in snapshot.documents.iter().enumerate() {
+            for d in &doc.declarations {
+                check()?;
+                ensure!(work.charge(1), "bounded_work: rules selection budget");
+                targets.insert((index, d.syntax_id.as_str()), d);
+            }
+        }
+    }
     let (declarations, test_declarations) = DocumentEvaluation {
         config,
+        targets: &targets,
         inheritance,
         source_set,
         #[cfg(test)]
@@ -1711,10 +1853,24 @@ fn evaluate_with_layers_workers<'a>(
     Ok(Evaluation {
         data: json!({"rulesVersion":"rules:v2","indexGeneration":snapshot.pin.index_generation.to_string(),"indexRevision":snapshot.pin.index_revision,"rulesFile":descriptor(config),
         "counts":counts(&instances),"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"externalPackages":external_packages,
-        "limitations":["Layer results describe observed structurally mapped syntax references, not absence of semantic dependencies.","Calls and type relationships have no admitted bindings and remain unknown.","testOnly policy statuses are hypothetical and never production violations.","Structural reference provenance attests captured source bytes, not a semantic target association."]}),
+        "limitations":limitations(semantic)}),
         layers: assignments,
     })
 }
+/// The evaluation's limitations: the bindings note says whether any were admitted (#523).
+fn limitations(semantic: bool) -> Vec<&'static str> {
+    vec![
+        "Layer results describe observed mapped references, not absence of dependencies.",
+        if semantic {
+            "Call and type constraints use fresh bindings of each language's selected producer; unbound, stale, dispatched and ambiguous calls and missing relationships remain unknown, and absence of a required edge is never a violation."
+        } else {
+            "Calls and type relationships have no admitted bindings and remain unknown."
+        },
+        "testOnly policy statuses are hypothetical and never production violations.",
+        "Structural reference provenance attests captured source bytes, not a semantic target association; semantic sites carry their binding's provenance.",
+    ]
+}
+
 pub fn explain(
     mut payload: Value,
     rule: &str,
@@ -1915,6 +2071,7 @@ mod document_parallel_tests {
                     .cloned()
                     .collect();
                 DocumentInput {
+                    semantic: Default::default(),
                     key,
                     file,
                     declarations,
@@ -1946,8 +2103,10 @@ mod document_parallel_tests {
     fn document_work_overlaps_but_rows_and_counts_are_admitted_in_order() {
         let (config, snapshot) = fixture();
         let documents: Vec<_> = snapshot.documents.iter().collect();
+        let targets = Targets::new();
         let evaluation = DocumentEvaluation {
             config: &config,
+            targets: &targets,
             inheritance: true,
             source_set: None,
             before_document: None,
@@ -1984,6 +2143,7 @@ mod document_parallel_tests {
         // Each file fits locally, but the sum exceeds the single request allowance.
         let per_file = evaluate_document(
             &config,
+            &targets,
             documents[0],
             true,
             None,
@@ -2014,8 +2174,10 @@ mod document_parallel_tests {
     fn worker_callback_error_is_preserved_without_rows() {
         let (config, snapshot) = fixture();
         let documents: Vec<_> = snapshot.documents.iter().collect();
+        let targets = Targets::new();
         let evaluation = DocumentEvaluation {
             config: &config,
+            targets: &targets,
             inheritance: true,
             source_set: None,
             before_document: None,
