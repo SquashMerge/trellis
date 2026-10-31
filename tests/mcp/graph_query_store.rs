@@ -745,6 +745,38 @@ fn sequence_expansion_respects_the_step_bound() {
     );
 }
 
+/// #522 review: a repository-defined `console.log` the JS adapter hides by spelling, bound
+/// by fresh exact direct evidence to its local method, is shown with its expanded body.
+#[test]
+fn sequence_resolved_local_call_is_not_hidden_by_a_spelling_heuristic() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let source = "const console = { log() { helper(); } };\nfunction helper() {}\nfunction visible() {}\nfunction a() { console.log(); visible(); }\n";
+    let mut spec = Spec::new(&[("a.js", source)]);
+    spec.languages = vec![s::Language::Javascript];
+    spec.bindings = vec![bind("a", 0, "log"), bind("log", 0, "helper")];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let (log, helper) = (
+        syntax_id(publisher.native(), "log"),
+        syntax_id(publisher.native(), "helper"),
+    );
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    let call = sequence_steps(&view.steps)
+        .into_iter()
+        .find(|step| step.target.as_deref() == Some(log.as_str()))
+        .expect("console.log resolves to the local method");
+    assert!(!call.hidden);
+    assert_eq!(call.children.len(), 1, "{view:?}");
+    assert_eq!(call.children[0].target.as_deref(), Some(helper.as_str()));
+    assert!(!call.children[0].hidden);
+    assert_eq!((view.hidden_steps, view.incidental_steps), (0, 0));
+}
+
 /// #522: a step the syntax adapter already hid (a standalone `console.log`) that is also
 /// bound external is incidental once, not hidden twice.
 #[test]

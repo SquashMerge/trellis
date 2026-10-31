@@ -581,6 +581,7 @@ pub(super) fn sequence_calls(
         limited: false,
         truncated: false,
         hidden: 0,
+        revealed: 0,
         incidental: 0,
     };
     let seed_id = view.seed.id.clone();
@@ -591,10 +592,11 @@ pub(super) fn sequence_calls(
         limited,
         truncated,
         hidden,
+        revealed,
         incidental,
         ..
     } = enrichment;
-    view.hidden_steps += hidden;
+    view.hidden_steps = (view.hidden_steps + hidden).saturating_sub(revealed);
     view.incidental_steps = incidental;
     if truncated || limited {
         view.truncated = true;
@@ -696,6 +698,8 @@ struct Enrichment<'a, 'b> {
     limited: bool,
     truncated: bool,
     hidden: usize,
+    /// Steps a syntax heuristic hid that resolved to an internal target, so are shown.
+    revealed: usize,
     incidental: usize,
 }
 
@@ -749,6 +753,12 @@ impl Enrichment<'_, '_> {
                 }
                 if reason == BoundaryReason::None {
                     step.target = Some(id.clone());
+                    // A spelling heuristic (JavaScript `console.log`) never hides a call
+                    // with a fresh exact internal target, nor so its expanded body.
+                    if step.hidden {
+                        step.hidden = false;
+                        self.revealed += 1;
+                    }
                 }
             }
             let selected = disposition.selected;

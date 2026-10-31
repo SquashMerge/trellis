@@ -61,7 +61,9 @@ it adds is read from the same selected snapshot.
   none covering the language, or several), the seed document's coverage not selected or not
   `complete`/`partial`, or no measured call of the seed having a fresh selected binding
   (stale or missing evidence). One fresh binding is enough to enrich; the seed's other calls
-  then keep their own `stale` or `missingEvidence` boundaries.
+  then keep their own `stale` or `missingEvidence` boundaries. A seed with no measured calls has nothing
+  to fall back from: it reports `tier=semantic` with the producer, and none of its steps
+  carries call evidence.
 - Each exact direct/constructor target (contract-v1 dispatch, #470) is a participant. The
   first call to each function/method target has the target's own measured body expanded as
   that call step's `children`. Expanded steps carry `lane` (the participant whose body they
@@ -71,6 +73,8 @@ it adds is read from the same selected snapshot.
   200 steps or depth 24 in the whole view is not expanded, the view is truncated and a
   warning names it. Other dispatch, ambiguous (#466, one edge), unresolved, external and
   stale calls stay boundaries.
+- A syntax heuristic never hides a call with a fresh exact internal target (for example a
+  repository-defined JavaScript `console.log`); it and its expanded body stay visible.
 - A standalone call step whose boundary reason is `external` (the standard library or any
   other package) is incidental. `incidentalSteps` counts them; unless `showAll`, they are
   `hidden` and counted in `hiddenSteps`. A chain group whose calls are all hidden is hidden.
