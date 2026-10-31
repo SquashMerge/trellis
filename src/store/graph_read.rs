@@ -612,6 +612,7 @@ pub(super) fn sequence_calls(
         truncated: false,
         limits: BTreeSet::new(),
         accessors,
+        bodies,
     };
     let seed_id = view.seed.id.clone();
     enrichment.steps(&mut view.steps, &document, &seed_id, 0)?;
@@ -729,6 +730,8 @@ struct Enrichment<'a, 'b> {
     limits: BTreeSet<crate::behavior::SequenceLimit>,
     /// The trivial accessors (#543) of each target document read so far, by path.
     accessors: BTreeMap<String, BTreeSet<String>>,
+    /// The functions and methods of each target document read so far, by path (#542).
+    bodies: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Whether the declaration `id` in `key` is a trivial accessor (#543), from its own body in
@@ -1083,6 +1086,9 @@ impl Enrichment<'_, '_> {
         let callee = self.source.document(&key)?;
         let (store, db, selected) = (self.store, self.db, self.selected);
         let accessors = &mut self.accessors;
+        let bodies = &mut self.bodies;
+        // The same structural test protects an accessor's expandable operands here as in the
+        // seed (#547 review); the reserve is the seed's only, so these targets are dropped.
         hide_incidental(
             self.source,
             self.languages,
@@ -1091,7 +1097,7 @@ impl Enrichment<'_, '_> {
             &callee,
             target,
             &mut BTreeSet::new(),
-            &mut |_, _| Ok(false),
+            &mut |id, key| expandable(store, db, selected, bodies, id, key),
             &mut |id, key| accessor(store, db, selected, accessors, id, key),
         )?;
         let shown = visible_count(&body.steps);

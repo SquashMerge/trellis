@@ -345,3 +345,100 @@ fn java_bare_name_getter_must_return_a_field() {
     let id = step(&view, source, "id(1)");
     assert!(id.incidental.is_none() && !id.hidden);
 }
+
+/// Publishes `source` at `path` in `language` with `bindings` and returns the view of
+/// `seed` in both show-all modes.
+fn publish_views(
+    path: &str,
+    source: &str,
+    language: s::Language,
+    bindings: Vec<crate::graph_fixtures::Bind>,
+    seed: &str,
+) -> [SequenceView; 2] {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[(path, source)]);
+    spec.languages = vec![language];
+    spec.bindings = bindings;
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), seed);
+    let view = |show_all| {
+        publisher
+            .store
+            .sequence_at(&seed, pin, show_all)
+            .unwrap()
+            .unwrap()
+    };
+    [view(false), view(true)]
+}
+
+/// #547 review: an f-string executes, so it is no docstring: a getter that starts with one
+/// is not trivial, stays visible and expands; a varargs parameter shadows a same-named field.
+#[test]
+fn python_fstring_and_java_varargs_are_not_accessors() {
+    let source = "def effect():\n    return 1\n\nclass S:\n    def get_x(self):\n        f\"{effect()}\"\n        return self.x\n\n    def run(self):\n        self.get_x()\n";
+    let views = publish_views(
+        "a.py",
+        source,
+        s::Language::Python,
+        vec![bind("run", 0, "get_x"), bind("get_x", 0, "effect")],
+        "run",
+    );
+    for view in &views {
+        let call = step(view, source, "self.get_x()");
+        assert!(call.incidental.is_none() && !call.hidden, "{call:?}");
+        assert!(!call.children.is_empty(), "the getter expands");
+    }
+    let source =
+        "class S {\n  int[] x;\n  int[] id(int... x) { return x; }\n  void run() { id(1); }\n}\n";
+    let views = publish_views(
+        "S.java",
+        source,
+        s::Language::Java,
+        vec![bind("run", 0, "id")],
+        "run",
+    );
+    for view in &views {
+        let call = step(view, source, "id(1)");
+        assert!(call.incidental.is_none() && !call.hidden, "{call:?}");
+    }
+}
+
+/// #547 review: an accessor's expandable operand stays shown and expands inside an expanded
+/// body too, as it does when that body is the seed: entry → wrapper → set_x(compute()).
+#[test]
+fn expandable_accessor_operand_expands_in_a_callee_body() {
+    let source = "struct S { x: u8 }\nimpl S {\n    fn set_x(&mut self, v: u8) { self.x = v; }\n    fn compute(&self) -> u8 { work() }\n    fn wrapper(&mut self) { self.set_x(self.compute()); }\n    fn entry(&mut self) { self.wrapper(); }\n}\nfn work() -> u8 { 1 }\n";
+    let bindings = vec![
+        bind("entry", 0, "wrapper"),
+        bind("wrapper", 0, "set_x"),
+        bind("wrapper", 1, "compute"),
+        bind("compute", 0, "work"),
+    ];
+    let views = publish_views("a.rs", source, s::Language::Rust, bindings, "entry");
+    for (show_all, view) in [false, true].into_iter().zip(&views) {
+        let wrapper = &view.steps[0];
+        assert!(!wrapper.children.is_empty(), "wrapper expands");
+        let compute = wrapper
+            .children
+            .iter()
+            .find(|s| source[s.range.start_byte..s.range.end_byte] == *"self.compute()")
+            .unwrap();
+        assert!(
+            compute.incidental.is_none() && !compute.hidden,
+            "show_all={show_all}"
+        );
+        assert!(
+            !compute.children.is_empty(),
+            "compute expands, show_all={show_all}"
+        );
+        let set_x = wrapper
+            .children
+            .iter()
+            .find(|s| source[s.range.start_byte..s.range.end_byte].starts_with("self.set_x"))
+            .unwrap();
+        assert_eq!(set_x.incidental, Some(IncidentalReason::Accessor));
+        assert_eq!(set_x.hidden, !show_all);
+    }
+}

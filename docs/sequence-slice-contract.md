@@ -197,13 +197,15 @@ Owner rulings 2026-10-31 (#543). They amend the #522, #536 and #542 sections abo
   one statement that either returns a field or assigns a plain name to a field:
   - **Returns a field:** `self.f`/`this.f`; in Rust also `&self.f`, `&mut self.f` and
     `self.f.clone()`; in Java also a bare name that the native declarations list as a field
-    of the enclosing class and no parameter shadows (an identity method such as
-    `T id(T x) { return x; }` never qualifies). Python skips a docstring.
+    of the enclosing class and no parameter, varargs included, shadows (an identity
+    method such as `T id(T x) { return x; }` never qualifies). Python skips a docstring
+    that is a plain string literal; an f-string executes, so it is behavior.
   - **Assigns a field:** `this.f = v`/`self.f = v`; in Java also `f = v` under the same
     field rule.
 
   The rule is the same for Java, Rust, Python and JavaScript. The steps evaluating its
-  receiver and arguments are hidden with it, except a call that can expand. An unresolved
+  receiver and arguments are hidden with it, except a call that can expand (by the same
+  structural test as the reserve, in the seed and in every expanded body). An unresolved
   `getX()` is never an accessor: the name alone never qualifies.
 - A call that may return early (#542) is never incidental, and an operand subtree that
   holds one is not hidden with the call it feeds. Operand subtrees are hidden whole: every

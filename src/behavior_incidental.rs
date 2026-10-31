@@ -220,7 +220,15 @@ fn accessor_body(
     if let Some(list) = node.child_by_field_name("parameters") {
         let mut cursor = list.walk();
         for parameter in list.named_children(&mut cursor) {
-            if let Some(name) = parameter.child_by_field_name("name") {
+            // A varargs parameter names itself in a nested declarator (#547 review).
+            let name = parameter.child_by_field_name("name").or_else(|| {
+                let mut inner = parameter.walk();
+                let declarator = parameter
+                    .named_children(&mut inner)
+                    .find(|n| n.kind() == "variable_declarator");
+                declarator.and_then(|d| d.child_by_field_name("name"))
+            });
+            if let Some(name) = name {
                 parameters.insert(text(name));
             }
         }
@@ -236,13 +244,25 @@ fn accessor_body(
         .named_children(&mut cursor)
         .filter(|n| !n.is_extra())
         .collect();
-    // A Python docstring before the statement is documentation, not behavior.
+    // A Python docstring before the statement is documentation, not behavior: a plain
+    // string literal. An f-string (or any interpolation) executes, so it is behavior.
+    let docstring = |n: Node<'_>| {
+        if n.kind() != "string" {
+            return false;
+        }
+        let mut cursor = n.walk();
+        let parts: Vec<Node<'_>> = n.named_children(&mut cursor).collect();
+        !parts.iter().any(|part| part.kind() == "interpolation")
+            && parts
+                .iter()
+                .find(|part| part.kind() == "string_start")
+                .is_some_and(|start| !text(*start).to_ascii_lowercase().contains('f'))
+    };
     if file.language == "python"
         && statements.len() == 2
         && statements[0].kind() == "expression_statement"
-        && statements[0]
-            .named_child(0)
-            .is_some_and(|s| s.kind() == "string")
+        && statements[0].named_child_count() == 1
+        && statements[0].named_child(0).is_some_and(docstring)
     {
         statements.remove(0);
     }
@@ -320,6 +340,7 @@ fn accessor_body(
 mod tests {
     use super::{accessor_body, logging_call};
     use crate::model::SourceFile;
+    use std::collections::BTreeSet;
 
     /// Whether the declaration starting at `decl` (and ending at its first closing brace)
     /// in a Java class is a trivial accessor.
@@ -352,6 +373,47 @@ mod tests {
         assert!(!java(class, "int id"));
         assert!(!java(class, "int other"));
         assert!(!java(class, "void shadow"));
+    }
+
+    /// Whether `def` (to the end of `source`) in a Python module is a trivial accessor.
+    fn python(source: &str, def: &str) -> bool {
+        let file = SourceFile {
+            path: "a.py".into(),
+            hash: String::new(),
+            language: "python".into(),
+            text: source.into(),
+        };
+        let start = source.find(def).unwrap();
+        let end = source.trim_end().len();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        accessor_body(&file, tree.root_node(), start, end, &BTreeSet::new())
+    }
+
+    #[test]
+    fn only_a_plain_string_is_a_python_docstring() {
+        assert!(python(
+            "class S:\n    def get_x(self):\n        \"\"\"The x.\"\"\"\n        return self.x\n",
+            "def get_x"
+        ));
+        assert!(!python(
+            "class S:\n    def get_x(self):\n        f\"{effect()}\"\n        return self.x\n",
+            "def get_x"
+        ));
+        assert!(!python(
+            "class S:\n    def get_x(self):\n        f\"plain\"\n        return self.x\n",
+            "def get_x"
+        ));
+    }
+
+    #[test]
+    fn java_varargs_parameter_shadows_the_field() {
+        let class = "class S {\n  int[] x;\n  int[] id(int... x) { return x; }\n  int[] get() { return x; }\n}\n";
+        assert!(!java(class, "int[] id"));
+        assert!(java(class, "int[] get"));
     }
 
     #[test]
