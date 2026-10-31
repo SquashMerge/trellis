@@ -163,7 +163,7 @@
           const prefix = target.reason === "enclosing" ? "Sequence · enclosing · syntax" : target.reason === "call" ? "Sequence of callee · resolved" : "Sequence · syntax";
           actions.push({label: `${prefix} · ${label}`, run: run(owner.selectMethod)});
         }
-        if (symbol.kind === "class" && target.action === "class" && /\.(?:java|py|js|mjs|cjs)$/i.test(symbol.path) && typeof owner.openClass === "function")
+        if (symbol.kind === "class" && target.action === "class" && /\.(?:java|py|js|mjs|cjs|rs)$/i.test(symbol.path) && typeof owner.openClass === "function")
           actions.push({label: `Class diagram · syntax · ${label}`, run: run(owner.openClass)});
         if (["declaration", "enclosing"].includes(target.reason) && typeof owner.inspectSymbol === "function")
           actions.push({label: `Inspect${target.reason === "enclosing" ? " enclosing declaration" : ""} · syntax · ${label}`, run: run(owner.inspectSymbol)});

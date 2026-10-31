@@ -710,6 +710,16 @@ async fn unsupported_classes_never_become_class_targets_but_methods_remain_measu
     let (status, view) = call(&app, member(&dir, id(&_graph, "Supported"), "run", 0)).await;
     assert_eq!(status, 200, "{view}");
     assert_eq!(targets(&view, "declaration"), ["run"], "{view}");
+    // A Rust method merged from an impl block (#452) navigates to its measured
+    // declaration although its measured parent is the impl, not the struct.
+    let structure = _graph
+        .nodes
+        .iter()
+        .find(|n| n.name == "Unsupported" && n.range.start_line == 1)
+        .unwrap();
+    let (status, view) = call(&app, member(&dir, &structure.id, "run", 0)).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(targets(&view, "declaration"), ["run"], "{view}");
 }
 
 #[tokio::test]

@@ -154,7 +154,7 @@ test("loading a new view invalidates keyboard member/source callbacks in old dia
  pending.resolve(diagram(["B"]));await work;
 });
 test("unsupported, unindexed, empty, partial and error states are explicit",async()=>{
- const h=harness();await h.controller.open({path:"src/lib.rs"});assert.equal(h.get("classes-state").dataset.state,"unsupported");assert.equal(h.calls.length,0);
+ const h=harness();await h.controller.open({path:"src/main.go"});assert.equal(h.get("classes-state").dataset.state,"unsupported");assert.equal(h.calls.length,0);
  h.setRequest(async()=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[],warnings:["Index workspace to populate class declarations."],requireIndex:true}));await h.controller.open({});assert.equal(h.get("classes-state").dataset.state,"unindexed");
  h.setRequest(async()=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[],warnings:[]}));await h.controller.open({});assert.equal(h.get("classes-state").dataset.state,"empty");
  h.setRequest(async()=>({...diagram(),truncated:true,warnings:["Bound reached"]}));await h.controller.open({seed:"A"});assert.equal(h.get("classes-state").dataset.state,"partial");

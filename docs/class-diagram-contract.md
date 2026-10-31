@@ -29,6 +29,38 @@ caps are those of Decision 0004, unchanged. As for Java and Python, every relati
 a targeted relation). `GET /api/classes` returns `supportedLanguages` (`crate::classes::SUPPORTED_LANGUAGES`)
 so clients can gate class views by language.
 
+Rust (#452 slice 2): `struct_item`, `enum_item`, `union_item` and `trait_item` with a unique measured
+`type` symbol are ClassDefinitions (`language:"rust"`, `declarationKind` struct/enum/union/trait).
+Qualified names are `crate-key::module::Name` from the conventional Cargo layout (`src/a/b.rs` and
+`src/a/b/mod.rs` are `a::b`; `src/lib.rs`/`main.rs` the crate root; the root crate has an empty key,
+another crate's key is its directory, and `src/bin/*` targets and files outside `src/` are keyed by
+path), plus inline `mod` names. Members: struct/union named fields (tuple fields `0`, `1`, …) with the
+declared type as hint; enum variants with the payload text as hint; trait methods (signatures and
+defaults). Relations: `field`, `parameter`, `returns` from field and signature types, `extends` from
+supertrait bounds, `derives` from `#[derive]` names, all terminal `unmatched` hints; generic parameters
+(type and const) and `Self` are excluded. Function bodies are not read.
+
+Per-file extraction also yields `FileExtraction.impls`: one `ImplItem {target, records, text, value}` per
+inherent-impl method (with its own path, range and measured method symbol) and its signature relations,
+and one `implements` relation per `impl Trait for Type`. `target` is the qualified name that the self
+type resolves to through that file's own `mod`/`use` scopes only: declared types of the same module,
+`use` bindings (`as`, lists, `self`), `crate`/`self`/`super` paths, and `use super::*`-style globs into a
+module of the same file. Unbound names, other globs, re-exports, aliases and extern paths do not resolve;
+a self type that is a generic parameter, a reference, tuple or trait object is a blanket/non-path impl
+and adds the per-file notice `"{path}: blanket or non-path impl not attributed to a class"`. Negative
+impls declare nothing; macro-generated items and derived impls are not attributed. `F` therefore still
+depends only on its own file, and impl items charge the same per-file and detail budgets.
+
+Composition (the global step) charges each impl item in its file's walk position under the Decision 0004
+detail rules, then attaches each admitted item to the one admitted Rust class whose qualified name equals
+`target`: methods are appended (class member limit 256; excess marks the class truncated), relations get
+that class as owner and id `class-ref:{owner}:{start}:{end}:{kind}:{typeName}`. No match or several
+(cfg duplicates) leave it unattributed. Relations are ordered by owner document, then `(path, start_byte,
+id)`, and stored with the owner's class projection. Because another document's class rows depend on an
+impl, a local publication that changes, removes or recovers a Rust document recomposes the revision from
+all stored `F` instead of reusing per-document projections. A method seed whose lexical ancestry has no
+class (a Rust method's parent is its impl block) resolves to the one Rust class recording that method.
+
 Backend core owner: src/classes.rs + tests/classes.rs only. Public serde camelCase DTOs:
 ClassMember {name:String, type_hint:Option<String>, symbol_id:Option<String>, path:String, range:SourceRange}
 ClassDefinition {symbol:Symbol, qualified_name:String, language:String, declaration_kind:String,

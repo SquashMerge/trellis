@@ -178,6 +178,19 @@ pub struct FileExtraction {
     pub registry_incomplete: bool,
     pub classes: Vec<ClassDefinition>,
     pub items: Vec<DetailItem>,
+    /// Rust `impl` contributions bound by scoped path to a class declared in any
+    /// document. Composition attaches them; they charge detail budgets in this file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub impls: Vec<ImplItem>,
+}
+/// One member or relation from a Rust `impl` block, for the class whose
+/// qualified name is `target`. A relation's `owner` and `id` are bound at composition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImplItem {
+    pub target: String,
+    pub records: usize,
+    pub text: usize,
+    pub value: DetailValue,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

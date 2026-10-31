@@ -4,8 +4,8 @@
 // Pele class nodes and members map back to the exact response records.
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const {rmSync, writeFileSync} = require("node:fs");
-const {join} = require("node:path");
+const {mkdirSync, rmSync, writeFileSync} = require("node:fs");
+const {dirname, join} = require("node:path");
 const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
 
@@ -36,7 +36,10 @@ test.after(async () => H.cleanup());
 async function withApp(files, run) {
   const [first, ...rest] = files;
   const paths = H.fixture(first[1], first[0]);
-  for (const [name, text] of rest) writeFileSync(join(paths.workspace, name), text);
+  for (const [name, text] of rest) {
+    mkdirSync(dirname(join(paths.workspace, name)), {recursive:true});
+    writeFileSync(join(paths.workspace, name), text);
+  }
   let server, browser;
   try {
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
@@ -111,6 +114,77 @@ test("published JavaScript classes render through Pele with members, menus and m
     await page.waitForFunction(() => /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""), null, {timeout:15000});
     const sequence = requests.filter(row => row.url.pathname.endsWith("/sequence")).at(-1);
     assert.equal(sequence.body.seed, render.symbolId);
+    assert.deepEqual(sequence.body.expectedRevision, pin);
+  });
+});
+
+const rustModel = `pub struct Account {
+    pub id: u64,
+    balance: i64,
+}
+pub trait Ledger {
+    fn post(&mut self, account: &Account) -> i64;
+}
+`;
+const rustOps = `use crate::model::{Account, Ledger};
+impl Account {
+    pub fn balance(&self) -> i64 {
+        if self.balance > 0 { self.balance } else { 0 }
+    }
+}
+pub struct Memory;
+impl Ledger for Memory {
+    fn post(&mut self, account: &Account) -> i64 { account.balance() }
+}
+`;
+
+test("published Rust types merge impl methods across files and render through Pele", {timeout:240000}, async () => {
+  await withApp([["Cargo.toml", "[package]\nname = \"bank\"\nversion = \"0.1.0\"\n"], ["src/lib.rs", "pub mod model;\npub mod ops;\n"],
+    ["src/model.rs", rustModel], ["src/ops.rs", rustOps]], async ({page, pin, read, requests}) => {
+    const catalog = await read("GET", `classes?${new URLSearchParams({q:"", offset:"0", limit:"100", ...pin})}`);
+    assert.ok(catalog.supportedLanguages.includes("rust"), JSON.stringify(catalog.supportedLanguages));
+    assert.deepEqual(catalog.items.map(item => item.qualifiedName).sort(), ["model::Account", "model::Ledger", "ops::Memory"]);
+    const account = catalog.items.find(item => item.qualifiedName === "model::Account");
+    assert.deepEqual(account.methods.map(method => [method.name, method.path]), [["balance", "src/ops.rs"]]);
+
+    // Right-click the model file: its first type opens with members from ops.rs.
+    await page.locator(".directory-pick[title='src/']").first().click();
+    const file = page.locator(".file-pick[title='src/model.rs']").first();
+    await file.waitFor();
+    await file.click({button:"right"});
+    await page.getByRole("menuitem", {name:"Show class diagram"}).click();
+    await page.waitForFunction(() => /Pele rendered/.test(document.querySelector("#classes-state")?.textContent || ""), null, {timeout:15000});
+    assert.equal(requests.filter(row => row.url.pathname.endsWith("/class-diagram")).at(-1).body.seed, account.symbol.id);
+    const node = page.locator(`#classes-diagram .pele-node[data-trellis-class-id="${account.symbol.id}"]`);
+    assert.match(await node.locator(".pele-annotation").textContent(), /rust · struct/);
+    assert.equal(await page.locator("#classes-diagram .pele-edge").count(), 0);
+    await node.locator("> rect").click({position:{x:10, y:10}});
+    await page.getByRole("menuitem", {name:/Show members/}).click();
+    assert.deepEqual(await node.locator(".pele-member").allTextContents(), memberTexts(account));
+    assert.deepEqual(memberTexts(account), ["id: u64", "balance: i64", "balance() : i64"]);
+
+    // The trait is an interface box with its methods.
+    await page.locator("#classes-query").fill("Ledger");
+    await page.locator("#classes-search").click();
+    await page.locator(".classes-result").filter({hasText:"model::Ledger"}).first().click();
+    const ledger = catalog.items.find(item => item.qualifiedName === "model::Ledger");
+    await page.waitForFunction(seed => /Pele rendered/.test(document.querySelector("#classes-state")?.textContent || "") &&
+      !!document.querySelector(`#classes-diagram .pele-node[data-trellis-class-id="${seed}"]`), ledger.symbol.id, {timeout:15000});
+    assert.match(await page.locator(`#classes-diagram .pele-node[data-trellis-class-id="${ledger.symbol.id}"] .pele-annotation`).textContent(), /rust · trait/);
+
+    // A merged method member opens its measured sequence in ops.rs.
+    await page.locator("#classes-query").fill("Account");
+    await page.locator("#classes-search").click();
+    await page.locator(".classes-result").filter({hasText:"model::Account"}).first().click();
+    await page.waitForFunction(seed => !!document.querySelector(`#classes-diagram .pele-node[data-trellis-class-id="${seed}"]`), account.symbol.id, {timeout:15000});
+    const again = page.locator(`#classes-diagram .pele-node[data-trellis-class-id="${account.symbol.id}"]`);
+    await again.locator("> rect").click({position:{x:10, y:10}});
+    await page.getByRole("menuitem", {name:/Show members/}).click();
+    const balance = account.methods[0];
+    await page.locator(`.pele-member[data-trellis-symbol-id="${balance.symbolId}"]`).click();
+    await page.waitForFunction(() => /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""), null, {timeout:15000});
+    const sequence = requests.filter(row => row.url.pathname.endsWith("/sequence")).at(-1);
+    assert.equal(sequence.body.seed, balance.symbolId);
     assert.deepEqual(sequence.body.expectedRevision, pin);
   });
 });

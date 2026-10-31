@@ -28,7 +28,7 @@ fn fixture() -> (
             "class B(Base):\n    value: Base\n    def run(self):\n        return 2\n",
         ),
         ("C.java", "class C { int later; int run(){ return 3; } }\n"),
-        ("edit.rs", "fn edit() -> i32 { 1 }\n"),
+        ("edit.js", "function edit(){ return 1; }\n"),
     ] {
         fs::write(work.path().join(path), source).unwrap();
     }
@@ -153,7 +153,10 @@ fn both_full_routes_persist_summaries_and_unchanged_copies_completeness() {
                 assert!(extraction.is_none() && summary.is_none());
             }
         }
-        assert_eq!(ready, 3);
+        assert_eq!(
+            ready, 4,
+            "every document language is a class-catalog language (#452)"
+        );
         drop(db);
         let original = selections(store, first);
         let before = counters();
@@ -192,11 +195,15 @@ fn no_hit_local_edits_equal_independent_full_and_reuse_complete_cids() {
             }
             "language" => {
                 fs::remove_file(work.path().join("A.java")).unwrap();
-                fs::write(work.path().join("A.rs"), "fn moved() -> i32 { 1 }\n").unwrap();
+                fs::write(work.path().join("A.js"), "function moved(){ return 1; }\n").unwrap();
                 "B.py"
             }
             "nonclass" => {
-                fs::write(work.path().join("edit.rs"), "fn changed() -> i32 { 2 }\n").unwrap();
+                fs::write(
+                    work.path().join("edit.js"),
+                    "function changed(){ return 2; }\n",
+                )
+                .unwrap();
                 "A.java"
             }
             _ => unreachable!(),
@@ -243,7 +250,7 @@ fn select_clipped_catalog(store: &Store, pin: IndexPin, limits: Limits) -> Catal
         .prepare(
             "SELECT m.path,m.gid,g.graph_hash FROM revision_documents m
          JOIN graph_projections g ON g.gid=m.gid WHERE m.revision_id=?1
-         AND m.language IN ('java','python','javascript') ORDER BY m.path",
+         AND m.language IN ('java','python','javascript','rust') ORDER BY m.path",
         )
         .unwrap()
         .query_map([&selected.key], |row| {
@@ -347,15 +354,18 @@ fn formerly_cut_declarations_and_details_recover_immediately_when_summaries_fit(
             );
         }
         let prior = selections(&store, first);
-        assert!(prior["edit.rs"].2);
+        assert!(
+            !prior["edit.js"].2,
+            "a catalog document without classes is still selected"
+        );
         assert!(!prior["B.py"].2 && !prior["C.java"].2);
         fs::remove_file(work.path().join("A.java")).unwrap();
         let before = counters();
         let next = reindex(&store, &options, true);
         assert_eq!(
             counters(),
-            (before.0 + 2, before.1 + 2),
-            "only the two unchanged incomplete class selections need F and hashes"
+            (before.0 + 3, before.1 + 3),
+            "only the three unchanged incomplete class selections (B.py, C.java, edit.js) need F and hashes"
         );
         assert!(
             selections(&store, next)
@@ -380,7 +390,11 @@ fn malformed_or_missing_summary_fails_typed_before_publication_then_repairs() {
     for payload in [Some("not-json"), None, Some(r#"{"source_bytes":-1}"#)] {
         let (_state, work, store, options, first) = fixture();
         let baseline = store.publication_index_baseline().unwrap();
-        fs::write(work.path().join("edit.rs"), "fn edit() -> i32 { 2 }\n").unwrap();
+        fs::write(
+            work.path().join("edit.js"),
+            "function edit(){ return 2; }\n",
+        )
+        .unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
         {
@@ -456,12 +470,70 @@ fn intrinsic_file_truncation_is_a_complete_selection_on_no_global_hit() {
         "complete means all immutable F output, not !F.truncated"
     );
     drop(db);
-    fs::write(work.path().join("edit.rs"), "fn edit() -> i32 { 3 }\n").unwrap();
+    fs::write(
+        work.path().join("edit.js"),
+        "function edit(){ return 3; }\n",
+    )
+    .unwrap();
     let next = reindex(&store, &options, true);
     assert_eq!(counters(), before);
     assert_eq!(
         selections(&store, pin)["Broken.java"],
         selections(&store, next)["Broken.java"]
     );
+    assert_fresh_full_parity(&store, &options, next);
+}
+
+#[test]
+fn rust_local_edit_recomposes_impl_members_merged_into_another_document() {
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    fs::create_dir(work.path().join("src")).unwrap();
+    let ops = "use crate::model::Account;\nimpl Account {\n    pub fn first(&self) -> u64 { 1 }\n    pub fn second(&self) -> u64 { 2 }\n}\n";
+    for (path, source) in [
+        ("src/lib.rs", "pub mod model;\npub mod ops;\n"),
+        ("src/model.rs", "pub struct Account {\n    id: u64,\n}\n"),
+        ("src/ops.rs", ops),
+    ] {
+        fs::write(work.path().join(path), source).unwrap();
+    }
+    let options = IndexOptions::new(work.path().to_owned());
+    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let first = reindex(&store, &options, false);
+    let account = |pin| {
+        catalog(&store, pin)
+            .classes
+            .into_iter()
+            .find(|c| c.qualified_name == "model::Account")
+            .unwrap()
+    };
+    let before = account(first);
+    assert_eq!(
+        before
+            .methods
+            .iter()
+            .map(|m| (m.name.as_str(), m.path.as_str()))
+            .collect::<Vec<_>>(),
+        [("first", "src/ops.rs"), ("second", "src/ops.rs")]
+    );
+    // A body-only edit of the contributing file is a local publication. The
+    // members merged into src/model.rs's projection must follow its new ranges.
+    fs::write(
+        work.path().join("src/ops.rs"),
+        ops.replace("{ 1 }", "{ 100000 }"),
+    )
+    .unwrap();
+    let next = reindex(&store, &options, true);
+    let after = account(next);
+    assert_ne!(after.methods[1].range, before.methods[1].range);
+    let graph = store.graph_at(Some(next)).unwrap();
+    for method in &after.methods {
+        let node = graph
+            .nodes
+            .iter()
+            .find(|n| Some(&n.id) == method.symbol_id.as_ref())
+            .unwrap();
+        assert_eq!(node.range, method.range, "{}", method.name);
+    }
     assert_fresh_full_parity(&store, &options, next);
 }

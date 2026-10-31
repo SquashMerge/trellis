@@ -267,10 +267,6 @@ fn cancellation_and_old_or_unsupported_snapshots_are_safe() {
             .to_string()
             .contains("cancelled")
     );
-    // Rust declarations are not catalogued in this slice.
-    let (_, c) = index(&[("a.rs", "struct Foo {}")]);
-    assert!(c.classes.is_empty());
-    assert!(c.relations.is_empty());
 }
 fn names(members: &[trellis::model::ClassMember]) -> Vec<&str> {
     members.iter().map(|m| m.name.as_str()).collect()
@@ -736,6 +732,7 @@ fn cap_file(
         registry_incomplete: false,
         classes: if class { vec![definition] } else { vec![] },
         items: if class { vec![cap_ref(path)] } else { vec![] },
+        impls: vec![],
     }
 }
 fn cap_ref(path: &str) -> trellis::model::DetailItem {
@@ -1248,4 +1245,364 @@ fn decision_0004_per_file_f_is_independent_of_other_workspace_documents() {
         f_before,
         "F still authenticates its own source and class/method ranges"
     );
+}
+
+fn rel<'a>(c: &'a Catalog, owner: &str) -> Vec<(&'a str, &'a str, &'a str)> {
+    let owner = &class(c, owner).symbol.id;
+    let mut out: Vec<_> = c
+        .relations
+        .iter()
+        .filter(|r| &r.owner == owner)
+        .map(|r| (r.kind.as_str(), r.type_name.as_str(), r.path.as_str()))
+        .collect();
+    out.sort();
+    out
+}
+const RUST_MODEL: &str = r#"use std::collections::BTreeMap;
+#[derive(Debug, Clone)]
+pub struct Account {
+    pub id: AccountId,
+    balance: i64,
+    tags: Vec<Tag>,
+}
+pub struct AccountId(pub u64);
+pub enum Tag {
+    Plain,
+    Named(String),
+    Scoped { scope: Scope, name: String },
+}
+pub struct Scope;
+pub trait Ledger: Store + std::fmt::Debug {
+    fn post(&mut self, account: &Account) -> Result<Receipt, String>;
+    fn total(&self) -> i64 {
+        0
+    }
+}
+pub trait Store {}
+pub struct Receipt;
+impl Account {
+    pub fn new(id: AccountId) -> Self {
+        Account { id, balance: 0, tags: Vec::new() }
+    }
+}
+pub struct Wrapper<T> {
+    inner: T,
+    account: Account,
+}
+impl<T> Wrapper<T> {
+    fn get(&self) -> &T {
+        &self.inner
+    }
+}
+"#;
+const RUST_SERVICE: &str = r#"use crate::model::{Account, Ledger, Receipt, Store};
+use crate::model as m;
+pub struct Memory {
+    accounts: Vec<Account>,
+}
+impl Account {
+    pub fn balance(&self, at: &BTreeMap<String, Receipt>) -> i64 {
+        self.balance
+    }
+}
+impl m::AccountId {
+    fn raw(&self) -> u64 {
+        self.0
+    }
+}
+impl Store for Memory {}
+impl Ledger for Memory {
+    fn post(&mut self, account: &Account) -> Result<Receipt, String> {
+        Ok(Receipt)
+    }
+}
+impl<T: Store> Store for Box<T> {}
+impl<T> Store for T where T: Clone {}
+macro_rules! generated { () => { pub struct Generated; impl Generated {} }; }
+generated!();
+mod tests {
+    use super::*;
+    impl Memory {
+        fn fixture() -> Self {
+            Memory { accounts: vec![] }
+        }
+    }
+}
+"#;
+fn rust_workspace() -> (Graph, Catalog) {
+    index(&[
+        (
+            "src/lib.rs",
+            "pub mod model;\npub mod service;\nmod util;\nmod other;\n",
+        ),
+        ("src/model.rs", RUST_MODEL),
+        ("src/service.rs", RUST_SERVICE),
+        (
+            "src/util.rs",
+            "use crate::model::*;\nimpl Account {\n    fn via_glob(&self) {}\n}\n",
+        ),
+        (
+            "src/other.rs",
+            "pub struct Account;\nimpl Account {\n    fn shadow(&self) {}\n}\n",
+        ),
+        (
+            "tests/it.rs",
+            "struct Account;\nimpl Account {\n    fn test_only() {}\n}\n",
+        ),
+    ])
+}
+#[test]
+fn rust_types_traits_and_inherent_impls_merge_across_files_by_scoped_path() {
+    let (g, c) = rust_workspace();
+    let mut qualified: Vec<_> = c
+        .classes
+        .iter()
+        .map(|k| (k.qualified_name.as_str(), k.declaration_kind.as_str()))
+        .collect();
+    qualified.sort();
+    assert_eq!(
+        qualified,
+        [
+            ("model::Account", "struct"),
+            ("model::AccountId", "struct"),
+            ("model::Ledger", "trait"),
+            ("model::Receipt", "struct"),
+            ("model::Scope", "struct"),
+            ("model::Store", "trait"),
+            ("model::Tag", "enum"),
+            ("model::Wrapper", "struct"),
+            ("other::Account", "struct"),
+            ("service::Memory", "struct"),
+            ("tests/it.rs::Account", "struct"),
+        ],
+        "macro-generated items are not boxes"
+    );
+    let account = class(&c, "model::Account");
+    assert_eq!(account.language, "rust");
+    assert_eq!(names(&account.fields), ["id", "balance", "tags"]);
+    assert_eq!(
+        account
+            .fields
+            .iter()
+            .map(|f| f.type_hint.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        ["AccountId", "i64", "Vec<Tag>"]
+    );
+    // Inherent methods from every impl block and file, in path then source order.
+    assert_eq!(names(&account.methods), ["new", "balance"]);
+    assert_eq!(account.methods[1].path, "src/service.rs");
+    for method in &account.methods {
+        let id = method.symbol_id.as_deref().expect("measured method");
+        let node = g.nodes.iter().find(|n| n.id == id).unwrap();
+        assert_eq!(
+            (node.path.as_str(), &node.range),
+            (method.path.as_str(), &method.range)
+        );
+    }
+    assert_eq!(names(&class(&c, "model::AccountId").fields), ["0"]);
+    assert_eq!(
+        names(&class(&c, "model::AccountId").methods),
+        ["raw"],
+        "use-as module alias"
+    );
+    let tag = class(&c, "model::Tag");
+    assert_eq!(names(&tag.fields), ["Plain", "Named", "Scoped"]);
+    assert_eq!(tag.fields[1].type_hint.as_deref(), Some("(String)"));
+    assert_eq!(
+        rel(&c, "model::Tag"),
+        [
+            ("field", "Scope", "src/model.rs"),
+            ("field", "String", "src/model.rs"),
+            ("field", "String", "src/model.rs"),
+        ]
+    );
+    let ledger = class(&c, "model::Ledger");
+    assert_eq!(names(&ledger.methods), ["post", "total"]);
+    assert!(ledger.methods.iter().all(|m| m.symbol_id.is_some()));
+    assert_eq!(
+        rel(&c, "model::Ledger"),
+        [
+            ("extends", "Store", "src/model.rs"),
+            ("extends", "std::fmt::Debug", "src/model.rs"),
+            ("parameter", "Account", "src/model.rs"),
+            ("returns", "Receipt", "src/model.rs"),
+            ("returns", "Result", "src/model.rs"),
+            ("returns", "String", "src/model.rs"),
+        ]
+    );
+    let memory = class(&c, "service::Memory");
+    assert_eq!(
+        names(&memory.methods),
+        ["fixture"],
+        "trait impl methods stay with the trait; `use super::*` reaches the parent module"
+    );
+    assert_eq!(
+        rel(&c, "service::Memory"),
+        [
+            ("field", "Account", "src/service.rs"),
+            ("field", "Vec", "src/service.rs"),
+            ("implements", "Ledger", "src/service.rs"),
+            ("implements", "Store", "src/service.rs"),
+        ],
+        "`-> Self` is not a reference"
+    );
+    assert_eq!(
+        rel(&c, "model::Account"),
+        [
+            ("derives", "Clone", "src/model.rs"),
+            ("derives", "Debug", "src/model.rs"),
+            ("field", "AccountId", "src/model.rs"),
+            ("field", "Tag", "src/model.rs"),
+            ("field", "Vec", "src/model.rs"),
+            ("parameter", "AccountId", "src/model.rs"),
+            ("parameter", "BTreeMap", "src/service.rs"),
+            ("parameter", "Receipt", "src/service.rs"),
+            ("parameter", "String", "src/service.rs"),
+        ]
+    );
+    // Generic parameters never become references; the box keeps its own methods.
+    let wrapper = class(&c, "model::Wrapper");
+    assert_eq!(names(&wrapper.methods), ["get"]);
+    assert_eq!(
+        rel(&c, "model::Wrapper"),
+        [("field", "Account", "src/model.rs")]
+    );
+    // A glob from another file, a same-named type in another module and another
+    // crate never receive these methods.
+    assert_eq!(names(&class(&c, "other::Account").methods), ["shadow"]);
+    assert_eq!(
+        names(&class(&c, "tests/it.rs::Account").methods),
+        ["test_only"]
+    );
+    assert!(
+        !c.classes
+            .iter()
+            .any(|k| k.methods.iter().any(|m| m.name == "via_glob"))
+    );
+    assert!(
+        c.warnings
+            .iter()
+            .any(|w| w == "src/service.rs: blanket or non-path impl not attributed to a class"),
+        "{:?}",
+        c.warnings
+    );
+    assert!(
+        c.relations.iter().all(|r| r.target.is_none()
+            && r.candidate_ids.is_empty()
+            && r.match_kind == "unmatched")
+    );
+    // Composition stores each cross-file relation with its owner's document.
+    let owners: std::collections::BTreeMap<_, _> = c
+        .classes
+        .iter()
+        .map(|k| (k.symbol.id.as_str(), k.symbol.path.as_str()))
+        .collect();
+    let order: Vec<_> = c
+        .relations
+        .iter()
+        .map(|r| owners[r.owner.as_str()])
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(order, sorted);
+}
+#[test]
+fn rust_generic_parameters_aliases_and_cfg_duplicates_never_attract_impls() {
+    let (_, c) = index(&[(
+        "src/lib.rs",
+        r#"pub struct Item;
+pub trait Show {}
+impl<Item: Clone> Show for Item {}
+pub struct Holder<Item> {
+    value: Item,
+}
+pub type Alias = Item;
+impl Alias {
+    fn via_alias(&self) {}
+}
+#[cfg(unix)]
+pub struct Sys;
+#[cfg(not(unix))]
+pub struct Sys;
+impl Sys {
+    fn ambiguous(&self) {}
+}
+impl !Send for Item {}
+"#,
+    )]);
+    assert!(class(&c, "Item").methods.is_empty());
+    assert!(
+        rel(&c, "Item").is_empty(),
+        "blanket impl over a parameter named Item"
+    );
+    assert!(
+        rel(&c, "Holder").is_empty(),
+        "a field of parameter type Item is not a reference"
+    );
+    assert!(c.classes.iter().all(|k| k.methods.is_empty()));
+    assert_eq!(
+        c.classes
+            .iter()
+            .filter(|k| k.qualified_name == "Sys")
+            .count(),
+        2
+    );
+}
+#[test]
+fn rust_impl_contributions_charge_detail_budgets_in_their_own_file() {
+    use trellis::classes::Limits;
+    let (g, full) = rust_workspace();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    // Records admitted through src/model.rs only: service.rs contributions are cut.
+    let model_records: usize = {
+        let file = g.files.iter().find(|f| f.path == "src/model.rs").unwrap();
+        let f = trellis::model::FileExtraction::extract_file(
+            file,
+            &g.nodes,
+            &cancel,
+            Limits::default(),
+        )
+        .unwrap();
+        f.items.len() + f.impls.len()
+    };
+    let limits = Limits {
+        records: model_records,
+        ..Limits::default()
+    };
+    let cut = Catalog::build_with_limits(&g.files, &g.nodes, &cancel, limits).unwrap();
+    assert!(cut.truncated);
+    assert!(
+        cut.warnings
+            .iter()
+            .any(|w| w.starts_with("Class detail limit reached"))
+    );
+    assert_eq!(names(&class(&cut, "model::Account").methods), ["new"]);
+    assert_eq!(
+        names(&class(&full, "model::Account").methods),
+        ["new", "balance"]
+    );
+    // F of a contributing file is independent of the target's file.
+    let service = g.files.iter().find(|f| f.path == "src/service.rs").unwrap();
+    let alone: Vec<_> = g
+        .nodes
+        .iter()
+        .filter(|n| n.path == service.path)
+        .cloned()
+        .collect();
+    assert_eq!(
+        trellis::model::FileExtraction::extract_file(service, &alone, &cancel, Limits::default())
+            .unwrap(),
+        trellis::model::FileExtraction::extract_file(service, &g.nodes, &cancel, Limits::default())
+            .unwrap(),
+    );
+}
+#[test]
+fn rust_recovered_syntax_and_macros_are_bounded_and_reported() {
+    let (_, c) = index(&[(
+        "src/lib.rs",
+        "pub struct Ok { a: u8 }\nmacro_rules! m { ($t:ident) => { struct $t; } }\nm!(Made);\npub struct Broken { b: \nimpl Ok { fn f(&self) {} }\n",
+    )]);
+    assert!(c.truncated);
+    assert!(c.warnings.iter().any(|w| w.contains("recovered syntax")));
+    assert!(c.classes.iter().all(|k| k.qualified_name != "Made"));
 }

@@ -389,7 +389,9 @@ impl Reader<'_> {
             && symbol.name == member.name
             && symbol.path == member.path
             && symbol.range == member.range
-            && symbol.parent.as_deref() == Some(&s.class_id)
+            // A Rust method merged from an `impl` block (#452) has the impl, not
+            // the class, as measured parent; the recorded member names it exactly.
+            && (symbol.parent.as_deref() == Some(&s.class_id) || symbol.path.ends_with(".rs"))
         {
             self.add(symbol, "declaration", "measured")?;
         }

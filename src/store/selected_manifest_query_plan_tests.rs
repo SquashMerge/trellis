@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn selected_capture_and_reconcile_use_the_revision_index() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V30).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V31).unwrap();
     for (label, sql) in [
         ("capture", SELECTED_CAPTURE_SNAPSHOT_SQL),
         ("reconcile", SELECTED_RECONCILE_FILES_SQL),
@@ -35,7 +35,7 @@ fn selected_capture_and_reconcile_use_the_revision_index() {
 #[test]
 fn incomplete_current_schema_is_rejected() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V30).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V31).unwrap();
     db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .unwrap();
     validate_cache_shape(&db).unwrap();
@@ -53,7 +53,7 @@ fn incomplete_current_schema_is_rejected() {
 #[test]
 fn per_file_manifest_lookup_uses_the_path_index() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V30).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V31).unwrap();
     db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .unwrap();
     validate_cache_shape(&db).unwrap();
@@ -81,7 +81,7 @@ fn per_file_manifest_lookup_uses_the_path_index() {
 #[test]
 fn header_and_changing_manifest_plan_avoid_wide_revision_scans() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V30).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V31).unwrap();
     db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .unwrap();
     validate_cache_shape(&db).unwrap();
@@ -424,7 +424,7 @@ fn hot_pair_check_skips_stable_history_but_admission_checks_it() {
 #[test]
 fn native_reference_reads_use_owner_ordered_primary_key() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V30).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V31).unwrap();
     for sql in [
         "SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,spelling,COALESCE(lookup_key,spelling) FROM native_version_references WHERE vid=1 ORDER BY owner_syntax_id,ordinal",
         "SELECT EXISTS(SELECT 1 FROM native_version_references WHERE vid=1 AND owner_syntax_id=X'00')",

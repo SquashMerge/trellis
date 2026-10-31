@@ -2,7 +2,7 @@
 //! never compiler resolution. No source reads, body inference, or dependency loading.
 use crate::model::{
     CancelFlag, ClassDefinition, ClassMember, ClassRelation, DetailItem, DetailValue,
-    FileExtraction, SourceFile, SourceRange, Symbol, SymbolKind,
+    FileExtraction, ImplItem, SourceFile, SourceRange, Symbol, SymbolKind,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,8 @@ use std::{
     sync::atomic::Ordering,
 };
 use tree_sitter::Node;
+
+mod rust;
 
 const FILE_BYTES: usize = 2 * 1024 * 1024;
 const TOTAL_BYTES: usize = 256 * 1024 * 1024;
@@ -25,12 +27,12 @@ const TEXT: usize = 2_048;
 const OUTPUT_TEXT: usize = 64 * 1024 * 1024;
 const REGISTRY_TEXT: usize = 32 * 1024 * 1024;
 /// Languages whose declarations the class catalog extracts, in API order.
-pub const SUPPORTED_LANGUAGES: [&str; 3] = ["java", "python", "javascript"];
+pub const SUPPORTED_LANGUAGES: [&str; 4] = ["java", "python", "javascript", "rust"];
 /// Whether `language` documents carry a class extraction (`F`) and class rows.
 pub fn supports_language(language: &str) -> bool {
     SUPPORTED_LANGUAGES.contains(&language)
 }
-const CATALOG_NOTICE: &str = "Declared types are terminal source text, not class relationships. Direct class declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.";
+const CATALOG_NOTICE: &str = "Declared types are terminal source text, not class relationships. Direct class declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery. Rust: inherent impl methods merge by scoped path; derives, macro-generated items and blanket impls are not attributed.";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -121,6 +123,7 @@ struct Builder<'a> {
     registry_complete: bool,
     limits: Limits,
     items: Vec<DetailItem>,
+    impls: Vec<ImplItem>,
 }
 fn check(cancel: &CancelFlag) -> Result<()> {
     ensure!(!cancel.load(Ordering::Relaxed), "class catalog cancelled");
@@ -219,6 +222,8 @@ pub(crate) struct CatalogComposer {
     detail_open: bool,
     open: bool,
     limits: Limits,
+    /// Admitted Rust impl contributions, attached to their unique class at `finish`.
+    merged: Vec<(String, DetailValue)>,
 }
 impl CatalogComposer {
     pub(crate) fn new(file_count: usize, symbol_count: usize, limits: Limits) -> Self {
@@ -241,6 +246,7 @@ impl CatalogComposer {
             detail_open: true,
             open,
             limits,
+            merged: Vec::new(),
         }
     }
     pub(crate) fn is_open(&self) -> bool {
@@ -300,34 +306,10 @@ impl CatalogComposer {
             c.fields.clear();
             c.methods.clear();
             for item in f.items.iter().filter(|i| i.class_index == index) {
-                if !self.detail_open {
+                if !self.admit_detail(item.records, item.text) {
                     c.truncated = true;
                     continue;
                 }
-                if self.records.saturating_add(item.records) > self.limits.records
-                    || self.detail.saturating_add(item.text) > self.limits.output_text
-                {
-                    let message = if self.records.saturating_add(item.records) > self.limits.records
-                    {
-                        format!(
-                            "Class detail limit reached ({} records / {} MiB text / {} visits per file); declaration discovery continues",
-                            self.limits.records,
-                            self.limits.output_text / (1024 * 1024),
-                            self.limits.visits
-                        )
-                    } else {
-                        format!(
-                            "Class detail text limit reached ({} MiB); declaration discovery continues",
-                            self.limits.output_text / (1024 * 1024)
-                        )
-                    };
-                    self.result.limit_warning(&message, self.limits.text);
-                    self.detail_open = false;
-                    c.truncated = true;
-                    continue;
-                }
-                self.records += item.records;
-                self.detail += item.text;
                 match &item.value {
                     DetailValue::Field(value) => c.fields.push(value.clone()),
                     DetailValue::Method(value) => c.methods.push(value.clone()),
@@ -337,20 +319,50 @@ impl CatalogComposer {
             }
             self.result.classes.push(c);
         }
+        for item in &f.impls {
+            // Charged in this file's walk position, like any detail item.
+            if self.admit_detail(item.records, item.text) {
+                self.merged.push((item.target.clone(), item.value.clone()));
+            }
+        }
+        true
+    }
+    /// Decision 0004 detail admission: the first failing item closes detail output.
+    fn admit_detail(&mut self, records: usize, text: usize) -> bool {
+        if !self.detail_open {
+            return false;
+        }
+        if self.records.saturating_add(records) > self.limits.records
+            || self.detail.saturating_add(text) > self.limits.output_text
+        {
+            let message = if self.records.saturating_add(records) > self.limits.records {
+                format!(
+                    "Class detail limit reached ({} records / {} MiB text / {} visits per file); declaration discovery continues",
+                    self.limits.records,
+                    self.limits.output_text / (1024 * 1024),
+                    self.limits.visits
+                )
+            } else {
+                format!(
+                    "Class detail text limit reached ({} MiB); declaration discovery continues",
+                    self.limits.output_text / (1024 * 1024)
+                )
+            };
+            self.result.limit_warning(&message, self.limits.text);
+            self.detail_open = false;
+            return false;
+        }
+        self.records += records;
+        self.detail += text;
         true
     }
     pub(crate) fn finish(mut self) -> Catalog {
-        self.result.classes.sort_by(|a, b| {
-            (&a.symbol.path, a.symbol.range.start_byte, &a.symbol.id).cmp(&(
-                &b.symbol.path,
-                b.symbol.range.start_byte,
-                &b.symbol.id,
-            ))
-        });
-        self.result.relations.sort_by(|a, b| {
-            (&a.path, a.range.start_byte, &a.id).cmp(&(&b.path, b.range.start_byte, &b.id))
-        });
-        self.result.relations.dedup_by(|a, b| a.id == b.id);
+        attach_impls(
+            &mut self.result,
+            std::mem::take(&mut self.merged),
+            self.limits.members,
+        );
+        sort_catalog(&mut self.result);
         if !self.result.classes.is_empty() {
             self.result.warnings.push(CATALOG_NOTICE.into());
         }
@@ -361,6 +373,88 @@ impl CatalogComposer {
         }
         self.result
     }
+}
+
+/// Global step of #452: an admitted Rust impl contribution joins the one Rust
+/// class whose qualified name equals its scoped target. No class, or several
+/// (for example cfg-duplicated declarations), leave it unattributed.
+fn attach_impls(result: &mut Catalog, merged: Vec<(String, DetailValue)>, members: usize) {
+    if merged.is_empty() {
+        return;
+    }
+    let mut targets: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, class) in result.classes.iter().enumerate() {
+        if class.language == "rust" {
+            targets
+                .entry(class.qualified_name.as_str())
+                .or_default()
+                .push(index);
+        }
+    }
+    let targets: BTreeMap<String, usize> = targets
+        .into_iter()
+        .filter(|(_, found)| found.len() == 1)
+        .map(|(key, found)| (key.to_owned(), found[0]))
+        .collect();
+    for (target, value) in merged {
+        let Some(&index) = targets.get(&target) else {
+            continue;
+        };
+        let class = &mut result.classes[index];
+        match value {
+            DetailValue::Method(method) => {
+                if class.fields.len() + class.methods.len() >= members {
+                    class.truncated = true;
+                } else {
+                    class.methods.push(method);
+                }
+            }
+            DetailValue::Relation(mut relation) => {
+                relation.owner = class.symbol.id.clone();
+                relation.id = format!(
+                    "class-ref:{}:{}:{}:{}:{}",
+                    relation.owner,
+                    relation.range.start_byte,
+                    relation.range.end_byte,
+                    relation.kind,
+                    relation.type_name
+                );
+                result.relations.push(relation);
+            }
+            DetailValue::Field(_) | DetailValue::ScopeText => {}
+        }
+    }
+}
+/// Classes in `(path, start_byte, id)` order; relations grouped by their owner's
+/// document, then `(path, start_byte, id)`. A Rust `impl Trait for T` relation is
+/// stored with T's document even when the impl is in another file.
+fn sort_catalog(result: &mut Catalog) {
+    result.classes.sort_by(|a, b| {
+        (&a.symbol.path, a.symbol.range.start_byte, &a.symbol.id).cmp(&(
+            &b.symbol.path,
+            b.symbol.range.start_byte,
+            &b.symbol.id,
+        ))
+    });
+    let owners: BTreeMap<&str, &str> = result
+        .classes
+        .iter()
+        .map(|c| (c.symbol.id.as_str(), c.symbol.path.as_str()))
+        .collect();
+    let mut keyed: Vec<(String, ClassRelation)> = std::mem::take(&mut result.relations)
+        .into_iter()
+        .map(|r| {
+            let owner = owners
+                .get(r.owner.as_str())
+                .map_or_else(|| r.path.clone(), |path| (*path).to_owned());
+            (owner, r)
+        })
+        .collect();
+    keyed.sort_by(|(ao, a), (bo, b)| {
+        (ao, &a.path, a.range.start_byte, &a.id).cmp(&(bo, &b.path, b.range.start_byte, &b.id))
+    });
+    result.relations = keyed.into_iter().map(|(_, r)| r).collect();
+    result.relations.dedup_by(|a, b| a.id == b.id);
 }
 
 /// Plans the no-global-limit-hit case without loading extraction payloads.
@@ -446,17 +540,18 @@ pub(crate) fn complete_file_catalog(extraction: &FileExtraction) -> Catalog {
         }
         result.classes.push(class);
     }
-    result.classes.sort_by(|a, b| {
-        (&a.symbol.path, a.symbol.range.start_byte, &a.symbol.id).cmp(&(
-            &b.symbol.path,
-            b.symbol.range.start_byte,
-            &b.symbol.id,
-        ))
-    });
-    result.relations.sort_by(|a, b| {
-        (&a.path, a.range.start_byte, &a.id).cmp(&(&b.path, b.range.start_byte, &b.id))
-    });
-    result.relations.dedup_by(|a, b| a.id == b.id);
+    // Only same-file targets are known here; publication composes a revision
+    // in full whenever a Rust document changes.
+    attach_impls(
+        &mut result,
+        extraction
+            .impls
+            .iter()
+            .map(|item| (item.target.clone(), item.value.clone()))
+            .collect(),
+        Limits::default().members,
+    );
+    sort_catalog(&mut result);
     let has_classes = !result.classes.is_empty();
     append_complete_catalog_warnings(&mut result, has_classes, !extraction.registry_incomplete);
     result
@@ -529,6 +624,10 @@ impl FileExtraction {
             detail_records = detail_records.saturating_add(item.records);
             detail_text = detail_text.saturating_add(item.text);
         }
+        for item in &self.impls {
+            detail_records = detail_records.saturating_add(item.records);
+            detail_text = detail_text.saturating_add(item.text);
+        }
         FileSummary {
             source_bytes: self.source_bytes,
             registry_bytes: self.registry_bytes,
@@ -560,6 +659,7 @@ impl FileExtraction {
             registry_complete: true,
             limits,
             items: vec![],
+            impls: vec![],
         };
         if file.text.len() > limits.file_bytes {
             b.registry_limit(&format!(
@@ -586,6 +686,7 @@ impl FileExtraction {
                 "java" => tree_sitter_java::LANGUAGE.into(),
                 "python" => tree_sitter_python::LANGUAGE.into(),
                 "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+                "rust" => tree_sitter_rust::LANGUAGE.into(),
                 other => anyhow::bail!("class catalog does not support {other}"),
             })?;
             let mut cancelled = |_: &tree_sitter::ParseState| {
@@ -619,7 +720,11 @@ impl FileExtraction {
                 exhausted: false,
                 detail_visits: 0,
             };
-            ex.module(tree.root_node(), 0)?;
+            if file.language == "rust" {
+                ex.rust_file(tree.root_node())?;
+            } else {
+                ex.module(tree.root_node(), 0)?;
+            }
             if ex.exhausted {
                 for c in &mut ex.b.catalog.classes {
                     c.truncated = true;
@@ -637,6 +742,7 @@ impl FileExtraction {
             registry_incomplete: !b.registry_complete,
             classes: b.catalog.classes,
             items: b.items,
+            impls: b.impls,
         })
     }
 }
@@ -1625,6 +1731,7 @@ mod budget_tests {
                 registry_complete: true,
                 limits: Limits::default(),
                 items: vec![],
+                impls: vec![],
             };
             Extractor {
                 b: &mut b,
@@ -1734,6 +1841,7 @@ mod budget_tests {
                     text: 1,
                     value: DetailValue::ScopeText,
                 }],
+                impls: vec![],
             }
         }
         let files = [extraction("c.py"), extraction("a.py"), extraction("b.py")];
@@ -1836,6 +1944,7 @@ mod summary_tests {
                 text: 3,
                 value: DetailValue::ScopeText,
             }],
+            impls: vec![],
         }
     }
 
