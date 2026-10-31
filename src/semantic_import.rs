@@ -1396,6 +1396,14 @@ fn measure_occurrence<S: JoinStore>(
             .is_some_and(|kind| match candidate.kind.as_str() {
                 _ if kind == 0 => true,
                 "type" => matches!(kind, 7 | 11 | 21),
+                // Native JavaScript represents a class constructor as a method. SCIP can
+                // state either its constructor semantics or its method declaration shape.
+                "method"
+                    if candidate.document.language == "javascript"
+                        && candidate.name.as_deref() == Some("constructor") =>
+                {
+                    matches!(kind, 9 | 26)
+                }
                 "method" => kind == 26,
                 _ => true,
             });
@@ -3032,6 +3040,7 @@ pub(crate) fn original_associations_from_selected(
     producer_id: &str,
 ) -> Option<JoinedFacts> {
     let mut by_provenance = BTreeMap::new();
+    let proofs = inventory.proof_lookup();
     for row in snapshot
         .provenance
         .iter()
@@ -3039,7 +3048,7 @@ pub(crate) fn original_associations_from_selected(
     {
         let derived = row.derived_from.as_ref()?;
         let kind = serde_json::to_value(derived.record_kind).ok()?;
-        let claim = inventory
+        let claim = proofs
             .lookup(&derived.provenance_id, kind.as_str()?, &derived.fact_digest)
             .ok()?;
         if row.document.language != claim.language || row.document.path != claim.path {
@@ -3808,7 +3817,6 @@ fn empty_publication(producer: &semantic::Producer) -> semantic::SemanticPublica
 
 struct ProofIdentityIndex<'a> {
     by_proof: BTreeMap<String, &'a crate::scip_raw::RawProofIdentity>,
-    inventory: &'a crate::scip_raw::ProofInventory,
 }
 impl<'a> ProofIdentityIndex<'a> {
     fn new(inventory: &'a crate::scip_raw::ProofInventory) -> Result<Self> {
@@ -3819,10 +3827,7 @@ impl<'a> ProofIdentityIndex<'a> {
                 "non-unique original proof ID"
             );
         }
-        Ok(Self {
-            by_proof,
-            inventory,
-        })
+        Ok(Self { by_proof })
     }
 }
 
@@ -3838,8 +3843,11 @@ impl ProofIdentities for ProofIdentityIndex<'_> {
     }
 
     fn check_proof(&self, proof_id: &str, kind: &str, digest: &str) -> Result<()> {
-        self.inventory.lookup(proof_id, kind, digest)?;
-        Ok(())
+        // Proof IDs are unique (checked in `new`), so the index answers the inventory's lookup.
+        match self.by_proof.get(proof_id) {
+            Some(claim) if claim.record_kind == kind && claim.fact_digest == digest => Ok(()),
+            _ => Err(crate::scip_raw::ScipCaptureError::MissingProof.into()),
+        }
     }
 }
 
