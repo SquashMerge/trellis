@@ -80,6 +80,9 @@ pub struct ClassPage {
     pub truncated: bool,
     pub warnings: Vec<String>,
     pub require_index: bool,
+    /// Source languages the class catalog extracts (`crate::classes::SUPPORTED_LANGUAGES`).
+    /// Clients gate class views on this list and each class's `language`.
+    pub supported_languages: Vec<String>,
 }
 impl ClassDiagram {
     pub fn unindexed(revision: IndexPin, seed: String) -> Self {

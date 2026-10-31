@@ -12,7 +12,22 @@ Initial meaningful support: Java/Python declared classes/types, direct members, 
 declared field/parameter/return type references. No inferred receiver types, runtime dispatch, ownership,
 composition/multiplicity, generated methods or Maven/pip resolution. Candidate links are syntax matches,
 not compiler resolution. Ambiguous/unmatched names remain terminal hints, hidden by default but revealable.
-JS/Rust class/type extraction for this view is explicitly outside this initial slice (existing sequences unchanged).
+JS/Rust class/type extraction was outside this initial slice; #452 adds it (below).
+
+JavaScript (#452 slice 1, owner direction 2026-10-29): a named ES `class_declaration` at module level,
+directly or as an `export`/`export default` declaration, with a unique measured `type` symbol, is a
+ClassDefinition (`language:"javascript"`, `declarationKind:"class"`, qualified name = path without
+`.js`/`.mjs`/`.cjs`, `/`→`.`, then the name). Members are direct `field_definition`s and
+`method_definition`s (static, getters/setters, private `#names` included) in source order; static
+blocks are not members. A method's `symbolId` is its unique measured method symbol, so `#private`
+methods have none. `extends` with an identifier or dotted member expression records one `extends`
+relation; other heritage expressions record none. No field/parameter/return relations: plain JS has
+no type annotations and JSDoc is out of scope. Class expressions, prototype assignment, factories,
+object-literal "classes" and function-body classes are not extracted. Per-file limits, composition and
+caps are those of Decision 0004, unchanged. As for Java and Python, every relation stays a terminal
+`unmatched` hint (Decision 0004 "No resolution is added"; #64 no lexical class edges; publication refuses
+a targeted relation). `GET /api/classes` returns `supportedLanguages` (`crate::classes::SUPPORTED_LANGUAGES`)
+so clients can gate class views by language.
 
 Backend core owner: src/classes.rs + tests/classes.rs only. Public serde camelCase DTOs:
 ClassMember {name:String, type_hint:Option<String>, symbol_id:Option<String>, path:String, range:SourceRange}

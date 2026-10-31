@@ -263,7 +263,7 @@
     ui.results.replaceChildren(); ui.diagram.replaceChildren(); renderWarnings();
     ui.diagram.setAttribute("aria-busy", "false");
     ui.query.value = ""; if (ui.unmatched) ui.unmatched.checked = false;
-    state("Choose a Java or Python class, or search the indexed workspace.", "empty");
+    state("Choose a class, or search the indexed workspace.", "empty");
   }
   function init(options) {
     api = options;
@@ -303,12 +303,12 @@
     }
     reset();
   }
-  function unsupported(path) { return path && !/\.(java|py|pyi)$/i.test(path); }
+  function unsupported(path) { return path && !/\.(java|py|pyi|js|mjs|cjs)$/i.test(path); }
   async function open(options = {}) {
     if (!ui) return;
     closeContextMenu(false);
     if (unsupported(options.path)) {
-      reset(); state("Class diagrams currently support Java and Python declarations. Sequence browsing is unchanged.", "unsupported"); return;
+      reset(); state("Class diagrams currently support Java, Python and JavaScript declarations. Sequence browsing is unchanged.", "unsupported"); return;
     }
     if (options.seed) {
       searchSerial++; ui.results.replaceChildren();
@@ -358,7 +358,7 @@
       const warnings = data.warnings || [];
       const unindexed = data.requireIndex || warnings.some(warning => /index workspace/i.test(warning));
       renderWarnings(warnings);
-      state(`${unindexed ? "Index workspace to populate class declarations." : items.length ? "Choose a class to show its declared relationships." : "No matching classes. Try another name or index Java / Python files."}${data.truncated ? " Results are partial." : ""}`, unindexed ? "unindexed" : data.truncated ? "partial" : items.length ? "ready" : "empty");
+      state(`${unindexed ? "Index workspace to populate class declarations." : items.length ? "Choose a class to show its declared relationships." : "No matching classes. Try another name or index supported source files."}${data.truncated ? " Results are partial." : ""}`, unindexed ? "unindexed" : data.truncated ? "partial" : items.length ? "ready" : "empty");
       if (autoOpen && items.length) await loadDiagram(items[0].symbol.id, [], true);
     } catch (error) {
       if (ticket === searchSerial && valid(c) && error.name !== "AbortError") {

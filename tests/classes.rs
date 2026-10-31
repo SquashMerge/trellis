@@ -32,6 +32,12 @@ fn golden(catalog: &Catalog) {
     );
 }
 fn fixture(files: &[(&str, &str)]) -> (Graph, Catalog) {
+    let (graph, catalog) = index(files);
+    golden(&catalog);
+    (graph, catalog)
+}
+/// Indexes a fixture without a frozen pre-Decision-0004 golden (new languages).
+fn index(files: &[(&str, &str)]) -> (Graph, Catalog) {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let git = temp.path().join(".git");
@@ -51,7 +57,6 @@ fn fixture(files: &[(&str, &str)]) -> (Graph, Catalog) {
     let cancel = Arc::new(AtomicBool::new(false));
     let graph = index_workspace(&IndexOptions::new(temp.path().into()), &cancel, |_| {}).unwrap();
     let catalog = Catalog::build(&graph.files, &graph.nodes, &cancel).unwrap();
-    golden(&catalog);
     (graph, catalog)
 }
 fn class<'a>(c: &'a Catalog, name: &str) -> &'a trellis::model::ClassDefinition {
@@ -262,9 +267,158 @@ fn cancellation_and_old_or_unsupported_snapshots_are_safe() {
             .to_string()
             .contains("cancelled")
     );
-    let (_, c) = fixture(&[("a.js", "class Foo {}"), ("a.rs", "struct Foo {}")]);
+    // Rust declarations are not catalogued in this slice.
+    let (_, c) = index(&[("a.rs", "struct Foo {}")]);
     assert!(c.classes.is_empty());
     assert!(c.relations.is_empty());
+}
+fn names(members: &[trellis::model::ClassMember]) -> Vec<&str> {
+    members.iter().map(|m| m.name.as_str()).collect()
+}
+#[test]
+fn javascript_es_classes_have_members_and_terminal_extends_hints() {
+    let (g, c) = index(&[
+        (
+            "web/shapes.js",
+            r#"import { Base } from "./base.js";
+export class Shape extends Base {
+  #id = 0;
+  name;
+  static count = 1;
+  constructor(name) { super(); this.name = name; }
+  area() { return 0; }
+  static create() { return new Shape("x"); }
+  get label() { return this.name; }
+  #hidden() {}
+  static { Shape.count++; }
+}
+export default class Circle extends ns.Shape { radius = 1; }
+class Mixed extends mixin(Base) {}
+const Expr = class Hidden extends Base {};
+function factory() { return class Local {}; }
+const literal = { method() {} };
+Thing.prototype.go = function () {};
+"#,
+        ),
+        ("web/base.mjs", "export class Base { id() {} }\n"),
+    ]);
+    let mut qualified: Vec<_> = c
+        .classes
+        .iter()
+        .map(|c| c.qualified_name.as_str())
+        .collect();
+    qualified.sort();
+    assert_eq!(
+        qualified,
+        [
+            "web.base.Base",
+            "web.shapes.Circle",
+            "web.shapes.Mixed",
+            "web.shapes.Shape"
+        ],
+        "only named ES class declarations; no class expressions, factories, object literals or prototypes"
+    );
+    let shape = class(&c, "web.shapes.Shape");
+    assert_eq!(shape.language, "javascript");
+    assert_eq!(shape.declaration_kind, "class");
+    assert_eq!(names(&shape.fields), ["#id", "name", "count"]);
+    assert_eq!(
+        names(&shape.methods),
+        ["constructor", "area", "create", "label", "#hidden"]
+    );
+    assert!(
+        shape
+            .fields
+            .iter()
+            .all(|f| f.type_hint.is_none() && f.symbol_id.is_none())
+    );
+    for method in &shape.methods {
+        assert!(method.type_hint.is_none());
+        if method.name == "#hidden" {
+            // Private names are not measured native declarations: listed, not navigable.
+            assert!(method.symbol_id.is_none());
+            continue;
+        }
+        let id = method
+            .symbol_id
+            .as_deref()
+            .unwrap_or_else(|| panic!("measured method symbol {method:?} {:#?}", g.nodes));
+        assert!(
+            g.nodes
+                .iter()
+                .any(|n| n.id == id && n.path == "web/shapes.js")
+        );
+        let node = g.nodes.iter().find(|n| n.id == id).unwrap();
+        let parent = g.nodes.iter().find(|n| Some(&n.id) == node.parent.as_ref());
+        assert_eq!(
+            parent.map(|p| (&p.name, p.kind)),
+            Some((&shape.symbol.name, trellis::model::SymbolKind::Class)),
+            "{} parent {:?}",
+            method.name,
+            node.parent
+        );
+    }
+    assert_eq!(names(&class(&c, "web.shapes.Circle").fields), ["radius"]);
+    let mut relations: Vec<_> = c
+        .relations
+        .iter()
+        .map(|r| {
+            let owner = c.classes.iter().find(|k| k.symbol.id == r.owner).unwrap();
+            (
+                owner.qualified_name.as_str(),
+                r.kind.as_str(),
+                r.type_name.as_str(),
+            )
+        })
+        .collect();
+    relations.sort();
+    assert_eq!(
+        relations,
+        [
+            ("web.shapes.Circle", "extends", "ns.Shape"),
+            ("web.shapes.Shape", "extends", "Base"),
+        ],
+        "plain JavaScript has no field, parameter or return types; a mixin call is not a name"
+    );
+    linked(&c, "web.shapes.Shape", "Base", "extends", "web.base.Base");
+    assert!(!c.truncated, "{:?}", c.warnings);
+}
+#[test]
+fn javascript_recovered_syntax_is_bounded_and_reported() {
+    let (_, c) = index(&[(
+        "broken.cjs",
+        "class Ok { a() {} }\nclass Broken extends { b( }\n",
+    )]);
+    assert!(c.truncated);
+    assert!(c.warnings.iter().any(|w| w.contains("recovered syntax")));
+    assert!(c.relations.iter().all(|r| r.target.is_none()));
+}
+#[test]
+fn javascript_dotted_extends_ignore_whitespace_and_comments_but_not_other_expressions() {
+    let source = "class A extends ns . Base {}\nclass B extends ns /*c*/ . deep\n  . Base {}\nclass C extends ns?.Base {}\nclass D extends ns[\"Base\"] {}\nclass E extends make().Base {}\nclass F extends /* lead */ Base {}\n";
+    let (_, c) = index(&[("w.js", source)]);
+    let mut found: Vec<_> = c
+        .relations
+        .iter()
+        .map(|r| {
+            let owner = c.classes.iter().find(|k| k.symbol.id == r.owner).unwrap();
+            (
+                owner.symbol.name.as_str(),
+                r.type_name.as_str(),
+                &source[r.range.start_byte..r.range.end_byte],
+            )
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("A", "ns.Base", "ns . Base"),
+            ("B", "ns.deep.Base", "ns /*c*/ . deep\n  . Base"),
+            ("F", "Base", "Base"),
+        ],
+        "canonical spelling with the source range; optional, computed and call heritage stay out"
+    );
 }
 #[test]
 fn missing_measured_symbols_and_member_limits_are_explicit() {

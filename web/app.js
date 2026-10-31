@@ -2197,7 +2197,7 @@ $("dependency-next")?.addEventListener("click", () => { if (!$("dependency-next"
 
 // Class diagrams are an independent, cached-source projection. They never infer
 // a sequence participant's type or call a provider.
-function classLanguage(path) { return /\.(?:java|py)$/i.test(path || ""); }
+function classLanguage(path) { return /\.(?:java|py|js|mjs|cjs)$/i.test(path || ""); }
 async function openClasses(options = {}) {
   architecture?.clearInspection();
   treemap?.clearInspection();
