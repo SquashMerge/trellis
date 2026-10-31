@@ -23,8 +23,16 @@ struct HardwareProducer {
     version: String,
     #[serde(rename = "executableHash")]
     executable_hash: String,
+    #[serde(rename = "targetPins", default)]
+    target_pins: Vec<HardwareTargetPin>,
     #[serde(rename = "positionEncoding")]
     position_encoding: Option<String>,
+}
+#[derive(Deserialize)]
+struct HardwareTargetPin {
+    target: String,
+    #[serde(rename = "executableHash")]
+    executable_hash: String,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,8 +60,13 @@ pub struct PinnedProducer {
     pub name: String,
     pub version: String,
     pub identity_kind: IdentityKind,
-    /// For `generatorSource` identities this is the SHA-256 of the generator source.
+    /// For `generatorSource` identities this is the SHA-256 of the generator source. A producer
+    /// with `target_pins` carries the host target's entry here, or the reference host's value
+    /// on a target with no entry, where only a pickup can name it.
     pub executable_hash: String,
+    /// `(target triple, executable hash)`, for a producer whose binary differs per target
+    /// (Decision 0017 Amendment 6). Empty for one pinned by a single hash.
+    pub target_pins: Vec<(String, String)>,
     pub position_encoding: u8,
     pub languages: Vec<String>,
     pub trust_origin: &'static str,
@@ -61,6 +74,14 @@ pub struct PinnedProducer {
 }
 
 impl PinnedProducer {
+    /// The hash pinned for `target`, or `None` when no pin covers it.
+    pub fn target_hash(&self, target: &str) -> Option<&str> {
+        self.target_pins
+            .iter()
+            .find(|(pinned, _)| pinned == target)
+            .map(|(_, hash)| hash.as_str())
+    }
+
     pub fn producer(&self) -> semantic_evidence::Producer {
         semantic_evidence::Producer {
             id: self.name.clone(),
@@ -125,6 +146,47 @@ pub fn witness_language(producer_id: &str) -> Option<&'static str> {
     }
 }
 
+/// The host's target name: the toolchain triple on the operating systems Trellis ships for.
+pub(crate) fn host_target() -> String {
+    let arch = std::env::consts::ARCH;
+    match std::env::consts::OS {
+        "macos" => format!("{arch}-apple-darwin"),
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        os => format!("{arch}-{os}"),
+    }
+}
+
+/// `producer`'s pin as `target` sees it, or `None` for a row that isn't a usable reference pin.
+fn reference_pin(
+    producer: &HardwareProducer,
+    profile_id: &str,
+    target: &str,
+) -> Option<PinnedProducer> {
+    let language = producer_language(&producer.name)?;
+    let target_pins: Vec<_> = producer
+        .target_pins
+        .iter()
+        .map(|pin| (pin.target.clone(), pin.executable_hash.clone()))
+        .collect();
+    let mut pinned = PinnedProducer {
+        name: producer.name.clone(),
+        version: producer.version.clone(),
+        identity_kind: IdentityKind::Executable,
+        executable_hash: producer.executable_hash.clone(),
+        target_pins,
+        position_encoding: encoding_code(producer.position_encoding.as_deref()?)?,
+        languages: vec![language.into()],
+        trust_origin: REFERENCE_TRUST_ORIGIN,
+        profile_id: profile_id.to_owned(),
+    };
+    if let Some(hash) = pinned.target_hash(target) {
+        pinned.executable_hash = hash.to_owned();
+    }
+    let hashes_valid = hexhash(&producer.executable_hash)
+        && pinned.target_pins.iter().all(|(_, hash)| hexhash(hash));
+    hashes_valid.then_some(pinned)
+}
+
 fn profiles() -> Result<&'static Profiles, ScipCaptureError> {
     static PROFILES: OnceLock<Option<Profiles>> = OnceLock::new();
     PROFILES
@@ -142,23 +204,11 @@ fn load_profiles() -> Option<Profiles> {
         "../docs/semantic-evidence/synthetic-profiles/trellis-synthetic-scip-v1.json"
     ))
     .ok()?;
+    let host = host_target();
     let reference = hardware
         .semantic_producers
         .iter()
-        .filter_map(|producer| {
-            let language = producer_language(&producer.name)?;
-            Some(PinnedProducer {
-                name: producer.name.clone(),
-                version: producer.version.clone(),
-                identity_kind: IdentityKind::Executable,
-                executable_hash: producer.executable_hash.clone(),
-                position_encoding: encoding_code(producer.position_encoding.as_deref()?)?,
-                languages: vec![language.into()],
-                trust_origin: REFERENCE_TRUST_ORIGIN,
-                profile_id: hardware.profile_id.clone(),
-            })
-            .filter(|pinned| hexhash(&pinned.executable_hash))
-        })
+        .filter_map(|producer| reference_pin(producer, &hardware.profile_id, &host))
         .collect();
     let generator = synthetic.generator;
     if synthetic.identity_kind != "generatorSource"
@@ -177,6 +227,7 @@ fn load_profiles() -> Option<Profiles> {
             version: generator.version,
             identity_kind: IdentityKind::GeneratorSource,
             executable_hash: generator.source_sha256,
+            target_pins: Vec::new(),
             position_encoding: encoding_code(&generator.position_encoding)?,
             languages: generator.languages,
             trust_origin: SYNTHETIC_TRUST_ORIGIN,
@@ -376,12 +427,17 @@ mod tests {
             assert_eq!(pinned.profile_id, profile.profile_id);
             assert_eq!(pinned.position_encoding, encoding.0);
             assert_eq!(pinned.languages, [language]);
+            let expected_hash = row
+                .target_pins
+                .iter()
+                .find(|pin| pin.target == host_target())
+                .map_or(&row.executable_hash, |pin| &pin.executable_hash);
             assert_eq!(
                 pinned.producer(),
                 semantic_evidence::Producer {
                     id: id.into(),
                     version: row.version.clone(),
-                    executable_hash: row.executable_hash.clone(),
+                    executable_hash: expected_hash.clone(),
                     kind: SemanticKind::Semantic,
                     languages: vec![semantic_language],
                     position_encoding: encoding.1,
@@ -396,6 +452,48 @@ mod tests {
         assert_eq!(pinned_producer_by_id("scip-unknown"), None);
         assert_eq!(producer_language("scip-unknown"), None);
     }
+    #[test]
+    fn rust_analyzer_pin_selects_the_hash_of_each_target() {
+        let profile: Hardware = serde_json::from_str(include_str!(
+            "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+        ))
+        .unwrap();
+        let row = profile
+            .semantic_producers
+            .iter()
+            .find(|p| p.name == "rust-analyzer")
+            .unwrap();
+        let hash = |target: &str| {
+            reference_pin(row, &profile.profile_id, target)
+                .unwrap()
+                .executable_hash
+        };
+        // The reference host's table entry is its measured hash, which the checker pins by.
+        assert_eq!(hash("aarch64-apple-darwin"), row.executable_hash);
+        let linux = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"].map(hash);
+        assert!(linux.iter().all(|hash| hexhash(hash)));
+        assert_ne!(linux[0], linux[1]);
+        assert!(!linux.contains(&row.executable_hash));
+        // A target with no entry names nothing in the table; resolution refuses it.
+        let other = reference_pin(row, &profile.profile_id, "x86_64-apple-darwin").unwrap();
+        assert_eq!(other.target_hash("x86_64-apple-darwin"), None);
+    }
+
+    #[test]
+    fn a_malformed_target_pin_drops_the_row() {
+        let row = HardwareProducer {
+            name: "rust-analyzer".into(),
+            version: "1".into(),
+            executable_hash: "a".repeat(64),
+            target_pins: vec![HardwareTargetPin {
+                target: "t".into(),
+                executable_hash: "not hex".into(),
+            }],
+            position_encoding: Some("utf8".into()),
+        };
+        assert_eq!(reference_pin(&row, "p", "other"), None);
+    }
+
     #[test]
     fn synthetic_and_reference_identities_cannot_be_crossed() {
         let synthetic = pinned_producer_by_id("trellis-synthetic-scip").unwrap();

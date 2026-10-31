@@ -360,7 +360,12 @@ const HARDWARE_SHAPE = {
     os: {name: nonEmpty, version: nonEmpty, build: nonEmpty},
     rustVersion: nonEmpty, cargoVersion: nonEmpty, nodeVersion: nonEmpty,
   },
-  semanticProducers: list({...pin("executableHash"), positionEncoding: optional(text(/^(utf8|utf16|unicodeScalar)$/))}, "name"),
+  semanticProducers: list({
+    ...pin("executableHash"),
+    positionEncoding: optional(text(/^(utf8|utf16|unicodeScalar)$/)),
+    // Decision 0017 Amendment 6: a producer whose binary differs per target.
+    targetPins: optional(list({target: text(/^[a-z0-9_]+(-[a-z0-9_]+)+$/), executableHash: hex64}, "target")),
+  }, "name"),
   // Decision 0017: each corpus PR that pins a toolchain adds its toolchains[] entry.
   toolchains: optional(list(pin("toolchainHash"), "name")),
   qualification: {producerInventoryComplete: flag, readyForAuthoritativeBaseline: flag, benchmarkEvidence: null, passingBenchmarkClaim: false},
@@ -539,6 +544,10 @@ function selfTest(documents) {
           const document = structuredClone(base);
           delete at(document)[key];
           assert.doesNotThrow(() => checkDocument(buffer(document), HARDWARE), `optional ${label}.${key}`);
+        } else if (key === "targetPins" && route[0] === "semanticProducers") {
+          const document = structuredClone(base);
+          delete at(document)[key];
+          assert.doesNotThrow(() => checkDocument(buffer(document), HARDWARE), `optional ${label}.${key}`);
         } else {
           hardwareMutation(base, `${label} missing ${key}`, (document) => { delete at(document)[key]; });
         }
@@ -637,6 +646,13 @@ function selfTest(documents) {
       ["fractional nested count", ["observed", "ssd", "capacityTB"], 0.5],
     ]) shape(label, /invalid number/, set(route, value));
     shape("duplicate producer", /semanticProducers\[3\]\.name: duplicate name/, (d) => { d.semanticProducers.push({...d.semanticProducers[0]}); });
+    shape("duplicate target pin", /targetPins\[1\]\.target: duplicate target/, (d) => {
+      const row = {target: "aarch64-apple-darwin", executableHash: hex};
+      d.semanticProducers[0].targetPins = [row, row];
+    });
+    shape("bad target pin hash", /targetPins\[0\]\.executableHash: invalid format/, (d) => {
+      d.semanticProducers[0].targetPins = [{target: "aarch64-apple-darwin", executableHash: `sha256:${hex}`}];
+    });
     shape("duplicate toolchain", /toolchains\[1\]\.name: duplicate name/, (d) => { d.toolchains.push({...d.toolchains[0]}); });
     shape("empty toolchains", /toolchains: expected at least 1 entries/, (d) => { d.toolchains = []; });
     shape("schema version", /\$\.version: expected 1/, (d) => { d.version = 2; });
