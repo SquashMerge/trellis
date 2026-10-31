@@ -120,6 +120,21 @@ pub struct SequenceStep {
     /// counted against any step bound.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folded: Vec<SequenceStep>,
+    /// Why this step is incidental (#543): hidden unless `showAll`, and counted in
+    /// `incidentalSteps`. Absent for a step that is not incidental.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incidental: Option<IncidentalReason>,
+}
+/// Why a step is incidental (#536, #543).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IncidentalReason {
+    /// A standalone call bound to an external declaration (the standard library included).
+    External,
+    /// A logging call or macro, or a step evaluating its arguments: a naming rule.
+    Logging,
+    /// A call whose fresh exact target's body only returns or assigns one field.
+    Accessor,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -282,6 +297,7 @@ pub(crate) fn build_sequence_work(
         _ => bail!("unsupported sequence language: {}", file.language),
     }?;
     cap_depth(&mut view);
+    crate::behavior_incidental::mark_logging(&mut view, file, show_all);
     Ok(view)
 }
 
@@ -339,6 +355,19 @@ pub(crate) fn visible_count(steps: &[SequenceStep]) -> usize {
         .sum()
 }
 
+/// The incidental steps in `steps`, as `incidentalSteps` counts them (#543): a group of
+/// incidental calls counts its calls, not itself.
+pub(crate) fn incidental_count(steps: &[SequenceStep]) -> usize {
+    steps
+        .iter()
+        .map(|step| {
+            usize::from(step.incidental.is_some() && step.kind != "group")
+                + incidental_count(&step.children)
+                + incidental_count(&step.alternate)
+        })
+        .sum()
+}
+
 /// The hidden steps in `steps`, as `hiddenSteps` counts them: a hidden group of hidden
 /// calls counts its calls, not itself.
 pub(crate) fn hidden_count(steps: &[SequenceStep]) -> usize {
@@ -382,7 +411,10 @@ pub(crate) fn cap_visible(view: &mut SequenceView, limit: usize) {
         false
     }
     let mut room = limit;
-    if !cap(&mut view.steps, &mut room) {
+    let cut = cap(&mut view.steps, &mut room);
+    view.hidden_steps = hidden_count(&view.steps);
+    view.incidental_steps = incidental_count(&view.steps);
+    if !cut {
         return;
     }
     view.limit(SequenceLimit::VisibleSteps);
@@ -394,7 +426,6 @@ pub(crate) fn cap_visible(view: &mut SequenceView, limit: usize) {
     if !view.warnings.iter().any(|w| w == warning) {
         view.warnings.push(warning.into());
     }
-    view.hidden_steps = hidden_count(&view.steps);
 }
 
 /// Keeps the step tree within [`MAX_STEP_DEPTH`]: a step at the bound that still nests

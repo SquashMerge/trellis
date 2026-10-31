@@ -2,6 +2,7 @@ pub mod architecture_details;
 pub mod auth;
 pub mod behavior;
 mod behavior_bindings;
+mod behavior_incidental;
 mod behavior_java;
 pub mod behavior_js;
 mod behavior_python;

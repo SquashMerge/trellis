@@ -568,6 +568,7 @@ pub(super) fn sequence_calls(
     // seed with a resolved target keeps room for the callee bodies it expands (#542).
     let mut targets = BTreeSet::new();
     let mut bodies = BTreeMap::new();
+    let mut accessors = BTreeMap::new();
     hide_incidental(
         &mut source,
         &languages,
@@ -577,6 +578,7 @@ pub(super) fn sequence_calls(
         &view.seed.id,
         &mut targets,
         &mut |id, key| expandable(store, db, selected, &mut bodies, id, key),
+        &mut |id, key| accessor(store, db, selected, &mut accessors, id, key),
     )?;
     // The reserve applies only when a call that may expand is among the steps it keeps.
     let reserve = shown_within(&view.steps, &targets, &mut { crate::behavior::SEED_STEPS });
@@ -609,7 +611,8 @@ pub(super) fn sequence_calls(
         work: crate::behavior::step_count(&view.steps),
         truncated: false,
         limits: BTreeSet::new(),
-        incidental: 0,
+        accessors,
+        bodies,
     };
     let seed_id = view.seed.id.clone();
     enrichment.steps(&mut view.steps, &document, &seed_id, 0)?;
@@ -618,11 +621,10 @@ pub(super) fn sequence_calls(
         edges,
         truncated,
         limits,
-        incidental,
         ..
     } = enrichment;
     view.hidden_steps = crate::behavior::hidden_count(&view.steps);
-    view.incidental_steps = incidental;
+    view.incidental_steps = crate::behavior::incidental_count(&view.steps);
     view.truncated |= truncated;
     for limit in limits {
         view.limit(limit);
@@ -726,7 +728,30 @@ struct Enrichment<'a, 'b> {
     /// Truncated by an adapter bound with no typed limit.
     truncated: bool,
     limits: BTreeSet<crate::behavior::SequenceLimit>,
-    incidental: usize,
+    /// The trivial accessors (#543) of each target document read so far, by path.
+    accessors: BTreeMap<String, BTreeSet<String>>,
+    /// The functions and methods of each target document read so far, by path (#542).
+    bodies: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Whether the declaration `id` in `key` is a trivial accessor (#543), from its own body in
+/// the selected snapshot; memoized in `memo`.
+fn accessor(
+    store: &Store,
+    db: &Connection,
+    selected: &ReadRevision,
+    memo: &mut BTreeMap<String, BTreeSet<String>>,
+    id: &str,
+    key: &DocumentKey,
+) -> Result<bool> {
+    if !memo.contains_key(&key.path) {
+        // One read and one parse per target document.
+        let document = store.selected_graph_document_for(db, &key.path, selected)?;
+        let accessors =
+            crate::behavior_incidental::trivial_accessors(&document.file, &document.nodes);
+        memo.insert(key.path.clone(), accessors);
+    }
+    Ok(memo[&key.path].contains(id))
 }
 
 /// Sets which of `steps`, measured in `owner`'s body in `document`, are shown, before the
@@ -736,6 +761,10 @@ struct Enrichment<'a, 'b> {
 /// chain whose calls are all hidden is hidden. A call that may return early (#542) is
 /// control flow, so it is never incidental. Adds to `targets` the step IDs of calls with a
 /// resolved target other than `owner` itself, the calls that may expand a body (#542).
+///
+/// #543: a logging call stays hidden even when it resolves to a local wrapper (an owner
+/// exception to the rule above), and a call whose fresh exact target is a trivial accessor
+/// (`accessor`) is incidental too. Each incidental step carries its reason.
 #[allow(clippy::too_many_arguments)]
 fn hide_incidental(
     source: &mut SnapshotGraphSource<'_>,
@@ -746,10 +775,13 @@ fn hide_incidental(
     owner: &str,
     targets: &mut BTreeSet<String>,
     expandable: &mut dyn FnMut(&str, &DocumentKey) -> Result<bool>,
+    accessor: &mut dyn FnMut(&str, &DocumentKey) -> Result<bool>,
 ) -> Result<()> {
+    use crate::behavior::IncidentalReason;
     use crate::graph_query::{self as engine, BoundaryReason};
     let semantic = engine::semantic(Some(languages), document).map_err(engine_error)?;
-    for step in steps {
+    for at in 0..steps.len() {
+        let step = &mut steps[at];
         source.check_work()?;
         hide_incidental(
             source,
@@ -760,6 +792,7 @@ fn hide_incidental(
             owner,
             targets,
             expandable,
+            accessor,
         )?;
         hide_incidental(
             source,
@@ -770,6 +803,7 @@ fn hide_incidental(
             owner,
             targets,
             expandable,
+            accessor,
         )?;
         if step.kind == "group"
             && !step.children.is_empty()
@@ -786,18 +820,31 @@ fn hide_incidental(
         };
         let disposition = engine::call_disposition(semantic, call, source).map_err(engine_error)?;
         let reason = disposition.boundary_reason;
-        if reason == BoundaryReason::None {
-            step.hidden = false;
-            // Only a call `expand` could build reserves room: not recursion into the
-            // owner, nor a target that is not a function or method (a class constructor).
-            if let Some((id, key)) = disposition.exact_target
-                && id != owner
-                && expandable(id, key)?
-            {
-                targets.insert(step.id.clone());
+        if step.incidental == Some(IncidentalReason::Logging) {
+            // Hidden (unless `show_all`) by the logging rule, resolved or not.
+        } else if reason == BoundaryReason::None {
+            let (id, key) = disposition.exact_target.expect("eligible target is exact");
+            if step.folded.is_empty() && accessor(id, key)? {
+                // Its receiver and argument steps go with it, except calls that may expand.
+                let keep = |s: &crate::behavior::SequenceStep| targets.contains(&s.id);
+                crate::behavior_incidental::mark_with_operands(
+                    steps,
+                    at,
+                    IncidentalReason::Accessor,
+                    show_all,
+                    &keep,
+                );
+            } else {
+                step.hidden = false;
+                // Only a call `expand` could build reserves room: not recursion into the
+                // owner, nor a target that is not a function or method (a class constructor).
+                if id != owner && expandable(id, key)? {
+                    targets.insert(step.id.clone());
+                }
             }
-        } else if !show_all && is_incidental(step, reason) {
-            step.hidden = true;
+        } else if is_incidental(step, reason) {
+            step.incidental = Some(IncidentalReason::External);
+            step.hidden |= !show_all;
         }
     }
     Ok(())
@@ -892,7 +939,11 @@ impl Enrichment<'_, '_> {
             let disposition =
                 engine::call_disposition(semantic, call, self.source).map_err(engine_error)?;
             let mut reason = disposition.boundary_reason;
-            if reason == BoundaryReason::None {
+            // A hidden incidental step (an accessor, a logging call) takes no lane and has no
+            // target (#547); its call evidence keeps the binding. Show all, which shows it,
+            // gives it a lane.
+            let laneless = step.hidden && step.incidental.is_some();
+            if reason == BoundaryReason::None && !laneless {
                 let (id, key) = disposition.exact_target.expect("eligible target is exact");
                 if !self.participants.iter().any(|p| &p.id == id) {
                     if self.participants.len() == 20 {
@@ -937,11 +988,8 @@ impl Enrichment<'_, '_> {
                 },
                 boundary_reason: reason,
             });
-            // `hide_incidental` already hid it unless `show_all`.
-            if is_incidental(step, reason) {
-                self.incidental += 1;
-            }
-            if let Some(target) = step.target.clone() {
+            // An incidental call (a trivial accessor, a logging wrapper) is never expanded.
+            if let Some(target) = step.target.clone().filter(|_| step.incidental.is_none()) {
                 self.expand(step, &target, depth)?;
             }
         }
@@ -1036,6 +1084,11 @@ impl Enrichment<'_, '_> {
             .locate(target)?
             .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
         let callee = self.source.document(&key)?;
+        let (store, db, selected) = (self.store, self.db, self.selected);
+        let accessors = &mut self.accessors;
+        let bodies = &mut self.bodies;
+        // The same structural test protects an accessor's expandable operands here as in the
+        // seed (#547 review); the reserve is the seed's only, so these targets are dropped.
         hide_incidental(
             self.source,
             self.languages,
@@ -1044,7 +1097,8 @@ impl Enrichment<'_, '_> {
             &callee,
             target,
             &mut BTreeSet::new(),
-            &mut |_, _| Ok(false),
+            &mut |id, key| expandable(store, db, selected, bodies, id, key),
+            &mut |id, key| accessor(store, db, selected, accessors, id, key),
         )?;
         let shown = visible_count(&body.steps);
         if self.used + shown > MAX_STEPS {

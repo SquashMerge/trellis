@@ -96,6 +96,7 @@ impl Builder<'_> {
             hidden: false,
             lane: None,
             folded: vec![],
+            incidental: None,
         })
     }
     fn boundary(&mut self, n: Node<'_>, message: &str) -> Flow {

@@ -64,6 +64,10 @@ const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
 /// views or post-native semantic evidence, never native facts, graph or class projections.
 const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
     ("src/behavior_bindings.rs", "read-time sequence views"),
+    (
+        "src/behavior_incidental.rs",
+        "read-time sequence views: trivial accessor bodies (#543)",
+    ),
     ("src/behavior_java.rs", "read-time sequence views"),
     ("src/behavior_js.rs", "read-time sequence views"),
     ("src/behavior_python.rs", "read-time sequence views"),

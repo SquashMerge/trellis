@@ -29,6 +29,7 @@ function sequenceEvidenceLabel(step, view) {
   if (!["call", "boundary"].includes(step?.kind) || !step.callId) return "Measured source syntax";
   const evidence = step.callEvidence;
   if (!evidence) return "measured syntax; target unverified";
+  if (evidence.boundaryReason === "none" && step.hidden && step.incidental && !step.target) return "Resolved declaration - hidden incidental call, no lane";
   if (evidence.boundaryReason === "none" && view && !sequenceTarget(view, step)) return "Target unverified - invalid declaration evidence";
   const labels = {none:"Resolved declaration", external:"External boundary", unresolved:"Unresolved target",
     ambiguous:"Ambiguous target", dispatch:"Dispatch boundary", stale:"Stale evidence", nodeLimit:"Target omitted - participant limit",

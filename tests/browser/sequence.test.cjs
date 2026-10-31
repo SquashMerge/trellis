@@ -227,6 +227,21 @@ test("folded ? marks its call and stays in the inspector",{timeout:240000},async
  assert.match(await page.locator("#inspector-detail").textContent(),/early return on residual/);
 }));
 
+// #543: a Rust logging macro is incidental: hidden and counted under the incidental toggle;
+// Show all draws it and the inspector names the reason.
+test("logging macro hides under the incidental toggle with its reason",{timeout:240000},async()=>published("fn measured() {\n    log::info!(\"x\");\n    work();\n}\n",async({page,dto})=>{
+ const [logging,work]=dto.steps;
+ assert.equal(logging.incidental,"logging");assert.equal(logging.hidden,true);
+ assert.equal(work.label,"work");assert.equal(dto.incidentalSteps,1);assert.equal(dto.hiddenSteps,1);
+ assert.equal(await page.locator(`#sequence-diagram .pele-note[data-trellis-step-id="${logging.id}"]`).count(),0);
+ const toggle=page.locator("#sequence-incidental");
+ assert.equal(await toggle.textContent(),"Show 1 incidental call");
+ await toggle.click();
+ const note=page.locator(`#sequence-diagram .pele-note[data-trellis-step-id="${logging.id}"]`);
+ await note.waitFor();await note.click();
+ assert.match(await page.locator("#inspector-evidence").textContent(),/^hidden: logging \(naming heuristic\) \(shown by Show all\)/);
+}));
+
 const truncatedSource=`function measured() {\n${Array.from({length:202},(_,i)=>`  observed_${i}();\n`).join("")}}\n`;
 test("published truncated producer shows bound while retaining original call witness",{timeout:240000},async()=>published(truncatedSource,async({page,dto,pin})=>{
  assert.equal(dto.truncated,true,"the actual producer must reach its 200-step cap");

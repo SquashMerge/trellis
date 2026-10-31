@@ -173,7 +173,7 @@ fn loops_group_evaluation_without_unrolling() {
     assert_eq!(calls(&loops[1].children), vec!["tick", "again"]);
 }
 #[test]
-fn effects_and_unresolved_argument_effects_are_never_hidden() {
+fn effects_stay_shown_and_logging_hides_its_arguments() {
     let (g, view) = fixture(
         "function run() { this.state = value(); this.count++; this.count += 2; delete this.old; console.log(writeDb()); }",
         "run",
@@ -186,15 +186,23 @@ fn effects_and_unresolved_argument_effects_are_never_hidden() {
         4
     );
     assert!(calls(&view.steps).contains(&"writeDb"));
-    assert_eq!(view.hidden_steps, 1);
+    // #543: a logging call is hidden with the steps evaluating its arguments.
+    let hidden: Vec<_> = flatten(&view.steps)
+        .into_iter()
+        .filter(|s| s.hidden)
+        .map(|s| (s.label.as_str(), s.incidental))
+        .collect();
+    let logging = Some(trellis::behavior::IncidentalReason::Logging);
+    assert_eq!(hidden, [("writeDb", logging), ("console.log", logging)]);
+    assert_eq!((view.hidden_steps, view.incidental_steps), (2, 2));
     assert!(
         flatten(&view.steps)
             .iter()
-            .filter(|s| s.hidden)
-            .all(|s| s.label == "console.log")
+            .filter(|s| s.kind == "effect")
+            .all(|s| !s.hidden)
     );
     let all = build_sequence(test_pin(7), &view.seed, &g.files[0], &g.calls, true).unwrap();
-    assert_eq!(all.hidden_steps, 0);
+    assert_eq!((all.hidden_steps, all.incidental_steps), (0, 2));
     assert!(flatten(&all.steps).iter().all(|s| !s.hidden));
     assert_eq!(calls(&view.steps), calls(&all.steps));
 }
@@ -330,7 +338,7 @@ fn optional_computed_access_does_not_execute_key_unconditionally() {
 }
 
 #[test]
-fn logging_in_guards_and_warning_calls_are_retained() {
+fn logging_calls_of_every_level_hide_with_their_arguments() {
     let (_, view) = fixture(
         "function run() { if(console.log(check())) work(); console.warn(warn()); console.error(error()); console.debug(debugArg()); }",
         "run",
@@ -340,13 +348,27 @@ fn logging_in_guards_and_warning_calls_are_retained() {
         .filter(|s| s.hidden)
         .map(|s| s.label.as_str())
         .collect();
-    assert_eq!(hidden, vec!["console.debug"]);
-    assert_eq!(view.hidden_steps, 1);
+    // #543: every console level, with its arguments; the guarded work stays shown.
+    assert_eq!(
+        hidden,
+        [
+            "check",
+            "console.log",
+            "warn",
+            "console.warn",
+            "error",
+            "console.error",
+            "debugArg",
+            "console.debug"
+        ]
+    );
+    assert_eq!(view.hidden_steps, 8);
     assert!(
         flatten(&view.steps)
             .iter()
-            .any(|s| s.label == "debugArg" && !s.hidden)
+            .any(|s| s.label == "work" && !s.hidden)
     );
+    assert!(view.warnings.iter().any(|w| w.contains("naming rule")));
 }
 
 #[test]

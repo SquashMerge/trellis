@@ -95,6 +95,7 @@ impl Builder<'_> {
             hidden: false,
             lane: None,
             folded: vec![],
+            incidental: None,
         })
     }
     fn boundary(&mut self, n: Node<'_>, message: &str) -> Flow {
@@ -207,6 +208,8 @@ impl Builder<'_> {
         match n.kind() {
             "function_item" | "closure_expression" => self.boundary(n, "Nested callable boundary: body does not execute at definition; captures are not expanded."),
             "async_block" => self.boundary(n, "Async block boundary: future construction does not execute its body; captures are not expanded."),
+            // A logging macro (#543) is a boundary that continues: it guards nothing after it.
+            "macro_invocation" if crate::behavior_incidental::logging_call(self.text(n)) => self.event(n, "boundary", "Logging macro: expansion and argument effects not expanded."),
             "macro_invocation" | "unsafe_block" | "const_block" => self.unknown(n, "Opaque macro/unsafe/const boundary: expansion, effects and transfers unknown."),
             "break_expression" | "continue_expression" | "yield_expression" => {
                 let mut f = self.boundary(n, "Unsupported control transfer: remainder of this path omitted.");

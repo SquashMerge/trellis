@@ -123,7 +123,8 @@
       if (++inspected > 12000) unsupported("Too many sequence members");
       const step = pending.pop();
       if (step?.target != null && !targetFor(step)) unsupported("Invalid resolved target evidence");
-      if (step?.callEvidence?.boundaryReason === "none" && !targetFor(step)) unsupported("Missing resolved declaration witness");
+      // A hidden incidental step has no lane or target (#547); Show all gives it both.
+      if (step?.callEvidence?.boundaryReason === "none" && !targetFor(step) && !(step.hidden && step.incidental)) unsupported("Missing resolved declaration witness");
       if (Array.isArray(step?.children)) pending.push(...step.children);
       if (Array.isArray(step?.alternate)) pending.push(...step.alternate);
     }

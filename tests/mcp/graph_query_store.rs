@@ -745,10 +745,11 @@ fn sequence_expansion_respects_the_step_bound() {
     );
 }
 
-/// #522 review: a repository-defined `console.log` the JS adapter hides by spelling, bound
-/// by fresh exact direct evidence to its local method, is shown with its expanded body.
+/// #543 (owner exception to #522's rule): a logging call stays hidden even when fresh exact
+/// direct evidence resolves it to a local wrapper, and it is never expanded; Show all
+/// reveals it with its target.
 #[test]
-fn sequence_resolved_local_call_is_not_hidden_by_a_spelling_heuristic() {
+fn sequence_resolved_logging_wrapper_stays_hidden() {
     let (state, root) = workspace();
     let mut publisher = Publisher::open(state.path(), root.path());
     let source = "const console = { log() { helper(); } };\nfunction helper() {}\nfunction visible() {}\nfunction a() { console.log(); visible(); }\n";
@@ -757,24 +758,35 @@ fn sequence_resolved_local_call_is_not_hidden_by_a_spelling_heuristic() {
     spec.bindings = vec![bind("a", 0, "log"), bind("log", 0, "helper")];
     let pin = publisher.publish(&spec);
     let seed = syntax_id(publisher.native(), "a");
-    let (log, helper) = (
-        syntax_id(publisher.native(), "log"),
-        syntax_id(publisher.native(), "helper"),
-    );
-    let view = publisher
-        .store
-        .sequence_at(&seed, pin, false)
-        .unwrap()
-        .unwrap();
-    let call = sequence_steps(&view.steps)
-        .into_iter()
-        .find(|step| step.target.as_deref() == Some(log.as_str()))
-        .expect("console.log resolves to the local method");
-    assert!(!call.hidden);
-    assert_eq!(call.children.len(), 1, "{view:?}");
-    assert_eq!(call.children[0].target.as_deref(), Some(helper.as_str()));
-    assert!(!call.children[0].hidden);
-    assert_eq!((view.hidden_steps, view.incidental_steps), (0, 0));
+    let log = syntax_id(publisher.native(), "log");
+    for show_all in [false, true] {
+        let view = publisher
+            .store
+            .sequence_at(&seed, pin, show_all)
+            .unwrap()
+            .unwrap();
+        let call = sequence_steps(&view.steps)
+            .into_iter()
+            .find(|step| step.label == "console.log")
+            .unwrap();
+        assert_eq!(
+            call.call_evidence.as_ref().unwrap().boundary_reason,
+            BoundaryReason::None,
+            "console.log resolves to the local method"
+        );
+        // Hidden, it takes no lane (#547); shown, it has its lane and target.
+        assert_eq!(call.target.as_deref(), show_all.then_some(log.as_str()));
+        assert_eq!(call.hidden, !show_all);
+        assert_eq!(
+            call.incidental,
+            Some(trellis::behavior::IncidentalReason::Logging)
+        );
+        assert!(call.children.is_empty(), "never expanded");
+        assert_eq!(
+            (view.hidden_steps, view.incidental_steps),
+            (usize::from(!show_all), 1)
+        );
+    }
 }
 
 /// The `nth` call of `caller` bound to an external (standard-library) declaration.
