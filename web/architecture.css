@@ -55,8 +55,6 @@
 .architecture-status { display: flex; flex: none; flex-wrap: wrap; column-gap: 12px; }
 .architecture-status p { margin-right: 0; }
 #architecture-legend p { margin: 0; }
-.architecture-display-footers { display: flex; flex: none; flex-wrap: wrap; min-width: 0; }
-.architecture-display-footers > div { flex: 1 1 auto; max-width: 100%; }
 
 /* Compact arrow key and measured coverage under the canvas (#449). */
 .architecture-edge-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; }
@@ -77,3 +75,13 @@
 /* Summary chips are display only: a click falls through to their band header toggle. */
 #architecture-diagram [data-trellis-summary-chip] { pointer-events: none; }
 .architecture-key-line[data-tone="neutral"] { border-top-color: #B8BAC8; }
+
+/* #525: only the drawing sits above the key. The ready status line is empty (its counts
+   are behind the ⓘ); the heat legend joins the arrow key under the drawing; the
+   hidden-layer note is laid out inside the canvas, directly under the drawing. */
+#architecture-state:empty { display: none; }
+#architecture-diagram { scrollbar-gutter: stable; }
+#architecture-legend { padding-top: 8px; }
+#architecture-diagram > .architecture-display-footer { padding: 8px 0 0; }
+#architecture-diagram > .architecture-display-footer { flex-wrap: wrap; }
+#architecture-diagram > .architecture-display-footer span { white-space: normal; overflow: visible; }

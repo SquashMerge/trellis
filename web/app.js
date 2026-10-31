@@ -1782,6 +1782,8 @@ const architecture = window.TrellisArchitecture?.create({
   },
   libraryButton: identity => identity.standardLibrary ? null : libraryButton({ecosystem:identity.language, name:identity.package, origin:"Architecture reference"}),
   onInspect: () => { viewerMetrics?.clearInspection(); clearSource(); },
+  // A rules edit can change which layers are application layers (#524).
+  onRulesChanged: () => { void viewerMetrics?.refresh(); },
 });
 window.TrellisShell?.setViewCallback?.(name => {
   if (!routeViewChange && name !== "sequence") {
@@ -2290,9 +2292,10 @@ $("dependency-previous")?.addEventListener("click", () => { if (!$("dependency-p
 $("dependency-next")?.addEventListener("click", () => { if (!$("dependency-next").disabled && dependencyNext != null) return loadDependencySymbols(dependencyNext); });
 
 
-// Classes is shown only when the checkout has production code in a language the class
-// catalog extracts (#450): the metrics projection's stored roles joined with the
-// catalog's supportedLanguages, read once per pin after production code is known.
+// Classes is shown only when the checkout's application layers have production code in a
+// language the class catalog extracts (#450, #524): the workbench metrics projection's
+// stored roles (which leave out fixtures and authored hidden layers such as tooling)
+// joined with the catalog's supportedLanguages, read once per pin after that code is known.
 // Unknown (loading or failed) hides the tab; explicit class menus still work.
 let classSupport = null;
 async function refreshClassSupport(pin) {
@@ -2321,7 +2324,8 @@ function updateViewAvailability() {
   window.TrellisShell?.setViewAvailable?.("classes", !!languages && !!supported && [...supported].some(language => languages.has(language)));
 }
 // With no method selected, Sequence offers the highest-cognitive named callables of the
-// current metrics projection as starting points (#450). Repository text stays text.
+// current metrics projection as starting points (#450): application layers only, since
+// that population leaves out fixtures and hidden tooling (#524). Repository text stays text.
 const SEQUENCE_STARTS = 5;
 function renderSequenceStart() {
   const top = !selectedMethod && token && status ? viewerMetrics?.topCallables?.() : null;

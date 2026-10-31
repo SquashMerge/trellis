@@ -327,7 +327,7 @@ test("Treemap native identities drill and return, Architecture selects exactly, 
   const sourceRequest = requests.filter(row => row.url.pathname.endsWith("/source")).at(-1);
   assert.equal(sourceRequest.url.searchParams.get("path"), mixed.path);
   await page.locator("#view-architecture").click();
-  await page.locator("#architecture-state[data-state=ready]").waitFor();
+  await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
   // Summary-first Architecture (#391): the full stack is drawn (#449); open the band and folders.
   const opened = async action => {
     await page.evaluate(() => { document.querySelector("#architecture-diagram svg").__old = true; });
