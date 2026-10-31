@@ -10,7 +10,6 @@
 }
 .source-line.navigation-active-line { outline: 1px solid var(--focus); outline-offset: -1px; }
 .source-line.navigation-active-line .line-number { color: var(--link); }
-.source-line.navigation-active-line.highlight .line-number { color: var(--on-selected); }
 @media (pointer: coarse) { .source-navigation-action { min-height: 44px; } }
 
 /* Reveal declaration actions without replacing source spans or selecting a token. */

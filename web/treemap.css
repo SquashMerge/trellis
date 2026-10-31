@@ -20,3 +20,4 @@
 #treemap-inspector-title { margin-top: 0; font: 13px/1.6 var(--mono); }
 #treemap-inspector-content button { font-size: 12px; min-height: 34px; }
 #treemap-state[data-state="error"] { color: var(--error); }
+#treemap-summary:empty { display: none; }

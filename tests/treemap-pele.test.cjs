@@ -177,8 +177,9 @@ test("measured viewport sets a non-square native layout; tiny or crowded panels 
   assert.equal(roots[0].full,"trellis · one · / · 100 physical file lines","exact source set stays in the full label");
   assert.equal(roots[1].full,"two · / · 10 physical file lines");
   assert.deepEqual({...adapter.layoutSize(3,{width:300,height:100})},{width:640,height:360},"readable minimum");
-  const crowded=adapter.layoutSize(1000,{width:1000,height:500});
-  assert.ok(crowded.width*crowded.height>=1000*2500 && Math.abs(crowded.width/crowded.height-2)<0.01,"grows in the panel's aspect ratio");
-  assert.deepEqual({...adapter.layoutSize(12000,{width:1000,height:500})},{width:4000,height:3873},"never beyond 4000 px per side");
+  // #451: a crowded panel keeps its width and grows only downward.
+  assert.deepEqual({...adapter.layoutSize(1000,{width:1000,height:500})},{width:1000,height:2500},"grows only in height");
+  assert.deepEqual({...adapter.layoutSize(12000,{width:1000,height:500})},{width:1000,height:4000},"never beyond 4000 px tall");
+  assert.deepEqual({...adapter.layoutSize(10,{width:1000.6,height:500.4})},{width:1000,height:500},"an uncrowded panel is filled exactly");
   assert.deepEqual({...adapter.layoutSize(4,undefined)},{width:640,height:640});
 });

@@ -395,8 +395,9 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 #source, #external-source { white-space: pre; margin: 8px 0 0; max-height: none; min-width: 0; }
 #source:empty, #external-source:empty { display: none; }
 .source-line { display: block; min-height: 1.7em; }
-.source-line.highlight { background: var(--selected); color: var(--on-selected); }
-.source-line.highlight .line-number { color: inherit; }
+/* The selected source range is quiet emphasis: raised surface, lavender left bar (#451). */
+.source-line.highlight { background: var(--sm-raised); color: var(--ink); box-shadow: inset 3px 0 0 var(--sm-lavender); }
+.source-line.highlight .line-number { color: var(--link); }
 .line-number { display: inline-block; width: 5em; text-align: right; padding-right: 1.5em; color: var(--muted); user-select: none; }
 #external-definitions { max-height: 130px; overflow: auto; }
 #external-filter { margin: 6px; }
