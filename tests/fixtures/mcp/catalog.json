@@ -178,12 +178,85 @@
             },
             "language": {
               "$ref": "#/$defs/Language"
+            },
+            "semantic": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "producerId": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "freshness": {
+                  "enum": [
+                    "fresh",
+                    "possiblyStale",
+                    "stale",
+                    "unavailable"
+                  ]
+                },
+                "coverage": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "selected": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "complete": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "partial": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "failed": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "unselected": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "selected",
+                    "complete",
+                    "partial",
+                    "failed",
+                    "unselected"
+                  ],
+                  "type": "object"
+                },
+                "note": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "producerId",
+                "freshness",
+                "coverage",
+                "note"
+              ],
+              "type": "object"
             }
           },
           "required": [
             "language",
             "evidenceTier",
-            "coverage"
+            "coverage",
+            "semantic"
           ],
           "type": "object"
         },
@@ -219,6 +292,12 @@
             },
             "sourceLines": {
               "const": 200
+            },
+            "callDefaultLimit": {
+              "const": 6
+            },
+            "pageBytes": {
+              "const": 24576
             }
           },
           "required": [
@@ -231,7 +310,9 @@
             "calleeTextBytes",
             "hintWorkMs",
             "deadlineMs",
-            "concurrency"
+            "concurrency",
+            "callDefaultLimit",
+            "pageBytes"
           ],
           "type": "object"
         },
@@ -675,7 +756,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 2
+                  "const": 3
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -780,7 +861,8 @@
         }
       ],
       "type": "object"
-    }
+    },
+    "description": "Index status and limits. Per language, `coverage` counts native syntax tuples and `semantic` reports the selected imported producer (for example rust-analyzer or scip-typescript SCIP): `available` is true when it is fresh and covers documents, with its own tuple counts, so partial coverage of either stays visible. Call this first."
   },
   {
     "annotations": {
@@ -1698,12 +1780,85 @@
             },
             "language": {
               "$ref": "#/$defs/Language"
+            },
+            "semantic": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "producerId": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "freshness": {
+                  "enum": [
+                    "fresh",
+                    "possiblyStale",
+                    "stale",
+                    "unavailable"
+                  ]
+                },
+                "coverage": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "selected": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "complete": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "partial": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "failed": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "unselected": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "selected",
+                    "complete",
+                    "partial",
+                    "failed",
+                    "unselected"
+                  ],
+                  "type": "object"
+                },
+                "note": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "producerId",
+                "freshness",
+                "coverage",
+                "note"
+              ],
+              "type": "object"
             }
           },
           "required": [
             "language",
             "evidenceTier",
-            "coverage"
+            "coverage",
+            "semantic"
           ],
           "type": "object"
         },
@@ -1942,7 +2097,8 @@
         }
       ],
       "type": "object"
-    }
+    },
+    "description": "Find declarations by literal name or ID substring (no regex). Returns symbol IDs for the other tools, with line ranges. Results are native declarations; `scopeCoverage` also reports each language's selected semantic evidence, and `syntaxOnly` appears only for returned languages without it."
   },
   {
     "annotations": {
@@ -2872,12 +3028,85 @@
             },
             "language": {
               "$ref": "#/$defs/Language"
+            },
+            "semantic": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "producerId": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "freshness": {
+                  "enum": [
+                    "fresh",
+                    "possiblyStale",
+                    "stale",
+                    "unavailable"
+                  ]
+                },
+                "coverage": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "selected": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "complete": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "partial": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "failed": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "unselected": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "selected",
+                    "complete",
+                    "partial",
+                    "failed",
+                    "unselected"
+                  ],
+                  "type": "object"
+                },
+                "note": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "producerId",
+                "freshness",
+                "coverage",
+                "note"
+              ],
+              "type": "object"
             }
           },
           "required": [
             "language",
             "evidenceTier",
-            "coverage"
+            "coverage",
+            "semantic"
           ],
           "type": "object"
         },
@@ -3323,7 +3552,8 @@
         }
       ],
       "type": "object"
-    }
+    },
+    "description": "Rank declarations for a natural-language or code query (lexical plus local vector search when available). Returns symbol IDs for the other tools. Relevance is not proof; `scopeCoverage` reports each language's selected semantic evidence."
   },
   {
     "annotations": {
@@ -4621,7 +4851,8 @@
         }
       ],
       "type": "object"
-    }
+    },
+    "description": "Read one declaration's measured record (signature header, ancestors, range and lines) by symbol ID. No body; use trellis_read_source with the returned lines."
   },
   {
     "annotations": {
@@ -4669,7 +4900,8 @@
         "limit": {
           "maximum": 50,
           "minimum": 1,
-          "type": "integer"
+          "type": "integer",
+          "default": 6
         },
         "semanticProducerId": {
           "type": "string",
@@ -4685,6 +4917,10 @@
         "workspace": {
           "type": "string",
           "maxLength": 4096
+        },
+        "compact": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -4891,16 +5127,6 @@
             "range": {
               "$ref": "#/$defs/Range"
             },
-            "semanticBasis": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticBasis"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
             "staleBecause": {
               "maxItems": 0,
               "type": "array"
@@ -4927,6 +5153,16 @@
                   "type": "null"
                 }
               ]
+            },
+            "semanticBasisRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -4939,12 +5175,10 @@
             "calleeTextTruncated",
             "displayKey",
             "nativeCandidates",
-            "binding",
             "disposition",
             "targetId",
             "boundaryReason",
             "evidenceTier",
-            "semanticBasis",
             "freshness",
             "staleBecause",
             "doc",
@@ -5303,30 +5537,20 @@
               },
               "then": {
                 "properties": {
-                  "basis": {
-                    "const": null
-                  },
                   "derivedFrom": {
                     "const": null
                   },
                   "freshness": {
                     "const": "fresh"
+                  },
+                  "basisRef": {
+                    "const": null
                   }
                 }
               }
             }
           ],
           "properties": {
-            "basis": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticBasis"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
             "contentHash": {
               "$ref": "#/$defs/Hash"
             },
@@ -5366,6 +5590,16 @@
             },
             "revisionId": {
               "$ref": "#/$defs/Text"
+            },
+            "basisRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -5375,7 +5609,7 @@
             "revisionId",
             "contentHash",
             "evidenceKind",
-            "basis",
+            "basisRef",
             "freshness",
             "derivedFrom"
           ],
@@ -5407,65 +5641,6 @@
             "import",
             "alias"
           ]
-        },
-        "SemanticBasis": {
-          "additionalProperties": false,
-          "properties": {
-            "artifactHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "configHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "dependencyHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "lookupDependencies": {
-              "items": {
-                "$ref": "#/$defs/Text"
-              },
-              "type": "array"
-            },
-            "producerHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "producerVersion": {
-              "$ref": "#/$defs/Text"
-            },
-            "revisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "sourceManifestHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "sourceSetId": {
-              "$ref": "#/$defs/Text"
-            },
-            "toolchainHash": {
-              "$ref": "#/$defs/Hash"
-            }
-          },
-          "required": [
-            "producerId",
-            "producerVersion",
-            "producerHash",
-            "artifactHash",
-            "language",
-            "sourceSetId",
-            "revisionId",
-            "sourceManifestHash",
-            "toolchainHash",
-            "configHash",
-            "dependencyHash",
-            "lookupDependencies"
-          ],
-          "type": "object"
         },
         "SymbolKey": {
           "additionalProperties": false,
@@ -5967,6 +6142,69 @@
               "type": "integer"
             }
           ]
+        },
+        "SemanticBasisEntry": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "lookupDependencies": {
+              "items": {
+                "$ref": "#/$defs/Text"
+              },
+              "type": "array"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "ref": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "ref",
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6006,14 +6244,18 @@
                   "items": {
                     "$ref": "#/$defs/DocumentRef"
                   }
+                },
+                "semanticBases": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/SemanticBasisEntry"
+                  }
                 }
               },
               "required": [
                 "symbolId",
                 "displayKey",
                 "calls",
-                "coverage",
-                "provenance",
                 "documents"
               ],
               "type": "object"
@@ -6098,7 +6340,8 @@
         }
       ],
       "type": "object"
-    }
+    },
+    "description": "List the calls made inside one declaration, with semantic bindings and targets where a fresh imported producer covers the language, else syntax-only name hints. Default limit 6 (max 50). Each distinct semantic basis appears once in `semanticBases`, referenced by `semanticBasisRef` and provenance `basisRef`; `compact:true` omits bindings, coverage and provenance for a much smaller answer."
   },
   {
     "annotations": {
@@ -6146,7 +6389,8 @@
         "limit": {
           "maximum": 50,
           "minimum": 1,
-          "type": "integer"
+          "type": "integer",
+          "default": 6
         },
         "semanticProducerId": {
           "type": "string",
@@ -6162,6 +6406,10 @@
         "workspace": {
           "type": "string",
           "maxLength": 4096
+        },
+        "compact": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -6406,30 +6654,20 @@
               },
               "then": {
                 "properties": {
-                  "basis": {
-                    "const": null
-                  },
                   "derivedFrom": {
                     "const": null
                   },
                   "freshness": {
                     "const": "fresh"
+                  },
+                  "basisRef": {
+                    "const": null
                   }
                 }
               }
             }
           ],
           "properties": {
-            "basis": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticBasis"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
             "contentHash": {
               "$ref": "#/$defs/Hash"
             },
@@ -6469,6 +6707,16 @@
             },
             "revisionId": {
               "$ref": "#/$defs/Text"
+            },
+            "basisRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -6478,7 +6726,7 @@
             "revisionId",
             "contentHash",
             "evidenceKind",
-            "basis",
+            "basisRef",
             "freshness",
             "derivedFrom"
           ],
@@ -6510,65 +6758,6 @@
             "import",
             "alias"
           ]
-        },
-        "SemanticBasis": {
-          "additionalProperties": false,
-          "properties": {
-            "artifactHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "configHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "dependencyHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "lookupDependencies": {
-              "items": {
-                "$ref": "#/$defs/Text"
-              },
-              "type": "array"
-            },
-            "producerHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "producerVersion": {
-              "$ref": "#/$defs/Text"
-            },
-            "revisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "sourceManifestHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "sourceSetId": {
-              "$ref": "#/$defs/Text"
-            },
-            "toolchainHash": {
-              "$ref": "#/$defs/Hash"
-            }
-          },
-          "required": [
-            "producerId",
-            "producerVersion",
-            "producerHash",
-            "artifactHash",
-            "language",
-            "sourceSetId",
-            "revisionId",
-            "sourceManifestHash",
-            "toolchainHash",
-            "configHash",
-            "dependencyHash",
-            "lookupDependencies"
-          ],
-          "type": "object"
         },
         "SyntaxId": {
           "pattern": "^sid:v1:[0-9a-f]{32}$",
@@ -7121,16 +7310,6 @@
                 "semantic"
               ]
             },
-            "semanticBasis": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticBasis"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
             "freshness": {
               "enum": [
                 "fresh",
@@ -7142,6 +7321,16 @@
             "staleBecause": {
               "type": "array",
               "maxItems": 0
+            },
+            "semanticBasisRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -7155,12 +7344,10 @@
             "calleeRange",
             "calleeText",
             "matchedBy",
-            "binding",
             "disposition",
             "targetId",
             "boundaryReason",
             "evidenceTier",
-            "semanticBasis",
             "freshness",
             "staleBecause"
           ],
@@ -7202,12 +7389,85 @@
                 "unselected"
               ],
               "type": "object"
+            },
+            "semantic": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "producerId": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "freshness": {
+                  "enum": [
+                    "fresh",
+                    "possiblyStale",
+                    "stale",
+                    "unavailable"
+                  ]
+                },
+                "coverage": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "selected": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "complete": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "partial": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "failed": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "unselected": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "selected",
+                    "complete",
+                    "partial",
+                    "failed",
+                    "unselected"
+                  ],
+                  "type": "object"
+                },
+                "note": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "producerId",
+                "freshness",
+                "coverage",
+                "note"
+              ],
+              "type": "object"
             }
           },
           "required": [
             "language",
             "evidenceTier",
-            "coverage"
+            "coverage",
+            "semantic"
           ],
           "type": "object"
         },
@@ -7454,6 +7714,69 @@
             "kind"
           ],
           "type": "object"
+        },
+        "SemanticBasisEntry": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "lookupDependencies": {
+              "items": {
+                "$ref": "#/$defs/Text"
+              },
+              "type": "array"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "ref": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "ref",
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7504,6 +7827,12 @@
                   "type": "array",
                   "minItems": 4,
                   "maxItems": 4
+                },
+                "semanticBases": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/SemanticBasisEntry"
+                  }
                 }
               },
               "required": [
@@ -7512,9 +7841,7 @@
                 "match",
                 "callers",
                 "documents",
-                "coverage",
-                "scopeCoverage",
-                "provenance"
+                "scopeCoverage"
               ],
               "type": "object"
             },
@@ -7598,7 +7925,8 @@
         }
       ],
       "type": "object"
-    }
+    },
+    "description": "Find call sites whose callee name matches one declaration (name match, not proof), each annotated with its semantic binding where one is selected. Default limit 6 (max 50); production callers first. Each distinct semantic basis appears once in `semanticBases`; `compact:true` omits bindings, coverage and provenance, so 50 callers fit easily."
   },
   {
     "annotations": {
@@ -8313,7 +8641,8 @@
         }
       ],
       "type": "object"
-    }
+    },
+    "description": "Read up to 200 lines (16 KiB) of indexed source by path and 1-based inclusive line range, from the cached snapshot, never the live disk."
   },
   {
     "annotations": {
@@ -10165,7 +10494,8 @@
         }
       ],
       "type": "object"
-    }
+    },
+    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead."
   },
   {
     "annotations": {
@@ -12139,7 +12469,7 @@
       ],
       "type": "object"
     },
-    "description": "Read pinned structural native-module and external-package references, not resolved semantic dependencies. Production and test sites are separate."
+    "description": "Read pinned structural native-module and external-package references, not resolved semantic dependencies. Production and test sites are separate. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
   },
   {
     "annotations": {
@@ -14167,7 +14497,7 @@
       ],
       "type": "object"
     },
-    "description": "Check reviewed architecture rules against pinned evidence without writing files. Unavailable call/type bindings remain unknown."
+    "description": "Check reviewed architecture rules against pinned evidence without writing files. Unavailable call/type bindings remain unknown. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
   },
   {
     "annotations": {
@@ -16463,6 +16793,6 @@
       ],
       "type": "object"
     },
-    "description": "Explain one exact architecture rule instance at a pin, including unknowns and reviewed exceptions."
+    "description": "Explain one exact architecture rule instance at a pin, including unknowns and reviewed exceptions. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
   }
 ]

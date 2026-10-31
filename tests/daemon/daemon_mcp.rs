@@ -959,6 +959,11 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
                     let refused = next();
                     assert_eq!(refused["error"]["code"], -32000, "{refused}");
                     assert_eq!(refused["error"]["data"]["code"], "too_many_requests");
+                    // #528: the relay names its per-connection limit.
+                    assert_eq!(
+                        refused["error"]["message"],
+                        "Too many outstanding requests on this connection (limit 16)"
+                    );
                     refused_ids.push(refused["id"].as_u64().unwrap());
                 }
                 refused_ids.sort_unstable();
@@ -971,6 +976,11 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
                 let envelope = &refused["result"]["structuredContent"];
                 assert_eq!(envelope["error"]["code"], "too_many_requests", "{refused}");
                 assert_eq!(envelope["error"]["retryable"], true);
+                // #528: the relay, which agents talk to, names the per-connection limit.
+                assert_eq!(
+                    envelope["error"]["message"],
+                    "Too many concurrent tool calls on this connection (limit 4); wait for one to finish"
+                );
                 assert_eq!(
                     envelope["error"]["attemptedWorkspace"]["value"],
                     json!(root.canonicalize().unwrap())

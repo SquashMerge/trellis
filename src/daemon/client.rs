@@ -1149,7 +1149,8 @@ impl<W: std::io::Write> Relay<'_, W> {
             }
             if !call && self.forwarded.len() - calls >= RELAY_OUTSTANDING_REQUESTS {
                 let response = serde_json::json!({"jsonrpc":"2.0","id":value["id"],"error":{
-                    "code":-32000,"message":"Relay queue is full",
+                    "code":-32000,"message":format!(
+                        "Too many outstanding requests on this connection (limit {RELAY_OUTSTANDING_REQUESTS})"),
                     "data":{"code":"too_many_requests"}}});
                 self.due_response(value, response, None);
                 return Ok(());

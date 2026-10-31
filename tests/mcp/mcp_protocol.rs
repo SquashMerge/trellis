@@ -727,6 +727,13 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str) {
                     count("complete") + count("partial") + count("failed")
                 );
                 assert!(row["evidenceTier"] == "syntax");
+                // #528: no import, so no language reports selected semantic evidence.
+                assert_eq!(
+                    row["semantic"],
+                    json!({"available":false,"producerId":null,"freshness":"unavailable",
+                        "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
+                        "note":"no semantic producer published; showing syntax"})
+                );
             }
             let partial = languages
                 .iter()
@@ -816,7 +823,10 @@ fn golden_settled_failure(id: &Value, root: &Value, code: &str, basis: Value) ->
 fn empty_scope_coverage() -> Value {
     let row = |language: &str| {
         json!({"language":language,"evidenceTier":"syntax","coverage":{
-            "selected":0,"complete":0,"partial":0,"failed":0,"unselected":0}})
+            "selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
+            "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
+                "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
+                "note":"no semantic producer published; showing syntax"}})
     };
     json!([row("java"), row("rust"), row("python"), row("javascript")])
 }
@@ -825,7 +835,7 @@ fn golden_settled_empty_find(id: &Value, root: &Value, pin: &Value) -> Value {
     json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":false,
         "evidenceBasis":pin,"data":{"symbols":[],"documents":[],"coverage":[],
             "scopeCoverage":empty_scope_coverage(),"provenance":[]},
-        "warnings":[{"code":"syntaxOnly","message":"Only syntax evidence is available",
+        "warnings":[{"code":"syntaxOnly","message":"This answer is syntax-derived",
             "provenanceId":null}],"partial":false,"truncated":false,
         "truncationReason":null})
 }
@@ -5616,6 +5626,15 @@ async fn four_calls_run_concurrently_and_a_fifth_is_refused() {
     let envelope = &refused["result"]["structuredContent"];
     assert_eq!(envelope["error"]["code"], "too_many_requests", "{refused}");
     assert_eq!(envelope["error"]["retryable"], true);
+    // #528: the refusal names the per-connection limit so an agent can adapt.
+    assert_eq!(
+        envelope["error"]["message"],
+        "Too many concurrent tool calls on this connection (limit 4); wait for one to finish"
+    );
+    assert_eq!(
+        refused["result"]["content"][0]["text"],
+        "trellis_workspace_describe failed: too_many_requests: Too many concurrent tool calls on this connection (limit 4); wait for one to finish"
+    );
     assert_eq!(envelope["error"]["attemptedWorkspace"]["kind"], "path");
     assert!(envelope.get("workspace").is_none() && envelope.get("catchingUp").is_none());
     gate.open();
@@ -5670,6 +5689,10 @@ async fn timed_out_workers_keep_their_permits_across_connections() {
     assert_eq!(
         refused["result"]["structuredContent"]["error"]["code"], "too_many_requests",
         "{refused}"
+    );
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["message"],
+        "Too many concurrent tool calls in the daemon (limit 16); retry shortly"
     );
     gate.open();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
@@ -6083,6 +6106,10 @@ async fn over_bound_requests_are_refused_after_validation() {
     let seventeenth = &seen["117"];
     assert_eq!(seventeenth["error"]["code"], -32000, "{seventeenth}");
     assert_eq!(seventeenth["error"]["data"]["code"], "too_many_requests");
+    assert_eq!(
+        seventeenth["error"]["message"],
+        "Too many outstanding requests on this connection (limit 16)"
+    );
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
@@ -6744,7 +6771,10 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     let row = |language: &str, counts: [u64; 5]| {
         json!({"language":language,"evidenceTier":"syntax","coverage":{
             "selected":counts[0],"complete":counts[1],"partial":counts[2],
-            "failed":counts[3],"unselected":counts[4]}})
+            "failed":counts[3],"unselected":counts[4]},
+            "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
+                "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
+                "note":"no semantic producer published; showing syntax"}})
     };
     assert_eq!(
         data["data"]["scopeCoverage"],
@@ -10731,8 +10761,9 @@ fn assert_incoming_emitted_proof_closure(declaration: &Value, incoming: &Value) 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn incoming_default_twenty_and_limit_one_keep_exact_required_closure() {
-    for (limit, expected) in [(None, 20), (Some(1), 1)] {
+async fn incoming_default_six_limit_twenty_and_one_keep_exact_required_closure() {
+    // #528: the default call page is six items.
+    for (limit, expected) in [(None, 6), (Some(20), 20), (Some(1), 1)] {
         let (declaration, response) = incoming_many_documents_fixture(false, limit).await;
         let envelope = &response["result"]["structuredContent"];
         let data = &envelope["data"];
@@ -14107,6 +14138,29 @@ impl GraphMcp {
         envelope
     }
 
+    /// A successful call of any tool; validated against the catalog schema in `finish`.
+    fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        writeln!(
+            self.client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":name,"arguments":arguments})
+            )
+        )
+        .unwrap();
+        let reply = next_reply(&mut self.reader);
+        assert_eq!(reply["id"], id);
+        tool(&reply, None, true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        self.pairs
+            .push(json!({"name":name,"structuredContent":envelope}));
+        envelope
+    }
+
     /// A successful call; the envelope is validated against the catalog schema in `finish`.
     fn graph(&mut self, arguments: Value) -> Value {
         let id = self.send(arguments);
@@ -14302,6 +14356,122 @@ fn with_bindings(
     let mut spec = graph_fixtures::Spec::new(files);
     spec.bindings = bindings;
     spec
+}
+
+/// #528 review: compact changes presentation, never the optional evidence chosen for the
+/// same required prefix. Six bound calls, each with eight long-path native hints: full and
+/// compact show the same hints and documents for the same six calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_outgoing_keeps_the_full_answers_hints_for_the_same_calls() {
+    let mut files = vec![(
+        "src/lib.rs".to_owned(),
+        "fn run() { foo(); foo(); foo(); foo(); foo(); foo(); }\n".to_owned(),
+    )];
+    for i in 0..8 {
+        files.push((
+            format!(
+                "src/candidate{i}/{}/a.rs",
+                vec!["x".repeat(70); 5].join("/")
+            ),
+            "pub fn foo() {}\n".to_owned(),
+        ));
+    }
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let spec = with_bindings(
+        &files,
+        (0..6)
+            .map(|i| graph_fixtures::bind("run", i, "foo"))
+            .collect(),
+    );
+    let mut mcp = GraphMcp::start(528, &[spec], Default::default()).await;
+    let full = mcp.call_tool(
+        "trellis_outgoing_calls",
+        mcp.args("run", json!({"limit":6})),
+    );
+    let compact = mcp.call_tool(
+        "trellis_outgoing_calls",
+        mcp.args("run", json!({"limit":6,"compact":true})),
+    );
+    let calls = |v: &Value| v["data"]["calls"].as_array().unwrap().clone();
+    assert_eq!(calls(&full).len(), 6, "{full}");
+    assert_eq!(calls(&compact).len(), 6, "{compact}");
+    let hints = |v: &Value| {
+        calls(v)
+            .iter()
+            .map(|c| c["nativeCandidates"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(hints(&full), hints(&compact));
+    assert_eq!(full["data"]["documents"], compact["data"]["documents"]);
+    assert_eq!(full["warnings"], compact["warnings"]);
+    assert_eq!(full["partial"], compact["partial"]);
+    // The page target bounds the optional hints of the full answer.
+    assert!(
+        hints(&full)
+            .iter()
+            .any(|h| h["omitted"].as_u64().unwrap_or(0) > 0),
+        "{full}"
+    );
+    mcp.finish();
+}
+
+/// #528 review: a malformed stored semantic enum is typed corruption, never healthy
+/// availability. The store is reopened after the edit, as accidental corruption would be.
+#[test]
+fn malformed_semantic_freshness_or_state_fails_language_tiers() {
+    fn index_db(dir: &Path) -> Option<PathBuf> {
+        for entry in fs::read_dir(dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                if let Some(found) = index_db(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|name| name == "index.db") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    for corruption in [
+        "UPDATE semantic_provenance SET freshness='garbage'",
+        "UPDATE semantic_coverage SET state='garbage'",
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut publisher = graph_fixtures::Publisher::open(state.path(), root.path());
+        let mut spec = graph_fixtures::Spec::new(&[("src/lib.rs", "fn a(){b();} fn b(){}")]);
+        spec.bindings = vec![graph_fixtures::bind("a", 0, "b")];
+        publisher.publish(&spec);
+        drop(publisher);
+        // Healthy first: rust has fresh selected semantic evidence.
+        let store = trellis::store::Store::open_for_tests(state.path(), root.path()).unwrap();
+        let tiers = store
+            .evidence_response()
+            .unwrap()
+            .mcp_language_tiers()
+            .unwrap();
+        assert!(tiers[1].semantic(), "{tiers:?}");
+        drop(store);
+        let db = rusqlite::Connection::open(index_db(state.path()).unwrap()).unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA ignore_check_constraints=ON; {corruption};"
+        ))
+        .unwrap();
+        drop(db);
+        let store = trellis::store::Store::open_for_tests(state.path(), root.path()).unwrap();
+        let error = store
+            .evidence_response()
+            .unwrap()
+            .mcp_language_tiers()
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("store_unavailable:"),
+            "{corruption}: {error:#}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
