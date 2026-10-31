@@ -113,12 +113,11 @@ async function published(callback, signal, {library = false, rules = null, git =
     await page.locator("#token").fill(paths.token);
     await page.locator("#connect-form button[type=submit]").click();
     await page.locator("#checkout-select").waitFor({state:"visible"});
-    await page.waitForFunction(() => !document.querySelector("#checkout-select").disabled);
-    assert.equal(await page.locator("#checkout-select").inputValue(), "", "one checkout still requires explicit selection");
-    assert.equal(await page.locator("#workspace").isVisible(), false);
-    assert.ok(requests.every(row => ["/api/checkouts", "/api/daemon/status"].includes(row.url.pathname)), "Connect loads discovery only");
-    await page.locator("#checkout-select").selectOption(server.rootKey);
+    // Arrival (#447): the only checkout opens on Architecture without another click.
     await page.locator("#workspace").waitFor({state:"visible"});
+    assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "the only checkout is selected on arrival");
+    assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "true", "arrival lands on Architecture");
+    assert.equal(requests.some(row => row.method === "POST"), false, "arrival never starts indexing");
     await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("Indexed snapshot · max"));
     await page.locator('.directory-pick[title="src/"]').waitFor();
     const reloadedPin = await callback({page, paths, server, pin, requests});
@@ -245,7 +244,7 @@ async function assertLegend(page, payload, metric) {
 }
 async function noOverflow(page, width) {
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}px page has no horizontal overflow`);
-  for (const selector of [".app-header", ".canvas-area", ".metric-controls", ".view-tabs", "footer"]) {
+  for (const selector of [".app-header", ".canvas-area", ".view-tabs", "footer"]) {
     const box = await page.locator(selector).boundingBox();
     assert.ok(box && box.width > 0 && box.x >= 0 && box.x + box.width <= width + 1, `${selector} fits ${width}px viewport`);
   }
@@ -257,32 +256,33 @@ test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top
   const checkout = listing.data.checkouts.find(row => row.rootKey === server.rootKey);
   assert.equal(checkout.workspaceRoot, realpathSync(paths.workspace));
   assert.deepEqual(checkout.revision, pin);
-  const checkoutPick = page.locator("#indexed-checkouts .checkout-pick");
-  assert.equal(await checkoutPick.count(), 1);
-  assert.equal(await checkoutPick.getAttribute("aria-pressed"), "true");
-  assert.equal(await checkoutPick.getAttribute("title"), checkout.workspaceRoot);
-  assert.ok((await checkoutPick.textContent()).includes(`rev ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`));
+  assert.equal(await page.locator("#indexed-checkouts").count(), 0, "the rail no longer repeats the header picker");
+  const option = page.locator(`#checkout-select option[value="${server.rootKey}"]`);
+  assert.equal(await option.getAttribute("title"), checkout.workspaceRoot);
+  assert.ok((await option.textContent()).includes(`rev ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`));
   const status = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "status"));
   assert.equal(status.status, 200, JSON.stringify(status.data));
   assert.deepEqual(status.data.revision, pin);
   const freshness = status.data.catchingUp ? "catching-up" : "fresh";
-  assert.equal(await checkoutPick.locator(".checkout-freshness").getAttribute("data-state"), freshness);
   assert.equal(await page.locator("#workspace-index-state").getAttribute("data-state"), freshness);
   assert.match(await page.locator("#workspace-index-label").textContent(), new RegExp(`rev(?:ision)? ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`));
   await expandSources(page);
   let payload = await metrics(server, paths, pin, "max");
   await assertLegend(page, payload, "cognitive");
-  assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true", "Sequence shares the explorer heat surface");
+  assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "true", "Architecture shares the explorer heat surface");
+  const swatchTip = await page.locator('.file-pick[title="src/flow.js"] .metric-value').getAttribute("title");
+  assert.match(swatchTip, /^Cognitive · max · production callables · indexed snapshot: \d+ · Fixed per-callable bands · band /, "a swatch's tooltip carries the legend");
+  assert.equal(await page.locator("#explorer-metric-legend").count(), 0, "no separate rail legend");
   assert.equal(await page.locator("#metric-relative").isChecked(), false);
   const heatBefore = await page.locator('.file-pick[title="src/flow.js"] .metric-swatch').getAttribute("class");
   await page.locator("#file-filter").fill("src/flow.js");
   assert.equal(await page.locator('.file-pick[title="src/flow.js"] .metric-swatch').getAttribute("class"), heatBefore, "same file keeps fixed color when explorer filtering changes");
   await page.locator("#file-filter").fill("");
   const readsBefore = requests.filter(row => row.url.pathname.endsWith("/metrics")).length;
-  await page.locator("#metric-relative").check(); await assertLegend(page, payload, "cognitive");
+  await H.reveal(page, "#metric-relative"); await page.locator("#metric-relative").check(); await assertLegend(page, payload, "cognitive");
   assert.match(await page.locator("#metric-legend").textContent(), /Relative to visible set/);
   assert.equal(requests.filter(row => row.url.pathname.endsWith("/metrics")).length, readsBefore);
-  await page.locator("#metric-relative").uncheck(); await assertLegend(page, payload, "cognitive");
+  await H.reveal(page, "#metric-relative"); await page.locator("#metric-relative").uncheck(); await assertLegend(page, payload, "cognitive");
   const file = payload.files.find(row => row.path === "src/flow.js");
   await page.locator('.file-pick[title="src/flow.js"]').click();
   const selectedFile = await metrics(server, paths, pin, "max", "file", file);
@@ -293,17 +293,17 @@ test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top
   assert.ok(selectedFile.topCognitive.some(row => row.name === "measured"));
   assert.equal(requests.some(row => row.url.pathname.endsWith("/source")), false, "metric inspection never fetches source");
   for (const metric of ["cyclomatic", "maxNesting", "halstead.volume", "fanOut", "maintainabilityIndex"]) {
-    await page.locator("#metric-color").selectOption(metric);
+    await H.reveal(page, "#metric-color"); await page.locator("#metric-color").selectOption(metric);
     const values = await assertLegend(page, payload, metric);
     if (metric === "maintainabilityIndex") {
       assert.ok(new Set(values).size > 1, "real Maintainability values differ so reversed severity is exercised");
       assert.match(await page.locator("#metric-legend").textContent(), /higher is better/);
     }
   }
-  await page.locator("#metric-color").selectOption("none");
+  await H.reveal(page, "#metric-color"); await page.locator("#metric-color").selectOption("none");
   assert.equal(await page.locator("#file-tree .metric-swatch").count(), 0);
   assert.equal(await page.locator("#metric-legend").textContent(), "");
-  await page.locator("#metric-color").selectOption("cognitive");
+  await H.reveal(page, "#metric-color"); await page.locator("#metric-color").selectOption("cognitive");
   const directory = payload.directories.find(row => row.path === "src");
   await page.locator('.directory-pick[title="src/"]').click();
   const directoryMax = await metrics(server, paths, pin, "max", "directory", directory);
@@ -311,7 +311,7 @@ test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top
   const descendants = payload.files.filter(row => row.path.startsWith("src/"));
   const callableRows = (await Promise.all(descendants.map(row => metrics(server, paths, pin, "max", "file", row)))).flatMap(file => file.declarations);
   for (const aggregate of ["sum", "mean", "max"]) {
-    await page.locator("#metric-aggregate").selectOption(aggregate);
+    await H.reveal(page, "#metric-aggregate"); await page.locator("#metric-aggregate").selectOption(aggregate);
     payload = await metrics(server, paths, pin, aggregate);
     const selected = await metrics(server, paths, pin, aggregate, "directory", directory);
     const row = await assertInspection(page, selected, "directory", "src");
@@ -346,11 +346,11 @@ test("Viewer starts with production heat and includes stored tests at the same c
   // Hand count: one production if, zero in test-support, and two nested test ifs (1 + 2).
   for (const role of ["production", "all"]) {
     if (role === "all") {
-      await page.locator("#metric-include-tests").check();
+      await H.reveal(page, "#metric-include-tests"); await page.locator("#metric-include-tests").check();
       await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("all indexed callables"));
     }
     for (const aggregate of ["max", "sum", "mean"]) {
-      await page.locator("#metric-aggregate").selectOption(aggregate);
+      await H.reveal(page, "#metric-aggregate"); await page.locator("#metric-aggregate").selectOption(aggregate);
       await page.waitForFunction(value => document.querySelector("#metrics-state")?.textContent.includes(`Indexed snapshot · ${value} ·`), aggregate);
       const payload = await metrics(server, paths, pin, aggregate, "file", mixed, role);
       const scores = fixtureScores[role], file = payload.files.find(row => row.path === mixed.path);
@@ -378,8 +378,12 @@ test("Viewer starts with production heat and includes stored tests at the same c
     await capture(page, `viewer-${role}-desktop`);
     await page.setViewportSize({width:390, height:844});
     if (await page.locator("#inspector-toggle").getAttribute("aria-expanded") === "true") await page.locator("#inspector-toggle").click();
-    assert.equal(await page.locator("#metric-include-tests").isVisible(), true);
+    await page.locator("#explorer-toggle").click();
+    await H.reveal(page, "#metric-include-tests");
+    assert.equal(await page.locator("#metric-include-tests").isVisible(), true, "heat options stay reachable in the mobile explorer menu");
     await capture(page, `viewer-${role}-mobile`);
+    await page.keyboard.press("Escape");
+    await page.locator("#explorer-toggle").click();
     await page.locator("#inspector-toggle").click();
     await capture(page, `viewer-${role}-mobile-inspector`);
     await page.setViewportSize({width:1440, height:900});
@@ -420,17 +424,17 @@ test("Viewer rejects a proven late production response after include-tests wins 
     };
   });
   try {
-    await page.locator("#metric-include-tests").check();
+    await H.reveal(page, "#metric-include-tests"); await page.locator("#metric-include-tests").check();
     await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("all indexed callables"));
     await page.locator('.directory-pick[title="roles/"]').click();
     await page.locator('.file-pick[title="roles/mixed.rs"]').click();
     await page.waitForFunction(() => document.querySelector("#metric-inspector-values dt"));
     await page.route(pattern, respond);
-    await page.locator("#metric-include-tests").uncheck();
+    await H.reveal(page, "#metric-include-tests"); await page.locator("#metric-include-tests").uncheck();
     await seen;
     assert.equal(await page.locator("#metric-inspector-values dt").count(), 0, "changing role clears inspection before a response exists");
     assert.equal(await page.locator("#file-tree .heat-0, #file-tree .heat-1, #file-tree .heat-2, #file-tree .heat-3").count(), 0, "old population heat is cleared while production is blocked");
-    await page.locator("#metric-include-tests").check();
+    await H.reveal(page, "#metric-include-tests"); await page.locator("#metric-include-tests").check();
     await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("all indexed callables"));
     const allHeat = await page.locator("#file-tree").textContent();
     release();
@@ -518,14 +522,12 @@ test("Sequence URLs wait for authentication and checkout, use the returned seed,
     const before = sequenceRequests().length;
     await page.goto(`${server.base}/#sequence?${query}`, {waitUntil:"domcontentloaded"});
     assert.equal(sequenceRequests().length, before, "a URL never reads evidence before Connect");
+    const responsePromise = valid || backend ? page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence")) : null;
     await page.locator("#token").fill(paths.token);
     await page.locator("#connect-form button[type=submit]").click();
-    await page.waitForFunction(() => !document.querySelector("#checkout-select").disabled);
-    assert.equal(await page.locator("#checkout-select").inputValue(), "");
-    assert.equal(sequenceRequests().length, before, "authentication alone does not choose a checkout for the route");
-    const responsePromise = valid || backend ? page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence")) : null;
-    await page.locator("#checkout-select").selectOption(server.rootKey);
+    // Arrival selects the only checkout; the URL itself never chooses one.
     await page.locator("#workspace").waitFor({state:"visible"});
+    assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey);
     if (valid) {
       const response = await responsePromise, dto = await response.json();
       assert.equal(response.status(), 200, JSON.stringify(dto));
@@ -667,7 +669,7 @@ test("retained Files and diagram evidence names the newer head until explicit ke
   const head = await H.indexThroughApi(server, paths.token, pin, "src/flow.js", flowQ);
   const sequenceRead = page.waitForResponse(response => response.url().endsWith(H.scoped(server.rootKey, "sequence")) &&
     response.request().postDataJSON()?.showAll === true);
-  await page.locator("#all-steps").check();
+  await H.reveal(page, "#all-steps"); await page.locator("#all-steps").check();
   const retainedSequence = await sequenceRead;
   assert.equal(retainedSequence.status(), 200, "the next actual pinned read still succeeds after head advances");
   assert.deepEqual(retainedSequence.request().postDataJSON().expectedRevision, pin);
@@ -744,9 +746,13 @@ test("explorer hides dot and unindexed folders, status says what was indexed, an
   await page.waitForFunction(() => document.querySelector('.directory-pick[title="roles/"]') && !document.querySelector('.directory-pick[title="assets/"]'));
   assert.equal(await page.locator('.directory-pick[title=".tool-cache/"]').count(), 0, "dot-directories are hidden by default");
   assert.equal(await page.locator('.directory-pick[title="assets/"]').count(), 0, "a folder without indexed files is hidden by default");
-  assert.match(await page.locator("#files-state").textContent(), /2 hidden or unindexed entries not shown/);
+  assert.match(await page.locator("#files-state").textContent(), /^2 hidden or unindexed entries · ⋯ to show$/);
+  await page.locator("#rail-menu > summary").click();
   const toggle = page.getByRole("checkbox", {name:"Show hidden/ignored", exact:true});
   await toggle.focus(); await page.keyboard.press("Space");
+  await page.keyboard.press("Escape");
+  assert.equal(await page.locator("#rail-menu").evaluate(node => node.open), false, "Escape closes the rail menu");
+  assert.equal(await page.locator("#rail-menu > summary").evaluate(node => document.activeElement === node), true, "focus returns to the menu button");
   await page.locator('.directory-pick[title=".tool-cache/"]').waitFor();
   await page.locator('.directory-pick[title="assets/"]').waitFor();
   assert.equal(await page.evaluate(key => localStorage.getItem(key), `trellis.files.showHidden.v1:${await page.locator("#checkout-select").inputValue()}`), "true", "the choice is remembered per checkout");
@@ -791,7 +797,7 @@ test("Sequence explorer excludes fixtures and vendored inputs from heat while Fi
   }
   await page.locator("#file-filter").fill("");
   await page.locator("#section-diagrams").click();
-  await page.locator("#metric-include-tests").check();
+  await H.reveal(page, "#metric-include-tests"); await page.locator("#metric-include-tests").check();
   await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("all indexed callables"));
   const included = await metrics(server, paths, pin, "max", "revision", undefined, "all");
   for (const path of inputs) {
@@ -805,8 +811,10 @@ test("invalid rules keep Explorer and Treemap heat with a warning while Architec
   const warning = "Rules unavailable; layer-based heat exclusions were not applied.";
   const payload = await metrics(server, paths, pin, "max");
   assert.equal(payload.layerExclusionsWarning, warning);
+  await H.reveal(page, "#metrics-state");
   assert.ok(await page.locator("#metrics-state").isVisible());
   assert.ok((await page.locator("#metrics-state").textContent()).includes(warning));
+  await page.keyboard.press("Escape");
   const measured = payload.files.find(row => row.path === "src/flow.js");
   assert.ok(measured.metrics.cognitive > 0);
   const fixture = payload.files.find(row => row.path === "tests/fixtures/input.js");
@@ -882,39 +890,52 @@ async function assertIndexState(page, state, words) {
   assert.ok(shape && shape.width > 0 && shape.height > 0, `${state} has a visible shape as well as words`);
 }
 
-test("connected chrome uses one desktop action line, folded details and brand-sized controls without losing narrow drawers", {timeout:240000}, async () => published(async ({page, requests}) => {
-  const toolbar = page.locator(".workspace-toolbar");
+test("connected chrome is one header row: picker, status chip and a menu holding Refresh, Diagnostics and Disconnect", {timeout:240000}, async () => published(async ({page, requests}) => {
   const header = await page.locator(".app-header").boundingBox();
-  const actions = await toolbar.boundingBox();
   const frame = await page.locator(".workspace-frame").boundingBox();
-  const primary = await page.locator("#index").boundingBox();
-  assert.ok(header && actions && frame && primary);
-  assert.ok(primary.height >= 44, "explicit Index is a primary action of at least 44px");
-  assert.ok(actions.height <= primary.height + 20, "closed desktop status/actions occupy one compact line");
-  assert.ok(Math.abs(actions.y - (header.y + header.height)) <= 1, "no revision or browse-notice row separates header and actions");
-  assert.ok(Math.abs(frame.y - (actions.y + actions.height)) <= 1, "no job row separates actions from the panes");
-  const headerControls = await Promise.all([".brand", ".section-nav", "#checkout-select", "#logout"].map(selector => page.locator(selector).boundingBox()));
+  assert.ok(header && frame);
+  assert.equal(await page.locator(".workspace-toolbar").count(), 0, "no second action row");
+  assert.ok(Math.abs(frame.y - (header.y + header.height)) <= 1, "the panes start right under the header");
+  const headerControls = await Promise.all([".brand", ".section-nav", "#checkout-select", "#workspace-index-state", "#app-menu > summary"].map(selector => page.locator(selector).boundingBox()));
   assert.ok(headerControls.every(Boolean));
   assert.ok(Math.max(...headerControls.map(box => box.y)) < Math.min(...headerControls.map(box => box.y + box.height)), "desktop header controls share one row");
+  assert.equal(await page.locator("#index").isVisible(), false, "Index workspace is hidden while the index is usable");
+  for (const id of ["refresh", "logout"]) assert.equal(await page.locator(`#${id}`).isVisible(), false, `${id} waits in the closed menu`);
   for (const id of ["workspace-meta", "checkout-root", "status", "diagnostics", "job", "stale"]) {
     assert.equal(await page.locator(`#${id}`).evaluate(node => node.closest("#workspace-details") !== null), true, `${id} belongs to folded Diagnostics`);
     assert.equal(await page.locator(`#${id}`).isVisible(), false, `${id} consumes no closed-chrome height`);
   }
   assert.equal(await page.locator("#checkout-state").isVisible(), false, "successful selection adds no guidance row");
   assert.equal(await page.locator("#notice").isVisible(), false, "browse guidance is not a separate connected row");
-  for (const selector of ["#refresh", "#index", "#checkout-select", "#file-filter", "#metric-color", "#metric-aggregate"]) {
+  await page.locator("#app-menu > summary").click();
+  assert.deepEqual(await page.locator("#app-menu .menu-body > :is(button, details)").evaluateAll(nodes => nodes.filter(node => !node.hidden).map(node => node.id)), ["refresh", "workspace-details", "logout"]);
+  await page.locator("#workspace-details > summary").click();
+  assert.equal(await page.locator("#checkout-root").isVisible(), true, "Diagnostics opens from the menu");
+  await capture(page, "chrome-menu-diagnostics");
+  await page.mouse.click(700, 500);
+  assert.equal(await page.locator("#app-menu").evaluate(node => node.open), false, "an outside click closes the menu");
+  for (const selector of ["#checkout-select", "#file-filter", "#refresh", "#metric-color", "#metric-aggregate"]) {
+    await H.reveal(page, selector);
     const style = await page.locator(selector).evaluate(node => ({font:getComputedStyle(node).fontSize, radius:getComputedStyle(node).borderTopLeftRadius}));
     assert.deepEqual(style, {font:"14px", radius:"8px"}, `${selector} uses interface label and control tokens`);
   }
-  assert.ok((await page.locator("#refresh").boundingBox()).height < primary.height, "secondary controls stay compact rather than all becoming primary-sized");
+  await page.keyboard.press("Escape");
+  const refreshed = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/status"));
+  await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
+  assert.equal((await refreshed).status(), 200, "Refresh in the menu re-reads status");
+  assert.equal(await page.locator("#app-menu").evaluate(node => node.open), false, "choosing a menu action closes the menu");
   await capture(page, "chrome-compact-desktop");
   for (const width of [390, 320]) {
     await page.setViewportSize({width, height:844});
     await noOverflow(page, width);
-    for (const selector of ["#checkout-select", "#refresh", "#index", "#workspace-details > summary"]) {
+    for (const selector of ["#checkout-select", "#app-menu > summary", "#workspace-index-state"]) {
       const box = await page.locator(selector).boundingBox();
       assert.ok(box && box.x >= 0 && box.x + box.width <= width + 1, `${selector} remains reachable at ${width}px`);
     }
+    await page.locator("#app-menu > summary").click();
+    const menu = await page.locator("#app-menu .popover-body").boundingBox();
+    assert.ok(menu && menu.x >= 0 && menu.x + menu.width <= width + 1, `the open menu fits ${width}px`);
+    await page.keyboard.press("Escape");
     await page.locator("#explorer-toggle").click();
     assert.equal(await page.locator("#explorer-panel").isVisible(), true);
     await page.keyboard.press("Escape");
@@ -922,6 +943,120 @@ test("connected chrome uses one desktop action line, folded details and brand-si
     await capture(page, `chrome-compact-${width}`);
   }
   assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false, "layout and drawer actions never request indexing");
+}));
+
+test("view toolbars are one row with Options and an About popover; Sequence and Classes have no Color by", {timeout:240000}, async () => published(async ({page}) => {
+  const rowOf = async panel => {
+    const boxes = await page.locator(`${panel} .view-toolbar > :is(label, select, input, button, details > summary)`).evaluateAll(nodes => nodes.filter(node => node.getClientRects().length).map(node => node.getBoundingClientRect()).map(box => ({top:box.top, bottom:box.bottom})));
+    assert.ok(boxes.length > 1, `${panel} has toolbar controls`);
+    assert.ok(Math.max(...boxes.map(box => box.top)) < Math.min(...boxes.map(box => box.bottom)), `${panel} controls share one row at 1440px`);
+  };
+  // Every toolbar popover's full box stays inside the viewport and its visible panel.
+  const inside = async (panel, popover, label) => {
+    const body = page.locator(`${panel} ${popover} > .popover-body`);
+    await body.waitFor({state:"visible"});
+    // Placement runs on the popover's toggle event; wait for it, then check the whole box.
+    await page.waitForFunction(selector => document.querySelector(selector)?.style.left !== "", `${panel} ${popover} > .popover-body`);
+    const {box, frame, width, height} = await body.evaluate((node, selector) => ({box:node.getBoundingClientRect().toJSON(),
+      frame:document.querySelector(selector).getBoundingClientRect().toJSON(), width:innerWidth, height:innerHeight}), panel);
+    assert.ok(box.width > 0 && box.left >= Math.max(0, frame.left) - 1 && box.right <= Math.min(width, frame.right) + 1 &&
+      box.top >= 0 && box.bottom <= height + 1, `${label}: ${JSON.stringify({box, frame, width})}`);
+  };
+  const popovers = [["architecture", "#architecture-panel", [".view-options", ".view-about"]], ["treemap", "#treemap-panel", [".view-options", ".view-about"]],
+    ["classes", "#classes-panel", [".view-about"]], ["sequence", "#sequence-panel", [".view-options", ".view-about"]]];
+  const checkAll = async state => {
+    for (const [view, panel, kinds] of popovers) {
+      await page.locator(`#view-${view}`).click();
+      for (const kind of kinds) {
+        await page.locator(`${panel} ${kind} > summary`).click();
+        await inside(panel, kind, `${view} ${kind} ${state}`);
+        await page.keyboard.press("Escape");
+      }
+    }
+  };
+  for (const [view, panel] of [["architecture", "#architecture-panel"], ["treemap", "#treemap-panel"], ["classes", "#classes-panel"]]) {
+    await page.locator(`#view-${view}`).click();
+    await rowOf(panel);
+    const about = page.locator(`${panel} .view-about > summary`);
+    assert.equal(await about.getAttribute("aria-label"), "About this view");
+    await about.click();
+    assert.equal(await page.locator(`${panel} .view-about h3`).textContent(), "About this view");
+    await capture(page, `toolbar-${view}-about`);
+    await page.keyboard.press("Escape");
+  }
+  await checkAll("at 1440px");
+  await page.locator('.directory-pick[title="src/"]').click();
+  await page.locator("#call-inspector").waitFor({state:"visible"});
+  await checkAll("with the inspector open");
+  await capture(page, "toolbar-popover-inspector-open");
+  await page.locator("#inspector-clear").click();
+  for (const width of [900, 390]) {
+    await page.setViewportSize({width, height:844});
+    await checkAll(`at ${width}px`);
+  }
+  await page.setViewportSize({width:1440, height:900});
+  await page.locator("#view-architecture").click();
+  for (const id of ["architecture-metric-tests", "architecture-relative", "architecture-tests"]) {
+    assert.equal(await page.locator(`#${id}`).isVisible(), false, `${id} waits in Options`);
+  }
+  await page.locator("#architecture-panel .view-options > summary").click();
+  for (const id of ["architecture-metric-tests", "architecture-relative", "architecture-tests"]) assert.equal(await page.locator(`#${id}`).isVisible(), true);
+  await capture(page, "toolbar-architecture-options");
+  await page.keyboard.press("Escape");
+  assert.equal(await page.locator(".architecture-basis").first().isVisible(), false, "caveats are behind the ⓘ");
+  await page.locator("#view-treemap").click();
+  assert.equal(await page.locator(".treemap-basis").isVisible(), false);
+  for (const view of ["sequence", "classes"]) {
+    await page.locator(`#view-${view}`).click();
+    assert.equal(await page.locator(`#${view}-panel`).getByText("Color by", {exact:true}).count(), 0, `${view} has nothing to colour`);
+    assert.equal(await page.locator("#metric-color").isVisible(), false);
+  }
+  assert.equal(await page.locator("#classes-unmatched").count(), 0, "no disabled placeholder option");
+  assert.equal(await page.locator(".sequence-context").count(), 0, "the Sequence caveat row moved behind the ⓘ");
+  await page.locator("#view-sequence").click();
+  assert.equal(await page.locator("#all-steps").isVisible(), false);
+  await page.locator("#sequence-panel .view-options > summary").click();
+  assert.equal(await page.locator("#all-steps").isVisible(), true);
+}));
+
+test("the rail is just the tree: its filter searches unopened folders through the pinned catalog", {timeout:240000}, async () => published(async ({page, server, pin, requests}) => {
+  for (const gone of ["#indexed-checkouts", "#browse-scope", ".file-filter-label", "#explorer-metric-legend"]) assert.equal(await page.locator(gone).count(), 0, `${gone} is gone`);
+  assert.equal(await page.locator("#browse-root").isVisible(), false, "the absolute path is not repeated");
+  assert.doesNotMatch(await page.locator("#explorer-panel").innerText(), /trellis mcp|Expand folders to browse/);
+  const filter = page.locator("#file-filter");
+  assert.equal(await filter.getAttribute("aria-label"), "Filter files");
+  const height = (await filter.boundingBox()).height;
+  assert.ok(height <= 40, `the filter is one line (${height}px)`);
+  assert.equal(await page.locator('.directory-pick[title="src/nested/"]').count(), 0, "src/nested/ has not been opened");
+  const search = page.waitForRequest(request => new URL(request.url()).pathname === H.scoped(server.rootKey, "files") && new URL(request.url()).searchParams.get("q") === "other.js");
+  await filter.fill("other.js");
+  const url = new URL((await search).url());
+  assert.equal(url.searchParams.get("indexGeneration"), pin.indexGeneration);
+  assert.equal(url.searchParams.get("indexRevision"), String(pin.indexRevision));
+  const match = page.locator('#file-tree .file-pick[title="src/nested/other.js"]');
+  await match.waitFor();
+  assert.match(await page.locator("#files-state").textContent(), /^1 matching indexed file$/);
+  assert.equal(await page.locator("#file-tree .file-pick").count(), 1, "only matches are listed");
+  await match.click();
+  await page.locator(".method-pick").filter({hasText:"moderate"}).waitFor();
+  await capture(page, "rail-filter-unopened-folder");
+  // Reveal from the filter opens the never-opened ancestors in the live tree.
+  await page.locator(".method-pick").filter({hasText:"moderate"}).click();
+  await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("moderate"));
+  await H.reveal(page, "#reveal-method"); await page.locator("#reveal-method").click();
+  await page.locator('.directory-pick[title="src/nested/"][aria-expanded="true"]').waitFor();
+  assert.equal(await filter.inputValue(), "", "reveal clears the filter");
+  assert.equal(await page.locator('.directory-pick[title="src/"]').getAttribute("aria-expanded"), "true");
+  const revealed = page.locator(".method-pick.selected");
+  await revealed.waitFor();
+  assert.match(await revealed.textContent(), /moderate/);
+  assert.equal(await revealed.evaluate(node => document.activeElement === node), true, "focus moves to the revealed method");
+  await capture(page, "rail-reveal-from-filter");
+  await filter.fill("no-such-path");
+  await page.locator("#file-tree").getByText("No indexed files match.").waitFor();
+  await filter.fill("");
+  await page.locator('.directory-pick[title="src/"]').waitFor();
+  assert.equal(requests.filter(row => row.url.searchParams.has("q")).every(row => row.method === "GET"), true);
 }));
 
 test("selected status reconciles jobs, catch-up and stale evidence while raw errors stay in Diagnostics and Stop waiting never cancels", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests}) => {
@@ -934,20 +1069,22 @@ test("selected status reconciles jobs, catch-up and stale evidence while raw err
     fixture.status.stats.changedFiles = [];
     fixture.job = job;
     await fixture.select();
-    await assertIndexState(page, "failed", /Index failed/i);
-    assert.doesNotMatch(await page.locator("#workspace-index-label").textContent(), /Fresh|0\/0|index_failed/);
-    const selectedCheckout = page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-freshness');
-    assert.match(await selectedCheckout.textContent(), /Index failed/i);
-    assert.doesNotMatch(await selectedCheckout.textContent(), /Fresh/);
+    // #447 item 9: revision N is ready and fresh, so the chip says so; the failed re-index is a note with its cause.
+    await assertIndexState(page, "fresh", /^Fresh · rev /);
+    const note = page.locator("#workspace-index-note");
+    assert.equal(await note.isVisible(), true);
+    assert.equal(await note.textContent(), "Last re-index failed · index_failed");
+    assert.match(await page.locator("#workspace-index-announce").textContent(), /Fresh.*Last re-index failed · index_failed/);
+    await capture(page, "chrome-failed-reindex-note");
     assert.equal(await page.locator("#job").isVisible(), false);
     assert.equal(await page.locator("body").evaluate((node, text) => node.innerText.includes(text), failure), false, "raw error text is not exposed in the compact chrome");
-    await page.locator("#workspace-details > summary").click();
+    await H.reveal(page, "#workspace-details > summary"); await page.locator("#workspace-details > summary").click();
     assert.ok((await page.locator("#job").textContent()).includes(failure));
     assert.match(await page.locator("#job").textContent(), /index_failed/);
     assert.equal(await page.locator("#workspace-details img").count(), 0, "error objects render only as inert text");
     assert.equal(await page.evaluate(() => globalThis.statusExecuted), undefined);
     await capture(page, "chrome-failed-diagnostics");
-    await page.locator("#workspace-details > summary").click();
+    await H.reveal(page, "#workspace-details > summary"); await page.locator("#workspace-details > summary").click();
 
     fixture.job = {...job, state:"done", error:null, revision:pin};
     fixture.status.catchingUp = true;
@@ -958,15 +1095,25 @@ test("selected status reconciles jobs, catch-up and stale evidence while raw err
     fixture.status.stats.changedFiles = ["src/flow.js"];
     await fixture.select();
     await assertIndexState(page, "stale", /Stale evidence/i);
-    await page.locator("#workspace-details > summary").click();
+    await H.reveal(page, "#workspace-details > summary"); await page.locator("#workspace-details > summary").click();
     assert.match(await page.locator("#stale").textContent(), /1 inputs differ/);
-    await page.locator("#workspace-details > summary").click();
+    await H.reveal(page, "#workspace-details > summary"); await page.locator("#workspace-details > summary").click();
     fixture.status.stats.changedFiles = [];
     await fixture.select();
     await assertIndexState(page, "fresh", /Fresh/i);
     assert.doesNotMatch(await page.locator("#job").textContent(), /0\/0/);
     assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false, "selecting or refreshing status never indexes");
 
+    assert.equal(await page.locator("#index").isVisible(), false, "a usable index offers no Index workspace button");
+    // Without a usable index the button appears and the tabs grey out.
+    const readyPin = fixture.status.revision;
+    fixture.status.revision = null;
+    await fixture.select();
+    await page.locator("#index").waitFor({state:"visible"});
+    assert.ok((await page.locator("#index").boundingBox()).height >= 44, "Index workspace is a primary action of at least 44px");
+    for (const view of ["architecture", "treemap", "sequence", "classes", "libraries"]) assert.equal(await page.locator(`#view-${view}`).isDisabled(), true, `${view} is greyed out`);
+    assert.equal(await page.locator("#section-files").isDisabled(), true);
+    await capture(page, "chrome-no-index");
     fixture.job = {...job, state:"running", error:null, finishedAt:null, progress:{phase:"capture", completed:0, total:0}};
     const accepted = page.waitForResponse(response => new URL(response.url()).pathname === H.scoped(server.rootKey, "index"));
     await page.locator("#index").click();
@@ -985,6 +1132,9 @@ test("selected status reconciles jobs, catch-up and stale evidence while raw err
     assert.equal(await page.locator("#cancel").isVisible(), true);
     await assertIndexState(page, "catching-up", /Indexing/i);
     await page.locator("#cancel").click();
+    fixture.status.revision = readyPin; fixture.job = null;
+    await fixture.select();
+    assert.equal(await page.locator("#view-sequence").isDisabled(), false, "tabs return with a usable index");
   } finally { await fixture.close(); }
 }));
 
@@ -998,7 +1148,6 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
   assert.equal(gitResponse.data.git.head.name, "measured-branch");
   assert.deepEqual(gitResponse.data.git.workingTree, {state:"available", changedFiles:0});
   await page.waitForFunction(() => document.querySelector("#workspace-git")?.textContent === "measured-branch · No upstream · clean");
-  assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), "measured-branch · No upstream · clean");
   const shortRevision = `rev ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`;
   assert.equal(await page.locator(`#checkout-select option[value="${server.rootKey}"]`).textContent(), `workspace ⎇ measured-branch · ${shortRevision}`, "the real measured Git branch labels the published checkout");
   const branch = '<svg onload="globalThis.branchExecuted=true">' + "-long-branch".repeat(12);
@@ -1017,11 +1166,11 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
   await page.route(pattern, respond);
   await page.route(gitPattern, respondGit);
   try {
-    await page.locator("#logout").click();
+    await H.reveal(page, "#logout"); await page.locator("#logout").click();
     await page.locator("#token").fill(paths.token);
     await page.locator("#connect-form button[type=submit]").click();
-    await page.waitForFunction(() => !document.querySelector("#checkout-select").disabled);
-    assert.equal(await page.locator("#checkout-select").inputValue(), "", "even a measured branch never auto-selects a checkout");
+    await page.waitForFunction(key => document.querySelector("#checkout-select").value === key, server.rootKey);
+    assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "the only selectable checkout opens on arrival; busy and unavailable rows do not count");
     const option = page.locator(`#checkout-select option[value="${server.rootKey}"]`);
     assert.equal(await option.textContent(), `workspace ⎇ ${branch} · ${shortRevision}`);
     assert.equal(await option.getAttribute("title"), observed.workspaceRoot);
@@ -1033,8 +1182,7 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
     assert.equal(await page.locator("#workspace-name").getAttribute("title"), observed.workspaceRoot);
     const hostileGit = `${branch} · 9 uncommitted · ${upstream} ↑2 ↓3 · As of last fetch`;
     await page.waitForFunction(text => document.querySelector("#workspace-git")?.textContent === text, hostileGit);
-    assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), hostileGit);
-    assert.equal(await page.locator(".app-header svg, #indexed-checkouts svg, #workspace-git img, #indexed-checkouts img").count(), 0);
+    assert.equal(await page.locator(".app-header svg, #workspace-git img").count(), 0);
     assert.equal(await page.evaluate(() => globalThis.branchExecuted || globalThis.upstreamExecuted), undefined);
     for (const width of [390, 320]) {
       await page.setViewportSize({width, height:844});
@@ -1044,9 +1192,9 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
     }
     await page.setViewportSize({width:1440, height:900});
     assert.equal(await page.locator("#checkout-root").isVisible(), false);
-    await page.locator("#workspace-details > summary").click();
+    await H.reveal(page, "#workspace-details > summary"); await page.locator("#workspace-details > summary").click();
     assert.equal(await page.locator("#checkout-root").textContent(), observed.workspaceRoot);
-    await page.locator("#workspace-details > summary").click();
+    await H.reveal(page, "#workspace-details > summary"); await page.locator("#workspace-details > summary").click();
     for (const [git, identity, words] of [
       [{...available, upstream:null, workingTree:{state:"unavailable", reason:"deadline_exceeded"}}, branch, /No upstream · Changes unavailable/],
       [{...available, upstream:null, head:{...available.head, kind:"detached", name:null}}, `Detached ${available.head.shortCommit}`, /Detached HEAD .*No upstream.*9 uncommitted/],
@@ -1064,7 +1212,6 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
       const shown = await page.locator("#workspace-git").textContent();
       assert.match(shown, words);
       if (git.head?.kind === "detached") assert.doesNotMatch(shown, /Git unavailable/, "a detached HEAD is still Git");
-      assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), shown, "header and selected list row share the accepted observation");
       if (git.state === "unavailable") assert.doesNotMatch(shown, /uncommitted|clean|↑|↓/);
       assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "retry retains explicit selection of the same available checkout");
     }
@@ -1078,7 +1225,6 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
       await page.waitForFunction(() => document.querySelector("#checkout-state")?.textContent.includes("Index not ready"));
       await page.waitForFunction(() => document.querySelector("#workspace-git")?.textContent.includes("4 uncommitted"));
       assert.ok((await page.locator("#workspace-git").textContent()).startsWith(branch));
-      assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), `${branch} · No upstream · 4 uncommitted`);
     } finally { await page.unroute(statusPattern, coldStatus); }
     assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false);
     await capture(page, "chrome-checkout-git-unavailable");
@@ -1111,11 +1257,14 @@ test("a failed job lookup reads as unavailable until Refresh retries it, and the
 
     await page.unroute(jobsPattern, failJobs);
     const retried = page.waitForResponse(response => new URL(response.url()).pathname === `${prefix}jobs/current`);
-    await page.locator("#refresh").click();
+    await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
     assert.equal((await retried).status(), 200, "Refresh retries the failed job lookup");
     await assertIndexState(page, "fresh", /^Fresh/);
     assert.equal(await page.locator("#checkout-state").isVisible(), false);
 
+    fixture.status.revision = null;
+    await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
+    await page.locator("#index").waitFor({state:"visible"});
     fixture.job = {id:"live-job", state:"running", error:null, finishedAt:null, revision:null, progress:{phase:"capture", completed:1, total:10}};
     await page.locator("#index").click();
     await page.waitForFunction(() => document.querySelector("#workspace-index-label")?.textContent === "Indexing · capture · 1/10");
@@ -1124,7 +1273,7 @@ test("a failed job lookup reads as unavailable until Refresh retries it, and the
     await page.waitForFunction(() => document.querySelector("#workspace-index-label")?.textContent === "Indexing · capture · 6/10");
     assert.equal(await page.locator("#workspace-index-announce").textContent(), "Indexing · capture · 1/10", "a progress-only poll is not announced");
     fixture.job = {...fixture.job, state:"failed", error:{code:"index_failed", message:"fixture"}, finishedAt:1};
-    await page.waitForFunction(() => document.querySelector("#workspace-index-announce")?.textContent === "Index failed · see Diagnostics");
+    await page.waitForFunction(() => document.querySelector("#workspace-index-announce")?.textContent === "Index failed · index_failed");
     assert.equal(requests.filter(row => row.method === "POST" && row.url.pathname.endsWith("/index")).length, 1, "only the explicit Index click requests a job");
   } finally {
     await page.unroute(jobsPattern, failJobs).catch(() => {});
@@ -1134,7 +1283,7 @@ test("a failed job lookup reads as unavailable until Refresh retries it, and the
 
 test("an unsaved token warning stays visible in the header after a checkout is selected", {timeout:240000}, async () => published(async ({page, paths, server}) => {
   const warning = "Browser storage is unavailable; token was not saved.";
-  await page.locator("#logout").click();
+  await H.reveal(page, "#logout"); await page.locator("#logout").click();
   await page.evaluate(() => { Storage.prototype.setItem = () => { throw new DOMException("blocked", "SecurityError"); }; });
   await page.locator("#token").fill(paths.token);
   await page.locator("#remember-token").check();
@@ -1203,14 +1352,14 @@ test("late Git from an old root and an older checkout list cannot regress select
   const assertCurrent = async name => {
     const expected = `${name} · No upstream · 1 uncommitted`;
     await page.waitForFunction(text => document.querySelector("#workspace-git")?.textContent === text, expected);
-    assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), expected);
     assert.ok((await page.locator(`#checkout-select option[value="${otherKey}"]`).textContent()).includes(name));
     assert.equal(await page.locator('.file-pick[title="src/flow.js"] .git-marker[data-status="modified"]').count(), 1);
     assert.equal(await page.locator("#file-tree .git-marker").evaluateAll((nodes, path) => nodes.filter(node => node.dataset.path === path).length, maliciousName), 0);
   };
   try {
     // Refresh discovery once to admit the second explicit checkout.
-    await page.locator("#logout").click();
+    await H.reveal(page, "#logout"); await page.locator("#logout").click();
+    await page.evaluate(() => localStorage.removeItem("trellis.lastCheckout.v1"));
     await page.locator("#token").fill(paths.token);
     await page.locator("#connect-form button[type=submit]").click();
     await page.waitForFunction(() => !document.querySelector("#checkout-select").disabled);
@@ -1229,19 +1378,18 @@ test("late Git from an old root and an older checkout list cannot regress select
     await page.waitForFunction(() => window.__gitOrdering.entered);
     current.git = summary("newer-selected");
     const refreshed = page.waitForResponse(response => new URL(response.url()).pathname === H.scoped(otherKey, "git"));
-    await page.locator("#refresh").click();
+    await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
     assert.equal((await refreshed).status(), 200);
     await page.waitForFunction(() => document.querySelector("#workspace-git")?.textContent.startsWith("newer-selected"));
     await release();
     await assertCurrent("newer-selected");
     current.git = {state:"unavailable", reason:"git_changed"}; current.changes = null;
-    await page.locator("#refresh").click();
+    await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
     await page.waitForFunction(() => document.querySelector("#workspace-git")?.textContent === "Git unavailable");
     assert.equal(await page.locator("#file-tree .git-marker").count(), 0, "unavailable observation clears previously measured paths");
-    assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), "Git unavailable");
     await page.waitForFunction(() => !document.querySelector("#refresh").disabled);
     current.git = {...summary("newer-selected"), workingTree:{state:"available", changedFiles:0}}; current.changes = [];
-    await page.locator("#refresh").click();
+    await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
     await page.waitForFunction(() => document.querySelector("#workspace-git")?.textContent === "newer-selected · No upstream · clean");
     assert.equal(await page.locator("#file-tree .git-marker").count(), 0, "measured clean never retains dirty path markers");
     assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false);

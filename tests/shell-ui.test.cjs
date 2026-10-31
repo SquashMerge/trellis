@@ -43,23 +43,39 @@ const view=(steps=[])=>({revision:{indexGeneration:'12345678-1234-4123-8123-1234
 const response=data=>({ok:true,status:200,json:async()=>data});
 const key=(element,value)=>{let prevented=false;element.listeners.keydown({key:value,preventDefault(){prevented=true;}});return prevented;};
 
-test("Architecture owns its metric controls across view and Files transitions", () => {
+test("the shell lands on Architecture and explorer heat options stay in the rail menu in every Diagrams view", () => {
   const h = harness();
-  h.shell.showView("architecture");
-  assert.equal(h.get("diagram-metrics").hidden, true);
+  assert.equal(h.get("view-architecture").attrs["aria-selected"], "true", "arrival lands on Architecture");
+  assert.equal(h.get("architecture-panel").hidden, false); assert.equal(h.get("sequence-panel").hidden, true);
+  for (const view of ["architecture", "treemap", "sequence", "classes", "libraries"]) {
+    h.shell.showView(view);
+    assert.equal(h.get("diagram-metrics").hidden, false, `${view} keeps the rail heat options`);
+  }
   h.shell.setSection("files");
+  assert.equal(h.get("diagram-metrics").hidden, true, "Files has no explorer heat");
   h.shell.setSection("diagrams");
-  assert.equal(h.get("diagram-metrics").hidden, true);
-  h.shell.showView("sequence");
-  assert.equal(h.get("diagram-metrics").hidden, false);
-  h.shell.showView("classes");
   assert.equal(h.get("diagram-metrics").hidden, false);
   assert.deepEqual(h.requests, []);
+});
+test("without a usable index the view tabs and Files are greyed out and inert", () => {
+  const h = harness();
+  h.shell.setConnected(true);
+  h.shell.setIndexAvailable(false);
+  for (const view of ["architecture", "treemap", "sequence", "classes", "libraries"]) assert.equal(h.get(`view-${view}`).disabled, true, view);
+  assert.equal(h.get("section-files").disabled, true);
+  h.get("view-sequence").listeners.click();
+  assert.equal(h.get("sequence-panel").hidden, true, "a greyed tab cannot be clicked through");
+  assert.equal(key(h.get("view-architecture"), "ArrowRight"), false, "nor reached by keyboard");
+  h.shell.setIndexAvailable(true);
+  assert.equal(h.get("view-sequence").disabled, false); assert.equal(h.get("section-files").disabled, false);
+  h.get("view-sequence").listeners.click();
+  assert.equal(h.get("sequence-panel").hidden, false);
 });
 
 test("five workspace tabs have roving keyboard focus and never request source",()=>{
   const h=harness();
-  assert.equal(h.get("sequence-panel").hidden,false);assert.equal(h.get("dependency-library").hidden,true);assert.equal(h.get("architecture-panel").hidden,true);
+  assert.equal(h.get("architecture-panel").hidden,false);assert.equal(h.get("dependency-library").hidden,true);assert.equal(h.get("sequence-panel").hidden,true);
+  h.shell.showView("sequence");
   assert.equal(key(h.get("view-sequence"),"ArrowRight"),true);
   assert.equal(h.get("view-classes").attrs["aria-selected"],"true");
   assert.equal(h.get("classes-panel").hidden,false);
@@ -424,7 +440,6 @@ test("Treemap owns its controls and inspector across view and Files transitions"
   const h = harness();
   h.shell.showView("treemap");
   assert.equal(h.get("treemap-panel").hidden, false);
-  assert.equal(h.get("diagram-metrics").hidden, true);
   h.shell.showTreemapInspector();
   assert.equal(h.get("treemap-inspector").hidden, false);
   h.shell.showArchitectureInspector();
@@ -436,9 +451,7 @@ test("Treemap owns its controls and inspector across view and Files transitions"
   assert.equal(h.get("treemap-inspector").hidden, true);
   h.shell.setSection("diagrams");
   assert.equal(h.get("treemap-panel").hidden, false);
-  assert.equal(h.get("diagram-metrics").hidden, true);
-  h.shell.showView("sequence");
-  assert.equal(h.get("diagram-metrics").hidden, false);
+  assert.equal(h.get("diagram-metrics").hidden, false, "explorer heat options are not view-specific");
 });
 
 function resolvedView() {
@@ -504,10 +517,17 @@ test("one index status reconciles jobs, freshness, stale evidence and unavailabl
   const label = () => h.get("workspace-index-label").textContent;
   h.run(`$("stale").hidden=true;status.catchingUp=false;renderIndexStatus();`);
   assert.match(label(), /^Fresh/);
-  h.run(`job={state:"failed",error:{code:"index_failed",message:"<img src=x>"}};showJob();`);
-  assert.equal(label(), "Index failed · see Diagnostics");
-  assert.ok(!label().includes("index_failed"));
-  assert.match(h.get("job").textContent, /index_failed/);
+  // A failed re-index beside a ready revision is a note with its recorded cause, not the status.
+  h.run(`job={state:"failed",error:{code:"invalid_artifact",reason:"empty or reversed SCIP range",message:"<img src=x>"}};showJob();`);
+  assert.match(label(), /^Fresh · rev 12345678:1$/);
+  assert.equal(h.get("workspace-index-note").hidden, false);
+  assert.equal(h.get("workspace-index-note").textContent, "Last re-index failed · invalid_artifact: empty or reversed SCIP range");
+  assert.ok(!h.get("workspace-index-note").textContent.includes("<img"), "the generic message is not the cause");
+  assert.match(h.get("job").textContent, /invalid_artifact/);
+  h.run(`status={...status,revision:null};renderIndexStatus();`);
+  assert.equal(label(), "Index failed · invalid_artifact: empty or reversed SCIP range", "without a usable revision the failure is the status");
+  assert.equal(h.get("workspace-index-note").hidden, true);
+  h.run(`status={...status,revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
   h.run(`job={state:"running",progress:{phase:"capture",total:0,completed:0}};waitingForJob=true;showJob();`);
   assert.match(label(), /^Indexing · capture/);
   assert.ok(!label().includes("0/0"));
@@ -576,7 +596,7 @@ test("the header live region announces state-word changes, not each progress pol
   assert.equal(h.get("workspace-index-label").textContent, "Indexing · capture · 7/10");
   assert.equal(announced(), "Indexing · capture · 1/10", "a progress-only change is not re-announced");
   h.run(`job={state:"failed",error:{code:"index_failed",message:"boom"}};showJob();`);
-  assert.equal(announced(), "Index failed · see Diagnostics");
+  assert.equal(announced(), "Fresh · rev 12345678:1 · Last re-index failed · index_failed");
 });
 const selectedStatus = {revision:{indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1},workspaceRoot:"/repo",stats:{files:1,changedFiles:[]},catchingUp:false};
 async function selectWith(h, jobs) {

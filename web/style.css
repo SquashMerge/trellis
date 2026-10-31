@@ -161,13 +161,35 @@ pre { font: 12px/1.7 var(--mono); overflow: auto; background: var(--rail); paddi
 [data-state="stale"] > .state-shape { border-color: var(--warning); border-radius: 0; transform: rotate(45deg); }
 [data-state="failed"] > .state-shape { background: var(--error); border-color: var(--error); border-radius: 0; }
 [data-state="unknown"] > .state-shape { border-radius: 0; transform: rotate(45deg); }
-#workspace-index-state { margin-right: auto; }
 #workspace-index-label { overflow-wrap: anywhere; }
+/* A failed re-index beside a usable revision is a secondary note, not the status. */
+.index-note { max-width: 42ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--error); font-size: 12px; }
+.index-note::before { content: "△ "; }
+.header-status { display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; }
 .workspace-identity strong { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
 #workspace-meta { min-width: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 #workspace-git { min-width: 0; color: var(--secondary); font-size: 12px; overflow-wrap: anywhere; }
-.header-actions { display: flex; gap: 8px; margin-left: auto; flex: none; }
-#logout { color: var(--secondary); background: var(--clear); border-color: var(--clear); }
+.header-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: none; }
+/* Disclosure popovers: menus, Options and "About this view". Content stays in the DOM. */
+.popover { position: relative; flex: none; }
+.popover > summary { display: inline-flex; align-items: center; justify-content: center; min-height: 34px; padding: 5px 10px; border: 1px solid var(--line-strong); border-radius: var(--radius-control); color: var(--ink); background: var(--clear); font-size: 14px; list-style: none; cursor: pointer; }
+.popover > summary::-webkit-details-marker { display: none; }
+.popover > summary:hover, .popover[open] > summary { background: var(--node); }
+.popover.menu > summary, .popover.view-about > summary { min-width: 34px; padding: 5px 8px; font-weight: 700; }
+.popover-body { position: absolute; top: calc(100% + 4px); right: 0; z-index: 30; display: flex; flex-direction: column; align-items: stretch; gap: 8px; width: max-content; min-width: 200px; max-width: min(420px, calc(100vw - 24px)); max-height: 70dvh; overflow: auto; overscroll-behavior: contain; padding: 12px; background: var(--card); border: 1px solid var(--line-strong); border-radius: var(--radius-control); font-size: 14px; color: var(--ink); text-align: left; }
+.popover-body h3 { margin: 0; font-size: 14px; }
+.popover-body p { margin: 0; color: var(--secondary); white-space: normal; }
+.popover-body label { display: flex; align-items: center; gap: 6px; }
+.menu-body > button { width: 100%; text-align: left; }
+/* Toolbar popovers are placed by shell.js under their button and clamped to the visible panel and
+   viewport, so a scrolling or narrow panel can neither clip them nor push them off screen. */
+.view-toolbar > .popover > .popover-body { position: fixed; right: auto; width: max-content; min-width: 0; max-width: min(360px, calc(100vw - 16px)); max-height: min(50dvh, 360px); }
+.view-about .popover-body { width: 360px; }
+.view-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+#app-menu .popover-body { width: min(580px, calc(100vw - 24px)); }
+#workspace-details { font-size: 14px; }
+#workspace-details > summary { min-height: 34px; padding: 6px 8px; border-radius: var(--radius-control); }
+.workspace-status { margin-top: 8px; }
 .mobile-toggle { display: none; }
 main { min-height: 0; flex: 1; display: flex; flex-direction: column; }
 main:has(#workspace[hidden]) { overflow: auto; }
@@ -225,16 +247,10 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 #notice { flex: none; padding: 5px 18px; margin: 0; color: var(--secondary); border-bottom: 1px solid var(--line); font-size: 14px; }
 .daemon-connected:has(#workspace:not([hidden])) #notice { display: none; }
 #workspace { display: flex; flex: 1; min-height: 0; flex-direction: column; }
-.workspace-toolbar { position: relative; flex: none; background: var(--surface); border-bottom: 1px solid var(--line); padding: 6px 14px; }
-.workspace-actions { gap: 8px; min-height: 44px; }
-.workspace-actions button { padding: 5px 10px; }
 #index { min-height: var(--control-min-height); padding: 10px 14px; font-weight: 600; background: var(--primary); border-color: var(--primary); color: var(--bg); }
 #index:hover { background: var(--sm-gold); border-color: var(--sm-gold); }
 #index:active { background: var(--sm-orange); border-color: var(--sm-orange); }
 #index:disabled { background: var(--primary); border-color: var(--primary); }
-#workspace-details { font-size: 14px; }
-#workspace-details > summary { min-height: 34px; padding: 6px 8px; border-radius: var(--radius-control); }
-.workspace-status { position: absolute; top: 100%; right: 14px; z-index: 20; width: min(580px, calc(100vw - 28px)); max-height: 60dvh; overflow: auto; overscroll-behavior: contain; margin-top: 4px; padding: 16px; background: var(--card); border: 1px solid var(--line-strong); border-radius: var(--radius-control); }
 .workspace-status h3:first-child { margin-top: 0; }
 .workspace-status p { margin: 8px 0; }
 .workspace-status pre { max-height: 30vh; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -245,22 +261,14 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 /* Three real panes. Only their contents scroll. */
 .workspace-frame { position: relative; display: grid; grid-template-columns: 244px minmax(0, 1fr) 284px; flex: 1; min-height: 0; }
 .file-browser { display: flex; flex-direction: column; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 14px 10px 8px; background: var(--surface); border-right: 1px solid var(--line); }
-.indexed-checkouts-section { flex: none; margin: 0 -10px 14px; padding: 0 10px 10px; border-bottom: 1px solid var(--line); }
-.indexed-checkouts-section > .detail { padding: 0 6px; font-size: 11px; }
-#indexed-checkouts { max-height: 180px; overflow: auto; overscroll-behavior: contain; }
-#indexed-checkouts li { padding: 2px 0; border: 0; }
-#indexed-checkouts button { display: block; width: 100%; margin: 0; padding: 7px 8px; border-color: transparent; border-radius: var(--radius-control); background: transparent; text-align: left; overflow-wrap: anywhere; font-size: 14px; }
-#indexed-checkouts button:hover { background: var(--node); }
-#indexed-checkouts button[aria-pressed=true] { background: var(--selected); color: var(--on-selected); }
-#indexed-checkouts button[aria-pressed=true] :is(span, strong, small, code, .detail) { color: inherit; }
-.file-filter-label { padding: 0 6px; margin-top: 4px; }
-.file-browser h2 { padding: 0 6px; }
-.browse-root { font: 12px/1.6 var(--mono); color: var(--secondary); padding: 0 6px; }
-.browse-scope, .browse-options { flex: none; font-size: 12px; padding: 0 6px; margin: 4px 0; }
-.browse-options > label { display: block; margin-top: 8px; }
-#file-filter { width: 100%; margin-top: 6px; }
-.file-hidden-toggle { display: block; padding: 4px 6px 0; color: var(--secondary); }
-#files-state { flex: none; font-size: 12px; color: var(--secondary); padding: 0 6px; }
+.rail-head { display: flex; flex: none; align-items: center; gap: 6px; margin-bottom: 6px; }
+#file-filter { flex: 1; min-width: 0; min-height: 34px; }
+.browse-root { flex: none; margin: 0 0 6px; font: 12px/1.6 var(--mono); color: var(--secondary); padding: 0 6px; overflow-wrap: anywhere; }
+#files-state { flex: none; margin: 0 0 4px; font-size: 12px; color: var(--secondary); padding: 0 6px; }
+#files-state:empty { display: none; }
+/* The rail's own tree scrolls; the rail lets its menu overlay the canvas instead of clipping it. */
+.file-browser { overflow: visible; }
+#rail-menu .popover-body { left: 0; right: auto; width: min(300px, calc(100vw - 24px)); }
 #file-tree { flex: 1 0 150px; min-height: 150px; overflow: auto; overscroll-behavior: contain; }
 .file-tree ul { list-style: none; margin: 0; padding-left: 12px; }
 .file-tree li { padding: 0; border: 0; }
@@ -278,8 +286,6 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .file-tree .unsupported-files summary { padding: 3px 6px; color: var(--secondary); font: 11px/1.5 var(--mono); }
 .file-tree .file-pick:has(> .metric-value) { display: flex; align-items: baseline; }
 .file-tree .file-pick > .metric-value { display: inline-flex; flex: none; align-items: center; gap: 4px; margin-left: auto; padding-left: 8px; }
-.explorer-legend { margin: 4px 0 8px; }
-.explorer-legend:empty { display: none; }
 #reveal-method, #retry-files, #more-files { padding: 4px 6px; }
 .canvas-area { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
 .view-tabs, .dock-tabs { display: flex; align-items: stretch; gap: 0; }
@@ -289,7 +295,7 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .view-tabs button[aria-selected=true], .dock-tabs button[aria-selected=true] { color: var(--on-selected); background: var(--selected); border-bottom-color: var(--selected); }
 .checkout-pick { display: block; width: 100%; margin: 0; text-align: left; overflow-wrap: anywhere; }
 .checkout-git, .checkout-freshness { display: block; margin-top: 3px; font: 11px/1.5 var(--mono); }
-.metric-controls { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 8px 14px; border-bottom: 1px solid var(--line); font-size: 12px; }
+.metric-controls { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 8px 0 0; border-top: 1px solid var(--line); font-size: 12px; }
 .metric-controls select { padding: 4px 6px; }
 .metric-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; color: var(--secondary); font: 11px/1.5 var(--mono); }
 #metrics-state { flex-basis: 100%; margin: 0; color: var(--secondary); font-size: 11px; }
@@ -309,8 +315,6 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .sequence-toolbar h2 { margin-right: auto; }
 .sequence-toolbar .bar { gap: 12px; }
 .sequence-toolbar button, .sequence-toolbar label { font-size: 14px; }
-.sequence-context { display: flex; flex: none; align-items: center; flex-wrap: wrap; gap: 5px; padding: 0 18px 8px; color: var(--muted); font-size: 11px; }
-.sequence-context .badge { color: var(--secondary); }
 #sequence-state { flex: none; padding: 0 18px; margin: 4px 0 10px; color: var(--secondary); font-size: 12px; }
 .sequence-scroll { flex: 1; min-height: 80px; min-width: 0; overflow: auto; overscroll-behavior: contain; padding: 14px 8px; }
 .sequence-scroll:empty { min-height: 100px; }
@@ -434,6 +438,7 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
   .file-browser { left: 0; border-right-color: var(--line-strong); }
   .call-inspector { right: 0; border-left-color: var(--line-strong); }
   body.explorer-open .file-browser, body.inspector-open .call-inspector { display: flex; }
+  #rail-menu .popover-body { left: auto; right: 0; }
   .file-tree button, .file-tree summary { min-height: 34px; }
   .dependency-layout { grid-template-columns: minmax(170px, 1fr) minmax(0, 2fr); }
 }
@@ -442,22 +447,15 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
   .brand { gap: 5px; }
   .brand-mark { width: 23px; height: 23px; }
   h1 { font-size: 19px; }
-  .metric-controls { padding: 7px 10px; }
-  #indexed-checkouts { max-height: 140px; }
   .checkout-picker { align-items: center; }
   .header-actions { flex: 0 1 auto; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
-  #logout { padding: 5px; }
   #notice { padding: 5px 10px; }
-  .workspace-toolbar { padding: 6px 10px; }
-  .workspace-actions { gap: 6px; }
-  #workspace-index-state { flex: 1 1 110px; }
-  #workspace-details { margin-left: auto; }
-  .workspace-status { right: 10px; width: min(580px, calc(100vw - 20px)); }
+  .header-status { flex: 1 1 100%; order: 4; }
+  .index-note { max-width: 100%; }
   .view-tabs { padding: 0 6px; overflow-x: auto; }
   .view-tabs button { flex: none; padding: 9px 12px; }
   .sequence-toolbar { padding: 12px 12px 8px; gap: 8px; }
   .sequence-toolbar .bar { gap: 9px; }
-  .sequence-context { padding: 0 12px 8px; }
   #sequence-state { padding: 0 12px; }
   .sequence-scroll { padding: 8px 0; }
   #dependency-library { padding: 14px 12px; }
@@ -467,7 +465,7 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
   #source-dock { min-height: 150px; }
   footer { padding: 5px 10px; font-size: 10px; }
 }
-@media (max-height: 560px) { #notice { display: none; } .sequence-toolbar { padding-top: 8px; } .sequence-context { padding-bottom: 3px; } #source-dock { min-height: 110px; } }
+@media (max-height: 560px) { #notice { display: none; } .sequence-toolbar { padding-top: 8px; } #source-dock { min-height: 110px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; } }
 
 /* Class diagrams use the full canvas; their node menus replace the call inspector. */

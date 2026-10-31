@@ -30,10 +30,23 @@ watcher delivery is complete. True is **Catching up**. Failures and missing head
 The watcher does not publish a pending-file count, so no count is guessed from dirty generations,
 SCIP drift, modified Git paths or private watcher batches.
 
-Both checkout entry buttons and the native header selector use the same explicit selection path.
-Connecting never picks a checkout. Checkout, session or full pin changes clear metrics, tree,
+The native header selector is the only checkout list; the rail does not repeat it (#447).
+On arrival after Connect, the shell selects the only selectable checkout, else the checkout last
+selected in this browser (a per-browser convenience, ignored when no longer selectable), and lands
+on Architecture. The agent's working directory is not observable here, so it is not used. Arrival
+uses the same selection path as the selector: it reads status and Git but never starts indexing.
+A URL still never chooses a checkout. Checkout, session or full pin changes clear metrics, tree,
 source callbacks and open views before rebinding; equal revision numbers in different generations
 are not equal pins. Existing busy/replacement and authentication semantics remain intact.
+
+## Header
+
+The header holds the picker, one status chip and a ⋯ menu with Refresh, Diagnostics and
+Disconnect. **Index workspace** appears only when the selected checkout has no usable index; then
+the view tabs and Files are greyed out and inert. A failed index job beside a ready revision is a
+secondary note on the chip ("Last re-index failed · code: reason", from the job's recorded code
+and reason), not the status; without a usable revision the failure is the status. Raw job details
+stay in Diagnostics.
 
 ## Displayed revision and observed head
 
@@ -71,8 +84,11 @@ files and ambiguous source-set/language matches have no metric evidence. Expandi
 metrics never reads source, starts indexing or calls a provider. Compacted directory chains inspect
 their terminal displayed directory. Files the server reports as an unsupported source type
 collapse into one quiet marker per folder that keeps their count and names; other unindexed
-reasons keep their own rows. Filtering still searches loaded entries only. Files instead
-uses the pinned indexed-file catalog: its cached source must remain reachable when a live file
+reasons keep their own rows. The rail holds only the tree and a one-line filter; its options
+(hidden entries, all methods, explorer heat) are in a ⋯ menu. The filter searches the whole
+pinned indexed catalog, including folders never opened, through `GET files?q=` (at most 256
+bytes, ASCII case-insensitive substring, 200-row pages), and lists only those matches. It does
+not search unindexed filesystem entries. Files instead uses the pinned indexed-file catalog: its cached source must remain reachable when a live file
 has been deleted. That catalog is not a claim about the current filesystem or Git changed set.
 
 The inspector shows every metric leaf at the named aggregate. Null stays `—`; explicit unavailable
@@ -84,8 +100,9 @@ Callable-range LOC/SLOC may overlap and are not production physical file lines. 
 `roleCounts` describe all measured production/test callables at the pin, not physical line coverage.
 
 Heat uses the shared [fixed per-callable bands](metrics.md#workbench-heat-395) by default,
-including in the explorer. Explorer rows show a swatch and number; whenever they do, an explorer
-legend names their metric, aggregate and population and states the bands, in every Diagrams view.
+including in the explorer. Explorer rows show a swatch and number; each row's tooltip names its
+metric, aggregate, population, scale and band, in every Diagrams view, and the full legend is in
+the rail menu beside the heat options (#447).
 Max and mean use the same bands; sum is neutral
 and labelled relative totals. **Relative**, off by default, explicitly uses quartiles of the
 currently displayed finite file/directory rows after loaded-entry filtering, expansion and

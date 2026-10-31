@@ -262,7 +262,7 @@
     if (!ui) return;
     ui.results.replaceChildren(); ui.diagram.replaceChildren(); renderWarnings();
     ui.diagram.setAttribute("aria-busy", "false");
-    ui.query.value = ""; ui.unmatched.checked = false;
+    ui.query.value = ""; if (ui.unmatched) ui.unmatched.checked = false;
     state("Choose a class, or search the indexed workspace.", "empty");
   }
   function init(options) {
@@ -290,7 +290,7 @@
       ui.query.addEventListener("keydown", event => {
         if (event.key === "Enter") { event.preventDefault(); lookup({q: ui.query.value.trim()}); }
       });
-      ui.unmatched.addEventListener("change", () => { if (seed) return loadDiagram(seed, expanded); });
+      ui.unmatched?.addEventListener("change", () => { if (seed) return loadDiagram(seed, expanded); });
       document.addEventListener("pointerdown", event => { if (menu && !menu.contains(event.target)) closeContextMenu(false); }, true);
       document.addEventListener("focusin", event => { if (menu && (!valid(menuContext) || !menu.contains(event.target))) closeContextMenu(false); });
       document.addEventListener("scroll", event => {

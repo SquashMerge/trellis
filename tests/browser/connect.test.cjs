@@ -18,7 +18,8 @@ async function disconnected(page) {
   assert.equal(await page.locator("#workspace").isVisible(), false);
 }
 async function connectedWithoutTokenInDom(page, server, token) {
-  await page.waitForFunction(host => document.querySelector("#notice")?.textContent.includes(`Connected to the daemon on ${host}.`), new URL(server.base).host);
+  // Arrival may already have opened the only checkout, which replaces the connect notice.
+  await page.waitForFunction(host => document.querySelector("#notice")?.textContent.includes(`Connected to the daemon on ${host}.`) || !document.querySelector("#workspace").hidden, new URL(server.base).host);
   assert.equal(await page.locator("#connect-form").isVisible(), false);
   assert.ok(await page.locator("#token").evaluate(input => input.value === ""), "connected password input is cleared");
   assert.ok(await page.evaluate(secret => !document.documentElement.outerHTML.includes(secret) && !document.body.textContent.includes(secret), token), "connected DOM does not contain the credential");
@@ -85,13 +86,18 @@ test("real Connect preserves explicit token opt-in, file loading, restore, typed
     // Enable Chromium chooser interception before navigation, not alongside the key press.
     page.on("filechooser", chooser => fileChoosers.push(chooser));
     page.on("pageerror", error => pageErrors.push(error.message));
+    // Requests are attributed to the document that sent them: reads the previous document
+    // started (for example arrival's pinned reads) are not the reloaded page's requests.
+    let documentGeneration = 0;
+    page.on("framenavigated", frame => { if (frame === page.mainFrame()) documentGeneration++; });
+    const currentDocument = () => apiRequests.filter(request => request.generation === documentGeneration);
     page.on("request", request => {
       const url = new URL(request.url());
       assert.ok(!request.url().includes(paths.token) && !request.url().includes(wrongToken), "credentials are never placed in a URL");
       assert.ok(!(request.postData() || "").includes(paths.token), "credential is not sent in a request body");
       if (url.pathname.startsWith("/api/")) apiRequests.push({
         path:url.pathname, method:request.method(),
-        validBearer:request.headers().authorization === `Bearer ${paths.token}`,
+        validBearer:request.headers().authorization === `Bearer ${paths.token}`, generation:documentGeneration,
       });
     });
     await page.goto(`${server.base}/`, {waitUntil:"networkidle"});
@@ -150,10 +156,13 @@ test("real Connect preserves explicit token opt-in, file loading, restore, typed
     await page.keyboard.press("Enter");
     await connectedWithoutTokenInDom(page, server, paths.token);
     assert.equal(await hasSavedToken(page, paths.token), true, "successful explicit opt-in saves the token");
-    assert.deepEqual(apiRequests.map(request => request.path).sort(), ["/api/checkouts", "/api/daemon/status"]);
-    assert.ok(apiRequests.every(request => request.method === "GET" && request.validBearer), "handshake uses only read-only authenticated requests");
-    assert.equal(await page.locator("#checkout-select").inputValue(), "", "a single checkout is not auto-selected");
-    assert.equal(await page.locator("#workspace").isVisible(), false);
+    assert.deepEqual(apiRequests.slice(0, 2).map(request => request.path).sort(), ["/api/checkouts", "/api/daemon/status"]);
+    // Arrival (#447): the only checkout opens on Architecture; selection reads but never indexes.
+    await page.locator("#workspace").waitFor({state:"visible"});
+    assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "the only checkout is selected on arrival");
+    assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "true");
+    assert.ok(apiRequests.slice(2).every(request => request.path.startsWith(`/api/checkouts/${server.rootKey}/`)), "arrival reads only the selected checkout");
+    assert.ok(apiRequests.every(request => request.method === "GET" && request.validBearer), "handshake and arrival use only read-only authenticated requests");
 
     // The same origin restores convenience, not an authenticated session.
     apiRequests.length = 0;
@@ -161,22 +170,21 @@ test("real Connect preserves explicit token opt-in, file loading, restore, typed
     await disconnected(page);
     assert.ok(await page.locator("#token").evaluate((input, secret) => input.value === secret, paths.token), "reload restores the remembered value");
     assert.equal(await page.locator("#remember-token").isChecked(), true);
-    assert.deepEqual(apiRequests, [], "remembered token does not auto-connect on reload");
+    assert.deepEqual(currentDocument(), [], "remembered token does not auto-connect on reload");
     await page.locator("#remember-token").uncheck();
     assert.equal(await hasNoSavedToken(page), true, "unchecking Remember forgets immediately");
-    assert.deepEqual(apiRequests, []);
+    assert.deepEqual(currentDocument(), []);
+    apiRequests.length = 0;
     await page.locator("#remember-token").check();
     await page.locator("#connect-form button[type=submit]").click();
     await connectedWithoutTokenInDom(page, server, paths.token);
     assert.equal(await hasSavedToken(page, paths.token), true);
-    assert.ok(apiRequests.every(request => ["/api/checkouts", "/api/daemon/status"].includes(request.path)), "reconnection does not choose a checkout");
-    await page.locator("#checkout-select").selectOption(server.rootKey);
     await page.locator("#workspace").waitFor({state:"visible"});
     await page.waitForFunction(() => document.querySelector("#status")?.textContent.includes("Revision"));
     assert.equal(await page.locator("#error").isVisible(), false);
-    assert.ok(apiRequests.some(request => request.path === `/api/checkouts/${server.rootKey}/status`), "explicit selection loads the selected checkout");
+    assert.ok(apiRequests.some(request => request.path === `/api/checkouts/${server.rootKey}/status`), "arrival loads the selected checkout");
     assert.ok(apiRequests.every(request => request.method === "GET" && request.validBearer), "Connect and checkout selection do not index or call providers");
-    await page.locator("#logout").click();
+    await H.reveal(page, "#logout"); await page.locator("#logout").click();
     await disconnected(page);
     assert.equal(await hasNoSavedToken(page), true);
     assert.equal(await page.locator("#remember-token").isChecked(), false);

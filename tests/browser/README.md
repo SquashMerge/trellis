@@ -139,6 +139,15 @@ setup and build, set `TRELLIS_SUITE_BINARY` to the absolute built binary and run
 `node --test --test-concurrency=1 tests/browser/files.test.cjs` with the same external
 `PLAYWRIGHT_BROWSERS_PATH`.
 
+## Shell acceptance (#447)
+
+`viewer-shell.test.cjs` covers arrival (the only checkout opens on Architecture without indexing),
+the one-row header with its ⋯ menu (Refresh, Diagnostics, Disconnect), the failed re-index note
+beside a ready revision, the Index workspace button and greyed tabs without a usable index, the
+rail's whole-catalog filter reaching an unopened folder, and one-row view toolbars with Options and
+"About this view" popovers. Controls inside closed popovers are opened with `H.reveal` before use.
+The suite harness waits for arrival instead of choosing the checkout.
+
 ## Architecture acceptance
 
 `architecture.test.cjs` uses an isolated real daemon, authenticated checkout selection and

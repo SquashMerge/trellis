@@ -2934,6 +2934,22 @@ struct FilesQuery {
     offset: usize,
     #[serde(default = "file_limit")]
     limit: usize,
+    /// Optional path filter over the whole pinned catalog.
+    #[serde(default)]
+    q: Option<String>,
+}
+/// Longest accepted catalog path filter, in bytes.
+const FILES_QUERY_MAX: usize = 256;
+impl FilesQuery {
+    fn validate(&self) -> Result<(), ApiError> {
+        let query_ok = self.q.as_deref().is_none_or(|q| {
+            !q.is_empty() && q.len() <= FILES_QUERY_MAX && !q.chars().any(char::is_control)
+        });
+        if !(1..=200).contains(&self.limit) || self.offset > i64::MAX as usize || !query_ok {
+            return Err(browse_invalid());
+        }
+        Ok(())
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3002,12 +3018,14 @@ async fn files(
     query: Result<Query<FilesQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Query(q) = query.map_err(|_| browse_invalid())?;
-    if !(1..=200).contains(&q.limit) || q.offset > i64::MAX as usize {
-        return Err(browse_invalid());
-    }
+    q.validate()?;
     let pin = q.pin.pin()?;
     Ok(Json(
-        db(s, move |s| s.files_at(pin, q.offset, q.limit)).await?,
+        db(s, move |s| match q.q.as_deref() {
+            Some(filter) => s.files_matching_at(pin, filter, q.offset, q.limit),
+            None => s.files_at(pin, q.offset, q.limit),
+        })
+        .await?,
     ))
 }
 #[cfg(feature = "test-support")]
@@ -5163,13 +5181,14 @@ async fn provisioned_core_answer(
         }
         BrowserCoreRoute::Files => {
             let Query(q) = Query::<FilesQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
-            if !(1..=200).contains(&q.limit) || q.offset > i64::MAX as usize {
-                return Err(browse_invalid());
-            }
+            q.validate()?;
             let pin = q.pin.pin()?;
             let (value, catching_up) =
-                selected_evidence(runtime, hook, move |r| r.files_at(pin, q.offset, q.limit))
-                    .await?;
+                selected_evidence(runtime, hook, move |r| match q.q.as_deref() {
+                    Some(filter) => r.files_matching_at(pin, filter, q.offset, q.limit),
+                    None => r.files_at(pin, q.offset, q.limit),
+                })
+                .await?;
             Ok((Json(value).into_response(), catching_up))
         }
         BrowserCoreRoute::FileSymbols => {

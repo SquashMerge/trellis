@@ -2829,7 +2829,21 @@ impl EvidenceResponse {
         offset: usize,
         limit: usize,
     ) -> Result<serde_json::Value> {
-        self.store.files_in(&self.db, expected, offset, limit, true)
+        self.store
+            .files_in(&self.db, expected, None, offset, limit, true)
+    }
+    /// One catalog page of indexed paths that contain `query`, ASCII
+    /// case-insensitively. The whole pinned catalog is searched, so a filter
+    /// finds files in folders the browser has not opened.
+    pub fn files_matching_at(
+        &self,
+        expected: Option<IndexPin>,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<serde_json::Value> {
+        self.store
+            .files_in(&self.db, expected, Some(query), offset, limit, true)
     }
     pub fn methods_at(
         &self,
@@ -21583,7 +21597,30 @@ impl Store {
             |response| {
                 response
                     .store
-                    .files_in(&response.db, expected, offset, limit, false)
+                    .files_in(&response.db, expected, None, offset, limit, false)
+            },
+            || Ok(()),
+            |_| {},
+        )
+    }
+    /// [`Self::files_at`] restricted to paths containing `query` (ASCII
+    /// case-insensitive) across the whole pinned catalog.
+    pub fn files_matching_at(
+        &self,
+        expected: Option<IndexPin>,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<serde_json::Value> {
+        ensure!(
+            (1..=200).contains(&limit) && offset <= i64::MAX as usize,
+            "invalid catalog pagination"
+        );
+        self.with_evidence_response(
+            |response| {
+                response
+                    .store
+                    .files_in(&response.db, expected, Some(query), offset, limit, false)
             },
             || Ok(()),
             |_| {},
@@ -21593,22 +21630,26 @@ impl Store {
         &self,
         tx: &Connection,
         expected: Option<IndexPin>,
+        query: Option<&str>,
         offset: usize,
         limit: usize,
         pre_startup: bool,
     ) -> Result<serde_json::Value> {
         let selected = self.read_revision_for(tx, expected, pre_startup)?;
         let revision = selected.pin;
+        // SQLite lower() folds ASCII only, which matches the browser filter.
         let mut stmt = tx.prepare(
             "SELECT m.path,d.language,g.gid FROM revision_documents m
                  LEFT JOIN document_versions d ON d.vid=m.vid
                    AND d.language=m.language AND d.path=m.path
                  LEFT JOIN graph_projections g ON g.gid=m.gid AND g.vid=m.vid
-                 WHERE m.revision_id=?3 ORDER BY m.path LIMIT ?1 OFFSET ?2",
+                 WHERE m.revision_id=?3
+                   AND (?4 IS NULL OR instr(lower(m.path),lower(?4))>0)
+                 ORDER BY m.path LIMIT ?1 OFFSET ?2",
         )?;
         let source_rows: Vec<(String, Option<String>, Option<i64>)> = stmt
             .query_map(
-                params![(limit + 1) as i64, offset as i64, selected.key],
+                params![(limit + 1) as i64, offset as i64, selected.key, query],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?
             .collect::<rusqlite::Result<_>>()?;

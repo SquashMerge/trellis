@@ -10,7 +10,8 @@ not authorization for Herdr controls, future tabs or gated actions.
 Files is a real section of the existing shell. Diagrams retains Sequence, Classes, Libraries
 and its source dock. Files reuses the same checkout/session/full-pin owner and the existing
 cached workspace-source cache and navigation. It does not create a second source cache or
-independent checkout selection. Connecting selects no checkout; entering Files selects no file.
+independent checkout selection. Entering Files selects no file; arrival after Connect may select the
+only or last used checkout ([Viewer shell](viewer-shell.md#checkout-observation)).
 Only explicit file/source/location actions read cached source. Section switches, folder expansion
 and filtering never start indexing or call providers.
 
@@ -23,7 +24,8 @@ source or partially update the inspector. Existing authentication and stale-pin 
 
 ## Cached file catalog and all-symbol outline
 
-Files uses the pinned indexed `files` catalog for its tree. The Diagrams Explorer remains a
+Files uses the pinned indexed `files` catalog for its tree. A non-empty filter asks the same
+catalog for matching paths (`q`, at most 256 bytes) instead of filtering loaded pages. The Diagrams Explorer remains a
 live filesystem metadata browser; it is not the Files catalog. This distinction keeps captured
 files reachable after live deletion and prevents a directory listing from silently changing the
 indexed basis. A cached path need not exist on disk now. Conversely, a live-only or Git-only path
