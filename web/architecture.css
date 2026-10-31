@@ -76,3 +76,4 @@
 #architecture-diagram .pele-edges path { pointer-events: none; }
 /* Summary chips are display only: a click falls through to their band header toggle. */
 #architecture-diagram [data-trellis-summary-chip] { pointer-events: none; }
+.architecture-key-line[data-tone="neutral"] { border-top-color: #B8BAC8; }

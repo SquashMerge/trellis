@@ -587,6 +587,10 @@ test("Architecture draws the full stack, module chips per band, lower-bound coun
   assert.deepEqual(stored, {open:[["low", true]], drilled:[], unassigned:false, hidden:false});
   await rerendered(page, () => page.locator("#view-architecture").click());
   assert.equal(await page.locator(low).getAttribute("aria-expanded"), "true", "display choices are remembered for this checkout");
+  // A click on a display-only summary chip falls through to its band header toggle.
+  const midChip = await page.locator('#architecture-diagram [data-trellis-summary-chip="mid"]').first().boundingBox();
+  await rerendered(page, () => page.mouse.click(midChip.x + midChip.width / 2, midChip.y + midChip.height / 2));
+  assert.equal(await page.locator('#architecture-diagram [data-trellis-layer-id="mid"]').getAttribute("aria-expanded"), "true");
 }));
 
 test("Architecture hides test and fixture layers until tests and fixtures are included", {timeout:240000}, async () => {

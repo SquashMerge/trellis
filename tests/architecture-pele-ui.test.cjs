@@ -78,6 +78,18 @@ test("display projection: module chips, a folded band as a short composite, stat
   const raw=pele.render(p.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
   for(const id of p.nodes.keys()) assert.equal((raw.match(new RegExp(`data-id="${id}"`,"g"))||[]).length,1);
 });
+test("#449: open bands charge the chip budget before collapsed summary rows, whatever their order",()=>{
+  const {adapter}=setup(), view=fixture(), budget={left:6}, calls=[];
+  const last=[...view.layers].filter(l=>!l.shared).sort((a,b)=>b.order-a.order||b.name.localeCompare(a.name))[0].name;
+  const display={layers:new Set(view.layers.map(l=>l.name)),edge:()=>true,unassigned:null,reset:()=>{budget.left=6;},
+    expanded:name=>name===last&&budget.left>0,
+    entries:(key,modules)=>{calls.push(["entries",key]);const kept=modules.slice(0,budget.left);budget.left-=kept.length;return kept.map(module=>({type:"module",module,name:module.identity.path}));},
+    summary:(key,modules)=>{calls.push(["summary",key]);const kept=modules.slice(0,budget.left);budget.left-=kept.length;return kept.map(module=>({type:"chip",band:null,label:"x",shown:"x"}));}};
+  const p=adapter.project(view,{display,columns:4,measureText:text=>Array.from(text).length*7});
+  assert.deepEqual(calls[0],["entries",last],"the opened band is charged first even though it is drawn last");
+  assert.equal([...p.nodes.values()].find(n=>n.kind==="L"&&n.record.name===last).expanded,true,"summary rows cannot fold a band the viewer opened");
+  assert.ok([...p.nodes.values()].filter(n=>n.kind==="M").length>0);
+});
 test("#449: collapsed bands draw summary chips, width sets chip columns, arrows carry lower bounds and coverage",()=>{
   const {adapter,pele}=setup(), view=fixture(); let resets=0;
   const summary=(key,modules,columns)=>modules.slice(0,columns).map((module,i)=>({type:"chip",band:i%4,label:`${module.identity.path} · chip`,shown:`m${i}\n${i}`}));

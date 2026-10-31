@@ -97,7 +97,7 @@ display = "hidden" # "expanded" | "collapsed" | "hidden"
 
 - `"expanded"` draws the band open on its module chips on first view.
 - `"collapsed"` draws a summary band (header, count chips and one row of module chips
-  coloured by metric, #449) until the viewer opens it. This is the same as no `display` field.
+  coloured by metric, or a short stack in a shared box, #449) until the viewer opens it. This is the same as no `display` field.
 - `"hidden"` leaves the band out of the diagram and lists it in a footer line
   (`N hidden layers · M files · E edges`) from which the viewer can show it.
 

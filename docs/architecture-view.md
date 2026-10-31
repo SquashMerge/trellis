@@ -42,14 +42,17 @@ Unassigned endpoints and unresolved sites remain explicit unknown evidence.
 The view always draws the full stack: every ordered layer, with the shared layers beside
 it (#449). Only authored `display = "hidden"` layers and unhinted test or fixture layers
 wait in the hidden footer. Deviations are highlighted and allowed arrows (conforming or
-excepted) are dimmed; no layer or arrow is dropped to focus on deviations. The drawing
-fits as many chip columns as the canvas width holds, and scrolls inside the canvas when
-the headers need more.
+excepted) are dimmed; no layer or arrow is dropped to focus on deviations. Each render
+fits as many chip columns as the canvas width holds at that moment, and scrolls inside the
+canvas when the headers need more; resizing the window or the inspector does not redraw on
+its own (the next render refits).
 
 An open band draws **one chip per module**, not per file. Bands start collapsed unless
 their authored `display` is `"expanded"` (#391 ruling; see [rules](rules.md#layer-display-hint)).
-A collapsed band draws one row of its module chips, coloured by metric and hottest first,
-with a last chip counting the modules the row leaves out; the band header opens it. A module is a browser display
+A collapsed band draws one row of its module chips (a shared box: up to six stacked),
+coloured by metric and hottest first, with a last chip counting the modules the row leaves
+out; the band header opens it. Open bands charge the size-cap budget first, so summary rows
+use only what remains and never fold a band the viewer opened. A module is a browser display
 grouping computed from the existing response, not an identity or a new API field: the
 first path component below the band's common directory, where a file and its same-named
 directory form one module (`src/store.rs` and `src/store/**` are `store`), and a
@@ -71,7 +74,7 @@ Counts are lower bounds whenever their source layer has unresolved sites (#449):
 reference that maps to no module draws no arrow. A bounded count reads `↑≥102`, and a bounded
 highlighted (deviating or unknown) arrow also shows the share of its source layer's sites
 that map to a module (`↑≥102 · 9% mapped`). The accessible name says the same in words.
-These figures come from the summary's measured `references.coverage`, never estimates.
+These figures come from the summary's measured `references.coverage`, never estimates. Unknown-verdict arrows are drawn in neutral grey.
 A compact arrow key sits under the canvas with the whole snapshot's coverage
 (`3,727 of 40,219 reference sites mapped to a module (9%) · 740 of 1,095 production rule
 instances unknown`); the longer prose lives under the coverage notices.

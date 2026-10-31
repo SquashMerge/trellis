@@ -55,7 +55,7 @@ function emulateDetails(full, url) {
 }
 function harness() {
   const elements = new Map(), calls = [], detailCalls = [], renders = [], reads = [], conflicts = [];
-  let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null;
+  let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null, detailError = null;
   // Created nodes with an id (the inspector's review chips, #449) resolve by that id; the newest wins.
   const created = [];
   const document = {getElementById:id => {
@@ -78,7 +78,7 @@ function harness() {
   }};
   vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console});
   const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
-    if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); return emulateDetails(full, url); }
+    if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; return emulateDetails(full, url); }
     calls.push({url,current,options}); const data = await response(url,options);
     if (!url.startsWith("/api/architecture?") || !data?.payload?.references) return data;
     // The daemon sends the summary; only the detail emulation sees the full arrays.
@@ -89,7 +89,7 @@ function harness() {
   },context:() => context,
     readSource:(site,revision,current) => reads.push({site,revision,current}),onConflict:() => conflicts.push(true)});
   const button = label => {const found = descendants(get("architecture-inspector-content")).find(item => item.tagName === "button" && item.textContent === label);assert.ok(found, `Missing ${label}`);return found;};
-  return {window,controller,calls,detailCalls,renders,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;}};
+  return {window,controller,calls,detailCalls,renders,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;},setDetailError:error => {detailError=error;}};
 }
 
 test("init is inert; one owned pin/digest supplies metric values and explicit sampled source actions", async () => {
@@ -669,6 +669,17 @@ test("the full stack stays drawn with deviations, and counted review chips open 
   assert.deepEqual(chips().map(item => item.textContent), ["23 deviations", "156 unassigned", "0 exceptions"], "every inspection keeps the counted chips");
   await h.get("architecture-unassigned").fire("click");
   assert.match(text(h.get("architecture-review-list")), /src\/no-edges.rs/);
+});
+
+test("without a refresh button, a rules conflict in a detail list offers an explicit Reload Architecture", async () => {
+  const h = harness(); await h.controller.refresh();
+  const error = new Error("rules changed"); error.code = "rules_conflict"; error.status = 409; h.setDetailError(error);
+  h.renders[0].options.onSelectModule(h.renders[0].view.modules[0]); await flush();
+  assert.match(text(h.get("architecture-inspector-content")), /Rules changed since this diagram was loaded\./);
+  assert.equal(h.calls.length, 1);
+  h.setDetailError(null); await h.button("Reload Architecture").fire("click");
+  assert.equal(h.calls.length, 2, "the button re-reads the summary at the same pin");
+  assert.match(h.calls[1].url, /^\/api\/architecture\?/);
 });
 
 test("a collapsed band draws one row of metric-coloured module chips, hottest first, within the size cap", async () => {

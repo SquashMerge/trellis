@@ -124,19 +124,28 @@
       const item = layers.get(layer.name), columns = layer.shared ? 1 : display ? bandColumns(layer) : 4;
       const members = moduleRows.get(layer.name).sort((a,b) => identity(a).localeCompare(identity(b)));
       if (display) {
-        item.expanded = !!display.expanded(layer.name);
         // A collapsed band shows one row of module chips coloured by metric (#449), not a file count.
         if (!item.expanded) {
           const chips = display.summary ? display.summary(layer.name,members,layer.shared ? SHARED_ROWS : columns) : [];
           if (!chips.length) { folded(item,layer,`${members.length} files folded`,span); return; }
           open(item,columns,span); emitEntries(chips,columns); source.push("end"); return;
         }
-        open(item,columns,span); emitEntries(display.entries(layer.name,members),columns); source.push("end"); return;
+        open(item,columns,span); emitEntries(opened.get(layer.name),columns); source.push("end"); return;
       }
       open(item,columns);
       if (!members.length) leaf(addNode("B",null,"No indexed modules"));
       for (const m of members) moduleNode(m);
       source.push("end");
+    }
+    // Open bands and an open unassigned row charge the chip budget first, in drawing order,
+    // so collapsed summary rows only use what remains and never fold a band the viewer opened.
+    const opened = new Map(), unassigned = moduleRows.get(null);
+    if (display) {
+      for (const layer of [...ordered, ...shared]) {
+        const item = layers.get(layer.name); item.expanded = !!display.expanded(layer.name);
+        if (item.expanded) opened.set(layer.name, display.entries(layer.name,moduleRows.get(layer.name).sort((a,b) => identity(a).localeCompare(identity(b)))));
+      }
+      if (display.unassigned && unassigned.length && display.unassigned.expanded) opened.set(null, display.entries(null,unassigned));
     }
     // Pele stretches a composite's children to equal grid columns, so the stack spans
     // several columns and each shared box one, keeping the shared boxes narrow.
@@ -156,10 +165,9 @@
       peers.forEach(layer => emitLayer(layer)); if (peers.length > 1) source.push("end");
     }
     source.push("end"); shared.forEach(layer => emitLayer(layer)); if (!display) source.push("end");
-    const unassigned = moduleRows.get(null);
     if (display?.unassigned && unassigned.length) {
-      const item = addNode("U",display.unassigned,display.unassigned.label); item.expanded = !!display.unassigned.expanded;
-      if (item.expanded) { open(item,COLUMNS + shared.length,stackSpan + shared.length); emitEntries(display.entries(null,unassigned),COLUMNS + shared.length); source.push("end"); }
+      const item = addNode("U",display.unassigned,display.unassigned.label); item.expanded = opened.has(null);
+      if (item.expanded) { open(item,COLUMNS + shared.length,stackSpan + shared.length); emitEntries(opened.get(null),COLUMNS + shared.length); source.push("end"); }
       else {
         const chips = display.summary ? display.summary(null,unassigned,COLUMNS + shared.length) : [];
         if (chips.length) { open(item,COLUMNS + shared.length,stackSpan + shared.length); emitEntries(chips,COLUMNS + shared.length); source.push("end"); }
@@ -289,7 +297,7 @@
         projection = project(view,{...options,columns,measureText:measure});
         raw = window.pele.render(projection.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
         const drawnWidth = Number(/^<svg\b[^>]*?\swidth="([0-9.]+)"/.exec(raw)?.[1]);
-        if (!options.display || !Number.isFinite(options.width) || !(drawnWidth > options.width)) break;
+        if (!options.display || !(options.width > 0) || !(drawnWidth > options.width)) break;
         if (!best || drawnWidth < best.drawnWidth) best = {drawnWidth,columns,projection,raw};
         if (columns <= 1) { ({projection,raw} = best); if (best.columns !== columns) projection = project(view,{...options,columns:best.columns,measureText:measure}); break; }
         columns--;
