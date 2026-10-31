@@ -2086,6 +2086,8 @@ fn validate_evidence_inner(
             .insert(digest);
     }
     let mut proof = BTreeMap::new();
+    // One proof-ID index for the whole loop, not a scan of every raw claim per proof (#494).
+    let raw_proofs = raw.as_ref().map(|raw| raw.inventory.proof_lookup());
     for p in &semantic.provenance {
         text(&p.id)?;
         key(&p.document, revision)?;
@@ -2100,10 +2102,9 @@ fn validate_evidence_inner(
             captured_revision: raw.captured_revision,
         });
         let lookup = |proof: &str, kind: &str, digest: &str| -> Result<RawClaimDocument> {
-            let claim = raw
+            let claim = raw_proofs
                 .as_ref()
                 .context("derived provenance requires authenticated raw inventory")?
-                .inventory
                 .lookup(proof, kind, digest)?;
             Ok(RawClaimDocument {
                 language: claim.language.clone(),
@@ -2395,14 +2396,43 @@ fn validate_evidence_inner(
         let proof = fact(&r.provenance_id, None, EvidenceKind::TypeRelationship)?;
         validate_type_relationship_row(r, proof, &env, &mut relationships)?;
     }
+    // Each document's observed roles, from one pass over the admitted rows (#494): the roles of
+    // its references, a definition for a bound declaration, a call for a bound call and a type
+    // for a type relationship, each attributed to the document of the row's own proof.
+    let mut observed: BTreeMap<(&str, &str, &str), BTreeSet<Role>> = BTreeMap::new();
+    let mut observe = |id: &str, roles: &[Role]| {
+        if let Some(p) = proof.get(id) {
+            observed
+                .entry((
+                    p.producer_id.as_str(),
+                    p.document.language.as_str(),
+                    p.document.path.as_str(),
+                ))
+                .or_default()
+                .extend(roles.iter().copied());
+        }
+    };
+    for r in &semantic.references {
+        observe(&r.provenance_id, &r.roles);
+    }
+    for b in &semantic.declaration_bindings {
+        if b.syntax_id.is_some() {
+            observe(&b.provenance_id, &[Role::Definition]);
+        }
+    }
+    for b in &semantic.call_bindings {
+        if b.call_id.is_some() {
+            observe(&b.provenance_id, &[Role::Call]);
+        }
+    }
+    for r in &semantic.type_relationships {
+        observe(&r.provenance_id, &[Role::Type]);
+    }
+    let none = BTreeSet::new();
     for ((producer, lang, path), row) in &coverage {
-        let observed = |id: &str| {
-            proof.get(id).is_some_and(|p| {
-                p.producer_id == *producer
-                    && p.document.language == *lang
-                    && p.document.path == *path
-            })
-        };
+        let roles = observed
+            .get(&(*producer, lang.as_str(), *path))
+            .unwrap_or(&none);
         for role in &[
             Role::Definition,
             Role::Read,
@@ -2412,28 +2442,8 @@ fn validate_evidence_inner(
             Role::Import,
             Role::Alias,
         ] {
-            let from_reference = semantic
-                .references
-                .iter()
-                .any(|r| observed(&r.provenance_id) && r.roles.contains(role));
-            let from_binding = *role == Role::Definition
-                && semantic
-                    .declaration_bindings
-                    .iter()
-                    .any(|b| observed(&b.provenance_id) && b.syntax_id.is_some());
-            let from_call = *role == Role::Call
-                && semantic
-                    .call_bindings
-                    .iter()
-                    .any(|b| observed(&b.provenance_id) && b.call_id.is_some());
-            let from_type = *role == Role::Type
-                && semantic
-                    .type_relationships
-                    .iter()
-                    .any(|r| observed(&r.provenance_id));
             ensure!(
-                row.observed_roles.contains(role)
-                    == (from_reference || from_binding || from_call || from_type),
+                row.observed_roles.contains(role) == roles.contains(role),
                 "coverage observed roles differ from admitted evidence"
             );
         }
