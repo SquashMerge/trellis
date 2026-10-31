@@ -766,7 +766,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        31
+        32
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -1141,7 +1141,7 @@ fn complete_current_schema_index_remains_gc_eligible() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        31
+        32
     );
     let now = 1_800_000_000_i64;
     db.execute(

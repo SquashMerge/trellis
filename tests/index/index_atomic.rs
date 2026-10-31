@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        31
+        32
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")

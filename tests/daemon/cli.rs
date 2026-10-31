@@ -2197,7 +2197,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     );
     assert_eq!(
         all_rows.len(),
-        36,
+        37,
         "retain every native evidence table and logical search corpus in schema-32 snapshot"
     );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
@@ -3102,7 +3102,7 @@ def sink():
         assert_eq!(
             same_bytes_evidence(&native_after),
             same_bytes_evidence(&post_start_native),
-            "{name}: all 35 native schema-32 evidence tables, logical head search corpus and documents must match after only publication identity normalization"
+            "{name}: all 36 native schema-32 evidence tables, logical head search corpus and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,

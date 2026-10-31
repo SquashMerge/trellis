@@ -407,7 +407,7 @@ fn hostile_macro_input_is_bounded_and_never_fails_the_document() {
     let artifact = measure(&file, true);
     assert!(artifact.capability_reports[0].macro_expansions.is_empty());
     assert_eq!(gaps(&artifact).len(), 1);
-    // Re-parsing nested macros is bounded by the per-document byte budget.
+    // Deep nesting of measurable macros stops at the depth bound, leaving one inner gap.
     let nested = format!(
         "fn f() {{ {}g(){}; }}\n",
         "assert!(".repeat(100),
@@ -415,7 +415,31 @@ fn hostile_macro_input_is_bounded_and_never_fails_the_document() {
     );
     let artifact = measure(&rust("src/nested.rs", &nested), true);
     assert_eq!(artifact.capability_reports[0].macro_expansions.len(), 1);
-    assert!(!gaps(&artifact).is_empty());
+    assert_eq!(gaps(&artifact).len(), 1);
+    // Re-parsing nested macros is bounded by the per-document byte budget: each level
+    // re-reads the large payload, so the innermost levels stay opaque.
+    let levels = 14;
+    let payload = (0..8000)
+        .map(|i| format!("g({i})"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let nested = format!(
+        "fn g(x: i32) -> i32 {{ x }}\nfn f() {{ {}{payload} > 0{}; }}\n",
+        "assert!(".repeat(levels),
+        ")".repeat(levels)
+    );
+    let artifact = measure(&rust("src/budget.rs", &nested), true);
+    assert_eq!(artifact.capability_reports[0].macro_expansions.len(), 1);
+    let opaque = gaps(&artifact);
+    assert_eq!(opaque.len(), 1, "{opaque:?}");
+    assert!(opaque[0].diagnostic.contains("within native bounds"));
+    // The budget (8 x document + 64 KiB) admits about nine nested re-reads of the payload.
+    let depth_of_gap = nested[..opaque[0].range.start].matches("assert!(").count();
+    assert!((2..levels).contains(&depth_of_gap), "{depth_of_gap}");
+    assert!(
+        artifact.calls.is_empty(),
+        "payload calls lie inside the opaque level"
+    );
     // Arbitrary token trees never panic and stay opaque when they are not expressions.
     for body in [
         "assert!(@ # $ ~);",

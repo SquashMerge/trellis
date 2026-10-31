@@ -2668,6 +2668,8 @@ fn extract_document(
         macro_expansions: Vec::new(),
         expansion_bytes: 0,
         macro_parser: None,
+        visit_ceiling: VISIT_LIMIT,
+        reserved_until: 0,
     };
     let mut macros = Vec::new();
     state.walk(
@@ -2797,6 +2799,10 @@ struct ParserState<'a> {
     macro_expansions: Vec<Range>,
     expansion_bytes: usize,
     macro_parser: Option<tree_sitter::Parser>,
+    /// Visit ceiling for the expansion being measured, and the visit count its reservation
+    /// runs to. A nested expansion must leave room for the rest of its enclosing one.
+    visit_ceiling: usize,
+    reserved_until: usize,
 }
 /// Per-document walk bounds. Exceeding them fails the document, so a macro expansion reserves
 /// its measured extent first and stays opaque rather than cross them.
@@ -3285,14 +3291,34 @@ impl ParserState<'_> {
             self.unmeasured_macro(site.node);
             return Ok(false);
         };
-        // The path, `!` and wrapper add a few visits beyond the argument subtree.
-        let reserve = VISIT_LIMIT.saturating_sub(self.visits).saturating_sub(16);
-        let fits = macros::height(arguments, reserve)
-            .is_some_and(|height| site.depth + 2 + height < DEPTH_LIMIT);
-        if !fits {
+        // Reserve the whole expansion before recording anything. A nested expansion's own
+        // parse can hold more nodes than the tokens its enclosing reservation counted, so it
+        // must also leave the rest of that reservation available. The path, `!` and wrapper
+        // add a few visits beyond the argument subtree.
+        let ceiling = self
+            .visit_ceiling
+            .saturating_sub(self.reserved_until.saturating_sub(self.visits));
+        let available = ceiling.saturating_sub(self.visits).saturating_sub(16);
+        let Some((nodes, height)) = macros::extent(arguments, available) else {
+            self.unmeasured_macro(site.node);
+            return Ok(false);
+        };
+        if site.depth + 2 + height >= DEPTH_LIMIT {
             self.unmeasured_macro(site.node);
             return Ok(false);
         }
+        let enclosing = (self.visit_ceiling, self.reserved_until);
+        self.visit_ceiling = ceiling;
+        self.reserved_until = self.visits + nodes + 16;
+        let measured = self.measure_arguments(&site, arguments);
+        (self.visit_ceiling, self.reserved_until) = enclosing;
+        measured?;
+        Ok(true)
+    }
+
+    fn measure_arguments(&mut self, site: &MacroSite<'_>, arguments: Node<'_>) -> Result<()> {
+        use crate::native_rust_macros as macros;
+        let file = self.file;
         let flags = (site.test, false);
         let (owner, ancestry, regions) = (&site.owner, &site.ancestry, &site.regions);
         if let Some(path) = site.node.child_by_field_name("macro") {
@@ -3367,7 +3393,7 @@ impl ParserState<'_> {
                 &mut Vec::new(),
             )?;
         }
-        Ok(true)
+        Ok(())
     }
 
     fn unmeasured_macro(&mut self, n: Node<'_>) {

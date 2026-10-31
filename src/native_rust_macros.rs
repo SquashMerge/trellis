@@ -130,9 +130,9 @@ pub(crate) fn arguments(
         .then_some(node)
 }
 
-/// The height of `n`'s subtree, or `None` once it holds more than `limit` nodes (named or
-/// not). Iterative, so hostile nesting cannot exhaust the stack.
-pub(crate) fn height(n: Node<'_>, limit: usize) -> Option<usize> {
+/// `(nodes, height)` of `n`'s subtree, or `None` once it holds more than `limit` nodes
+/// (named or not). Iterative, so hostile nesting cannot exhaust the stack.
+pub(crate) fn extent(n: Node<'_>, limit: usize) -> Option<(usize, usize)> {
     let mut cursor = n.walk();
     let (mut nodes, mut depth, mut height) = (1usize, 0usize, 0usize);
     loop {
@@ -141,13 +141,13 @@ pub(crate) fn height(n: Node<'_>, limit: usize) -> Option<usize> {
         } else {
             while !cursor.goto_next_sibling() {
                 if depth == 0 || !cursor.goto_parent() {
-                    return Some(height);
+                    return Some((nodes, height));
                 }
                 depth -= 1;
             }
         }
         if depth == 0 {
-            return Some(height);
+            return Some((nodes, height));
         }
         nodes += 1;
         height = height.max(depth);
@@ -160,6 +160,15 @@ pub(crate) fn height(n: Node<'_>, limit: usize) -> Option<usize> {
 /// Whether a format-string literal names an argument: an implicit `{name}` capture, a
 /// `{name}` named argument, or a `name$` width or precision. Such names stay opaque.
 pub(crate) fn names_arguments(literal: &str, raw: bool) -> bool {
+    // An escaped `{` (`\x7b`, `\u{7b}`) is a format brace after unescaping; stay opaque.
+    let lower = literal.to_ascii_lowercase();
+    if !raw
+        && ["\\x7b", "\\u{7b}", "\\u{007b}"]
+            .iter()
+            .any(|e| lower.contains(e))
+    {
+        return true;
+    }
     let bytes = literal.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -236,5 +245,7 @@ mod tests {
             assert!(!names_arguments(literal, false), "{literal}");
         }
         assert!(names_arguments(r#"r"\u{a}""#, true));
+        assert!(names_arguments(r#""\x7bx}""#, false));
+        assert!(names_arguments(r#""\u{7B}x}""#, false));
     }
 }
