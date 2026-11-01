@@ -16,6 +16,7 @@ pub mod dependencies;
 pub mod dependency_links;
 mod dependency_rust;
 pub mod dependency_rust_symbols;
+pub(crate) mod evidence_budget;
 #[cfg(test)]
 mod extractor_inputs_tests;
 pub mod file_tree;

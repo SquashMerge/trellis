@@ -22,6 +22,7 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/indexer_java.rs",
     "src/indexer_python.rs",
     "src/indexer_rust.rs",
+    "src/evidence_budget.rs",
     "src/model.rs",
     "src/native_evidence.rs",
     "src/native_ids.rs",

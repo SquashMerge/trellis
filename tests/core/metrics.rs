@@ -82,9 +82,9 @@ fn four_grammars_hand_checked_branches_and_fan_in() {
     }
 }
 #[test]
-fn malformed_source_fails_even_outside_callable() {
+fn malformed_source_is_partial_even_outside_a_callable() {
     let text = "def calc():\n    return 1\ninvalid = (\n";
-    let err = metrics::compute(
+    let rows = metrics::compute(
         "python",
         text,
         &[declaration("python", 24)],
@@ -92,8 +92,23 @@ fn malformed_source_fails_even_outside_callable() {
         &[],
         &mut || Ok(()),
     )
-    .unwrap_err();
-    assert!(err.to_string().contains("invalid_source_syntax"));
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+}
+#[test]
+fn a_callable_whose_body_the_parser_lost_is_unmeasured_not_corrupt() {
+    // The declaration covers bytes with no callable left in the recovered tree.
+    let text = "def calc(:\n    return 1\n";
+    let rows = metrics::compute(
+        "python",
+        text,
+        &[declaration("python", text.len())],
+        &[],
+        &[],
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
 }
 #[test]
 fn cancelled_parse_never_enters_memo() {

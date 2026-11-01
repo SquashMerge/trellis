@@ -268,9 +268,7 @@ fn depth_steps_participants_and_wide_inert_work_are_bounded() {
     let (_, wide) = fixture(
         &format!(
             "class Fixture {{ void run() {{ {} after(); }} }}",
-            (0..11_000)
-                .map(|i| format!("int x{i};"))
-                .collect::<String>()
+            (0..11_000).map(|i| format!("x = {i};")).collect::<String>()
         ),
         "run",
     );

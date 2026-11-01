@@ -2123,8 +2123,9 @@ fn real_source_above_injected_ancillary_cap_keeps_selected_source_available() {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap();
-    let (max_ancillary, total_ancillary) =
+    let (max_ancillary, native_ancillary, class_ancillary) =
         Store::selected_ancillary_byte_usage(&db, vid, cid, &version_id, &source_set_id).unwrap();
+    let total_ancillary = native_ancillary + class_ancillary;
     let source_json_bytes: i64 = db
         .query_row(
             "SELECT length(source_bytes) FROM document_versions WHERE path='flow.js'",
@@ -2193,6 +2194,103 @@ fn local_composition_preserves_prior_stats_metadata() {
     expected_stats.external = prepared.old_stats.external;
     expected_stats.ambiguous = prepared.old_stats.ambiguous;
     assert_eq!(graph.stats, expected_stats);
+}
+
+/// A full and a local publication agree on rows cut to fit their budgets (#564): the warning
+/// and flag outlive an edit elsewhere, and leave with the cause.
+#[test]
+fn a_local_publication_keeps_the_class_fit_of_the_revision() {
+    use crate::index_coordinator::IndexJobCoordinator;
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    fs::create_dir(work.path().join("src")).unwrap();
+    let write = |path: &str, text: String| fs::write(work.path().join(path), text).unwrap();
+    let methods = |count: usize| -> String {
+        (0..count)
+            .map(|i| format!("    pub fn method_{i}(&self) -> u32 {{ 1 }}\n"))
+            .collect()
+    };
+    write("src/lib.rs", "pub mod a; pub mod b;\n".into());
+    write("src/a.rs", "pub struct S;\n".into());
+    write(
+        "src/b.rs",
+        format!("use crate::a::S;\nimpl S {{\n{}}}\n", methods(400)),
+    );
+    write("other.js", "function other() { return 1; }\n".into());
+    let options = IndexOptions::new(work.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let publish = || {
+        IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+        let selected = store.read_revision_for(&db, None, true).unwrap();
+        class_metadata(&db, &selected).unwrap()
+    };
+    let fitted = |(warnings, truncated): &(Vec<String>, bool)| {
+        *truncated
+            && warnings
+                .iter()
+                .any(|warning| warning.contains("per-file evidence budget"))
+    };
+    assert!(fitted(&publish()));
+    write("other.js", "function other() { return 2; }\n".into());
+    assert!(fitted(&publish()));
+    write(
+        "src/b.rs",
+        format!("use crate::a::S;\nimpl S {{\n{}}}\n", methods(2)),
+    );
+    assert!(!fitted(&publish()));
+}
+
+/// The fit outlives a warning list too full to hold its marker: a local publication and a
+/// fresh full one over the same checkout agree on the catalog.
+#[test]
+fn a_fit_hidden_by_full_warnings_survives_a_local_publication() {
+    use crate::index_coordinator::IndexJobCoordinator;
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    fs::create_dir(work.path().join("src")).unwrap();
+    let methods: String = (0..400)
+        .map(|i| format!("    pub fn method_{i}(&self) -> u32 {{ 1 }}\n"))
+        .collect();
+    let files = [
+        ("src/lib.rs", "pub mod a; pub mod b;\n".to_owned()),
+        ("src/a.rs", "pub struct S;\n".to_owned()),
+        (
+            "src/b.rs",
+            format!("use crate::a::S;\nimpl S {{\n{methods}}}\n"),
+        ),
+    ];
+    for (path, text) in &files {
+        fs::write(work.path().join(path), text).unwrap();
+    }
+    for index in 0..100 {
+        fs::write(work.path().join(format!("broken{index}.py")), "def f(:\n").unwrap();
+    }
+    let options = IndexOptions::new(work.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let metadata = |store: &Store| {
+        IndexJobCoordinator::prepare(store, None)
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+        let selected = store.read_revision_for(&db, None, true).unwrap();
+        class_metadata(&db, &selected).unwrap()
+    };
+    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    assert!(metadata(&store).1);
+    for index in 0..100 {
+        fs::remove_file(work.path().join(format!("broken{index}.py"))).unwrap();
+    }
+    let local = metadata(&store);
+    let fresh_state = tempfile::tempdir().unwrap();
+    let fresh = Store::open_for_tests(fresh_state.path(), work.path()).unwrap();
+    assert_eq!(local, metadata(&fresh));
+    assert!(local.1 && local.0.iter().any(|w| w.contains("evidence budget")));
 }
 
 #[test]
