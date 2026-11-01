@@ -129,6 +129,7 @@ mod tests {
                 calls: Vec::new(),
             }],
             manifests: vec![manifest, present],
+            evidence_gaps: Default::default(),
         };
         assert_eq!(snapshot_bytes(&snapshot, &mut || Ok(())).unwrap(), 4);
         assert_eq!(

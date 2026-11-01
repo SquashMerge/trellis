@@ -56,6 +56,7 @@ pub(crate) struct MetricsDocument {
     pub(super) rows: Vec<DeclarationMetrics>,
     pub(super) gap: Option<crate::syntax_bounds::SyntaxGap>,
     pub(super) physical_lines: usize,
+    pub(super) physical_bytes: usize,
     pub(super) file_role: DeclarationRole,
 }
 pub(crate) type ArchitectureMetrics = BTreeMap<DocumentKey, MetricsDocument>;
@@ -326,6 +327,7 @@ fn measure_documents(
         let MetricsComputedDocument {
             computed,
             physical_lines,
+            physical_bytes,
             file_role,
         } = match outcome {
             Some(Ok(computed)) => computed,
@@ -348,6 +350,7 @@ fn measure_documents(
                 rows,
                 gap,
                 physical_lines,
+                physical_bytes,
                 file_role,
             },
         );

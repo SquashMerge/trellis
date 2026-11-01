@@ -43,7 +43,7 @@ if (mode === "prepare") {
   const descriptor = await json(descriptorPath);
   const producer = descriptor.producer;
   assert.equal(producer.id, "trellis.native.syntax");
-  assert.equal(producer.version, "native-v12");
+  assert.equal(producer.version, "native-v13");
   assert.equal(producer.positionEncoding, "utf8");
   assert.equal(descriptor.hashKind, "nativeExtractor");
   const fixture = await json(join(root, "fixture.json"));

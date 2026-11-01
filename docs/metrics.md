@@ -123,7 +123,7 @@ Let `n1,n2` be distinct operator/operand spellings and `N1,N2` their occurrence 
 | JavaScript | `if_statement`, `for_statement`, `for_in_statement`, `while_statement`, `do_statement`, `switch_statement`, `switch_case`/`switch_default`, `catch_clause`, `ternary_expression` | `arrow_function`, `function_expression` | `&&`, `||` |
 | Rust | `if_expression`, `for_expression`, `while_expression`, `loop_expression`, `match_expression`, `match_arm`, `closure_expression`, `try_expression` (`?` adds zero) | `closure_expression` | `&&`, `||` |
 
-Reject the entire request with typed `invalid_source_syntax` if *any* selected pinned source parses with a tree-sitter `ERROR` or `MISSING`, even outside a callable. A valid file with zero callables succeeds. Cancellation and deadlines are separate `cancelled`/`deadline_exceeded`, not syntax errors.
+A selected pinned source that parses with a tree-sitter `ERROR` or `MISSING`, even outside a callable, is reported and never refuses the request (owner ruling 2026-10-31, #563): the file is a `partialFiles` row with reason `syntax_error`, and every other file is served. Its callables are scored from the recovered tree, and a callable whose body the parser lost has an unmeasured body, so its scores are lower bounds. A valid file with zero callables succeeds. Cancellation and deadlines are separate `cancelled`/`deadline_exceeded`, not syntax errors.
 
 ## Aggregation and unavailability
 
@@ -134,10 +134,12 @@ Select from canonical order `loc,sloc,commentLines,cyclomatic,cognitive,maxNesti
 
 `GET /api/checkouts/{rootKey}/metrics` returns `{catchingUp,payload}`. The payload carries
 `metricsVersion,indexGeneration,indexRevision,scope,aggregate,role,selectedMetrics,declarations,files,directories`,
-plus `partialFiles` when a selected file exceeds the syntax walk bounds. Its rows are the
+plus `partialFiles` when a selected file has a syntax error, exceeds the syntax walk bounds or
+was published without evidence. Its rows are the
 [`PartialFile`](rules.md#work-bounds-and-located-failures) rows of references: scores stay
 exact within their own bound of 512 levels and 2,000,000 visits per callable, and skip what
-lies past it, and one pathological file never refuses the request (#554).
+lies past it, a file without evidence has no scores, and one bad file never refuses the
+request (#554, #563, #564).
 The optional paired pin is supplied as `indexGeneration` and `indexRevision`. File selectors require
 `sourceSetId,language,path`; directory selectors require `sourceSetId,path` (empty path means the
 source-set root); declaration selectors require `sourceSetId,path,sid` and no language. Source-set IDs

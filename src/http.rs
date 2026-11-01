@@ -1979,11 +1979,6 @@ impl From<anyhow::Error> for ApiError {
                     ),
                     ("not_found", StatusCode::NOT_FOUND, "not_found"),
                     (
-                        "invalid_source_syntax",
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        "invalid_source_syntax",
-                    ),
-                    (
                         "deadline_exceeded",
                         StatusCode::REQUEST_TIMEOUT,
                         "deadline_exceeded",

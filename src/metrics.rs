@@ -496,7 +496,6 @@ fn compute_source(
     }
     check()?;
     let tree = tree.context("bounded_work: parser stopped")?;
-    ensure!(!tree.root_node().has_error(), "invalid_source_syntax");
     let gap = crate::syntax_bounds::scan(tree.root_node(), check)?;
     let newline_offsets: Vec<usize> = source
         .bytes()
@@ -534,6 +533,7 @@ fn compute_source(
             d,
             &nested,
             &newline_offsets,
+            gap.is_some(),
             check,
         )?);
     }
@@ -548,8 +548,13 @@ fn callable_body(
     root: Node<'_>,
     source: &str,
     d: &Declaration,
+    partial: bool,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Range> {
+    let unmeasured = Range {
+        start: d.range.end,
+        end: d.range.end,
+    };
     let mut stack = vec![root];
     let mut selected = None;
     let mut visits = 0;
@@ -558,10 +563,7 @@ fn callable_body(
         visits += 1;
         if visits > MAX_VISITS {
             // The scan already reported this file; the body goes unmeasured.
-            return Ok(Range {
-                start: d.range.end,
-                end: d.range.end,
-            });
+            return Ok(unmeasured);
         }
         if node.end_byte() <= d.range.start || node.start_byte() >= d.range.end {
             continue;
@@ -573,10 +575,7 @@ fn callable_body(
                 .child_by_field_name("name")
                 .is_some_and(|name| d.name.as_deref() == Some(&source[name.byte_range()]))
         {
-            return Ok(Range {
-                start: d.range.end,
-                end: d.range.end,
-            });
+            return Ok(unmeasured);
         }
         if let Some(body) = node.child_by_field_name("body")
             && node.start_byte() >= d.range.start
@@ -602,6 +601,10 @@ fn callable_body(
         let mut cursor = node.walk();
         stack.extend(node.children(&mut cursor));
     }
+    // Recovered syntax can lose the body of a declaration measured around it.
+    if partial && selected.is_none() {
+        return Ok(unmeasured);
+    }
     selected.with_context(|| {
         SelectedIntegrity(format!(
             "corrupt: callable body not found: {} {} {:?} {:?}",
@@ -610,6 +613,7 @@ fn callable_body(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // One callable's measured context stays explicit.
 fn score(
     language: &str,
     source: &str,
@@ -617,9 +621,10 @@ fn score(
     d: &Declaration,
     nested: &[&Range],
     newline_offsets: &[usize],
+    partial: bool,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Score> {
-    let body = callable_body(root, source, d, check)?;
+    let body = callable_body(root, source, d, partial, check)?;
     let mut s = empty();
     let mut code_lines = std::collections::BTreeSet::new();
     let mut comments = std::collections::BTreeSet::new();

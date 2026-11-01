@@ -35,6 +35,8 @@ pub struct Snapshot {
     pub pin: IndexPin,
     pub documents: Vec<DocumentInput>,
     pub manifests: Vec<external::ManifestInput>,
+    /// Documents published with no evidence but their file module (#564).
+    pub evidence_gaps: BTreeSet<DocumentKey>,
 }
 
 /// Fresh bindings of one document under its language's selected producer (#483, #523).
@@ -386,12 +388,25 @@ fn resolve(
     let partial_files: Vec<_> = docs
         .iter()
         .zip(&gaps)
-        .filter_map(|(doc, gap)| gap.as_ref().map(|gap| gap.file(&doc.key)))
+        .filter_map(|(doc, gap)| {
+            snapshot
+                .evidence_gaps
+                .contains(&doc.key)
+                .then(|| syntax_bounds::SyntaxGap::evidence_budget(doc.file.text.len()))
+                .as_ref()
+                .or(gap.as_ref())
+                .map(|gap| gap.file(&doc.key))
+        })
         .collect();
     let selected: Vec<_> = docs
         .iter()
         .enumerate()
-        .filter_map(|(i, doc)| (paths.is_empty() || globs.is_match(&doc.key.path)).then_some(i))
+        .filter_map(|(i, doc)| {
+            // A document with no evidence has no sites either: only `partialFiles` names it.
+            ((paths.is_empty() || globs.is_match(&doc.key.path))
+                && !snapshot.evidence_gaps.contains(&doc.key))
+            .then_some(i)
+        })
         .collect();
     let limit = work::reference_limit(docs.len(), total_bytes);
     let catalogs = map_batch(&[0u8, 1, 2, 3], workers, request, |language| {
@@ -1102,12 +1117,10 @@ fn parse(doc: &DocumentInput, check: &mut impl FnMut() -> Result<()>) -> Result<
     if let Some(error) = aborted {
         return Err(error);
     }
-    let tree = tree.context("bounded_work: reference parser stopped")?;
-    ensure!(!tree.root_node().has_error(), "invalid_source_syntax");
-    Ok(tree)
+    tree.context("bounded_work: reference parser stopped")
 }
-/// Depth-first over named syntax. What lies past the bounds is skipped: the projection's
-/// scan of this tree reported it.
+/// Depth-first over named syntax. What lies past the bounds and inside a parser error is
+/// skipped: the projection's scan of this tree reported it.
 pub(crate) fn walk<'a, C: FnMut() -> Result<()>>(
     root: Node<'a>,
     check: &mut C,
@@ -1121,7 +1134,7 @@ pub(crate) fn walk<'a, C: FnMut() -> Result<()>>(
         if visits > VISITS {
             break;
         }
-        if depth > DEPTH {
+        if depth > DEPTH || node.is_error() {
             continue;
         }
         if !visit(node, check)? {
@@ -1461,6 +1474,7 @@ mod parallel_tests {
             },
             documents,
             manifests: Vec::new(),
+            evidence_gaps: Default::default(),
         }
     }
 
@@ -1628,7 +1642,7 @@ mod parallel_tests {
     #[test]
     fn a_claimed_earlier_item_runs_after_a_later_typed_failure() {
         for message in [
-            "invalid_source_syntax",
+            "bounded_work: reference site count",
             "bounded_work: reference owner lookup",
         ] {
             let mut check = || Ok(());
