@@ -125,8 +125,15 @@ for (const mode of ["sole", "constructor", "zero", "multiple", "unresolved", "am
       assert.equal(dto.seed.id, fixture.caller);
       const calls = sequenceSteps(dto.steps).filter(step => fixture.calls.includes(step.callId));
       assert.deepEqual(calls.map(step => step.callId), fixture.calls, "every occurrence survives graph grouping");
-      await page.locator("#sequence-diagram svg.pele").waitFor();
-      assert.match(await page.locator("#sequence-state").textContent(), /Pele rendered/);
+      // Every step of the external fixture is hidden: no lone box, the panel says so (#558).
+      if (mode === "external") {
+        const empty = page.locator("#sequence-diagram .sequence-empty");
+        await empty.waitFor();
+        assert.equal(await empty.textContent(), "Only external calls (2 hidden). Show them");
+      } else {
+        await page.locator("#sequence-diagram svg.pele").waitFor();
+        assert.match(await page.locator("#sequence-state").textContent(), /Pele rendered/);
+      }
       if (mode === "sole") {
         const participant = dto.participants.find(row => row.id === calls[0].target);
         assert.equal(participant.declaration.id, fixture.callee);
@@ -269,7 +276,7 @@ test("an external call names its SCIP package and offers no library action witho
       assert.equal(call.target, undefined);
     }
     assert.ok(dto.participants.every(row => !row.declaration || row.id === fixture.caller), "no external declaration lane");
-    await page.locator("#sequence-diagram svg.pele").waitFor();
+    await page.locator("#sequence-diagram .sequence-empty").waitFor();
     // External calls are incidental (#522): show them first.
     await page.locator("#sequence-incidental").click();
     await page.waitForFunction(() => document.querySelector("#sequence-incidental")?.getAttribute("aria-pressed") === "true" && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
@@ -312,9 +319,17 @@ test("sequence draws resolved participants, expands direct callees and hides std
     assert.equal(inner.target, fixture.inner);
     await page.waitForFunction(() => /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
     assert.match(await page.locator("#sequence-state").textContent(), / · Semantic bindings · semantic\.synthetic · 2 incidental steps hidden/);
-    // Three lanes; the callee's call to `inner` leaves the callee's lane, not the seed's.
-    assert.deepEqual(await page.locator("#sequence-diagram .pele-actor[data-trellis-target-id]").evaluateAll(rows => [...new Set(rows.map(row => row.dataset.trellisTargetId))]), [fixture.callee, fixture.inner]);
-    const source = await page.evaluate(view => window.TrellisPeleSequence.project(view).source, dto);
+    // The callee and `inner` are one file's functions, so one column (#558): a self arrow, and
+    // a column of two methods offers no one target. Were they three types, the callee's
+    // call to `inner` would leave the callee's lane, not the seed's.
+    assert.deepEqual(dto.participants.map(row => row.column.label), ["flow", "target", "target"]);
+    assert.equal(await page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").count(), 2);
+    assert.equal(await page.locator("#sequence-diagram .pele-actor[data-trellis-target-id]").count(), 0);
+    const columns = await page.evaluate(view => window.TrellisPeleSequence.project(view).source, dto);
+    assert.match(columns, /^S->>P1: /m);
+    assert.match(columns, /^P1->>P1: /m);
+    const lanes = {...dto, participants:dto.participants.map(({column, ...row}) => row)};
+    const source = await page.evaluate(view => window.TrellisPeleSequence.project(view).source, lanes);
     assert.match(source, /^S->>P1: /m);
     assert.match(source, /^P1->>P2: /m);
     assert.equal(await page.locator(`#sequence-diagram .pele-message[data-trellis-call-id="${fixture.calleeCalls[0]}"]`).getAttribute("data-trellis-target-id"), fixture.inner);
@@ -340,7 +355,7 @@ test("sequence draws resolved participants, expands direct callees and hides std
       const d = box.querySelector(`path.sequence-arrow[data-trellis-call-id="${id}"]`)?.getAttribute("d");
       box.remove();
       return {lanes, d};
-    }, [dto, fixture.calleeCalls[0]]);
+    }, [lanes, fixture.calleeCalls[0]]);
     assert.equal(arrow.lanes.length, 3);
     assert.ok(arrow.d.startsWith(`M ${arrow.lanes[1]} `), JSON.stringify(arrow));
     assert.ok(arrow.d.endsWith(` H ${arrow.lanes[2]}`), JSON.stringify(arrow));

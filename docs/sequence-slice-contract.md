@@ -233,9 +233,8 @@ and #542's "any other guard is unchanged".
     class defers outward.
   - A Rust type's `impl` blocks join across files when the snapshot declares at most one
     type of that name. With several, nothing says which an `impl` implements, so its blocks
-    stay apart by file, inline module and the path as written: two declared types are never
-    conflated. Types
-    are not resolved here, so an imported foreign type with a local type's bare name
+    stay apart by file, inline module and the path as written: two module-level types are
+    never conflated. Types are not resolved here, so an imported foreign type with a local type's bare name
     (`use other::Error; impl Tr for Error`) reads as the local one.
   - Two columns that read the same are told apart in `column.label`: by path, and by line
     within one file.
