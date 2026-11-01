@@ -11100,6 +11100,8 @@ async fn a_read_during_an_architecture_build_is_answered_or_retryable() {
     registry.attach_launch(556, &identity).unwrap();
     let runtime = registry.activate(&identity.root_key).unwrap();
     let scheduler = runtime.browser_scheduler().unwrap();
+    // Startup's own build finishes first, so the hook below sees the build this test starts.
+    runtime.await_architecture_for_tests();
     let (entered, reached) = std::sync::mpsc::channel();
     let (release, held) = std::sync::mpsc::channel::<()>();
     let held = std::sync::Mutex::new(held);
@@ -11113,6 +11115,12 @@ async fn a_read_during_an_architecture_build_is_answered_or_retryable() {
                 .recv_timeout(trellis::testing::HANG_BACKSTOP);
         }
     }));
+    // A rules edit needs a new core at this revision.
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.other]\norder = 1\npaths = [\"*.js\"]\n",
+    )
+    .unwrap();
     scheduler.architecture_hint();
     reached
         .recv_timeout(trellis::testing::HANG_BACKSTOP)
