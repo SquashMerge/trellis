@@ -14609,7 +14609,8 @@ impl Store {
         })()
         .map_err(|error| self.report_index_failure(error))?;
         let mut status = status;
-        skipped_config_diagnostics(db, &mut status)?;
+        skipped_config_diagnostics(db, &mut status)
+            .map_err(|error| self.report_index_failure(error))?;
         Ok(status)
     }
 
