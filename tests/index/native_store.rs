@@ -922,6 +922,64 @@ fn selected_class_payload_oversize_refuses_before_json_decode() {
     assert_current_corruption(closed);
 }
 
+/// #564: a repository file is never what sends an index back to reconciliation. It publishes
+/// as a coverage gap, every read of it succeeds, and it recovers when the file changes.
+#[test]
+#[cfg(feature = "test-support")]
+fn a_file_past_the_evidence_budget_publishes_as_a_gap_and_needs_no_reconciliation() {
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let huge = root.path().join("huge.py");
+    let metrics = |store: &Store| {
+        store
+            .evidence_response()
+            .unwrap()
+            .metrics_at(&Default::default(), &mut || Ok(()))
+            .unwrap()
+    };
+
+    fs::write(&huge, format!("import {}a\n", "a.".repeat(20_000))).unwrap();
+    publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    assert!(!store.recovery_pending_for_tests());
+    let partial = metrics(&store).partial_files;
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial[0].path, "huge.py");
+    assert_eq!(partial[0].reason, "evidence_budget");
+    assert!(!store.recovery_pending_for_tests());
+
+    // The same file, cut below the budget: a whole document again, not a stale gap.
+    fs::write(&huge, "import a.b\n").unwrap();
+    publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    assert!(metrics(&store).partial_files.is_empty());
+
+    // And past it again.
+    fs::write(&huge, format!("import {}a\n", "a.".repeat(20_000))).unwrap();
+    publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    assert_eq!(metrics(&store).partial_files.len(), 1);
+    assert!(!store.recovery_pending_for_tests());
+}
+
 #[test]
 #[cfg(feature = "test-support")]
 fn every_encoded_selected_id_rejects_wrong_length_blob() {

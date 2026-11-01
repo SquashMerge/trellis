@@ -571,7 +571,92 @@ pub(crate) fn complete_file_catalog(extraction: &FileExtraction) -> Catalog {
     result
 }
 
+/// Marks a revision whose class rows were cut to fit, so later publications recompose them.
+pub(crate) const BUDGET_WARNING: &str = "class rows exceed the per-file evidence budget";
+
+/// What a class row is charged beside its text columns and payload: the projection's two
+/// hashes with their keys, and the stored ID.
+const CLASS_ROW_BYTES: usize = 84 + 73 + 39;
+/// What a relation row is charged beside its ID and payload.
+const RELATION_ROW_BYTES: usize = 84 + 2 * 39;
+
 impl Catalog {
+    /// Fit each document's class rows to what a selected read admits (#564). A Rust class
+    /// takes members from other files, so a small file can own a large row: its last members
+    /// go, and it is marked truncated. Past the document's budget, its last rows go too, with a
+    /// warning. A class is never published where a read would refuse its document.
+    pub(crate) fn fit_stored_budgets(&mut self, source_bytes: impl Fn(&str) -> i64) -> Result<()> {
+        use crate::evidence_budget as budget;
+        fn encoded<T: serde::Serialize>(value: &T) -> Result<usize> {
+            Ok(serde_json::to_vec(value)?.len())
+        }
+        let mut left = BTreeMap::<String, (i64, i64)>::new();
+        let mut fits = |path: &str, row: usize| {
+            let bytes = source_bytes(path);
+            let (total, rows) = left
+                .entry(path.to_owned())
+                .or_insert_with(|| (budget::total(bytes), budget::row_limit(bytes)));
+            let row = row as i64;
+            let fits = row <= budget::max_row(bytes) && row <= *total && *rows > 0;
+            if fits {
+                *total -= row;
+                *rows -= 1;
+            }
+            fits
+        };
+        let mut omitted = BTreeSet::new();
+        let mut dropped = BTreeSet::new();
+        let mut kept = Vec::with_capacity(self.classes.len());
+        for mut class in std::mem::take(&mut self.classes) {
+            let path = class.symbol.path.clone();
+            let limit = budget::max_row(source_bytes(&path)) as usize;
+            let fixed =
+                CLASS_ROW_BYTES + class.symbol.name.len() + class.qualified_name.len() + path.len();
+            let mut row = fixed + encoded(&class)?;
+            while row > limit {
+                let member = match class.methods.pop().or_else(|| class.fields.pop()) {
+                    Some(member) => member,
+                    None => break,
+                };
+                row -= (encoded(&member)? + 1).min(row);
+                class.truncated = true;
+                omitted.insert(path.clone());
+            }
+            if fits(&path, row) {
+                kept.push(class);
+            } else {
+                dropped.insert(class.symbol.id);
+                omitted.insert(path);
+            }
+        }
+        self.classes = kept;
+        let owners: BTreeMap<&str, &str> = self
+            .classes
+            .iter()
+            .map(|class| (class.symbol.id.as_str(), class.symbol.path.as_str()))
+            .collect();
+        let mut relations = Vec::with_capacity(self.relations.len());
+        for relation in std::mem::take(&mut self.relations) {
+            let path = owners.get(relation.owner.as_str()).copied();
+            let path = path.unwrap_or(relation.path.as_str()).to_owned();
+            let row = RELATION_ROW_BYTES + relation.id.len() + encoded(&relation)?;
+            if !dropped.contains(&relation.owner) && fits(&path, row) {
+                relations.push(relation);
+            } else {
+                omitted.insert(path);
+            }
+        }
+        self.relations = relations;
+        for path in &omitted {
+            self.truncated = true;
+            self.add_warning(
+                &format!("{path}: {BUDGET_WARNING}; some omitted"),
+                Limits::default().text,
+            );
+        }
+        Ok(())
+    }
+
     pub fn build(files: &[SourceFile], nodes: &[Symbol], cancel: &CancelFlag) -> Result<Self> {
         Self::build_with_limits(files, nodes, cancel, Limits::default())
     }
@@ -652,6 +737,26 @@ impl FileExtraction {
             truncated: self.truncated,
             registry_incomplete: self.registry_incomplete,
         }
+    }
+
+    /// A read refuses a document whose stored extraction is past its ceiling, so such a file
+    /// keeps no classes (#564). A record holds at most a few capped texts, so only a file with
+    /// thousands of them can reach the ceiling, and the rest skip this encoding.
+    fn within_stored_budget(mut self) -> Result<Self> {
+        const SMALL: usize = 4096;
+        if self.classes.len() + self.items.len() + self.impls.len() < SMALL
+            || serde_json::to_vec(&self)?.len() <= crate::evidence_budget::CLASS_EXTRACTION
+        {
+            return Ok(self);
+        }
+        self.classes.clear();
+        self.items.clear();
+        self.impls.clear();
+        self.truncated = true;
+        self.registry_incomplete = true;
+        self.warnings
+            .push(format!("{}: {BUDGET_WARNING}; all omitted", self.path));
+        Ok(self)
     }
 
     pub fn extract_file(
@@ -747,7 +852,7 @@ impl FileExtraction {
         }
         b.resolve()?;
         check(cancel)?;
-        Ok(Self {
+        let extraction = Self {
             path: file.path.clone(),
             source_bytes: file.text.len(),
             registry_bytes: b.text_bytes,
@@ -757,7 +862,8 @@ impl FileExtraction {
             classes: b.catalog.classes,
             items: b.items,
             impls: b.impls,
-        })
+        };
+        extraction.within_stored_budget()
     }
 }
 impl Builder<'_> {
@@ -2250,5 +2356,129 @@ mod summary_tests {
                 Catalog::compose(&[file], 1, graph.nodes.len(), Limits::default()).unwrap()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fit_budget_tests {
+    use super::*;
+    use crate::model::{Provenance, SourceRange, Symbol, SymbolKind};
+
+    fn range() -> SourceRange {
+        SourceRange {
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            start_column: 0,
+            end_line: 1,
+            end_column: 1,
+        }
+    }
+    fn member(index: usize) -> ClassMember {
+        ClassMember {
+            name: format!("member_{index}"),
+            type_hint: None,
+            symbol_id: None,
+            path: "other.rs".into(),
+            range: range(),
+        }
+    }
+    fn class(path: &str, name: &str, members: usize) -> ClassDefinition {
+        ClassDefinition {
+            symbol: Symbol {
+                id: format!("sid:{path}:{name}"),
+                name: name.into(),
+                display_label: None,
+                kind: SymbolKind::Class,
+                path: path.into(),
+                range: range(),
+                parent: None,
+                accessor: false,
+                provenance: Provenance {
+                    source: "syntax".into(),
+                    semantic: crate::model::SemanticState::Unavailable,
+                },
+            },
+            qualified_name: name.into(),
+            language: "rust".into(),
+            declaration_kind: "struct".into(),
+            fields: vec![],
+            methods: (0..members).map(member).collect(),
+            truncated: false,
+        }
+    }
+    fn relation(owner: &str, index: usize) -> ClassRelation {
+        ClassRelation {
+            id: format!("rel-{index}"),
+            owner: owner.into(),
+            target: None,
+            type_name: "T".into(),
+            kind: "implements".into(),
+            path: "other.rs".into(),
+            range: range(),
+            candidate_ids: vec![],
+            match_kind: "unmatched".into(),
+        }
+    }
+
+    #[test]
+    fn rows_within_the_budgets_are_unchanged() {
+        let mut catalog = Catalog {
+            classes: vec![class("a.rs", "A", 10)],
+            relations: vec![relation("sid:a.rs:A", 0)],
+            ..Catalog::default()
+        };
+        let before = catalog.clone();
+        catalog.fit_stored_budgets(|_| 100).unwrap();
+        assert_eq!(catalog.classes, before.classes);
+        assert_eq!(catalog.relations, before.relations);
+        assert!(!catalog.truncated && catalog.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_small_file_keeps_its_class_and_loses_the_last_members_past_its_row_budget() {
+        let mut catalog = Catalog {
+            classes: vec![class("a.rs", "A", 2_000)],
+            ..Catalog::default()
+        };
+        catalog.fit_stored_budgets(|_| 16).unwrap();
+        let class = &catalog.classes[0];
+        assert!(class.truncated && catalog.truncated);
+        assert!(!class.methods.is_empty() && class.methods.len() < 2_000);
+        assert_eq!(class.methods[0].name, "member_0");
+        assert!(serde_json::to_vec(class).unwrap().len() <= 32 * 16 + 16 * 1024);
+        assert!(catalog.warnings[0].starts_with("a.rs: "));
+    }
+
+    #[test]
+    fn rows_past_a_files_share_go_with_their_relations() {
+        let classes: Vec<_> = (0..2_000)
+            .map(|index| class("a.rs", &format!("A{index}"), 0))
+            .collect();
+        let last = classes.last().unwrap().symbol.id.clone();
+        let mut catalog = Catalog {
+            classes,
+            relations: vec![relation("sid:a.rs:A0", 0), relation(&last, 1)],
+            ..Catalog::default()
+        };
+        catalog.fit_stored_budgets(|_| 16).unwrap();
+        assert!(catalog.classes.len() < 2_000 && !catalog.classes.is_empty());
+        assert_eq!(catalog.classes[0].symbol.name, "A0");
+        assert!(catalog.relations.iter().all(|r| r.owner != last));
+        assert!(catalog.truncated);
+    }
+
+    #[test]
+    fn one_files_rows_are_charged_only_to_that_file() {
+        let mut catalog = Catalog {
+            classes: vec![class("a.rs", "A", 2_000), class("b.rs", "B", 2_000)],
+            ..Catalog::default()
+        };
+        catalog
+            .fit_stored_budgets(|path| if path == "b.rs" { 1024 * 1024 } else { 16 })
+            .unwrap();
+        assert!(catalog.classes[0].truncated);
+        assert!(!catalog.classes[1].truncated);
+        assert_eq!(catalog.classes[1].methods.len(), 2_000);
     }
 }

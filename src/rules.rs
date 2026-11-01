@@ -1108,7 +1108,8 @@ fn parse_bases(
         return Err(e);
     }
     let tree = tree.context("bounded_work: selector parser stopped")?;
-    ensure!(!tree.root_node().has_error(), "invalid_source_syntax");
+    // A base clause inside a parser error goes unseen, so its file's bases stay unknown.
+    let broken = tree.root_node().has_error();
     let mut types = BTreeMap::new();
     // A type past the walk's bounds is unknown here, and references report its file.
     crate::references::walk(tree.root_node(), check, &mut |node, _check| {
@@ -1129,6 +1130,10 @@ fn parse_bases(
                     implements: Some(vec![]),
                 },
             );
+            continue;
+        }
+        if broken {
+            result.insert(d.syntax_id.clone(), Bases::default());
             continue;
         }
         let mut node = types.get(&(d.range.start, d.range.end)).copied();
@@ -1998,6 +2003,7 @@ mod portable_exception_tests {
                 content_hash: None,
                 bytes: None,
             }],
+            evidence_gaps: Default::default(),
         };
         let error = portable_source_set(
             &config,
@@ -2097,6 +2103,7 @@ mod document_parallel_tests {
             },
             documents,
             manifests: vec![],
+            evidence_gaps: Default::default(),
         }
     }
 

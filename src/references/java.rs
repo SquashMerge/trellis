@@ -18,6 +18,8 @@ struct Bucket {
 struct Package {
     exports: BTreeMap<String, Bucket>,
     declared: BTreeSet<String>,
+    /// A file here has a parser error, so any top-level type can be hidden.
+    partial: bool,
     declarations: BTreeMap<String, usize>,
 }
 struct Import {
@@ -102,6 +104,9 @@ pub(super) struct Catalog {
     packages: BTreeMap<PackageKey, Package>,
     units: BTreeMap<usize, Unit>,
     source_sets: BTreeMap<usize, String>,
+    /// Source sets with a file whose package is unknown: any of their packages can hold its
+    /// types.
+    unplaced: BTreeSet<String>,
 }
 impl Catalog {
     pub(super) fn new(
@@ -115,6 +120,7 @@ impl Catalog {
             packages: BTreeMap::new(),
             units: BTreeMap::new(),
             source_sets: BTreeMap::new(),
+            unplaced: BTreeSet::new(),
         };
         for (document, doc) in docs.iter().enumerate() {
             if doc.key.language != "java" {
@@ -132,12 +138,17 @@ impl Catalog {
                 }
             }
             let root = trees[document].root_node();
+            if package_unknown(doc, root, work, check)? {
+                result.unplaced.insert(doc.key.source_set_id.clone());
+            }
             let package_path = package_path(doc, root, work, check)?;
             owner_step(work, check)?;
             let package = result
                 .packages
                 .entry((doc.key.source_set_id.clone(), package_path))
                 .or_default();
+            // A parser error can hide any top-level type of its file.
+            package.partial |= root.has_error();
             let mut cursor = root.walk();
             for child in root.named_children(&mut cursor) {
                 owner_step(work, check)?;
@@ -234,8 +245,16 @@ impl Catalog {
                 }
             }
             scan_blockers(doc, root, &mut unit, work, check)?;
-            // Syntax past the bounds can hold a shadow or a binding, so no type root is proved.
-            unit.static_unknown |= unit.cut || crate::syntax_bounds::scan(root, check)?.is_some();
+            // Syntax skipped here can hold an import, a shadow or a binding.
+            unit.cut |= root.has_error();
+            // So no type root is proved, nor one a hidden type of this package could shadow.
+            unit.static_unknown |= unit.cut
+                || crate::syntax_bounds::scan(root, check)?.is_some()
+                || result.unplaced.contains(&doc.key.source_set_id)
+                || result
+                    .packages
+                    .get(&(doc.key.source_set_id.clone(), unit.package.clone()))
+                    .is_some_and(|package| package.partial);
             for blockers in unit.blockers.values_mut() {
                 blockers.finish(work, check)?;
             }
@@ -258,6 +277,7 @@ impl Catalog {
                     .packages
                     .get(&(source_set.clone(), import.path.clone()))
                 {
+                    unit.static_unknown |= package.partial;
                     for (name, bucket) in &package.exports {
                         owner_step(work, check)?;
                         let merged = unit.on_demand.entry(name.clone()).or_default();
@@ -362,6 +382,9 @@ impl Catalog {
             .packages
             .get(&(source_set.to_owned(), package_path.to_vec()))
         {
+            if package.partial || self.unplaced.contains(source_set) {
+                return Ok(SiteResolution::unknown("java_type_identity_ambiguous"));
+            }
             if let Some(bucket) = package.exports.get(name) {
                 return bucket_resolution(bucket, work, check);
             }
@@ -391,7 +414,10 @@ impl Catalog {
             if self
                 .packages
                 .get(&(source_set.to_owned(), path[..split].to_vec()))
-                .is_some_and(|package| package.declared.contains(&path[split]))
+                // Nothing outside the unnamed package can name a type hidden in it.
+                .is_some_and(|package| {
+                    package.declared.contains(&path[split]) || (split > 0 && package.partial)
+                })
             {
                 return Ok(true);
             }
@@ -420,6 +446,9 @@ impl Catalog {
             }
             return Ok(SiteResolution::unknown("java_package_mapping_unavailable"));
         };
+        if package.partial || self.unplaced.contains(source_set) {
+            return Ok(SiteResolution::unknown("java_wildcard_name_ambiguous"));
+        }
         let same_package = self
             .packages
             .get(&(source_set.to_owned(), unit.package.clone()));
@@ -558,6 +587,38 @@ fn package_path(
         }
     }
     Ok(Vec::new())
+}
+/// Whether this file's package declaration was lost to a parser error or the path bound. It
+/// comes first, so a file that starts with an import or type with an intact header declares
+/// none, whatever else is broken.
+fn package_unknown(
+    doc: &DocumentInput,
+    root: Node<'_>,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<bool> {
+    if root.is_error() {
+        return Ok(true);
+    }
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        owner_step(work, check)?;
+        if child.kind() == "package_declaration" {
+            return Ok(child.has_error() || declaration_path(doc, child, work, check)?.is_none());
+        }
+        if !matches!(child.kind(), "line_comment" | "block_comment") {
+            let body = child.child_by_field_name("body");
+            let mut parts = child.walk();
+            let header_error = child
+                .children(&mut parts)
+                .any(|part| part.has_error() && Some(part) != body);
+            return Ok(header_error
+                || (root.has_error()
+                    && child.kind() != "import_declaration"
+                    && !type_declaration(child)));
+        }
+    }
+    Ok(false)
 }
 fn declaration_path(
     doc: &DocumentInput,

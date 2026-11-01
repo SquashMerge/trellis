@@ -2326,3 +2326,76 @@ fn native_v9_rust_underscore_import_does_not_create_alias_declaration() {
         assert!(artifact.references.iter().any(|r| r.spelling == imported));
     }
 }
+
+fn native_for(root: &std::path::Path) -> trellis::native_evidence::Artifact {
+    let identity = trellis::store::topology::WorkspaceIdentity::discover(Some(root), root).unwrap();
+    let (_, native) = trellis::indexer::index_workspace_with_native(
+        &trellis::indexer::IndexOptions::new(root.to_owned()),
+        &identity.record_id,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    native
+}
+
+/// #564: a document past its stored budgets keeps only what a read can always admit.
+#[test]
+fn a_document_past_the_evidence_budget_keeps_its_file_module_and_a_whole_file_gap() {
+    for (path, source) in [
+        ("huge.py", format!("import {}a\n", "a.".repeat(20_000))),
+        ("huge.js", "a();".repeat(10_000)),
+        ("huge.rs", "m!();".repeat(8_000)),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(path), &source).unwrap();
+        let artifact = native_for(root.path());
+        assert_eq!(artifact.declarations.len(), 1, "{path}");
+        assert_eq!(artifact.declarations[0].kind, "module");
+        assert!(artifact.calls.is_empty() && artifact.references.is_empty());
+        assert!(artifact.control_regions.is_empty());
+        let coverage = &artifact.coverage[0];
+        assert_eq!(coverage.state, "partial");
+        assert!(
+            coverage
+                .diagnostic
+                .as_ref()
+                .unwrap()
+                .contains("per-file budget")
+        );
+        assert!(coverage.observed_roles.is_empty());
+        for family in &artifact.capability_reports[0].families {
+            assert_eq!(family.gaps.len(), 1);
+            assert_eq!(family.gaps[0].range.start, 0);
+            assert_eq!(family.gaps[0].range.end, source.len());
+        }
+    }
+}
+
+/// A real minified bundle is dense, but a selected read admits it, so it stays whole.
+#[test]
+fn a_minified_bundle_within_the_evidence_budget_keeps_its_facts() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/web/vendor/pele-1.10.0-trellis.2.js"
+    );
+    std::fs::copy(bundle, root.path().join("bundle.js")).unwrap();
+    let artifact = native_for(root.path());
+    assert!(artifact.declarations.len() > 1);
+    assert!(
+        artifact.coverage[0].diagnostic.is_none(),
+        "{:?}",
+        artifact.coverage[0]
+    );
+}
+
+#[test]
+fn a_dense_document_within_the_evidence_budget_keeps_its_facts() {
+    let root = tempfile::tempdir().unwrap();
+    let source = "a();".repeat(200);
+    std::fs::write(root.path().join("dense.js"), &source).unwrap();
+    let artifact = native_for(root.path());
+    assert_eq!(artifact.calls.len(), 200);
+    assert_eq!(artifact.coverage[0].state, "complete");
+}

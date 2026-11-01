@@ -271,6 +271,217 @@ async fn view(app: axum::Router, key: &str, route: &str) -> (StatusCode, Value) 
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+/// #563 (owner ruling 2026-10-31): one file with a syntax error is partial, and every view of
+/// the checkout is served.
+#[tokio::test]
+async fn one_file_with_a_syntax_error_is_partial_and_every_whole_checkout_view_is_served() {
+    for (path, source) in [
+        ("src/broken.rs", "pub fn broken( {\n"),
+        ("src/broken.js", "export function broken( {\n"),
+        ("src/Broken.java", "public class Broken extends {\n"),
+        ("src/broken.py", "def broken(:\n    pass\n"),
+    ] {
+        let (base, _runtime, browser, key) = fixture_with_sources(
+            false,
+            &[
+                (path, source),
+                ("src/a.js", "import { b } from './b.js'; b();\n"),
+                ("src/b.js", "export function b() {}\n"),
+            ],
+        )
+        .await;
+        write_rules(
+            &base,
+            "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js','deep/**','zero/**']",
+        );
+        let app = browser.router();
+        let (status, body) = request(app.clone(), &key, "").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        let payload = &body["payload"];
+        assert_eq!(payload["partialFiles"][0]["path"], path, "{payload}");
+        assert_eq!(payload["partialFiles"][0]["reason"], "syntax_error");
+        assert_eq!(payload["references"]["partialFiles"][0]["path"], path);
+        assert_eq!(payload["rules"]["partialFiles"][0]["path"], path);
+        assert!(
+            payload["references"]["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|limit| limit.as_str().unwrap().contains("partialFiles"))
+        );
+        assert!(
+            payload["references"]["counts"]["mappedSites"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        let (status, metrics) = view(app.clone(), &key, "metrics").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {metrics}");
+        assert_eq!(metrics["payload"]["partialFiles"][0]["path"], path);
+        assert_eq!(
+            metrics["payload"]["partialFiles"][0]["reason"],
+            "syntax_error"
+        );
+        let (status, classes) = view(app.clone(), &key, "classes").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {classes}");
+    }
+}
+
+/// #564: a file past the stored evidence budgets, one shape per language and per budget.
+/// Publication must not admit what a read refuses, so these index and every view is served.
+#[tokio::test]
+async fn one_file_past_the_evidence_budgets_is_a_coverage_gap_and_every_view_is_served() {
+    let bytes = 40_000;
+    let cases = [
+        // References, past the native budget.
+        (
+            "src/huge.py",
+            format!("import {}a\n", "a.".repeat(bytes / 2)),
+        ),
+        (
+            "src/huge.js",
+            format!("import{{{}}}from'b';\n", vec!["a"; bytes / 2].join(",")),
+        ),
+        (
+            "src/huge.rs",
+            format!("use a::{{{}}};\n", vec!["a"; bytes / 2].join(",")),
+        ),
+        (
+            "src/Huge.java",
+            format!(
+                "class Huge implements {} {{}}\n",
+                vec!["a"; bytes / 2].join(",")
+            ),
+        ),
+        // Calls, past the graph budget.
+        ("src/huge.py", "a()\n".repeat(bytes / 4)),
+        ("src/huge.js", "a();".repeat(bytes / 4)),
+        (
+            "src/huge.rs",
+            format!("fn m() {{ {} }}\n", "a();".repeat(bytes / 4)),
+        ),
+        (
+            "src/Huge.java",
+            format!(
+                "class Huge {{ void m() {{ {} }} }}\n",
+                "a();".repeat(bytes / 4)
+            ),
+        ),
+        // Capability gaps of opaque macros.
+        ("src/huge.rs", "m!();".repeat(bytes / 5)),
+    ];
+    for (path, source) in cases {
+        let (base, _runtime, browser, key) = fixture_with_sources(
+            false,
+            &[
+                (path, source.as_str()),
+                ("src/a.js", "import { b } from './b.js'; b();\n"),
+                ("src/b.js", "export function b() {}\n"),
+            ],
+        )
+        .await;
+        write_rules(
+            &base,
+            "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js','deep/**','zero/**']",
+        );
+        let app = browser.router();
+        let (status, body) = request(app.clone(), &key, "").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {source:.40}: {body}");
+        let payload = &body["payload"];
+        assert_eq!(payload["partialFiles"][0]["path"], path, "{source:.40}");
+        assert_eq!(payload["partialFiles"][0]["reason"], "evidence_budget");
+        assert_eq!(payload["partialFiles"][0]["range"]["end"], source.len());
+        assert_eq!(payload["references"]["partialFiles"][0]["path"], path);
+        assert_eq!(payload["rules"]["partialFiles"][0]["path"], path);
+        assert!(
+            payload["references"]["counts"]["mappedSites"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        let (status, metrics) = view(app.clone(), &key, "metrics").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {metrics}");
+        assert_eq!(metrics["payload"]["partialFiles"][0]["path"], path);
+        assert_eq!(
+            metrics["payload"]["partialFiles"][0]["reason"],
+            "evidence_budget"
+        );
+        let (status, classes) = view(app.clone(), &key, "classes").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {classes}");
+    }
+}
+
+/// A file whose stored class extraction is past its ceiling keeps no classes (#564).
+#[tokio::test]
+async fn a_class_extraction_past_its_ceiling_is_left_out_and_every_view_is_served() {
+    let long_type = "T".repeat(2000);
+    let fields: Vec<_> = (0..256).map(|index| format!("a{index}")).collect();
+    let source: String = (0..135)
+        .map(|index| format!("class C{index} {{ {long_type} {}; }}\n", fields.join(",")))
+        .collect();
+    let (base, _runtime, browser, key) = fixture_with_sources(
+        false,
+        &[
+            ("src/Huge.java", source.as_str()),
+            ("src/a.js", "import { b } from './b.js'; b();\n"),
+            ("src/b.js", "export function b() {}\n"),
+        ],
+    )
+    .await;
+    write_rules(
+        &base,
+        "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js']",
+    );
+    let app = browser.router();
+    let (status, body) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, metrics) = view(app.clone(), &key, "metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    let (status, classes) = view(app.clone(), &key, "classes").await;
+    assert_eq!(status, StatusCode::OK, "{classes}");
+    assert!(
+        classes.to_string().contains("evidence budget"),
+        "{classes:.400}"
+    );
+}
+
+/// A Rust class takes members from other files, so a small file can own a large class row
+/// (#564). Its last members go; nothing fails.
+#[tokio::test]
+async fn a_small_rust_file_with_a_large_impl_elsewhere_keeps_its_class_and_every_view() {
+    let methods = "    pub fn method(&self, x: u32) -> u32 { x }\n";
+    let mut implementation = String::from("use crate::a::Foo;\nimpl Foo {\n");
+    for index in 0..2_000 {
+        implementation.push_str(&methods.replace("method", &format!("method_{index}")));
+    }
+    implementation.push_str("}\n");
+    let (base, _runtime, browser, key) = fixture_with_sources(
+        false,
+        &[
+            ("src/lib.rs", "pub mod a; pub mod b;\n"),
+            ("src/a.rs", "pub struct Foo;\n"),
+            ("src/b.rs", implementation.as_str()),
+        ],
+    )
+    .await;
+    write_rules(
+        &base,
+        "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js']",
+    );
+    let app = browser.router();
+    let (status, body) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payload"]["partialFiles"], serde_json::json!([]));
+    let (status, metrics) = view(app.clone(), &key, "metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    let (status, classes) = view(app.clone(), &key, "classes").await;
+    assert_eq!(status, StatusCode::OK, "{classes}");
+    assert!(
+        classes.to_string().contains("evidence budget"),
+        "{classes:.400}"
+    );
+}
+
 /// #554: repository content is untrusted, but one pathological file is a gap in the
 /// views, never a refusal of the whole checkout.
 #[tokio::test]

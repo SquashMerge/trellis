@@ -494,20 +494,46 @@ inventory at 100,000 documents and 512 MiB of aggregate stored input. These boun
 refuse the entire result rather than silently dropping evidence.
 
 Syntax walks are bounded per document, to 128 levels and 1,000,000 visits, but one
-pathological file doesn't refuse the result (#554). Walks skip what lies past the bounds, and
-`partialFiles` names each such document in the snapshot, whatever the source filter,
-because any document can feed resolution:
+pathological file doesn't refuse the result (#554), and neither does a file with a syntax
+error (owner ruling 2026-10-31, #563). Walks skip what lies past the bounds and what lies
+inside a parser error, and `partialFiles` names each such document in the snapshot, whatever
+the source filter, because any document can feed resolution:
 
 ```text
-PartialFile = {sourceSetId,language,path,reason:"depth_limit"|"visit_limit",
+PartialFile = {sourceSetId,language,path,
+               reason:"syntax_error"|"depth_limit"|"visit_limit"|"evidence_budget",
                range:Range,subtrees:UInt}
 ```
 
-`range` is the first skipped subtree, and `subtrees` counts subtrees skipped over the depth
-bound. References and declarations inside them are missing, so absence there proves
-nothing, and a partial file's names stay unknown wherever a proof would need the skipped
-syntax: a skipped import or declaration never proves a competing binding absent. The field is empty when every document was read whole, and a `limitations` entry
-appears when it isn't. A partial file alone doesn't change the exit status.
+A file has one row: `evidence_budget` wins over `syntax_error`, and `syntax_error` over the
+bounds.
+`range` is the first skipped subtree or parser error, and `subtrees` counts subtrees skipped
+over the depth bound, or the file's parser errors. References and declarations inside them
+are missing, so absence there proves nothing, and a partial file's names stay unknown
+wherever a proof would need the skipped syntax: a skipped import or declaration never proves
+a competing binding absent. The field is empty when every document was read whole, and a
+`limitations` entry appears when it isn't. A partial file alone doesn't change the exit
+status.
+
+A parser error can hide or misplace anything in its file, so a broken file proves less than
+an over-deep one:
+
+- In Rust, every scope of the file is opaque, and an explicit name there is unknown too.
+- In JavaScript and Python, the file counts as dynamic: its exports are unknown.
+- In Java, no type root or explicit import of the file is proved, and neither is any type of
+  its package, nor any name another file's type root could lose to a type hidden there. A
+  parser error at or before the package declaration leaves the file's package unknown, which
+  does the same for every package of its source set.
+- A selector's `extends` or `implements` on a type in the file is unknown, not false.
+
+Sites that survive in the recovered tree keep the resolution their language gives them: an
+intact `import` of a broken JavaScript or Python file still maps its literal path.
+
+`evidence_budget` names a document published with no evidence but its file module, because
+its facts exceed a [per-file budget](daemon-v1.md#current-limits) (#564). `range` is the whole file and
+`subtrees` is 0. Its source is still read for what others resolve through it, but it has no
+sites, scores, or declarations for rules to select, so nothing resolves to a declaration
+inside it.
 
 Reference work has one request-wide allowance of
 `min(100_000_000, 5_000_000 + 20_000*N + 512*K)` units. Rules use a separate

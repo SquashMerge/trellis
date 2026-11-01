@@ -641,40 +641,40 @@ impl std::io::Write for EncodedSourceBudget {
         Ok(())
     }
 }
-const SELECTED_ANCILLARY_BYTE_SQL: &str = r#"SELECT COALESCE(max(row_bytes),0),COALESCE(sum(row_bytes),0) FROM (
-SELECT ?3+COALESCE(length(CAST(x.role_kind AS BLOB)),0)+COALESCE(length(CAST(x.role AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes FROM native_version_coverage_roles x WHERE x.vid=?1
+const SELECTED_ANCILLARY_BYTE_SQL: &str = r#"SELECT COALESCE(max(row_bytes),0),COALESCE(sum(CASE WHEN NOT class THEN row_bytes END),0),COALESCE(sum(CASE WHEN class THEN row_bytes END),0) FROM (
+SELECT ?3+COALESCE(length(CAST(x.role_kind AS BLOB)),0)+COALESCE(length(CAST(x.role AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_coverage_roles x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.lookup_key AS BLOB)),0)+COALESCE(length(CAST(x.key_signature_present AS BLOB)),0)+COALESCE(length(CAST(x.key_type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.key_variadic AS BLOB)),0)+COALESCE(length(CAST(x.key_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.name_start AS BLOB)),0)+COALESCE(length(CAST(x.name_end AS BLOB)),0) AS row_bytes FROM native_version_declarations x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.lookup_key AS BLOB)),0)+COALESCE(length(CAST(x.key_signature_present AS BLOB)),0)+COALESCE(length(CAST(x.key_type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.key_variadic AS BLOB)),0)+COALESCE(length(CAST(x.key_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.name_start AS BLOB)),0)+COALESCE(length(CAST(x.name_end AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_declarations x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.sibling_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.signature_present AS BLOB)),0)+COALESCE(length(CAST(x.type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes FROM native_version_declaration_ancestors x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.sibling_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.signature_present AS BLOB)),0)+COALESCE(length(CAST(x.type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_declaration_ancestors x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes FROM native_version_own_signature_types x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_own_signature_types x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ancestor_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes FROM native_version_ancestor_signature_types x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ancestor_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_ancestor_signature_types x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.result_type AS BLOB)),0) AS row_bytes FROM native_version_headers x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.result_type AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_headers x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.item_kind AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.value AS BLOB)),0) AS row_bytes FROM native_version_header_items x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.item_kind AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.value AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_header_items x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes FROM native_version_parameters x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_parameters x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.callee_start AS BLOB)),0)+COALESCE(length(CAST(x.callee_end AS BLOB)),0)+COALESCE(length(CAST(x.spelling AS BLOB)),0)+?4+COALESCE(length(CAST(x.language AS BLOB)),0)+COALESCE(length(CAST(x.callee_lookup_key AS BLOB)),0) AS row_bytes FROM native_version_calls x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.callee_start AS BLOB)),0)+COALESCE(length(CAST(x.callee_end AS BLOB)),0)+COALESCE(length(CAST(x.spelling AS BLOB)),0)+?4+COALESCE(length(CAST(x.language AS BLOB)),0)+COALESCE(length(CAST(x.callee_lookup_key AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_calls x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+(CASE WHEN x.parent_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.arm AS BLOB)),0) AS row_bytes FROM native_version_control_regions x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+(CASE WHEN x.parent_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.arm AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_control_regions x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.call_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.region_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes FROM native_version_call_regions x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.call_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.region_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_call_regions x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+78+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+length(CAST(x.spelling AS BLOB))+length(CAST(COALESCE(x.lookup_key,x.spelling) AS BLOB)) AS row_bytes FROM native_version_references x WHERE x.vid=?1
+SELECT ?3+78+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+length(CAST(x.spelling AS BLOB))+length(CAST(COALESCE(x.lookup_key,x.spelling) AS BLOB)) AS row_bytes,0 AS class FROM native_version_references x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.available AS BLOB))+COALESCE(length(CAST(x.diagnostic AS BLOB)),0)+length(CAST(x.ordinal AS BLOB)) AS row_bytes FROM native_version_capability_families x WHERE x.vid=?1
+SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.available AS BLOB))+COALESCE(length(CAST(x.diagnostic AS BLOB)),0)+length(CAST(x.ordinal AS BLOB)) AS row_bytes,0 AS class FROM native_version_capability_families x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.ordinal AS BLOB))+length(CAST(x.start_byte AS BLOB))+length(CAST(x.end_byte AS BLOB))+length(CAST(x.diagnostic AS BLOB)) AS row_bytes FROM native_version_capability_gaps x WHERE x.vid=?1
+SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.ordinal AS BLOB))+length(CAST(x.start_byte AS BLOB))+length(CAST(x.end_byte AS BLOB))+length(CAST(x.diagnostic AS BLOB)) AS row_bytes,0 AS class FROM native_version_capability_gaps x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+length(CAST(x.ordinal AS BLOB))+length(CAST(x.start_byte AS BLOB))+length(CAST(x.end_byte AS BLOB)) AS row_bytes FROM native_version_macro_expansions x WHERE x.vid=?1
+SELECT ?3+length(CAST(x.ordinal AS BLOB))+length(CAST(x.start_byte AS BLOB))+length(CAST(x.end_byte AS BLOB)) AS row_bytes,0 AS class FROM native_version_macro_expansions x WHERE x.vid=?1
 UNION ALL
-SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(SELECT length(graph_hash)+9 FROM graph_projections WHERE gid=x.gid)+39+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.qualified_name AS BLOB)),0)+COALESCE(length(CAST(x.path AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM classes x WHERE x.cid=?2
+SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(SELECT length(graph_hash)+9 FROM graph_projections WHERE gid=x.gid)+39+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.qualified_name AS BLOB)),0)+COALESCE(length(CAST(x.path AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class FROM classes x WHERE x.cid=?2
 UNION ALL
-SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
+SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class FROM class_relations x WHERE x.cid=?2
 )"#;
 const DATABASE_SCHEMA_VERSION: u32 = 33;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
@@ -881,51 +881,6 @@ struct FetchedDocument {
     calls: Vec<crate::native_evidence::Call>,
     regions: Vec<crate::native_evidence::ControlRegion>,
     stored_bytes: u64,
-}
-
-/// Match the former graph-row SQL charge: key TEXT byte lengths plus the
-/// compact JSON payload, with identical row and aggregate thresholds.
-fn derived_graph_bytes(
-    nodes: &[Symbol],
-    calls: &[CallSite],
-    regions: &[ControlRegion],
-    source_bytes: i64,
-) -> Result<u64> {
-    let mut max_row = 0u64;
-    let mut total = 0u64;
-    for node in nodes {
-        let row = node.id.len() + node.name.len() + node.path.len() + json(node)?.len();
-        let row = row as u64;
-        max_row = max_row.max(row);
-        total = total.saturating_add(row);
-    }
-    for call in calls {
-        let row = call.id.len() + call.caller.len() + call.path.len() + json(call)?.len();
-        let row = row as u64;
-        max_row = max_row.max(row);
-        total = total.saturating_add(row);
-    }
-    for region in regions {
-        let row = region.id.len() + region.owner.len() + region.path.len() + json(region)?.len();
-        let row = row as u64;
-        max_row = max_row.max(row);
-        total = total.saturating_add(row);
-    }
-    let bytes = source_bytes.max(0) as u64;
-    ensure!(
-        max_row
-            <= bytes
-                .saturating_mul(6)
-                .saturating_add(16 * 1024)
-                .min(256 * 1024 * 1024 + 16 * 1024)
-            && total
-                <= bytes
-                    .saturating_mul(64)
-                    .saturating_add(256 * 1024)
-                    .min(512 * 1024 * 1024),
-        "incompatible_index: selected graph row byte budget exceeded"
-    );
-    Ok(total)
 }
 
 /// Header of a retained native revision: everything but the document inventory.
@@ -1482,6 +1437,7 @@ impl MetricsReadCheck<'_> {
 struct MetricsComputedDocument {
     computed: crate::metrics::Computed,
     physical_lines: usize,
+    physical_bytes: usize,
     file_role: DeclarationRole,
 }
 
@@ -1970,12 +1926,14 @@ impl EvidenceResponse {
         check()?;
         let selected = self.selected(pin)?;
         let mut statement = self.db.prepare(
-            "SELECT r.source_set_id,m.language,m.path FROM revision_documents m
+            "SELECT r.source_set_id,m.language,m.path,m.coverage_diagnostic
+             FROM revision_documents m
              JOIN native_revisions r ON r.id=m.revision_id
              WHERE m.revision_id=?1 ORDER BY r.source_set_id,m.language,m.path",
         )?;
         let mut cursor = statement.query([&selected.key])?;
         let mut documents = Vec::new();
+        let mut evidence_gaps = BTreeSet::new();
         let mut pending = Vec::new();
         let mut source_bytes = 0u64;
         let mut stored_bytes = 0u64;
@@ -1990,6 +1948,7 @@ impl EvidenceResponse {
                 language: row.get(1)?,
                 path: row.get(2)?,
             };
+            let diagnostic: Option<String> = row.get(3)?;
             let fetched = {
                 let progress_failure = Mutex::new(None);
                 let check = Mutex::new(&mut *check);
@@ -2026,6 +1985,9 @@ impl EvidenceResponse {
                 }
                 fetched?
             };
+            if diagnostic.as_deref() == Some(crate::evidence_budget::DIAGNOSTIC) {
+                evidence_gaps.insert(key.clone());
+            }
             pending.push((key, std::sync::Mutex::new(Some(fetched))));
         }
         // SQLite reads stay on this connection; decoding needs no connection, so
@@ -2202,6 +2164,7 @@ impl EvidenceResponse {
             pin: selected.pin,
             documents,
             manifests: manifests.into_values().collect(),
+            evidence_gaps,
         })
     }
 
@@ -2253,19 +2216,27 @@ impl EvidenceResponse {
         let names: Vec<&str> = selected_metrics.iter().map(String::as_str).collect();
         use crate::native_evidence::DocumentKey;
         let mut stmt = self.db.prepare(
-            "SELECT r.source_set_id,m.language,m.path FROM revision_documents m
+            "SELECT r.source_set_id,m.language,m.path,m.coverage_diagnostic
+            FROM revision_documents m
             JOIN native_revisions r ON r.id=m.revision_id
             WHERE m.revision_id=?1 ORDER BY r.source_set_id,m.language,m.path",
         )?;
         let mut documents = Vec::new();
+        let mut evidence_gaps = BTreeSet::new();
         let mut cursor = stmt.query([&selected.key])?;
         while let Some(row) = cursor.next()? {
             progress.check()?;
-            documents.push(DocumentKey {
+            let key = DocumentKey {
                 source_set_id: row.get(0)?,
                 language: row.get(1)?,
                 path: row.get(2)?,
-            });
+            };
+            if row.get::<_, Option<String>>(3)?.as_deref()
+                == Some(crate::evidence_budget::DIAGNOSTIC)
+            {
+                evidence_gaps.insert(key.clone());
+            }
+            documents.push(key);
         }
         progress.check()?;
         // Existence is decided from the manifest, not from callable rows.
@@ -2404,6 +2375,7 @@ impl EvidenceResponse {
                 .map(|computed| MetricsComputedDocument {
                     computed,
                     physical_lines,
+                    physical_bytes: fetched.file.text.len(),
                     file_role,
                 })
                 .map_err(MetricsDocumentFailure::Other)
@@ -2425,6 +2397,7 @@ impl EvidenceResponse {
             let MetricsComputedDocument {
                 computed,
                 physical_lines,
+                physical_bytes,
                 file_role,
             } = match outcome {
                 Some(Ok(computed)) => computed,
@@ -2439,7 +2412,14 @@ impl EvidenceResponse {
                     return progress.result(Err(anyhow::anyhow!("cancelled")));
                 }
             };
-            partial_files.extend(computed.gap().map(|gap| gap.file(key)));
+            partial_files.extend(
+                evidence_gaps
+                    .contains(key)
+                    .then(|| {
+                        crate::syntax_bounds::SyntaxGap::evidence_budget(physical_bytes).file(key)
+                    })
+                    .or_else(|| computed.gap().map(|gap| gap.file(key))),
+            );
             let mut rows = computed.commit(
                 &mut self
                     .store
@@ -5307,6 +5287,9 @@ pub(crate) struct LocalPrepared {
     prior_coverage: BTreeMap<String, crate::native_evidence::Coverage>,
     prior_summaries: BTreeMap<String, crate::classes::FileSummary>,
     prior_class_complete: BTreeMap<String, bool>,
+    /// The prior revision's class rows were cut to fit their budgets. Rows it keeps stay cut,
+    /// so its warning and flag are recomposed too.
+    prior_class_fit: bool,
     old_stats: IndexStats,
     old_diagnostics: Vec<Diagnostic>,
     old_changed_counts: (usize, usize, usize),
@@ -5318,10 +5301,12 @@ impl LocalPrepared {
     /// without comparing its recomposed rows.
     fn recomposes_rust(&self) -> bool {
         let rust = |path: &String| path.ends_with(".rs");
-        self.changed_paths
-            .iter()
-            .chain(&self.removed_paths)
-            .any(rust)
+        self.prior_class_fit
+            || self
+                .changed_paths
+                .iter()
+                .chain(&self.removed_paths)
+                .any(rust)
             || self.prior_class_complete.iter().any(|(path, complete)| {
                 rust(path) && !complete && !self.changed_paths.contains(path)
             })
@@ -17450,8 +17435,12 @@ impl Store {
                 "SELECT m.stats,m.diagnostics
                  FROM index_metadata m JOIN native_revisions r ON r.id=?1 WHERE m.singleton=1",
                 [&selected.key],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            let prior_class_fit = class_metadata(db, &selected)?
+                .0
+                .iter()
+                .any(|warning| warning.contains(crate::classes::BUDGET_WARNING));
             Ok(Some(LocalPrepared {changed_paths,removed_paths,native,prior_pin:selected.pin,
-                prior_ids,prior_coverage,prior_summaries,prior_class_complete,
+                prior_ids,prior_coverage,prior_summaries,prior_class_complete,prior_class_fit,
                 old_stats:serde_json::from_str(&stats).context(SelectedIntegrity("incompatible_index: stored JSON decode failed".into()))?,old_diagnostics:serde_json::from_str(&diagnostics).context(SelectedIntegrity("incompatible_index: stored JSON decode failed".into()))?,
                 old_changed_counts}))
         })
@@ -18334,7 +18323,7 @@ impl Store {
             "unsupported graph schema"
         );
         check_cancel(cancel)?;
-        let (stats, classes, extractions, class_complete) = if let Some(spool) = stream {
+        let (stats, mut classes, extractions, class_complete) = if let Some(spool) = stream {
             ensure!(
                 local.is_none(),
                 "local and streamed publication cannot be combined"
@@ -18478,6 +18467,13 @@ impl Store {
             };
             (stats, classes, extractions, complete)
         };
+        let source_bytes: BTreeMap<&str, usize> = capture
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.text.len()))
+            .collect();
+        classes
+            .fit_stored_budgets(|path| source_bytes.get(path).map_or(0, |bytes| *bytes as i64))?;
         // The public read_status guard has this exact singleton JSON ceiling.
         // Refuse over-limit catalog warnings before paired CAS.
         ensure!(
@@ -20266,7 +20262,7 @@ impl Store {
         cid: i64,
         version_id: &str,
         source_set_id: &str,
-    ) -> Result<(i64, i64)> {
+    ) -> Result<(i64, i64, i64)> {
         Ok(db.prepare_cached(SELECTED_ANCILLARY_BYTE_SQL)?.query_row(
             params![
                 vid,
@@ -20274,7 +20270,7 @@ impl Store {
                 version_id.len() as i64,
                 source_set_id.len() as i64
             ],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?)
     }
     /// Read one selected document and project its graph once from the stored
@@ -20399,7 +20395,9 @@ impl Store {
                 && class_hash.is_some()
                 && class_id.len() <= 16 * 1024
                 && (if crate::classes::supports_language(&language) {
-                    f_length.is_some_and(|n| (0..=64 * 1024 * 1024).contains(&n))
+                    f_length.is_some_and(|n| {
+                        (0..=crate::evidence_budget::CLASS_EXTRACTION as i64).contains(&n)
+                    })
                 } else {
                     f_length.is_none()
                 }),
@@ -20423,7 +20421,7 @@ impl Store {
             scope.version_id == version_id && scope.native_revision_id == native_revision_id,
             "incompatible_index: selected native manifest mismatch"
         );
-        let row_limit = bytes.saturating_mul(16).clamp(1024, 1_000_000);
+        let row_limit = crate::evidence_budget::row_limit(bytes);
         let counts_sql = "SELECT (SELECT count(*) FROM graph_nodes WHERE gid=?1),
             (SELECT count(*) FROM graph_display_labels WHERE gid=?1),
             (SELECT count(*) FROM native_version_calls WHERE vid=?3),
@@ -20455,23 +20453,18 @@ impl Store {
             "incompatible_index: selected evidence row budget exceeded"
         );
         optional_hint_check(progress)?;
-        let (max_row, total_bytes) =
+        let (max_row, native_bytes, class_bytes) =
             Self::selected_ancillary_byte_usage(db, vid, cid, &version_id, &source_set)?;
         selected_ensure!(
             max_row >= 0
-                && total_bytes >= 0
-                && max_row
-                    <= bytes
-                        .saturating_mul(32)
-                        .saturating_add(16 * 1024)
-                        .min(256 * 1024 * 1024)
-                && total_bytes
-                    <= bytes
-                        .saturating_mul(64)
-                        .saturating_add(256 * 1024)
-                        .min(512 * 1024 * 1024),
+                && native_bytes >= 0
+                && class_bytes >= 0
+                && max_row <= crate::evidence_budget::max_row(bytes)
+                && native_bytes <= crate::evidence_budget::total(bytes)
+                && class_bytes <= crate::evidence_budget::total(bytes),
             "incompatible_index: selected evidence byte budget exceeded"
         );
+        let total_bytes = native_bytes.saturating_add(class_bytes);
         // The graph byte budget is checked on serialized derived rows after
         // the native facts and labels have been fetched. The row counts above
         // still bound their allocation before any native decoding.
@@ -20572,9 +20565,15 @@ impl Store {
         .context(SelectedIntegrity(
             "incompatible_index: selected graph derivation failed".into(),
         ))?;
-        derived_graph_bytes(&nodes, &graph_calls, &graph_regions, file.text.len() as i64).context(
-            SelectedIntegrity("incompatible_index: selected graph byte budget exceeded".into()),
-        )?;
+        crate::evidence_budget::graph_bytes(
+            &nodes,
+            &graph_calls,
+            &graph_regions,
+            file.text.len() as i64,
+        )
+        .context(SelectedIntegrity(
+            "incompatible_index: selected graph byte budget exceeded".into(),
+        ))?;
         Ok(SelectedDocument {
             file,
             nodes,
@@ -22598,11 +22597,14 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
         class_projection_id + bytes(&["rel-1", "{}"]) + sid.len() + target_sid.len(),
     ];
     let actual = Store::selected_ancillary_byte_usage(&db, 1, 3, version, source_set).unwrap();
+    // The last three rows are the two classes and their relation.
+    let (native, class) = rows.split_at(rows.len() - 3);
     assert_eq!(
         actual,
         (
             *rows.iter().max().unwrap() as i64,
-            rows.iter().sum::<usize>() as i64,
+            native.iter().sum::<usize>() as i64,
+            class.iter().sum::<usize>() as i64,
         )
     );
 }

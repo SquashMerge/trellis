@@ -2662,6 +2662,7 @@ fn extract_document(
         gaps: Vec::new(),
         bound_gaps: Vec::new(),
         bounded: false,
+        over_budget: false,
         name_owners: BTreeMap::new(),
         lexical_owners: BTreeMap::from([(canonical(&json!([])), module_id.clone())]),
         header_witness,
@@ -2698,6 +2699,7 @@ fn extract_document(
         .gaps
         .sort_by_key(|gap| (gap.range.start, gap.range.end));
     state.finish_occurrences()?;
+    state.keep_within_budget(declaration_start);
     state
         .artifact
         .search_cards
@@ -2738,7 +2740,11 @@ fn extract_document(
         revision_id: state.artifact.revision.id.clone(),
         requested: true,
         selected: true,
-        state: if tree.root_node().has_error() || state.opaque_rust || state.bounded {
+        state: if tree.root_node().has_error()
+            || state.opaque_rust
+            || state.bounded
+            || state.over_budget
+        {
             "partial"
         } else {
             "complete"
@@ -2751,6 +2757,7 @@ fn extract_document(
             state.opaque_rust,
             state.bounded,
         ) {
+            _ if state.over_budget => Some(crate::evidence_budget::DIAGNOSTIC.into()),
             (true, true, false) => Some("parser recovered from invalid source; opaque Rust macro/attribute token trees skipped".into()),
             (true, false, false) => Some("parser recovered from invalid source".into()),
             (false, true, false) => Some("opaque Rust macro/attribute token trees skipped; calls and definitions inside were not measured".into()),
@@ -2804,6 +2811,8 @@ struct ParserState<'a> {
     /// Subtrees skipped at the walk bounds, at most [`BOUND_GAPS`], and whether any was.
     bound_gaps: Vec<Range>,
     bounded: bool,
+    /// The facts exceeded the document's stored budgets, so only its file module was kept.
+    over_budget: bool,
     name_owners: BTreeMap<(usize, usize), String>,
     lexical_owners: BTreeMap<Vec<u8>, String>,
     header_witness: &'a mut dyn FnMut(&str, String, Range),
@@ -3043,7 +3052,8 @@ impl ParserState<'_> {
         }
         let test_context = test_flags.0 || test_flags.1 || local_test_marker(n, self.file);
         let mut owner = owner.to_owned();
-        let mut ancestry = ancestors.to_vec();
+        // Most nodes declare nothing, and a key can carry a whole Java signature.
+        let mut ancestry = std::borrow::Cow::Borrowed(ancestors);
         let mut regions = regions.to_vec();
         if let Some(k) = kind(&self.file.language, n)
             && (matches!(k, "implementation" | "anonymousFunction") || name(n, self.file).is_some())
@@ -3069,7 +3079,7 @@ impl ParserState<'_> {
                 self.name_owners
                     .insert((range.start, range.end), parent.clone());
             }
-            let mut lexical_ancestry = ancestry.clone();
+            let mut lexical_ancestry = ancestry.to_vec();
             lexical_ancestry.push(key.clone());
             self.lexical_owners
                 .insert(canonical(&json!(lexical_ancestry)), id.clone());
@@ -3105,7 +3115,7 @@ impl ParserState<'_> {
                     .as_ref()
                     .map(|v| declaration_lookup(&self.file.language, &v.0))
                     .transpose()?,
-                ancestors: ancestry.clone(),
+                ancestors: ancestry.to_vec(),
                 key: key.clone(),
                 range: Range::node(n),
                 name_range: named.map(|v| v.1),
@@ -3130,7 +3140,7 @@ impl ParserState<'_> {
                 owner = id;
                 regions.clear();
             }
-            ancestry.push(key);
+            ancestry.to_mut().push(key);
         }
         if is_region(n) {
             let count = self.control_ordinals.entry(owner.clone()).or_default();
@@ -3313,6 +3323,41 @@ impl ParserState<'_> {
                 });
             }
         }
+    }
+
+    /// One document past the stored budgets publishes as a coverage gap, whatever its
+    /// language or shape of evidence (#564). What reads can't admit must not be published:
+    /// nothing is left to fail a read, or to send the index back to reconciliation.
+    fn keep_within_budget(&mut self, declaration_start: usize) {
+        let artifact = &*self.artifact;
+        let facts = crate::evidence_budget::Facts {
+            declarations: &artifact.declarations[declaration_start..],
+            calls: &artifact.calls[self.call_start..],
+            control_regions: &artifact.control_regions[self.control_start..],
+            references: &artifact.references[self.reference_start..],
+            gaps: &self.gaps,
+            macro_expansions: self.macro_expansions.len(),
+        };
+        if !crate::evidence_budget::exceeded(self.file, &artifact.source_set.id, facts) {
+            return;
+        }
+        self.over_budget = true;
+        self.artifact.declarations.truncate(declaration_start + 1);
+        self.artifact.calls.truncate(self.call_start);
+        self.artifact.control_regions.truncate(self.control_start);
+        self.artifact.references.truncate(self.reference_start);
+        self.macro_expansions.clear();
+        self.measured_macros.clear();
+        self.search_nodes.clear();
+        self.saw_definition = false;
+        self.saw_call = false;
+        self.gaps = vec![MeasurementGap {
+            range: Range {
+                start: 0,
+                end: self.file.text.len(),
+            },
+            diagnostic: crate::evidence_budget::DIAGNOSTIC.into(),
+        }];
     }
 
     fn opaque_gap(&mut self, n: Node<'_>, diagnostic: String) {

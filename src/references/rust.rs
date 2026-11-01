@@ -231,6 +231,13 @@ impl Catalog {
                 check,
             )?;
         }
+        // A parser error can hide an item from any scope of its file, or move it to another.
+        for scope in &mut result.scopes {
+            if trees[scope.document].root_node().has_error() {
+                scope.opaque = true;
+                scope.cut = true;
+            }
+        }
         for edge in &mut edges {
             result.step(check)?;
             if edge.child.is_none() {
