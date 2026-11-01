@@ -94,7 +94,7 @@ pub struct SemanticRelationship {
 #[derive(Debug)]
 pub struct Projection {
     pub data: Value,
-    // Rules assign layers and report unassigned modules across the full snapshot.
+    // Rules assign layers across the full snapshot, whatever the source filter selects.
     pub(crate) modules: Vec<Value>,
     /// Exact reference-site coverage per source path and role (test = true):
     /// scanned sites, sites with at least one mapped target, and unresolved sites.

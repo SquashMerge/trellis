@@ -38,8 +38,6 @@ body.files-section #source { margin: 0; padding: 10px 0; font-size: 12px; }
 .files-symbol-pick { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 6px; width: 100%; padding: 5px 7px; border: 0; text-align: left; font: 12px/1.5 var(--mono); white-space: nowrap; }
 .files-symbol-icon { flex: none; color: var(--secondary); }
 .files-symbol-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.files-symbol-kind, .files-symbol-line { flex: none; color: var(--secondary); }
-.files-symbol-kind { margin-left: auto; padding-left: 6px; }
 .files-symbol-pick[aria-pressed=true] { background: var(--selected); color: var(--on-selected); }
 .files-symbol-pick[aria-pressed=true] > span { color: inherit; }
 /* Whole-line syntax colouring; the selected range keeps its own contrast. */

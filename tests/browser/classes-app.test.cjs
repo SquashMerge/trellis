@@ -58,8 +58,6 @@ test("published Java class renders through Pele with exact class, member and met
     assert.equal(await page.locator("#classes-diagram .pele-node").count(), 1);
     assert.equal(await node.locator(".pele-label").textContent(), declaration.symbol.name);
     assert.match(await node.getAttribute("aria-label"), new RegExp(`${declaration.symbol.path.replace(/\./g, "\\.")}`));
-    await node.locator("> rect").click({position:{x:10, y:10}});
-    await page.getByRole("menuitem", {name:/Show members/}).click();
     const expected = [...declaration.fields.map(f => `${f.name}${f.typeHint ? ": " + f.typeHint : ""}`),
       ...declaration.methods.map(m => `${m.name}()${m.typeHint ? " : " + m.typeHint : ""}`)];
     assert.deepEqual(await node.locator(".pele-member").allTextContents(), expected);

@@ -92,12 +92,12 @@
           twist.addEventListener("click", () => { if (current()) toggle(key, !open); });
           head.append(twist);
         } else head.append(make("span", undefined, "files-symbol-toggle-space"));
-        // One row: icon and name, then kind and line right-aligned. Names truncate, with the full text as a tooltip.
+        // One row: the icon marks a container or a callable and the name takes the rest. Kind and
+        // line are in the tooltip and the accessible name, and selecting a row shows them in the inspector.
         const pick = make("button", undefined, "files-symbol-pick"), icon = make("span", CONTAINERS.has(kind) || kind === "impl" ? "◆" : "◇", "files-symbol-icon");
         icon.setAttribute("aria-hidden", "true");
-        const name = make("span", label, "files-symbol-name"); name.title = label;
-        pick.append(icon, name, make("span", kind, "files-symbol-kind"), make("span", line, "files-symbol-line"));
-        pick.setAttribute("aria-label", `${label} · ${kind} · ${line}`);
+        pick.append(icon, make("span", label, "files-symbol-name"));
+        pick.title = `${label} · ${kind} · ${line}`; pick.setAttribute("aria-label", pick.title);
         pick.type = "button"; pick.setAttribute("data-symbol-id", symbol.id);
         pick.setAttribute("aria-pressed", String(selected?.symbol.id === symbol.id));
         pick.addEventListener("click", () => { if (current()) return choose(item); });

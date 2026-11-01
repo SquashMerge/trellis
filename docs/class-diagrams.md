@@ -13,7 +13,9 @@ application, run package tools, fetch dependencies, or send source to a provider
 - Right-click a class and choose **Show related classes**, select other type references, then
   **Add selected classes**. A visible hierarchy class does not need to be manually added first.
   The chooser uses the current bounded result, not an exhaustive workspace graph.
-- **Members** reveals fields, methods, qualified name and path. Click a method name to open its sequence.
+- Fields and methods show by default. A class stays collapsed, with a notice, when showing it would
+  pass the diagram's size limit. **Members** or the class menu shows or hides them; choosing a class
+  starts from the default again. Click a method name to open its sequence.
   Click a type hint, right-click a member, or use its `…` button to navigate recorded type candidates
   and the member's method. See [source and member navigation](member-navigation.md).
 - **Show all returned classes** reveals the bounded API result; **Show hierarchy and selected classes**
