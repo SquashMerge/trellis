@@ -71,7 +71,9 @@ test("resolved declaration adds a safe lane and exact measured message with keyb
  assert.equal(await page.locator(".pele-actor:not(.pele-actor-footer)").count(),2);
  const message=page.locator(`.pele-edge-label[data-trellis-step-id="${call.id}"]`);
  assert.equal(await message.getAttribute("data-trellis-call-id"),call.callId);
- assert.match(await message.textContent(),/lexical_decoy/);
+ // The arrow names the exact declaration; the measured spelling stays on the step (#558).
+ assert.equal(await message.textContent(),"[001] actual <T> & café");
+ assert.match(await message.getAttribute("aria-label"),/lexical_decoy/);
  await message.click();await message.focus();await page.keyboard.press("Enter");
  assert.deepEqual(await page.evaluate(()=>window.picks.map(step=>step.id)),[call.id,call.id]);
  const action=page.locator(`.pele-actor[data-trellis-target-id="${target.id}"]`).first();
@@ -202,7 +204,7 @@ test("changed resolved message or participant mapping refuses all target and sou
        // Change trusted renderer output before production validation, not the installed DOM.
        let svg=output.svg;
        if(mutation==="message-id") svg=svg.replace(/(class="pele-edge pele-message" data-id=")[^"]+/,"$1i999");
-       if(mutation==="message-text") svg=svg.replace("lexical_decoy","changed_decoy");
+       if(mutation==="message-text") svg=svg.replace("[001]","[002]");
        if(mutation==="participant-id") svg=svg.replace(/(class="pele-node pele-actor[^"]*" data-id=")P1/,"$1P999");
        if(mutation==="participant-text") svg=svg.replace("actual &lt;T&gt; &amp; café","altered &lt;T&gt; &amp; café");
        if(mutation==="message-order") svg=svg.replace(/(class="pele-edge-label" data-id=")i1/,"$1i2");

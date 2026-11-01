@@ -231,6 +231,13 @@ impl Catalog {
                 check,
             )?;
         }
+        // A parser error can hide an item from any scope of its file, or move it to another.
+        for scope in &mut result.scopes {
+            if trees[scope.document].root_node().has_error() {
+                scope.opaque = true;
+                scope.cut = true;
+            }
+        }
         for edge in &mut edges {
             result.step(check)?;
             if edge.child.is_none() {
@@ -305,6 +312,7 @@ impl Catalog {
                 }
             }
         }
+        result.keep_lost_owners_unknown(docs, trees, &edges, check)?;
         for id in 0..result.scopes.len() {
             result.step(check)?;
             let scope = &result.scopes[id];
@@ -325,6 +333,56 @@ impl Catalog {
             index.build(0, index.ranges.len(), &mut result.work, check)?;
         }
         Ok(result)
+    }
+    /// A parser error can hide a `mod` from its file, and a file with two owners has no proved
+    /// crate. So a file a broken module could declare, because its text names it, has no root
+    /// unless that broken file still declares it, and neither has anything below it.
+    fn keep_lost_owners_unknown(
+        &mut self,
+        docs: &[&DocumentInput],
+        trees: &[Tree],
+        edges: &[ModuleEdge],
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let mut pending = Vec::new();
+        for (&document, &owner) in &self.files.clone() {
+            if !trees[document].root_node().has_error() {
+                continue;
+            }
+            let (names, unnamed) = possible_module_names(&docs[document].file.text);
+            let below = format!("{}/", self.scopes[owner].directory);
+            for (&other, &child) in &self.files.clone() {
+                self.step(check)?;
+                let path = &docs[other].key.path;
+                let name = path
+                    .strip_suffix("/mod.rs")
+                    .or_else(|| path.strip_suffix(".rs"))
+                    .and_then(|module| module.rsplit('/').next());
+                if other != document
+                    && path.starts_with(&below)
+                    && (unnamed || name.is_some_and(|name| names.contains(name)))
+                    && !edges
+                        .iter()
+                        .any(|edge| edge.scope == owner && edge.child == Some(child))
+                {
+                    pending.push(child);
+                }
+            }
+        }
+        let mut visited = BTreeSet::new();
+        while let Some(scope) = pending.pop() {
+            self.step(check)?;
+            if visited.insert(scope) {
+                self.ambiguous.insert(scope);
+                pending.extend(
+                    edges
+                        .iter()
+                        .filter(|edge| edge.scope == scope)
+                        .filter_map(|edge| edge.child),
+                );
+            }
+        }
+        Ok(())
     }
     fn step(&mut self, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
         check()?;
@@ -1655,6 +1713,24 @@ fn imports(
         }
     }
     Ok((result, cut))
+}
+
+/// The words of a source's text, whatever its syntax, and whether a `mod` has no name left to
+/// read. A parser error can break the keyword too, so any word could have been a module.
+fn possible_module_names(text: &str) -> (BTreeSet<&str>, bool) {
+    let identifier = |c: char| c.is_alphanumeric() || c == '_';
+    let words: BTreeSet<_> = text
+        .split(|c| !identifier(c))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let unnamed = text.match_indices("mod").any(|(at, _)| {
+        let tail = text[at + 3..].trim_start();
+        !text[..at].ends_with(identifier)
+            && !text[at + 3..].starts_with(identifier)
+            && !tail.starts_with(identifier)
+            && !tail.starts_with("r#")
+    });
+    (words, unnamed)
 }
 
 pub(super) fn extract(

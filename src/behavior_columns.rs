@@ -1,0 +1,492 @@
+//! Which column a sequence participant is drawn in (#558): one per type or module, so a
+//! type's methods share a lifeline and the method is named on the arrow. A display grouping
+//! over measured declarations: it never changes a step's exact target.
+use crate::behavior::{MAX_COLUMNS, Participant, SequenceColumn};
+use crate::files_view::ImplTarget;
+use crate::model::{Symbol, SymbolKind};
+use anyhow::Result;
+use std::collections::BTreeMap;
+
+/// The declarations of one document, by ID, and its text. Reads nothing: the caller supplies
+/// both from the selected snapshot.
+pub(crate) struct DocumentColumns {
+    pub language: String,
+    pub nodes: BTreeMap<String, Symbol>,
+    pub text: String,
+}
+
+/// A Rust type, whose `impl` blocks may span files, or a class or module of one document.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Owner {
+    RustType { target: ImplTarget, scope: String },
+    Column(SequenceColumn),
+}
+
+impl DocumentColumns {
+    /// The nearest named type enclosing `symbol`, itself included, or else its module.
+    /// A closure or nested function belongs to whatever encloses it. Rust: `impl` type,
+    /// trait, struct or enum, else the module; `impl Trait for Foo` belongs to `Foo`.
+    /// JavaScript, Java and Python: the class, else the file.
+    pub(crate) fn owner(&self, symbol: &Symbol) -> Owner {
+        for node in self.ancestry(symbol) {
+            if node.kind != SymbolKind::Class {
+                continue;
+            }
+            let named = !node.name.starts_with('<');
+            if self.language != "rust" {
+                if named {
+                    return Owner::Column(SequenceColumn {
+                        id: node.id.clone(),
+                        label: node.name.clone(),
+                    });
+                }
+                continue;
+            }
+            let block = self.text.get(node.range.start_byte..node.range.end_byte);
+            let target = block.and_then(crate::files_view::impl_block_target);
+            let declared = named.then(|| ImplTarget {
+                name: node.name.clone(),
+                written: node.name.clone(),
+                relative: false,
+            });
+            if let Some(target) = target.or(declared) {
+                let scope = self.inline_modules(node, &symbol.path);
+                return Owner::RustType {
+                    target,
+                    scope: format!("{}{scope}", symbol.path),
+                };
+            }
+        }
+        let label = file_module(&symbol.path) + &self.inline_modules(symbol, &symbol.path);
+        Owner::Column(SequenceColumn {
+            id: format!("module:{}:{label}", symbol.path),
+            label,
+        })
+    }
+
+    /// `symbol` and then the declarations enclosing it, innermost first. A parent chain is a
+    /// tree; the bound only stops a corrupt row from looping.
+    fn ancestry<'a>(&'a self, symbol: &'a Symbol) -> impl Iterator<Item = &'a Symbol> {
+        std::iter::successors(Some(symbol), |node| self.nodes.get(node.parent.as_ref()?))
+            .take(self.nodes.len() + 1)
+    }
+
+    /// The inline modules enclosing `node`, as a `::a::b` suffix of its file's module.
+    fn inline_modules(&self, node: &Symbol, path: &str) -> String {
+        let modules: Vec<_> = self
+            .ancestry(node)
+            .filter(|n| n.kind == SymbolKind::Module && n.name != path)
+            .map(|n| format!("::{}", n.name))
+            .collect();
+        modules.into_iter().rev().collect()
+    }
+}
+
+impl Owner {
+    /// The column of this owner. A Rust type's name joins its `impl` blocks across files
+    /// when it names one type in the snapshot, the ordinary case. `declarations` counts the
+    /// types of that name; when several exist, nothing here says which an `impl` implements,
+    /// so its blocks stay apart by file, module and the path as written rather than conflate
+    /// two types. A relative path may name a foreign type, so it never joins a local name.
+    pub(crate) fn column(
+        self,
+        declarations: &mut dyn FnMut(&str) -> Result<usize>,
+    ) -> Result<SequenceColumn> {
+        Ok(match self {
+            Owner::Column(column) => column,
+            Owner::RustType { target, scope } => {
+                let ImplTarget {
+                    name,
+                    written,
+                    relative,
+                } = target;
+                let id = if declarations(&name)? > 1 {
+                    format!("type:{scope}:{written}")
+                } else if relative {
+                    format!("type:{written}")
+                } else {
+                    format!("type:{name}")
+                };
+                let label = if relative { written } else { name };
+                SequenceColumn { id, label }
+            }
+        })
+    }
+}
+
+/// The module a file is, by the last meaningful segment of its path: `src/a/b.rs` is `b`,
+/// `src/a/mod.rs` and `src/a/__init__.py` are `a`. JavaScript keeps its file name.
+fn file_module(path: &str) -> String {
+    let mut segments = path.rsplit('/');
+    let file = segments.next().unwrap_or(path);
+    let (stem, extension) = file.rsplit_once('.').unwrap_or((file, ""));
+    match (stem, extension) {
+        ("mod", "rs") | ("__init__", "py") => segments.next().unwrap_or(stem).to_owned(),
+        (_, "rs" | "py") => stem.to_owned(),
+        _ => file.to_owned(),
+    }
+}
+
+/// Whether a target in `column` can be drawn: its column is drawn already, or fits.
+pub(crate) fn fits(participants: &[Participant], column: &SequenceColumn) -> bool {
+    let mut drawn: Vec<&str> = participants
+        .iter()
+        .filter_map(|p| p.column.as_ref())
+        .map(|c| c.id.as_str())
+        .collect();
+    drawn.sort_unstable();
+    drawn.dedup();
+    drawn.contains(&column.id.as_str()) || drawn.len() < MAX_COLUMNS
+}
+
+/// Tells apart two columns that would read the same (two `index.js`, or a type name that
+/// stayed apart), by the path of each column's first participant, and by its line when the
+/// two share a file.
+pub(crate) fn disambiguate(participants: &mut [Participant]) {
+    let mut first: BTreeMap<String, BTreeMap<String, &Symbol>> = BTreeMap::new();
+    for participant in participants.iter() {
+        if let (Some(column), Some(symbol)) = (&participant.column, &participant.declaration) {
+            first
+                .entry(column.label.clone())
+                .or_default()
+                .entry(column.id.clone())
+                .or_insert(symbol);
+        }
+    }
+    let mut names = BTreeMap::new();
+    for (label, ids) in first.iter().filter(|(_, ids)| ids.len() > 1) {
+        for (id, symbol) in ids {
+            let shared = ids.values().filter(|s| s.path == symbol.path).count() > 1;
+            let name = if shared {
+                format!("{label} ({}:{})", symbol.path, symbol.range.start_line)
+            } else {
+                format!("{label} ({})", symbol.path)
+            };
+            names.insert(id.clone(), name);
+        }
+    }
+    for participant in participants {
+        if let Some(column) = &mut participant.column
+            && let Some(name) = names.get(&column.id)
+        {
+            column.label.clone_from(name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Provenance, SemanticState, SourceRange};
+
+    fn symbol(
+        id: &str,
+        name: &str,
+        kind: SymbolKind,
+        parent: Option<&str>,
+        start: usize,
+    ) -> Symbol {
+        Symbol {
+            id: id.into(),
+            name: name.into(),
+            display_label: None,
+            kind,
+            path: "src/store/graph_read.rs".into(),
+            range: SourceRange {
+                start_byte: start,
+                end_byte: start + 1,
+                ..SourceRange::default()
+            },
+            parent: parent.map(str::to_owned),
+            accessor: false,
+            provenance: Provenance {
+                source: "test".into(),
+                semantic: SemanticState::Unavailable,
+            },
+        }
+    }
+
+    fn nodes(symbols: Vec<Symbol>) -> BTreeMap<String, Symbol> {
+        symbols.into_iter().map(|s| (s.id.clone(), s)).collect()
+    }
+
+    #[test]
+    fn file_modules_name_the_module_not_its_entry_file() {
+        assert_eq!(file_module("src/store/graph_read.rs"), "graph_read");
+        assert_eq!(file_module("src/store/mod.rs"), "store");
+        assert_eq!(file_module("pkg/sub/__init__.py"), "sub");
+        assert_eq!(file_module("pkg/util.py"), "util");
+        assert_eq!(file_module("web/app.js"), "app.js");
+    }
+
+    #[test]
+    fn a_rust_method_belongs_to_its_impl_type_even_for_a_trait_or_a_closure() {
+        let path = "src/store/graph_read.rs";
+        let text = "impl<T> Display for crate::a::Store<T> where T: Copy { fn open() {} }";
+        let mut block = symbol(
+            "impl",
+            "<implementation@0>",
+            SymbolKind::Class,
+            Some("file"),
+            0,
+        );
+        block.range.end_byte = text.len();
+        let columns = DocumentColumns {
+            language: "rust".into(),
+            nodes: nodes(vec![
+                symbol("file", path, SymbolKind::Module, None, 0),
+                block,
+                symbol("m", "open", SymbolKind::Method, Some("impl"), 11),
+                symbol("c", "<closure>", SymbolKind::Function, Some("m"), 12),
+            ]),
+            text: text.into(),
+        };
+        for id in ["m", "c"] {
+            assert_eq!(
+                columns.owner(&columns.nodes[id]),
+                Owner::RustType {
+                    target: ImplTarget {
+                        name: "Store".into(),
+                        written: "crate::a::Store".into(),
+                        relative: false,
+                    },
+                    scope: path.into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_rust_impl_of_no_nameable_type_falls_back_to_its_module() {
+        let path = "src/store/graph_read.rs";
+        for text in [
+            "impl Tr for [u8] { fn open() {} }",
+            "impl<A: X> Tr for A { fn open() {} }",
+            "impl<A> Tr for &A { fn open() {} }",
+            "impl<A: X> Tr for Box<A> where A: Y { fn open() {} }",
+        ] {
+            let mut block = symbol(
+                "impl",
+                "<implementation@0>",
+                SymbolKind::Class,
+                Some("file"),
+                0,
+            );
+            block.range.end_byte = text.len();
+            let columns = DocumentColumns {
+                language: "rust".into(),
+                nodes: nodes(vec![
+                    symbol("file", path, SymbolKind::Module, None, 0),
+                    block,
+                    symbol("m", "open", SymbolKind::Method, Some("impl"), 11),
+                ]),
+                text: text.into(),
+            };
+            let expected = if text.contains("Box") {
+                "Box"
+            } else {
+                "graph_read"
+            };
+            let label = match columns.owner(&columns.nodes["m"]) {
+                Owner::Column(column) => column.label,
+                Owner::RustType { target, .. } => target.name,
+            };
+            assert_eq!(label, expected, "{text}");
+        }
+    }
+
+    fn target(name: &str, written: &str, relative: bool) -> ImplTarget {
+        ImplTarget {
+            name: name.into(),
+            written: written.into(),
+            relative,
+        }
+    }
+
+    #[test]
+    fn an_impl_target_is_read_as_written() {
+        let read = crate::files_view::impl_block_target;
+        for (header, expected) in [
+            (
+                "impl Tr for fmt::Error {",
+                target("Error", "fmt::Error", true),
+            ),
+            (
+                "impl Tr for &other::a::E<T> {",
+                target("E", "other::a::E", true),
+            ),
+            (
+                "impl Tr for crate::a::E {",
+                target("E", "crate::a::E", false),
+            ),
+            (
+                "impl super::Tr for self::E {",
+                target("E", "self::E", false),
+            ),
+            ("impl Tr for E {", target("E", "E", false)),
+        ] {
+            assert_eq!(read(header), Some(expected), "{header}");
+        }
+    }
+
+    #[test]
+    fn a_rust_free_function_belongs_to_its_file_and_inline_modules() {
+        let path = "src/store/graph_read.rs";
+        let columns = DocumentColumns {
+            language: "rust".into(),
+            nodes: nodes(vec![
+                symbol("file", path, SymbolKind::Module, None, 0),
+                symbol("mod", "tests", SymbolKind::Module, Some("file"), 1),
+                symbol("f", "helper", SymbolKind::Function, Some("mod"), 2),
+                symbol("g", "top", SymbolKind::Function, Some("file"), 3),
+            ]),
+            text: String::new(),
+        };
+        let label = |id: &str| match columns.owner(&columns.nodes[id]) {
+            Owner::Column(column) => column.label,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(label("f"), "graph_read::tests");
+        assert_eq!(label("g"), "graph_read");
+    }
+
+    #[test]
+    fn a_class_is_its_own_column_and_an_anonymous_class_defers_outward() {
+        let columns = DocumentColumns {
+            language: "java".into(),
+            nodes: nodes(vec![
+                symbol(
+                    "file",
+                    "src/store/graph_read.rs",
+                    SymbolKind::Module,
+                    None,
+                    0,
+                ),
+                symbol("outer", "Outer", SymbolKind::Class, Some("file"), 1),
+                symbol("anon", "<class@2>", SymbolKind::Class, Some("outer"), 2),
+                symbol("m", "run", SymbolKind::Method, Some("anon"), 3),
+            ]),
+            text: String::new(),
+        };
+        let outer = Owner::Column(SequenceColumn {
+            id: "outer".into(),
+            label: "Outer".into(),
+        });
+        assert_eq!(columns.owner(&columns.nodes["m"]), outer);
+        assert_eq!(columns.owner(&columns.nodes["outer"]), outer);
+    }
+
+    fn id(written: &str, relative: bool, scope: &str, count: usize) -> SequenceColumn {
+        let name = written.rsplit("::").next().unwrap();
+        Owner::RustType {
+            target: target(name, written, relative),
+            scope: scope.into(),
+        }
+        .column(&mut |counted| {
+            assert_eq!(counted, name, "the count is by the declared name");
+            Ok(count)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_rust_type_name_joins_files_only_while_it_names_one_type() {
+        assert_eq!(id("S", false, "a.rs", 1), id("S", false, "b.rs", 1));
+        assert_eq!(
+            id("S", false, "a.rs", 1),
+            id("crate::m::S", false, "b.rs", 1)
+        );
+        assert_ne!(id("S", false, "a.rs", 2), id("S", false, "b.rs", 2));
+        assert_eq!(id("S", false, "a.rs", 2), id("S", false, "a.rs", 2));
+        assert_eq!(id("S", false, "a.rs", 2).label, "S");
+    }
+
+    #[test]
+    fn two_paths_to_two_declared_types_are_never_conflated() {
+        // One file, two crate paths to two types of one name.
+        assert_ne!(
+            id("crate::a::S", false, "c.rs", 2),
+            id("crate::b::S", false, "c.rs", 2)
+        );
+        // One relative path written in two files, resolving to two types.
+        assert_ne!(
+            id("types::Config", true, "a/x.rs", 2),
+            id("types::Config", true, "b/x.rs", 2)
+        );
+    }
+
+    #[test]
+    fn a_relative_path_never_joins_a_local_name() {
+        let foreign = id("fmt::Error", true, "a.rs", 1);
+        assert_ne!(foreign, id("Error", false, "a.rs", 1));
+        assert_eq!(foreign.label, "fmt::Error");
+        assert_eq!(foreign, id("fmt::Error", true, "b.rs", 1));
+    }
+
+    fn participant(id: &str, column: &str, label: &str, path: &str) -> Participant {
+        let mut declaration = symbol(id, id, SymbolKind::Method, None, 1);
+        declaration.path = path.into();
+        Participant {
+            id: id.into(),
+            label: id.into(),
+            kind: "method".into(),
+            identification: String::new(),
+            declaration: Some(declaration),
+            column: Some(SequenceColumn {
+                id: column.into(),
+                label: label.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_column_cap_counts_columns_not_methods() {
+        let mut participants: Vec<_> = (0..MAX_COLUMNS)
+            .map(|i| participant(&format!("m{i}"), &format!("c{i}"), "x", "a.rs"))
+            .collect();
+        participants.push(participant("again", "c0", "x", "a.rs"));
+        let known = participant("next", "c1", "x", "a.rs");
+        let new = participant("next", "new", "x", "a.rs");
+        assert!(fits(&participants, known.column.as_ref().unwrap()));
+        assert!(!fits(&participants, new.column.as_ref().unwrap()));
+        participants.truncate(MAX_COLUMNS - 1);
+        assert!(fits(&participants, new.column.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn columns_that_read_the_same_are_told_apart_by_path() {
+        let mut participants = vec![
+            participant("a", "1", "index.js", "web/a/index.js"),
+            participant("b", "1", "index.js", "web/a/index.js"),
+            participant("c", "2", "index.js", "web/b/index.js"),
+            participant("d", "3", "Store", "src/s.rs"),
+        ];
+        disambiguate(&mut participants);
+        let labels: Vec<_> = participants
+            .iter()
+            .map(|p| p.column.as_ref().unwrap().label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "index.js (web/a/index.js)",
+                "index.js (web/a/index.js)",
+                "index.js (web/b/index.js)",
+                "Store"
+            ]
+        );
+    }
+
+    #[test]
+    fn same_named_columns_of_one_file_are_told_apart_by_line() {
+        let mut one = participant("a", "1", "S", "a.rs");
+        let mut two = participant("b", "2", "S", "a.rs");
+        one.declaration.as_mut().unwrap().range.start_line = 3;
+        two.declaration.as_mut().unwrap().range.start_line = 9;
+        let mut participants = vec![one, two];
+        disambiguate(&mut participants);
+        let label = |at: usize| participants[at].column.as_ref().unwrap().label.as_str();
+        assert_eq!(label(0), "S (a.rs:3)");
+        assert_eq!(label(1), "S (a.rs:9)");
+    }
+}

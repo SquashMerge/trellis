@@ -148,7 +148,7 @@ browser() {
   cargo build --locked --bin trellis
   python3 tools/verify-40-query-performance.py --smoke --binary "$target_dir/debug/trellis"
   browser_system_deps
-  TRELLIS_NAVIGATION_FIXTURE_BINARY="$target_dir/debug/trellis-navigation-fixture" TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/treemap.test.cjs tests/browser/classes-pele.test.cjs tests/browser/classes-app.test.cjs tests/browser/classes-languages.test.cjs tests/browser/navigation-resolved.test.cjs
+  TRELLIS_NAVIGATION_FIXTURE_BINARY="$target_dir/debug/trellis-navigation-fixture" TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence-readable.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/treemap.test.cjs tests/browser/classes-pele.test.cjs tests/browser/classes-app.test.cjs tests/browser/classes-languages.test.cjs tests/browser/navigation-resolved.test.cjs
 }
 rust() {
   lint

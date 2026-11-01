@@ -816,7 +816,7 @@ test("resolved projection maps original occurrences and participants, not call s
   view.steps = [branch];
   const result = adapter.project(view);
   assert.equal(result.lanes.length,2);
-  assert.equal(result.lanes[1].participant.declaration,target);
+  assert.equal(result.lanes[1].targets.get(target.id).participant.declaration,target);
   assert.match(result.source,/participant P1 as actual_target/);
   assert.equal(result.rows[1].step,call);
   assert.equal(result.rows[2].step,repeat);
@@ -892,7 +892,7 @@ test("measured boundary calls retain their control-flow context and exact engine
   view.steps = [boundary];
   const row = peleProjector().project(view).rows[0];
   assert.equal(row.step,boundary); assert.equal(row.target.declaration,target); assert.equal(row.type,"note");
-  assert.match(row.display,/boundary Resolved declaration - Optional-chain/);
+  assert.match(row.display,/Resolved declaration - Optional-chain/);
   const nodes = diagram(view,{onOpenTarget:()=>{}}).nodes();
   assert.ok(nodes.some(n=>n.attrs["data-trellis-target-id"]===target.id));
   assert.equal(nodes.filter(n=>n.attrs.class === "sequence-arrow").length,0);

@@ -2,6 +2,7 @@ pub mod architecture_details;
 pub mod auth;
 pub mod behavior;
 mod behavior_bindings;
+mod behavior_columns;
 mod behavior_incidental;
 mod behavior_java;
 pub mod behavior_js;
@@ -16,6 +17,7 @@ pub mod dependencies;
 pub mod dependency_links;
 mod dependency_rust;
 pub mod dependency_rust_symbols;
+pub(crate) mod evidence_budget;
 #[cfg(test)]
 mod extractor_inputs_tests;
 pub mod file_tree;

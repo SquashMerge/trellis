@@ -54,9 +54,12 @@ function sequenceBasisLabel(evidence) {
   return `basis ${basis.producerId}${typeof basis.producerVersion === "string" ? " " + basis.producerVersion : ""}`;
 }
 // A call that may return early carries its folded `?` and guards (#542); a chain group
-// shows it when one of its calls does. Server fields, never inferred from labels.
+// shows it when one of its calls does. An `if` or `match` carries the guard after it (#558):
+// its own frame shows how the path ends. Server fields, never inferred from labels.
 function sequenceEarlyReturn(step) {
   const folded = item => Array.isArray(item?.folded) && item.folded.length > 0;
+  // A branch keeps its folded steps when the depth bound redraws it as a boundary: no call ID.
+  if (folded(step) && !step.callId) return " · may exit early";
   return folded(step) || step?.kind === "group" && (step.children || []).some(folded) ? " · may return early" : "";
 }
 function sequenceEntry(step) {
@@ -64,6 +67,128 @@ function sequenceEntry(step) {
   return step?.kind === "group" && !step.alternate?.length && children.length &&
     children.every(child => child.kind === "call" && !child.hidden && !child.children?.length && !child.alternate?.length && sourceWitness(child) && child.path === step.path) &&
     sourceWitness(step) ? children[0] : null;
+}
+// Exact DTO prose is abbreviated for display only. These mappings never
+// equate guards, alter their source ranges, or change the control tree.
+const compactLabels = new Map([
+  ["only if the preceding path continues normally", "continues"],
+  ["?: continue only on success; otherwise early return", "success / early return"],
+  ["?: early return on residual; conversion not expanded", "early return"],
+  ["only if iteration continues normally", "iteration continues"],
+  ["arm body only if guard is true", "guard is true"],
+  ["RHS only if left is true", "left is true"],
+  ["RHS only if left is false", "left is false"],
+  ["RHS only if left is truthy", "left is truthy"],
+  ["RHS only if left is falsy", "left is falsy"],
+  ["RHS only if left is nullish", "left is nullish"],
+  ["match: mutually exclusive arms; first matching pattern with true guard", "match · first matching arm"],
+  ["body only if condition is true / next item exists (loop: each iteration)", "condition true / next item"],
+  ["catch: only if an exception reaches this handler", "catch · exception reaches handler"],
+  ["for_expression: possible iterations, not unrolled; exit/termination unknown", "for · possible iterations"],
+  ["while_expression: possible iterations, not unrolled; exit/termination unknown", "while · possible iterations"],
+  ["loop_expression: possible iterations, not unrolled; exit/termination unknown", "loop · termination unknown"],
+  ["Definition boundary: decorators/defaults/annotations and binding effects not expanded; callable body does not execute here.", "definition · effects not expanded"],
+  ["Class definition boundary: bases, decorators, metaclass and class-body execution not expanded; method bodies do not execute here.", "class definition · effects not expanded"],
+  ["Nested callable boundary: body does not execute at definition; captures are not expanded.", "nested callable · captures not expanded"],
+  ["Lambda boundary: body does not execute at definition; captures are not expanded.", "lambda · captures not expanded"],
+  ["Nested declaration boundary: bodies are not executed here; implicit initialization is not expanded.", "nested declaration · initialization not expanded"],
+  ["Nested function/callback/class boundary: bodies are not executed here; class definition effects (base, computed keys, static initialization) are not expanded.", "nested definition · effects not expanded"],
+  ["Attribute lookup: descriptor/__getattribute__ effects and type unresolved.", "attribute lookup · effects/type unresolved"],
+  ["Subscription: implicit __getitem__ effects unresolved.", "subscription · effects unresolved"],
+  ["Comprehension/generator boundary: iteration, filters and deferred execution not expanded.", "comprehension / generator · not expanded"],
+  ["Context-manager/match boundary: implicit protocol and conditional execution not expanded.", "context manager / match · not expanded"],
+  ["Async iteration boundary: protocol and suspension not expanded.", "async iteration · protocol not expanded"],
+  ["Argument unpacking boundary: iteration/mapping protocol not expanded.", "argument unpacking · protocol not expanded"],
+  ["Formatted string boundary: interpolation and formatting protocol not expanded.", "formatted string · protocol not expanded"],
+  ["Yield boundary: generator suspension, send/throw/close and yield-from protocol not expanded.", "yield · protocol not expanded"],
+  ["Try boundary: exception selection, else and finally execution/transfers not expanded.", "try · paths not expanded"],
+  ["Assignment target boundary: unpacking/setter effects not expanded.", "assignment target · effects not expanded"],
+  ["Call unpacking boundary: positional/keyword evaluation and iteration effects not expanded.", "call unpacking · effects not expanded"],
+  ["Augmented assignment boundary: target read/write and overloaded operator effects not expanded.", "augmented assignment · effects not expanded"],
+  ["Chained assignment boundary: target write sequence not expanded.", "chained assignment · writes not expanded"],
+  ["Annotation-only target boundary: target address effects not expanded; local annotation is not evaluated.", "annotation target · effects not expanded"],
+  ["Chained comparison boundary: later operands are conditional; not expanded.", "chained comparison · conditional / not expanded"],
+  ["Loop-else boundary: break versus exhaustion paths not expanded.", "loop else · paths not expanded"],
+  ["Async block boundary: future construction does not execute its body; captures are not expanded.", "async block · captures not expanded"],
+  ["Opaque macro/unsafe/const boundary: expansion, effects and transfers unknown.", "macro / unsafe / const · effects unknown"],
+  ["Unsupported control transfer: remainder of this path omitted.", "unsupported transfer · path omitted"],
+  ["Unsupported complex control: possible behavior remains unknown; body not expanded.", "unsupported control · behavior unknown"],
+  ["Destructuring binding: computed keys/defaults/implicit reads are not expanded (RHS evaluated first).", "destructuring binding · reads not expanded"],
+  ["Destructuring assignment: computed keys/defaults/writes are not expanded (RHS evaluated first).", "destructuring assignment · writes not expanded"],
+  ["Loop destructuring binding: per-iteration reads/defaults are not expanded.", "loop destructuring · reads not expanded"],
+  ["Parameter defaults/destructuring may execute before the body; behavior not expanded.", "parameter defaults / destructuring · not expanded"],
+  ["await: possible suspension/resumption; await protocol unresolved", "await · protocol unresolved"],
+  ["await: suspension/resumption boundary, timing unknown", "await · timing unknown"],
+  ["iteration target write: implicit setters/unpacking unresolved", "iteration write · setters/unpacking unresolved"]
+]);
+const analysisKinds = new Set(["effect", "return", "throw", "exit", "await", "note", "boundary", "definition"]);
+function compactAnalysis(step) {
+  const label = step.label || step.kind;
+  if (compactLabels.has(label)) return compactLabels.get(label);
+  // Abbreviate DTO evidence categories, not source expressions. Never parse an
+  // assignment target or infer a return value from the original source label.
+  if (step.kind === "effect") {
+    if (label.startsWith("bind name: ")) return `bind ${label.slice("bind name: ".length)}`;
+    if (label.startsWith("write: ")) return label.endsWith(" (implicit setters/unpacking unresolved)")
+      ? "write · setters/unpacking unresolved" : "write";
+    return "effect · inspect details";
+  }
+  if (step.kind === "return" || step.kind === "throw") return step.kind;
+  if (step.kind === "definition") return label.startsWith("define ") ? label : "definition · inspect details";
+  return label;
+}
+// Compact rows stay near one screen wide; the full label is in the inspector (#558).
+const SEQUENCE_LABEL_LIMIT = 72;
+// The row of an arrow, in both renderers (#558): its number and the exact target's name. The
+// lane names the type. The call's source text and evidence are in the inspector and Show all.
+function sequenceArrowLabel(ordinal, target, collapsed, early, limit = SEQUENCE_LABEL_LIMIT) {
+  const marker = `[${String(ordinal).padStart(3, "0")}]`, name = target.declaration.name || target.label;
+  const suffix = `${collapsed ? ` +${collapsed} calls collapsed (entry preview)` : ""}${early}`;
+  const room = Math.max(12, limit - marker.length - 1 - suffix.length);
+  return `${marker} ${name.length > room ? `${name.slice(0, room - 1)}…` : name}${suffix}`;
+}
+// The short text of a step (#558). The exact label stays in the DTO and the inspector.
+function sequenceCompactLabel(step) {
+  const label = step.label || step.kind;
+  return analysisKinds.has(step.kind) ? compactAnalysis(step) : compactLabels.get(label) || label;
+}
+// The column a participant is drawn in (#558): its type or module. A syntax hint, which has
+// none, stays its own column. The participant keeps the exact identity.
+function sequenceColumn(participant) {
+  const column = participant?.column;
+  return typeof column?.id === "string" && column.id && typeof column.label === "string" && column.label
+    ? column : {id:participant?.id, label:participant?.label};
+}
+// Rust's standard library crates, as a producer names their package. Other languages' producers
+// do not name one, so their external calls stay "external".
+const STANDARD_LIBRARIES = new Set(["std", "core", "alloc"]);
+// What to say when a view has steps and every one is hidden (#558), or "" when any shows.
+// Counts come from the server; the reasons are the steps' own.
+function sequenceEmptySummary(view) {
+  const steps = view?.steps || [];
+  if (!steps.length || steps.some(step => !step.hidden)) return "";
+  const hidden = [];
+  const walk = items => { for (const step of items) { if (step.incidental) hidden.push(step); walk(step.children || []); walk(step.alternate || []); } };
+  walk(steps);
+  const external = step => step.incidental === "external";
+  const standard = step => {
+    const pkg = step.callEvidence?.externalPackage;
+    return external(step) && pkg?.manager === "cargo" && STANDARD_LIBRARIES.has(pkg.name);
+  };
+  const kind = hidden.length && hidden.every(standard) ? "standard-library" : hidden.length && hidden.every(external) ? "external" : "incidental";
+  return `Only ${kind} calls (${view.hiddenSteps} hidden).`;
+}
+// Replaces a diagram with its empty state. `onShow`, when given, is a real control.
+function renderSequenceEmpty(container, summary, onShow) {
+  const note = document.createElement("p");
+  note.className = "sequence-empty"; note.textContent = `${summary} `;
+  if (onShow) {
+    const show = document.createElement("button");
+    show.type = "button"; show.textContent = "Show them";
+    show.addEventListener("click", onShow);
+    note.append(show);
+  }
+  container.replaceChildren(note);
 }
 const sequenceRenders = new WeakMap();
 function beginSequenceRender(container) {
@@ -105,16 +230,26 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     pending.push(...[...(step.alternate || []).slice().reverse(), ...(step.children || []).slice().reverse()].map(step => ({step, depth:depth+1})));
   }
   // Hidden chain members and replaced candidate hints must not leave ghost lanes.
-  const participants = [...visibleTargets].map(id => participantById.get(id)).filter(Boolean);
+  // One column per type or module (#558). A column with one method keeps its open action.
+  const columns = new Map();
+  for (const id of visibleTargets) {
+    const participant = participantById.get(id);
+    if (!participant) continue;
+    const column = sequenceColumn(participant), known = columns.get(column.id);
+    if (known) known.members.push(participant);
+    else columns.set(column.id, {...participant, id:column.id, label:column.label, members:[participant]});
+  }
+  const participants = [...columns.values()];
   // Keep a readable guard column even for deeply nested input. The canvas scrolls.
   const width = Math.max(720, participants.length * 210 + 80, visibleDepth * 10 + 400);
   const svg = make("svg", {viewBox:`0 0 ${width} 200`, width, role:"group", "aria-label":"Static possible paths; resolved declarations where evidenced, not a runtime trace"});
   svg.append(make("title", {}, `${view.seed.name}: measured source steps, not a runtime trace${view.revision?.indexGeneration ? ` · revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}` : ""}`));
   const positions = new Map(participants.map((p, i) => [p.id, 130 + i * 210]));
-  const origin = positions.get(view.seed.id) || 130;
+  const columnX = id => positions.get(sequenceColumn(participantById.get(id)).id);
+  const origin = columnX(view.seed.id) || 130;
   // Steps of an expanded callee body run on that callee's lane (#522); the seed's own
   // steps carry no lane.
-  const laneX = step => (step?.lane != null && positions.get(step.lane)) || origin;
+  const laneX = step => (step?.lane != null && columnX(step.lane)) || origin;
   const lines = make("g", {class:"sequence-lifelines"}); svg.append(lines);
   const kindLabels = {externalCandidate:"External type · candidate", unresolvedReceiver:"Receiver · type unresolved", unresolvedCallee:"Callee · unresolved", boundary:"Unknown target", builtin:"Built-in name", import:"Imported binding", receiver:"Receiver hint", internal:"Indexed target", method:"Selected method"};
   const compactKinds = {externalCandidate:"candidate", unresolvedReceiver:"unresolved", unresolvedCallee:"unresolved", boundary:"unknown", builtin:"source hint", import:"source hint", receiver:"source hint", internal:"indexed", method:"selected"};
@@ -124,13 +259,13 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     svg.append(make("rect", {x:x-95, y:10, width:190, height:44, class:"participant"}));
     const text = make("text", {x, y:28, "text-anchor":"middle", class:"sequence-participant-label"}, shorten(p.label, 24));
     text.append(make("title", {}, p.label)); svg.append(text);
-    if (p.declaration && typeof options.onOpenTarget === "function") {
-      const proof = targetProofs.get(p.id);
+    if (p.members.length === 1 && p.members[0].declaration && typeof options.onOpenTarget === "function") {
+      const member = p.members[0], proof = targetProofs.get(member.id);
       if (proof) {
         text.setAttribute("role", "button"); text.setAttribute("tabindex", "0");
-        text.setAttribute("aria-label", `${sequenceTargetActionLabel(p.declaration)}: ${p.declaration.name}`);
-        text.setAttribute("data-trellis-target-id", p.id);
-        const open = () => { if ((!options.isCurrent || options.isCurrent()) && sequenceTarget(view, proof) === p) options.onOpenTarget(p.declaration, proof); };
+        text.setAttribute("aria-label", `${sequenceTargetActionLabel(member.declaration)}: ${member.declaration.name}`);
+        text.setAttribute("data-trellis-target-id", member.id);
+        const open = () => { if ((!options.isCurrent || options.isCurrent()) && sequenceTarget(view, proof) === member) options.onOpenTarget(member.declaration, proof); };
         text.addEventListener("click", open);
         text.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });
       }
@@ -158,80 +293,13 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     }
     return output;
   };
-  // Exact DTO prose is abbreviated for display only. These mappings never
-  // equate guards, alter their source ranges, or change the control tree.
-  const compactLabels = new Map([
-    ["only if the preceding path continues normally", "continues"],
-    ["?: continue only on success; otherwise early return", "success / early return"],
-    ["?: early return on residual; conversion not expanded", "early return"],
-    ["only if iteration continues normally", "iteration continues"],
-    ["arm body only if guard is true", "guard is true"],
-    ["RHS only if left is true", "left is true"],
-    ["RHS only if left is false", "left is false"],
-    ["RHS only if left is truthy", "left is truthy"],
-    ["RHS only if left is falsy", "left is falsy"],
-    ["RHS only if left is nullish", "left is nullish"],
-    ["match: mutually exclusive arms; first matching pattern with true guard", "match · first matching arm"],
-    ["body only if condition is true / next item exists (loop: each iteration)", "condition true / next item"],
-    ["catch: only if an exception reaches this handler", "catch · exception reaches handler"],
-    ["for_expression: possible iterations, not unrolled; exit/termination unknown", "for · possible iterations"],
-    ["while_expression: possible iterations, not unrolled; exit/termination unknown", "while · possible iterations"],
-    ["loop_expression: possible iterations, not unrolled; exit/termination unknown", "loop · termination unknown"],
-    ["Definition boundary: decorators/defaults/annotations and binding effects not expanded; callable body does not execute here.", "definition · effects not expanded"],
-    ["Class definition boundary: bases, decorators, metaclass and class-body execution not expanded; method bodies do not execute here.", "class definition · effects not expanded"],
-    ["Nested callable boundary: body does not execute at definition; captures are not expanded.", "nested callable · captures not expanded"],
-    ["Lambda boundary: body does not execute at definition; captures are not expanded.", "lambda · captures not expanded"],
-    ["Nested declaration boundary: bodies are not executed here; implicit initialization is not expanded.", "nested declaration · initialization not expanded"],
-    ["Nested function/callback/class boundary: bodies are not executed here; class definition effects (base, computed keys, static initialization) are not expanded.", "nested definition · effects not expanded"],
-    ["Attribute lookup: descriptor/__getattribute__ effects and type unresolved.", "attribute lookup · effects/type unresolved"],
-    ["Subscription: implicit __getitem__ effects unresolved.", "subscription · effects unresolved"],
-    ["Comprehension/generator boundary: iteration, filters and deferred execution not expanded.", "comprehension / generator · not expanded"],
-    ["Context-manager/match boundary: implicit protocol and conditional execution not expanded.", "context manager / match · not expanded"],
-    ["Async iteration boundary: protocol and suspension not expanded.", "async iteration · protocol not expanded"],
-    ["Argument unpacking boundary: iteration/mapping protocol not expanded.", "argument unpacking · protocol not expanded"],
-    ["Formatted string boundary: interpolation and formatting protocol not expanded.", "formatted string · protocol not expanded"],
-    ["Yield boundary: generator suspension, send/throw/close and yield-from protocol not expanded.", "yield · protocol not expanded"],
-    ["Try boundary: exception selection, else and finally execution/transfers not expanded.", "try · paths not expanded"],
-    ["Assignment target boundary: unpacking/setter effects not expanded.", "assignment target · effects not expanded"],
-    ["Call unpacking boundary: positional/keyword evaluation and iteration effects not expanded.", "call unpacking · effects not expanded"],
-    ["Augmented assignment boundary: target read/write and overloaded operator effects not expanded.", "augmented assignment · effects not expanded"],
-    ["Chained assignment boundary: target write sequence not expanded.", "chained assignment · writes not expanded"],
-    ["Annotation-only target boundary: target address effects not expanded; local annotation is not evaluated.", "annotation target · effects not expanded"],
-    ["Chained comparison boundary: later operands are conditional; not expanded.", "chained comparison · conditional / not expanded"],
-    ["Loop-else boundary: break versus exhaustion paths not expanded.", "loop else · paths not expanded"],
-    ["Async block boundary: future construction does not execute its body; captures are not expanded.", "async block · captures not expanded"],
-    ["Opaque macro/unsafe/const boundary: expansion, effects and transfers unknown.", "macro / unsafe / const · effects unknown"],
-    ["Unsupported control transfer: remainder of this path omitted.", "unsupported transfer · path omitted"],
-    ["Unsupported complex control: possible behavior remains unknown; body not expanded.", "unsupported control · behavior unknown"],
-    ["Destructuring binding: computed keys/defaults/implicit reads are not expanded (RHS evaluated first).", "destructuring binding · reads not expanded"],
-    ["Destructuring assignment: computed keys/defaults/writes are not expanded (RHS evaluated first).", "destructuring assignment · writes not expanded"],
-    ["Loop destructuring binding: per-iteration reads/defaults are not expanded.", "loop destructuring · reads not expanded"],
-    ["Parameter defaults/destructuring may execute before the body; behavior not expanded.", "parameter defaults / destructuring · not expanded"],
-    ["await: possible suspension/resumption; await protocol unresolved", "await · protocol unresolved"],
-    ["await: suspension/resumption boundary, timing unknown", "await · timing unknown"],
-    ["iteration target write: implicit setters/unpacking unresolved", "iteration write · setters/unpacking unresolved"]
-  ]);
   const quietGuard = step => !options.showDetails && step.kind === "branch" &&
     step.label === "only if the preceding path continues normally" && !step.alternate?.length;
-  const analysisKinds = new Set(["effect", "return", "throw", "await", "note", "boundary", "definition"]);
-  const compactAnalysis = step => {
-    const label = step.label || step.kind;
-    if (compactLabels.has(label)) return compactLabels.get(label);
-    // Abbreviate DTO evidence categories, not source expressions. Never parse an
-    // assignment target or infer a return value from the original source label.
-    if (step.kind === "effect") {
-      if (label.startsWith("bind name: ")) return `bind ${label.slice("bind name: ".length)}`;
-      if (label.startsWith("write: ")) return label.endsWith(" (implicit setters/unpacking unresolved)")
-        ? "write · setters/unpacking unresolved" : "write";
-      return "effect · inspect details";
-    }
-    if (step.kind === "return" || step.kind === "throw") return step.kind;
-    if (step.kind === "definition") return label.startsWith("define ") ? label : "definition · inspect details";
-    return label;
-  };
   if (!options.showDetails) svg.append(make("text", {x:24, y:73, class:"sequence-meta"}, "Compact labels · select for details"));
   let y = options.showDetails ? 78 : 98;
+  let rows = 0; // Each row's number, as Pele counts them.
   function sourceControl(group, step, x, top, display = step, evidence = step, operator = null) {
+    const ordinal = ++rows;
     const interactive = sourceWitness(step) && sourceWitness(evidence) && step.path === evidence.path &&
       (!options.isCurrent || options.isCurrent()) &&
       (typeof options.onSelect === "function" || typeof readSource === "function");
@@ -256,7 +324,8 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     const labelX = operator ? x + tabWidth + 12 : x + 5;
     const capacity = Math.max(24, Math.floor((width-labelX-(proof && options.showDetails ? 145 : 35))/7.8));
     const early = sequenceEarlyReturn(step);
-    if (!options.showDetails) label = shorten(label.replace(/\s+/g, " "), isControl ? Math.min(56, capacity - (operator ? 2 : 0)) : Math.max(12, capacity - early.length));
+    const limit = Math.min(SEQUENCE_LABEL_LIMIT, capacity);
+    if (!options.showDetails) label = shorten(label.replace(/\s+/g, " "), isControl ? Math.min(56, capacity - (operator ? 2 : 0)) : Math.max(12, limit - early.length));
     label += early;
     // Brackets are a presentation frame, not an inferred or rewritten predicate.
     if (operator) label = `[${label}]`;
@@ -265,8 +334,11 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       const suffix = ` · +${step.children.length-1} calls collapsed (entry preview)${early}`;
       // Keep the collapsed count and entry-only claim visible even when the
       // measured name is long. At deep indentation the annotation can wrap.
-      labels = wrap((evidence.callEvidence ? `${sequenceEvidenceLabel(evidence, view)} · ` : "") + shorten(evidence.label, Math.max(12, capacity-suffix.length)) + suffix, capacity);
+      const proven = evidence.callEvidence ? `${sequenceEvidenceLabel(evidence, view)} · ` : "";
+      labels = wrap(proven + shorten(evidence.label, Math.max(12, limit-proven.length-suffix.length)) + suffix, capacity);
     }
+    const target = sequenceTarget(view, evidence), arrow = target && evidence.kind === "call" && columnX(target.id);
+    if (arrow && !options.showDetails) labels = [sequenceArrowLabel(ordinal, target, display.kind === "call chain" ? step.children.length - 1 : 0, early, limit)];
     const extra = (labels.length-1)*16;
     control.append(make("rect", {x, y:top-(operator ? 19 : 15), width:Math.max(1,width-x-24), height:(operator ? 30 : 24)+extra, fill:"transparent", class:"sequence-row-hit"}));
     if (operator) {
@@ -293,16 +365,15 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       control.addEventListener("click", select);
       control.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); } });
     }
-    const target = sequenceTarget(view, evidence);
-    if (target && evidence.kind === "call" && positions.has(target.id)) {
-      const end = positions.get(target.id), arrowY = top + extra + 10, from = laneX(evidence);
+    if (arrow) {
+      const end = columnX(target.id), arrowY = top + extra + 10, from = laneX(evidence);
       const d = end === from ? `M ${from} ${arrowY} h 48 v 18 h -48` : `M ${from} ${arrowY} H ${end}`;
       group.append(make("path", {d, class:"sequence-arrow", fill:"none", "data-trellis-call-id":evidence.callId, "data-trellis-target-id":target.id}));
       const direction = end === from ? -1 : end > from ? 1 : -1, headY = arrowY + (end === from ? 18 : 0);
       group.append(make("path", {d:`M ${end-direction*7} ${headY-4} L ${end} ${headY} L ${end-direction*7} ${headY+4}`, class:"sequence-arrow", fill:"none"}));
     }
     group.append(control);
-    return extra + (target && target.id === (evidence.lane ?? view.seed.id) ? 20 : 0);
+    return extra + (target && columnX(target.id) === laneX(evidence) ? 20 : 0);
   }
   function draw(steps, parent, depth) {
     for (const step of steps || []) {
@@ -381,4 +452,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty};

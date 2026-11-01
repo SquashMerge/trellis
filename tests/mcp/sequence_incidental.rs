@@ -309,15 +309,9 @@ fn hidden_accessors_take_no_lanes() {
         .sequence_at(&seed, pin, true)
         .unwrap()
         .unwrap();
-    assert_eq!(
-        all.participants.len(),
-        20,
-        "shown accessors get lanes up to the cap"
-    );
-    assert!(
-        all.truncated_by
-            .contains(&trellis::behavior::SequenceLimit::Participants)
-    );
+    // Shown accessors are targets like any other; all of them are in class S's column (#558).
+    assert_eq!(all.participants.len(), 27);
+    assert!(all.truncated_by.is_empty(), "{:?}", all.truncated_by);
 }
 
 /// #547: Java's bare-name getter must return a field of its class (native declarations),

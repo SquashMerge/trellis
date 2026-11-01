@@ -336,7 +336,7 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .sequence-source[aria-pressed=true] .sequence-fragment-operator { fill: var(--on-selected); }
 .sequence-divider { stroke: var(--line-strong); stroke-dasharray: 4 4; }
 .sequence-note { fill: var(--card); stroke: var(--line); }
-.sequence-scroll .sequence-meta, .sequence-scroll .sequence-provenance { font-size: 10px; fill: var(--secondary); }
+.sequence-scroll .sequence-meta, .sequence-scroll .sequence-provenance { font-size: 12px; fill: var(--secondary); }
 .sequence-scroll .sequence-control-label { fill: var(--secondary); font-size: 13px; }
 .sequence-label { font-size: 13px; }
 /* Analysis is an ordered, selectable row, not another full-width card. The
@@ -516,6 +516,15 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
 .sequence-scroll .trellis-pele .sequence-group-control:hover,
 .sequence-scroll .trellis-pele .sequence-group-control:focus-visible { color: var(--link); border-color: var(--line-strong); outline: 2px solid var(--focus); outline-offset: 3px; }
 @media (max-width: 600px) { .sequence-scroll svg.pele.trellis-pele { max-width: none; } }
+/* The full diagram opens at its own size and the panel scrolls, so its text stays readable
+   (#558). The Files preview keeps fitting its narrow column. Fit is an explicit toggle. */
+#sequence-diagram svg.pele.trellis-pele { max-width: none; }
+#sequence-diagram[data-fit] svg, #sequence-diagram[data-fit] svg.pele.trellis-pele { max-width: 100%; height: auto; }
+/* The column names, kept in view down a tall diagram. A copy over the panel, not the panel's
+   content: it takes no pointer events and no space, and the diagram's own headers stay. */
+#sequence-columns { position: relative; flex: none; height: 0; z-index: 2; pointer-events: none; }
+#sequence-columns span { position: absolute; top: 4px; transform: translateX(-50%); padding: 2px 8px; white-space: nowrap; font-size: 13px; color: var(--ink); background: var(--node); border: 1px solid var(--line-strong); border-radius: 4px; }
+.sequence-empty { margin: 12px 10px; color: var(--secondary); font-size: 14px; }
 
 /* Selection owns its nested labels too, including package metadata and badges. */
 button:is(.selected, [aria-pressed="true"]),

@@ -17,7 +17,7 @@ A user must provide a directory containing the pinned files; a missing or differ
 is unavailable, not a request to fetch one. The custom Python file is provenance only:
 Trellis never executes it.
 
-The Rust port uses Candle core/nn **0.11.0** and tokenizers **0.22.2**. Candle's public
+The Rust port uses Candle core/nn **0.11.1** and tokenizers **0.23.2**. Candle's public
 Qwen3 model exposes only causal attention, so a small private adaptation supplies the
 bidirectional key-padding mask. It retains the explicit 128-wide heads, per-head Q/K
 normalization, split-half RoPE and learned tokenwise 1024→2048 projection. Masked mean pooling
@@ -141,6 +141,9 @@ seven saved vectors against an independent Python float64 direct-maxabs oracle.
 The full-corpus utility/checker, not this seven-row test, supplies the all-card claim.
 
 ## Observed results
+
+These results were measured on Candle 0.11.0; the full-corpus run has not been repeated on
+0.11.1.
 
 Release Metal inference covered all **6,722 cards in each form (`a`, `b`, `c`)**
 and 50 queries. Every card exceeded cosine 0.999:
