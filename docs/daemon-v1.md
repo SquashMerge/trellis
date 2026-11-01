@@ -261,7 +261,9 @@ checkout indexes (#576): it isn't read, its stored source is a short placeholder
 it publishes as below with a `native-coverage-partial` status diagnostic, and a reference or rules
 read names it in `partialFiles` with reason `oversized` or `not_utf8`. It could declare
 anything, so it proves no binding absent, as for a file with a syntax error; for Java that leaves
-every package of its source set unknown. It recovers when the file changes back. Root
+every package of its source set unknown. A SCIP artifact that names it is admitted with no
+claims for it, and while a source of a language is unread, a symbol the artifact never defines
+is unresolved rather than external in that language. It recovers when the file changes back. Root
 configuration inputs such as `package.json` over the cap still fail the index. Syntax past 128
 levels or 1,000,000 visits is a per-file coverage gap (#554). So is a file whose evidence exceeds a selected read's budgets: 16
 rows per source byte in a table, at most 1,000,000, and 64 bytes per source byte plus 256 KiB of
