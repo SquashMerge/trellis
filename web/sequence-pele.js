@@ -6,8 +6,6 @@
   const kinds = new Set(["call", "group", "branch", "loop", "try", "effect", "return", "throw", "exit", "await", "note", "boundary", "definition"]);
   const tags = new Set(["svg", "g", "path", "rect", "text", "tspan"]);
   const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "fill-opacity", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "stroke-dasharray", "stroke-linecap", "xml:space"]);
-  // Compact rows stay near one screen wide; the full label is in the inspector (#558).
-  const LABEL_LIMIT = 72;
   function unsupported(reason) { const error = new Error(reason); error.code = "unsupported"; throw error; }
   // Pele decodes numeric entities into SVG text. Escape everything outside
   // a small literal alphabet so repository text cannot become Mermaid grammar.
@@ -45,10 +43,11 @@
       return lane;
     };
     const shorten = (text, max) => text.length > max ? text.slice(0, Math.max(1, max - 3)) + "..." : text;
-    const shortened = text => shorten(text, LABEL_LIMIT);
+    const shortened = text => shorten(text, window.TrellisSequence.labelLimit);
     const add = (step, preview) => {
       const ordinal = rows.length + 1;
       if (ordinal > 200) unsupported("Too many source notes");
+      const early = window.TrellisSequence.earlyReturn?.(step) || "";
       let label = options.showDetails ? step.label || step.kind : window.TrellisSequence.compactLabel(step);
       if (step.kind === "call" || step.kind === "boundary" && step.callId) label = step.callEvidence
         ? `${window.TrellisSequence.evidenceLabel(step, view)} - ${label}`
@@ -67,18 +66,15 @@
         displayLabel = `${shorten(label, groupLimit)} - first measured entry: ${shorten(preview.label, entryLimit)} - call ${entryId} -${suffix}`;
         if (preview.callEvidence) displayLabel = `${window.TrellisSequence.evidenceLabel(preview, view)} - ${displayLabel}`;
       } else {
-        if (!options.showDetails) label = shorten(label, LABEL_LIMIT);
+        // The row number and any mark count toward the limit.
+        if (!options.showDetails) label = shorten(label, window.TrellisSequence.labelLimit - 6 - early.length);
         displayLabel = label;
       }
       const marker = `[${String(ordinal).padStart(3, "0")}]`;
       const evidence = preview || step, target = targetFor(evidence), lane = target && laneFor(target, evidence);
       const message = lane && evidence.kind === "call", type = message ? "message" : "note";
-      const early = window.TrellisSequence.earlyReturn?.(step) || "";
-      // The lane names the type; the arrow names the method (#558). The call's source text,
-      // evidence and exact target are one click away in the inspector.
-      const collapsed = preview ? ` +${step.children.length - 1} calls collapsed (entry preview)` : "";
       const display = message && !options.showDetails
-        ? `${marker} ${shorten(target.declaration.name || target.label, LABEL_LIMIT)}${collapsed}${early}`
+        ? window.TrellisSequence.arrowLabel(ordinal, target, preview ? step.children.length - 1 : 0, early)
         : `${marker} ${options.showDetails ? `${step.kind} ` : ""}${displayLabel}${early}`;
       // An expanded callee body runs on the callee's lane, opened by the call before it (#522).
       const ownerId = step.lane == null ? null : columnOf(view.participants.find(p => p.id === step.lane)).id;

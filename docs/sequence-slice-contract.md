@@ -246,12 +246,16 @@ and #542's "any other guard is unchanged".
 - **Bound.** The 20-participant bound counts drawn columns (`MAX_COLUMNS`), the seed's included.
   A target in a drawn column always fits, so `participants` may hold more than 20 entries;
   a target needing a 21st column is `nodeLimit` as before, typed `participants`.
-- **Arrow labels.** The compact diagram labels an arrow with the target declaration's name
-  and its row number, not the call's source spelling. Rows and frame headers use the compact
-  labels, at most 72 characters. Options → Show all steps keeps the exact DTO text.
-- **Size.** The full diagram opens at its own size (no text under 12 px) and the panel
-  scrolls. "Fit to width", offered only while the diagram is wider than the panel, shrinks
-  it on request. The Files preview keeps fitting its column.
+- **Arrow labels.** In both renderers the compact diagram labels an arrow with its row number
+  and the target declaration's name, not the call's source spelling. Rows and frame headers
+  use the compact labels, at most 72 characters; a collapsed chain whose entry call draws no
+  arrow keeps its entry call ID and may run longer. Options → Show all steps keeps the
+  exact DTO text.
+- **Size.** Each method opens at its own size (no text under 12 px) and the panel scrolls.
+  "Fit to width", offered only while the diagram is wider than the panel, shrinks it on
+  request, for that method and its redraws. The Files preview keeps fitting its column.
+  Once a tall diagram has scrolled its headers away, a copy of the column names stays over
+  the panel, whichever renderer drew it.
 - **Folded guards after `if` and `match`.** An "only if the preceding path continues normally"
   guard also folds into the nearest `if` or `match` before it, in every language, provided
   only plain calls come between them and that step's own frame draws an exit: a `return` or

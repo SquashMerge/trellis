@@ -155,6 +155,47 @@ test("the legacy renderer draws the same columns", async () => {
   assert.notEqual(x("exact:0:0"), x("exact:1:0"));
 });
 
+test("both renderers number each arrow and name its exact target", async () => {
+  const view = coordinateView({types:2, methods:3, steps:20});
+  const arrows = view.steps.flatMap(step => [step, ...step.children]).filter(step => step.kind === "call");
+  assert.equal((await render(view)).status, "rendered");
+  const pele = await page.locator("#sequence-diagram .pele-edge-label[data-trellis-step-id]").evaluateAll(nodes => nodes.map(node => [node.dataset.trellisStepId, node.textContent]));
+  const legacy = options => page.evaluate(({view, options}) => {
+    const box = document.getElementById("sequence-diagram");
+    TrellisSequence.render(box, view, null, new Set(), options);
+    return Object.fromEntries([...box.querySelectorAll(".sequence-source")].map(node => [node.dataset.sourceStepId, node.querySelector("text").firstChild.textContent]));
+  }, {view, options});
+  const compact = await legacy({});
+  assert.equal(pele.length, arrows.length);
+  for (const [id, text] of pele) assert.equal(compact[id], text, id);
+  const first = arrows[0], name = view.participants.find(p => p.id === first.target).declaration.name;
+  assert.equal(compact[first.id], `[001] ${name}`);
+  // Show all keeps the source spelling and the evidence.
+  assert.match((await legacy({showDetails:true}))[first.id], /Resolved declaration · self\.lexical_spelling_0/);
+});
+
+test("both renderers cap a long name, and a collapsed chain's arrow names its entry", async () => {
+  const view = coordinateView({types:1, methods:2, steps:3});
+  const call = view.steps[0], target = view.participants.find(p => p.id === call.target);
+  target.declaration.name = "a_declaration_name_".repeat(8);
+  const second = {...structuredClone(call), id:"call:second", callId:"callid:second"};
+  const chain = {...structuredClone(call), id:"chain", kind:"group", label:"a.b().c()", callId:null, target:undefined, callEvidence:undefined, children:[structuredClone(call), second]};
+  view.steps = [call, chain];
+  chain.children[0].id = "call:first"; chain.children[0].callId = "callid:first";
+  view.steps[0] = {...call, folded:[{label:"?: continue only on success; otherwise early return"}]};
+  assert.equal((await render(view)).status, "rendered");
+  const texts = await page.locator("#sequence-diagram .pele-edge-label").evaluateAll(nodes => nodes.map(node => node.querySelector("text").textContent));
+  const drawn = await page.evaluate(view => {
+    const box = document.getElementById("sequence-diagram");
+    TrellisSequence.render(box, view, null, new Set(), {});
+    return [...box.querySelectorAll(".sequence-source")].map(node => [...node.querySelector("text").childNodes].filter(item => item.nodeName === "tspan").map(item => item.textContent).join(" "));
+  }, view);
+  assert.deepEqual(drawn, texts, "the same rows in both renderers");
+  for (const text of texts) assert.ok(text.length <= 72, `${text.length}: ${text}`);
+  assert.match(texts[0], /^\[001\] a_declaration_name_.*… · may return early$/);
+  assert.match(texts[1], /^\[002\] a_declaration_name_.*… \+1 calls collapsed \(entry preview\)$/);
+});
+
 test("a large diagram opens at readable size and the panel scrolls", async () => {
   assert.equal((await render(coordinateView())).status, "rendered");
   const open = await geometry("sequence-diagram");

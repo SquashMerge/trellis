@@ -1550,6 +1550,8 @@ function renderIncidentalToggle(data) {
   button.title = "Calls bound to the standard library or another external package, logging calls (a naming rule) and trivial accessors";
   button.setAttribute("aria-pressed", String(showing));
 }
+// The method Fit was asked for: a redraw of it keeps Fit, another opens at its own size (#558).
+let sequenceFitted = null;
 async function loadSequence(admitted = null, preserveSource = false, callerCurrent = () => true) {
   viewerMetrics?.clearInspection();
   window.TrellisShell?.resetInspector();
@@ -1560,6 +1562,7 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
   let published = false;
   const current = () => (published || callerCurrent()) && guard() && section === "diagrams" && surface === sectionSerial && serial === diagramSerial && selectedMethod === symbol;
   if (!preserveSource) clearSource();
+  if (sequenceFitted !== symbol.id) { sequenceFitted = null; $("sequence-diagram").removeAttribute?.("data-fit"); }
   $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
   if ($("sequence-incidental")) $("sequence-incidental").hidden = true;
   $("sequence-state").textContent = `Loading ${symbol.name}…`;
@@ -1658,9 +1661,38 @@ function renderSequenceFit() {
   button.hidden = !width || !fitted && width <= diagram.clientWidth;
   button.setAttribute("aria-pressed", String(fitted));
 }
-$("sequence-fit")?.addEventListener("click", () => { $("sequence-diagram").toggleAttribute("data-fit"); renderSequenceFit(); });
-if (typeof MutationObserver === "function" && $("sequence-diagram")) new MutationObserver(renderSequenceFit).observe($("sequence-diagram"), {childList:true});
-if (typeof ResizeObserver === "function" && $("sequence-diagram")) new ResizeObserver(renderSequenceFit).observe($("sequence-diagram"));
+// A tall diagram scrolls its headers away; a copy of the column names stays over the panel
+// once they have gone. It reads what either renderer drew, so it needs no renderer's help.
+let sequenceHeaderEnd = 0;
+function positionSequenceColumns() {
+  const diagram = $("sequence-diagram"), strip = $("sequence-columns");
+  if (!strip) return;
+  strip.hidden = !sequenceHeaderEnd || diagram.scrollTop < sequenceHeaderEnd;
+  strip.style.transform = `translateX(${-diagram.scrollLeft}px)`;
+}
+function renderSequenceColumns() {
+  const diagram = $("sequence-diagram"), strip = $("sequence-columns");
+  if (!strip || !diagram?.getBoundingClientRect) return;
+  const box = diagram.getBoundingClientRect();
+  const headers = [...diagram.querySelectorAll(":scope > svg .pele-actor:not(.pele-actor-footer), :scope > svg .sequence-participant-label")];
+  sequenceHeaderEnd = 0;
+  strip.replaceChildren(...headers.map(header => {
+    const rect = header.getBoundingClientRect();
+    const name = element("span", header.matches(".pele-actor") ? header.textContent : header.firstChild.textContent);
+    name.style.left = `${rect.left + rect.width / 2 - box.left + diagram.scrollLeft}px`;
+    sequenceHeaderEnd = Math.max(sequenceHeaderEnd, rect.bottom - box.top + diagram.scrollTop);
+    return name;
+  }));
+  positionSequenceColumns();
+}
+function renderSequenceChrome() { renderSequenceFit(); renderSequenceColumns(); }
+$("sequence-fit")?.addEventListener("click", () => {
+  sequenceFitted = $("sequence-diagram").toggleAttribute("data-fit") ? selectedMethod?.id : null;
+  renderSequenceChrome();
+});
+$("sequence-diagram")?.addEventListener("scroll", positionSequenceColumns, {passive:true});
+if (typeof MutationObserver === "function" && $("sequence-diagram")) new MutationObserver(renderSequenceChrome).observe($("sequence-diagram"), {childList:true});
+if (typeof ResizeObserver === "function" && $("sequence-diagram")) new ResizeObserver(renderSequenceChrome).observe($("sequence-diagram"));
 $("more-files").addEventListener("click", () => perform(() => $("file-filter").value.trim() && filterResults?.next != null ? searchFiles(filterResults.next) : loadFiles(), $("more-files")));
 
 $("method-source").addEventListener("click", () => { if (selectedMethod && status) perform(() => showSource(selectedMethod, status.revision)); });

@@ -137,6 +137,16 @@ function compactAnalysis(step) {
   if (step.kind === "definition") return label.startsWith("define ") ? label : "definition · inspect details";
   return label;
 }
+// Compact rows stay near one screen wide; the full label is in the inspector (#558).
+const SEQUENCE_LABEL_LIMIT = 72;
+// The row of an arrow, in both renderers (#558): its number and the exact target's name. The
+// lane names the type. The call's source text and evidence are in the inspector and Show all.
+function sequenceArrowLabel(ordinal, target, collapsed, early, limit = SEQUENCE_LABEL_LIMIT) {
+  const marker = `[${String(ordinal).padStart(3, "0")}]`, name = target.declaration.name || target.label;
+  const suffix = `${collapsed ? ` +${collapsed} calls collapsed (entry preview)` : ""}${early}`;
+  const room = Math.max(12, limit - marker.length - 1 - suffix.length);
+  return `${marker} ${name.length > room ? `${name.slice(0, room - 1)}…` : name}${suffix}`;
+}
 // The short text of a step (#558). The exact label stays in the DTO and the inspector.
 function sequenceCompactLabel(step) {
   const label = step.label || step.kind;
@@ -287,7 +297,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     step.label === "only if the preceding path continues normally" && !step.alternate?.length;
   if (!options.showDetails) svg.append(make("text", {x:24, y:73, class:"sequence-meta"}, "Compact labels · select for details"));
   let y = options.showDetails ? 78 : 98;
+  let rows = 0; // Each row's number, as Pele counts them.
   function sourceControl(group, step, x, top, display = step, evidence = step, operator = null) {
+    const ordinal = ++rows;
     const interactive = sourceWitness(step) && sourceWitness(evidence) && step.path === evidence.path &&
       (!options.isCurrent || options.isCurrent()) &&
       (typeof options.onSelect === "function" || typeof readSource === "function");
@@ -312,7 +324,8 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     const labelX = operator ? x + tabWidth + 12 : x + 5;
     const capacity = Math.max(24, Math.floor((width-labelX-(proof && options.showDetails ? 145 : 35))/7.8));
     const early = sequenceEarlyReturn(step);
-    if (!options.showDetails) label = shorten(label.replace(/\s+/g, " "), isControl ? Math.min(56, capacity - (operator ? 2 : 0)) : Math.max(12, capacity - early.length));
+    const limit = Math.min(SEQUENCE_LABEL_LIMIT, capacity);
+    if (!options.showDetails) label = shorten(label.replace(/\s+/g, " "), isControl ? Math.min(56, capacity - (operator ? 2 : 0)) : Math.max(12, limit - early.length));
     label += early;
     // Brackets are a presentation frame, not an inferred or rewritten predicate.
     if (operator) label = `[${label}]`;
@@ -321,8 +334,11 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       const suffix = ` · +${step.children.length-1} calls collapsed (entry preview)${early}`;
       // Keep the collapsed count and entry-only claim visible even when the
       // measured name is long. At deep indentation the annotation can wrap.
-      labels = wrap((evidence.callEvidence ? `${sequenceEvidenceLabel(evidence, view)} · ` : "") + shorten(evidence.label, Math.max(12, capacity-suffix.length)) + suffix, capacity);
+      const proven = evidence.callEvidence ? `${sequenceEvidenceLabel(evidence, view)} · ` : "";
+      labels = wrap(proven + shorten(evidence.label, Math.max(12, limit-proven.length-suffix.length)) + suffix, capacity);
     }
+    const target = sequenceTarget(view, evidence), arrow = target && evidence.kind === "call" && columnX(target.id);
+    if (arrow && !options.showDetails) labels = [sequenceArrowLabel(ordinal, target, display.kind === "call chain" ? step.children.length - 1 : 0, early, limit)];
     const extra = (labels.length-1)*16;
     control.append(make("rect", {x, y:top-(operator ? 19 : 15), width:Math.max(1,width-x-24), height:(operator ? 30 : 24)+extra, fill:"transparent", class:"sequence-row-hit"}));
     if (operator) {
@@ -349,8 +365,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       control.addEventListener("click", select);
       control.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); } });
     }
-    const target = sequenceTarget(view, evidence);
-    if (target && evidence.kind === "call" && columnX(target.id)) {
+    if (arrow) {
       const end = columnX(target.id), arrowY = top + extra + 10, from = laneX(evidence);
       const d = end === from ? `M ${from} ${arrowY} h 48 v 18 h -48` : `M ${from} ${arrowY} H ${end}`;
       group.append(make("path", {d, class:"sequence-arrow", fill:"none", "data-trellis-call-id":evidence.callId, "data-trellis-target-id":target.id}));
@@ -437,4 +452,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty};
