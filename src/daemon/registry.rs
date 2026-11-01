@@ -2158,6 +2158,36 @@ impl CheckoutRuntime {
         }
     }
 
+    /// Move the retention clock past `pin`'s grace and release it.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn release_past_grace_for_tests(&self, pin: IndexPin) -> anyhow::Result<()> {
+        let resources = self.resources()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        resources
+            .store
+            .set_retention_clock_for_tests(now + 1_800, 1_800);
+        let session = resources.scheduler.retained_serving_session()?;
+        // The worker's own maintenance can hold the writer: contention is typed and retried.
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
+        loop {
+            match resources
+                .store
+                .release_revision(pin, session.writer_guard()?)
+            {
+                Err(error)
+                    if error.to_string().starts_with("storage_busy")
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+    }
+
     #[cfg(feature = "test-support")]
     pub fn set_after_claim_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
         if let Ok(resources) = self.resources() {

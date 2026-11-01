@@ -7207,6 +7207,64 @@ fn witnessed_local_rejoin_does_not_keep_a_method_direct_in_an_edited_document() 
     assert_eq!(calls(&world), [call("f", "Unknown"), call("g", "Direct")]);
 }
 
+/// The witnessed path rejoins one document at a time, so "the reused documents" must still mean
+/// all of them: a method call into a document the edit did not touch keeps its `direct`, as a
+/// full rejoin keeps it.
+#[test]
+fn witnessed_local_rejoin_keeps_a_method_direct_in_an_unchanged_document() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+                ("src/c.rs", "fn other() { }\n"),
+            ],
+        )
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g) = (symbol("r()."), symbol("impl#[S]f()."), symbol("g()."));
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 15, 16], &[], &f, 0)
+                .occurrence(&[0, 20, 21], &[], &g, 0)
+                .symbol(&r, 17, &[]),
+            DocSpec::new("src/b.rs")
+                .occurrence(&[1, 12, 13], &[], &f, 1)
+                .occurrence(&[2, 3, 4], &[], &g, 1)
+                .symbol(&f, 26, &[])
+                .symbol(&g, 17, &[]),
+            DocSpec::new("src/c.rs"),
+        ],
+    );
+    let descriptor = world.write(&fixture);
+    drop(world.publish(&descriptor).unwrap());
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+    }
+    let work = local_edit(&world, "src/c.rs", "fn other() { let _ = 1; }\n", &counts);
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    let head = world.store.index_baseline().unwrap();
+    let call = |callee: &str| ["src/a.rs", callee, "Resolved", "Direct"].map(str::to_owned);
+    assert_eq!(
+        rust_calls(
+            &world,
+            &world.store.semantic_at(head).unwrap().call_bindings
+        ),
+        [call("f"), call("g")]
+    );
+}
+
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the
 /// per-document cap shrunk below src/lib.rs's 36 occurrences: the document is admitted partial
 /// with the typed reason, keeps exactly its definitions, and both join paths agree.
