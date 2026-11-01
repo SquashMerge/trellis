@@ -474,18 +474,19 @@ async fn a_tool_read_is_served_or_typed_retryable_within_its_wait() {
     scheduler.architecture_hint();
     hold.wait_reached();
     let tool = runtime.clone();
-    let building = tokio::task::spawn_blocking(move || {
+    let (building, scoped) = tokio::task::spawn_blocking(move || {
         let (response, _) = tool.evidence_response().unwrap();
-        tool.architecture_tool(
-            &response,
-            "check",
-            &json!({"paths":["sample.js"]}),
-            &mut || Ok(()),
+        let read =
+            |arguments| tool.architecture_tool(&response, "check", &arguments, &mut || Ok(()));
+        (
+            read(json!({})).unwrap_err(),
+            read(json!({"paths":["sample.js"]})).unwrap(),
         )
-        .unwrap_err()
     })
     .await
     .unwrap();
+    // A narrow read need not wait: it computes its own scope while the build runs.
+    assert_eq!(scoped["rulesVersion"], "rules:v2");
     assert!(building.to_string().starts_with("deadline_exceeded:"));
     let envelope = trellis::mcp::architecture::failure(&json!(1), &building);
     assert_eq!(envelope["error"]["code"], "deadline_exceeded");
@@ -500,21 +501,20 @@ async fn a_tool_read_is_served_or_typed_retryable_within_its_wait() {
 
     hold.release();
     let tool = runtime.clone();
-    let scoped = tokio::task::spawn_blocking(move || {
-        let arguments = json!({"paths":["sample.js"]});
+    let whole = tokio::task::spawn_blocking(move || {
         tool.await_architecture_tool(
             "check",
-            &arguments,
+            &json!({}),
             trellis::testing::HANG_BACKSTOP,
             &mut || Ok(()),
         );
         let (response, _) = tool.evidence_response().unwrap();
-        tool.architecture_tool(&response, "check", &arguments, &mut || Ok(()))
+        tool.architecture_tool(&response, "check", &json!({}), &mut || Ok(()))
             .unwrap()
     })
     .await
     .unwrap();
-    assert_eq!(scoped["rulesVersion"], "rules:v2");
+    assert_eq!(whole["rulesVersion"], "rules:v2");
     assert_eq!(scheduler.architecture_builds_for_tests(), 1);
 }
 

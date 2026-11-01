@@ -115,6 +115,14 @@ impl OwnerState {
     fn answer(&self, pin: IndexPin, rules_hash: Option<&str>) -> Option<&Published> {
         self.published.iter().find(|p| p.answers(pin, rules_hash))
     }
+    /// The owner has seen a newer head than `pin`, and no page asked it for `pin`.
+    fn passed(&self, pin: IndexPin) -> bool {
+        self.older.as_ref().is_none_or(|older| older.pin != pin)
+            && self.head.is_some_and(|head| {
+                head.index_generation != pin.index_generation
+                    || head.index_revision > pin.index_revision
+            })
+    }
     /// The head's core stays; a page's older revision takes the other place.
     fn publish(&mut self, published: Published) {
         if self.older.as_ref() == Some(&published.key) {
@@ -386,7 +394,8 @@ impl DaemonState {
                 owner.changed.notify_all();
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            // The head moved past this pin, so no build is coming: the caller reads again.
+            if remaining.is_zero() || state.passed(pin) {
                 return Err(ArchitectureBuilding { pin, progress }.into());
             }
             if state.shutdown {
@@ -730,6 +739,20 @@ mod owner_state_tests {
         state.head = Some(pin(6));
         state.publish(published(6));
         assert_eq!(revisions(&state), [6, 3]);
+    }
+
+    #[test]
+    fn a_pin_behind_the_owners_head_is_passed_unless_a_page_asked_for_it() {
+        let mut state = OwnerState {
+            head: Some(pin(5)),
+            ..OwnerState::default()
+        };
+        assert!(state.passed(pin(4)));
+        assert!(!state.passed(pin(5)));
+        // A reader can see a head before the owner does.
+        assert!(!state.passed(pin(6)));
+        state.older = Some(published(4).key);
+        assert!(!state.passed(pin(4)));
     }
 
     #[test]
