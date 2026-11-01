@@ -6578,6 +6578,9 @@ fn a_java_package_declaration_lost_to_a_syntax_error_could_be_any_package() {
     for broken in [
         "@Foo( package p;\npublic class Target {}\n",
         "import package p;\npublic class Target {}\n",
+        "class Scratch {\npackage p;\npublic class Target {}\n",
+        "class Scratch { void f() {\npackage p;\npublic class Target {}\n",
+        "class A {}\n@Foo( package p;\npublic class Target {}\n",
     ] {
         let edges = outcome(&files(broken)).0;
         assert!(
@@ -6585,7 +6588,7 @@ fn a_java_package_declaration_lost_to_a_syntax_error_could_be_any_package() {
             "{broken}: {edges:?}"
         );
     }
-    // A parser error after a file's first item cannot have hidden a package declaration.
+    // A broken file that never spells a package is in the unnamed package only.
     let edges = outcome(&[
         ("p/One.java", "public class Other {}\n"),
         ("p/Target.java", "package p; public class Target {}\n"),

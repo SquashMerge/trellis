@@ -411,6 +411,41 @@ async fn one_file_past_the_evidence_budgets_is_a_coverage_gap_and_every_view_is_
     }
 }
 
+/// Escaped text reaches the ceiling from a small file: a control character encodes to six
+/// bytes, and each declarator repeats the type.
+#[tokio::test]
+async fn a_small_file_of_escaped_class_text_is_left_out_and_every_view_is_served() {
+    let long_type = format!("L<{}A>", "\u{b}".repeat(2040));
+    let fields: Vec<_> = (0..255).map(|index| format!("a{index}")).collect();
+    let source: String = (0..12)
+        .map(|index| format!("class C{index} {{ {long_type} {}; }}\n", fields.join(",")))
+        .collect();
+    let (base, _runtime, browser, key) = fixture_with_sources(
+        false,
+        &[
+            ("src/B.java", source.as_str()),
+            ("src/a.js", "import { b } from './b.js'; b();\n"),
+            ("src/b.js", "export function b() {}\n"),
+        ],
+    )
+    .await;
+    write_rules(
+        &base,
+        "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js']",
+    );
+    let app = browser.router();
+    let (status, body) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, metrics) = view(app.clone(), &key, "metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    let (status, classes) = view(app.clone(), &key, "classes").await;
+    assert_eq!(status, StatusCode::OK, "{classes}");
+    assert!(
+        classes.to_string().contains("evidence budget"),
+        "{classes:.400}"
+    );
+}
+
 /// A file whose stored class extraction is past its ceiling keeps no classes (#564).
 #[tokio::test]
 async fn a_class_extraction_past_its_ceiling_is_left_out_and_every_view_is_served() {

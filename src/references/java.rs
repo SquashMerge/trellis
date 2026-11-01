@@ -588,18 +588,15 @@ fn package_path(
     }
     Ok(Vec::new())
 }
-/// Whether this file's package declaration was lost to a parser error or the path bound. It
-/// comes first, so a file that starts with an import or type with an intact header declares
-/// none, whatever else is broken.
+/// Whether this file's package declaration was lost to a parser error or the path bound. A
+/// parser error can hide one anywhere, so a broken file with none that still spells the word
+/// could be in any package; one that doesn't is in the unnamed package.
 fn package_unknown(
     doc: &DocumentInput,
     root: Node<'_>,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<bool> {
-    if root.is_error() {
-        return Ok(true);
-    }
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
         owner_step(work, check)?;
@@ -607,18 +604,13 @@ fn package_unknown(
             return Ok(child.has_error() || declaration_path(doc, child, work, check)?.is_none());
         }
         if !matches!(child.kind(), "line_comment" | "block_comment") {
-            let body = child.child_by_field_name("body");
-            let mut parts = child.walk();
-            let header_error = child
-                .children(&mut parts)
-                .any(|part| part.has_error() && Some(part) != body);
-            return Ok(header_error
-                || (root.has_error()
-                    && child.kind() != "import_declaration"
-                    && !type_declaration(child)));
+            // A misspelled declaration leaves neither the word nor an import or a type.
+            return Ok(root.has_error()
+                && (doc.file.text.contains("package")
+                    || (child.kind() != "import_declaration" && !type_declaration(child))));
         }
     }
-    Ok(false)
+    Ok(root.has_error() && doc.file.text.contains("package"))
 }
 fn declaration_path(
     doc: &DocumentInput,

@@ -522,8 +522,8 @@ an over-deep one:
 - In JavaScript and Python, the file counts as dynamic: its exports are unknown.
 - In Java, no type root or explicit import of the file is proved, and neither is any type of
   its package, nor any name another file's type root could lose to a type hidden there. A
-  parser error at or before the package declaration leaves the file's package unknown, which
-  does the same for every package of its source set.
+  broken package declaration, or a broken file with none that still spells `package`, leaves
+  the file's package unknown, which does the same for every package of its source set.
 - A selector's `extends` or `implements` on a type in the file is unknown, not false.
 
 Sites that survive in the recovered tree keep the resolution their language gives them: an

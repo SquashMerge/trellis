@@ -571,6 +571,18 @@ pub(crate) fn complete_file_catalog(extraction: &FileExtraction) -> Catalog {
     result
 }
 
+/// Counts what a value encodes to, without holding it.
+struct EncodedBytes(usize);
+impl std::io::Write for EncodedBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Marks a revision whose class rows were cut to fit, so later publications recompose them.
 pub(crate) const BUDGET_WARNING: &str = "class rows exceed the per-file evidence budget";
 
@@ -740,13 +752,11 @@ impl FileExtraction {
     }
 
     /// A read refuses a document whose stored extraction is past its ceiling, so such a file
-    /// keeps no classes (#564). A record holds at most a few capped texts, so only a file with
-    /// thousands of them can reach the ceiling, and the rest skip this encoding.
+    /// keeps no classes (#564). Escaped text makes its encoded size independent of any count.
     fn within_stored_budget(mut self) -> Result<Self> {
-        const SMALL: usize = 4096;
-        if self.classes.len() + self.items.len() + self.impls.len() < SMALL
-            || serde_json::to_vec(&self)?.len() <= crate::evidence_budget::CLASS_EXTRACTION
-        {
+        let mut encoded = EncodedBytes(0);
+        serde_json::to_writer(&mut encoded, &self)?;
+        if encoded.0 <= crate::evidence_budget::CLASS_EXTRACTION {
             return Ok(self);
         }
         self.classes.clear();
