@@ -76,6 +76,225 @@ fn fixture() -> (
     (root, native, sources, inventory)
 }
 
+/// #576: a SCIP artifact names a source Trellis skipped. The producer read the real file, so
+/// its text and positions don't match the stored placeholder: the document is admitted with no
+/// claims instead of failing the artifact, and the rest of the artifact still imports.
+#[test]
+fn an_artifact_naming_a_skipped_source_admits_it_without_claims() {
+    let text = "function f(){g();}\n";
+    for (bytes, cap) in [
+        (format!("{text}//{}\n", "x".repeat(600)).into_bytes(), 256),
+        ([text.as_bytes(), b"// caf\xe9\n"].concat(), 2 * 1024 * 1024),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        fs::create_dir(physical.join("src")).unwrap();
+        fs::write(physical.join("src/A.js"), &bytes).unwrap();
+        fs::write(physical.join("src/B.js"), "function g(){}\n").unwrap();
+        let mut options = IndexOptions::new(physical.clone());
+        options.max_file_bytes = cap;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        // The real file's text, an occurrence past the placeholder's end, and a readable
+        // document beside it.
+        let artifact =
+            crate::semantic_batch_support::edit_scip(&hex::decode(WIRE).unwrap(), |index| {
+                let mut skipped = index.documents[0].clone();
+                skipped.text = String::from_utf8_lossy(&bytes).into_owned();
+                skipped.occurrences[0].range = vec![2, 0, 3];
+                let mut readable = index.documents[0].clone();
+                readable.relative_path = "src/B.js".into();
+                readable.symbols.clear();
+                readable.occurrences.truncate(1);
+                readable.occurrences[0].range = vec![0, 9, 10];
+                index.documents = vec![skipped, readable];
+            });
+        let inventory = admit(
+            &capture,
+            "scip-typescript",
+            "javascript",
+            &artifact,
+            &cancel,
+        );
+        assert!(!inventory.claims.is_empty());
+        assert!(
+            inventory
+                .claims
+                .iter()
+                .all(|claim| claim.envelope.relative_path == "src/B.js"),
+            "{:?}",
+            inventory.claims
+        );
+        // And the readable document's claims still join its native facts.
+        let identity =
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical)
+                .unwrap();
+        let native =
+            native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
+        let sources = capture
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    native::DocumentKey {
+                        source_set_id: native.revision.source_set_id.clone(),
+                        language: f.language.clone(),
+                        path: f.path.clone(),
+                    },
+                    f.text.as_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let facts = join_inventory(&inventory, &native, &sources, 2).unwrap();
+        assert!(!facts.joins.is_empty());
+    }
+}
+
+/// #576 review: a document of an unread source is still validated against the closed SCIP
+/// domains: an unknown position encoding, symbol role or symbol kind there rejects the whole
+/// artifact, as it does for a readable one.
+#[test]
+fn an_unread_document_still_rejects_unknown_enums() {
+    use protobuf::EnumOrUnknown;
+    let text = "function f(){g();}\n";
+    type Edit = fn(&mut scip::types::Document);
+    let edits: [(&str, Edit); 3] = [
+        ("position encoding", |d| {
+            d.position_encoding = EnumOrUnknown::from_i32(999)
+        }),
+        ("symbol roles", |d| d.occurrences[0].symbol_roles = 1 << 20),
+        ("symbol kind", |d| {
+            d.symbols[0].kind = EnumOrUnknown::from_i32(99_999)
+        }),
+    ];
+    for (name, edit) in edits {
+        for (bytes, cap) in [
+            (text.as_bytes().to_vec(), 2 * 1024 * 1024),
+            (format!("{text}//{}\n", "x".repeat(600)).into_bytes(), 256),
+            ([text.as_bytes(), b"// caf\xe9\n"].concat(), 2 * 1024 * 1024),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let physical = fs::canonicalize(root.path()).unwrap();
+            fs::create_dir(physical.join("src")).unwrap();
+            fs::write(physical.join("src/A.js"), &bytes).unwrap();
+            fs::write(physical.join("src/B.js"), "function g(){}\n").unwrap();
+            let mut options = IndexOptions::new(physical.clone());
+            options.max_file_bytes = cap;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+            let artifact =
+                crate::semantic_batch_support::edit_scip(&hex::decode(WIRE).unwrap(), |index| {
+                    let mut readable = index.documents[0].clone();
+                    readable.relative_path = "src/B.js".into();
+                    readable.symbols.clear();
+                    readable.occurrences.truncate(1);
+                    readable.occurrences[0].range = vec![0, 9, 10];
+                    edit(&mut index.documents[0]);
+                    index.documents.push(readable);
+                });
+            let (descriptor, pages) = testing::single_artifact_batch(
+                &capture,
+                "scip-typescript",
+                "javascript",
+                &artifact,
+            )
+            .unwrap();
+            let pages: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+            let admitted = testing::admit_in_memory_from_capture(
+                &capture,
+                &descriptor,
+                &pages,
+                &[&artifact],
+                &cancel,
+            );
+            assert!(admitted.is_err(), "{name}, cap {cap}: {admitted:?}");
+        }
+    }
+}
+
+/// #576 review: a symbol whose only definition is in a skipped source is absent from the
+/// artifact's claims, but that proves nothing: its uses stay unresolved, never external. The
+/// readable control resolves them into the file.
+#[test]
+fn a_use_of_a_symbol_defined_only_in_a_skipped_source_is_never_external() {
+    let text = "function f(){g();}\n";
+    for (bytes, cap, skipped) in [
+        (text.as_bytes().to_vec(), 2 * 1024 * 1024, false),
+        (
+            format!("{text}//{}\n", "x".repeat(600)).into_bytes(),
+            256,
+            true,
+        ),
+        (
+            [text.as_bytes(), b"// caf\xe9\n"].concat(),
+            2 * 1024 * 1024,
+            true,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        fs::create_dir(physical.join("src")).unwrap();
+        fs::write(physical.join("src/A.js"), &bytes).unwrap();
+        fs::write(physical.join("src/B.js"), "A();\n").unwrap();
+        let mut options = IndexOptions::new(physical.clone());
+        options.max_file_bytes = cap;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        // B.js only uses `A#`, which A.js defines.
+        let artifact =
+            crate::semantic_batch_support::edit_scip(&hex::decode(WIRE).unwrap(), |index| {
+                let a = index.documents[0].clone();
+                let mut b = index.documents[0].clone();
+                b.relative_path = "src/B.js".into();
+                b.symbols.clear();
+                b.occurrences.truncate(1);
+                b.occurrences[0].range = vec![0, 0, 1];
+                b.occurrences[0].symbol_roles = 0;
+                index.documents = vec![a, b];
+            });
+        let inventory = admit(
+            &capture,
+            "scip-typescript",
+            "javascript",
+            &artifact,
+            &cancel,
+        );
+        let identity =
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical)
+                .unwrap();
+        let native =
+            native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
+        let sources = capture
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    native::DocumentKey {
+                        source_set_id: native.revision.source_set_id.clone(),
+                        language: f.language.clone(),
+                        path: f.path.clone(),
+                    },
+                    f.text.as_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let facts = join_inventory(&inventory, &native, &sources, 2).unwrap();
+        assert!(!facts.references.is_empty());
+        for resolution in facts
+            .references
+            .iter()
+            .map(|r| &r.resolution)
+            .chain(facts.call_bindings.iter().map(|c| &c.resolution))
+        {
+            if skipped {
+                assert_eq!(*resolution, semantic::Resolution::Unresolved, "cap {cap}");
+            } else {
+                assert_eq!(*resolution, semantic::Resolution::Resolved, "cap {cap}");
+            }
+        }
+    }
+}
+
 #[test]
 fn authenticated_javascript_claims_join_real_native_candidates() {
     let (_root, native, sources, inventory) = fixture();

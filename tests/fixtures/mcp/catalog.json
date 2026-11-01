@@ -12382,7 +12382,9 @@
                 "syntax_error",
                 "depth_limit",
                 "visit_limit",
-                "evidence_budget"
+                "evidence_budget",
+                "oversized",
+                "not_utf8"
               ]
             },
             "range": {
@@ -14534,7 +14536,9 @@
                 "syntax_error",
                 "depth_limit",
                 "visit_limit",
-                "evidence_budget"
+                "evidence_budget",
+                "oversized",
+                "not_utf8"
               ]
             },
             "range": {
@@ -16910,7 +16914,9 @@
                 "syntax_error",
                 "depth_limit",
                 "visit_limit",
-                "evidence_budget"
+                "evidence_budget",
+                "oversized",
+                "not_utf8"
               ]
             },
             "range": {

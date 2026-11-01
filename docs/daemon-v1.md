@@ -255,9 +255,18 @@ ancestor-directory replacement**, nor a defense against another process with the
 user's privileges. Do not expose it through a tunnel or untrusted proxy.
 
 Caps: 2 MiB per source by default (`--max-file-bytes`, up to 16 MiB through the CLI),
-256 MiB aggregate source, 100,000 discovered source files and 256 MiB SCIP. Oversized or
-unreadable individual files are diagnosed, and syntax past 128 levels or 1,000,000 visits is a
-per-file coverage gap (#554). So is a file whose evidence exceeds a selected read's budgets: 16
+256 MiB aggregate source, 100,000 discovered source files and 256 MiB SCIP. A source over
+`--max-file-bytes`, or one that isn't UTF-8, is skipped with a diagnostic, and the rest of the
+checkout indexes (#576): it isn't read, its stored source is a short placeholder that says why,
+it publishes as below with a `native-coverage-partial` status diagnostic, and a reference or rules
+read names it in `partialFiles` with reason `oversized` or `not_utf8`. It could declare
+anything, so it proves no binding absent, as for a file with a syntax error; for Java that leaves
+every package of its source set unknown. A SCIP artifact that names it is admitted with no
+claims for it, and while a source of a language is unread, a symbol the artifact never defines
+is unresolved rather than external in that language, and an unread Rust file a Cargo target
+reaches leaves every file of the workspace without a Cargo target. It recovers when the file changes back. Root
+configuration inputs such as `package.json` over the cap still fail the index. Syntax past 128
+levels or 1,000,000 visits is a per-file coverage gap (#554). So is a file whose evidence exceeds a selected read's budgets: 16
 rows per source byte in a table, at most 1,000,000, and 64 bytes per source byte plus 256 KiB of
 native rows, the same of graph rows and the same of class rows (#564). It publishes its file module, `partial` coverage and a whole-file capability gap,
 and nothing that would make a read refuse it. A class row past its budget loses its last

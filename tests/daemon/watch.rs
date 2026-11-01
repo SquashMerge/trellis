@@ -42,6 +42,71 @@ fn leader_reconciles_edit_without_explicit_request() {
     pinned.finish(()).unwrap();
 }
 
+/// #576: the watcher publishes a source that grows past the size cap, or stops being UTF-8,
+/// as a skipped file, and the file recovers when it changes back.
+#[test]
+fn watcher_skips_an_unreadable_source_and_recovers_when_it_changes_back() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("a.js");
+    let good = "function before() { return other(); }\n";
+    fs::write(&source, good).unwrap();
+    fs::write(workspace.path().join("b.js"), "function other() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let mut options = IndexOptions::new(workspace.path().to_owned());
+    options.max_file_bytes = 256;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let session =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let mut work = WatcherWork::new(&store, &session, &options).unwrap();
+    let mut publish = |bytes: &[u8]| {
+        let before = store.status().unwrap().revision;
+        fs::write(&source, bytes).unwrap();
+        let until = Instant::now() + trellis::testing::HANG_BACKSTOP;
+        while store.status().unwrap().revision == before {
+            assert!(Instant::now() < until, "the watcher did not publish");
+            work.reconcile_due(&store, &session, &options, &cancel, false)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        store.status().unwrap()
+    };
+    let mut latin1 = good.as_bytes().to_vec();
+    latin1.extend_from_slice(b"// caf\xe9\n");
+    for (bytes, diagnostic) in [
+        (
+            format!("{good}//{}\n", " ".repeat(300)).into_bytes(),
+            "--max-file-bytes",
+        ),
+        (latin1, "not UTF-8"),
+    ] {
+        let status = publish(&bytes);
+        assert_eq!(status.stats.files, 2);
+        assert!(
+            status
+                .diagnostics
+                .iter()
+                .any(|d| d.path.as_deref() == Some("a.js") && d.message.contains(diagnostic)),
+            "{:?}",
+            status.diagnostics
+        );
+        // Its stored source says why it wasn't read. A reader's snapshot ends when it drops.
+        let pinned = store.evidence_response().unwrap();
+        let (_, file) = pinned.source_at("a.js", None).unwrap().unwrap();
+        assert!(file.text.contains("Trellis did not read this file"));
+        pinned.finish(()).unwrap();
+        drop(pinned);
+        let status = publish(good.as_bytes());
+        assert!(status.diagnostics.is_empty(), "{:?}", status.diagnostics);
+        let pinned = store.evidence_response().unwrap();
+        assert_eq!(
+            pinned.source_at("a.js", None).unwrap().unwrap().1.text,
+            good
+        );
+        pinned.finish(()).unwrap();
+    }
+}
+
 #[test]
 fn delayed_snapshot_does_not_publish_after_pre_cutoff_edit() {
     use notify::{Event, EventKind, event::ModifyKind};

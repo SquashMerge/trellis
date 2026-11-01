@@ -380,7 +380,9 @@ fn failed_and_cached_failed_rows_keep_watcher_full_due() {
         work.disable_native_watcher_for_tests();
         work.force_periodic_inventory_for_tests();
         let watcher = std::sync::Mutex::new(Some((Arc::downgrade(&session), work)));
-        fs::write(options.workspace_root.join("bad.js"), [0xff, 0xfe]).unwrap();
+        // A source that isn't a regular file still fails capture (#576 skips only unreadable
+        // text).
+        std::os::unix::fs::symlink("missing", options.workspace_root.join("bad.js")).unwrap();
         let row = store.enqueue_request(&options, None).unwrap();
         if cached {
             store.inject_queue_finish_failure(false);

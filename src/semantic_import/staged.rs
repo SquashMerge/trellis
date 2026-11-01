@@ -114,6 +114,8 @@ pub(super) struct JoinCtx<'a> {
     stage_base: u64,
     mutations: DestinationMutations,
     cancel: CancelFlag,
+    /// Whether a source of a language was not read (#576), by revision side and language.
+    unread: RefCell<BTreeMap<(u8, String), bool>>,
 }
 
 impl JoinCtx<'_> {
@@ -1128,6 +1130,22 @@ impl ProofIdentities for StagedSide<'_> {
 }
 
 impl<'a> JoinStore for StagedSide<'a> {
+    fn has_unread_source(&self, language: &str) -> Result<bool> {
+        let key = (self.rev, language.to_owned());
+        if let Some(&unread) = self.ctx.unread.borrow().get(&key) {
+            return Ok(unread);
+        }
+        self.charge(1)?;
+        let [oversized, not_utf8] = crate::skipped_source::placeholder_hashes(language);
+        let unread = exists(
+            self.ctx.conn,
+            "SELECT 1 FROM nat_docs WHERE rev=?1 AND language=?2 AND content_hash IN (?3,?4) LIMIT 1",
+            &[&self.rev, &language, &oversized, &not_utf8],
+        )?;
+        self.ctx.unread.borrow_mut().insert(key, unread);
+        Ok(unread)
+    }
+
     fn claims(&self) -> Box<dyn Iterator<Item = Result<Cow<'_, CapturedClaim>>> + '_> {
         match &self.local_claims {
             Some(local) => Box::new(local.claims.iter().map(|claim| Ok(Cow::Borrowed(claim)))),
@@ -2524,6 +2542,7 @@ pub fn join_staged(
             mutations
         },
         cancel: cancel.clone(),
+        unread: RefCell::default(),
     };
     let producer = parts.producer.producer();
     let body =
