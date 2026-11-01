@@ -256,6 +256,68 @@ async fn a_new_revision_gets_its_own_build_and_an_older_pin_stays_readable() {
     assert_eq!(scheduler.architecture_builds_for_tests(), builds);
 }
 
+/// Release removes a revision the owner still holds a core for: its pin stops resolving, typed,
+/// on every route, and the core is not served in its place. The head is untouched.
+#[tokio::test]
+async fn a_released_revision_is_not_served_from_the_core_the_owner_kept() {
+    let (base, runtime, browser, key) = fixture().await;
+    write_rules(&base, RULES);
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let app = browser.clone().router();
+    let (status, first) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let root = base.path().join("checkout");
+    std::fs::write(root.join("added.js"), "function added() {}\n").unwrap();
+    let indexing = runtime.clone();
+    tokio::task::spawn_blocking(move || indexing.cli_index(&IndexOptions::new(root)))
+        .await
+        .unwrap()
+        .unwrap();
+    let (status, next) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    let older = head(&first["payload"]);
+    let (status, kept) = request(app.clone(), &key, &older).await;
+    assert_eq!(status, StatusCode::OK, "{kept}");
+    let builds = scheduler.architecture_builds_for_tests();
+
+    let pin: trellis::model::IndexPin = serde_json::from_value(json!({
+        "indexGeneration": first["payload"]["indexGeneration"],
+        "indexRevision": first["payload"]["indexRevision"]
+    }))
+    .unwrap();
+    let releasing = runtime.clone();
+    tokio::task::spawn_blocking(move || releasing.release_past_grace_for_tests(pin))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (status, gone) = request(app.clone(), &key, &older).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{gone}");
+    assert_eq!(gone["error"]["code"], "pin_expired", "{gone}");
+    let tool = runtime.clone();
+    let basis = json!({
+        "indexGeneration": first["payload"]["indexGeneration"],
+        "indexRevision": first["payload"]["indexRevision"]
+    });
+    let error = tokio::task::spawn_blocking(move || {
+        let (response, _) = tool.evidence_response().unwrap();
+        tool.architecture_tool(
+            &response,
+            "references",
+            &json!({"expectedBasis": basis}),
+            &mut || Ok(()),
+        )
+        .unwrap_err()
+    })
+    .await
+    .unwrap();
+    assert!(error.to_string().starts_with("pin_expired"), "{error:#}");
+    let (status, current) = request(app, &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{current}");
+    assert_eq!(current["payload"], next["payload"]);
+    assert_eq!(scheduler.architecture_builds_for_tests(), builds);
+}
+
 /// A page on an older revision nothing was built for gets it from the owner, after the head.
 #[tokio::test]
 async fn a_page_on_an_older_revision_gets_it_from_the_owner() {
