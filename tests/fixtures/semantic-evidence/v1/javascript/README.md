@@ -38,7 +38,7 @@ a file whose bytes equal its placeholder now measures the same way) re-ran the p
 `native-capture` command twice on these unchanged snapshots using pinned Rust 1.99.1 and
 `test-support`. Both outputs were byte-identical (SHA-256
 `5ccf4b7f2c9d12e9ecc913f5cca18be69f28eed45cfc59d62c5ff9b561727c87`). The compiled native extractor hash is
-`35154a0b928e64fffc95ee4b045bc7867c340c99d30e809fec0248c0d721969e`, pinned as
+`1349b2d70fb9e954065952c42e307fcf14910aa7c2b295152678c1056d701470`, pinned as
 `trellis-native-v15-javascript-test-support` in the hardware profile.
 
 JavaScript measurement is unchanged: only the producer version, extractor hash and
