@@ -346,6 +346,8 @@ type EvidenceToolReadFn<'a> = dyn Fn(
     ) -> anyhow::Result<serde_json::Value>
     + 'a;
 type EvidenceToolRead<'a> = Box<EvidenceToolReadFn<'a>>;
+/// Work of a tool before read admission, outside any read transaction.
+type BeforeEvidenceRead<'a> = dyn Fn(&crate::daemon::registry::CheckoutRuntime) + 'a;
 
 #[cfg(feature = "test-support")]
 fn capture_evidence_error(
@@ -404,6 +406,7 @@ fn evidence_read(
     id: &serde_json::Value,
     #[cfg(feature = "test-support")] evidence_error: Option<&EvidenceErrorHook>,
     query: Option<&str>,
+    before_read: Option<&BeforeEvidenceRead<'_>>,
     read: &EvidenceToolReadFn<'_>,
 ) -> anyhow::Result<(serde_json::Value, bool)> {
     let _profile = query.map(|_| crate::search_model::SearchPhaseTimer::start("search_total"));
@@ -433,6 +436,9 @@ fn evidence_read(
     };
     #[cfg(feature = "test-support")]
     runtime.run_mcp_read_hook_for_tests();
+    if let Some(before_read) = before_read {
+        before_read(&runtime);
+    }
     let search_head = query
         .and_then(|_| runtime.browser_scheduler().ok())
         .and_then(|scheduler| scheduler.search_head_slot(true));
@@ -1064,7 +1070,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             }
                             Ok(())
                         };
-                        match response.architecture_response(kind, &arguments, &mut check) {
+                        match runtime.architecture_tool(response, kind, &arguments, &mut check) {
                             Ok(mut payload) => {
                                 if let Some(limit) = evidence_limit {
                                     architecture::sample_evidence(&mut payload, limit);
@@ -1478,6 +1484,29 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             if let Some(tool_read) = tool_read
                 && let Some((registry, _)) = &registry
             {
+                // An architecture read waits for the owner, leaving its deadline's last
+                // second for the answer.
+                let await_architecture = |runtime: &crate::daemon::registry::CheckoutRuntime| {
+                    let store_arguments = architecture::store_arguments(
+                        &name,
+                        arguments.as_ref().unwrap_or(&serde_json::Value::Null),
+                    );
+                    let wait = deadline
+                        .saturating_duration_since(runtime.mcp_clock_now())
+                        .saturating_sub(std::time::Duration::from_secs(1));
+                    runtime.await_architecture_tool(
+                        architecture::operation(&name),
+                        &store_arguments,
+                        wait,
+                        &mut || {
+                            anyhow::ensure!(
+                                !cancel.load(std::sync::atomic::Ordering::Acquire),
+                                "cancelled"
+                            );
+                            Ok(())
+                        },
+                    );
+                };
                 let publish = |sampled: bool| {
                     *resolved.lock().unwrap() = Some((root.to_owned(), sampled));
                 };
@@ -1498,6 +1527,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             .as_str()
                             .expect("validated search query")
                     }),
+                    (architecture::is_tool(&name) || name == architecture::PROMPT_NAME)
+                        .then_some(&await_architecture as &BeforeEvidenceRead<'_>),
                     &*tool_read,
                 ) {
                     Ok((found, sampled)) => {

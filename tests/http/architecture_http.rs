@@ -16,7 +16,7 @@ use trellis::{
 };
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-async fn request(app: axum::Router, key: &str, query: &str) -> (StatusCode, Value) {
+pub(super) async fn request(app: axum::Router, key: &str, query: &str) -> (StatusCode, Value) {
     let response = app
         .oneshot(
             Request::builder()
@@ -34,7 +34,7 @@ async fn request(app: axum::Router, key: &str, query: &str) -> (StatusCode, Valu
         .unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
 }
-async fn fixture() -> (
+pub(super) async fn fixture() -> (
     tempfile::TempDir,
     Arc<trellis::daemon::registry::CheckoutRuntime>,
     ProvisionedBrowser,
@@ -52,7 +52,7 @@ async fn fixture_with_roles(
 ) {
     fixture_with_sources(role_fixture, &[]).await
 }
-async fn fixture_with_sources(
+pub(super) async fn fixture_with_sources(
     role_fixture: bool,
     extra_sources: &[(&str, &str)],
 ) -> (
@@ -154,12 +154,12 @@ async fn fixture_with_sources(
     (base, runtime, browser, key)
 }
 
-fn write_rules(base: &tempfile::TempDir, text: &str) {
+pub(super) fn write_rules(base: &tempfile::TempDir, text: &str) {
     let path = base.path().join("checkout/.trellis");
     fs::create_dir_all(&path).unwrap();
     fs::write(path.join("rules.toml"), text).unwrap();
 }
-const RULES: &str = "version=1\n[layers.app]\norder=1\npaths=['**/*.js']";
+pub(super) const RULES: &str = "version=1\n[layers.app]\norder=1\npaths=['**/*.js']";
 #[tokio::test]
 async fn architecture_route_pin_aggregate_setup_and_located_diagnostics() {
     let (base, _runtime, browser, key) = fixture().await;
