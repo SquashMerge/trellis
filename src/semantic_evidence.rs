@@ -869,13 +869,20 @@ fn admitted_proof<'a>(witness: &'a WitnessedDocument, proof: &Provenance) -> Res
         .derived_from
         .as_ref()
         .context("unwitnessed derived proof")?;
-    let mut matches = witness.original.provenance.iter().filter(|p| {
-        p.document == proof.document
-            && p.producer_id == proof.producer_id
-            && p.derived_from.as_ref() == Some(derived)
-            && p.evidence_kind == proof.evidence_kind
-            && p.content_hash == proof.content_hash
-    });
+    let mut matches = witness
+        .index
+        .proofs
+        .get(&derived.provenance_id)
+        .into_iter()
+        .flatten()
+        .map(|position| &witness.original.provenance[*position])
+        .filter(|p| {
+            p.document == proof.document
+                && p.producer_id == proof.producer_id
+                && p.derived_from.as_ref() == Some(derived)
+                && p.evidence_kind == proof.evidence_kind
+                && p.content_hash == proof.content_hash
+        });
     let previous = matches
         .next()
         .context("missing admitted proof association")?;
@@ -893,20 +900,8 @@ fn original_join<'a>(
 ) -> Result<&'a Join> {
     let id = admitted_proof(witness, proof)?;
     let matches: Vec<_> = match family {
-        JoinKind::DeclarationName => witness
-            .original
-            .declaration_bindings
-            .iter()
-            .filter(|b| b.provenance_id == id)
-            .map(|b| &b.join)
-            .collect(),
-        JoinKind::Callee => witness
-            .original
-            .call_bindings
-            .iter()
-            .filter(|b| b.provenance_id == id)
-            .map(|b| &b.join)
-            .collect(),
+        JoinKind::DeclarationName => witness.declaration_bindings(id).map(|b| &b.join).collect(),
+        JoinKind::Callee => witness.call_bindings(id).map(|b| &b.join).collect(),
         _ => anyhow::bail!("invalid witnessed join family"),
     };
     ensure!(matches.len() == 1, "incomplete admitted join association");
@@ -918,11 +913,7 @@ fn original_reference<'a>(
     proof: &Provenance,
 ) -> Result<&'a Reference> {
     let id = admitted_proof(witness, proof)?;
-    let mut matches = witness
-        .original
-        .references
-        .iter()
-        .filter(|r| r.provenance_id == id);
+    let mut matches = witness.references(id);
     let original = matches
         .next()
         .context("missing admitted reference association")?;
@@ -976,7 +967,7 @@ pub fn validate_evidence(
     native: &native::Artifact,
     captured: &CapturedComponents,
 ) -> Result<()> {
-    validate_evidence_inner(semantic, native, captured, None, None, None)
+    validate_evidence_inner(semantic, native, captured, None, None)
 }
 
 /// The whole-publication validator a profile-pinned batch runs, over an in-memory admission of
@@ -1003,7 +994,7 @@ pub fn validate_evidence_profile_pinned_for_tests(
             .collect(),
         inventory: inventory.proof_identities(),
     };
-    validate_evidence_inner(semantic, native, captured, Some(raw), Some(&attested), None)
+    validate_evidence_inner(semantic, native, captured, Some(raw), Some(&attested))
 }
 
 struct ValidatedRaw<'a> {
@@ -1016,18 +1007,6 @@ struct ValidatedRaw<'a> {
     inventory: crate::scip_raw::ProofInventory,
 }
 impl<'a> ValidatedRaw<'a> {
-    fn from_witnessed(raw: &'a crate::store::WitnessedRawCapture) -> Self {
-        Self {
-            producer_id: &raw.producer_id,
-            source_set_id: &raw.source_set_id,
-            captured_revision: &raw.captured_revision,
-            binaries: BTreeMap::from([(
-                native_ids::digest(b"", &raw.binary_bytes),
-                &raw.binary_bytes[..],
-            )]),
-            inventory: raw.inventory.clone(),
-        }
-    }
     fn from_batch(
         raw: &'a crate::store::SelectedRawBatch,
         inventory: &crate::scip_raw::CapturedScipInventory,
@@ -1062,17 +1041,125 @@ pub(crate) fn validate_evidence_with_attested_batch(
         captured,
         Some(ValidatedRaw::from_batch(raw, inventory)),
         Some(attested),
-        None,
     )
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct WitnessedDocument {
-    pub source_hash: String,
-    pub wire_digest: Option<String>,
-    pub captured_version: String,
-    pub current_version: String,
-    pub original: SemanticSnapshot,
+    source_hash: String,
+    wire_digest: Option<String>,
+    captured_version: String,
+    current_version: String,
+    original: SemanticSnapshot,
+    index: WitnessIndex,
+}
+
+/// Row positions in a witness's original tuple, so checking one row never scans the others: a
+/// single document can hold hundreds of thousands of them.
+#[derive(Debug, Clone, Default)]
+struct WitnessIndex {
+    /// By the raw proof a provenance row derives from.
+    proofs: BTreeMap<String, Vec<usize>>,
+    /// By provenance ID.
+    symbols: BTreeMap<String, Vec<usize>>,
+    declaration_bindings: BTreeMap<String, Vec<usize>>,
+    references: BTreeMap<String, Vec<usize>>,
+    call_bindings: BTreeMap<String, Vec<usize>>,
+    type_relationships: BTreeMap<String, Vec<usize>>,
+}
+
+fn positions<'a, T>(rows: &'a [T], id: impl Fn(&'a T) -> &'a str) -> BTreeMap<String, Vec<usize>> {
+    let mut index: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (position, row) in rows.iter().enumerate() {
+        index.entry(id(row).to_owned()).or_default().push(position);
+    }
+    index
+}
+
+fn rows_at<'a, T>(
+    rows: &'a [T],
+    index: &'a BTreeMap<String, Vec<usize>>,
+    id: &str,
+) -> impl Iterator<Item = &'a T> {
+    index
+        .get(id)
+        .into_iter()
+        .flatten()
+        .map(|position| &rows[*position])
+}
+
+impl WitnessedDocument {
+    pub(crate) fn new(
+        source_hash: String,
+        wire_digest: Option<String>,
+        captured_version: String,
+        current_version: String,
+        original: SemanticSnapshot,
+    ) -> Self {
+        let mut proofs: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (position, row) in original.provenance.iter().enumerate() {
+            if let Some(derived) = &row.derived_from {
+                proofs
+                    .entry(derived.provenance_id.clone())
+                    .or_default()
+                    .push(position);
+            }
+        }
+        let index = WitnessIndex {
+            proofs,
+            symbols: positions(&original.symbols, |row| &row.provenance_id),
+            declaration_bindings: positions(&original.declaration_bindings, |row| {
+                &row.provenance_id
+            }),
+            references: positions(&original.references, |row| &row.provenance_id),
+            call_bindings: positions(&original.call_bindings, |row| &row.provenance_id),
+            type_relationships: positions(&original.type_relationships, |row| &row.provenance_id),
+        };
+        Self {
+            source_hash,
+            wire_digest,
+            captured_version,
+            current_version,
+            original,
+            index,
+        }
+    }
+
+    /// The admitted tuple this document reuses.
+    pub(crate) fn original(&self) -> &SemanticSnapshot {
+        &self.original
+    }
+
+    fn symbols<'a>(&'a self, id: &str) -> impl Iterator<Item = &'a Symbol> {
+        rows_at(&self.original.symbols, &self.index.symbols, id)
+    }
+
+    fn declaration_bindings<'a>(
+        &'a self,
+        id: &str,
+    ) -> impl Iterator<Item = &'a DeclarationBinding> {
+        rows_at(
+            &self.original.declaration_bindings,
+            &self.index.declaration_bindings,
+            id,
+        )
+    }
+
+    fn references<'a>(&'a self, id: &str) -> impl Iterator<Item = &'a Reference> {
+        rows_at(&self.original.references, &self.index.references, id)
+    }
+
+    fn call_bindings<'a>(&'a self, id: &str) -> impl Iterator<Item = &'a CallBinding> {
+        rows_at(&self.original.call_bindings, &self.index.call_bindings, id)
+    }
+
+    fn type_relationships<'a>(&'a self, id: &str) -> impl Iterator<Item = &'a TypeRelationship> {
+        rows_at(
+            &self.original.type_relationships,
+            &self.index.type_relationships,
+            id,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1081,25 +1168,6 @@ pub(crate) struct TargetDeclaration {
     pub document: native::DocumentKey,
     pub name: String,
     pub name_range: native::Range,
-}
-
-pub(crate) fn validate_evidence_with_witnessed_raw(
-    semantic: &SemanticPublication,
-    native: &native::Artifact,
-    captured: &CapturedComponents,
-    raw: &crate::store::WitnessedRawCapture,
-    attested: &crate::store::AttestedProfileProducer,
-    witnesses: &BTreeMap<native::DocumentKey, WitnessedDocument>,
-    current_declarations: &[TargetDeclaration],
-) -> Result<()> {
-    validate_evidence_inner(
-        semantic,
-        native,
-        captured,
-        Some(ValidatedRaw::from_witnessed(raw)),
-        Some(attested),
-        Some((witnesses, current_declarations)),
-    )
 }
 
 /// Validates one coverage row against the producers and the native revision. Returns the
@@ -1348,7 +1416,8 @@ struct RowEnv<'a> {
     declaration: &'a dyn Fn(&str) -> Option<&'a native::Declaration>,
     reference: &'a dyn Fn(&str) -> Option<&'a native::Reference>,
     known: KnownTarget<'a>,
-    witnesses: Option<&'a BTreeMap<native::DocumentKey, WitnessedDocument>>,
+    /// The witness of the one document whose rows these are, on the witnessed path.
+    witness: Option<&'a WitnessedDocument>,
 }
 
 type TargetClaim = (Resolution, Option<Vec<u8>>, Vec<Vec<u8>>);
@@ -1366,7 +1435,7 @@ fn validate_declaration_binding_row<'a>(
         captured,
         revision,
         sources,
-        witnesses,
+        witness,
         ..
     } = *env;
     ensure!(
@@ -1378,8 +1447,7 @@ fn validate_declaration_binding_row<'a>(
         )),
         "duplicate declaration binding fact"
     );
-    let admitted = witnesses
-        .and_then(|items| items.get(&p.document))
+    let admitted = witness
         .map(|w| original_join(w, p, JoinKind::DeclarationName))
         .transpose()?;
     validate_join(
@@ -1397,19 +1465,16 @@ fn validate_declaration_binding_row<'a>(
             "foreign admitted declaration anchor"
         );
         ensure!(
-            witnesses
-                .and_then(|items| items.get(&p.document))
-                .is_some_and(|w| {
-                    let Ok(id) = admitted_proof(w, p) else {
-                        return false;
-                    };
-                    w.original.declaration_bindings.iter().any(|previous| {
-                        previous.provenance_id == id
-                            && previous.join == *old
-                            && previous.syntax_id == b.syntax_id
-                            && previous.symbols == b.symbols
-                    })
-                }),
+            witness.is_some_and(|w| {
+                let Ok(id) = admitted_proof(w, p) else {
+                    return false;
+                };
+                w.declaration_bindings(id).any(|previous| {
+                    previous.join == *old
+                        && previous.syntax_id == b.syntax_id
+                        && previous.symbols == b.symbols
+                })
+            }),
             "binding differs from admitted association"
         );
     }
@@ -1454,15 +1519,12 @@ fn validate_reference_row<'a>(
         declaration,
         reference,
         known,
-        witnesses,
+        witness,
     } = *env;
     let empty = std::cell::OnceCell::new();
     let measured = index.document(&r.document, &empty);
     ensure!(r.revision_id == revision.id, "foreign reference revision");
-    let admitted = witnesses
-        .and_then(|items| items.get(&r.document))
-        .map(|w| original_reference(w, p))
-        .transpose()?;
+    let admitted = witness.map(|w| original_reference(w, p)).transpose()?;
     if let Some(original) = admitted {
         ensure!(
             original.revision_id == captured.captured_revision.id,
@@ -1581,12 +1643,15 @@ fn validate_reference_row<'a>(
     Ok(())
 }
 
-/// Validates one call binding against its resolved provenance row. `references` is the
+/// A publication's reference rows by provenance ID.
+type ReferencesByProof<'a> = BTreeMap<&'a str, Vec<&'a Reference>>;
+
+/// Validates one call binding against its resolved provenance row. `references` holds the
 /// publication's reference rows, which a witnessed call must agree with.
 fn validate_call_binding_row(
     b: &CallBinding,
     proof: &Provenance,
-    references: &[Reference],
+    references: &ReferencesByProof<'_>,
     env: &RowEnv<'_>,
     call_facts: &mut BTreeSet<(String, native::DocumentKey, String, Vec<u8>)>,
     call_resolutions: &mut BTreeMap<(String, String), Vec<TargetClaim>>,
@@ -1598,7 +1663,7 @@ fn validate_call_binding_row(
         revision,
         sources,
         known,
-        witnesses,
+        witness,
         ..
     } = *env;
     ensure!(
@@ -1610,8 +1675,7 @@ fn validate_call_binding_row(
         )),
         "duplicate call binding fact"
     );
-    let admitted = witnesses
-        .and_then(|items| items.get(&proof.document))
+    let admitted = witness
         .map(|w| original_join(w, proof, JoinKind::Callee))
         .transpose()?;
     validate_join(&b.join, JoinKind::Callee, native, index, sources, admitted)?;
@@ -1621,37 +1685,40 @@ fn validate_call_binding_row(
                 && old.anchor.content_hash == proof.content_hash,
             "foreign admitted call anchor"
         );
-        let witness = witnesses
-            .and_then(|items| items.get(&proof.document))
-            .context("missing call witness")?;
+        let witness = witness.context("missing call witness")?;
         let id = admitted_proof(witness, proof)?;
         ensure!(
             witness
-                .original
-                .call_bindings
-                .iter()
-                .any(|previous| previous.provenance_id == id
-                    && previous.join == *old
-                    && previous.call_id == b.call_id),
+                .call_bindings(id)
+                .any(|previous| previous.join == *old && previous.call_id == b.call_id),
             "call differs from admitted source association"
         );
         let call = b.call_id.as_ref().context("unwitnessed call ID")?;
-        let owner = &witness
-            .original
-            .references
-            .iter()
-            .find(|old| old.provenance_id == id)
+        let spans = |r: &Reference| {
+            r.range == b.join.anchor.range
+                || (b.join.anchor.kind == JoinKind::Invocation
+                    && b.join.anchor.range.start <= r.range.start
+                    && r.range.end <= b.join.anchor.range.end)
+        };
+        // A proof fused into another proof's reference row finds that row at the call's span.
+        let own_row = witness.references(id).next();
+        let owner = &own_row
+            .or_else(|| witness.original.references.iter().find(|r| spans(r)))
             .context("missing admitted call reference")?
             .owner_syntax_id;
-        ensure!(
-            references.iter().any(|r| r.document == proof.document
-                && r.provenance_id == b.provenance_id
+        let published = |r: &&Reference| {
+            r.document == proof.document
                 && r.roles.contains(&Role::Call)
-                && (r.range == b.join.anchor.range
-                    || (b.join.anchor.kind == JoinKind::Invocation
-                        && b.join.anchor.range.start <= r.range.start
-                        && r.range.end <= b.join.anchor.range.end))
-                && &r.owner_syntax_id == owner),
+                && spans(r)
+                && &r.owner_syntax_id == owner
+        };
+        ensure!(
+            references
+                .get(b.provenance_id.as_str())
+                .into_iter()
+                .flatten()
+                .any(&published)
+                || (own_row.is_none() && references.values().flatten().any(&published)),
             "call/reference witness mismatch"
         );
         occ(call)?;
@@ -1709,15 +1776,14 @@ fn validate_type_relationship_row(
     let RowEnv {
         revision,
         known,
-        witnesses,
+        witness,
         ..
     } = *env;
-    if let Some(witness) = witnesses.and_then(|items| items.get(&proof.document)) {
+    if let Some(witness) = witness {
         let id = admitted_proof(witness, proof)?;
         ensure!(
-            witness.original.type_relationships.iter().any(|old| {
-                old.provenance_id == id
-                    && old.kind == r.kind
+            witness.type_relationships(id).any(|old| {
+                old.kind == r.kind
                     && matches!((&old.source, &r.source),
                         (Target::Internal { syntax_id: old_id, document: old_doc, .. },
                          Target::Internal { syntax_id: new_id, document: new_doc, .. })
@@ -1754,7 +1820,7 @@ fn validate_symbol_row(
     let RowEnv {
         revision,
         known,
-        witnesses,
+        witness,
         ..
     } = *env;
     symbol_key(&s.key, revision)?;
@@ -1772,30 +1838,24 @@ fn validate_symbol_row(
         _ => {}
     }
     targets(&s.declarations, revision, known, false)?;
-    if let Some(witness) = witnesses.and_then(|items| items.get(&p.document)) {
+    if let Some(witness) = witness {
         let id = admitted_proof(witness, p)?;
         ensure!(
-            witness
-                .original
-                .symbols
-                .iter()
-                .any(|old| old.provenance_id == id
-                    && old.key == s.key
-                    && old.display_name == s.display_name
-                    && old.declarations.len() == s.declarations.len()
-                    && old
-                        .declarations
-                        .iter()
-                        .zip(&s.declarations)
-                        .all(|(before, after)| match (before, after) {
-                            (
-                                Target::Internal { document: a, .. },
-                                Target::Internal { document: b, .. },
-                            ) => a == b,
-                            (Target::External { symbol: a }, Target::External { symbol: b }) =>
-                                a == b,
-                            _ => false,
-                        })),
+            witness.symbols(id).any(|old| old.key == s.key
+                && old.display_name == s.display_name
+                && old.declarations.len() == s.declarations.len()
+                && old
+                    .declarations
+                    .iter()
+                    .zip(&s.declarations)
+                    .all(|(before, after)| match (before, after) {
+                        (
+                            Target::Internal { document: a, .. },
+                            Target::Internal { document: b, .. },
+                        ) => a == b,
+                        (Target::External { symbol: a }, Target::External { symbol: b }) => a == b,
+                        _ => false,
+                    })),
             "symbol differs from admitted association"
         );
     }
@@ -1846,12 +1906,7 @@ fn validate_evidence_inner(
     captured: &CapturedComponents,
     raw: Option<ValidatedRaw<'_>>,
     attested: Option<&crate::store::AttestedProfileProducer>,
-    witnessed: Option<(
-        &BTreeMap<native::DocumentKey, WitnessedDocument>,
-        &[TargetDeclaration],
-    )>,
 ) -> Result<()> {
-    let witnesses = witnessed.map(|(documents, _)| documents);
     ensure!(
         captured.native_extraction_components.is_empty(),
         "undeclared native extraction components"
@@ -1866,136 +1921,30 @@ fn validate_evidence_inner(
         "unadmitted captured source set"
     );
     let mut sources = BTreeMap::new();
-    let mut manifest = Vec::new();
     for doc in &captured.captured_revision.documents {
-        key(&doc.key, &captured.captured_revision)?;
-        ensure!(
-            doc.revision_id == captured.captured_revision.id,
-            "foreign native document revision"
-        );
         ensure!(
             !sources.contains_key(&doc.key),
             "duplicate native manifest document"
         );
-        if let Some(witness) = witnesses.and_then(|items| items.get(&doc.key)) {
-            if let Some(wire_digest) = &witness.wire_digest {
-                hash(wire_digest)?;
-            } else {
-                ensure!(
-                    !semantic
-                        .producers
-                        .iter()
-                        .any(|p| p
-                            .languages
-                            .iter()
-                            .any(|language| serde_json::to_value(language)
-                                .ok()
-                                .and_then(|v| v.as_str().map(str::to_owned))
-                                .as_deref()
-                                == Some(&doc.key.language)))
-                        && witness.original.producers.is_empty()
-                        && witness.original.coverage.is_empty()
-                        && witness.original.provenance.is_empty()
-                        && witness.original.symbols.is_empty()
-                        && witness.original.declaration_bindings.is_empty()
-                        && witness.original.references.is_empty()
-                        && witness.original.call_bindings.is_empty()
-                        && witness.original.type_relationships.is_empty()
-                        && raw.as_ref().is_some_and(|raw| raw
-                            .inventory
-                            .claims
-                            .iter()
-                            .all(|claim| claim.language != doc.key.language
-                                || claim.path != doc.key.path)),
-                    "missing producer-covered document witness"
-                );
-            }
-            ensure!(
-                !captured.sources.contains_key(&doc.key)
-                    && witness.source_hash == doc.content_hash
-                    && witness.captured_version == witness.current_version
-                    && revision
-                        .documents
-                        .iter()
-                        .any(|current| current.key == doc.key
-                            && current.content_hash == doc.content_hash
-                            && current.byte_length == doc.byte_length),
-                "invalid unchanged source witness"
-            );
-        } else {
-            let bytes = captured
-                .sources
-                .get(&doc.key)
-                .context("absent captured source")?;
-            #[cfg(feature = "test-support")]
-            if witnessed.is_some() {
-                crate::semantic_import::note_original_source_hash(&doc.key);
-            }
-            ensure!(
-                doc.content_hash == native_ids::digest(b"", bytes)
-                    && doc.byte_length == bytes.len(),
-                "source digest/length mismatch"
-            );
-            sources.insert(doc.key.clone(), bytes.clone());
-        }
-        manifest.push(json!({"document":doc.key,"contentHash":doc.content_hash}));
+        let bytes = captured
+            .sources
+            .get(&doc.key)
+            .context("absent captured source")?;
+        ensure!(
+            doc.content_hash == native_ids::digest(b"", bytes) && doc.byte_length == bytes.len(),
+            "source digest/length mismatch"
+        );
+        sources.insert(doc.key.clone(), bytes.clone());
     }
     ensure!(
-        captured.sources.len() == sources.len()
-            && witnesses.is_none_or(|items| items.keys().all(|key| captured
-                .captured_revision
-                .documents
-                .iter()
-                .any(|doc| &doc.key == key))),
+        captured.sources.len() == sources.len(),
         "extra captured source or witness"
     );
-    let mut ordered_docs = captured
-        .captured_revision
-        .documents
-        .iter()
-        .map(|d| (language_rank(&d.key.language), d.key.path.as_bytes()))
-        .collect::<Vec<_>>();
-    let original = ordered_docs.clone();
-    ordered_docs.sort();
-    ensure!(
-        original == ordered_docs && original.windows(2).all(|w| w[0] != w[1]),
-        "unsorted native document manifest"
-    );
-    ensure!(
-        captured.captured_revision.id == native_revision_id(captured),
-        "unauthenticated captured native revision ID"
-    );
-    ensure!(
-        captured.toolchain == native_ids::canonical(&captured.native_toolchain)
-            && captured.config == native_ids::canonical(&json!(captured.native_config))
-            && captured.dependency == native_ids::canonical(&json!(captured.native_dependencies)),
-        "captured native component input mismatch"
-    );
+    let manifest_hash = validate_captured_header(captured)?;
     if captured.captured_revision.id == revision.id {
         ensure!(
             captured.captured_revision == *revision,
             "same native revision has different captured snapshot"
-        );
-    }
-    let manifest_hash = native_ids::digest(
-        b"",
-        &native_ids::canonical(&serde_json::Value::Array(manifest)),
-    );
-    for (declared, bytes) in [
-        (
-            &captured.captured_revision.toolchain_hash,
-            &captured.toolchain,
-        ),
-        (&captured.captured_revision.config_hash, &captured.config),
-        (
-            &captured.captured_revision.dependency_hash,
-            &captured.dependency,
-        ),
-    ] {
-        hash(declared)?;
-        ensure!(
-            declared == &native_ids::digest(b"", bytes),
-            "captured revision component mismatch"
         );
     }
     let mut producers = BTreeMap::new();
@@ -2103,27 +2052,6 @@ fn validate_evidence_inner(
             }
         }
     }
-    if let Some(documents) = witnesses {
-        ensure!(
-            native
-                .declarations
-                .iter()
-                .all(|d| !documents.contains_key(&d.document))
-                && native
-                    .references
-                    .iter()
-                    .all(|r| !documents.contains_key(&r.document))
-                && native
-                    .calls
-                    .iter()
-                    .all(|c| !documents.contains_key(&c.document))
-                && native
-                    .capability_reports
-                    .iter()
-                    .all(|r| !documents.contains_key(&r.document)),
-            "witness overlaps measured native document"
-        );
-    }
     let decls: BTreeMap<_, _> = native
         .declarations
         .iter()
@@ -2133,41 +2061,6 @@ fn validate_evidence_inner(
         decls.len() == native.declarations.len(),
         "duplicate measured declaration ID"
     );
-    let selected: Option<BTreeMap<String, &TargetDeclaration>> =
-        witnessed.map(|(_, rows)| rows.iter().map(|d| (d.syntax_id.clone(), d)).collect());
-    if let Some((_, rows)) = witnessed {
-        let selected = selected.as_ref().expect("selected declarations");
-        ensure!(
-            selected.len() == rows.len(),
-            "duplicate current target declaration"
-        );
-        for d in rows {
-            sid(&d.syntax_id)?;
-            key(&d.document, revision)?;
-            text(&d.name)?;
-            ensure!(
-                d.name_range.start < d.name_range.end,
-                "invalid target name range"
-            );
-            let document = revision
-                .documents
-                .iter()
-                .find(|doc| doc.key == d.document)
-                .context("target declaration without current document")?;
-            ensure!(
-                d.name_range.end <= document.byte_length,
-                "target name exceeds current document"
-            );
-            if let Some(measured) = decls.get(&d.syntax_id) {
-                ensure!(
-                    measured.document == d.document
-                        && measured.name.as_deref() == Some(&d.name)
-                        && measured.name_range.as_ref() == Some(&d.name_range),
-                    "current target contradicts measurement"
-                );
-            }
-        }
-    }
     let mut artifact_hashes: BTreeMap<&String, BTreeSet<String>> = BTreeMap::new();
     for ((producer_id, keyed_hash), bytes) in &captured.artifacts {
         let digest = native_ids::digest(b"", bytes);
@@ -2188,41 +2081,170 @@ fn validate_evidence_inner(
             .or_default()
             .insert(digest);
     }
-    let mut proof = BTreeMap::new();
     // One proof-ID index for the whole loop, not a scan of every raw claim per proof (#494).
     let raw_proofs = raw.as_ref().map(|raw| raw.inventory.proof_lookup());
-    for p in &semantic.provenance {
-        text(&p.id)?;
-        key(&p.document, revision)?;
-        hash(&p.content_hash)?;
-        if let Some(witness) = witnesses.and_then(|items| items.get(&p.document)) {
-            ensure!(p.derived_from.is_some(), "unwitnessed captured proof");
-            admitted_proof(witness, p)?;
-        }
-        let identity = raw.as_ref().map(|raw| RawCaptureIdentity {
-            producer_id: raw.producer_id,
-            source_set_id: raw.source_set_id,
-            captured_revision: raw.captured_revision,
-        });
-        let lookup = |proof: &str, kind: &str, digest: &str| -> Result<RawClaimDocument> {
-            let claim = raw_proofs
-                .as_ref()
-                .context("derived provenance requires authenticated raw inventory")?
-                .lookup(proof, kind, digest)?;
-            Ok(RawClaimDocument {
-                language: claim.language.clone(),
-                path: claim.path.clone(),
-                artifact_hash: claim.artifact_hash.clone(),
-            })
-        };
-        let claim_artifact = validate_provenance_row(
-            p,
-            identity
-                .as_ref()
-                .map(|identity| (identity, &lookup as &ClaimLookup<'_>)),
+    let lookup = |proof: &str, kind: &str, digest: &str| -> Result<RawClaimDocument> {
+        let claim = raw_proofs
+            .as_ref()
+            .context("derived provenance requires authenticated raw inventory")?
+            .lookup(proof, kind, digest)?;
+        Ok(RawClaimDocument {
+            language: claim.language.clone(),
+            path: claim.path.clone(),
+            artifact_hash: claim.artifact_hash.clone(),
+        })
+    };
+    let identity = raw.as_ref().map(|raw| RawCaptureIdentity {
+        producer_id: raw.producer_id,
+        source_set_id: raw.source_set_id,
+        captured_revision: raw.captured_revision,
+    });
+    let captured_documents = document_index(&captured.captured_revision);
+    let requested_documents = document_index(revision);
+    let proof = validate_provenance_rows(
+        semantic,
+        &coverage,
+        &ProofEnv {
             captured,
             revision,
-        )?;
+            captured_documents: &captured_documents,
+            requested_documents: &requested_documents,
+            producers: &producers,
+            requested_producers: &requested_producers,
+            artifact_hashes: &artifact_hashes,
+            manifest_hash: &manifest_hash,
+            requested_manifest_hash: &requested_manifest_hash(revision),
+            raw: identity
+                .as_ref()
+                .map(|identity| (identity, &lookup as &ClaimLookup<'_>)),
+            raw_manifest_hash: None,
+        },
+    )?;
+    let native_references: BTreeMap<_, _> = native
+        .references
+        .iter()
+        .map(|r| (r.id.as_str(), r))
+        .collect();
+    ensure!(
+        native_references.len() == native.references.len(),
+        "duplicate native reference ID"
+    );
+    let known = |syntax_id: &str, document: &native::DocumentKey| -> Result<bool> {
+        Ok(decls
+            .get(syntax_id)
+            .is_some_and(|d| &d.document == document))
+    };
+    // The whole publication's facts are already materialized; the index adds a range-ordered
+    // position per fact, bounded by the artifact the request bounds already admitted.
+    let index = NativeIndex::new(native);
+    let env = RowEnv {
+        native,
+        index: &index,
+        captured,
+        revision,
+        sources: &|key| sources.get(key).map(Vec::as_slice),
+        declaration: &|id| decls.get(id).copied(),
+        reference: &|id| native_references.get(id).copied(),
+        known: &known,
+        witness: None,
+    };
+    validate_fact_rows(semantic, &proof, &coverage, &env)
+}
+
+/// Checks the captured manifest's order and revision identity and its component hashes, and
+/// returns the manifest hash the captured bases name.
+fn validate_captured_header(captured: &CapturedComponents) -> Result<String> {
+    let mut manifest = Vec::new();
+    for doc in &captured.captured_revision.documents {
+        key(&doc.key, &captured.captured_revision)?;
+        ensure!(
+            doc.revision_id == captured.captured_revision.id,
+            "foreign native document revision"
+        );
+        manifest.push(json!({"document":doc.key,"contentHash":doc.content_hash}));
+    }
+    let mut ordered_docs = captured
+        .captured_revision
+        .documents
+        .iter()
+        .map(|d| (language_rank(&d.key.language), d.key.path.as_bytes()))
+        .collect::<Vec<_>>();
+    let original = ordered_docs.clone();
+    ordered_docs.sort();
+    ensure!(
+        original == ordered_docs && original.windows(2).all(|w| w[0] != w[1]),
+        "unsorted native document manifest"
+    );
+    ensure!(
+        captured.captured_revision.id == native_revision_id(captured),
+        "unauthenticated captured native revision ID"
+    );
+    ensure!(
+        captured.toolchain == native_ids::canonical(&captured.native_toolchain)
+            && captured.config == native_ids::canonical(&json!(captured.native_config))
+            && captured.dependency == native_ids::canonical(&json!(captured.native_dependencies)),
+        "captured native component input mismatch"
+    );
+    for (declared, bytes) in [
+        (
+            &captured.captured_revision.toolchain_hash,
+            &captured.toolchain,
+        ),
+        (&captured.captured_revision.config_hash, &captured.config),
+        (
+            &captured.captured_revision.dependency_hash,
+            &captured.dependency,
+        ),
+    ] {
+        hash(declared)?;
+        ensure!(
+            declared == &native_ids::digest(b"", bytes),
+            "captured revision component mismatch"
+        );
+    }
+    Ok(native_ids::digest(
+        b"",
+        &native_ids::canonical(&serde_json::Value::Array(manifest)),
+    ))
+}
+
+/// A revision's documents by key.
+fn document_index(
+    revision: &native::Revision,
+) -> BTreeMap<&native::DocumentKey, &native::Document> {
+    revision.documents.iter().map(|d| (&d.key, d)).collect()
+}
+
+/// The coverage of a publication by producer, language and path.
+type CoverageIndex<'a> = BTreeMap<(&'a str, String, &'a str), &'a Coverage>;
+
+/// What a provenance row is checked against.
+struct ProofEnv<'a> {
+    captured: &'a CapturedComponents,
+    revision: &'a native::Revision,
+    captured_documents: &'a BTreeMap<&'a native::DocumentKey, &'a native::Document>,
+    requested_documents: &'a BTreeMap<&'a native::DocumentKey, &'a native::Document>,
+    producers: &'a BTreeMap<&'a str, &'a Producer>,
+    requested_producers: &'a BTreeMap<&'a str, &'a Producer>,
+    artifact_hashes: &'a BTreeMap<&'a String, BTreeSet<String>>,
+    manifest_hash: &'a str,
+    requested_manifest_hash: &'a str,
+    raw: Option<(&'a RawCaptureIdentity<'a>, &'a ClaimLookup<'a>)>,
+    raw_manifest_hash: Option<&'a str>,
+}
+
+/// Validates every provenance row and returns them by ID.
+fn validate_provenance_rows<'a>(
+    semantic: &'a SemanticPublication,
+    coverage: &CoverageIndex<'a>,
+    env: &ProofEnv<'_>,
+) -> Result<BTreeMap<&'a str, &'a Provenance>> {
+    let mut proof = BTreeMap::new();
+    for p in &semantic.provenance {
+        text(&p.id)?;
+        key(&p.document, env.revision)?;
+        hash(&p.content_hash)?;
+        let claim_artifact = validate_provenance_row(p, env.raw, env.captured, env.revision)?;
         let row = coverage
             .get(&(
                 p.producer_id.as_str(),
@@ -2238,40 +2260,37 @@ fn validate_evidence_inner(
             .basis
             .as_ref()
             .context("semantic proof requires captured basis")?;
-        let producer = producers
+        let producer = env
+            .producers
             .get(p.producer_id.as_str())
             .context("unknown proof producer")?;
         validate_basis(
             p,
             basis,
             producer,
-            captured,
+            env.captured,
             BasisArtifacts {
-                producer: artifact_hashes.get(&p.producer_id),
+                producer: env.artifact_hashes.get(&p.producer_id),
                 claim: claim_artifact.as_deref(),
-                raw_manifest_hash: raw
-                    .as_ref()
-                    .filter(|_| witnessed.is_some())
-                    .map(|raw| raw.inventory.source_manifest_hash.as_str()),
+                raw_manifest_hash: env.raw_manifest_hash,
             },
-            &manifest_hash,
+            env.manifest_hash,
         )?;
-        let document = captured
-            .captured_revision
-            .documents
-            .iter()
-            .find(|d| d.key == p.document)
+        let document = env
+            .captured_documents
+            .get(&p.document)
             .context("missing captured provenance document")?;
         ensure!(
             p.content_hash == document.content_hash,
             "captured proof document hash mismatch"
         );
-        let requested = revision.documents.iter().find(|d| d.key == p.document);
-        let requested_producer = requested_producers.get(p.producer_id.as_str());
+        let requested = env.requested_documents.get(&p.document);
+        let requested_producer = env.requested_producers.get(p.producer_id.as_str());
+        let revision = env.revision;
         let freshness = if requested.is_none_or(|d| d.content_hash != p.content_hash) {
             Freshness::Stale
         } else if basis.revision_id != revision.id
-            || basis.source_manifest_hash != requested_manifest_hash(revision)
+            || basis.source_manifest_hash != env.requested_manifest_hash
             || basis.toolchain_hash != revision.toolchain_hash
             || basis.config_hash != revision.config_hash
             || basis.dependency_hash != revision.dependency_hash
@@ -2299,6 +2318,18 @@ fn validate_evidence_inner(
             "duplicate semantic provenance"
         );
     }
+    Ok(proof)
+}
+
+/// Validates every fact row of a publication against its provenance row and `env`, then each
+/// document's observed roles.
+fn validate_fact_rows(
+    semantic: &SemanticPublication,
+    proof: &BTreeMap<&str, &Provenance>,
+    coverage: &CoverageIndex<'_>,
+    env: &RowEnv<'_>,
+) -> Result<()> {
+    let revision = env.revision;
     let fact =
         |id: &str, doc: Option<&native::DocumentKey>, kind: EvidenceKind| -> Result<&Provenance> {
             let p = *proof.get(id).context("dangling semantic fact provenance")?;
@@ -2315,127 +2346,10 @@ fn validate_evidence_inner(
             );
             Ok(p)
         };
-    for (doc, witness) in witnesses.into_iter().flat_map(|items| items.iter()) {
-        let producer_id = &raw.as_ref().context("missing raw witness")?.producer_id;
-        ensure!(
-            witness
-                .original
-                .provenance
-                .iter()
-                .all(|p| p.document == *doc),
-            "witness contains foreign proof document"
-        );
-        let admitted_ids: BTreeSet<_> = witness
-            .original
-            .provenance
-            .iter()
-            .map(|p| p.id.as_str())
-            .collect();
-        let admitted: BTreeSet<_> = witness
-            .original
-            .provenance
-            .iter()
-            .filter(|p| p.document == *doc && p.producer_id == *producer_id)
-            .filter_map(|p| {
-                p.derived_from.as_ref().map(|d| {
-                    (
-                        &d.provenance_id,
-                        d.record_kind,
-                        &d.fact_digest,
-                        p.evidence_kind,
-                    )
-                })
-            })
-            .collect();
-        ensure!(
-            admitted_ids.len() == witness.original.provenance.len()
-                && admitted.len() == witness.original.provenance.len(),
-            "duplicate or non-derived admitted proof"
-        );
-        ensure!(
-            witness.original.references.iter().all(|r| witness
-                .original
-                .provenance
-                .iter()
-                .any(|p| p.id == r.provenance_id))
-                && witness.original.declaration_bindings.iter().all(|b| witness
-                    .original
-                    .provenance
-                    .iter()
-                    .any(|p| p.id == b.provenance_id))
-                && witness.original.call_bindings.iter().all(|b| witness
-                    .original
-                    .provenance
-                    .iter()
-                    .any(|p| p.id == b.provenance_id)),
-            "foreign admitted association proof"
-        );
-        let output: BTreeSet<_> = semantic
-            .provenance
-            .iter()
-            .filter(|p| p.document == *doc && p.producer_id == *producer_id)
-            .filter_map(|p| {
-                p.derived_from.as_ref().map(|d| {
-                    (
-                        &d.provenance_id,
-                        d.record_kind,
-                        &d.fact_digest,
-                        p.evidence_kind,
-                    )
-                })
-            })
-            .collect();
-        ensure!(
-            admitted == output
-                && output.len()
-                    == semantic
-                        .provenance
-                        .iter()
-                        .filter(|p| p.document == *doc && p.producer_id == *producer_id)
-                        .count(),
-            "incomplete witnessed document proof inventory"
-        );
-    }
-    let native_references: BTreeMap<_, _> = native
-        .references
-        .iter()
-        .map(|r| (r.id.as_str(), r))
-        .collect();
-    ensure!(
-        native_references.len() == native.references.len(),
-        "duplicate native reference ID"
-    );
-    let known = |syntax_id: &str, document: &native::DocumentKey| -> Result<bool> {
-        let measured = || {
-            decls
-                .get(syntax_id)
-                .is_some_and(|d| &d.document == document)
-        };
-        Ok(
-            match selected.as_ref().and_then(|items| items.get(syntax_id)) {
-                Some(d) => &d.document == document,
-                None => measured(),
-            },
-        )
-    };
-    // The whole publication's facts are already materialized; the index adds a range-ordered
-    // position per fact, bounded by the artifact the request bounds already admitted.
-    let index = NativeIndex::new(native);
-    let env = RowEnv {
-        native,
-        index: &index,
-        captured,
-        revision,
-        sources: &|key| sources.get(key).map(Vec::as_slice),
-        declaration: &|id| decls.get(id).copied(),
-        reference: &|id| native_references.get(id).copied(),
-        known: &known,
-        witnesses,
-    };
     let mut symbols = BTreeSet::new();
     for s in &semantic.symbols {
         let p = fact(&s.provenance_id, None, EvidenceKind::DeclarationBinding)?;
-        validate_symbol_row(s, p, &env, &mut symbols)?;
+        validate_symbol_row(s, p, env, &mut symbols)?;
     }
     let mut binding_facts = BTreeSet::new();
     for b in &semantic.declaration_bindings {
@@ -2444,7 +2358,7 @@ fn validate_evidence_inner(
             Some(&b.join.anchor.document),
             EvidenceKind::DeclarationBinding,
         )?;
-        validate_declaration_binding_row(b, p, &env, &mut binding_facts)?;
+        validate_declaration_binding_row(b, p, env, &mut binding_facts)?;
     }
     let mut references = BTreeSet::new();
     for r in &semantic.references {
@@ -2453,7 +2367,14 @@ fn validate_evidence_inner(
             Some(&r.document),
             EvidenceKind::SemanticReference,
         )?;
-        validate_reference_row(r, p, &env, &mut references)?;
+        validate_reference_row(r, p, env, &mut references)?;
+    }
+    let mut references_by_proof: ReferencesByProof<'_> = BTreeMap::new();
+    for r in &semantic.references {
+        references_by_proof
+            .entry(r.provenance_id.as_str())
+            .or_default()
+            .push(r);
     }
     let mut call_facts = BTreeSet::new();
     let mut call_resolutions: BTreeMap<(String, String), Vec<TargetClaim>> = BTreeMap::new();
@@ -2466,8 +2387,8 @@ fn validate_evidence_inner(
         validate_call_binding_row(
             b,
             proof,
-            &semantic.references,
-            &env,
+            &references_by_proof,
+            env,
             &mut call_facts,
             &mut call_resolutions,
         )?;
@@ -2497,7 +2418,7 @@ fn validate_evidence_inner(
     let mut relationships = BTreeSet::new();
     for r in &semantic.type_relationships {
         let proof = fact(&r.provenance_id, None, EvidenceKind::TypeRelationship)?;
-        validate_type_relationship_row(r, proof, &env, &mut relationships)?;
+        validate_type_relationship_row(r, proof, env, &mut relationships)?;
     }
     // Each document's observed roles, from one pass over the admitted rows (#494): the roles of
     // its references, a definition for a bound declaration, a call for a bound call and a type
@@ -2532,7 +2453,7 @@ fn validate_evidence_inner(
         observe(&r.provenance_id, &[Role::Type]);
     }
     let none = BTreeSet::new();
-    for ((producer, lang, path), row) in &coverage {
+    for ((producer, lang, path), row) in coverage {
         let roles = observed
             .get(&(*producer, lang.as_str(), *path))
             .unwrap_or(&none);
@@ -2670,7 +2591,7 @@ impl<'h> EmissionValidator<'h> {
             declaration: facts.declaration,
             reference: facts.reference,
             known: facts.known,
-            witnesses: None,
+            witness: None,
         })
     }
 
@@ -2740,7 +2661,7 @@ impl<'h> EmissionValidator<'h> {
             validate_call_binding_row(
                 row,
                 proof,
-                &[],
+                &BTreeMap::new(),
                 env,
                 &mut BTreeSet::new(),
                 &mut BTreeMap::new(),
@@ -2757,6 +2678,374 @@ impl<'h> EmissionValidator<'h> {
         self.with_env(facts, |env| {
             validate_type_relationship_row(row, proof, env, &mut BTreeSet::new())
         })
+    }
+}
+
+/// The identity of the single raw capture a witnessed publication stands on.
+pub(crate) struct WitnessedRaw<'a> {
+    pub producer_id: &'a str,
+    pub source_set_id: &'a str,
+    pub captured_revision: &'a str,
+    pub artifact_hash: &'a str,
+    pub binary_bytes: &'a [u8],
+    pub source_manifest_hash: &'a str,
+}
+
+/// The narrow witness-aware final validator (Decision 0002): it checks the capture once, then
+/// the combined output one document at a time, so a publication never has to be materialized
+/// to be validated. A reused document's rows must equal its admitted original associations; a
+/// changed document holds no semantic rows. Rows are unique across documents by construction:
+/// a raw proof and an occurrence ID belong to one document.
+pub(crate) struct WitnessValidator<'a> {
+    native: &'a native::Artifact,
+    captured: &'a CapturedComponents,
+    raw: WitnessedRaw<'a>,
+    index: NativeIndex,
+    declarations: BTreeMap<&'a str, &'a native::Declaration>,
+    references: BTreeMap<&'a str, &'a native::Reference>,
+    measured_documents: BTreeSet<&'a native::DocumentKey>,
+    captured_documents: BTreeMap<&'a native::DocumentKey, &'a native::Document>,
+    requested_documents: BTreeMap<&'a native::DocumentKey, &'a native::Document>,
+    producers: BTreeMap<&'a str, &'a Producer>,
+    artifact_hashes: BTreeMap<&'a String, BTreeSet<String>>,
+    manifest_hash: String,
+    requested_manifest_hash: String,
+    producer_id: &'a String,
+}
+
+impl<'a> WitnessValidator<'a> {
+    /// `native` carries the destination revision and only the changed documents' measurements;
+    /// `captured.sources` holds only those documents' captured bytes.
+    pub(crate) fn new(
+        producer: &'a Producer,
+        native: &'a native::Artifact,
+        captured: &'a CapturedComponents,
+        raw: WitnessedRaw<'a>,
+        attested: &crate::store::AttestedProfileProducer,
+    ) -> Result<Self> {
+        let revision = &native.revision;
+        ensure!(
+            captured.native_extraction_components.is_empty(),
+            "undeclared native extraction components"
+        );
+        ensure!(
+            revision.source_set_id == native.source_set.id
+                && captured.captured_revision.source_set_id == native.source_set.id,
+            "unadmitted captured source set"
+        );
+        for (document, bytes) in &captured.sources {
+            let measured = captured
+                .captured_revision
+                .documents
+                .iter()
+                .find(|doc| &doc.key == document)
+                .context("extra captured source or witness")?;
+            ensure!(
+                measured.content_hash == native_ids::digest(b"", bytes)
+                    && measured.byte_length == bytes.len(),
+                "source digest/length mismatch"
+            );
+        }
+        let manifest_hash = validate_captured_header(captured)?;
+        if captured.captured_revision.id == revision.id {
+            ensure!(
+                captured.captured_revision == *revision,
+                "same native revision has different captured snapshot"
+            );
+        }
+        text(&producer.id)?;
+        text(&producer.version)?;
+        hash(&producer.executable_hash)?;
+        ordered(&producer.languages)?;
+        ensure!(!producer.languages.is_empty(), "empty producer languages");
+        ensure!(
+            attested.matches(producer),
+            "authenticated profile producer mismatch"
+        );
+        ensure!(
+            raw.producer_id == producer.id
+                && native_ids::digest(b"", raw.binary_bytes) == raw.artifact_hash,
+            "captured artifact differs from admitted raw binary"
+        );
+        let declarations: BTreeMap<_, _> = native
+            .declarations
+            .iter()
+            .map(|d| (d.syntax_id.as_str(), d))
+            .collect();
+        ensure!(
+            declarations.len() == native.declarations.len(),
+            "duplicate measured declaration ID"
+        );
+        let references: BTreeMap<_, _> = native
+            .references
+            .iter()
+            .map(|r| (r.id.as_str(), r))
+            .collect();
+        ensure!(
+            references.len() == native.references.len(),
+            "duplicate native reference ID"
+        );
+        let measured_documents = native
+            .declarations
+            .iter()
+            .map(|d| &d.document)
+            .chain(native.references.iter().map(|r| &r.document))
+            .chain(native.calls.iter().map(|c| &c.document))
+            .chain(native.capability_reports.iter().map(|r| &r.document))
+            .collect();
+        Ok(Self {
+            index: NativeIndex::new(native),
+            declarations,
+            references,
+            measured_documents,
+            captured_documents: document_index(&captured.captured_revision),
+            requested_documents: document_index(revision),
+            producers: BTreeMap::from([(producer.id.as_str(), producer)]),
+            artifact_hashes: BTreeMap::from([(
+                &producer.id,
+                BTreeSet::from([raw.artifact_hash.to_owned()]),
+            )]),
+            manifest_hash,
+            requested_manifest_hash: requested_manifest_hash(revision),
+            producer_id: &producer.id,
+            native,
+            captured,
+            raw,
+        })
+    }
+
+    /// Checks a current target declaration; each is checked once, when it is looked up.
+    pub(crate) fn target(&self, d: &TargetDeclaration) -> Result<()> {
+        sid(&d.syntax_id)?;
+        key(&d.document, &self.native.revision)?;
+        text(&d.name)?;
+        ensure!(
+            d.name_range.start < d.name_range.end,
+            "invalid target name range"
+        );
+        let document = self
+            .requested_documents
+            .get(&d.document)
+            .context("target declaration without current document")?;
+        ensure!(
+            d.name_range.end <= document.byte_length,
+            "target name exceeds current document"
+        );
+        if let Some(measured) = self.declarations.get(d.syntax_id.as_str()) {
+            ensure!(
+                measured.document == d.document
+                    && measured.name.as_deref() == Some(&d.name)
+                    && measured.name_range.as_ref() == Some(&d.name_range),
+                "current target contradicts measurement"
+            );
+        }
+        Ok(())
+    }
+
+    /// Validates one document's output: its only coverage row, its minted proofs and its fact
+    /// rows, against `witness` when the document is reused.
+    pub(crate) fn document(
+        &self,
+        document: &native::DocumentKey,
+        semantic: &SemanticPublication,
+        witness: Option<&WitnessedDocument>,
+        targets: &BTreeMap<(native::DocumentKey, String), TargetDeclaration>,
+        claims: &ClaimLookup<'_>,
+    ) -> Result<()> {
+        let revision = &self.native.revision;
+        if let Some(witness) = witness {
+            self.reuse(document, witness)?;
+        } else {
+            ensure!(
+                semantic.provenance.is_empty(),
+                "semantic rows on an unwitnessed document"
+            );
+        }
+        let mut coverage = BTreeMap::new();
+        for row in &semantic.coverage {
+            let lang = validate_coverage_row(
+                row,
+                &self.producers,
+                &CoverageEnv {
+                    revision_id: &revision.id,
+                    source_set_id: &revision.source_set_id,
+                    languages: &self.native.source_set.languages,
+                    has_document: &|language, path| {
+                        document.language == language && document.path == path
+                    },
+                },
+            )?;
+            ensure!(
+                coverage
+                    .insert(
+                        (row.producer_id.as_str(), lang, row.document_path.as_str()),
+                        row
+                    )
+                    .is_none(),
+                "duplicate coverage tuple"
+            );
+        }
+        ensure!(coverage.len() == 1, "missing producer coverage tuple");
+        if let Some(witness) = witness {
+            for p in &semantic.provenance {
+                ensure!(p.derived_from.is_some(), "unwitnessed captured proof");
+                admitted_proof(witness, p)?;
+            }
+        }
+        let identity = RawCaptureIdentity {
+            producer_id: self.raw.producer_id,
+            source_set_id: self.raw.source_set_id,
+            captured_revision: self.raw.captured_revision,
+        };
+        let proof = validate_provenance_rows(
+            semantic,
+            &coverage,
+            &ProofEnv {
+                captured: self.captured,
+                revision,
+                captured_documents: &self.captured_documents,
+                requested_documents: &self.requested_documents,
+                producers: &self.producers,
+                requested_producers: &self.producers,
+                artifact_hashes: &self.artifact_hashes,
+                manifest_hash: &self.manifest_hash,
+                requested_manifest_hash: &self.requested_manifest_hash,
+                raw: Some((&identity, claims)),
+                raw_manifest_hash: Some(self.raw.source_manifest_hash),
+            },
+        )?;
+        if let Some(witness) = witness {
+            self.same_proofs(document, semantic, witness)?;
+        }
+        let known = |syntax_id: &str, target: &native::DocumentKey| -> Result<bool> {
+            Ok(
+                targets.contains_key(&(target.clone(), syntax_id.to_owned()))
+                    || self
+                        .declarations
+                        .get(syntax_id)
+                        .is_some_and(|d| &d.document == target),
+            )
+        };
+        validate_fact_rows(
+            semantic,
+            &proof,
+            &coverage,
+            &RowEnv {
+                native: self.native,
+                index: &self.index,
+                captured: self.captured,
+                revision,
+                sources: &|key| self.captured.sources.get(key).map(Vec::as_slice),
+                declaration: &|id| self.declarations.get(id).copied(),
+                reference: &|id| self.references.get(id).copied(),
+                known: &known,
+                witness,
+            },
+        )
+    }
+
+    /// The conditions under which `witness` stands in for measuring `document`.
+    fn reuse(&self, document: &native::DocumentKey, witness: &WitnessedDocument) -> Result<()> {
+        if let Some(wire_digest) = &witness.wire_digest {
+            hash(wire_digest)?;
+        } else {
+            // The batch excluded this document: only its coverage survives.
+            let original = &witness.original;
+            ensure!(
+                original.coverage.iter().all(|row| {
+                    !matches!(row.state, CoverageState::Complete | CoverageState::Partial)
+                }) && original.provenance.is_empty()
+                    && original.symbols.is_empty()
+                    && original.declaration_bindings.is_empty()
+                    && original.references.is_empty()
+                    && original.call_bindings.is_empty()
+                    && original.type_relationships.is_empty(),
+                "missing producer-covered document witness"
+            );
+        }
+        let captured = self
+            .captured_documents
+            .get(document)
+            .context("extra captured source or witness")?;
+        ensure!(
+            !self.captured.sources.contains_key(document)
+                && !self.measured_documents.contains(document)
+                && witness.source_hash == captured.content_hash
+                && witness.captured_version == witness.current_version
+                && self
+                    .requested_documents
+                    .get(document)
+                    .is_some_and(|current| {
+                        current.content_hash == captured.content_hash
+                            && current.byte_length == captured.byte_length
+                    }),
+            "invalid unchanged source witness"
+        );
+        Ok(())
+    }
+
+    /// The document's minted proofs are exactly its admitted ones.
+    fn same_proofs(
+        &self,
+        document: &native::DocumentKey,
+        semantic: &SemanticPublication,
+        witness: &WitnessedDocument,
+    ) -> Result<()> {
+        let original = &witness.original;
+        ensure!(
+            original.provenance.iter().all(|p| p.document == *document),
+            "witness contains foreign proof document"
+        );
+        let ids: BTreeSet<_> = original.provenance.iter().map(|p| p.id.as_str()).collect();
+        let proofs =
+            |rows: &'_ [Provenance]| -> BTreeSet<(String, RecordKind, String, EvidenceKind)> {
+                rows.iter()
+                    .filter(|p| p.document == *document && p.producer_id == *self.producer_id)
+                    .filter_map(|p| {
+                        p.derived_from.as_ref().map(|d| {
+                            (
+                                d.provenance_id.clone(),
+                                d.record_kind,
+                                d.fact_digest.clone(),
+                                p.evidence_kind,
+                            )
+                        })
+                    })
+                    .collect()
+            };
+        let admitted = proofs(&original.provenance);
+        ensure!(
+            ids.len() == original.provenance.len() && admitted.len() == original.provenance.len(),
+            "duplicate or non-derived admitted proof"
+        );
+        ensure!(
+            original
+                .references
+                .iter()
+                .map(|r| &r.provenance_id)
+                .chain(
+                    original
+                        .declaration_bindings
+                        .iter()
+                        .map(|b| &b.provenance_id)
+                )
+                .chain(original.call_bindings.iter().map(|b| &b.provenance_id))
+                .all(|id| ids.contains(id.as_str())),
+            "foreign admitted association proof"
+        );
+        // A fact that depends on an absent target is omitted, and its coverage says so.
+        let output = proofs(&semantic.provenance);
+        let omitted = semantic
+            .coverage
+            .iter()
+            .any(|row| row.reasons.as_ref().is_some_and(|reasons| reasons.omitted));
+        ensure!(
+            output.len() == semantic.provenance.len()
+                && output.is_subset(&admitted)
+                && (omitted || output == admitted),
+            "incomplete witnessed document proof inventory"
+        );
+        Ok(())
     }
 }
 
@@ -2830,23 +3119,24 @@ mod witness_tests {
             call_bindings: vec![],
             type_relationships: vec![],
         };
-        let mut witness = WitnessedDocument {
-            source_hash: "a".repeat(64),
-            wire_digest: Some("b".repeat(64)),
-            captured_version: "v".into(),
-            current_version: "v".into(),
-            original: original.clone(),
+        let witness_of = |original: &SemanticSnapshot| {
+            WitnessedDocument::new(
+                "a".repeat(64),
+                Some("b".repeat(64)),
+                "v".into(),
+                "v".into(),
+                original.clone(),
+            )
         };
+        let witness = witness_of(&original);
         assert_eq!(original_reference(&witness, &proof).unwrap().spelling, "a");
         original.references.push(original.references[0].clone());
-        witness.original = original;
         assert!(
-            original_reference(&witness, &proof)
+            original_reference(&witness_of(&original), &proof)
                 .unwrap_err()
                 .to_string()
                 .contains("fused or ambiguous")
         );
-        witness.original.references.pop();
         let mut wrong = proof;
         wrong.derived_from.as_mut().unwrap().fact_digest = "0".repeat(64);
         assert!(
@@ -3176,7 +3466,7 @@ mod native_index_tests {
             declaration: &declaration,
             reference: &reference,
             known: &known,
-            witnesses: None,
+            witness: None,
         };
         let proof = Provenance {
             id: "proof".into(),
