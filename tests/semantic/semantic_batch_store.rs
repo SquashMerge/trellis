@@ -4634,6 +4634,147 @@ fn an_interrupted_release_resumes_without_touching_what_the_head_holds() {
     assert_eq!(work["fullFallbacks"], 0, "{work}");
 }
 
+/// A batch reselected while the revision that took its import is pending release: that
+/// revision is held again and returns to retained, so the next edit still stands on its
+/// admitted tuples (#573 review).
+#[test]
+fn a_reselected_batch_brings_its_pending_import_revision_back() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+                ("src/Q.py", "def q(): return 1\n"),
+            ],
+        )
+    });
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let mut q = world.fixture().reference("scip-python");
+    q.artifact("python", vec![DocSpec::new("src/Q.py")]);
+    world.publish(&world.write(&q)).unwrap();
+    let captured = world.store.index_baseline().unwrap();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let first = world.write(&fixture);
+    let import = world.publish(&first).unwrap().0;
+    world.store.set_retention_clock_for_tests(1_001, 1);
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    local_edit(&world, "src/C.js", "function unrelated(){}\n", &counts);
+    let (a, b) = definitions_docs();
+    let a = a.occurrence(&[0, 0, 1], &[], "pkg extra.", 0);
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    world.publish(&world.write(&fixture)).unwrap();
+    world.store.set_retention_clock_for_tests(2_002, 1_002);
+    // Stop between maintenance units, as soon as the import revision is pending.
+    for _ in 0..100 {
+        if revision_state(&world, import) == "pending" {
+            break;
+        }
+        let leader = world.store.publication_for_tests().unwrap();
+        if !world
+            .store
+            .maintain_one_revision_step_for_tests(&leader)
+            .unwrap()
+        {
+            break;
+        }
+    }
+    assert_eq!(revision_state(&world, import), "pending");
+    assert_eq!(revision_state(&world, captured), "retained");
+    world.publish(&first).unwrap();
+    let head = world.store.index_baseline().unwrap();
+    let semantic = world.store.semantic_at(head).unwrap();
+    run_maintenance(&world);
+    assert_eq!(revision_state(&world, import), "retained");
+    assert_eq!(world.store.semantic_at(head).unwrap(), semantic);
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1") };
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function unrelated(){ return 2; }\n",
+        &counts,
+    );
+    // Both producers, Q and the reselected one.
+    assert_eq!(work["witnessedRejoins"], 2, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+}
+
+/// Release past its first unit cannot be undone: a revision that no longer selects anything is
+/// no witness, and a reselection of its batch leaves it to finish releasing.
+#[test]
+fn a_partly_released_import_revision_is_not_brought_back() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+                ("src/Q.py", "def q(): return 1\n"),
+            ],
+        )
+    });
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let mut q = world.fixture().reference("scip-python");
+    q.artifact("python", vec![DocSpec::new("src/Q.py")]);
+    world.publish(&world.write(&q)).unwrap();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let first = world.write(&fixture);
+    let import = world.publish(&first).unwrap().0;
+    world.store.set_retention_clock_for_tests(1_001, 1);
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    local_edit(&world, "src/C.js", "function unrelated(){}\n", &counts);
+    let (a, b) = definitions_docs();
+    let a = a.occurrence(&[0, 0, 1], &[], "pkg extra.", 0);
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    world.publish(&world.write(&fixture)).unwrap();
+    world.store.set_retention_clock_for_tests(2_002, 1_002);
+    let leader = world.store.publication_for_tests().unwrap();
+    for _ in 0..100 {
+        if revision_state(&world, import) == "pending" {
+            break;
+        }
+        assert!(
+            world
+                .store
+                .maintain_one_revision_step_for_tests(&leader)
+                .unwrap()
+        );
+    }
+    // One more unit releases its selections.
+    assert!(
+        world
+            .store
+            .maintain_one_revision_step_for_tests(&leader)
+            .unwrap()
+    );
+    drop(leader);
+    world.publish(&first).unwrap();
+    run_maintenance(&world);
+    assert_eq!(revision_state(&world, import), "released");
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function unrelated(){ return 2; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 0, "{work}");
+    assert_eq!(
+        work["fallbackReasons"],
+        json!(["original_import_missing"]),
+        "{work}"
+    );
+}
+
 /// A definition's claim can lose its reference row to another claim at its span while it keeps
 /// its declaration binding: the row's proof is still fused. Whether that claim or the other one
 /// owns the row follows the proof IDs, so several spellings cover both orders.

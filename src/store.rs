@@ -6315,6 +6315,24 @@ const RAW_PROOF_RELEASE_SQL: &str = "SELECT p.rowid FROM semantic_raw_captures c
         WHERE v.capture_id=p.capture_id AND v.derived_from_provenance_id=p.proof_id)
     LIMIT 64";
 
+/// Whether a pending revision is held again and still whole. Its release starts by deleting
+/// its selections, so one that still selects a batch has had nothing released.
+fn pending_release_reheld(db: &Connection, revision: &str) -> Result<bool> {
+    Ok(db.query_row(
+        concat!(
+            "SELECT EXISTS(SELECT 1 FROM native_revision_supersessions
+                WHERE revision_id=?1 AND state='pending')
+             AND EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1)
+             AND NOT EXISTS(SELECT 1 FROM native_revision_supersessions
+                WHERE revision_id=?1 ",
+            revision_release_holds!(),
+            ")"
+        ),
+        [revision],
+        |row| row.get(0),
+    )?)
+}
+
 fn semantic_pin_key(pin: IndexPin) -> String {
     format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
 }
@@ -9788,6 +9806,15 @@ fn write_semantic_tuple(
 }
 
 fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
+    // The selection goes first, in a step of its own: a pending revision that still selects a
+    // batch has had nothing released, so a reselection can still return it to retained.
+    if db.execute(
+        "DELETE FROM semantic_revision_raw_selections WHERE revision_id=?1",
+        [revision],
+    )? > 0
+    {
+        return Ok(true);
+    }
     let tuple: Option<i64> = db
         .query_row(
             "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 ORDER BY tuple_id LIMIT 1",
@@ -19656,6 +19683,23 @@ impl Store {
                 tx.execute(
                     "INSERT INTO revision_capture_inputs(revision_id,input_key,payload)
                     VALUES(?1,'__pending_release:v1','pending_release:v1')",
+                    [&selected],
+                )?;
+            } else if pending_release_reheld(&tx, &selected)? {
+                // A publication reselected a batch whose import this revision took, before any
+                // of it was released: the head-rooted hold applies again (#573).
+                tx.execute(
+                    "DELETE FROM native_revision_release_debt WHERE revision_id=?1",
+                    [&selected],
+                )?;
+                tx.execute(
+                    "DELETE FROM revision_capture_inputs
+                     WHERE revision_id=?1 AND input_key='__pending_release:v1'",
+                    [&selected],
+                )?;
+                tx.execute(
+                    "UPDATE native_revision_supersessions SET state='retained'
+                     WHERE revision_id=?1 AND state='pending'",
                     [&selected],
                 )?;
             } else {
