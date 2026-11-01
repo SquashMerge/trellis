@@ -297,8 +297,12 @@ fn rules_layer_specificity_preserves_modes_roles_filters_and_unassigned_paths() 
         ] {
             let refs = references::project(&input, &paths, 5, &mut || Ok(())).unwrap();
             let data = rules::evaluate(&config, &input, &refs, &paths, &mut || Ok(())).unwrap();
-            assert_eq!(data["unassigned"].as_array().unwrap().len(), 1);
-            assert_eq!(data["unassigned"][0]["path"], "other/unassigned.rs");
+            if paths.is_empty() {
+                assert_eq!(data["unassigned"].as_array().unwrap().len(), 1);
+                assert_eq!(data["unassigned"][0]["path"], "other/unassigned.rs");
+            } else {
+                assert_eq!(data["unassigned"], json!([]), "{paths:?}");
+            }
             if paths.first().is_some_and(|p| p == "absent.rs") {
                 assert!(data["instances"].as_array().unwrap().is_empty());
                 assert!(data["testOnly"].as_array().unwrap().is_empty());
@@ -335,24 +339,80 @@ fn rules_layer_specificity_preserves_modes_roles_filters_and_unassigned_paths() 
 }
 
 #[test]
-fn rules_source_filter_keeps_full_snapshot_assignments_and_unassigned_catalog() {
+fn rules_source_filter_scopes_the_unassigned_catalog_but_not_layer_assignment() {
     let input = snapshot(&[
-        ("web/a.js", "import './b.js';"),
-        ("web/b.js", "export const value = 1;"),
-        ("web/unrelated.js", ""),
+        ("src/lib.rs", "mod a; mod b; mod loose; mod unrelated;"),
+        (
+            "src/a.rs",
+            "pub fn a() { crate::b::run(); std::mem::drop(1); }",
+        ),
+        ("src/b.rs", "pub fn run() {}"),
+        ("src/loose.rs", "pub fn l() { core::mem::drop(1); }"),
+        ("src/unrelated.rs", "pub fn u() {}"),
     ]);
-    let config = rules::parse("version=1\n[layers.entry]\norder=1\npaths=[\"web/a.js\"]\n[layers.core]\norder=2\npaths=[\"web/b.js\"]\n").unwrap();
-    for paths in [vec!["web/a.js".into()], vec!["absent.js".into()]] {
-        let refs = references::project(&input, &paths, 1, &mut || Ok(())).unwrap();
-        let data = rules::evaluate(&config, &input, &refs, &paths, &mut || Ok(())).unwrap();
-        assert_eq!(data["unassigned"].as_array().unwrap().len(), 1);
-        assert_eq!(data["unassigned"][0]["path"], "web/unrelated.js");
-        if paths[0] == "web/a.js" {
-            assert_eq!(pair(&data, "web/a.js", "web/b.js")["status"], "conforms");
-        } else {
-            assert!(data["instances"].as_array().unwrap().is_empty());
-        }
-    }
+    let config = rules::parse("version=1\n[layers.entry]\norder=1\npaths=[\"src/lib.rs\",\"src/a.rs\"]\n[layers.core]\norder=2\npaths=[\"src/b.rs\"]\n").unwrap();
+    let catalog = |paths: &[String]| {
+        let refs = references::project(&input, paths, 1, &mut || Ok(())).unwrap();
+        let data = rules::evaluate(&config, &input, &refs, paths, &mut || Ok(())).unwrap();
+        let names: Vec<_> = data["unassigned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row["path"]
+                    .as_str()
+                    .or(row["package"].as_str())
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        // Every listed external identity keeps its descriptor; nothing else is closed in.
+        let packages = data["externalPackages"].as_array().unwrap();
+        let external = names.iter().filter(|n| !n.starts_with("src/")).count();
+        assert_eq!(packages.len(), external, "{names:?}");
+        // The list follows the filter; the checkout-wide file total never does.
+        assert_eq!(data["unassignedFileCount"], 2, "{names:?}");
+        (names, data)
+    };
+
+    assert_eq!(
+        catalog(&[]).0,
+        ["src/loose.rs", "src/unrelated.rs", "core", "std"]
+    );
+
+    // An assigned source lists none of the unrelated files, and its edge still sees the
+    // layer of a destination the filter did not select.
+    let (names, data) = catalog(&["src/a.rs".into()]);
+    assert_eq!(names, ["std"]);
+    let row = pair(&data, "src/a.rs", "src/b.rs");
+    assert_eq!(row["destinationLayer"], "core");
+    assert_eq!(row["status"], "conforms");
+
+    // Explain keeps both the narrowed list and the checkout-wide total.
+    let explained = rules::explain(
+        data.clone(),
+        "$layers",
+        &row["target"],
+        Some(&row["destination"]),
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(explained["unassigned"], data["unassigned"]);
+    assert_eq!(explained["unassignedFileCount"], 2);
+
+    // An unassigned file selects itself, by exact path or by glob.
+    assert_eq!(
+        catalog(&["src/loose.rs".into()]).0,
+        ["src/loose.rs", "core"]
+    );
+    assert_eq!(
+        catalog(&["src/un*.rs".into(), "src/loose.rs".into()]).0,
+        ["src/loose.rs", "src/unrelated.rs", "core"]
+    );
+
+    let (names, data) = catalog(&["absent.rs".into()]);
+    assert!(names.is_empty());
+    assert!(data["instances"].as_array().unwrap().is_empty());
 }
 
 #[test]

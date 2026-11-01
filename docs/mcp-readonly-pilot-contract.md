@@ -339,10 +339,14 @@ array contains descriptors for emitted external destinations only. References us
 replace v1 without compatibility. Check/explain descriptors close all returned
 external destinations and informational unassigned external identities, including
 a preserved unassigned catalog after explain filtering.
-A no-match source scope returns complete empty structural arrays and zero counts,
+A no-match source scope returns complete empty structural arrays and zero counts other than `unassignedFileCount`,
 while `semanticComplete:false` remains invariant. Module revision/hash/provenance
-links and all selected unresolved sites remain intact. Rules' informational
-`unassigned` catalog still uses the full snapshot map. `limit` defaults to 5 and
+links and all selected unresolved sites remain intact. Rules assign layers across
+the full snapshot map. Their informational `unassigned` catalog follows `paths`
+(owner ruling 2026-10-31, #559): with `paths` it lists the matching unassigned
+modules and the unassigned external identities those sources observed; without
+`paths`, everything. `unassignedFileCount` stays the checkout-wide number of
+unassigned files either way. `limit` defaults to 5 and
 accepts 1–50. For references, it is the number of **sample sites per edge**. For
 check/explain, it is the number of **evidence entries per rule instance**: the
 instance keeps exact `referenceCount`, status and constraints, and adds
@@ -361,7 +365,7 @@ UInt) that fit in the 24,576-byte page target (#528; a lone larger item still fi
 `page:{offset,nextOffset,total}` continues it: call again with the same arguments,
 `expectedBasis` and `offset:nextOffset`, until `nextOffset` is null. `total` counts
 every item. Every page carries the whole result's `counts`, `testCounts`,
-`limitations`, `rulesFile` and pin. The pages concatenate, in order, to the complete
+`unassignedFileCount`, `limitations`, `rulesFile` and pin. The pages concatenate, in order, to the complete
 selected result, and closures such as module and external-package descriptors hold
 across the sequence, not within each page. An `offset` past `total` fails
 `range_too_large`. Only an item that cannot fit even alone still fails atomically

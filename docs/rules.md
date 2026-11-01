@@ -758,7 +758,8 @@ Both tools return exactly:
 {rulesVersion:"rules:v2",indexGeneration,indexRevision,
  rulesFile:ConfigDescriptor,externalPackages:ExternalPackage[],
  instances:Instance[],testOnly:Instance[],
- counts:Counts,testCounts:Counts,unassigned:Destination[],limitations:string[]}
+ counts:Counts,testCounts:Counts,unassigned:Destination[],unassignedFileCount:UInt,
+ limitations:string[]}
 Instance = {rule:string,target:Target,destination:Destination|null,
             sourceLayer:string|null,destinationLayer:string|null,
             status:"conforms"|"deviates"|"unknown",excepted:boolean,
@@ -787,7 +788,11 @@ Layer instances have no constraints; declaration instances have
 null layer/destination fields and `referenceCount:0`. An unresolved reference
 produces a `$layers` unknown instance with null destination, aggregated by source.
 Unassigned module identities are listed even when no reference exists, using
-the full snapshot module map and observed unassigned external identities. Empty
+the full snapshot module map and observed unassigned external identities. A
+source filter narrows this list to the modules it selects and the external
+identities they observed, and never narrows layer assignment;
+`unassignedFileCount` stays the checkout-wide number of unassigned files (owner
+ruling 2026-10-31, #559). Empty
 or absent layers disables `$layers` instances,
 not this informational list, ordinary declaration rules or references.
 

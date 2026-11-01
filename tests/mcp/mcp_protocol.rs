@@ -11184,6 +11184,91 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
     session.join().unwrap().unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn rules_check_paths_scope_the_unassigned_list_through_every_page() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let mut files: Vec<(String, String)> = (0..60)
+        .map(|i| {
+            (
+                format!("loose_{i:03}.js"),
+                "export const x = 1;\n".to_owned(),
+            )
+        })
+        .collect();
+    files.push(("app_main.js".into(), "export const y = 1;\n".into()));
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let (identity, topology) = published_inactive_checkout(temp.path(), &borrowed);
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 1\npaths = [\"app_main.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(559, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 559, None);
+    let mut structured = Vec::new();
+    let mut ask = |id: i64, arguments: Value| {
+        let frame = modern(
+            json!(id),
+            "tools/call",
+            json!({"name":"trellis_rules_check","arguments":arguments}),
+        );
+        writeln!(client, "{frame}").unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, None, true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        structured.push(json!({"name":"trellis_rules_check","structuredContent":envelope.clone()}));
+        envelope["data"].clone()
+    };
+    let paths = |data: &Value| -> Vec<String> {
+        data["unassigned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["path"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // The file the issue checked: assigned, so nothing unrelated comes back.
+    let scoped = ask(1, json!({"schemaVersion":1,"paths":["app_main.js"]}));
+    assert_eq!(paths(&scoped), Vec::<String>::new());
+    assert_eq!(scoped["page"]["total"], 0);
+    assert_eq!(
+        scoped["unassignedFileCount"], 60,
+        "the total stays checkout-wide"
+    );
+    let one = ask(2, json!({"schemaVersion":1,"paths":["loose_007.js"]}));
+    assert_eq!(paths(&one), ["loose_007.js"]);
+    assert_eq!(one["page"]["total"], 1);
+    let some = ask(3, json!({"schemaVersion":1,"paths":["loose_00*.js"]}));
+    assert_eq!(some["page"]["total"], 10);
+    // Without paths, the whole catalog is still there.
+    let mut all = Vec::new();
+    let mut offset = 0;
+    let mut id = 10;
+    loop {
+        let data = ask(id, json!({"schemaVersion":1,"offset":offset}));
+        assert_eq!(data["unassignedFileCount"], 60);
+        all.extend(paths(&data));
+        id += 1;
+        match data["page"]["nextOffset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert_eq!(all.len(), 60);
+    drop(ask);
+    validate_structured_content(&structured);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 #[test]
 fn architecture_catalog_prompt_and_closed_inputs_use_both_protocol_modes() {
     for legacy in [false, true] {
