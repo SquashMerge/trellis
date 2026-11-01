@@ -2372,6 +2372,61 @@ fn a_document_past_the_evidence_budget_keeps_its_file_module_and_a_whole_file_ga
     }
 }
 
+/// #576: a source over the size cap, or not UTF-8, keeps only its file module, a whole-file gap
+/// and a typed diagnostic, and captures no search card, in every language.
+#[test]
+fn a_skipped_source_keeps_its_file_module_and_a_whole_file_gap() {
+    for (path, source) in [
+        ("a.py", "def f():\n    g()\n"),
+        ("a.js", "function f() { g(); }\n"),
+        ("a.rs", "fn f() { g(); }\n"),
+        ("A.java", "class A { void f() { g(); } }\n"),
+    ] {
+        let oversized = format!("{source}{}\n", " ".repeat(600)).into_bytes();
+        let latin1 = [source.as_bytes(), b"\n\xe9\n"].concat();
+        for (bytes, diagnostic) in [
+            (oversized, "larger than --max-file-bytes"),
+            (latin1, "not UTF-8"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join(path), &bytes).unwrap();
+            let identity = trellis::store::topology::WorkspaceIdentity::discover(
+                Some(root.path()),
+                root.path(),
+            )
+            .unwrap();
+            let mut options = trellis::indexer::IndexOptions::new(root.path().to_owned());
+            options.max_file_bytes = 512;
+            let (graph, artifact) = trellis::indexer::index_workspace_with_native(
+                &options,
+                &identity.record_id,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(artifact.declarations.len(), 1, "{path} {diagnostic}");
+            assert_eq!(artifact.declarations[0].kind, "module");
+            assert!(artifact.calls.is_empty() && artifact.references.is_empty());
+            assert!(artifact.control_regions.is_empty());
+            assert!(artifact.search_cards.is_empty(), "{path} {diagnostic}");
+            let coverage = &artifact.coverage[0];
+            assert_eq!(coverage.state, "partial");
+            assert!(coverage.diagnostic.as_ref().unwrap().contains(diagnostic));
+            assert!(coverage.observed_roles.is_empty());
+            let stored = &graph.files[0].text;
+            assert!(
+                stored.contains("Trellis did not read this file"),
+                "{stored:?}"
+            );
+            for family in &artifact.capability_reports[0].families {
+                assert_eq!(family.gaps.len(), 1);
+                assert_eq!(family.gaps[0].range.start, 0);
+                assert_eq!(family.gaps[0].range.end, stored.len());
+            }
+        }
+    }
+}
+
 /// A real minified bundle is dense, but a selected read admits it, so it stays whole.
 #[test]
 fn a_minified_bundle_within_the_evidence_budget_keeps_its_facts() {

@@ -1132,6 +1132,61 @@ fn definitions_world() -> World {
     })
 }
 
+/// #576: through staging, a use of a symbol defined only in a source Trellis didn't read stays
+/// unresolved, never external, and both join stores agree. The readable control resolves it.
+#[test]
+fn a_symbol_defined_only_in_a_skipped_source_stays_unresolved_through_staging() {
+    let definer = "function run() {}\n";
+    for (bytes, skipped) in [
+        (definer.as_bytes().to_vec(), false),
+        ([definer.as_bytes(), b"// caf\xe9\n"].concat(), true),
+    ] {
+        let world = world(|root| {
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("src/A.js"), &bytes).unwrap();
+            fs::write(root.join("src/B.js"), "run();\n").unwrap();
+        });
+        let descriptor = one_artifact_per_language(
+            &world,
+            vec![(
+                "javascript",
+                vec![
+                    DocSpec::new("src/A.js")
+                        .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
+                        .symbol("pkg run.", 17, &[]),
+                    DocSpec::new("src/B.js").occurrence(&[0, 0, 3], &[], "pkg run.", 0),
+                ],
+            )],
+        );
+        let (mut admitted, _, _) = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        let memory = world
+            .memory_rejoin(&descriptor, DestinationMutations::default())
+            .unwrap()
+            .publication;
+        assert_same_publication(&staged, &memory, "skipped definer");
+        let uses: Vec<_> = staged
+            .references
+            .iter()
+            .filter(|r| r.document.path == "src/B.js")
+            .map(|r| r.resolution)
+            .collect();
+        assert!(!uses.is_empty());
+        let expected = if skipped {
+            Resolution::Unresolved
+        } else {
+            Resolution::Resolved
+        };
+        assert!(uses.iter().all(|r| *r == expected), "{skipped}: {uses:?}");
+    }
+}
+
 #[test]
 fn staged_and_memory_join_stores_produce_identical_publications() {
     let check = |world: &World, descriptor: &(PathBuf, String), mutations, case: &str| {
@@ -7210,6 +7265,64 @@ fn witnessed_local_rejoin_does_not_keep_a_method_direct_in_an_edited_document() 
     let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
     assert_eq!(work["witnessedRejoins"], 1, "{work}");
     assert_eq!(calls(&world), [call("f", "Unknown"), call("g", "Direct")]);
+}
+
+/// The witnessed path rejoins one document at a time, so "the reused documents" must still mean
+/// all of them: a method call into a document the edit did not touch keeps its `direct`, as a
+/// full rejoin keeps it.
+#[test]
+fn witnessed_local_rejoin_keeps_a_method_direct_in_an_unchanged_document() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+                ("src/c.rs", "fn other() { }\n"),
+            ],
+        )
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g) = (symbol("r()."), symbol("impl#[S]f()."), symbol("g()."));
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 15, 16], &[], &f, 0)
+                .occurrence(&[0, 20, 21], &[], &g, 0)
+                .symbol(&r, 17, &[]),
+            DocSpec::new("src/b.rs")
+                .occurrence(&[1, 12, 13], &[], &f, 1)
+                .occurrence(&[2, 3, 4], &[], &g, 1)
+                .symbol(&f, 26, &[])
+                .symbol(&g, 17, &[]),
+            DocSpec::new("src/c.rs"),
+        ],
+    );
+    let descriptor = world.write(&fixture);
+    drop(world.publish(&descriptor).unwrap());
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+    }
+    let work = local_edit(&world, "src/c.rs", "fn other() { let _ = 1; }\n", &counts);
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    let head = world.store.index_baseline().unwrap();
+    let call = |callee: &str| ["src/a.rs", callee, "Resolved", "Direct"].map(str::to_owned);
+    assert_eq!(
+        rust_calls(
+            &world,
+            &world.store.semantic_at(head).unwrap().call_bindings
+        ),
+        [call("f"), call("g")]
+    );
 }
 
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the

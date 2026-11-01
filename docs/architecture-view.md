@@ -153,16 +153,20 @@ revision a page is showing. Every read projects from the result.
 A build resolves references and prepares declaration rules for the whole revision, under the
 existing budgets; layer-edge and exception work is charged per read, on the references that
 read selects. A revision over those budgets fails `bounded_work` for the summary, details and
-unscoped reads. A path-scoped MCP or CLI read then computes just its own paths on the request,
-under the budgets of that scope and its usual deadline.
+unscoped reads. A path-scoped MCP or CLI read then computes on the request: it reads the
+revision itself, resolves references and evaluates rules only for its own paths, and answers
+under the budgets of that scope and its usual deadline. It does the same when a build is still
+running after a 1 s wait, so an agent's narrow read after an edit usually needs no retry. That
+read holds a read transaction while it computes, and repeats the document read the build is
+doing. If it cannot finish in time it fails `deadline_exceeded`, which is retryable.
 
 
 | Read | While the build runs |
 | --- | --- |
 | `GET architecture` | Waits 1 s for the owner, then answers **202** with `{"state":"building","progress":{"phase","completed","total"},"retryAfterMs"}`. The view shows `Building Architecture for this revision: reading indexed files 120 of 604…` and asks again; the daemon answers as soon as the build is done. |
 | `GET architecture/details` | Waits 1 s, then answers **503** `architecture_building`. |
-| MCP `trellis_rules_check`, `trellis_rules_explain`, `trellis_references`, the layer prompt | Waits until one second before the 5 s call deadline, then returns the existing retryable `deadline_exceeded` with a message that says the build is running. |
-| CLI `trellis rules check`, `trellis references` | Waits up to 30 s, then fails `deadline_exceeded`. |
+| MCP `trellis_rules_check`, `trellis_rules_explain`, `trellis_references`, the layer prompt | A read without `paths` waits until one second before the 5 s call deadline, then returns the existing retryable `deadline_exceeded` with a message that says the build is running. A read with `paths` computes its own scope, below. |
+| CLI `trellis rules check`, `trellis references` | A read without paths waits up to 30 s, then fails `deadline_exceeded`. A read with paths computes its own scope, below. |
 | `metrics` (revision or directory scope) | Waits up to 5 s for a running build, then computes its own rows. It uses a published build's rows at once, and never asks for a build. |
 
 The periods above are bounds on one read's wait: a waiter wakes on the owner's signal, and
@@ -188,7 +192,7 @@ detail. On this repository it went from about 35 MB to about 0.75 MB. Its fields
   role's coverage row plus `complete` (no unresolved site) (#523);
 - `evidenceTier` (`syntax` or `mixed`) at the top level, as in the references payload;
 - `partialFiles` at the top level and in `references` and `rules`: the files with a syntax error,
-  with syntax past the walk bounds, or published without evidence (see
+  with syntax past the walk bounds, published without evidence, or not read (#576) (see
   [Work bounds](rules.md#work-bounds-and-located-failures)). One bad file is a reported gap here,
   never a refusal of the whole view (#554, #563, #564). Only a `ready` payload carries it;
 - `references`: `referencesVersion`, `evidenceTier`, `semanticComplete`,

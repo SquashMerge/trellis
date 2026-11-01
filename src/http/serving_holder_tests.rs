@@ -533,10 +533,12 @@ async fn selected_startup_failure_must_not_fail_valid_q1_before_reconciliation()
     let encoded =
         serde_json::to_string(&crate::indexer::ReconcileOptions::from(&q1_options)).unwrap();
     assert_eq!(q1.options_json, encoded);
-    // startup reconciliation cannot admit this source, but Q1's own larger limit could.
-    let large = format!("function a() {{}}\n// {}\n", "x".repeat(180));
+    // startup reconciliation cannot admit this ignore file, but Q1's own larger limit could. A
+    // source over the limit would only be skipped (#576), and a config input has its own cap
+    // (#581); an ignore file still fails.
+    let large = format!("# {}\n", "x".repeat(180));
     assert!(large.len() > 128 && large.len() <= 512);
-    fs::write(root.join("a.js"), large).unwrap();
+    fs::write(root.join(".gitignore"), large).unwrap();
     drop(old_owner);
     let error = state.worker_step().unwrap_err();
     assert!(format!("{error:#}").contains("unsafe or oversized input"));

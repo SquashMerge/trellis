@@ -506,7 +506,12 @@ fn evidence_read(
                 .map_err(|error| response.report_index_failure(error))
             {
                 Ok(envelope) => envelope,
-                Err(error) if crate::store::cli_read_retryable_contention(&error) => {
+                Err(error)
+                    if crate::store::cli_read_retryable_contention(&error)
+                        || error
+                            .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
+                            .is_some() =>
+                {
                     return Err(error);
                 }
                 Err(error) => {
@@ -535,6 +540,18 @@ fn evidence_read(
             Err(ref error) if crate::store::cli_read_retryable_contention(error) => {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
+            // The head moved, or the first wait could not admit. The read has ended, so this
+            // wait holds nothing; the next attempt answers from what the owner published.
+            Err(ref error)
+                if error
+                    .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
+                    .is_some() =>
+            {
+                if let Some(before_read) = before_read {
+                    before_read(&runtime);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             answer => return answer,
         }
     }
@@ -550,6 +567,8 @@ struct DescribedSnapshot {
 /// Every tool call is answered within this deadline; describe reports it as
 /// `limits.deadlineMs` (contract W1).
 pub const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(5000);
+/// An architecture read stops waiting for the owner this long before its deadline.
+const ARCHITECTURE_ANSWER_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Outgoing and incoming calls emit this many items unless `limit` says otherwise (#528):
 /// six semantic bindings with their proofs measured about 23.5 KB on this repository's
@@ -1077,6 +1096,16 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 }
                                 Ok(architecture::envelope(id, payload))
                             }
+                            // Time is left for the owner: wait for it outside this read.
+                            Err(error)
+                                if error
+                                    .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
+                                    .is_some()
+                                    && deadline.saturating_duration_since(runtime.mcp_clock_now())
+                                        > ARCHITECTURE_ANSWER_TIME =>
+                            {
+                                Err(error)
+                            }
                             Err(error) if crate::store::cli_read_retryable_contention(&error) => {
                                 Err(error)
                             }
@@ -1493,7 +1522,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     );
                     let wait = deadline
                         .saturating_duration_since(runtime.mcp_clock_now())
-                        .saturating_sub(std::time::Duration::from_secs(1));
+                        .saturating_sub(ARCHITECTURE_ANSWER_TIME);
                     runtime.await_architecture_tool(
                         architecture::operation(&name),
                         &store_arguments,

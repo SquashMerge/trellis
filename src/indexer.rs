@@ -15,6 +15,10 @@ use tree_sitter::Node;
 pub struct IndexOptions {
     pub workspace_root: PathBuf,
     pub max_file_bytes: u64,
+    /// The cap on one config input (#581). Always
+    /// [`crate::skipped_config::CONFIG_INPUT_MAX_BYTES`] outside tests, so it is neither a
+    /// flag nor a reconcile option; tests lower it to exercise the skip at normal size.
+    pub max_config_bytes: u64,
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -35,6 +39,7 @@ impl IndexOptions {
         Self {
             workspace_root,
             max_file_bytes: 2 * 1024 * 1024,
+            max_config_bytes: crate::skipped_config::CONFIG_INPUT_MAX_BYTES,
         }
     }
 }

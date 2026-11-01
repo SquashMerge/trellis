@@ -1874,9 +1874,12 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
     })?;
     let key = scoped_symbol_key(&scoped);
     let mut asserted = scoped_declaration_targets(store, index, &scoped, operation)?;
+    // A symbol the artifact never declares nor describes is external, unless a source of this
+    // language wasn't read: the producer saw it, but its claims are dropped (#576).
     if asserted.is_empty()
         && key.scope == semantic::SymbolScope::Global
         && index.presence(&symbol, None)? == (false, false)
+        && !store.has_unread_source(&doc.language)?
     {
         store.reserve_operation(operation, || {
             staged::sizes::sum(&[
@@ -2525,6 +2528,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             if target_candidates.is_empty()
                 && !target_symbol.starts_with("local ")
                 && !index.is_information_symbol(target_symbol)?
+                && !store.has_unread_source(&doc.language)?
             {
                 store.reserve_operation(&mut operation, || {
                     staged::sizes::sum(&[
@@ -2671,7 +2675,12 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 }
                 let mut destination =
                     declaration_target(store, index, doc, target_symbol, &mut operation)?;
-                if destination.is_none() && target_method.is_none() {
+                // A global symbol could be declared in a source that wasn't read (#576).
+                if destination.is_none()
+                    && target_method.is_none()
+                    && (target_symbol.starts_with("local ")
+                        || !store.has_unread_source(&doc.language)?)
+                {
                     store.reserve_operation(&mut operation, || {
                         staged::sizes::sum(&[
                             std::mem::size_of::<semantic::Target>() as u64,
@@ -4877,6 +4886,9 @@ pub(crate) struct WitnessedRejoin<'a> {
     pub basis: &'a BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
     /// The document's original associations when it is reused; `None` when it changed.
     pub reused: Option<JoinedFacts>,
+    /// Every document this producer reuses: a call's target in one of them is still a
+    /// destination classification.
+    pub reusable: &'a BTreeSet<native::DocumentKey>,
     /// The native gap counts its admission recorded.
     pub gaps: [u64; 4],
     pub current_targets: &'a BTreeMap<(native::DocumentKey, String), semantic::TargetDeclaration>,
@@ -4907,6 +4919,7 @@ pub(crate) fn rejoin_document_with_witness(
         producer,
         basis,
         reused,
+        reusable,
         gaps,
         current_targets,
         destination,
@@ -4914,16 +4927,16 @@ pub(crate) fn rejoin_document_with_witness(
     } = rejoin;
     let is_reused = reused.is_some();
     let captured = reused.unwrap_or_default();
-    let reusable = BTreeSet::from_iter(is_reused.then(|| document.clone()));
     let raw_index = ProofIdentityIndex::new(inventory)?;
     let mut filtered = inventory.clone();
     if !is_reused {
         filtered.claims.clear();
     }
     let filtered_index = ProofIdentityIndex::new(&filtered)?;
+    // `captured` holds this document's rows only, so `reusable` decides just their targets.
     let joined = reuse_captured_source_associations(
         &captured,
-        &reusable,
+        reusable,
         inventory,
         &destination_native.revision.source_set_id,
         &destination_native.revision.id,

@@ -27,11 +27,13 @@ pub struct SyntaxGap {
     subtrees: usize,
 }
 impl SyntaxGap {
-    /// A document with no evidence but its file module (#564). Its syntax can still be read,
-    /// so this is the whole file, and it never makes a binding unknown by itself.
-    pub(crate) fn evidence_budget(bytes: usize) -> Self {
+    /// A document with no evidence but its file module, over the evidence budget (#564) or
+    /// not read (#576): see [`module_only_reason`]. This is the whole file. An over-budget
+    /// file's syntax can still be read, so it never makes a binding unknown by itself; a skipped
+    /// file's placeholder is a parser error, so it proves nothing.
+    pub(crate) fn module_only(reason: &'static str, bytes: usize) -> Self {
         Self {
-            reason: "evidence_budget",
+            reason,
             range: Range {
                 start: 0,
                 end: bytes,
@@ -59,16 +61,31 @@ pub struct PartialFile {
     pub source_set_id: String,
     pub language: String,
     pub path: String,
-    /// `syntax_error`, `depth_limit`, `visit_limit` or `evidence_budget`.
+    /// `syntax_error`, `depth_limit`, `visit_limit`, `evidence_budget`, `oversized` or
+    /// `not_utf8`.
     pub reason: &'static str,
     pub range: Range,
     pub subtrees: usize,
 }
 
+/// The `partialFiles` reason of a document published with only its file module, from its
+/// stored coverage diagnostic.
+pub(crate) fn module_only_reason(diagnostic: Option<&str>) -> Option<&'static str> {
+    use crate::skipped_source::Skip;
+    let diagnostic = diagnostic?;
+    if diagnostic == crate::evidence_budget::DIAGNOSTIC {
+        return Some("evidence_budget");
+    }
+    [Skip::Oversized, Skip::NotUtf8]
+        .into_iter()
+        .find(|skip| skip.diagnostic() == diagnostic)
+        .map(|skip| skip.reason())
+}
+
 /// The limitation a result carries when it has partial files.
 pub(crate) fn limitation(files: usize) -> String {
     format!(
-        "{files} source file(s) could only be partly read: they have syntax errors, exceed the syntax bounds ({DEPTH} levels, {VISITS} nodes) or exceed the per-file evidence budget. Evidence inside partialFiles is missing, and resolution that depends on a partial file stays unknown."
+        "{files} source file(s) could only be partly read: they have syntax errors, exceed the syntax bounds ({DEPTH} levels, {VISITS} nodes), exceed the per-file evidence budget, or were not read because they exceed --max-file-bytes or aren't UTF-8. Evidence inside partialFiles is missing, and resolution that depends on a partial file stays unknown."
     )
 }
 

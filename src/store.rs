@@ -2197,7 +2197,7 @@ impl EvidenceResponse {
         let mut cursor = statement.query([&selected.key])?;
         let mut documents = Vec::new();
         let mut regions = Vec::new();
-        let mut evidence_gaps = BTreeSet::new();
+        let mut evidence_gaps = BTreeMap::new();
         let mut pending = Vec::new();
         let mut source_bytes = 0u64;
         let mut stored_bytes = 0u64;
@@ -2249,8 +2249,8 @@ impl EvidenceResponse {
                 }
                 fetched?
             };
-            if diagnostic.as_deref() == Some(crate::evidence_budget::DIAGNOSTIC) {
-                evidence_gaps.insert(key.clone());
+            if let Some(reason) = crate::syntax_bounds::module_only_reason(diagnostic.as_deref()) {
+                evidence_gaps.insert(key.clone(), reason);
             }
             pending.push((key, std::sync::Mutex::new(Some(fetched))));
             progress(pending.len(), total);
@@ -2383,7 +2383,8 @@ impl EvidenceResponse {
                 } => {
                     source_bytes = source_bytes.saturating_add(byte_length);
                     ensure!(
-                        byte_length <= 2 * 1024 * 1024 && source_bytes <= 256 * 1024 * 1024,
+                        byte_length <= crate::skipped_config::CONFIG_INPUT_MAX_BYTES
+                            && source_bytes <= 256 * 1024 * 1024,
                         "bounded_work: architecture source"
                     );
                     selected_ensure!(
@@ -2503,7 +2504,7 @@ impl EvidenceResponse {
             WHERE m.revision_id=?1 ORDER BY r.source_set_id,m.language,m.path",
         )?;
         let mut documents = Vec::new();
-        let mut evidence_gaps = BTreeSet::new();
+        let mut evidence_gaps = BTreeMap::new();
         let mut cursor = stmt.query([&selected.key])?;
         while let Some(row) = cursor.next()? {
             progress.check()?;
@@ -2512,10 +2513,10 @@ impl EvidenceResponse {
                 language: row.get(1)?,
                 path: row.get(2)?,
             };
-            if row.get::<_, Option<String>>(3)?.as_deref()
-                == Some(crate::evidence_budget::DIAGNOSTIC)
-            {
-                evidence_gaps.insert(key.clone());
+            if let Some(reason) = crate::syntax_bounds::module_only_reason(
+                row.get::<_, Option<String>>(3)?.as_deref(),
+            ) {
+                evidence_gaps.insert(key.clone(), reason);
             }
             documents.push(key);
         }
@@ -2652,9 +2653,10 @@ impl EvidenceResponse {
             };
             partial_files.extend(
                 evidence_gaps
-                    .contains(key)
-                    .then(|| {
-                        crate::syntax_bounds::SyntaxGap::evidence_budget(physical_bytes).file(key)
+                    .get(key)
+                    .map(|&reason| {
+                        crate::syntax_bounds::SyntaxGap::module_only(reason, physical_bytes)
+                            .file(key)
                     })
                     .or_else(|| computed.gap().map(|gap| gap.file(key))),
             );
@@ -11316,6 +11318,34 @@ impl ScanComparison {
     }
 }
 
+/// One status diagnostic per config input the published head admitted unread because it
+/// is over the config input cap (#581). Its recorded hash is the placeholder's.
+fn skipped_config_diagnostics(db: &Connection, status: &mut IndexStatus) -> Result<()> {
+    let placeholder = crate::skipped_config::placeholder_hash();
+    let mut statement = db.prepare_cached(
+        "SELECT i.input_key,i.payload FROM revision_capture_inputs i JOIN native_revisions r ON r.id=i.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE i.input_key LIKE 'config:%' OR i.input_key LIKE 'toolchain:%' ORDER BY i.input_key",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let key: String = row.get(0)?;
+        let payload: String = row.get(1)?;
+        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&payload)
+            .context(SelectedIntegrity(
+            "incompatible_index: stored JSON decode failed".into(),
+        ))?;
+        if let crate::capture::CaptureInputObservation::Present { hash, .. } = observation
+            && hash == placeholder
+        {
+            status.diagnostics.push(Diagnostic {
+                path: key.split_once(':').map(|(_, path)| path.to_owned()),
+                code: crate::skipped_config::DIAGNOSTIC_CODE.into(),
+                message: crate::skipped_config::diagnostic_message(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) type SourceObservations = BTreeMap<String, (String, crate::capture::CaptureStat)>;
 pub(crate) type InputObservations = BTreeMap<String, crate::capture::CaptureInputObservation>;
 
@@ -14596,6 +14626,9 @@ impl Store {
             Ok(())
         })()
         .map_err(|error| self.report_index_failure(error))?;
+        let mut status = status;
+        skipped_config_diagnostics(db, &mut status)
+            .map_err(|error| self.report_index_failure(error))?;
         Ok(status)
     }
 
@@ -15846,10 +15879,8 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(|counts| counts.opens == 1
-                        && counts.complete_reads == 1
-                        && counts.hashes == 1),
-            "native_evidence_required: each source must open, read, and hash once"
+                    .all(crate::capture::SourceOperations::read_once),
+            "native_evidence_required: each source must open and read at most once, and hash once"
         );
         ensure!(
             spool.len() == spool.header().revision.documents.len()
@@ -16353,7 +16384,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1),
+                    .all(crate::capture::SourceOperations::read_once),
             "native_evidence_required: incomplete selected capture"
         );
         let mut native = prepared.native.clone();
@@ -16516,10 +16547,8 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(|counts| counts.opens == 1
-                        && counts.complete_reads == 1
-                        && counts.hashes == 1),
-            "native_evidence_required: each source must open, read, and hash once"
+                    .all(crate::capture::SourceOperations::read_once),
+            "native_evidence_required: each source must open and read at most once, and hash once"
         );
         crate::indexer::validate_native_graph(graph, capture, native, cancel)?;
         Ok(())
@@ -16981,7 +17010,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1),
+                    .all(crate::capture::SourceOperations::read_once),
             "native_evidence_required: final inventory must freshly read and hash every admitted source"
         );
         leader.belongs_to(&self.identity)?;
@@ -17055,7 +17084,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1),
+                    .all(crate::capture::SourceOperations::read_once),
             "native_evidence_required: every unchanged source must be read and hashed"
         );
         let db = self.cache_write()?;

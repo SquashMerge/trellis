@@ -1831,13 +1831,26 @@ fn dispatch_connection(
                         Ok(())
                     };
                     // The owner finishes the first read after a publication; leave time to
-                    // answer. This wait comes before read admission.
-                    let wait = request_deadline
-                        .saturating_duration_since(Instant::now())
-                        .saturating_sub(Duration::from_secs(1));
-                    checkout.await_architecture_tool(kind, args, wait, &mut check);
-                    let (response, catching_up) = checkout.evidence_response()?;
-                    let result = checkout.architecture_tool(&response, kind, args, &mut check);
+                    // answer. The wait comes before read admission, and again if the head
+                    // moved meanwhile.
+                    let (response, catching_up, result) = loop {
+                        let wait = request_deadline
+                            .saturating_duration_since(Instant::now())
+                            .saturating_sub(Duration::from_secs(1));
+                        checkout.await_architecture_tool(kind, args, wait, &mut check);
+                        let (response, catching_up) = checkout.evidence_response()?;
+                        let result = checkout.architecture_tool(&response, kind, args, &mut check);
+                        let building = result.as_ref().err().is_some_and(|error| {
+                            error
+                                .downcast_ref::<trellis::http::ArchitectureBuilding>()
+                                .is_some()
+                        });
+                        if !building || wait.is_zero() {
+                            break (response, catching_up, result);
+                        }
+                        drop(response);
+                        std::thread::sleep(Duration::from_millis(1));
+                    };
                     match result {
                         Ok(payload) => {
                             check()?;

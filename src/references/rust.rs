@@ -349,7 +349,13 @@ impl Catalog {
             if !trees[document].root_node().has_error() {
                 continue;
             }
-            let (names, unnamed) = possible_module_names(&docs[document].file.text);
+            let file = &docs[document].file;
+            // A skipped file's placeholder names nothing, but the file could declare any module.
+            let (names, unnamed) = match crate::skipped_source::skipped(&file.language, &file.text)
+            {
+                Some(_) => (BTreeSet::new(), true),
+                None => possible_module_names(&file.text),
+            };
             let below = format!("{}/", self.scopes[owner].directory);
             for (&other, &child) in &self.files.clone() {
                 self.step(check)?;

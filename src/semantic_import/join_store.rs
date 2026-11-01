@@ -428,6 +428,9 @@ pub(super) trait JoinStore: JoinFacts + ProofIdentities {
     fn lookup_proof(&self, proof: &str, kind: &str, digest: &str) -> Result<()>;
     /// Re-reads a claim already admitted by `lookup_proof`.
     fn claim(&self, proof: &str, kind: &str, digest: &str) -> Result<Cow<'_, CapturedClaim>>;
+    /// Whether a source of `language` in this revision was not read (#576). A symbol it
+    /// defines is absent from the artifact's claims, so absence there proves nothing.
+    fn has_unread_source(&self, language: &str) -> Result<bool>;
     /// The SCIP kind of the symbol information for `symbol` in one document.
     fn symbol_kind(&self, language: &str, path: &str, symbol: &str) -> Result<Option<i64>>;
     fn occurrence_range(

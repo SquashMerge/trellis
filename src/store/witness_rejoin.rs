@@ -533,6 +533,7 @@ pub(super) fn publish_with_witness(
             producer,
             basis: &basis,
             reused,
+            reusable,
             gaps,
             current_targets: &targets,
             destination: &facts,
