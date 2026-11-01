@@ -37,7 +37,7 @@ The #557 slice (a Rust `impl Trait for Type` measures its trait in `Header.bases
 re-ran the production `native-capture` command twice on these unchanged snapshots
 using pinned Rust 1.99.1 and `test-support`. Both outputs were byte-identical
 (SHA-256 `5200774bbed03e6124abe34d0730e1ea3ad946a9ffb0777c8fde955fec5c715f`). The compiled native extractor hash is
-`936bf5d4cfacf2bedd053682c4d00e95ea8093138911acec73679874a5e79d0c`, pinned as
+`f05adee0cf069422fc8bf11739cdeb11140cd260d316c2c6ef334157d657d3cc`, pinned as
 `trellis-native-v13-javascript-test-support` in the hardware profile.
 
 JavaScript measurement is unchanged: only the producer version, extractor hash and

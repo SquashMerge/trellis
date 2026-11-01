@@ -63,8 +63,8 @@
       "installedAtCapture": true,
       "capturedOn": "2026-10-31",
       "installMethod": "cargo build --locked --features test-support --bin trellis; fix/557-inherent-dispatch from main 944417ad; descriptor and both captures reproducible from the README commands",
-      "artifactDigest": "sha256:936bf5d4cfacf2bedd053682c4d00e95ea8093138911acec73679874a5e79d0c",
-      "executableHash": "936bf5d4cfacf2bedd053682c4d00e95ea8093138911acec73679874a5e79d0c",
+      "artifactDigest": "sha256:f05adee0cf069422fc8bf11739cdeb11140cd260d316c2c6ef334157d657d3cc",
+      "executableHash": "f05adee0cf069422fc8bf11739cdeb11140cd260d316c2c6ef334157d657d3cc",
       "runtime": "trellis.native.syntax@native-v13 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
     },
     {
