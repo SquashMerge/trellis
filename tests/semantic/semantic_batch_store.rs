@@ -6987,6 +6987,178 @@ fn dispatch_declaration(world: &World, name: &str, ancestor: Option<&str>) -> St
     found[0].syntax_id.clone()
 }
 
+const RUST_ANALYZER_PARTIAL_CALLS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/scip-rust-analyzer-partial-calls"
+);
+
+fn partial_calls_mcp_world() -> World {
+    let world = world_with(
+        |root| {
+            fs::create_dir_all(root.join(".git")).unwrap();
+            WorkspaceIdentity::discover(Some(root), root)
+                .unwrap()
+                .attach_marker()
+                .unwrap();
+            copy_tree(
+                &Path::new(RUST_ANALYZER_PARTIAL_CALLS).join("workspace"),
+                root,
+            );
+        },
+        true,
+    );
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let docs = fixture.paths("rust");
+    let ordinal = fixture.artifact("rust", docs);
+    fixture.override_artifact_raw(
+        ordinal,
+        rust_analyzer_artifact_of(&world, RUST_ANALYZER_PARTIAL_CALLS),
+    );
+    let (pin, admitted, _) = world.publish(&world.write(&fixture)).unwrap();
+    drop(admitted);
+    let publication = world.store.semantic_at(pin).unwrap();
+    let partial = publication
+        .coverage
+        .iter()
+        .find(|row| row.document_path == "src/lib.rs")
+        .unwrap();
+    assert_eq!(
+        partial.state,
+        trellis::semantic_evidence::CoverageState::Partial
+    );
+    assert!(
+        partial
+            .reasons
+            .as_ref()
+            .is_some_and(|reasons| reasons.gaps().iter().sum::<u64>() > 0)
+    );
+    assert!(
+        publication
+            .call_bindings
+            .iter()
+            .any(|binding| binding.join.anchor.document.path == "src/lib.rs"
+                && binding.call_id.is_some())
+    );
+    world
+}
+
+async fn partial_import_calls_mcp(name: &str, session: u64) {
+    let world = partial_calls_mcp_world();
+    let concrete = declaration_in(&world, "run", "src/lib.rs");
+    let target = declaration_in(&world, "helper", "src/lib.rs");
+    let root = if name == "trellis_incoming_calls" {
+        &target
+    } else {
+        &concrete
+    };
+    let mut mcp = McpSession::start(&world, session);
+    let mut replies = Vec::new();
+    for explicit in [false, true] {
+        for compact in [false, true] {
+            if name == "trellis_call_graph" && compact {
+                continue;
+            }
+            let mut args = json!({"schemaVersion":1,"symbolId":root});
+            if name == "trellis_call_graph" {
+                args["depth"] = json!(2);
+            } else {
+                args["compact"] = json!(compact);
+            }
+            if explicit {
+                args["semanticProducerId"] = json!("rust-analyzer");
+            }
+            replies.push(mcp.call(name, args));
+        }
+    }
+    // Validate every actual response, including failures, against the advertised schema.
+    mcp.finish();
+    for reply in replies {
+        assert!(reply.get("error").is_none(), "{name}: {reply}");
+        if name == "trellis_call_graph" {
+            let result = &reply["data"]["result"];
+            assert!(result["nodes"].as_array().unwrap().len() > 1, "{reply}");
+            assert!(
+                result["coverage"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.get("reasons").is_none())
+            );
+        } else {
+            let items = if name == "trellis_outgoing_calls" {
+                "calls"
+            } else {
+                "callers"
+            };
+            assert!(
+                !reply["data"][items].as_array().unwrap().is_empty(),
+                "{reply}"
+            );
+            if !reply["data"]["coverage"].is_null() {
+                assert!(
+                    reply["data"]["coverage"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|row| row.get("reasons").is_none())
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn witnessed_local_rejoin_preserves_real_partial_import_metadata() {
+    let world = partial_calls_mcp_world();
+    let before = world
+        .store
+        .semantic_at(world.store.index_baseline().unwrap())
+        .unwrap();
+    let reasons = before
+        .coverage
+        .iter()
+        .find(|row| row.document_path == "src/lib.rs")
+        .unwrap()
+        .reasons
+        .clone();
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: nextest runs each test in its own process; the hook reads these during publication.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+    }
+    let work = local_edit(&world, "src/other.rs", "pub fn unrelated() {}\n", &counts);
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    let after = world
+        .store
+        .semantic_at(world.store.index_baseline().unwrap())
+        .unwrap();
+    assert_eq!(
+        after
+            .coverage
+            .iter()
+            .find(|row| row.document_path == "src/lib.rs")
+            .unwrap()
+            .reasons,
+        reasons
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_partial_import_outgoing_calls_match_the_catalog() {
+    partial_import_calls_mcp("trellis_outgoing_calls", 5951).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_partial_import_incoming_calls_match_the_catalog() {
+    partial_import_calls_mcp("trellis_incoming_calls", 5952).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_partial_import_call_graph_matches_the_catalog() {
+    partial_import_calls_mcp("trellis_call_graph", 5953).await;
+}
+
 /// Owner ruling 2026-10-31 (#557) on real rust-analyzer bytes, identically in the staged and
 /// in-memory joins. Inherent calls are direct, including through `self.m()`, `Type::f()` and
 /// `assert!`; a trait object's and a type parameter's calls name the trait's declaration and
