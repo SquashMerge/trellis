@@ -7252,9 +7252,9 @@ fn read_semantic_tuple_for_call(
             supported_roles,
             observed_roles,
             diagnostic,
-            // A whole-revision snapshot carries each tuple's import-time reasons (#520); the
-            // tuple reads behind graph results and history do not.
-            reasons: if selected_tuple.is_none() || trusted_admitted_raw {
+            // Import-time reasons belong to whole-revision snapshots, not answer projections.
+            // The witnessed rejoin explicitly reads its required tuple metadata.
+            reasons: if selected_tuple.is_none() {
                 read_coverage_reasons(db, tuple)?
             } else {
                 None
