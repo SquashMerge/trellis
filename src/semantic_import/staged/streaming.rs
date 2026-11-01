@@ -2110,6 +2110,7 @@ mod reservation_tests {
             stage_base: stage_bytes(conn).unwrap(),
             mutations: DestinationMutations::default(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            unread: Default::default(),
         }
     }
 
@@ -2336,6 +2337,7 @@ mod reservation_tests {
             stage_base: 0,
             mutations: DestinationMutations::default(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            unread: Default::default(),
         };
         let global = CompletedGlobal {
             ctx: &ctx,

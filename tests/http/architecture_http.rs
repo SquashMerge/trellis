@@ -61,6 +61,21 @@ async fn fixture_with_sources(
     ProvisionedBrowser,
     String,
 ) {
+    let sources: Vec<_> = extra_sources
+        .iter()
+        .map(|(path, source)| (*path, source.as_bytes()))
+        .collect();
+    fixture_with_bytes(role_fixture, &sources).await
+}
+async fn fixture_with_bytes(
+    role_fixture: bool,
+    extra_sources: &[(&str, &[u8])],
+) -> (
+    tempfile::TempDir,
+    Arc<trellis::daemon::registry::CheckoutRuntime>,
+    ProvisionedBrowser,
+    String,
+) {
     let base = tempfile::tempdir().unwrap();
     let root = base.path().join("checkout");
     fs::create_dir(&root).unwrap();
@@ -406,6 +421,52 @@ async fn one_file_past_the_evidence_budgets_is_a_coverage_gap_and_every_view_is_
             metrics["payload"]["partialFiles"][0]["reason"],
             "evidence_budget"
         );
+        let (status, classes) = view(app.clone(), &key, "classes").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {classes}");
+    }
+}
+
+/// #576: one source that isn't UTF-8, in each language, is skipped as a partial file, and every
+/// view of the checkout is served.
+#[tokio::test]
+async fn one_source_that_is_not_utf8_is_skipped_and_every_view_is_served() {
+    let cases: [(&str, &[u8]); 4] = [
+        ("src/latin.py", b"def f():\n    pass\n# caf\xe9\n"),
+        ("src/latin.js", b"export function f() {}\n// caf\xe9\n"),
+        ("src/latin.rs", b"pub fn f() {}\n// caf\xe9\n"),
+        ("src/Latin.java", b"class Latin {}\n// caf\xe9\n"),
+    ];
+    for (path, source) in cases {
+        let (base, _runtime, browser, key) = fixture_with_bytes(
+            false,
+            &[
+                (path, source),
+                ("src/a.js", b"import { b } from './b.js'; b();\n"),
+                ("src/b.js", b"export function b() {}\n"),
+            ],
+        )
+        .await;
+        write_rules(
+            &base,
+            "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js','deep/**','zero/**']",
+        );
+        let app = browser.router();
+        let (status, body) = request(app.clone(), &key, "").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        let payload = &body["payload"];
+        assert_eq!(payload["partialFiles"][0]["path"], path);
+        assert_eq!(payload["partialFiles"][0]["reason"], "not_utf8");
+        assert_eq!(payload["references"]["partialFiles"][0]["path"], path);
+        assert_eq!(payload["rules"]["partialFiles"][0]["path"], path);
+        assert!(
+            payload["references"]["counts"]["mappedSites"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        let (status, metrics) = view(app.clone(), &key, "metrics").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {metrics}");
+        assert_eq!(metrics["payload"]["partialFiles"][0]["reason"], "not_utf8");
         let (status, classes) = view(app.clone(), &key, "classes").await;
         assert_eq!(status, StatusCode::OK, "{path}: {classes}");
     }

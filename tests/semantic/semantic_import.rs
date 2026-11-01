@@ -150,6 +150,89 @@ fn an_artifact_naming_a_skipped_source_admits_it_without_claims() {
     }
 }
 
+/// #576 review: a symbol whose only definition is in a skipped source is absent from the
+/// artifact's claims, but that proves nothing: its uses stay unresolved, never external. The
+/// readable control resolves them into the file.
+#[test]
+fn a_use_of_a_symbol_defined_only_in_a_skipped_source_is_never_external() {
+    let text = "function f(){g();}\n";
+    for (bytes, cap, skipped) in [
+        (text.as_bytes().to_vec(), 2 * 1024 * 1024, false),
+        (
+            format!("{text}//{}\n", "x".repeat(600)).into_bytes(),
+            256,
+            true,
+        ),
+        (
+            [text.as_bytes(), b"// caf\xe9\n"].concat(),
+            2 * 1024 * 1024,
+            true,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        fs::create_dir(physical.join("src")).unwrap();
+        fs::write(physical.join("src/A.js"), &bytes).unwrap();
+        fs::write(physical.join("src/B.js"), "A();\n").unwrap();
+        let mut options = IndexOptions::new(physical.clone());
+        options.max_file_bytes = cap;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        // B.js only uses `A#`, which A.js defines.
+        let artifact =
+            crate::semantic_batch_support::edit_scip(&hex::decode(WIRE).unwrap(), |index| {
+                let a = index.documents[0].clone();
+                let mut b = index.documents[0].clone();
+                b.relative_path = "src/B.js".into();
+                b.symbols.clear();
+                b.occurrences.truncate(1);
+                b.occurrences[0].range = vec![0, 0, 1];
+                b.occurrences[0].symbol_roles = 0;
+                index.documents = vec![a, b];
+            });
+        let inventory = admit(
+            &capture,
+            "scip-typescript",
+            "javascript",
+            &artifact,
+            &cancel,
+        );
+        let identity =
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical)
+                .unwrap();
+        let native =
+            native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
+        let sources = capture
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    native::DocumentKey {
+                        source_set_id: native.revision.source_set_id.clone(),
+                        language: f.language.clone(),
+                        path: f.path.clone(),
+                    },
+                    f.text.as_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let facts = join_inventory(&inventory, &native, &sources, 2).unwrap();
+        assert!(!facts.references.is_empty());
+        for resolution in facts
+            .references
+            .iter()
+            .map(|r| &r.resolution)
+            .chain(facts.call_bindings.iter().map(|c| &c.resolution))
+        {
+            if skipped {
+                assert_eq!(*resolution, semantic::Resolution::Unresolved, "cap {cap}");
+            } else {
+                assert_eq!(*resolution, semantic::Resolution::Resolved, "cap {cap}");
+            }
+        }
+    }
+}
+
 #[test]
 fn authenticated_javascript_claims_join_real_native_candidates() {
     let (_root, native, sources, inventory) = fixture();

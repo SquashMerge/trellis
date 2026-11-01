@@ -60,6 +60,13 @@ pub(crate) fn placeholder(language: &str, skip: Skip) -> String {
     format!("{comment} Trellis did not read this file: {why}.\n\u{1}\n")
 }
 
+/// The content hashes of the placeholders of `language`: a stored document has one of them
+/// exactly when it was skipped.
+pub(crate) fn placeholder_hashes(language: &str) -> [String; 2] {
+    use sha2::{Digest, Sha256};
+    SKIPS.map(|skip| hex::encode(Sha256::digest(placeholder(language, skip).as_bytes())))
+}
+
 /// Why the document with this stored text was skipped, if it was.
 pub(crate) fn skipped(language: &str, text: &str) -> Option<Skip> {
     // Every placeholder is short and ends the same way, so ordinary sources fail fast.

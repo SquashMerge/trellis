@@ -1734,9 +1734,12 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
     })?;
     let key = scoped_symbol_key(&scoped);
     let mut asserted = scoped_declaration_targets(store, index, &scoped, operation)?;
+    // A symbol the artifact never declares nor describes is external, unless a source of this
+    // language wasn't read: the producer saw it, but its claims are dropped (#576).
     if asserted.is_empty()
         && key.scope == semantic::SymbolScope::Global
         && index.presence(&symbol, None)? == (false, false)
+        && !store.has_unread_source(&doc.language)?
     {
         store.reserve_operation(operation, || {
             staged::sizes::sum(&[
@@ -2385,6 +2388,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             if target_candidates.is_empty()
                 && !target_symbol.starts_with("local ")
                 && !index.is_information_symbol(target_symbol)?
+                && !store.has_unread_source(&doc.language)?
             {
                 store.reserve_operation(&mut operation, || {
                     staged::sizes::sum(&[
@@ -2531,7 +2535,12 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 }
                 let mut destination =
                     declaration_target(store, index, doc, target_symbol, &mut operation)?;
-                if destination.is_none() && target_method.is_none() {
+                // A global symbol could be declared in a source that wasn't read (#576).
+                if destination.is_none()
+                    && target_method.is_none()
+                    && (target_symbol.starts_with("local ")
+                        || !store.has_unread_source(&doc.language)?)
+                {
                     store.reserve_operation(&mut operation, || {
                         staged::sizes::sum(&[
                             std::mem::size_of::<semantic::Target>() as u64,
