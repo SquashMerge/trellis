@@ -3678,6 +3678,61 @@ fn explicit_cli_unchanged_claim_acks_done_without_new_revision() {
 }
 
 #[test]
+fn rules_check_path_filter_scopes_the_unassigned_list() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let daemon = FixtureDaemon::new(&home);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir(root.join(".trellis")).unwrap();
+    fs::write(root.join("src/lib.rs"), "mod high; mod low;\n").unwrap();
+    fs::write(root.join("src/high.rs"), "pub fn target() {}\n").unwrap();
+    fs::write(root.join("src/low.rs"), "pub fn run() {}\n").unwrap();
+    fs::write(
+        root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.high]\norder = 1\npaths = [\"src/high.rs\"]\n",
+    )
+    .unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let unassigned = |paths: &[&str]| -> Vec<String> {
+        let mut check = isolated_command(&home);
+        check
+            .args(["rules", "check", "--format", "json", "--workspace"])
+            .arg(&root);
+        for path in paths {
+            check.args(["--path", path]);
+        }
+        let output = check.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["payload"]["unassignedFileCount"], 2, "{paths:?}");
+        value["payload"]["unassigned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["path"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(unassigned(&[]), ["src/lib.rs", "src/low.rs"]);
+    assert_eq!(unassigned(&["src/high.rs"]), Vec::<String>::new());
+    assert_eq!(unassigned(&["src/low.rs"]), ["src/low.rs"]);
+    assert_eq!(
+        unassigned(&["src/h*.rs", "src/l*.rs"]),
+        ["src/lib.rs", "src/low.rs"]
+    );
+    drop(daemon);
+}
+
+#[test]
 fn architecture_cli_pins_layer_deviations_references_and_exact_exceptions_without_enqueue() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
