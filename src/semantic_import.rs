@@ -3423,6 +3423,16 @@ fn reuse_captured_source_associations(
     facts
         .call_bindings
         .retain(|row| is_reused(&row.join.anchor.document));
+    // A reused row is no destination classification of a target outside the reused documents:
+    // the rejoin takes the captured one under its own rule, as a full rejoin would (#557).
+    for row in &mut facts.call_bindings {
+        if matches!(
+            &row.declared_target,
+            Some(semantic::Target::Internal { document, .. }) if !is_reused(document)
+        ) {
+            row.declared_target = None;
+        }
+    }
     facts.type_relationships.retain(|row| {
         proof_documents
             .get(row.provenance_id.as_str())

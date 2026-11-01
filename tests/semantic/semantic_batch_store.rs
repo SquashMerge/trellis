@@ -6533,6 +6533,74 @@ fn rejoin_keeps_inherent_and_trait_dispatch_only_for_the_same_declaration() {
     ]));
 }
 
+/// #557: a witnessed LOCAL rejoin takes the same rule as a full one. Its reused rows are no
+/// destination classification of a target in the edited document, so the method's `direct`
+/// drops while the free function's holds.
+#[test]
+fn witnessed_local_rejoin_does_not_keep_a_method_direct_in_an_edited_document() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+            ],
+        )
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g) = (symbol("r()."), symbol("impl#[S]f()."), symbol("g()."));
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 15, 16], &[], &f, 0)
+                .occurrence(&[0, 20, 21], &[], &g, 0)
+                .symbol(&r, 17, &[]),
+            DocSpec::new("src/b.rs")
+                .occurrence(&[1, 12, 13], &[], &f, 1)
+                .occurrence(&[2, 3, 4], &[], &g, 1)
+                .symbol(&f, 26, &[])
+                .symbol(&g, 17, &[]),
+        ],
+    );
+    let descriptor = world.write(&fixture);
+    drop(world.publish(&descriptor).unwrap());
+    let calls = |world: &World| {
+        let head = world.store.index_baseline().unwrap();
+        rust_calls(world, &world.store.semantic_at(head).unwrap().call_bindings)
+    };
+    let call = |callee: &str, dispatch: &str| {
+        ["src/a.rs", callee, "Resolved", dispatch].map(str::to_owned)
+    };
+    assert_eq!(calls(&world), [call("f", "Direct"), call("g", "Direct")]);
+
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    write_files(
+        &world.root,
+        &[(
+            "src/b.rs",
+            "struct S;\nimpl T for S { fn f(&self) { } }\nfn g() { }\n",
+        )],
+    );
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(calls(&world), [call("f", "Unknown"), call("g", "Direct")]);
+}
+
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the
 /// per-document cap shrunk below src/lib.rs's 36 occurrences: the document is admitted partial
 /// with the typed reason, keeps exactly its definitions, and both join paths agree.
