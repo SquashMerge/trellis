@@ -1066,6 +1066,129 @@ fn a_skipped_source_publishes_as_a_gap_and_recovers() {
     }
 }
 
+/// #581: config inputs have their own cap, separate from `--max-file-bytes`. One under it is
+/// read in full; one over it is skipped with a typed status diagnostic, the checkout still
+/// publishes, the facts it would supply are unknown (never a false external), and it recovers
+/// when it shrinks back.
+#[test]
+#[cfg(feature = "test-support")]
+fn a_config_input_over_its_cap_is_skipped_with_a_diagnostic_and_recovers() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let write = |path: &str, text: &str| {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(
+        "src/app.js",
+        "import chunk from 'lodash';\nexport function app() { return chunk([1]); }\n",
+    );
+    write("pkg/util.js", "export function util() { return 1; }\n");
+    write("pkg/package.json", "{\"name\":\"pkg\"}");
+    write(
+        "src/lib.rs",
+        "use serde::Deserialize;\npub fn lib() { Deserialize::f(); }\n",
+    );
+    // Real manifests are small but past this test's --max-file-bytes, and under its config cap.
+    let pad = " ".repeat(400);
+    let package_json =
+        format!("{{\"name\":\"app\",\"dependencies\":{{\"lodash\":\"4.17.21\"}}}}{pad}\n");
+    let cargo_toml = format!(
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1.0.0\"\n#{pad}\n"
+    );
+    let oversized = |text: &str| format!("{text}{}", " ".repeat(5000));
+    write("package.json", &package_json);
+    write("Cargo.toml", &cargo_toml);
+    write("package-lock.json", "{\"lockfileVersion\":3}\n");
+    write("Cargo.lock", "version = 4\n");
+
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let leader = store.publication_for_tests().unwrap();
+    let mut options = IndexOptions::new(root.path().to_owned());
+    options.max_file_bytes = 256;
+    options.max_config_bytes = 4096;
+    let publish = || {
+        publish_with(
+            &store,
+            &options,
+            &cancel,
+            store.index_baseline().unwrap(),
+            &leader,
+        )
+        .unwrap();
+        assert!(!store.recovery_pending_for_tests());
+    };
+    let skipped = || {
+        let status = store.status().unwrap();
+        assert_eq!(status.stats.files, 3);
+        status
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "config-input-oversized")
+            .map(|d| {
+                assert!(d.message.contains("was not read"), "{}", d.message);
+                d.path.clone().unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let externals = || {
+        let references = store
+            .evidence_response()
+            .unwrap()
+            .architecture_response("references", &serde_json::json!({}), &mut || Ok(()))
+            .unwrap();
+        let mut packages: Vec<String> = references["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|package| package["identity"]["package"].as_str().unwrap().to_owned())
+            .collect();
+        packages.sort();
+        packages
+    };
+
+    // Every config input is read in full, though two are past --max-file-bytes.
+    publish();
+    assert!(skipped().is_empty());
+    assert_eq!(externals(), ["lodash", "serde"]);
+
+    // Lockfiles over the cap are skipped; the manifests still supply their dependencies.
+    write("package-lock.json", &oversized("{\"lockfileVersion\":3}"));
+    write("Cargo.lock", &oversized("version = 4"));
+    publish();
+    assert_eq!(skipped(), ["Cargo.lock", "package-lock.json"]);
+    assert_eq!(externals(), ["lodash", "serde"]);
+
+    // A manifest over the cap supplies nothing: its dependencies are unknown, not external.
+    write("package.json", &oversized(&package_json));
+    write("Cargo.toml", &oversized(&cargo_toml));
+    write("pkg/package.json", &oversized("{\"name\":\"pkg\"}"));
+    publish();
+    assert_eq!(
+        skipped(),
+        [
+            "Cargo.lock",
+            "Cargo.toml",
+            "package-lock.json",
+            "package.json",
+            "pkg/package.json"
+        ]
+    );
+    assert!(externals().is_empty());
+
+    // Each recovers when it shrinks back under the cap.
+    write("package.json", &package_json);
+    write("Cargo.toml", &cargo_toml);
+    write("pkg/package.json", "{\"name\":\"pkg\"}");
+    write("package-lock.json", "{\"lockfileVersion\":3}\n");
+    write("Cargo.lock", "version = 4\n");
+    publish();
+    assert!(skipped().is_empty());
+    assert_eq!(externals(), ["lodash", "serde"]);
+}
+
 #[test]
 #[cfg(feature = "test-support")]
 fn every_encoded_selected_id_rejects_wrong_length_blob() {

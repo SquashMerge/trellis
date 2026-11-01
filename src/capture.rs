@@ -301,9 +301,15 @@ fn identity(_item: &Stamp) -> Option<(u64, u64)> {
     None
 }
 
+/// Where an input over its cap goes: `None` fails the capture; a config input is instead
+/// admitted unread, with the placeholder as its bytes, and recorded here (#581).
+type SkippedInputs<'a> = Option<&'a mut BTreeSet<PathBuf>>;
+
+#[allow(clippy::too_many_arguments)] // The capture's admission maps, threaded through.
 fn admit_input(
     path: PathBuf,
     cap: u64,
+    skipped: SkippedInputs<'_>,
     cancel: &CancelFlag,
     source_identities: &BTreeSet<(u64, u64)>,
     identities: &mut BTreeMap<(u64, u64), PathBuf>,
@@ -314,8 +320,9 @@ fn admit_input(
     let bytes = match &state {
         None => None,
         Some(item) => {
+            let unread = item.kind == 2 && item.len > cap && skipped.is_some();
             ensure!(
-                item.kind == 2 && item.len <= cap,
+                item.kind == 2 && (item.len <= cap || unread),
                 "unsafe or oversized input: {}",
                 path.display()
             );
@@ -325,7 +332,10 @@ fn admit_input(
                 "input aliases source: {}",
                 path.display()
             );
-            if let Some(old_path) = key.and_then(|key| identities.get(&key)) {
+            if unread {
+                skipped.unwrap().insert(path.clone());
+                Some(Arc::from(crate::skipped_config::PLACEHOLDER))
+            } else if let Some(old_path) = key.and_then(|key| identities.get(&key)) {
                 #[cfg(test)]
                 source_read_hook(old_path, "alias");
                 if metadata(old_path)? != inputs[old_path] {
@@ -632,6 +642,8 @@ pub struct Capture {
     executable_digest: String,
     running_executable: Option<Arc<RunningExecutable>>,
     input_bytes: BTreeMap<PathBuf, Option<Arc<[u8]>>>,
+    /// Config inputs over their cap, admitted unread with the placeholder as their bytes.
+    skipped_inputs: BTreeSet<PathBuf>,
     reconcile_options: crate::indexer::ReconcileOptions,
 }
 impl Capture {
@@ -691,10 +703,17 @@ impl Capture {
                 );
             }
         }
+        // Config inputs are read for dependency and module-root facts, not as source, so
+        // they have their own cap, not --max-file-bytes (owner ruling 2026-11-01, #581).
+        let config_cap = options
+            .max_config_bytes
+            .min(crate::skipped_config::CONFIG_INPUT_MAX_BYTES);
+        let mut skipped_inputs = BTreeSet::new();
         for name in ROOT_INPUTS {
             admit_input(
                 root.join(name),
-                options.max_file_bytes.min(16 * 1024 * 1024),
+                config_cap,
+                Some(&mut skipped_inputs),
                 cancel,
                 &source_identities,
                 &mut input_identities,
@@ -711,6 +730,7 @@ impl Capture {
                 admit_input(
                     dir.join(name),
                     options.max_file_bytes.min(16 * 1024 * 1024),
+                    None,
                     cancel,
                     &source_identities,
                     &mut input_identities,
@@ -733,13 +753,13 @@ impl Capture {
                     .map(|dir| dir.join("Cargo.toml")),
             );
         for path in nested {
-            let cap = options.max_file_bytes.min(16 * 1024 * 1024);
-            if metadata(&path)?.is_some_and(|item| item.kind != 2 || item.len > cap) {
+            if metadata(&path)?.is_some_and(|item| item.kind != 2) {
                 continue;
             }
             admit_input(
                 path,
-                cap,
+                config_cap,
+                Some(&mut skipped_inputs),
                 cancel,
                 &source_identities,
                 &mut input_identities,
@@ -761,6 +781,7 @@ impl Capture {
             admit_input(
                 exe.clone(),
                 512 * 1024 * 1024,
+                None,
                 cancel,
                 &source_identities,
                 &mut input_identities,
@@ -856,6 +877,7 @@ impl Capture {
             executable_digest,
             running_executable,
             input_bytes,
+            skipped_inputs,
             reconcile_options: crate::indexer::ReconcileOptions::from(options),
         };
         capture.verify(cancel)?;
@@ -926,7 +948,11 @@ impl Capture {
             // Relevant config, manifest, ignore and toolchain bytes can change
             // while a filesystem reports an unchanged stat. Do not infer their
             // equality from timestamps at the publication cutoff.
-            if let Some(state) = expected {
+            // A config input admitted unread stays unread: its stat is its whole observation.
+            if let Some(state) = expected
+                .as_ref()
+                .filter(|_| !self.skipped_inputs.contains(path))
+            {
                 let now = regular_read(path, self.input_cap(path), state, cancel, None)?;
                 if self.input_bytes.get(path).and_then(Option::as_deref) != Some(now.as_slice()) {
                     return Err(SourceInputDrift("input contents drift").into());
@@ -940,7 +966,7 @@ impl Capture {
         if path == self.executable_path {
             512 * 1024 * 1024
         } else {
-            16 * 1024 * 1024
+            crate::skipped_config::CONFIG_INPUT_MAX_BYTES.max(16 * 1024 * 1024)
         }
     }
     pub(crate) fn physical_root(&self) -> &Path {
@@ -1023,7 +1049,9 @@ impl Capture {
                 }
                 (Some(stat), Some(bytes)) => {
                     ensure!(
-                        stat.kind == 2 && stat.len == bytes.len() as u64,
+                        stat.kind == 2
+                            && (stat.len == bytes.len() as u64
+                                || self.skipped_inputs.contains(path)),
                         "malformed admitted native input"
                     );
                     Some(if path == &self.executable_path {
@@ -1260,6 +1288,66 @@ mod tests {
         assert_eq!(
             error.downcast_ref::<SourceInputDrift>().unwrap().0,
             "input alias drift"
+        );
+    }
+
+    /// #581: a config input over its cap is admitted unread. It is never opened, its stat is
+    /// kept and the placeholder is its bytes; the capture verifies without reading it, and a
+    /// change to it is still drift.
+    #[test]
+    fn a_config_input_over_its_cap_is_admitted_unread() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let binary = exe.path().join("extractor");
+        fs::write(&binary, b"binary").unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        fs::write(workspace.path().join("package.json"), "{}\n").unwrap();
+        let lock = workspace.path().join("package-lock.json");
+        fs::write(&lock, "x".repeat(300)).unwrap();
+        let lock = fs::canonicalize(&lock).unwrap();
+        let mut options = IndexOptions::new(workspace.path().to_owned());
+        options.max_config_bytes = 256;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let opened = std::rc::Rc::new(std::cell::Cell::new(0));
+        let hook = |opened: std::rc::Rc<std::cell::Cell<i32>>, lock: PathBuf| {
+            move |path: &Path, phase: &str| {
+                if path == lock && phase == "open" {
+                    opened.set(opened.get() + 1);
+                }
+            }
+        };
+        let capture = with_source_read_hook(hook(opened.clone(), lock.clone()), || {
+            Capture::admit_with_executable(&options, &cancel, &|_| {}, binary)
+        })
+        .unwrap();
+        assert_eq!(opened.get(), 0);
+        assert_eq!(
+            capture.bytes(&lock),
+            Some(crate::skipped_config::PLACEHOLDER)
+        );
+        let inputs = capture.persisted_inputs().unwrap();
+        let CaptureInputObservation::Present { stat, hash } = &inputs["config:package-lock.json"]
+        else {
+            panic!("skipped input must stay present");
+        };
+        assert_eq!(stat.size, 300);
+        assert_eq!(hash, &crate::skipped_config::placeholder_hash());
+        // The manifest under the cap is read as usual.
+        assert!(matches!(
+            &inputs["config:package.json"],
+            CaptureInputObservation::Present { hash, .. } if hash == &super::hash(b"{}\n")
+        ));
+        capture.native_input_fingerprints().unwrap();
+        with_source_read_hook(hook(opened.clone(), lock.clone()), || {
+            capture.verify(&cancel)
+        })
+        .unwrap();
+        assert_eq!(opened.get(), 0);
+        fs::write(&lock, "y".repeat(400)).unwrap();
+        let error = capture.verify(&cancel).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SourceInputDrift>().unwrap().0,
+            "input inventory drift"
         );
     }
 

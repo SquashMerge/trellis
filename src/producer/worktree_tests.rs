@@ -148,6 +148,28 @@ fn trusted_python_includes_pyproject() {
     assert!(!dir.path().join("producer-config").exists());
 }
 
+/// #581: a config input captured unread is refused, never written as that file.
+#[test]
+fn a_skipped_config_input_refuses_the_worktree() {
+    let mut source = retained();
+    let skipped = present("Cargo.lock", crate::skipped_config::PLACEHOLDER);
+    source.dependencies[2] = skipped.clone();
+    source.config[2] = skipped;
+    let dir = tempfile::tempdir().unwrap();
+    let error = worktree::materialize(
+        &source,
+        &profiles::Rules::default(),
+        dir.path(),
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "capture_unavailable: config input Cargo.lock is over the config input cap and was not read"
+    );
+    assert!(!exists(&dir, "Cargo.lock") && !exists(&dir, "src/a.js"));
+}
+
 #[test]
 fn cancellation_stops_between_files() {
     let dir = tempfile::tempdir().unwrap();

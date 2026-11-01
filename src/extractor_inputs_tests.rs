@@ -35,6 +35,10 @@ const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
         "selects nested package.json config inputs (#443), captured and compared per revision",
     ),
     (
+        "skipped_config::CONFIG_INPUT_MAX_BYTES",
+        "the default config input cap (#581); a skipped input's placeholder is captured and compared per revision",
+    ),
+    (
         "capture::nested_cargo_manifest",
         "selects nested Cargo.toml config inputs (#394), captured and compared per revision",
     ),

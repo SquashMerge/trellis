@@ -2380,7 +2380,8 @@ impl EvidenceResponse {
                 } => {
                     source_bytes = source_bytes.saturating_add(byte_length);
                     ensure!(
-                        byte_length <= 2 * 1024 * 1024 && source_bytes <= 256 * 1024 * 1024,
+                        byte_length <= crate::skipped_config::CONFIG_INPUT_MAX_BYTES
+                            && source_bytes <= 256 * 1024 * 1024,
                         "bounded_work: architecture source"
                     );
                     selected_ensure!(
@@ -11304,6 +11305,34 @@ impl ScanComparison {
     }
 }
 
+/// One status diagnostic per config input the published head admitted unread because it
+/// is over the config input cap (#581). Its recorded hash is the placeholder's.
+fn skipped_config_diagnostics(db: &Connection, status: &mut IndexStatus) -> Result<()> {
+    let placeholder = crate::skipped_config::placeholder_hash();
+    let mut statement = db.prepare_cached(
+        "SELECT i.input_key,i.payload FROM revision_capture_inputs i JOIN native_revisions r ON r.id=i.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE i.input_key LIKE 'config:%' OR i.input_key LIKE 'toolchain:%' ORDER BY i.input_key",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let key: String = row.get(0)?;
+        let payload: String = row.get(1)?;
+        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&payload)
+            .context(SelectedIntegrity(
+            "incompatible_index: stored JSON decode failed".into(),
+        ))?;
+        if let crate::capture::CaptureInputObservation::Present { hash, .. } = observation
+            && hash == placeholder
+        {
+            status.diagnostics.push(Diagnostic {
+                path: key.split_once(':').map(|(_, path)| path.to_owned()),
+                code: crate::skipped_config::DIAGNOSTIC_CODE.into(),
+                message: crate::skipped_config::diagnostic_message(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) type SourceObservations = BTreeMap<String, (String, crate::capture::CaptureStat)>;
 pub(crate) type InputObservations = BTreeMap<String, crate::capture::CaptureInputObservation>;
 
@@ -14581,6 +14610,9 @@ impl Store {
             Ok(())
         })()
         .map_err(|error| self.report_index_failure(error))?;
+        let mut status = status;
+        skipped_config_diagnostics(db, &mut status)
+            .map_err(|error| self.report_index_failure(error))?;
         Ok(status)
     }
 
