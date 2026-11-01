@@ -57,6 +57,17 @@
       "runtime": "trellis.native.syntax@native-v10 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
     },
     {
+      "name": "trellis-native-v15-javascript-test-support",
+      "status": "recorded",
+      "version": "native-v15",
+      "installedAtCapture": true,
+      "capturedOn": "2026-11-01",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; fix/576-skip-oversized-files merged with main; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:35154a0b928e64fffc95ee4b045bc7867c340c99d30e809fec0248c0d721969e",
+      "executableHash": "35154a0b928e64fffc95ee4b045bc7867c340c99d30e809fec0248c0d721969e",
+      "runtime": "trellis.native.syntax@native-v15 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
+    },
+    {
       "name": "trellis-native-v14-javascript-test-support",
       "status": "recorded",
       "version": "native-v14",
