@@ -2648,7 +2648,7 @@ fn one_maintenance_unit_releases_many_chunks_within_its_budget() {
         )
         .unwrap();
     }
-    store.set_maintenance_unit_budget_for_tests(std::time::Duration::from_secs(600));
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::from_secs(10));
     store.set_retention_clock_for_tests(1_000, 0);
     let leader = store.publication_for_tests().unwrap();
     let old = publish(
@@ -3439,6 +3439,8 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
 fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
+    // One chunk per unit, so the large prior document is still partly drained when the next revision publishes.
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::ZERO);
     let source = root.path().join("large.js");
     let body: String = (0..20_000)
         .map(|n| format!("function f{n}() {{ return {n}; }}\n"))
@@ -3530,6 +3532,8 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
 fn large_revision_releases_in_batched_units_while_edits_continue() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
+    // One chunk per unit, so the old manifest is still partly drained when the edits publish.
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::ZERO);
     for n in 0..400 {
         fs::write(
             root.path().join(format!("batch{n}.js")),
