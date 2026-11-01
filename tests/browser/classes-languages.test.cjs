@@ -57,7 +57,7 @@ async function withApp(files, run) {
     page.on("console", message => { if (message.type() === "error" && /Content Security Policy|CSP/i.test(message.text())) errors.push(message.text()); });
     page.on("request", request => { const url = new URL(request.url()); if (url.pathname.startsWith("/api/")) requests.push({url, body:request.method() === "POST" ? request.postDataJSON() : null}); });
     await H.connect(page, server, paths.token);
-    await run({page, pin, read, requests, errors});
+    await run({page, pin, read, requests, errors, reconnect:() => H.connect(page, server, paths.token)});
     assert.deepEqual(errors, [], "class Pele view runs under the real CSP");
   } finally {
     await browser?.close(); await H.stopDaemon(server);
@@ -106,8 +106,6 @@ test("published JavaScript classes render through Pele with members, menus and m
     assert.equal(await page.locator("#classes-diagram .pele-edge").count(), 0, "extends stays a terminal hint, never an arrow");
     assert.equal(await node.locator(".pele-label").textContent(), "Widget");
     assert.match(await node.locator(".pele-annotation").textContent(), /javascript · class/);
-    await node.locator("> rect").click({position:{x:10, y:10}});
-    await page.getByRole("menuitem", {name:/Show members/}).click();
     assert.deepEqual(await node.locator(".pele-member").allTextContents(), memberTexts(widget));
     assert.deepEqual(memberTexts(widget), ["#state", "label", "instances", "constructor()", "render()", "of()"]);
 
@@ -161,8 +159,6 @@ test("published Rust types merge impl methods across files and render through Pe
     const node = page.locator(`#classes-diagram .pele-node[data-trellis-class-id="${account.symbol.id}"]`);
     assert.match(await node.locator(".pele-annotation").textContent(), /rust · struct/);
     assert.equal(await page.locator("#classes-diagram .pele-edge").count(), 0);
-    await node.locator("> rect").click({position:{x:10, y:10}});
-    await page.getByRole("menuitem", {name:/Show members/}).click();
     assert.deepEqual(await node.locator(".pele-member").allTextContents(), memberTexts(account));
     assert.deepEqual(memberTexts(account), ["id: u64", "balance: i64", "balance() : i64"]);
 
@@ -180,15 +176,30 @@ test("published Rust types merge impl methods across files and render through Pe
     await page.locator("#classes-search").click();
     await page.locator(".classes-result").filter({hasText:"model::Account"}).first().click();
     await page.waitForFunction(seed => !!document.querySelector(`#classes-diagram .pele-node[data-trellis-class-id="${seed}"]`), account.symbol.id, {timeout:15000});
-    const again = page.locator(`#classes-diagram .pele-node[data-trellis-class-id="${account.symbol.id}"]`);
-    await again.locator("> rect").click({position:{x:10, y:10}});
-    await page.getByRole("menuitem", {name:/Show members/}).click();
     const balance = account.methods[0];
     await page.locator(`.pele-member[data-trellis-symbol-id="${balance.symbolId}"]`).click();
     await page.waitForFunction(() => /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""), null, {timeout:15000});
     const sequence = requests.filter(row => row.url.pathname.endsWith("/sequence")).at(-1);
     assert.equal(sequence.body.seed, balance.symbolId);
     assert.deepEqual(sequence.body.expectedRevision, pin);
+  });
+});
+
+test("a reload shows the Classes tab this browser remembers while metrics are still out", {timeout:240000}, async () => {
+  await withApp([["widgets.js", widgets]], async ({page, reconnect}) => {
+    await page.locator("#view-classes").waitFor({state:"visible"});
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    await page.route("**/metrics?**", async route => { await held; await route.continue(); });
+    const out = page.waitForRequest(/\/metrics\?/);
+    await reconnect();
+    await out;
+    assert.equal(await page.locator("#view-classes").isVisible(), true, "the hint shows before the answer");
+    assert.doesNotMatch(await page.locator("#metrics-state").textContent(), /Indexed snapshot ·/);
+    release();
+    await page.waitForFunction(() => /Indexed snapshot ·/.test(document.querySelector("#metrics-state")?.textContent || ""));
+    assert.equal(await page.locator("#view-classes").isVisible(), true, "and the answer confirms it");
+    await page.unrouteAll({behavior:"wait"});
   });
 });
 

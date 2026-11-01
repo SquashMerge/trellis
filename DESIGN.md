@@ -14,7 +14,7 @@ that imply those capabilities already work.
 ## Product frame
 
 - Compact explorer on the left; Diagrams files expand to methods. Files uses a pinned indexed-file catalog and an all-symbol outline, including noncallables.
-- Diagrams has Architecture, Treemap, Sequence and Classes; Classes shows only for production code in a class-catalog language, and libraries open in context from external calls and references (#450, owner 2026-10-29). Architecture shows authored layer bands and counted structural-reference summaries, not module Flow; see the [Architecture contract](docs/architecture-view.md). Files is a real section of the same checkout/session frame, not another application. No placeholder capability tabs.
+- Diagrams has Architecture, Treemap, Sequence and Classes; Classes shows only for production code in a class-catalog language (until that answer arrives, the tab keeps the checkout's last one, #559), and libraries open in context from external calls and references (#450, owner 2026-10-29). Architecture shows authored layer bands and counted structural-reference summaries, not module Flow; see the [Architecture contract](docs/architecture-view.md). Files is a real section of the same checkout/session frame, not another application. No placeholder capability tabs.
 - Section switching alone never selects a file, reads source or starts indexing. Explicit Files selection opens cached indexed source; cached files remain reachable after live deletion.
 - The left pane lists local checkouts and their observed index state above the filtered file tree.
 - Classes uses the full canvas without the call inspector; explicit file/directory metric selection may show the metric inspector. Class menus expose related classes and cached source.
@@ -62,7 +62,7 @@ not authorization to retire Tools, add unshipped tabs or expose gated capabiliti
 
 Use short message names, compact control frames, quiet lifelines, and selection highlighting.
 Analysis notes use short selectable rows; exact continuation guards stay visibly conditional with a rail.
-Class views start with a focus and its indexed ancestors/descendants, collapsed members, and a chooser
+Class views start with a focus and its indexed ancestors/descendants, members shown within the diagram size bounds (#559), and a chooser
 for other related classes. Do not add unrelated peers merely because they share a base class.
 Bundle returned class references by ordered pair; keep the original records in folded evidence.
 Keep collapsed-chain entry arrows. A preview shows the first measured call, not a claim that

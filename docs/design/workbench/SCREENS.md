@@ -92,7 +92,7 @@ Diagrams only, no terminal.
 
 Source view, shared by both modes.
 
-- **Left:** file tree. Files expand to their symbols with kind and line (`struct`, `fn L71`), and the selected symbol is purple.
+- **Left:** file tree. Files expand to their symbols, and the selected symbol is purple. The name takes the row; kind and line are in its tooltip (#559).
 - **Center:**
   - Path, language and line count.
   - An **Indexed · rev 412 / Working tree · uncommitted vs HEAD** segmented toggle, with a basis line: "Cached source from revision 412 · navigation and diagrams use this basis".

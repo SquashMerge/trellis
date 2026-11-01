@@ -18,8 +18,8 @@ Sequence owner: web/sequence.js web/style.css tests/sequence-ui.test.cjs ONLY.
   callback original fullstep, keyboard and full-detail restoration. Existing grouping tests stay valid.
 
 Class owner: web/classes.js web/classes.css tests/classes-ui.test.cjs ONLY.
-- Default starts with ONE focus class; no automatic24node spiderweb. Members collapsed by default;
-  compact class name/card, member counts and Members reveal. Qualification/path via disclosure/tooltip,
+- Default starts with ONE focus class; no automatic24node spiderweb. Members show by default within
+  the diagram size bounds (#559), with member counts and a reversible Members toggle. Qualification/path via disclosure/tooltip,
   not repeated on everycard bydefault. All original source/method actions retained.
 - Right-click/visible menu Show related classes opens a bounded chooser (source-backed related names,
   directions/kinds, qualified identity todisambiguate); user chooses specific class(es) to add, not all24.

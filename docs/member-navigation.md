@@ -43,7 +43,7 @@ saved source text and cannot survive logout or a reload.
 
 ## Class members
 
-Expand **Members**. Method names still open their sequences directly. Click a type hint, right-click
+Method names open their sequences directly. Click a type hint, right-click
 its member row, or use the row's visible menu button to inspect navigation choices. A method menu
 can include both its own sequence and its declared parameter/return types. Primitive, unmatched,
 unsupported or omitted types do not acquire fictional targets.
