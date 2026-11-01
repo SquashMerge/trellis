@@ -194,6 +194,14 @@ fn guard_stays_after_an_exit_the_step_does_not_draw() {
     }
 }
 
+/// #558: `&mut x` is syntax, not an unknown form that could leave the path.
+#[test]
+fn mutable_reference_is_not_a_boundary() {
+    let (_, view) = fixture("fn run(mut x: u8) { take(&mut x); after(); }", "run");
+    let labels: Vec<_> = view.steps.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels, ["take", "after"]);
+}
+
 /// #558: a kept guard does not absorb the next one, and the `if` inside it folds its own.
 #[test]
 fn guard_after_an_opaque_step_stays_and_nests_the_fold_inside_it() {

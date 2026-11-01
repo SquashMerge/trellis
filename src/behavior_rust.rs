@@ -296,7 +296,7 @@ impl Builder<'_> {
             "identifier" | "field_identifier" | "shorthand_field_initializer" | "scoped_identifier" | "self"
             | "integer_literal" | "float_literal" | "boolean_literal" | "char_literal" | "string_literal"
             | "raw_string_literal" | "unit_expression" | "line_comment" | "block_comment" | "empty_statement"
-            | "use_declaration" => Flow::empty(),
+            | "use_declaration" | "mutable_specifier" => Flow::empty(),
             _ => self.unknown(n, &format!("Unsupported Rust form '{}': behavior unknown.", n.kind())),
         }
     }
