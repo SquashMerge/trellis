@@ -459,7 +459,7 @@ pub fn write_batch(reader: &NativeReader<'_>, spec: &BatchSpec<'_>) -> Result<Wr
 }
 
 /// Copies the owner's artifact into `<dir>/out/index.scip`, hashing while copying. The source
-/// is opened without following a symlink and must be a regular file of at most 64 MiB.
+/// is opened without following a symlink and must be a regular file within the artifact limit.
 pub fn copy_artifact(source: &Path, dir: &Path) -> Result<(String, u64)> {
     let file = fs::OpenOptions::new()
         .read(true)

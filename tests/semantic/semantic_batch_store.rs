@@ -585,6 +585,37 @@ fn page_artifact_and_staging_limits_are_typed() {
     }
 }
 
+/// The real cap, not a test override: the first byte past 256 MiB is refused typed before any
+/// artifact byte is read, and the last byte within it is not.
+#[test]
+fn production_artifact_cap_refuses_one_byte_over_256_mib() {
+    let world = world(two_languages);
+    let written = world.write(&full_fixture(&world));
+    let declare = |byte_length: u64| {
+        edit_descriptor(&written.0, |descriptor| {
+            let others: u64 = descriptor["artifacts"].as_array().unwrap()[1..]
+                .iter()
+                .map(|artifact| artifact["byteLength"].as_u64().unwrap())
+                .sum();
+            descriptor["artifacts"][0]["byteLength"] = json!(byte_length);
+            descriptor["totals"]["artifactBytes"] = json!(byte_length + others);
+        })
+    };
+    let cap = 256 * 1024 * 1024;
+    assert_eq!(BatchLimits::PRODUCTION.artifact_bytes, cap);
+    let error = expect_err(world.admit(&declare(cap + 1)));
+    assert!(
+        matches!(error.downcast_ref::<ScipCaptureError>(),
+            Some(ScipCaptureError::LimitExceeded(name)) if name == "artifact bytes"),
+        "{error:#}"
+    );
+    assert!(world.stage_dirs().is_empty());
+    // At the cap the descriptor passes and only the actual bytes disagree with it.
+    let error = expect_err(world.admit(&declare(cap)));
+    assert_eq!(detail(&error), "artifact length", "{error:#}");
+    assert!(world.stage_dirs().is_empty());
+}
+
 #[test]
 fn partial_coverage_stages_exclusions() {
     let world = world(two_languages);
