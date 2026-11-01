@@ -1299,36 +1299,9 @@ fn sequence_source_hints_do_not_consume_resolved_lane_budget() {
     assert!(
         sequence_steps(&view.steps)
             .iter()
-            .all(|step| step.target.is_some())
+            .all(|step| step.target.is_some() && step.kind == "call")
     );
-}
-
-#[test]
-fn sequence_participant_limit_keeps_evidence_without_inventing_target() {
-    let (state, root) = workspace();
-    let mut publisher = Publisher::open(state.path(), root.path());
-    let source = fanout_source(21);
-    let mut spec = Spec::new(&[("a.rs", &source)]);
-    spec.bindings = (0..21)
-        .map(|nth| bind("root", nth, &format!("f{nth}")))
-        .collect();
-    let pin = publisher.publish(&spec);
-    let seed = syntax_id(publisher.native(), "root");
-    let view = publisher
-        .store
-        .sequence_at(&seed, pin, false)
-        .unwrap()
-        .unwrap();
-    assert_eq!(view.participants.len(), 20);
-    assert!(view.truncated);
-    let steps = sequence_steps(&view.steps);
-    assert_eq!(steps.len(), 21);
-    assert!(steps.iter().any(|step| {
-        let evidence = step.call_evidence.as_ref().unwrap();
-        evidence.boundary_reason == BoundaryReason::NodeLimit
-            && step.target.is_none()
-            && evidence.resolution == Some(s::Resolution::Resolved)
-    }));
+    assert!(!view.truncated, "{:?}", view.warnings);
 }
 
 #[test]

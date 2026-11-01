@@ -64,6 +64,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
         },
         documents,
         manifests: Vec::new(),
+        evidence_gaps: Default::default(),
     }
 }
 // Snapshot construction is outside the deadline. Each run covers references and
@@ -495,15 +496,8 @@ fn references_grouped_imports_are_leaf_sites_not_nested_prefixes() {
 }
 
 #[test]
-fn references_bad_syntax_work_bounds_and_cancellation_fail_atomically() {
+fn references_work_bounds_and_cancellation_fail_atomically() {
     let mut input = snapshot(&[("src/lib.rs", "fn f() {}")]);
-    input.documents[0].file.text = "fn f( {".into();
-    assert!(
-        references::project(&input, &[], 20, &mut || Ok(()))
-            .unwrap_err()
-            .to_string()
-            .contains("invalid_source_syntax")
-    );
     input.documents[0].file.text = " ".repeat(2 * 1024 * 1024 + 1);
     assert!(
         references::project(&input, &[], 20, &mut || Ok(()))
@@ -533,20 +527,15 @@ fn references_parallel_failures_are_typed_and_atomic() {
         .iter()
         .position(|doc| doc.key.path == "src/c.rs")
         .unwrap();
-    for (source, code) in [
-        ("fn broken( {".to_owned(), "invalid_source_syntax"),
-        (" ".repeat(2 * 1024 * 1024 + 1), "bounded_work"),
-    ] {
-        input.documents[last].file.text = source;
-        for workers in [1, 4] {
-            // An Err has no projection: earlier successful files cannot escape.
-            let error = references::project_with_workers(&input, &[], 5, workers, &mut || Ok(()))
-                .unwrap_err();
-            assert!(
-                error.to_string().starts_with(code),
-                "workers={workers}: {error:#}"
-            );
-        }
+    input.documents[last].file.text = " ".repeat(2 * 1024 * 1024 + 1);
+    for workers in [1, 4] {
+        // An Err has no projection: earlier successful files cannot escape.
+        let error =
+            references::project_with_workers(&input, &[], 5, workers, &mut || Ok(())).unwrap_err();
+        assert!(
+            error.to_string().starts_with("bounded_work"),
+            "workers={workers}: {error:#}"
+        );
     }
 }
 
@@ -5592,6 +5581,7 @@ fn snapshot_javascript_manifest(files: &[(&str, &str)], manifest: &str) -> Snaps
         },
         documents,
         manifests: vec![manifest],
+        evidence_gaps: Default::default(),
     }
 }
 
@@ -6069,4 +6059,1082 @@ fn references_javascript_review_500_consumers_share_a_200_name_barrel_within_bud
     }
     assert!(data["tests"].as_array().unwrap().is_empty());
     assert!(data["externalPackages"].as_array().unwrap().is_empty());
+}
+
+/// One compile-shaped file of each kind that nests past the walk bounds.
+fn over_deep_sources(depth: usize) -> Vec<(&'static str, String)> {
+    let nest = |open: &str, close: &str, inner: &str| {
+        format!("{}{inner}{}", open.repeat(depth), close.repeat(depth))
+    };
+    vec![
+        (
+            "deep.rs",
+            format!("pub fn deep() {{ custom!({}); }}\n", nest("(", ")", "")),
+        ),
+        (
+            "deep.rs",
+            format!("pub fn deep() -> i32 {{ {} }}\n", nest("(", ")", "1")),
+        ),
+        (
+            "deep.rs",
+            format!(
+                "pub fn deep() {{ {} }}\n",
+                nest("{", "}", "crate::ok::run();")
+            ),
+        ),
+        (
+            "deep.rs",
+            format!("{}\n", nest("mod a {", "}", "pub fn run() {}")),
+        ),
+        ("deep.rs", format!("use a::{};\n", nest("{b::", "}", "c"))),
+        (
+            "deep.js",
+            format!("function deep() {{ return {}; }}\n", nest("[", "]", "")),
+        ),
+        (
+            "deep.js",
+            format!("function deep() {{ let {} = 1; }}\n", nest("[", "]", "x")),
+        ),
+        (
+            "deep.js",
+            format!("function deep() {{ return a{}; }}\n", ".b".repeat(depth)),
+        ),
+        (
+            "Deep.java",
+            format!(
+                "class Deep {{ int d() {{ return {}; }} }}\n",
+                nest("(", ")", "1")
+            ),
+        ),
+        ("Deep.java", format!("{}\n", nest("class A {", "}", ""))),
+        (
+            "deep.py",
+            format!("def deep():\n    return {}\n", nest("(", ")", "1")),
+        ),
+    ]
+}
+
+#[test]
+fn an_over_deep_file_is_partial_and_the_rest_of_the_checkout_is_served() {
+    for (path, source) in over_deep_sources(400) {
+        let input = snapshot(&[
+            ("src/lib.rs", "pub mod ok; pub mod other;"),
+            ("src/ok.rs", "pub fn run() { crate::other::run(); }"),
+            ("src/other.rs", "pub fn run() {}"),
+            (path, source.as_str()),
+        ]);
+        let projection = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+        let data = &projection.data;
+        let partial = data["partialFiles"].as_array().unwrap();
+        assert_eq!(partial.len(), 1, "{path}: {source:.60}: {partial:?}");
+        assert_eq!(partial[0]["path"], path);
+        assert_eq!(partial[0]["reason"], "depth_limit");
+        assert!(partial[0]["subtrees"].as_u64().unwrap() >= 1);
+        let range = partial[0]["range"]["start"].as_u64().unwrap() as usize
+            ..partial[0]["range"]["end"].as_u64().unwrap() as usize;
+        assert!(range.start > 0 && range.end <= source.len());
+        assert!(
+            data["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|limit| limit.as_str().unwrap().contains("partialFiles"))
+        );
+        assert!(
+            data["production"].as_array().unwrap().iter().any(|edge| {
+                edge["source"]["path"] == "src/ok.rs" && edge["target"]["path"] == "src/other.rs"
+            }),
+            "{path}: {data}"
+        );
+    }
+}
+
+#[test]
+fn a_path_filter_still_reports_a_partial_file_that_feeds_resolution() {
+    let (path, source) = over_deep_sources(400).remove(5);
+    let input = snapshot(&[("ok.js", "export const ok = 1;"), (path, source.as_str())]);
+    let projection = references::project(&input, &["ok.js".to_owned()], 5, &mut || Ok(())).unwrap();
+    assert_eq!(projection.data["partialFiles"][0]["path"], path);
+}
+
+#[test]
+fn nesting_at_any_depth_around_the_bound_indexes_and_projects() {
+    // An enclosing node records its name, callee and invocation before walking its children,
+    // so a child skipped at the bound can span one: the gap must not claim that candidate.
+    let shapes: [(&str, &str, &str, &str, &str); 7] = [
+        ("deep.rs", "fn f() { ", "g(", "1", ")"),
+        ("deep.rs", "fn f() { ", "a::g(", "1", ")"),
+        ("deep.rs", "fn f() { ", "x.g(", "1", ")"),
+        ("deep.rs", "", "fn g() {", "", "}"),
+        ("deep.js", "function f() { ", "a.g(", "1", ")"),
+        (
+            "Deep.java",
+            "class Deep { int d() { return ",
+            "a.g(",
+            "1",
+            ")",
+        ),
+        ("deep.py", "x = ", "a.g(", "1", ")"),
+    ];
+    for (path, prefix, open, inner, close) in shapes {
+        for depth in 30..140 {
+            let tail = match (prefix, path) {
+                ("", _) => "",
+                (_, "deep.rs") => "; }",
+                (_, "deep.js") => "; }",
+                (_, "Deep.java") => "; } }",
+                _ => "",
+            };
+            let source = format!(
+                "{prefix}{}{inner}{}{tail}\n",
+                open.repeat(depth),
+                close.repeat(depth)
+            );
+            let input = snapshot(&[(path, source.as_str())]);
+            references::project(&input, &[], 5, &mut || Ok(()))
+                .unwrap_or_else(|error| panic!("{path} {open} at {depth}: {error:#}"));
+        }
+    }
+}
+
+#[test]
+fn extremely_deep_sources_stay_bounded_and_never_overflow_the_stack() {
+    for (path, source) in over_deep_sources(50_000) {
+        let input = snapshot(&[("ok.rs", "pub fn run() {}"), (path, source.as_str())]);
+        let projection = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+        assert_eq!(projection.data["partialFiles"][0]["path"], path);
+    }
+}
+
+#[test]
+fn a_file_past_the_visit_bound_is_partial_too() {
+    let source = format!("const v = [{}];\n", "0,".repeat(1_000_001));
+    let input = snapshot(&[
+        ("ok.js", "export const ok = 1;"),
+        ("wide.js", source.as_str()),
+    ]);
+    let projection = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    assert_eq!(projection.data["partialFiles"][0]["path"], "wide.js");
+    assert_eq!(projection.data["partialFiles"][0]["reason"], "visit_limit");
+}
+
+#[test]
+fn a_hazard_past_the_walk_bounds_keeps_the_export_proof_unknown() {
+    let resolve = |deep: usize| {
+        let barrel = format!(
+            "export * from './p.js';\nconst d = {}module{};\n",
+            "[".repeat(deep),
+            "]".repeat(deep)
+        );
+        let input = snapshot(&[
+            ("barrel.js", barrel.as_str()),
+            ("p.js", "export const name = 1;\n"),
+            ("use.js", "import { name } from './barrel.js';\nname;\n"),
+        ]);
+        let data = references::project(&input, &[], 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        (
+            data["production"].clone(),
+            data["unresolved"].as_array().unwrap().len(),
+        )
+    };
+    let (shallow, shallow_unresolved) = resolve(2);
+    let (deep, deep_unresolved) = resolve(200);
+    assert!(shallow_unresolved >= 1);
+    assert_eq!(deep_unresolved, shallow_unresolved);
+    assert_eq!(
+        deep.as_array().unwrap().len(),
+        shallow.as_array().unwrap().len()
+    );
+
+    let resolve = |deep: usize| {
+        let module = format!(
+            "from p import *\n{}exec(code){}\n",
+            "[".repeat(deep),
+            "]".repeat(deep)
+        );
+        let input = snapshot(&[
+            ("a.py", module.as_str()),
+            ("p.py", "name = 1\n"),
+            ("use.py", "from a import name\n"),
+        ]);
+        let data = references::project(&input, &[], 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        data["unresolved"].as_array().unwrap().len()
+    };
+    assert_eq!(resolve(200), resolve(2));
+}
+
+#[test]
+fn a_rust_use_list_past_the_walk_bounds_names_its_file() {
+    let deep = format!("use a::{}c{};\n", "{b::".repeat(100), "}".repeat(100));
+    let input = snapshot(&[("deep.rs", deep.as_str())]);
+    let data = references::project(&input, &[], 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(data["partialFiles"][0]["path"], "deep.rs");
+}
+
+/// One file of each language with each kind of parser error.
+fn broken_sources() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("broken.rs", "pub fn broken( {\n"),
+        ("broken.rs", "pub fn broken() { let x = ; }\n"),
+        ("broken.rs", "pub fn broken() {\n"),
+        ("broken.rs", "use crate::{ok;\n"),
+        ("broken.rs", "}}}\n"),
+        ("broken.js", "export function broken( {\n"),
+        ("broken.js", "function broken() { return ; ) }\n"),
+        ("broken.js", "const s = `open;\n"),
+        ("broken.js", "import { from './ok.js';\n"),
+        ("Broken.java", "public class Broken extends {\n"),
+        ("Broken.java", "class Broken { void f( { } }\n"),
+        ("Broken.java", "package ;\nclass Broken {}\n"),
+        ("broken.py", "def broken(:\n    pass\n"),
+        ("broken.py", "class Broken\n    pass\n"),
+        ("broken.py", "x = (\n"),
+        ("broken.py", "from . import (\n"),
+        ("broken.py", "for in y:\n  pass\n"),
+        ("broken.py", "try:\n  pass\nexcept E as:\n  pass\n"),
+        ("broken.py", "match z:\n  case A() as :\n    pass\n"),
+        ("broken.py", "with a as:\n  pass\n"),
+        ("broken.py", "import a as\n"),
+        ("broken.py", "from a import b as\n"),
+        ("broken.py", "x = \ny = x\nz = \n"),
+    ]
+}
+
+#[test]
+fn a_file_with_a_syntax_error_is_partial_and_the_rest_of_the_checkout_is_served() {
+    for (path, source) in broken_sources() {
+        let input = snapshot(&[
+            ("src/lib.rs", "pub mod ok; pub mod other;"),
+            ("src/ok.rs", "pub fn run() { crate::other::run(); }"),
+            ("src/other.rs", "pub fn run() {}"),
+            ("a.py", "import b\n"),
+            ("b.py", "VALUE = 1\n"),
+            ("a.js", "import './b.js';\n"),
+            ("b.js", "export const value = 1;\n"),
+            (path, source),
+        ]);
+        let projection = references::project(&input, &[], 5, &mut || Ok(()))
+            .unwrap_or_else(|error| panic!("{path}: {source}: {error:#}"));
+        let data = &projection.data;
+        let partial = data["partialFiles"].as_array().unwrap();
+        assert_eq!(partial.len(), 1, "{path}: {source}: {partial:?}");
+        assert_eq!(partial[0]["path"], path);
+        assert_eq!(partial[0]["reason"], "syntax_error");
+        assert!(partial[0]["subtrees"].as_u64().unwrap() >= 1);
+        assert!(
+            data["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|limit| limit.as_str().unwrap().contains("syntax errors")),
+        );
+        for (from, to) in [
+            ("src/ok.rs", "src/other.rs"),
+            ("a.py", "b.py"),
+            ("a.js", "b.js"),
+        ] {
+            assert!(
+                data["production"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|edge| edge["source"]["path"] == from && edge["target"]["path"] == to),
+                "{path}: {source}: {from} -> {to}: {data}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_clean_checkout_has_no_partial_files_and_no_partial_limitation() {
+    let input = snapshot(&[("ok.js", "export const ok = 1;")]);
+    let data = references::project(&input, &[], 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(data["partialFiles"], serde_json::json!([]));
+    assert!(!data["limitations"].to_string().contains("partialFiles"));
+}
+
+#[test]
+fn a_path_filter_still_reports_a_broken_file_that_feeds_resolution() {
+    let input = snapshot(&[("ok.js", "export const ok = 1;"), ("broken.js", "(")]);
+    let projection = references::project(&input, &["ok.js".to_owned()], 5, &mut || Ok(())).unwrap();
+    assert_eq!(projection.data["partialFiles"][0]["path"], "broken.js");
+}
+
+#[test]
+fn a_whole_file_of_garbage_is_partial() {
+    for (path, source) in [
+        ("g.rs", "\u{1}\u{2} }}} é ((( \u{1F600}"),
+        ("g.js", "\u{1}\u{2} }}} é ((( \u{1F600}"),
+        ("G.java", "\u{1}\u{2} }}} é ((( \u{1F600}"),
+        ("g.py", "\u{1}\u{2} }}} é ((( \u{1F600}"),
+    ] {
+        let input = snapshot(&[("ok.js", "export const ok = 1;"), (path, source)]);
+        let projection = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+        assert_eq!(projection.data["partialFiles"][0]["path"], path);
+    }
+}
+
+/// `outcome` with a shallow control and a broken spelling of the same checkout: the broken
+/// one may only lose edges, never gain or move one.
+fn only_loses_edges(control: &[(&str, &str)], broken: &[(&str, &str)]) -> Vec<(String, String)> {
+    let (control, _) = outcome(control);
+    let (broken, _) = outcome(broken);
+    for edge in &broken {
+        assert!(control.contains(edge), "{edge:?} not in {control:?}");
+    }
+    broken
+}
+
+/// True when the production edges hold `from -> to`.
+fn has(edges: &[(String, String)], from: &str, to: &str) -> bool {
+    edges.iter().any(|(a, b)| a == from && b == to)
+}
+
+#[test]
+fn a_rust_import_lost_to_a_syntax_error_never_lets_a_competing_binding_win() {
+    // The lost alias competes with the wildcard, and with a surviving explicit import.
+    let files = |consumer: &'static str| {
+        [
+            ("src/lib.rs", "mod p; mod q; mod consumer;\n"),
+            ("src/p.rs", "pub mod foo { pub fn f() {} }\n"),
+            ("src/q.rs", "pub fn f() {}\n"),
+            ("src/consumer.rs", consumer),
+        ]
+    };
+    let wrong = ("src/consumer.rs", "src/p.rs");
+    let control = files("use crate::p::*; use crate::q as foo; fn run() { foo::f(); }\n");
+    assert!(!has(&outcome(&control).0, wrong.0, wrong.1));
+    assert!(has(&outcome(&control).0, wrong.0, "src/q.rs"));
+    for broken in [
+        "use crate::p::*; use crate::q as foo fn run() { foo::f(); }\n",
+        "use crate::p::*; use crate::{q as foo; fn run() { foo::f(); }\n",
+        "use crate::p::*; use crate::q as; fn run() { foo::f(); }\n",
+        "use crate::p::*; fn run() { use crate::q as foo; foo::f( }\n",
+    ] {
+        let edges = outcome(&files(broken)).0;
+        assert!(
+            !has(&edges, "src/consumer.rs", "src/p.rs"),
+            "{broken}: {edges:?}"
+        );
+    }
+}
+
+#[test]
+fn a_rust_module_with_a_syntax_error_proves_no_name_absent_for_its_importers() {
+    let files = |q: &'static str| {
+        [
+            ("src/lib.rs", "pub mod p; pub mod q; pub mod consumer;\n"),
+            ("src/p.rs", "pub fn f() {}\n"),
+            ("src/q.rs", q),
+            (
+                "src/consumer.rs",
+                "use crate::p::*; use crate::q::*; fn run() { f(); }\n",
+            ),
+        ]
+    };
+    // Both globs bind `f`, so it is ambiguous. Losing q's `f` must not leave p's alone.
+    let control = files("pub fn f() {}\n");
+    let broken = files("pub fn f() { (\n");
+    only_loses_edges(&control, &broken);
+    let target = |q: &'static str| {
+        let data = references::project(&snapshot(&files(q)), &[], 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|site| site["source"]["path"] == "src/consumer.rs")
+            .count()
+    };
+    assert_eq!(target("pub fn f() { (\n"), target("pub fn f() {}\n"));
+}
+
+#[test]
+fn a_module_a_broken_file_may_own_has_no_proved_crate() {
+    let files = |main: &'static str| {
+        [
+            ("src/lib.rs", "mod x; mod y;\n"),
+            ("src/x.rs", "fn run() { crate::y::f(); }\n"),
+            ("src/y.rs", "pub fn f() {}\n"),
+            ("src/main.rs", main),
+        ]
+    };
+    let control = "mod x; mod y { pub fn f() {} } fn main() {}\n";
+    assert!(!has(&outcome(&files(control)).0, "src/x.rs", "src/y.rs"));
+    for broken in [
+        "(mod x; mod y { pub fn f() {} } fn main() {}\n",
+        "mod (x; mod y { pub fn f() {} } fn main() {}\n",
+        "mod ; mod y { pub fn f() {} } fn main() {}\n",
+    ] {
+        let edges = outcome(&files(broken)).0;
+        assert!(!has(&edges, "src/x.rs", "src/y.rs"), "{broken}: {edges:?}");
+    }
+    // Everything below a possibly owned module has the same unknown owner.
+    let edges = outcome(&[
+        ("src/lib.rs", "mod x; mod y;\n"),
+        ("src/x.rs", "mod z;\n"),
+        ("src/x/z.rs", "fn run() { crate::y::f(); }\n"),
+        ("src/y.rs", "pub fn f() {}\n"),
+        ("src/main.rs", "(mod x; fn main() {}\n"),
+    ])
+    .0;
+    assert!(!has(&edges, "src/x/z.rs", "src/y.rs"), "{edges:?}");
+}
+
+#[test]
+fn a_module_already_ambiguous_still_passes_a_lost_owner_to_what_lies_below_it() {
+    // `src/mod.rs` makes x ambiguous before the broken main.rs is considered.
+    let files = |main: &'static str| {
+        [
+            ("src/lib.rs", "mod x; pub fn f() {}\n"),
+            ("src/mod.rs", "mod x;\n"),
+            ("src/x.rs", "mod z;\n"),
+            ("src/x/z.rs", "fn run() { crate::f(); }\n"),
+            ("src/main.rs", main),
+        ]
+    };
+    assert!(
+        outcome(&files("mod x; pub fn f() {} fn main() {}\n"))
+            .0
+            .is_empty()
+    );
+    let edges = outcome(&files("(mod x; pub fn f() {} fn main() {}\n")).0;
+    assert!(!has(&edges, "src/x/z.rs", "src/lib.rs"), "{edges:?}");
+}
+
+#[test]
+fn a_broken_binary_that_declares_no_module_leaves_the_library_proved() {
+    let edges = outcome(&[
+        ("src/lib.rs", "mod x; mod y;\n"),
+        ("src/x.rs", "fn run() { crate::y::f(); }\n"),
+        ("src/y.rs", "pub fn f() {}\n"),
+        ("src/main.rs", "fn main() { (\n"),
+    ])
+    .0;
+    assert!(has(&edges, "src/x.rs", "src/y.rs"), "{edges:?}");
+}
+
+#[test]
+fn a_java_package_of_unknown_place_never_falls_back_to_the_standard_library() {
+    let files = |hidden: &'static str, user: &'static str| {
+        [("Hidden.java", hidden), ("app/Use.java", user)]
+    };
+    for user in [
+        "package app; import javax.swing.Local; class Use {}\n",
+        "package app; import javax.swing.*; class Use {}\n",
+    ] {
+        let control = files("package javax.swing; public class Local {}\n", user);
+        assert!(
+            outcome(&control).1 == 0 || has(&outcome(&control).0, "app/Use.java", "Hidden.java")
+        );
+        for broken in [
+            "package ; public class Local {}\n",
+            "@Foo( pakage javax.swing;\npublic class Local {}\n",
+            "import pakage javax.swing;\npublic class Local {}\n",
+        ] {
+            let (edges, unresolved) = outcome(&files(broken, user));
+            assert!(unresolved >= 1, "{broken}: {user}: {edges:?}");
+            assert!(
+                edges.iter().all(|(from, _)| from != "app/Use.java"),
+                "{edges:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_rust_path_into_a_broken_module_stays_unknown() {
+    let files = |q: &'static str| {
+        [
+            ("src/lib.rs", "pub mod q; pub mod consumer;\n"),
+            ("src/q.rs", q),
+            ("src/consumer.rs", "fn run() { crate::q::inner::f(); }\n"),
+            ("src/q/inner.rs", "pub fn f() {}\n"),
+        ]
+    };
+    let control = files("pub mod inner;\n");
+    assert!(has(
+        &outcome(&control).0,
+        "src/consumer.rs",
+        "src/q/inner.rs"
+    ));
+    let broken = files("pub mod inner\nfn (\n");
+    let edges = outcome(&broken).0;
+    assert!(
+        !has(&edges, "src/consumer.rs", "src/q/inner.rs"),
+        "{edges:?}"
+    );
+}
+
+#[test]
+fn a_java_explicit_import_in_a_broken_file_stays_unknown() {
+    // A second import of `Target` makes the first ambiguous; syntax can hide that one.
+    let files = |consumer: &'static str| {
+        [
+            ("a/Target.java", "package a; public class Target {}\n"),
+            ("b/Target.java", "package b; public class Target {}\n"),
+            ("c/Consumer.java", consumer),
+        ]
+    };
+    let control = files("package c; import a.Target; import b.Target; class Consumer {}\n");
+    let broken = files("package c; import a.Target; import b.Target class Consumer { (\n");
+    only_loses_edges(&control, &broken);
+    let broken = files("package c; import a.Target; imprt b.Target; class Consumer {}\n");
+    assert!(outcome(&broken).0.is_empty(), "{:?}", outcome(&broken).0);
+}
+
+#[test]
+fn a_java_type_lost_to_a_syntax_error_never_leaves_its_duplicate_unique() {
+    let files = |second: &'static str| {
+        [
+            ("p/One.java", "package p; public class Target {}\n"),
+            ("p/Two.java", second),
+            ("c/Use.java", "package c; import p.Target; class Use {}\n"),
+        ]
+    };
+    let control = files("package p; public class Target {}\n");
+    let broken = files("package p; public clas Target {}\n");
+    assert!(!has(&outcome(&control).0, "c/Use.java", "p/One.java"));
+    let edges = only_loses_edges(&control, &broken);
+    assert!(!has(&edges, "c/Use.java", "p/One.java"), "{edges:?}");
+}
+
+#[test]
+fn a_java_shadow_lost_to_a_syntax_error_never_proves_a_package_path() {
+    // In package c, a top-level type `pkg` shadows the package `pkg`.
+    let files = |shadow: &'static str| {
+        [
+            ("pkg/Target.java", "package pkg; public class Target {}\n"),
+            ("c/Shadow.java", shadow),
+            (
+                "c/Use.java",
+                "package c; class Use { pkg.Target target; }\n",
+            ),
+        ]
+    };
+    let control = files("package c; class pkg { static class Target {} }\n");
+    let broken = files("package c; clas pkg { static class Target {} }\n");
+    assert!(!has(&outcome(&control).0, "c/Use.java", "pkg/Target.java"));
+    let edges = only_loses_edges(&control, &broken);
+    assert!(!has(&edges, "c/Use.java", "pkg/Target.java"), "{edges:?}");
+}
+
+#[test]
+fn a_java_on_demand_import_of_a_broken_package_proves_nothing() {
+    let files = |second: &'static str| {
+        [
+            ("p/One.java", "package p; public class One {}\n"),
+            ("p/Two.java", second),
+            ("c/Use.java", "package c; import p.*; class Use {}\n"),
+        ]
+    };
+    let control = files("package p; public class One {}\n");
+    let broken = files("package p; public clas One {}\n");
+    assert!(!has(&outcome(&control).0, "c/Use.java", "p/One.java"));
+    let edges = only_loses_edges(&control, &broken);
+    assert!(!has(&edges, "c/Use.java", "p/One.java"), "{edges:?}");
+}
+
+#[test]
+fn a_java_package_declaration_lost_to_a_syntax_error_could_be_any_package() {
+    let files = |second: &'static str| {
+        [
+            ("p/One.java", "package p; public class Target {}\n"),
+            ("q/Two.java", second),
+            ("c/Use.java", "package c; import p.Target; class Use {}\n"),
+        ]
+    };
+    let control = files("package p; public class Target {}\n");
+    assert!(!has(&outcome(&control).0, "c/Use.java", "p/One.java"));
+    for broken in [
+        "package p public class Target { (\n",
+        "package ; public class Target {}\n",
+        "package p.; public class Target {}\n",
+        "( package p; public class Target {}\n",
+    ] {
+        let edges = outcome(&files(broken)).0;
+        assert!(
+            !has(&edges, "c/Use.java", "p/One.java"),
+            "{broken}: {edges:?}"
+        );
+    }
+    // The lost declaration can hide inside the file's first item.
+    for broken in [
+        "@Foo( package p;\npublic class Target {}\n",
+        "import package p;\npublic class Target {}\n",
+        "class Scratch {\npackage p;\npublic class Target {}\n",
+        "class Scratch { void f() {\npackage p;\npublic class Target {}\n",
+        "class A {}\n@Foo( package p;\npublic class Target {}\n",
+        "@Foo( pakage p;\npublic class Target {}\n",
+        "import pakage p;\npublic class Target {}\n",
+    ] {
+        let edges = outcome(&files(broken)).0;
+        assert!(
+            !has(&edges, "c/Use.java", "p/One.java"),
+            "{broken}: {edges:?}"
+        );
+    }
+    // A broken file that never spells a package is in the unnamed package only.
+    let edges = outcome(&[
+        ("p/One.java", "public class Other {}\n"),
+        ("p/Target.java", "package p; public class Target {}\n"),
+        ("Scratch.java", "class Scratch {\n"),
+        ("c/Use.java", "package c; import p.Target; class Use {}\n"),
+    ])
+    .0;
+    assert!(has(&edges, "c/Use.java", "p/Target.java"), "{edges:?}");
+}
+
+#[test]
+fn a_javascript_export_lost_to_a_syntax_error_never_leaves_a_competitor_unique() {
+    let files = |q: &'static str| {
+        [
+            (
+                "barrel.js",
+                "export * from './p.js';\nexport * from './q.js';\n",
+            ),
+            ("p.js", "export const name = 1;\n"),
+            ("q.js", q),
+            ("use.js", "import { name } from './barrel.js';\nname;\n"),
+        ]
+    };
+    let control = files("export const name = 2;\n");
+    assert!(!has(&outcome(&control).0, "use.js", "p.js"));
+    for broken in ["export const name = (;\n", "expor const name = 2;\n"] {
+        let edges = only_loses_edges(&control, &files(broken));
+        assert!(!has(&edges, "use.js", "p.js"), "{broken}: {edges:?}");
+    }
+}
+
+#[test]
+fn a_javascript_shadow_lost_to_a_syntax_error_never_proves_a_star_binding() {
+    let files = |barrel: &'static str| {
+        [
+            ("barrel.js", barrel),
+            ("p.js", "export const name = 1;\n"),
+            ("use.js", "import { name } from './barrel.js';\nname;\n"),
+        ]
+    };
+    let control = files("export * from './p.js';\nexport const name = 2;\n");
+    let broken = files("export * from './p.js';\nexport const name = (;\n");
+    assert!(!has(&outcome(&control).0, "use.js", "p.js"));
+    assert!(
+        !has(&outcome(&broken).0, "use.js", "p.js"),
+        "{:?}",
+        outcome(&broken).0
+    );
+}
+
+#[test]
+fn a_python_binding_lost_to_a_syntax_error_never_leaves_a_competitor_unique() {
+    let files = |q: &'static str| {
+        [
+            ("barrel.py", "from p import *\nfrom q import *\n"),
+            ("p.py", "name = 1\n"),
+            ("q.py", q),
+            ("use.py", "from barrel import name\n"),
+        ]
+    };
+    let control = files("name = 2\n");
+    assert!(!has(&outcome(&control).0, "use.py", "p.py"));
+    for broken in ["name = (\n", "name = 2 +\n", "def name(:\n    pass\n"] {
+        let edges = only_loses_edges(&control, &files(broken));
+        assert!(!has(&edges, "use.py", "p.py"), "{broken}: {edges:?}");
+    }
+}
+
+#[test]
+fn a_python_hazard_lost_to_a_syntax_error_keeps_the_export_proof_unknown() {
+    // `__all__` in a broken file, and an import outside module scope, which nothing follows.
+    let files = |p: &'static str, consumer: &'static str| {
+        [("p.py", p), ("q.py", "name = 1\n"), ("use.py", consumer)]
+    };
+    let edges = outcome(&files(
+        "from q import *\n__all__ = ['other'\n",
+        "from p import name\n",
+    ))
+    .0;
+    assert!(!has(&edges, "use.py", "q.py"), "{edges:?}");
+    let edges = outcome(&files(
+        "from q import name\nname = (\n",
+        "def f():\n    from p import name\n",
+    ))
+    .0;
+    assert!(!has(&edges, "use.py", "q.py"), "{edges:?}");
+}
+
+#[test]
+fn a_site_inside_a_parser_error_is_not_a_reference() {
+    // `import` here is only recovered text: no surviving statement holds it.
+    let (edges, _) = outcome(&[
+        ("b.js", "export const value = 1;\n"),
+        ("broken.js", "class { import './b.js'; ) (\n"),
+    ]);
+    assert!(!has(&edges, "broken.js", "b.js"), "{edges:?}");
+}
+
+#[test]
+fn intact_imports_of_a_broken_file_keep_their_edges() {
+    let (edges, _) = outcome(&[
+        ("b.js", "export const value = 1;\n"),
+        ("broken.js", "import './b.js';\nfunction f( {\n"),
+        ("b.py", "VALUE = 1\n"),
+        ("broken.py", "import b\ndef f(:\n    pass\n"),
+    ]);
+    assert!(has(&edges, "broken.js", "b.js"), "{edges:?}");
+    assert!(has(&edges, "broken.py", "b.py"), "{edges:?}");
+}
+
+/// Rich source of each language, for cutting at any byte and deleting any token.
+const FUZZ_SOURCES: [(&str, &str); 4] = [
+    (
+        "fuzz.rs",
+        "//! é\nuse crate::{a::{b, c as d}, e::*};\n#[derive(Debug)]\npub struct S<T> { x: T }\nmod m { pub fn g(x: u32) -> u32 { match x { 0 => 1, _ => vec![x].len() as u32 } } }\nimpl<T: Clone> Tr for S<T> { fn f(&self) -> Option<T> { let c = |y| y + 1; println!(\"{}\", c(1)); Some(self.x.clone()) } }\nmacro_rules! r { () => { 1 } }\n",
+    ),
+    (
+        "Fuzz.java",
+        "package a.b;\nimport a.c.D;\nimport static a.c.E.*;\n@Ann(\"é\") public class Fuzz<T> extends Base implements I, J {\n  private int x = 1;\n  public <U> Fuzz(U u) { super(); }\n  void m(String... s) throws X { Runnable r = () -> n(1); for (int i : a) { if (i > 0) r.run(); } }\n  enum E { A, B; }\n  record R(int a) {}\n}\n",
+    ),
+    (
+        "fuzz.py",
+        "\"\"\"é\"\"\"\nimport a.b as c\nfrom .d import e, f as g\nfrom h import *\n__all__ = ['x']\nfor p in q:\n    pass\ntry:\n    pass\nexcept E as r:\n    pass\nwith s as t:\n    pass\nmatch u:\n    case A() as v:\n        pass\n@dec(1)\nclass K(Base, metaclass=M):\n    y: int = 1\n    def m(self, *a, k=1, **kw) -> str:\n        if a:\n            return f'{self.y}'\n        return [i for i in a if i]\nasync def x():\n    await y()\n",
+    ),
+    (
+        "fuzz.js",
+        "import a, { b as c } from './d.js';\nexport * from './e.js';\nexport const f = (x) => `é${x}`;\nclass G extends H { #p = 1; static s() { return /r/.test('t'); } get q() { return this.#p; } }\nexport default function* i({ j, k: [l] }, ...m) { for (const n of m) { if (n) yield require('./o.js'); } }\n",
+    ),
+];
+
+fn assert_every_view_succeeds(path: &str, source: &str) {
+    let input = snapshot(&[("ok.js", "export const ok = 1;\n"), (path, source)]);
+    let label = format!("{path}: {source:?}");
+    references::project(&input, &[], 5, &mut || Ok(()))
+        .unwrap_or_else(|error| panic!("{label}: {error:#}"));
+    let config = trellis::rules::parse(
+        "version=1\n[roles.child]\nselect={extends='Base'}\n[[rules]]\nid='r'\nfor_each='child'\nrequire=[{calls='child'}]\n",
+    )
+    .unwrap();
+    let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    trellis::rules::evaluate(&config, &input, &refs, &[], &mut || Ok(()))
+        .unwrap_or_else(|error| panic!("{label}: {error:#}"));
+    for doc in &input.documents {
+        trellis::metrics::compute(
+            &doc.key.language,
+            &doc.file.text,
+            &doc.declarations,
+            &doc.calls,
+            &[],
+            &mut || Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("{label}: {error:#}"));
+    }
+}
+
+/// A file mid-edit can be cut anywhere: every view of it succeeds, whatever the parser recovers.
+#[test]
+fn a_source_cut_anywhere_or_missing_a_token_never_fails_a_view() {
+    const STRIDE: usize = 5;
+    for (path, source) in FUZZ_SOURCES {
+        let mut cuts: Vec<_> = source.char_indices().map(|(at, _)| at).collect();
+        cuts.push(source.len());
+        for &at in cuts.iter().step_by(STRIDE) {
+            assert_every_view_succeeds(path, &source[..at]);
+            let tail = &source[at..];
+            let token = tail.chars().next().map_or(0, char::len_utf8);
+            assert_every_view_succeeds(path, &format!("{}{}", &source[..at], &tail[token..]));
+        }
+    }
+}
+
+/// Checkouts with competing bindings: a broken spelling of any file may lose edges, but a
+/// site must never resolve to a target its valid control doesn't have (#563).
+#[test]
+fn breaking_any_file_at_any_byte_only_loses_edges() {
+    const STRIDE: usize = 3;
+    let checkouts: [&[(&str, &str)]; 5] = [
+        &[
+            ("src/lib.rs", "mod p; mod q; mod user;\n"),
+            (
+                "src/p.rs",
+                "pub mod foo { pub fn f() {} }\npub fn g() {}\npub fn h() {}\n",
+            ),
+            ("src/q.rs", "pub fn f() {}\npub fn g() {}\n"),
+            (
+                "src/user.rs",
+                "use crate::p::*;\nuse crate::q::*;\nuse crate::q as foo;\nfn run() { foo::f(); g(); h(); }\n",
+            ),
+        ],
+        &[
+            ("src/lib.rs", "mod x; mod y;\n"),
+            ("src/x.rs", "fn run() { crate::y::f(); }\n"),
+            ("src/y.rs", "pub fn f() {}\n"),
+            (
+                "src/main.rs",
+                "mod x; mod y { pub fn f() {} } fn main() {}\n",
+            ),
+        ],
+        &[
+            ("p/One.java", "package p; public class T {}\n"),
+            ("p/Two.java", "package p; public class T {}\n"),
+            ("p/Three.java", "package p; public class U {}\n"),
+            ("q/Q.java", "package q; public class T {}\n"),
+            ("pkg/V.java", "package pkg; public class V {}\n"),
+            (
+                "c/Use.java",
+                "package c;\nimport p.*;\nimport q.T;\nclass Use { T t; p.U u; pkg.V v; }\n",
+            ),
+            ("c/pkg.java", "package c;\nclass pkg { class V {} }\n"),
+        ],
+        &[
+            ("a.js", "export * from './p.js';\nexport * from './q.js';\n"),
+            ("p.js", "export const n = 1;\nexport const m = 2;\n"),
+            ("q.js", "export const n = 2;\n"),
+            ("use.js", "import { n, m } from './a.js';\nn;\nm;\n"),
+        ],
+        &[
+            ("a.py", "from p import *\nfrom q import *\n"),
+            ("p.py", "n = 1\nm = 2\n"),
+            ("q.py", "n = 2\n"),
+            ("use.py", "from a import n, m\nn\nm\n"),
+        ],
+    ];
+    // Each edge with its site count, so one lost site can't hide a false one on the same edge.
+    let counted = |data: &serde_json::Value| -> std::collections::BTreeMap<(String, String), u64> {
+        data["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| {
+                let path = |end: &str| edge[end]["path"].as_str().unwrap_or("").to_owned();
+                (
+                    (path("source"), path("target")),
+                    edge["count"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let project = |files: &[(&str, &str)]| {
+        references::project(&snapshot(files), &[], 5, &mut || Ok(()))
+            .unwrap()
+            .data
+    };
+    let mut failures = Vec::new();
+    for files in checkouts {
+        let control = counted(&project(files));
+        for (index, (path, source)) in files.iter().enumerate() {
+            let cuts: Vec<_> = source.char_indices().map(|(at, _)| at).collect();
+            for &at in cuts.iter().step_by(STRIDE) {
+                for replacement in ["", "("] {
+                    let broken = format!("{}{replacement}{}", &source[..at], &source[at + 1..]);
+                    let mut changed = files.to_vec();
+                    changed[index].1 = &broken;
+                    let data = project(&changed);
+                    if data["partialFiles"].as_array().unwrap().is_empty() {
+                        continue;
+                    }
+                    failures.extend(
+                        counted(&data)
+                            .into_iter()
+                            // A cut `use crate::p::` still names the crate root.
+                            .filter(|((_, target), _)| target != "src/lib.rs")
+                            .filter(|(edge, count)| control.get(edge).is_none_or(|c| c < count))
+                            .map(|edge| format!("{path} as {broken:?}: {edge:?}")),
+                    );
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}: {failures:#?}", failures.len());
+}
+
+/// Production edges and unresolved sites, for comparing a shallow and a deep spelling.
+fn outcome(files: &[(&str, &str)]) -> (Vec<(String, String)>, usize) {
+    let input = snapshot(files);
+    let data = references::project(&input, &[], 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let mut edges: Vec<_> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| {
+            (
+                edge["source"]["path"].as_str().unwrap().to_owned(),
+                edge["target"]["path"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    edges.sort();
+    (edges, data["unresolved"].as_array().unwrap().len())
+}
+
+#[test]
+fn a_rust_import_past_the_bound_never_lets_a_wildcard_win() {
+    let target = |depth: usize| {
+        let consumer = format!(
+            "use crate::p::*; use {}crate::q as foo{}; fn run() {{ foo::f(); }}\n",
+            "{".repeat(depth),
+            "}".repeat(depth)
+        );
+        outcome(&[
+            ("src/lib.rs", "mod p; mod q; mod consumer;\n"),
+            ("src/p.rs", "pub mod foo { pub fn f() {} }\n"),
+            ("src/q.rs", "pub fn f() {}\n"),
+            ("src/consumer.rs", consumer.as_str()),
+        ])
+        .0
+    };
+    let wrong = ("src/consumer.rs".to_owned(), "src/p.rs".to_owned());
+    let right = ("src/consumer.rs".to_owned(), "src/q.rs".to_owned());
+    assert!(target(2).contains(&right));
+    assert!(!target(2).contains(&wrong));
+    assert!(!target(130).contains(&wrong), "{:?}", target(130));
+}
+
+#[test]
+fn a_java_import_past_the_bound_keeps_the_type_root_unknown() {
+    let edges = |depth: usize| {
+        let package = "a.".repeat(depth);
+        let path = format!("{}Outer.java", package.replace('.', "/"));
+        let outer = format!(
+            "package {};\npublic class Outer {{ public static class pkg {{ public static class Target {{}} }} }}\n",
+            package.trim_end_matches('.')
+        );
+        let consumer =
+            format!("import static {package}Outer.pkg;\nclass Use {{ pkg.Target value; }}\n");
+        outcome(&[
+            (path.as_str(), outer.as_str()),
+            ("pkg/Target.java", "package pkg;\npublic class Target {}\n"),
+            ("Use.java", consumer.as_str()),
+        ])
+        .0
+    };
+    let wrong = ("Use.java".to_owned(), "pkg/Target.java".to_owned());
+    assert!(!edges(2).contains(&wrong));
+    assert!(!edges(140).contains(&wrong), "{:?}", edges(140));
+}
+
+#[test]
+fn a_java_package_past_the_bound_leaves_its_own_names_unknown() {
+    let deep = format!(
+        "package {};\nclass Use {{ pkg.Target value; }}\nclass pkg {{ static class Target {{}} }}\n",
+        ["a"; 140].join(".")
+    );
+    let (edges, _) = outcome(&[
+        ("pkg/Target.java", "package pkg;\npublic class Target {}\n"),
+        ("Use.java", deep.as_str()),
+    ]);
+    assert!(
+        edges.iter().all(|(_, target)| target != "pkg/Target.java"),
+        "{edges:?}"
+    );
+}
+
+#[test]
+fn a_binding_past_the_bound_never_lets_a_star_export_win() {
+    // A deep explicit export shadows the star's name, as a shallow one does.
+    let target = |depth: usize| {
+        let barrel = format!(
+            "export * from './p.js';\nexport const {}name{} = [];\n",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        outcome(&[
+            ("barrel.js", barrel.as_str()),
+            ("p.js", "export const name = 1;\n"),
+            ("use.js", "import { name } from './barrel.js';\nname;\n"),
+        ])
+    };
+    let wrong = ("barrel.js".to_owned(), "p.js".to_owned());
+    assert_eq!(target(2).0.contains(&wrong), target(130).0.contains(&wrong));
+
+    let target = |depth: usize| {
+        let module = format!(
+            "from p import *\n{}name{} = 1\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        outcome(&[
+            ("a.py", module.as_str()),
+            ("p.py", "name = 1\n"),
+            ("use.py", "from a import name\n"),
+        ])
+    };
+    let shallow = target(2);
+    let deep = target(130);
+    assert!(
+        !deep
+            .0
+            .iter()
+            .any(|(source, target)| source == "use.py" && target == "p.py")
+            || shallow
+                .0
+                .iter()
+                .any(|(source, target)| source == "use.py" && target == "p.py"),
+        "{shallow:?} {deep:?}"
+    );
+
+    // A Python import nested past the bound shadows a star the same way.
+    let target = |depth: usize| {
+        let nest: String = (0..depth)
+            .map(|level| format!("{}if x:\n", " ".repeat(level)))
+            .collect();
+        let module = format!(
+            "from p import *\n{nest}{}from q import name\n",
+            " ".repeat(depth)
+        );
+        outcome(&[
+            ("a.py", module.as_str()),
+            ("p.py", "name = 1\n"),
+            ("q.py", "name = 2\n"),
+            ("use.py", "from a import name\n"),
+        ])
+    };
+    let wrong = ("use.py".to_owned(), "p.py".to_owned());
+    assert!(!target(130).0.contains(&wrong), "{:?}", target(130));
+}
+
+#[test]
+fn a_rust_import_past_the_bound_leaves_an_explicit_duplicate_unknown() {
+    let run = |depth: usize| {
+        let consumer = format!(
+            "use crate::p as foo;\nuse {}crate::q as foo{};\npub fn run() {{ foo::f(); }}\n",
+            "{".repeat(depth),
+            "}".repeat(depth)
+        );
+        let input = snapshot(&[
+            ("src/lib.rs", "pub mod p; pub mod q; pub mod consumer;\n"),
+            ("src/p.rs", "pub fn f() {}\n"),
+            ("src/q.rs", "pub fn f() {}\n"),
+            ("src/consumer.rs", consumer.as_str()),
+        ]);
+        let data = references::project(&input, &[], 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        let proved = data["production"].as_array().unwrap().iter().any(|edge| {
+            edge["target"]["path"] == "src/p.rs"
+                && edge["sites"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|site| site["spelling"] == "foo::f")
+        });
+        let unknown = data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["site"]["spelling"] == "foo::f");
+        (proved, unknown)
+    };
+    assert_eq!(run(2), (false, true));
+    assert_eq!(run(130), (false, true));
 }

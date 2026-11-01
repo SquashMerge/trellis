@@ -57,14 +57,25 @@
       "runtime": "trellis.native.syntax@native-v10 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
     },
     {
+      "name": "trellis-native-v14-javascript-test-support",
+      "status": "recorded",
+      "version": "native-v14",
+      "installedAtCapture": true,
+      "capturedOn": "2026-11-01",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; fix/557-inherent-dispatch merged with main; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:077ebac85b868be6c429bed60bbb00ecf9b4499349c5a41d4a8b7a9dbdc51b38",
+      "executableHash": "077ebac85b868be6c429bed60bbb00ecf9b4499349c5a41d4a8b7a9dbdc51b38",
+      "runtime": "trellis.native.syntax@native-v14 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
+    },
+    {
       "name": "trellis-native-v13-javascript-test-support",
       "status": "recorded",
       "version": "native-v13",
       "installedAtCapture": true,
-      "capturedOn": "2026-10-31",
-      "installMethod": "cargo build --locked --features test-support --bin trellis; fix/557-inherent-dispatch from main 944417ad; descriptor and both captures reproducible from the README commands",
-      "artifactDigest": "sha256:f05adee0cf069422fc8bf11739cdeb11140cd260d316c2c6ef334157d657d3cc",
-      "executableHash": "f05adee0cf069422fc8bf11739cdeb11140cd260d316c2c6ef334157d657d3cc",
+      "capturedOn": "2026-11-01",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; fix/563-one-file-partial from main 3d109bb2; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:ad5cf3093f15759ede50c5f1922e21d1b139d527482e2aba0638f7ef6e6ee195",
+      "executableHash": "ad5cf3093f15759ede50c5f1922e21d1b139d527482e2aba0638f7ef6e6ee195",
       "runtime": "trellis.native.syntax@native-v13 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
     },
     {

@@ -1620,6 +1620,7 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
             .collect(),
         warnings: serde_json::from_str(&warnings).unwrap(),
         truncated,
+        ..Catalog::default()
     };
     assert_eq!(
         serde_json::to_vec(&full_published).unwrap(),

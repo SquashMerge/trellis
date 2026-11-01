@@ -249,6 +249,7 @@ pub fn summary(references: &Value, rules: &Value, layers: &Layers<'_>) -> Result
         "semanticComplete": references["semanticComplete"],
         "semanticProducers": references["semanticProducers"],
         "counts": references["counts"],
+        "partialFiles": references["partialFiles"],
         "limitations": references["limitations"],
         "externalPackages": packages,
     });
@@ -263,6 +264,7 @@ pub fn summary(references: &Value, rules: &Value, layers: &Layers<'_>) -> Result
             .as_array()
             .context("store_unavailable: unassigned identities")?
             .len(),
+        "partialFiles": rules["partialFiles"],
         "limitations": rules["limitations"],
     });
     Ok((references, rules))

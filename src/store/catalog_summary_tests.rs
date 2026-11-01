@@ -81,6 +81,7 @@ fn catalog(store: &Store, pin: IndexPin) -> Catalog {
         relations,
         warnings,
         truncated,
+        fitted: Default::default(),
     }
 }
 

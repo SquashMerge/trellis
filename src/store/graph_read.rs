@@ -560,8 +560,11 @@ pub(super) fn sequence_calls(
     // Syntax receiver groups are display hints, not resolved participant lanes.
     view.participants
         .retain(|participant| participant.id == view.seed.id);
+    let mut columns = Columns::default();
+    let (_, column) = columns.of(store, db, selected, &view.seed.id, &view.seed.path)?;
     if let Some(participant) = view.participants.iter_mut().find(|p| p.id == view.seed.id) {
         participant.declaration = Some(view.seed.clone());
+        participant.column = Some(column);
     }
     // Hidden incidental calls do not count toward the visible bound (#536): hide them
     // first, then bound what is shown. The work bound already holds every step built. A
@@ -613,6 +616,7 @@ pub(super) fn sequence_calls(
         limits: BTreeSet::new(),
         accessors,
         bodies,
+        columns,
     };
     let seed_id = view.seed.id.clone();
     enrichment.steps(&mut view.steps, &document, &seed_id, 0)?;
@@ -623,6 +627,7 @@ pub(super) fn sequence_calls(
         limits,
         ..
     } = enrichment;
+    crate::behavior_columns::disambiguate(&mut view.participants);
     view.hidden_steps = crate::behavior::hidden_count(&view.steps);
     view.incidental_steps = crate::behavior::incidental_count(&view.steps);
     view.truncated |= truncated;
@@ -732,6 +737,66 @@ struct Enrichment<'a, 'b> {
     accessors: BTreeMap<String, BTreeSet<String>>,
     /// The functions and methods of each target document read so far, by path (#542).
     bodies: BTreeMap<String, BTreeSet<String>>,
+    columns: Columns,
+}
+
+/// What the column of a declaration is read from (#558), memoized per view: each document
+/// once, and the number of Rust types of each name once.
+#[derive(Default)]
+struct Columns {
+    documents: BTreeMap<String, crate::behavior_columns::DocumentColumns>,
+    rust_types: BTreeMap<String, usize>,
+}
+
+impl Columns {
+    /// The declaration `id` in the document at `path`, and its column.
+    fn of(
+        &mut self,
+        store: &Store,
+        db: &Connection,
+        selected: &ReadRevision,
+        id: &str,
+        path: &str,
+    ) -> Result<(Symbol, crate::behavior::SequenceColumn)> {
+        use std::collections::btree_map::Entry;
+        let document = match self.documents.entry(path.to_owned()) {
+            Entry::Occupied(known) => known.into_mut(),
+            Entry::Vacant(slot) => {
+                let document = store.selected_graph_document_for(db, path, selected)?;
+                slot.insert(crate::behavior_columns::DocumentColumns {
+                    language: document.file.language,
+                    nodes: document
+                        .nodes
+                        .into_iter()
+                        .map(|node| (node.id.clone(), node))
+                        .collect(),
+                    text: document.file.text,
+                })
+            }
+        };
+        let symbol = document
+            .nodes
+            .get(id)
+            .cloned()
+            .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
+        let rust_types = &mut self.rust_types;
+        let column = document.owner(&symbol).column(&mut |name| {
+            if let Some(known) = rust_types.get(name) {
+                return Ok(*known);
+            }
+            let count = db.query_row(
+                "SELECT count(DISTINCT d.syntax_id) FROM native_version_declarations d
+                 JOIN revision_documents m ON m.vid=d.vid
+                 WHERE d.name=?1 AND d.kind='type' AND m.language='rust' AND m.revision_id=?2",
+                params![name, selected.key],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let count = count as usize;
+            rust_types.insert(name.to_owned(), count);
+            Ok(count)
+        })?;
+        Ok((symbol, column))
+    }
 }
 
 /// Whether the declaration `id` in `key` is a trivial accessor (#543), from its own body in
@@ -946,12 +1011,15 @@ impl Enrichment<'_, '_> {
             if reason == BoundaryReason::None && !laneless {
                 let (id, key) = disposition.exact_target.expect("eligible target is exact");
                 if !self.participants.iter().any(|p| &p.id == id) {
-                    if self.participants.len() == 20 {
+                    let (target, column) =
+                        self.columns
+                            .of(self.store, self.db, self.selected, id, &key.path)?;
+                    if crate::behavior_columns::fits(self.participants, &column) {
+                        self.participant(target, column, key)?;
+                    } else {
                         reason = BoundaryReason::NodeLimit;
                         self.limits
                             .insert(crate::behavior::SequenceLimit::Participants);
-                    } else {
-                        self.participant(id, key)?;
                     }
                 }
                 if reason == BoundaryReason::None {
@@ -1013,20 +1081,18 @@ impl Enrichment<'_, '_> {
         Ok(())
     }
 
-    /// Adds the exact target `id` in `key` as a participant lane.
-    fn participant(&mut self, id: &str, key: &crate::native_evidence::DocumentKey) -> Result<()> {
-        let target = self
-            .store
-            .selected_graph_document_for(self.db, &key.path, self.selected)?
-            .nodes
-            .into_iter()
-            .find(|node| node.id == id)
-            .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
+    /// Adds the exact `target` in `key` as a participant, drawn in `column`.
+    fn participant(
+        &mut self,
+        target: Symbol,
+        column: crate::behavior::SequenceColumn,
+        key: &crate::native_evidence::DocumentKey,
+    ) -> Result<()> {
         let declaration = self
             .source
             .document(key)?
             .declarations
-            .get(id)
+            .get(&target.id)
             .cloned()
             .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
         self.nodes.push(crate::graph_query::GraphNode {
@@ -1035,7 +1101,7 @@ impl Enrichment<'_, '_> {
             depth: self.stack.len() as u64,
         });
         self.participants.push(crate::behavior::Participant {
-            id: id.to_owned(),
+            id: target.id.clone(),
             label: target.name.clone(),
             kind: serde_json::to_value(target.kind)?
                 .as_str()
@@ -1043,6 +1109,7 @@ impl Enrichment<'_, '_> {
                 .into(),
             identification: "Fresh exact semantic call target in the selected snapshot.".into(),
             declaration: Some(target),
+            column: Some(column),
         });
         Ok(())
     }

@@ -145,7 +145,11 @@ impl Catalog {
                     .or_default()
                     .push((document, package));
             }
-            let mut unit = Unit::default();
+            // A hazard or binding inside a parser error goes unseen, so the file proves nothing.
+            let mut unit = Unit {
+                dynamic: trees[document].root_node().has_error(),
+                ..Unit::default()
+            };
             scan(
                 doc,
                 trees[document].root_node(),
@@ -326,6 +330,9 @@ impl Catalog {
         }
         for document in seen.into_keys() {
             let unit = self.units.get_mut(&document).expect("followed Python unit");
+            // A hazard past the walk bounds goes unseen, so the file proves nothing.
+            unit.dynamic |=
+                crate::syntax_bounds::scan(trees[document].root_node(), check)?.is_some();
             // Only followed/selected units need body hazards. Bounded syntax walking is
             // cancellation-aware, but irrelevant AST nodes are not charged as owner work.
             walk(trees[document].root_node(), check, &mut |node, check| {
@@ -768,7 +775,9 @@ impl Catalog {
         let Some(spelling) = &import.name else {
             return Ok(unknown_bucket());
         };
-        let name_key = crate::native_evidence::lookup("python", spelling)?;
+        let Ok(name_key) = crate::native_evidence::lookup("python", spelling) else {
+            return Ok(unknown_bucket());
+        };
         let name = &name_key;
         let target_unit = &self.units[&layout.document];
         let present = target_unit.bindings.contains_key(name);
@@ -1265,7 +1274,11 @@ fn record(
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     charge(name.len() + 1, work, check)?;
-    let name = crate::native_evidence::lookup("python", &name)?;
+    // A name the parser supplied as missing binds nothing that can be looked up.
+    let Ok(name) = crate::native_evidence::lookup("python", &name) else {
+        unit.dynamic = true;
+        return Ok(());
+    };
     unit.bindings
         .entry(name)
         .or_default()
@@ -1310,10 +1323,9 @@ fn scan(
     while let Some((node, module_scope, conditional, decorated, depth)) = pending.pop() {
         check()?;
         visits += 1;
-        ensure!(
-            visits <= VISITS && depth <= DEPTH,
-            "bounded_work: reference AST"
-        );
+        if visits > VISITS || depth > DEPTH {
+            continue;
+        }
         let kind = node.kind();
         if matches!(kind, "comment" | "string" | "concatenated_string") {
             continue;
@@ -1415,10 +1427,8 @@ fn scan(
                 }
                 let binding = match right {
                     Some(right) if !conditional && right.kind() == "identifier" => {
-                        BindingKind::Alias(crate::native_evidence::lookup(
-                            "python",
-                            text(doc, right),
-                        )?)
+                        crate::native_evidence::lookup("python", text(doc, right))
+                            .map_or(BindingKind::Unknown, BindingKind::Alias)
                     }
                     Some(right)
                         if !conditional

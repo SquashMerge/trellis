@@ -142,16 +142,50 @@ fn short_circuit_and_ternary_calls_stay_in_guarded_arms() {
     assert_eq!(calls(&guards[3].children), vec!["left"]);
     assert_eq!(calls(&guards[3].alternate), vec!["right"]);
 }
+/// #558: only an `if` that draws its exit folds its guard; a `try` keeps its own, and many
+/// sequential guards spend no depth, so a long method keeps its suffix and nested calls.
+#[test]
+fn guards_fold_only_after_a_drawn_exit_and_spend_no_depth() {
+    let (_, view) = fixture(
+        "function run(x) { try { if (x) return; } catch (e) { work(); } after(); }",
+        "run",
+    );
+    assert!(
+        view.steps
+            .last()
+            .unwrap()
+            .label
+            .contains("continues normally")
+    );
+    assert_eq!(calls(&view.steps[view.steps.len() - 1..]), vec!["after"]);
+    let (_, view) = fixture(
+        "function run(x) { for (const y of x) { if (y) break; } after(); }",
+        "run",
+    );
+    assert!(flatten(&view.steps).iter().all(|s| s.folded.is_empty()));
+    let ifs: String = (0..40).map(|n| format!("if (x{n}) return; ")).collect();
+    let source = format!("function run() {{ {ifs} a(b(c(d()))); }}");
+    let (_, view) = fixture(&source, "run");
+    assert_eq!(calls(&view.steps), vec!["d", "c", "b", "a"]);
+    assert!(!view.truncated, "{:?}", view.warnings);
+    assert!(
+        view.steps
+            .iter()
+            .filter(|s| s.kind == "branch")
+            .all(|s| s.folded.len() == 1)
+    );
+}
+
 #[test]
 fn exits_omit_unreachable_and_guard_remaining_paths() {
     let (_, view) = fixture(
         "function run(x) { if (x) return early(); later(); return done(); forbidden(); }",
         "run",
     );
-    assert_eq!(view.steps.len(), 2);
-    assert_eq!(view.steps[1].kind, "branch");
-    assert!(view.steps[1].label.contains("continues normally"));
-    assert_eq!(calls(&view.steps[1].children), vec!["later", "done"]);
+    // The `if` draws its return: the guard folds into it and the suffix follows (#558).
+    assert_eq!(view.steps[0].folded.len(), 1);
+    assert!(view.steps[0].folded[0].label.contains("continues normally"));
+    assert_eq!(calls(&view.steps[1..]), vec!["later", "done"]);
     assert!(!calls(&view.steps).contains(&"forbidden"));
     assert!(view.warnings.iter().any(|s| s.contains("unreachable")));
     let (_, both) = fixture(
@@ -661,13 +695,27 @@ fn external_participant_cap_preserves_every_measured_call() {
         .collect::<String>();
     let body = (0..25).map(|i| format!("p{i}.call();")).collect::<String>();
     let (_, view) = fixture(&format!("{imports} function run() {{ {body} }}"), "run");
-    assert!(view.truncated);
+    // Excess hints share the last lane and stay calls: nothing is omitted (#558).
+    assert!(!view.truncated);
+    assert!(view.warnings.iter().any(|w| w.contains("Source-hint")));
     assert_eq!(view.participants.len(), 20);
+    assert_eq!(view.participants[19].id, "boundary:unknown");
     assert_eq!(
         flatten(&view.steps)
             .iter()
-            .filter(|s| s.call_id.is_some())
+            .filter(|s| s.call_id.is_some() && s.kind == "call")
             .count(),
         25
     );
+}
+
+#[test]
+fn an_over_deep_body_keeps_its_sequence_bounded() {
+    let source = format!(
+        "function seed() {{ first(); return {}{}; }}\nfunction first() {{}}\n",
+        "[".repeat(50_000),
+        "]".repeat(50_000)
+    );
+    let (_graph, view) = fixture(&source, "seed");
+    assert!(calls(&view.steps).contains(&"first"), "{:?}", view.warnings);
 }

@@ -1,6 +1,6 @@
 //! JavaScript-only adapter. No execution, filesystem reads, or model calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
-use crate::behavior::{Participant, SequenceStep, SequenceView};
+use crate::behavior::{CONTINUES_LABEL, Participant, SequenceStep, SequenceView, fold_guard};
 use crate::model::{CallSite, IndexPin, SourceFile, SourceRange, Symbol, SymbolKind};
 use anyhow::{Context, Result, ensure};
 use tree_sitter::Node;
@@ -8,6 +8,7 @@ use tree_sitter::Node;
 // The work bound (#536): the visible bound is applied to the view this builds.
 const MAX_STEPS: usize = crate::behavior::MAX_WORK_STEPS;
 const MAX_PARTICIPANTS: usize = 20;
+const UNKNOWN_LANE: &str = "boundary:unknown";
 const MAX_DEPTH: usize = 24;
 fn bounded(s: &str) -> String {
     let mut out: String = s.chars().take(180).collect();
@@ -161,21 +162,22 @@ impl Builder<'_> {
             }
             if f.exits && i + 1 < nodes.len() {
                 // Do not draw the suffix after a return/throw alternative as unconditional.
+                let Some(guard) = self.step(nodes[i + 1], "branch", CONTINUES_LABEL) else {
+                    break;
+                };
+                // After a branch that draws its exit the suffix stays at this level (#558).
+                let Some(mut guard) = fold_guard(&mut out.steps, guard) else {
+                    continue;
+                };
                 if depth >= MAX_DEPTH {
                     self.limit();
                     break;
                 }
-                if let Some(mut guard) = self.step(
-                    nodes[i + 1],
-                    "branch",
-                    "only if the preceding path continues normally",
-                ) {
-                    let rest = self.block(&nodes[i + 1..], depth + 1);
-                    guard.children = rest.steps;
-                    out.continues = rest.continues;
-                    out.exits |= rest.exits;
-                    out.steps.push(guard);
-                }
+                let rest = self.block(&nodes[i + 1..], depth + 1);
+                guard.children = rest.steps;
+                out.continues = rest.continues;
+                out.exits |= rest.exits;
+                out.steps.push(guard);
                 break;
             }
         }
@@ -421,16 +423,32 @@ impl Builder<'_> {
             .unwrap_or(c.callee_text.as_deref().unwrap_or(""));
         // Binding and name matching can label a terminal visual group, not a
         // callee identity or a cross-participant sequence arrow.
-        let participant = self
+        let unknown = || Participant {
+            declaration: None,
+            column: None,
+            id: UNKNOWN_LANE.into(),
+            label: "Unknown/external operations (visual group, not object identity)".into(),
+            kind: "boundary".into(),
+            identification: "Target unknown; visual group only.".into(),
+        };
+        let mut participant = self
             .bindings
             .identify(n, &self.file.text, &self.file.path)
-            .unwrap_or_else(|| Participant {
-                declaration: None,
-                id: "boundary:unknown".into(),
-                label: "Unknown/external operations (visual group, not object identity)".into(),
-                kind: "boundary".into(),
-                identification: "Target unknown; visual group only.".into(),
-            });
+            .unwrap_or_else(unknown);
+        if participant.kind != "internal"
+            && participant.id != UNKNOWN_LANE
+            && self.view.participants.len() >= MAX_PARTICIPANTS - 1
+            && !self
+                .view
+                .participants
+                .iter()
+                .any(|p| p.id == participant.id)
+        {
+            // Reserve the last lane for excess source hints. The call stays a measured
+            // call: no behavior has been omitted, and enrichment may still resolve it (#558).
+            participant = unknown();
+            self.warn("Source-hint participant limit reached; additional hints share Unknown/external operations. Measured call evidence is retained.");
+        }
         let target = participant.id.clone();
         // A boundary lane groups operations visually; it does not identify a shared object.
         if !self.view.participants.iter().any(|p| p.id == target) {
@@ -609,7 +627,7 @@ pub fn build(
         }
     }
     let mut b = Builder { file, seed, calls, bindings: crate::behavior_bindings::Bindings::new(tree.root_node(), &file.text), count: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
-        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
+        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, column: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not observed runtime order. Selectivity is an uncalibrated conservative heuristic. Implicit getters, coercions, iteration protocols, and other runtime effects are not expanded.".into()],
         hidden_steps: 0, truncated: false, truncated_by: vec![],
     }};

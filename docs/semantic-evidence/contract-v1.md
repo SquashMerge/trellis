@@ -507,7 +507,7 @@ Any missing/unknown nested field, mismatch, duplicate manifest document, or wron
 | `.typeParameters` | `Text[]` | Measured order/spelling. | Do not semantically normalize. |
 | `.parameters` | `Parameter[]` | Measured declaration order. | Missing/reordered row invalid. |
 | `.resultType` | `Text?` | Measured spelling or null. | No inferred type. |
-| `.bases` | `Text[]` | Measured order/spelling. A Rust `implementation`'s is the `impl Trait for Type` trait (#557). | No inferred relationship. |
+| `.bases` | `Text[]` | Measured order/spelling. A Rust `implementation`'s is the `impl Trait for Type` trait (#557, native-v14). | No inferred relationship. |
 | `Parameter.name` | `Text?` | Measured spelling or null. | No invented name. |
 | `.type` | `Text?` | Measured type-designator spelling or null. | No inferred type. |
 | `.variadic` | `boolean` | Measured form. | Wrong projection invalid. |

@@ -1250,7 +1250,7 @@ fn direct_native_opaque_macro_does_not_overflow_or_invent_calls() {
 }
 
 #[test]
-fn nonopaque_rust_nesting_retains_fail_closed_depth_guard() {
+fn over_deep_syntax_is_a_gap_and_the_rest_of_the_document_is_measured() {
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
@@ -1260,23 +1260,47 @@ fn nonopaque_rust_nesting_retains_fail_closed_depth_guard() {
     };
     let root = tempfile::tempdir().unwrap();
     let source = format!(
-        "fn run() {{ {} actual(); {} }}",
+        "fn run() {{ {} actual(); {} }}\nfn after() {{ measured(); }}\n",
         "{".repeat(150),
         "}".repeat(150)
     );
-    fs::write(root.path().join("deep.rs"), source).unwrap();
+    fs::write(root.path().join("deep.rs"), &source).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
-    let error = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap_err();
+    let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
+    let coverage = &artifact.coverage[0];
+    assert_eq!(coverage.state, "partial");
     assert!(
-        error
-            .to_string()
-            .contains("native extraction work budget exceeded"),
-        "{error:#}"
+        coverage.diagnostic.as_deref().unwrap().contains("bounds"),
+        "{coverage:?}"
     );
+    let spellings: Vec<_> = artifact
+        .calls
+        .iter()
+        .filter_map(|call| call.spelling.as_deref())
+        .collect();
+    assert_eq!(spellings, ["measured"]);
+    let after = artifact
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("after"))
+        .unwrap();
+    assert!(
+        artifact
+            .search_cards
+            .iter()
+            .any(|card| card.syntax_id == after.syntax_id)
+    );
+    for family in &artifact.capability_reports[0].families {
+        let [gap] = family.gaps.as_slice() else {
+            panic!("{family:?}");
+        };
+        assert!(source[gap.range.start..gap.range.end].contains("actual"));
+        assert!(!source[gap.range.start..gap.range.end].contains("measured"));
+    }
 }
 
 #[test]
@@ -2301,4 +2325,77 @@ fn native_v9_rust_underscore_import_does_not_create_alias_declaration() {
     for imported in ["Original", "Other"] {
         assert!(artifact.references.iter().any(|r| r.spelling == imported));
     }
+}
+
+fn native_for(root: &std::path::Path) -> trellis::native_evidence::Artifact {
+    let identity = trellis::store::topology::WorkspaceIdentity::discover(Some(root), root).unwrap();
+    let (_, native) = trellis::indexer::index_workspace_with_native(
+        &trellis::indexer::IndexOptions::new(root.to_owned()),
+        &identity.record_id,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    native
+}
+
+/// #564: a document past its stored budgets keeps only what a read can always admit.
+#[test]
+fn a_document_past_the_evidence_budget_keeps_its_file_module_and_a_whole_file_gap() {
+    for (path, source) in [
+        ("huge.py", format!("import {}a\n", "a.".repeat(20_000))),
+        ("huge.js", "a();".repeat(10_000)),
+        ("huge.rs", "m!();".repeat(8_000)),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(path), &source).unwrap();
+        let artifact = native_for(root.path());
+        assert_eq!(artifact.declarations.len(), 1, "{path}");
+        assert_eq!(artifact.declarations[0].kind, "module");
+        assert!(artifact.calls.is_empty() && artifact.references.is_empty());
+        assert!(artifact.control_regions.is_empty());
+        let coverage = &artifact.coverage[0];
+        assert_eq!(coverage.state, "partial");
+        assert!(
+            coverage
+                .diagnostic
+                .as_ref()
+                .unwrap()
+                .contains("per-file budget")
+        );
+        assert!(coverage.observed_roles.is_empty());
+        for family in &artifact.capability_reports[0].families {
+            assert_eq!(family.gaps.len(), 1);
+            assert_eq!(family.gaps[0].range.start, 0);
+            assert_eq!(family.gaps[0].range.end, source.len());
+        }
+    }
+}
+
+/// A real minified bundle is dense, but a selected read admits it, so it stays whole.
+#[test]
+fn a_minified_bundle_within_the_evidence_budget_keeps_its_facts() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/web/vendor/pele-1.10.0-trellis.2.js"
+    );
+    std::fs::copy(bundle, root.path().join("bundle.js")).unwrap();
+    let artifact = native_for(root.path());
+    assert!(artifact.declarations.len() > 1);
+    assert!(
+        artifact.coverage[0].diagnostic.is_none(),
+        "{:?}",
+        artifact.coverage[0]
+    );
+}
+
+#[test]
+fn a_dense_document_within_the_evidence_budget_keeps_its_facts() {
+    let root = tempfile::tempdir().unwrap();
+    let source = "a();".repeat(200);
+    std::fs::write(root.path().join("dense.js"), &source).unwrap();
+    let artifact = native_for(root.path());
+    assert_eq!(artifact.calls.len(), 200);
+    assert_eq!(artifact.coverage[0].state, "complete");
 }
