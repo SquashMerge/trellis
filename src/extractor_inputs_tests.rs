@@ -110,6 +110,10 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
         "read-time Files outline and syntax matches",
     ),
     ("src/references.rs", "read-time structural references"),
+    (
+        "src/symbol_lookup.rs",
+        "read-time MCP lookup keys, never stored native identities or facts",
+    ),
     ("src/rules.rs", "read-time architecture rules"),
     (
         "src/syntax_bounds.rs",

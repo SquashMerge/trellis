@@ -2721,7 +2721,8 @@ mod incoming_tests {
         for modern in [false, true] {
             let empty = project(fixture(0, false, 0), modern).unwrap();
             let data = &empty["data"];
-            assert_eq!(data.as_object().unwrap().len(), 9);
+            assert_eq!(data.as_object().unwrap().len(), 10);
+            assert!(data.get("stableLookupKey").is_some_and(Value::is_null));
             assert_eq!(data["semanticBases"], json!([]));
             assert_eq!(data["documents"], json!([]));
             assert_eq!(data["coverage"].as_array().unwrap().len(), 1);
