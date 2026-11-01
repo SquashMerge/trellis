@@ -2669,6 +2669,13 @@ impl CheckoutRuntime {
             } else {
                 ArchitectureRules::Unused
             };
+            // A scoped read can compute its answer, so it gives the owner only a page's wait.
+            let wait = match self.resources() {
+                Ok(resources) if parsed.scoped() => {
+                    wait.min(resources.scheduler.architecture_browser_wait())
+                }
+                _ => wait,
+            };
             self.await_architecture(parsed.pin(), rules, false, wait, check);
         }
     }
@@ -2736,8 +2743,15 @@ impl CheckoutRuntime {
                 )
             });
         match answer {
-            // The revision is over a whole-revision budget. A narrow read may not be.
-            Err(error) if parsed.scoped() && error.to_string().starts_with("bounded_work") => {
+            // The revision is over a whole-revision budget or still building, and a narrow
+            // read need not be: it computes its own scope within its deadline.
+            Err(error)
+                if parsed.scoped()
+                    && (error.to_string().starts_with("bounded_work")
+                        || error
+                            .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
+                            .is_some()) =>
+            {
                 response.architecture_response_scoped(
                     kind,
                     arguments,
@@ -2748,6 +2762,45 @@ impl CheckoutRuntime {
             }
             answer => answer,
         }
+    }
+
+    /// Wait for the head's core, whatever its outcome, once the head has settled.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn await_architecture_for_tests(&self) {
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
+        while Instant::now() < deadline {
+            let seen = self.state_version();
+            let target = (|| {
+                let resources = self.resources()?;
+                let (response, catching_up) = self.evidence_response()?;
+                let pin = response.selected_pin(None)?;
+                let root = Path::new(resources.store.workspace_root());
+                let hash = crate::rules::load(root)
+                    .ok()
+                    .flatten()
+                    .map(|config| config.content_hash);
+                response.finish((pin, hash, catching_up))
+            })();
+            let Ok((pin, hash, catching_up)) = target else {
+                self.wait_state_change(seen, Duration::from_millis(50));
+                continue;
+            };
+            let scheduler = self.browser_scheduler().expect("active runtime");
+            let wait = deadline.saturating_duration_since(Instant::now());
+            let outcome = scheduler.architecture_core(pin, hash.as_deref(), wait, &mut || Ok(()));
+            let building = outcome.as_ref().err().is_some_and(|error| {
+                error
+                    .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
+                    .is_some()
+            });
+            if !building && !catching_up {
+                return;
+            }
+            // The head moved past this pin, or startup is still going: sample again.
+            self.wait_state_change(seen, Duration::from_millis(50));
+        }
+        panic!("the checkout did not settle");
     }
 
     /// One paged Architecture detail read, bounded like the summary.

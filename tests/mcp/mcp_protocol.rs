@@ -5542,6 +5542,18 @@ async fn ready_registry(
     )
 }
 
+/// Wait for the checkout's Architecture build, on the owner's signal: an unscoped read that
+/// beats it to the 5 s call deadline answers a retryable failure, on purpose.
+async fn architecture_built(
+    registry: &std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    identity: &trellis::store::topology::WorkspaceIdentity,
+) {
+    let runtime = registry.lock().await.activate(&identity.root_key).unwrap();
+    tokio::task::spawn_blocking(move || runtime.await_architecture_for_tests())
+        .await
+        .unwrap();
+}
+
 /// One daemon-socket MCP connection served on a thread.
 fn socket_session(
     identity: &trellis::store::topology::WorkspaceIdentity,
@@ -10944,6 +10956,7 @@ async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_i
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(347, &identity).unwrap();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 347, None);
     let mut ask = |id, arguments| {
         writeln!(
@@ -11064,6 +11077,181 @@ async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_i
     session.join().unwrap().unwrap();
 }
 
+/// During an Architecture build a scoped read computes its own answer, and an unscoped one
+/// stays typed and retryable inside its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_during_an_architecture_build_is_answered_or_retryable() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            ("a.js", "import './b.js';\n"),
+            ("b.js", "export const b = 1;\n"),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 1\npaths = [\"*.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(556, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (entered, reached) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    scheduler.set_architecture_hook_for_tests(std::sync::Arc::new(move |point| {
+        // Past the build's read, which a publication at startup would have to wait for.
+        if point == "resolving" {
+            let _ = entered.send(());
+            let _ = held
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP);
+        }
+    }));
+    scheduler.architecture_hint();
+    reached
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    // The scoped read spends its whole deadline computing, not waiting for this held build.
+    scheduler.set_architecture_browser_wait_for_tests(Duration::ZERO);
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) =
+        socket_session(&identity, &registry, 556, Some(Duration::from_secs(3)));
+    let mut ask = |id: i64, arguments: Value| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":"trellis_rules_check", "arguments":arguments})
+            )
+        )
+        .unwrap();
+        next_reply(&mut reader)
+    };
+    let scoped = ask(1, json!({"schemaVersion":1,"paths":["a.js"]}));
+    tool(&scoped, None, true);
+    let whole = ask(2, json!({"schemaVersion":1}));
+    tool(&whole, Some("deadline_exceeded"), true);
+    let error = &whole["result"]["structuredContent"]["error"];
+    assert_eq!(error["retryable"], true, "{whole}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("being computed"),
+        "{whole}"
+    );
+    drop(release);
+    drop(ask);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// A read waiting on a build whose revision is passed waits again for the new head and answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_waits_again_when_the_head_moves_during_its_wait() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            ("a.js", "import './b.js';\n"),
+            ("b.js", "export const b = 1;\n"),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 1\npaths = [\"*.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(557, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+    runtime.await_architecture_for_tests();
+    let (waiting, reader_waits) = std::sync::mpsc::channel();
+    let (entered, reached) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    scheduler.set_architecture_hook_for_tests(std::sync::Arc::new(move |point| match point {
+        "architecture_read_waiting" => {
+            let _ = waiting.send(());
+        }
+        // Past the build's read, so the next publication does not wait for it.
+        "resolving" => {
+            let _ = entered.send(());
+            let _ = held
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP);
+        }
+        _ => {}
+    }));
+    // A rules edit starts a build at this revision that the read below waits for.
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.other]\norder = 1\npaths = [\"*.js\"]\n",
+    )
+    .unwrap();
+    scheduler.architecture_hint();
+    reached
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) =
+        socket_session(&identity, &registry, 557, Some(Duration::from_secs(60)));
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1),
+            "tools/call",
+            json!({"name":"trellis_rules_check","arguments":{"schemaVersion":1}})
+        )
+    )
+    .unwrap();
+    reader_waits
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    let before = runtime
+        .evidence_response()
+        .unwrap()
+        .0
+        .status()
+        .unwrap()
+        .revision;
+    fs::write(identity.root.join("c.js"), "export const c = 2;\n").unwrap();
+    let indexing = runtime.clone();
+    let root = identity.root.clone();
+    tokio::task::spawn_blocking(move || {
+        indexing.cli_index(&trellis::indexer::IndexOptions::new(root))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    scheduler.architecture_hint();
+    drop(release);
+    let reply = next_reply(&mut reader);
+    tool(&reply, None, true);
+    let basis = &reply["result"]["structuredContent"]["evidenceBasis"];
+    assert!(
+        basis["indexRevision"].as_u64().unwrap() > before.index_revision,
+        "{reply}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 /// #448: a rules check scoped to one file with hundreds of unknown sites failed
 /// `response_too_large`; it now samples evidence per instance and pages, while
 /// counts and `referenceCount` stay exact and equal the CLI's.
@@ -11094,6 +11282,7 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(448, &identity).unwrap();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 448, None);
     let mut ask = |id: i64, name: &str, arguments: Value| {
         writeln!(
@@ -11220,6 +11409,7 @@ async fn rules_check_paths_scope_the_unassigned_list_through_every_page() {
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(559, &identity).unwrap();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 559, None);
     let mut structured = Vec::new();
     let mut ask = |id: i64, arguments: Value| {
@@ -11360,6 +11550,7 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
         let mut registry = CheckoutRegistry::with_roots(topology);
         registry.attach_launch(129, &identity).unwrap();
         let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+        architecture_built(&registry, &identity).await;
         let (mut client, mut reader, session) = socket_session(&identity, &registry, 129, None);
         let frame = |id: i64, method: &str, params: Value| {
             if legacy {
@@ -11547,6 +11738,7 @@ external = [{ language = "python", package = "json", stdlib = true }]
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(163, &identity).unwrap();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 163, None);
     let mut ask = |id, params| {
         writeln!(client, "{}", modern(json!(id), "tools/call", params)).unwrap();
@@ -11646,6 +11838,7 @@ external = [{ language = "javascript", package = "widget", stdlib = false }]
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(163, &identity).unwrap();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 163, None);
     let mut ask = |id, params| {
         writeln!(client, "{}", modern(json!(id), "tools/call", params)).unwrap();
