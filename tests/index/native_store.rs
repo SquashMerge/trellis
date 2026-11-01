@@ -253,7 +253,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        33
+        34
     );
     let count: i64 = db
         .query_row(
@@ -855,7 +855,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        33
+        34
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -2713,6 +2713,8 @@ fn due_release_blocked_by_maintenance_admission_must_not_report_success() {
 fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_tombstone() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
+    // One chunk per unit, so the first unit leaves a partial manifest.
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::ZERO);
     for number in 0..65 {
         fs::write(
             root.path().join(format!("extra{number}.js")),
@@ -2838,6 +2840,144 @@ fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_t
         .unwrap();
     assert_eq!(exact, ("released".into(), 1, 0, 0));
     assert_eq!(store.status().unwrap().revision, head);
+}
+
+/// A unit keeps releasing chunks in one transaction until its budget passes, so a revision of
+/// more than one chunk is released by a single unit when the budget allows (#583). Committing
+/// one 64-row chunk per unit spent each unit on its open and commit cost.
+#[test]
+#[cfg(feature = "test-support")]
+fn one_maintenance_unit_releases_many_chunks_within_its_budget() {
+    use trellis::store::MaintenanceOutcome;
+    let (state, root, store, cancel) = fixture();
+    for number in 0..200 {
+        fs::write(
+            root.path().join(format!("extra{number}.js")),
+            format!("function extra{number}() {{ return {number}; }}"),
+        )
+        .unwrap();
+    }
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::from_secs(10));
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.publication_for_tests().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    let head = publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let manifest = |db: &Connection| -> i64 {
+        db.query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(manifest(&db) > 3 * 64, "{}", manifest(&db));
+    store.set_retention_clock_for_tests(1_901, 901);
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    // The first unit only marks the revision pending; the second releases all of it.
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .maintenance_step(&leader, &permit, &probe, || true)
+                .unwrap(),
+            MaintenanceOutcome::Progress
+        );
+    }
+    let state: String = db
+        .query_row(
+            "SELECT state FROM native_revision_supersessions WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((state.as_str(), manifest(&db)), ("released", 0));
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Idle
+    );
+    assert_eq!(store.status().unwrap().revision, head);
+}
+
+/// Priority is rechecked between chunks, so a higher class of work ends a unit at the next
+/// chunk rather than when its budget passes (#583).
+#[test]
+#[cfg(feature = "test-support")]
+fn a_priority_change_ends_a_unit_at_the_next_chunk() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use trellis::store::MaintenanceOutcome;
+    let (state, root, store, cancel) = fixture();
+    for number in 0..200 {
+        fs::write(
+            root.path().join(format!("extra{number}.js")),
+            format!("function extra{number}() {{ return {number}; }}"),
+        )
+        .unwrap();
+    }
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::from_secs(10));
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.publication_for_tests().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_901, 901);
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Progress
+    );
+    let priority = Arc::new(AtomicBool::new(false));
+    let signal = priority.clone();
+    store.set_maintenance_after_first_delete_hook_for_tests(move || {
+        signal.store(true, Ordering::Release)
+    });
+    let checks_after_change = AtomicUsize::new(0);
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || {
+                let changed = priority.load(Ordering::Acquire);
+                if changed {
+                    checks_after_change.fetch_add(1, Ordering::Relaxed);
+                }
+                !changed
+            })
+            .unwrap(),
+        MaintenanceOutcome::Deferred
+    );
+    // One check ends the chunk loop and one refuses the commit. Without the first, the loop
+    // would release all 200 documents before the second.
+    assert!(checks_after_change.load(Ordering::Relaxed) >= 2);
+    let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let manifest: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(manifest > 3 * 64, "the unit rolled back whole: {manifest}");
 }
 
 #[test]
@@ -3389,7 +3529,7 @@ fn schemas16_19_23_24_26_27_28_29_30_and31_recreate_exclusively_without_migratio
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            33
+            34
         );
         assert_eq!(
             rebuilt
@@ -3398,7 +3538,7 @@ fn schemas16_19_23_24_26_27_28_29_30_and31_recreate_exclusively_without_migratio
                     0
                 ))
                 .unwrap(),
-            33
+            34
         );
         for table in [
             "native_version_references",
@@ -3543,7 +3683,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=34").unwrap();
+    db.execute_batch("PRAGMA user_version=35").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3563,13 +3703,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 34);
+    assert_eq!(version, 35);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 33);
+    assert_eq!(metadata_version, 34);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
@@ -3578,6 +3718,8 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
 fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
+    // One chunk per unit, so the large prior document is still partly drained when the next revision publishes.
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::ZERO);
     let source = root.path().join("large.js");
     let body: String = (0..20_000)
         .map(|n| format!("function f{n}() {{ return {n}; }}\n"))
@@ -3669,6 +3811,8 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
 fn large_revision_releases_in_batched_units_while_edits_continue() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
+    // One chunk per unit, so the old manifest is still partly drained when the edits publish.
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::ZERO);
     for n in 0..400 {
         fs::write(
             root.path().join(format!("batch{n}.js")),
@@ -4980,6 +5124,8 @@ fn duplicate_reference_artifact_does_not_publish() {
 #[cfg(feature = "test-support")]
 fn reference_release_resumes_after_primary_key_batch_and_reopen() {
     let (state, root, store, cancel) = fixture();
+    // One chunk per unit, so a unit stops after one 256-row reference batch.
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::ZERO);
     let source = format!("function many() {{ {} }}\n", "value;".repeat(300));
     fs::write(root.path().join("flow.js"), source).unwrap();
     store.set_retention_clock_for_tests(1_000, 0);

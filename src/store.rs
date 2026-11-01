@@ -391,6 +391,8 @@ pub struct Store {
     test_before_request_terminal_commit_hook: Arc<TestOneShotHook>,
     maintenance_before_writer_hook: Arc<TestOneShotHook>,
     maintenance_after_first_delete_hook: Arc<TestOneShotHook>,
+    /// `MAINTENANCE_UNIT_BUDGET` in microseconds; tests may shorten or lengthen it.
+    maintenance_unit_budget_us: Arc<AtomicU64>,
     publication_before_commit_hook: Arc<TestOneShotHook>,
     #[cfg(feature = "test-support")]
     publication_before_semantic_hook: Arc<TestOneShotHook>,
@@ -682,11 +684,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 33;
+const DATABASE_SCHEMA_VERSION: u32 = 34;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V33: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=33), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V34: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=34), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -776,6 +778,7 @@ CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL REFERENCES semantic
 CREATE TABLE semantic_raw_documents(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id) ON DELETE CASCADE,language TEXT NOT NULL,path TEXT NOT NULL,source_hash TEXT NOT NULL CHECK(length(source_hash)=64),wire_digest TEXT NOT NULL CHECK(length(wire_digest)=64),capped INTEGER NOT NULL CHECK(capped IN (0,1)),PRIMARY KEY(capture_id,language,path));
 CREATE TABLE semantic_import_reports(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,report_json TEXT NOT NULL CHECK(json_valid(report_json)),PRIMARY KEY(revision_id,producer_id));
 CREATE TABLE semantic_provenance(tuple_id INTEGER NOT NULL,provenance_id TEXT NOT NULL,content_hash TEXT NOT NULL,evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('measuredSyntax','declarationBinding','semanticReference','typeRelationship')),freshness TEXT NOT NULL CHECK(freshness IN ('fresh','possiblyStale','stale')),basis_id INTEGER NOT NULL,capture_id INTEGER,derived_from_provenance_id TEXT,derived_from_record_kind TEXT CHECK(derived_from_record_kind IN ('occurrence','symbolInformation','relationship')),derived_from_fact_digest TEXT CHECK(length(derived_from_fact_digest)=64),CHECK((capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL) OR (capture_id IS NOT NULL AND derived_from_provenance_id IS NOT NULL AND derived_from_record_kind IS NOT NULL AND derived_from_fact_digest IS NOT NULL)),PRIMARY KEY(tuple_id,provenance_id),FOREIGN KEY(tuple_id) REFERENCES semantic_coverage(tuple_id),FOREIGN KEY(tuple_id,basis_id) REFERENCES semantic_basis(tuple_id,basis_id),FOREIGN KEY(capture_id,derived_from_provenance_id) REFERENCES semantic_raw_proofs(capture_id,proof_id));
+CREATE INDEX semantic_provenance_derived ON semantic_provenance(capture_id,derived_from_provenance_id) WHERE capture_id IS NOT NULL;
 CREATE TABLE semantic_symbols(symbol_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,key_scheme TEXT NOT NULL,key_symbol TEXT NOT NULL,key_scope TEXT NOT NULL CHECK(key_scope IN ('global','document','target')),key_document_language TEXT,key_document_path TEXT,display_name TEXT,provenance_id TEXT NOT NULL,UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
 CREATE UNIQUE INDEX semantic_symbols_key ON semantic_symbols(tuple_id,key_scheme,key_symbol,key_scope,COALESCE(key_document_language,''),COALESCE(key_document_path,''));
 CREATE TABLE semantic_symbol_targets(symbol_id INTEGER NOT NULL REFERENCES semantic_symbols(symbol_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND internal_native_revision_id IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(symbol_id,ordinal));
@@ -3983,7 +3986,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V33)?;
+    expected.execute_batch(CACHE_SCHEMA_V34)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -4007,7 +4010,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V33).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V34).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -6567,12 +6570,21 @@ macro_rules! revision_release_holds {
 /// Up to 64 stored proofs of a capture no selection names and no proof derives from. Captures
 /// come first: a scan over every stored proof, each checked against every provenance row, held
 /// one release step for tens of minutes once several large batches were retained (#567).
+/// `semantic_provenance_derived` serves both the provenance probe here and the foreign-key
+/// check SQLite runs for each deleted proof; without it each proof scanned every provenance
+/// row (#583).
 const RAW_PROOF_RELEASE_SQL: &str = "SELECT p.rowid FROM semantic_raw_captures c
     CROSS JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id
     WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=c.batch_id)
     AND NOT EXISTS(SELECT 1 FROM semantic_provenance v
         WHERE v.capture_id=p.capture_id AND v.derived_from_provenance_id=p.proof_id)
     LIMIT 64";
+
+/// How long one maintenance unit keeps releasing chunks before it commits. This bounds the
+/// chunk loop only: a unit also spends time on its last chunk, its opens and its commit. A
+/// waiting publisher still interrupts mid-statement, and a higher class of work ends the unit
+/// at the next chunk, which rolls the unit back (#583).
+const MAINTENANCE_UNIT_BUDGET: Duration = Duration::from_millis(100);
 
 /// Whether a pending revision is held again and still whole. Its release starts by deleting
 /// its selections, so one that still selects a batch has had nothing released.
@@ -10065,8 +10077,9 @@ fn write_semantic_tuple(
 }
 
 fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
-    // The selection goes first, in a step of its own: a pending revision that still selects a
-    // batch has had nothing released, so a reselection can still return it to retained.
+    // The selection goes first, in a chunk of its own that later chunks of the unit commit
+    // with: a pending revision that still selects a batch has had nothing released, so a
+    // reselection can still return it to retained.
     if db.execute(
         "DELETE FROM semantic_revision_raw_selections WHERE revision_id=?1",
         [revision],
@@ -10804,7 +10817,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V33 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V34 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -13135,6 +13148,9 @@ impl Store {
             test_before_request_terminal_commit_hook: Arc::new(TestOneShotHook::default()),
             maintenance_before_writer_hook: Arc::new(TestOneShotHook::default()),
             maintenance_after_first_delete_hook: Arc::new(TestOneShotHook::default()),
+            maintenance_unit_budget_us: Arc::new(AtomicU64::new(
+                MAINTENANCE_UNIT_BUDGET.as_micros() as u64,
+            )),
             publication_before_commit_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(feature = "test-support")]
             publication_before_semantic_hook: Arc::new(TestOneShotHook::default()),
@@ -13498,7 +13514,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V33)?;
+                db.execute_batch(CACHE_SCHEMA_V34)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -19801,7 +19817,105 @@ impl Store {
         self.maintenance_after_first_delete_hook.set(hook);
     }
 
-    /// One small writer unit. All negative no-op probes stay read-only and indexed.
+    /// Sets how long one maintenance unit keeps releasing chunks. Zero gives one chunk per
+    /// unit; a long budget releases a small revision in one unit.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_maintenance_unit_budget_for_tests(&self, budget: Duration) {
+        self.maintenance_unit_budget_us
+            .store(budget.as_micros() as u64, Ordering::Release);
+    }
+
+    /// One bounded chunk of a pending release: up to 64 rows of one semantic table, or 64
+    /// manifest entries and their candidates. True once the revision is released.
+    fn release_pending_chunk(&self, tx: &Connection, selected: &str) -> Result<bool> {
+        let semantic_progress = release_semantic_tuple(tx, selected)?;
+        let entries: Vec<(i64, i64, Option<i64>, i64)> = if semantic_progress {
+            Vec::new()
+        } else {
+            tx.prepare(
+                "SELECT vid,gid,cid,ordinal
+             FROM revision_documents WHERE revision_id=?1 ORDER BY ordinal LIMIT 64",
+            )?
+            .query_map([selected], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        for (version, graph, class, ordinal) in &entries {
+            tx.execute(
+                "INSERT OR IGNORE INTO native_release_candidate_versions VALUES(?1,?2)",
+                params![selected, version],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO native_release_candidate_graphs VALUES(?1,?2)",
+                params![selected, graph],
+            )?;
+            if let Some(class) = class {
+                tx.execute(
+                    "INSERT OR IGNORE INTO native_release_candidate_classes VALUES(?1,?2)",
+                    params![selected, class],
+                )?;
+            }
+            let deleted = tx.execute(
+                "DELETE FROM revision_documents WHERE revision_id=?1 AND ordinal=?2",
+                params![selected, ordinal],
+            )?;
+            if deleted == 1 && ordinal == &entries[0].3 {
+                self.maintenance_after_first_delete_hook.run();
+            }
+        }
+        // The candidate journal and manifest DELETE commit atomically.
+        // Bound dependent cleanup by 64 candidates per table per chunk.
+        cleanup_release_candidate(tx, selected, "class")?;
+        cleanup_release_candidate(tx, selected, "graph")?;
+        cleanup_release_candidate(tx, selected, "version")?;
+        let has_manifest: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?1 LIMIT 1)",
+            [selected],
+            |r| r.get(0),
+        )?;
+        let has_candidates: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_release_candidate_classes WHERE revision_id=?1)
+             OR EXISTS(SELECT 1 FROM native_release_candidate_graphs WHERE revision_id=?1)
+             OR EXISTS(SELECT 1 FROM native_release_candidate_versions WHERE revision_id=?1)",
+            [selected],
+            |r| r.get(0),
+        )?;
+        let has_semantic: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE revision_id=?1)
+                OR EXISTS(SELECT 1 FROM semantic_revision_producers WHERE revision_id=?1)
+                OR EXISTS(SELECT 1 FROM semantic_requested_producers WHERE revision_id=?1)
+                OR EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1)",
+            [selected],
+            |row| row.get(0),
+        )?;
+        if !has_manifest && !has_candidates && !has_semantic {
+            tx.execute(
+                "DELETE FROM revision_capture_inputs WHERE revision_id=?1",
+                [selected],
+            )?;
+            tx.execute(
+                "INSERT INTO revision_capture_inputs(revision_id,input_key,payload)
+                VALUES(?1,'__released:v1','released:v1')",
+                [selected],
+            )?;
+            tx.execute(
+                "DELETE FROM native_revision_release_debt WHERE revision_id=?1",
+                [selected],
+            )?;
+            tx.execute(
+                "UPDATE native_revision_supersessions SET state='released'
+                WHERE revision_id=?1 AND state='pending'",
+                [selected],
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// One writer unit of release chunks, bounded by `MAINTENANCE_UNIT_BUDGET`. All negative
+    /// no-op probes stay read-only and indexed.
     /// A newly waiting publisher or changed durable FIFO causes rollback.
     pub fn maintenance_step(
         &self,
@@ -19993,85 +20107,17 @@ impl Store {
                     state == "pending",
                     "incompatible_index: invalid pending debt state"
                 );
-                let semantic_progress = release_semantic_tuple(&tx, &selected)?;
-                let entries: Vec<(i64, i64, Option<i64>, i64)> = if semantic_progress {
-                    Vec::new()
-                } else {
-                    tx.prepare(
-                        "SELECT vid,gid,cid,ordinal
-                     FROM revision_documents WHERE revision_id=?1 ORDER BY ordinal LIMIT 64",
-                    )?
-                    .query_map([&selected], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                    })?
-                    .collect::<rusqlite::Result<_>>()?
-                };
-                for (version, graph, class, ordinal) in &entries {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO native_release_candidate_versions VALUES(?1,?2)",
-                        params![selected, version],
-                    )?;
-                    tx.execute(
-                        "INSERT OR IGNORE INTO native_release_candidate_graphs VALUES(?1,?2)",
-                        params![selected, graph],
-                    )?;
-                    if let Some(class) = class {
-                        tx.execute(
-                            "INSERT OR IGNORE INTO native_release_candidate_classes VALUES(?1,?2)",
-                            params![selected, class],
-                        )?;
-                    }
-                    let deleted = tx.execute(
-                        "DELETE FROM revision_documents WHERE revision_id=?1 AND ordinal=?2",
-                        params![selected, ordinal],
-                    )?;
-                    if deleted == 1 && ordinal == &entries[0].3 {
-                        self.maintenance_after_first_delete_hook.run();
-                    }
-                }
-                // The candidate journal and manifest DELETE commit atomically.
-                // Bound dependent cleanup by 64 candidates per table per unit.
-                cleanup_release_candidate(&tx, &selected, "class")?;
-                cleanup_release_candidate(&tx, &selected, "graph")?;
-                cleanup_release_candidate(&tx, &selected, "version")?;
-                let has_manifest: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?1 LIMIT 1)",
-                    [&selected],
-                    |r| r.get(0),
-                )?;
-                let has_candidates: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM native_release_candidate_classes WHERE revision_id=?1)
-                     OR EXISTS(SELECT 1 FROM native_release_candidate_graphs WHERE revision_id=?1)
-                     OR EXISTS(SELECT 1 FROM native_release_candidate_versions WHERE revision_id=?1)",
-                    [&selected], |r| r.get(0))?;
-                let has_semantic: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE revision_id=?1)
-                        OR EXISTS(SELECT 1 FROM semantic_revision_producers WHERE revision_id=?1)
-                        OR EXISTS(SELECT 1 FROM semantic_requested_producers WHERE revision_id=?1)
-                        OR EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1)",
-                    [&selected],
-                    |row| row.get(0),
-                )?;
-                if !has_manifest && !has_candidates && !has_semantic {
-                    tx.execute(
-                        "DELETE FROM revision_capture_inputs WHERE revision_id=?1",
-                        [&selected],
-                    )?;
-                    tx.execute(
-                        "INSERT INTO revision_capture_inputs(revision_id,input_key,payload)
-                        VALUES(?1,'__released:v1','released:v1')",
-                        [&selected],
-                    )?;
-                    tx.execute(
-                        "DELETE FROM native_revision_release_debt WHERE revision_id=?1",
-                        [&selected],
-                    )?;
-                    tx.execute(
-                        "UPDATE native_revision_supersessions SET state='released'
-                        WHERE revision_id=?1 AND state='pending'",
-                        [&selected],
-                    )?;
-                }
+                // Chunks repeat within one transaction until the unit budget passes, a
+                // higher class has work, or the revision is released (#583). Committing
+                // 64 rows per unit spent the unit on its fixed open and commit cost.
+                let budget =
+                    Duration::from_micros(self.maintenance_unit_budget_us.load(Ordering::Acquire));
+                let started = Instant::now();
+                while !self.release_pending_chunk(&tx, &selected)?
+                    && started.elapsed() < budget
+                    && progress.check()
+                    && self.maintenance_priority(permit, probe, &mut priority)
+                {}
             }
             leader.verify()?;
             self.identity.verify()?;
@@ -22518,7 +22564,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V33).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V34).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -22657,7 +22703,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V33).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V34).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];
