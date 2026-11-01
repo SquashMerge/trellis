@@ -11,8 +11,10 @@
 //! The placeholder is the stored meaning of a skipped input, as for a skipped source (#576):
 //! its hash changes when an input starts or stops being skipped, so change detection and
 //! the native revision need no special handling. It starts with U+0001, which JSON, TOML,
-//! YAML and XML all reject, so every reader applies its broken-file rule: a manifest that
-//! doesn't parse supplies no dependency or package-root facts. That makes the facts unknown,
+//! YAML and XML all reject. A manifest that doesn't parse supplies no dependency or
+//! package-root facts. A skipped Cargo manifest also leaves every workspace document without
+//! a Cargo target: its unread explicit target paths could cross package directories.
+//! That makes the facts unknown,
 //! never a false external and never a dependency proved absent (#562, #575, #580). A file
 //! whose bytes equal the placeholder is treated as skipped.
 
