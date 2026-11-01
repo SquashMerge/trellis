@@ -274,7 +274,7 @@ function specimen({ state = "complete", old = false, changed = false } = {}) {
     call: pair.call,
     callSiteCount: 1,
     from: sid(from),
-    to: reason === "none" ? to : null,
+    to: ["none", "dispatch"].includes(reason) ? to : null,
     binding,
     visit: reason === "none" ? visit : "boundary",
     boundaryReason: reason,
@@ -433,7 +433,10 @@ test("eight hand-authored priority, cycle, diamond, callback, depth, node and ca
         possibleDispatch: [2],
       }),
       stale = s.add(1, 2, { staleTarget: true });
+    // The dispatch boundary admits its declaration, never expanded; a stale one does not (#557).
     const e = s.authored({
+      names: ["A", "B"],
+      depths: [0, 1],
       edges: [
         s.edge(dispatch, 1, { reason: "dispatch" }),
         s.edge(stale, 1, { reason: "stale" }),

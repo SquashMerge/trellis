@@ -673,12 +673,61 @@ fn case8a_virtual_dispatch_boundary() {
             ..direct(B)
         },
     );
+    // The declaration's own call is never expanded, and no possible target is admitted.
+    w.call(B, 11, 11);
+    w.bind(11, direct(v));
     let mut facts = w.build();
     let r = run(&mut facts, &request(A, true));
-    assert_eq!(nodes(&r), [(A, 0)]);
-    assert_eq!(edges(&r), [(10, A, None, Visit::Boundary, DISPATCH)]);
+    assert_eq!(nodes(&r), [(A, 0), (B, 1)]);
+    assert_eq!(edges(&r), [(10, A, Some(B), Visit::Boundary, DISPATCH)]);
     assert!(r.frontier.is_empty());
     assert!(r.partial && !r.truncated);
+}
+
+/// #557: a dispatch boundary's declaration takes a node only if one is free, and direct calls
+/// claim nodes first. With none free the edge stays target-less, not a node-limit frontier.
+#[test]
+fn dispatch_boundary_target_yields_to_direct_calls_and_the_node_limit() {
+    let world_with = |target| {
+        let mut w = world(true);
+        for n in [A, B, 5] {
+            w.decl(n, "src/lib.rs");
+        }
+        w.call(A, 10, 10);
+        w.call(A, 11, 20);
+        w.bind(
+            10,
+            Bind {
+                dispatch: Dispatch::Dynamic,
+                ..direct(target)
+            },
+        );
+        w.bind(11, direct(B));
+        w
+    };
+    let mut facts = world_with(5).build();
+    let mut limited = request(A, true);
+    limited.max_nodes = 2;
+    let r = run(&mut facts, &limited);
+    assert_eq!(nodes(&r), [(A, 0), (B, 1)]);
+    assert_eq!(
+        edges(&r),
+        [
+            (11, A, Some(B), Visit::New, BoundaryReason::None),
+            (10, A, None, Visit::Boundary, DISPATCH),
+        ]
+    );
+    assert!(r.frontier.is_empty() && !r.truncated);
+    // A declaration already admitted keeps its edge a boundary, with the target shown.
+    let mut facts = world_with(B).build();
+    let r = run(&mut facts, &limited);
+    assert_eq!(
+        edges(&r),
+        [
+            (11, A, Some(B), Visit::New, BoundaryReason::None),
+            (10, A, Some(B), Visit::Boundary, DISPATCH),
+        ]
+    );
 }
 const DISPATCH: BoundaryReason = BoundaryReason::Dispatch;
 

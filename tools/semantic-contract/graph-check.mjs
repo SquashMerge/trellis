@@ -237,6 +237,14 @@ export function expectedGraph(loaded, records, checked, request) {
       continue;
     }
     let reason = group.reason, to = null, visit = "boundary";
+    if (reason === "dispatch" && group.exactInternal) {
+      // The target's declaration, admitted but never expanded (#557).
+      if (seen.has(target.syntaxId)) to = target.syntaxId;
+      else if (nodes.length < effective.maxNodes) {
+        to = target.syntaxId; seen.add(to);
+        nodes.push({ declaration: byId.get(to), depth: depth + 1 });
+      }
+    }
     if (reason === "none") {
       if (seen.has(target.syntaxId)) { to = target.syntaxId; visit = "seen"; }
       else if (nodes.length === effective.maxNodes) {

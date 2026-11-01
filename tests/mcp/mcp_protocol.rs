@@ -14674,12 +14674,13 @@ async fn call_graph_eight_cases_through_mcp() {
         &[],
         (false, false),
     );
-    // 8a. A virtual dispatch is a boundary; the possible target is not admitted.
+    // 8a. A virtual dispatch is a boundary that shows its declaration (#557); the possible
+    // target is not admitted.
     mcp.case(
         "c8_a",
         with(json!({})),
-        &["c8_a:0"],
-        &["c8_v:c8_a>-:boundary:dispatch"],
+        &["c8_a:0", "c8_v:1"],
+        &["c8_v:c8_a>c8_v:boundary:dispatch"],
         &[],
         (false, true),
     );

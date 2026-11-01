@@ -1272,8 +1272,9 @@ struct MeasuredOccurrence {
 }
 
 /// How a call's exact bound target declaration can be called, measured from its native
-/// declaration kind alone (owner ruling 2026-10-30, #470). Only JavaScript and Rust are
-/// classified; every other declaration is `Other`.
+/// declaration (owner rulings 2026-10-30, #470, and 2026-10-31, #557). Python and a Rust
+/// `impl Trait for Type` method are not classified; they, like every other declaration, are
+/// `Other`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum TargetCallable {
     #[default]
@@ -1283,10 +1284,17 @@ pub(super) enum TargetCallable {
     FreeFunction = 1,
     /// A JavaScript class, or its `constructor` method.
     Constructor = 2,
+    /// One fixed body: a Rust method of an inherent `impl`, or a Java `static`, `private` or
+    /// `final` method.
+    FixedMethod = 3,
+    /// A declaration, not the runtime body: a Rust `trait` method, a JavaScript method other
+    /// than `constructor`, or any other Java method.
+    DynamicMethod = 4,
 }
 
 impl TargetCallable {
-    fn of(declaration: &native::Declaration) -> Self {
+    /// `parent` is the immediate parent declaration of a Rust `implementation` method.
+    fn of(declaration: &native::Declaration, parent: Option<&native::Declaration>) -> Self {
         match (
             declaration.document.language.as_str(),
             declaration.kind.as_str(),
@@ -1296,7 +1304,59 @@ impl TargetCallable {
             ("javascript", "method") if declaration.name.as_deref() == Some("constructor") => {
                 Self::Constructor
             }
+            ("javascript", "method") => Self::DynamicMethod,
+            // The only native `type` that holds a method is a trait.
+            ("rust", "method")
+                if declaration
+                    .ancestors
+                    .last()
+                    .is_some_and(|parent| parent.kind == "type") =>
+            {
+                Self::DynamicMethod
+            }
+            // `impl Type` measures no trait base; `impl Trait for Type` stays unclassified.
+            ("rust", "method")
+                if parent.is_some_and(|parent| {
+                    parent.kind == "implementation" && parent.header.bases.is_empty()
+                }) =>
+            {
+                Self::FixedMethod
+            }
+            ("java", "method")
+                if declaration.header.modifiers.iter().any(|modifier| {
+                    matches!(modifier.as_str(), "static" | "private" | "final")
+                }) =>
+            {
+                Self::FixedMethod
+            }
+            ("java", "method") => Self::DynamicMethod,
             _ => Self::Other,
+        }
+    }
+
+    /// The immediate parent a Rust method's classification reads, which is only its
+    /// `implementation`: a method's measured ancestors name the parent's identity input.
+    fn parent<'s, S: JoinStore>(
+        store: &'s S,
+        declaration: &native::Declaration,
+    ) -> Result<Option<std::borrow::Cow<'s, native::Declaration>>> {
+        let document = &declaration.document;
+        match declaration.ancestors.split_last() {
+            Some((parent, ancestors))
+                if document.language == "rust"
+                    && declaration.kind == "method"
+                    && parent.kind == "implementation" =>
+            {
+                let id = native_ids::syntax_id(&serde_json::json!({
+                    "sourceSet": store.source_set_id(),
+                    "path": document.path,
+                    "language": document.language,
+                    "ancestors": ancestors,
+                    "declaration": parent,
+                }))?;
+                store.declaration_of(document, &id)
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1305,6 +1365,8 @@ impl TargetCallable {
             0 => Self::Other,
             1 => Self::FreeFunction,
             2 => Self::Constructor,
+            3 => Self::FixedMethod,
+            4 => Self::DynamicMethod,
             _ => anyhow::bail!("corrupt staged target callable"),
         })
     }
@@ -1321,7 +1383,9 @@ enum CallShape {
     Path,
     /// A JavaScript `new` expression whose constructor is an identifier or dotted name.
     New,
-    /// Member or method-call syntax, a compound callee, or anything not proved above.
+    /// The callee token follows a `.`: `x.m()`, `self.m()`, `a?.b()`, Java `this.m()`.
+    Member,
+    /// A compound callee, a call without a measured callee token, or anything not proved above.
     Other,
 }
 
@@ -1350,6 +1414,7 @@ fn call_shape(language: &str, call: &native::Call, source: &[u8]) -> CallShape {
             {
                 CallShape::New
             }
+            _ if member_prefix(prefix) => CallShape::Member,
             _ => CallShape::Other,
         },
         // A path callee's native token is its `scoped_identifier` name, so the prefix is path
@@ -1365,23 +1430,36 @@ fn call_shape(language: &str, call: &native::Call, source: &[u8]) -> CallShape {
         {
             CallShape::Path
         }
+        "rust" | "java" if member_prefix(prefix) => CallShape::Member,
         _ => CallShape::Other,
     }
 }
 
-/// A call binding's dispatch (owner ruling 2026-10-30, #470), from the measured native call
-/// shape and the exact bound target's declaration kind only: a plain JavaScript call, or a
-/// plain or path Rust call, to a free function is `direct`; a JavaScript `new` of a class or
-/// its constructor is `constructor`; everything else, member calls included, stays `unknown`.
+/// A call whose callee token directly follows a `.`. The receiver before it can be any
+/// expression; only the separator is read.
+fn member_prefix(prefix: &[u8]) -> bool {
+    prefix.trim_ascii_end().ends_with(b".")
+}
+
+/// A call binding's dispatch (owner rulings 2026-10-30, #470, and 2026-10-31, #557), from the
+/// measured native call shape and the exact bound target's native declaration only: a plain
+/// JavaScript call, or a plain or path Rust call, to a free function is `direct`, and so is a
+/// Rust member or path call to an inherent method and a Java plain or member call to a
+/// `static`, `private` or `final` method; a JavaScript `new` of a class or its constructor is
+/// `constructor`; a Rust trait method, a JavaScript member call to a method and any other Java
+/// method call is `dynamic`; everything else stays `unknown`.
 fn call_dispatch(language: &str, shape: CallShape, callable: TargetCallable) -> semantic::Dispatch {
+    use CallShape::{Member, New, Path, Plain};
+    use TargetCallable::{Constructor, DynamicMethod, FixedMethod, FreeFunction};
     match (language, shape, callable) {
-        ("javascript", CallShape::Plain, TargetCallable::FreeFunction)
-        | ("rust", CallShape::Plain | CallShape::Path, TargetCallable::FreeFunction) => {
-            semantic::Dispatch::Direct
-        }
-        ("javascript", CallShape::New, TargetCallable::Constructor) => {
-            semantic::Dispatch::Constructor
-        }
+        ("javascript", Plain, FreeFunction)
+        | ("rust", Plain | Path, FreeFunction)
+        | ("rust", Member | Path, FixedMethod)
+        | ("java", Plain | Member, FixedMethod) => semantic::Dispatch::Direct,
+        ("javascript", New, Constructor) => semantic::Dispatch::Constructor,
+        ("javascript", Member, DynamicMethod)
+        | ("rust", Member | Path, DynamicMethod)
+        | ("java", Plain | Member, DynamicMethod) => semantic::Dispatch::Dynamic,
         _ => semantic::Dispatch::Unknown,
     }
 }
@@ -1462,7 +1540,8 @@ fn measure_occurrence<S: JoinStore>(
         let candidate = store
             .declaration_of(doc, &binding.candidate_ids[0])?
             .context("missing exact native declaration")?;
-        callable = TargetCallable::of(&candidate);
+        let parent = TargetCallable::parent(store, &candidate)?;
+        callable = TargetCallable::of(&candidate, parent.as_deref());
         // A stated SCIP kind must agree with the measured native kind. An unspecified kind
         // (`0`, as scip-typescript 0.4.0 emits for every symbol) states nothing to conflict,
         // so it defers to the measured native kind of this exact, authenticated target (#473).
@@ -1479,7 +1558,9 @@ fn measure_occurrence<S: JoinStore>(
                 {
                     matches!(kind, 9 | 26)
                 }
-                "method" => kind == 26,
+                // rust-analyzer 1.98.1 states `TraitMethod` for a bodiless trait method and
+                // `StaticMethod` for an associated function without `self` (#557).
+                "method" => matches!(kind, 26 | 70 | 80),
                 _ => true,
             });
         if compatible {

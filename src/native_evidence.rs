@@ -31,7 +31,7 @@ const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v12";
+pub(crate) const NATIVE_VERSION: &str = "native-v13";
 /// The build-time producer hash of this executable's extraction inputs: the
 /// listed extraction modules and crates (`build/extractor_inputs.rs`). Each
 /// revision records it; an executable rebuild with an equal hash keeps the
@@ -2438,12 +2438,18 @@ fn header_with_witnesses(
                 .flatten()
         })
         .and_then(|node| measured!("header.resultType".into(), node));
-    let bases = ["superclass", "interfaces", "super_interfaces", "traits"]
-        .into_iter()
-        .flat_map(|field| n.child_by_field_name(field))
-        .enumerate()
-        .filter_map(|(_i, node)| measured!(format!("header.bases[{_i}]"), node))
-        .collect();
+    let bases = [
+        "superclass",
+        "interfaces",
+        "super_interfaces",
+        "traits",
+        "trait",
+    ]
+    .into_iter()
+    .flat_map(|field| n.child_by_field_name(field))
+    .enumerate()
+    .filter_map(|(_i, node)| measured!(format!("header.bases[{_i}]"), node))
+    .collect();
     Header {
         kind: key.kind.clone(),
         name: key.name.clone(),

@@ -57,6 +57,17 @@
       "runtime": "trellis.native.syntax@native-v10 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
     },
     {
+      "name": "trellis-native-v13-javascript-test-support",
+      "status": "recorded",
+      "version": "native-v13",
+      "installedAtCapture": true,
+      "capturedOn": "2026-10-31",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; fix/557-inherent-dispatch from main 944417ad; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:b066feacb0e745f71de9d60cd25a0c140832ffcff4d7f80b82b0a2c03093b3e2",
+      "executableHash": "b066feacb0e745f71de9d60cd25a0c140832ffcff4d7f80b82b0a2c03093b3e2",
+      "runtime": "trellis.native.syntax@native-v13 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
+    },
+    {
       "name": "trellis-native-v12-javascript-test-support",
       "status": "recorded",
       "version": "native-v12",
