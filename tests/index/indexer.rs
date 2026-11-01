@@ -469,12 +469,15 @@ fn cancellation_and_size_limits() {
         })
         .is_err()
     );
+    // A source over the cap is skipped with a diagnostic, not a failed index (#576).
     o.max_file_bytes = 2;
+    let graph = run(&o);
+    assert_eq!(graph.files.len(), 1);
+    assert!(graph.calls.is_empty());
     assert!(
-        index_workspace(&o, &cancel(), |_| {})
-            .unwrap_err()
-            .to_string()
-            .contains("oversized input")
+        graph.diagnostics.iter().any(
+            |d| d.path.as_deref() == Some("large.js") && d.message.contains("--max-file-bytes")
+        )
     );
 }
 #[test]

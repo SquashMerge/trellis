@@ -1132,6 +1132,61 @@ fn definitions_world() -> World {
     })
 }
 
+/// #576: through staging, a use of a symbol defined only in a source Trellis didn't read stays
+/// unresolved, never external, and both join stores agree. The readable control resolves it.
+#[test]
+fn a_symbol_defined_only_in_a_skipped_source_stays_unresolved_through_staging() {
+    let definer = "function run() {}\n";
+    for (bytes, skipped) in [
+        (definer.as_bytes().to_vec(), false),
+        ([definer.as_bytes(), b"// caf\xe9\n"].concat(), true),
+    ] {
+        let world = world(|root| {
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("src/A.js"), &bytes).unwrap();
+            fs::write(root.join("src/B.js"), "run();\n").unwrap();
+        });
+        let descriptor = one_artifact_per_language(
+            &world,
+            vec![(
+                "javascript",
+                vec![
+                    DocSpec::new("src/A.js")
+                        .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
+                        .symbol("pkg run.", 17, &[]),
+                    DocSpec::new("src/B.js").occurrence(&[0, 0, 3], &[], "pkg run.", 0),
+                ],
+            )],
+        );
+        let (mut admitted, _, _) = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        let memory = world
+            .memory_rejoin(&descriptor, DestinationMutations::default())
+            .unwrap()
+            .publication;
+        assert_same_publication(&staged, &memory, "skipped definer");
+        let uses: Vec<_> = staged
+            .references
+            .iter()
+            .filter(|r| r.document.path == "src/B.js")
+            .map(|r| r.resolution)
+            .collect();
+        assert!(!uses.is_empty());
+        let expected = if skipped {
+            Resolution::Unresolved
+        } else {
+            Resolution::Resolved
+        };
+        assert!(uses.iter().all(|r| *r == expected), "{skipped}: {uses:?}");
+    }
+}
+
 #[test]
 fn staged_and_memory_join_stores_produce_identical_publications() {
     let check = |world: &World, descriptor: &(PathBuf, String), mutations, case: &str| {

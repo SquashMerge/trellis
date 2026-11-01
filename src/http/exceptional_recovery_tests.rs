@@ -1991,7 +1991,8 @@ fn failed_nonurgent_full_gate_is_spent_then_next_row_covers_it() {
     let incoming = options.workspace_root.join("new.js");
     let watch = state.clone();
     state.test_queue_after_startup_drain.set(move || {
-        std::fs::write(&incoming, [0xff, 0xfe]).unwrap();
+        // A source that isn't a regular file still fails capture (#576 skips only unreadable text).
+        std::os::unix::fs::symlink("missing", &incoming).unwrap();
         watch
             .watcher_work
             .lock()
@@ -2022,6 +2023,7 @@ fn failed_nonurgent_full_gate_is_spent_then_next_row_covers_it() {
         store.request_by_id(&second.id).unwrap().unwrap().state,
         "queued"
     );
+    std::fs::remove_file(options.workspace_root.join("new.js")).unwrap();
     std::fs::write(
         options.workspace_root.join("new.js"),
         "function recovered() {}\n",
@@ -2070,7 +2072,8 @@ fn deferred_full_gate_clears_only_matching_explicit_registration() {
     watcher.set_waker(state.watch_waker.clone());
     *state.watcher_work.lock().unwrap() = Some((Arc::downgrade(&owner), watcher));
     let invalid = options.workspace_root.join("invalid.js");
-    std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+    // A source that isn't a regular file still fails capture (#576 skips only unreadable text).
+    std::os::unix::fs::symlink("missing", &invalid).unwrap();
     state
         .watcher_work
         .lock()
@@ -2088,6 +2091,7 @@ fn deferred_full_gate_clears_only_matching_explicit_registration() {
         state.explicit_pending.lock().unwrap().as_ref().unwrap(),
         &applied
     ));
+    std::fs::remove_file(&invalid).unwrap();
     std::fs::write(
         &invalid,
         "function valid() {}
@@ -2322,7 +2326,8 @@ fn empty_fifo_deferred_retry_emits_exact_causal_ack() {
     *state.causal_witness.lock().unwrap() = Some(reporter.clone());
     let owner = state.retained_serving_session().unwrap();
     let invalid = options.workspace_root.join("invalid.js");
-    std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+    // A source that isn't a regular file still fails capture (#576 skips only unreadable text).
+    std::os::unix::fs::symlink("missing", &invalid).unwrap();
     {
         let mut guard = state.watcher_work.lock().unwrap();
         let work = &mut guard.as_mut().unwrap().1;
@@ -2344,6 +2349,7 @@ fn empty_fifo_deferred_retry_emits_exact_causal_ack() {
         assert_ne!(event.kind, "WATCH_ACK");
     }
     assert!(pending);
+    std::fs::remove_file(&invalid).unwrap();
     std::fs::write(&invalid, "function recovered() {}\n").unwrap();
     state
         .watcher_work

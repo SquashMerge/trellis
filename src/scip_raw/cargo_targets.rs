@@ -45,6 +45,8 @@ struct FileModules {
     refs: Vec<ModRef>,
     /// A construct that names a module file this module cannot resolve exactly.
     uncertain: bool,
+    /// The source wasn't read (#576): it could declare any module, anywhere in the workspace.
+    unread: bool,
 }
 
 /// One package manifest: its directory (`""` for the workspace root) and its parsed table,
@@ -52,6 +54,7 @@ struct FileModules {
 struct Manifest {
     dir: String,
     table: Option<toml::Table>,
+    unread: bool,
 }
 
 /// Collects the manifests and module references of one captured revision.
@@ -96,13 +99,15 @@ impl CargoTargetsBuilder {
             if manifests.iter().any(|m: &Manifest| m.dir == dir) {
                 continue;
             }
-            let table = hex::decode(bytes)
-                .ok()
+            let bytes = hex::decode(bytes).ok();
+            let unread = bytes.as_deref() == Some(crate::skipped_config::PLACEHOLDER);
+            let table = bytes
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .and_then(|text| toml::from_str::<toml::Table>(&text).ok());
             manifests.push(Manifest {
                 dir: dir.to_owned(),
                 table,
+                unread,
             });
         }
         Self {
@@ -121,17 +126,26 @@ impl CargoTargetsBuilder {
         if self.is_empty() {
             return;
         }
+        // A source Trellis didn't read (#576) names no modules, but it could declare any.
+        let unread = std::str::from_utf8(source)
+            .is_ok_and(|text| crate::skipped_source::skipped("rust", text).is_some());
+        let modules = (!unread).then(|| module_refs(source)).flatten();
         self.files.insert(
             path.to_owned(),
-            module_refs(source).unwrap_or(FileModules {
+            modules.unwrap_or(FileModules {
                 refs: vec![],
                 uncertain: true,
+                unread,
             }),
         );
     }
 
     /// Resolves every document's target.
     pub fn finish(self) -> CargoTargets {
+        // A skipped manifest may name any workspace file as an explicit target via `../`.
+        if self.manifests.iter().any(|manifest| manifest.unread) {
+            return CargoTargets::default();
+        }
         let documents: BTreeSet<&str> = self.files.keys().map(String::as_str).collect();
         let mut targets: Vec<(usize, CargoTarget)> = Vec::new();
         let mut poisoned = BTreeSet::new();
@@ -154,6 +168,14 @@ impl CargoTargetsBuilder {
             let (reached, complete) = reach(&target.root, &self.files, &documents);
             if !complete {
                 poisoned.insert(*package);
+            }
+            // An unread module of a target can reach past its package with `#[path]`, so no
+            // file of the workspace is proved to have one owner (#576).
+            if reached
+                .iter()
+                .any(|path| self.files.get(*path).is_some_and(|file| file.unread))
+            {
+                return CargoTargets::default();
             }
             for path in reached {
                 owners.entry(path).or_default().insert(index);
@@ -666,6 +688,154 @@ mod tests {
     }
 
     const PACKAGE: &str = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+
+    /// #576 review: a crate root Trellis didn't read could still own a module, so a module the
+    /// readable control shares between two targets never gets the other one as its owner.
+    #[test]
+    fn an_unread_crate_root_leaves_its_possible_modules_without_a_target() {
+        use crate::skipped_source::{Skip, placeholder};
+        let files = |lib: &str| {
+            targets(
+                &[("Cargo.toml", PACKAGE)],
+                &[
+                    ("src/lib.rs", lib),
+                    ("src/main.rs", "mod shared; fn main() {}\n"),
+                    ("src/shared.rs", "pub fn f() {}\n"),
+                ],
+            )
+        };
+        assert_eq!(of(&files("mod shared;\n"), "src/shared.rs"), None);
+        for skip in [Skip::Oversized, Skip::NotUtf8] {
+            let unread = files(&placeholder("rust", skip));
+            assert_eq!(of(&unread, "src/shared.rs"), None, "{skip:?}");
+        }
+    }
+
+    /// #576 re-review: `#[path]` reaches past a package, so directory poisoning isn't enough. An
+    /// unread module could own any file of the workspace, in this package or another.
+    #[test]
+    fn an_unread_module_leaves_every_file_of_the_workspace_without_a_target() {
+        use crate::skipped_source::{Skip, placeholder};
+        let manifests = [
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"pkg\", \"other\"]\n",
+            ),
+            ("pkg/Cargo.toml", PACKAGE),
+            ("other/Cargo.toml", PACKAGE),
+        ];
+        let common = "#[path = \"../../shared/common.rs\"] mod common;\n";
+        let main = format!("{common}fn main() {{}}\n");
+        let files = |lib: &str, orphan: &str| {
+            targets(
+                &manifests,
+                &[
+                    ("pkg/src/lib.rs", lib),
+                    ("pkg/src/main.rs", &main),
+                    ("pkg/src/orphan.rs", orphan),
+                    ("shared/common.rs", "pub fn f() {}\n"),
+                    ("other/src/lib.rs", "mod own;\n"),
+                    ("other/src/own.rs", ""),
+                ],
+            )
+        };
+        let control = files(common, "");
+        assert_eq!(of(&control, "shared/common.rs"), None);
+        assert_eq!(
+            of(&control, "other/src/own.rs"),
+            owned("lib", "other/src/lib.rs")
+        );
+        for skip in [Skip::Oversized, Skip::NotUtf8] {
+            let unread = placeholder("rust", skip);
+            let skipped = files(&unread, "");
+            assert_eq!(of(&skipped, "shared/common.rs"), None, "{skip:?}");
+            assert_eq!(of(&skipped, "other/src/own.rs"), None, "{skip:?}");
+            // A file no target reaches is compiled by nothing, so it owns nothing.
+            let orphaned = files(common, &unread);
+            assert_eq!(of(&orphaned, "shared/common.rs"), None, "{skip:?}");
+            assert_eq!(
+                of(&orphaned, "other/src/own.rs"),
+                owned("lib", "other/src/lib.rs"),
+                "{skip:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unread_manifest_leaves_outside_targets_unknown() {
+        let shared = "[package]\nname='a'\n[[bin]]\nname='shared'\npath='../b/src/lib.rs'\n";
+        let files = [
+            ("a/src/lib.rs", "pub fn a() {}\n"),
+            ("b/src/lib.rs", "pub fn shared() {}\nfn main() {}\n"),
+        ];
+        let build = |a: &str| {
+            targets(
+                &[
+                    ("Cargo.toml", "[workspace]\nmembers=['a','b']\n"),
+                    ("a/Cargo.toml", a),
+                    ("b/Cargo.toml", "[package]\nname='b'\n"),
+                ],
+                &files,
+            )
+        };
+        assert_eq!(of(&build(shared), "b/src/lib.rs"), None);
+        assert_eq!(
+            of(&build("[package]\nname='a'\n"), "b/src/lib.rs"),
+            owned("lib", "b/src/lib.rs")
+        );
+        let skipped = build(std::str::from_utf8(crate::skipped_config::PLACEHOLDER).unwrap());
+        assert_eq!(of(&skipped, "a/src/lib.rs"), None);
+        assert_eq!(of(&skipped, "b/src/lib.rs"), None);
+    }
+
+    #[test]
+    fn a_captured_unread_manifest_leaves_outside_targets_unknown() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let root = tempfile::tempdir().unwrap();
+        for package in ["a", "b"] {
+            std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+            std::fs::write(
+                root.path().join(package).join("src/lib.rs"),
+                "pub fn f() {}\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers=['a','b']\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("b/Cargo.toml"), "[package]\nname='b'\n").unwrap();
+        let manifest = format!(
+            "[package]\nname='a'\n[[bin]]\nname='shared'\npath='../b/src/lib.rs'\n# {}\n",
+            "x".repeat(400)
+        );
+        std::fs::write(root.path().join("a/Cargo.toml"), manifest).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        for cap in [4096, 256] {
+            let mut options = crate::indexer::IndexOptions::new(root.path().to_owned());
+            options.max_config_bytes = cap;
+            let capture = crate::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
+            let config = crate::native_evidence::captured_components(&capture, "")
+                .unwrap()
+                .1;
+            let a = config
+                .iter()
+                .find(|entry| entry["path"] == "a/Cargo.toml")
+                .unwrap();
+            assert_eq!(
+                a["bytes"] == hex::encode(crate::skipped_config::PLACEHOLDER),
+                cap == 256
+            );
+            let mut builder = CargoTargetsBuilder::from_native_config(&config);
+            for file in &capture.files {
+                if file.language == "rust" {
+                    builder.add_document(&file.path, file.text.as_bytes());
+                }
+            }
+            assert_eq!(of(&builder.finish(), "b/src/lib.rs"), None, "cap={cap}");
+        }
+    }
 
     #[test]
     fn conventional_layout_assigns_each_target_its_module_tree() {

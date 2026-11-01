@@ -30,6 +30,7 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/parallel.rs",
     "src/search_card.rs",
     "src/search_capture.rs",
+    "src/skipped_source.rs",
 ];
 
 /// Fixture conversion is compiled only for test-support captures. It must not

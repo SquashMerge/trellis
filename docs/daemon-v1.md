@@ -255,9 +255,27 @@ ancestor-directory replacement**, nor a defense against another process with the
 user's privileges. Do not expose it through a tunnel or untrusted proxy.
 
 Caps: 2 MiB per source by default (`--max-file-bytes`, up to 16 MiB through the CLI),
-256 MiB aggregate source, 100,000 discovered source files and 256 MiB SCIP. Oversized or
-unreadable individual files are diagnosed, and syntax past 128 levels or 1,000,000 visits is a
-per-file coverage gap (#554). So is a file whose evidence exceeds a selected read's budgets: 16
+256 MiB aggregate source, 100,000 discovered source files and 256 MiB SCIP. A source over
+`--max-file-bytes`, or one that isn't UTF-8, is skipped with a diagnostic, and the rest of the
+checkout indexes (#576): it isn't read, its stored source is a short placeholder that says why,
+it publishes as below with a `native-coverage-partial` status diagnostic, and a reference or rules
+read names it in `partialFiles` with reason `oversized` or `not_utf8`. It could declare
+anything, so it proves no binding absent, as for a file with a syntax error; for Java that leaves
+every package of its source set unknown. A SCIP artifact that names it is admitted with no
+claims for it, and while a source of a language is unread, a symbol the artifact never defines
+is unresolved rather than external in that language, and an unread Rust file a Cargo target
+reaches leaves every file of the workspace without a Cargo target. It recovers when the file changes back. Config
+inputs (the root `package.json`, `package-lock.json`, `Cargo.lock` and other root build and
+lock files, and nested `package.json` and `Cargo.toml` manifests) are read for dependency and
+package-root facts, not as source, so `--max-file-bytes` doesn't apply to them: each has its
+own 16 MiB cap (#581). One over it isn't read; it is skipped with a `config-input-oversized`
+status diagnostic and the rest of the checkout indexes. Its stored bytes are a short
+placeholder that no config format parses, so the facts it would supply are unknown, as for a
+manifest with a syntax error: no external package and no absent dependency is inferred from it.
+A skipped `Cargo.toml` also leaves every workspace document without a Cargo target: its
+unread explicit target paths could cross package directories. These facts recover when the
+input shrinks back under the cap. Syntax past 128
+levels or 1,000,000 visits is a per-file coverage gap (#554). So is a file whose evidence exceeds a selected read's budgets: 16
 rows per source byte in a table, at most 1,000,000, and 64 bytes per source byte plus 256 KiB of
 native rows, the same of graph rows and the same of class rows (#564). It publishes its file module, `partial` coverage and a whole-file capability gap,
 and nothing that would make a read refuse it. A class row past its budget loses its last

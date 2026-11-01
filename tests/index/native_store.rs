@@ -79,19 +79,32 @@ fn publish(
     expected: IndexPin,
     leader: &trellis::store::topology::WriterGuard,
 ) -> anyhow::Result<IndexPin> {
-    let (graph, native, capture) = index_workspace_bundle(
+    publish_with(
+        store,
         &IndexOptions::new(root.to_owned()),
-        store.root_id(),
         cancel,
-        |_| {},
-    )?;
+        expected,
+        leader,
+    )
+}
+#[cfg(feature = "test-support")]
+fn publish_with(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+    expected: IndexPin,
+    leader: &trellis::store::topology::WriterGuard,
+) -> anyhow::Result<IndexPin> {
+    let (graph, native, capture) =
+        index_workspace_bundle(options, store.root_id(), cancel, |_| {})?;
     assert_eq!(capture.graph_projection_count(), 1);
+    // A source over the size cap is never opened (#576); every other one is read once.
     assert!(
         capture
             .source_operations
             .values()
-            .all(|operations| operations.opens == 1
-                && operations.complete_reads == 1
+            .all(|operations| operations.opens <= 1
+                && operations.complete_reads == operations.opens
                 && operations.hashes == 1)
     );
     let revision = store.publish_native(&graph, &capture, &native, leader, expected, cancel)?;
@@ -745,7 +758,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         let version: String = db
             .query_row("SELECT version FROM native_producers", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, "native-v14");
+        assert_eq!(version, "native-v15");
         let calls: Vec<String> = db
             .prepare("SELECT 'occ:v2:'||lower(hex(id)) FROM native_version_calls")
             .unwrap()
@@ -853,7 +866,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
     let version: String = rebuilt
         .query_row("SELECT version FROM native_producers", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, "native-v14");
+    assert_eq!(version, "native-v15");
     let roles = store
         .native_declarations_at(pin, "javascript", "hello")
         .unwrap();
@@ -978,6 +991,202 @@ fn a_file_past_the_evidence_budget_publishes_as_a_gap_and_needs_no_reconciliatio
     .unwrap();
     assert_eq!(metrics(&store).partial_files.len(), 1);
     assert!(!store.recovery_pending_for_tests());
+}
+
+/// #576: one source over `--max-file-bytes`, or one that isn't UTF-8, in any language, is
+/// skipped with a typed diagnostic, the rest of the checkout publishes, and the file recovers
+/// when it changes back.
+#[test]
+#[cfg(feature = "test-support")]
+fn a_skipped_source_publishes_as_a_gap_and_recovers() {
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let mut options = IndexOptions::new(root.path().to_owned());
+    options.max_file_bytes = 512;
+    let metrics = |store: &Store| {
+        store
+            .evidence_response()
+            .unwrap()
+            .metrics_at(&Default::default(), &mut || Ok(()))
+            .unwrap()
+    };
+    for (path, good) in [
+        ("flow.js", "function hello(x) { if (x) { obj.go(); } }\n"),
+        (
+            "flow.java",
+            "class Demo { void go() { if (true) { run(); } } }\n",
+        ),
+        ("flow.rs", "fn main() { if true { run(); } }\n"),
+        ("flow.py", "def go():\n    if True:\n        run()\n"),
+    ] {
+        let file = root.path().join(path);
+        let oversized = format!("{good}{}", " ".repeat(600)).into_bytes();
+        let mut latin1 = good.as_bytes().to_vec();
+        latin1.extend_from_slice(b"\n\xe9\n");
+        for (bytes, reason) in [(oversized, "oversized"), (latin1, "not_utf8")] {
+            fs::write(&file, &bytes).unwrap();
+            publish_with(
+                &store,
+                &options,
+                &cancel,
+                store.index_baseline().unwrap(),
+                &leader,
+            )
+            .unwrap();
+            assert!(!store.recovery_pending_for_tests());
+            let partial = metrics(&store).partial_files;
+            assert_eq!(partial.len(), 1, "{path} {reason}");
+            assert_eq!(partial[0].path, path);
+            assert_eq!(partial[0].reason, reason);
+            let status = store.status().unwrap();
+            assert_eq!(status.stats.files, 4, "{path} {reason}");
+            assert!(
+                status
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.path.as_deref() == Some(path) && d.message.contains("was not read")),
+                "{path} {reason}: {:?}",
+                status.diagnostics
+            );
+            // Every other file keeps its facts.
+            assert!(status.stats.calls >= 3, "{path} {reason}");
+
+            fs::write(&file, good).unwrap();
+            publish_with(
+                &store,
+                &options,
+                &cancel,
+                store.index_baseline().unwrap(),
+                &leader,
+            )
+            .unwrap();
+            assert!(metrics(&store).partial_files.is_empty(), "{path} {reason}");
+            assert!(store.status().unwrap().diagnostics.is_empty());
+        }
+    }
+}
+
+/// #581: config inputs have their own cap, separate from `--max-file-bytes`. One under it is
+/// read in full; one over it is skipped with a typed status diagnostic, the checkout still
+/// publishes, the facts it would supply are unknown (never a false external), and it recovers
+/// when it shrinks back.
+#[test]
+#[cfg(feature = "test-support")]
+fn a_config_input_over_its_cap_is_skipped_with_a_diagnostic_and_recovers() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let write = |path: &str, text: &str| {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(
+        "src/app.js",
+        "import chunk from 'lodash';\nexport function app() { return chunk([1]); }\n",
+    );
+    write("pkg/util.js", "export function util() { return 1; }\n");
+    write("pkg/package.json", "{\"name\":\"pkg\"}");
+    write(
+        "src/lib.rs",
+        "use serde::Deserialize;\npub fn lib() { Deserialize::f(); }\n",
+    );
+    // Real manifests are small but past this test's --max-file-bytes, and under its config cap.
+    let pad = " ".repeat(400);
+    let package_json =
+        format!("{{\"name\":\"app\",\"dependencies\":{{\"lodash\":\"4.17.21\"}}}}{pad}\n");
+    let cargo_toml = format!(
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1.0.0\"\n#{pad}\n"
+    );
+    let oversized = |text: &str| format!("{text}{}", " ".repeat(5000));
+    write("package.json", &package_json);
+    write("Cargo.toml", &cargo_toml);
+    write("package-lock.json", "{\"lockfileVersion\":3}\n");
+    write("Cargo.lock", "version = 4\n");
+
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let leader = store.publication_for_tests().unwrap();
+    let mut options = IndexOptions::new(root.path().to_owned());
+    options.max_file_bytes = 256;
+    options.max_config_bytes = 4096;
+    let publish = || {
+        publish_with(
+            &store,
+            &options,
+            &cancel,
+            store.index_baseline().unwrap(),
+            &leader,
+        )
+        .unwrap();
+        assert!(!store.recovery_pending_for_tests());
+    };
+    let skipped = || {
+        let status = store.status().unwrap();
+        assert_eq!(status.stats.files, 3);
+        status
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "config-input-oversized")
+            .map(|d| {
+                assert!(d.message.contains("was not read"), "{}", d.message);
+                d.path.clone().unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let externals = || {
+        let references = store
+            .evidence_response()
+            .unwrap()
+            .architecture_response("references", &serde_json::json!({}), &mut || Ok(()))
+            .unwrap();
+        let mut packages: Vec<String> = references["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|package| package["identity"]["package"].as_str().unwrap().to_owned())
+            .collect();
+        packages.sort();
+        packages
+    };
+
+    // Every config input is read in full, though two are past --max-file-bytes.
+    publish();
+    assert!(skipped().is_empty());
+    assert_eq!(externals(), ["lodash", "serde"]);
+
+    // Lockfiles over the cap are skipped; the manifests still supply their dependencies.
+    write("package-lock.json", &oversized("{\"lockfileVersion\":3}"));
+    write("Cargo.lock", &oversized("version = 4"));
+    publish();
+    assert_eq!(skipped(), ["Cargo.lock", "package-lock.json"]);
+    assert_eq!(externals(), ["lodash", "serde"]);
+
+    // A manifest over the cap supplies nothing: its dependencies are unknown, not external.
+    write("package.json", &oversized(&package_json));
+    write("Cargo.toml", &oversized(&cargo_toml));
+    write("pkg/package.json", &oversized("{\"name\":\"pkg\"}"));
+    publish();
+    assert_eq!(
+        skipped(),
+        [
+            "Cargo.lock",
+            "Cargo.toml",
+            "package-lock.json",
+            "package.json",
+            "pkg/package.json"
+        ]
+    );
+    assert!(externals().is_empty());
+
+    // Each recovers when it shrinks back under the cap.
+    write("package.json", &package_json);
+    write("Cargo.toml", &cargo_toml);
+    write("pkg/package.json", "{\"name\":\"pkg\"}");
+    write("package-lock.json", "{\"lockfileVersion\":3}\n");
+    write("Cargo.lock", "version = 4\n");
+    publish();
+    assert!(skipped().is_empty());
+    assert_eq!(externals(), ["lodash", "serde"]);
 }
 
 #[test]
