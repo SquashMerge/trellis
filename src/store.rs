@@ -7015,8 +7015,8 @@ fn read_semantic_tuple_for_call(
                         String,
                     );
                     let raw: Option<RawRow> = db.query_row(
-                        "SELECT p.record_kind,p.fact_digest,p.language,p.path,CASE WHEN ?3 THEN NULL ELSE p.canonical_bytes END,c.producer_id,c.source_set_id,c.captured_revision,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE p.capture_id=?1 AND p.proof_id=?2",
-                        params![capture, proof, trusted_admitted_raw],
+                        "SELECT p.record_kind,p.fact_digest,p.language,p.path,p.canonical_bytes,c.producer_id,c.source_set_id,c.captured_revision,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE p.capture_id=?1 AND p.proof_id=?2",
+                        params![capture, proof],
                         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
                     ).optional()?;
                     let (
@@ -7032,26 +7032,19 @@ fn read_semantic_tuple_for_call(
                     ) = raw.context(SelectedIntegrity(
                         "incompatible_index: missing raw proof".into(),
                     ))?;
-                    if let Some(canonical) = canonical.as_deref() {
-                        let envelope: serde_json::Value = serde_json::from_slice(canonical)
-                            .context(SelectedIntegrity(
-                                "incompatible_index: corrupt raw envelope".into(),
-                            ))?;
-                        selected_ensure!(
-                            envelope.get("recordKind").and_then(|v| v.as_str())
-                                == Some(kind.as_str())
-                                && envelope.get("relativePath").and_then(|v| v.as_str())
-                                    == Some(path.as_str())
-                                && envelope.get("formatVersion").and_then(|v| v.as_u64())
-                                    == Some(1),
-                            "incompatible_index: corrupt raw envelope identity"
-                        );
-                    } else {
-                        selected_ensure!(
-                            trusted_admitted_raw,
-                            "incompatible_index: missing raw envelope"
-                        );
-                    }
+                    let canonical = canonical.context(SelectedIntegrity(
+                        "incompatible_index: missing raw envelope".into(),
+                    ))?;
+                    let envelope: serde_json::Value = serde_json::from_slice(&canonical).context(
+                        SelectedIntegrity("incompatible_index: corrupt raw envelope".into()),
+                    )?;
+                    selected_ensure!(
+                        envelope.get("recordKind").and_then(|v| v.as_str()) == Some(kind.as_str())
+                            && envelope.get("relativePath").and_then(|v| v.as_str())
+                                == Some(path.as_str())
+                            && envelope.get("formatVersion").and_then(|v| v.as_u64()) == Some(1),
+                        "incompatible_index: corrupt raw envelope identity"
+                    );
                     selected_ensure!(
                         stored_kind == kind
                             && stored_digest == digest
@@ -7067,11 +7060,8 @@ fn read_semantic_tuple_for_call(
                                     &serde_json::json!({"producerId":stored_producer,"artifactHash":stored_artifact,"sourceSetId":stored_source_set,"sourceRevision":stored_revision,"language":stored_language,"relativePath":stored_path,"factDigest":stored_digest})
                                 )
                             ) == proof
-                            && (trusted_admitted_raw
-                                || canonical.as_deref().is_some_and(|bytes| {
-                                    crate::native_ids::digest(b"trellis.semantic-fact.v1\0", bytes)
-                                        == digest
-                                })),
+                            && crate::native_ids::digest(b"trellis.semantic-fact.v1\0", &canonical)
+                                == digest,
                         "incompatible_index: corrupt raw proof binding"
                     );
                     Some(sem::DerivedFrom {
@@ -19538,6 +19528,7 @@ impl Store {
                     "SELECT revision_id FROM native_revision_supersessions
                     WHERE state='retained' AND superseded_at<=?1
                     AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.captured_pin=native_revision_supersessions.revision_id)
+                    AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.revision_id=native_revision_supersessions.revision_id AND EXISTS(SELECT 1 FROM semantic_revision_raw_selections head JOIN index_metadata m ON m.singleton=1 WHERE head.batch_id=s.batch_id AND head.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections earlier JOIN native_revisions r ON r.id=earlier.revision_id JOIN native_revisions self ON self.id=s.revision_id WHERE earlier.batch_id=s.batch_id AND r.published_index_revision<self.published_index_revision))
                     ORDER BY superseded_at,revision_id LIMIT 1",
                     [now.saturating_sub(900)],
                     |r| r.get::<_, String>(0),
@@ -19613,7 +19604,8 @@ impl Store {
                 let changed = tx.execute(
                     "UPDATE native_revision_supersessions SET state='pending'
                     WHERE revision_id=?1 AND state='retained' AND superseded_at<=?2
-                    AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.captured_pin=native_revision_supersessions.revision_id)",
+                    AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.captured_pin=native_revision_supersessions.revision_id)
+                    AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.revision_id=native_revision_supersessions.revision_id AND EXISTS(SELECT 1 FROM semantic_revision_raw_selections head JOIN index_metadata m ON m.singleton=1 WHERE head.batch_id=s.batch_id AND head.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections earlier JOIN native_revisions r ON r.id=earlier.revision_id JOIN native_revisions self ON self.id=s.revision_id WHERE earlier.batch_id=s.batch_id AND r.published_index_revision<self.published_index_revision))",
                     params![selected, now.saturating_sub(900)],
                 )?;
                 ensure!(changed == 1, "revision conflict: due revision changed");

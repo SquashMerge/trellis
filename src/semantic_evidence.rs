@@ -1125,6 +1125,35 @@ impl WitnessedDocument {
         }
     }
 
+    /// Whether a fact of provenance `id` names an internal target that is not `known`.
+    fn has_absent_target(&self, id: &str, known: KnownTarget<'_>) -> Result<bool> {
+        let symbols = self.symbols(id).flat_map(|row| row.declarations.iter());
+        let references = self
+            .references(id)
+            .flat_map(|row| row.declared_target.iter().chain(&row.candidates));
+        let calls = self.call_bindings(id).flat_map(|row| {
+            row.declared_target
+                .iter()
+                .chain(&row.candidates)
+                .chain(&row.possible_dispatch)
+        });
+        let relationships = self
+            .type_relationships(id)
+            .flat_map(|row| [&row.source, &row.target]);
+        for target in symbols.chain(references).chain(calls).chain(relationships) {
+            if let Target::Internal {
+                syntax_id,
+                document,
+                ..
+            } = target
+                && !known(syntax_id, document)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The admitted tuple this document reuses.
     pub(crate) fn original(&self) -> &SemanticSnapshot {
         &self.original
@@ -2914,9 +2943,6 @@ impl<'a> WitnessValidator<'a> {
                 raw_manifest_hash: Some(self.raw.source_manifest_hash),
             },
         )?;
-        if let Some(witness) = witness {
-            self.same_proofs(document, semantic, witness)?;
-        }
         let known = |syntax_id: &str, target: &native::DocumentKey| -> Result<bool> {
             Ok(
                 targets.contains_key(&(target.clone(), syntax_id.to_owned()))
@@ -2926,6 +2952,9 @@ impl<'a> WitnessValidator<'a> {
                         .is_some_and(|d| &d.document == target),
             )
         };
+        if let Some(witness) = witness {
+            self.same_proofs(document, semantic, witness, &known)?;
+        }
         validate_fact_rows(
             semantic,
             &proof,
@@ -2990,6 +3019,7 @@ impl<'a> WitnessValidator<'a> {
         document: &native::DocumentKey,
         semantic: &SemanticPublication,
         witness: &WitnessedDocument,
+        known: KnownTarget<'_>,
     ) -> Result<()> {
         let original = &witness.original;
         ensure!(
@@ -3033,18 +3063,29 @@ impl<'a> WitnessValidator<'a> {
                 .all(|id| ids.contains(id.as_str())),
             "foreign admitted association proof"
         );
-        // A fact that depends on an absent target is omitted, and its coverage says so.
         let output = proofs(&semantic.provenance);
+        ensure!(
+            output.len() == semantic.provenance.len() && output.is_subset(&admitted),
+            "incomplete witnessed document proof inventory"
+        );
+        // A fact is omitted only when a target it depends on is absent, and coverage says so.
         let omitted = semantic
             .coverage
             .iter()
             .any(|row| row.reasons.as_ref().is_some_and(|reasons| reasons.omitted));
-        ensure!(
-            output.len() == semantic.provenance.len()
-                && output.is_subset(&admitted)
-                && (omitted || output == admitted),
-            "incomplete witnessed document proof inventory"
-        );
+        for p in &original.provenance {
+            let derived = p.derived_from.as_ref().context("non-derived proof")?;
+            let proof = (
+                derived.provenance_id.clone(),
+                derived.record_kind,
+                derived.fact_digest.clone(),
+                p.evidence_kind,
+            );
+            ensure!(
+                output.contains(&proof) || (omitted && witness.has_absent_target(&p.id, known)?),
+                "incomplete witnessed document proof inventory"
+            );
+        }
         Ok(())
     }
 }

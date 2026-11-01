@@ -4298,6 +4298,148 @@ fn replaced_batch_world() -> (World, IndexPin, IndexPin) {
     (world, older, head)
 }
 
+/// One LOCAL publication of `text` at `path`; returns its work counts.
+fn local_edit(world: &World, path: &str, text: &str, counts: &Path) -> Value {
+    let _ = fs::remove_file(counts);
+    write_files(&world.root, &[(path, text)]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    serde_json::from_slice(&fs::read(counts).unwrap()).unwrap()
+}
+
+/// Runs the due revision maintenance until nothing is left to do.
+fn run_maintenance(world: &World) {
+    let leader = world.store.publication_for_tests().unwrap();
+    world.store.maintain_revisions(&leader).unwrap();
+}
+
+/// #567: the admitted tuples the fast path reuses live on the revision that took the import, so
+/// that revision outlasts the grace while its batch stays selected, and no longer.
+#[test]
+fn the_import_revision_outlasts_the_grace_while_its_batch_is_selected() {
+    let world = definitions_world();
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let descriptor = world.write(&fixture);
+    world.publish(&descriptor).unwrap();
+    let import = world.head_key();
+    let tuples = |world: &World| {
+        world.count(&format!(
+            "SELECT COUNT(*) FROM semantic_coverage WHERE revision_id='{import}'"
+        ))
+    };
+    let admitted = tuples(&world);
+    assert!(admitted > 0);
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.store.set_retention_clock_for_tests(1_001, 1);
+    local_edit(&world, "src/C.js", "function other(){ }\n", &counts);
+    world.store.set_retention_clock_for_tests(1_902, 902);
+    local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 2; }\n",
+        &counts,
+    );
+    world.store.set_retention_clock_for_tests(2_803, 1_803);
+    run_maintenance(&world);
+    assert_eq!(tuples(&world), admitted);
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 3; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+    // A new batch replaces the selection: the old tuples are ordinary retained rows again.
+    let (a, b) = definitions_docs();
+    let a = a.occurrence(&[0, 0, 1], &[], "pkg extra.", 0);
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let replacement = world.write(&fixture);
+    world.publish(&replacement).unwrap();
+    world.store.set_retention_clock_for_tests(3_704, 2_704);
+    run_maintenance(&world);
+    assert_eq!(tuples(&world), 0);
+}
+
+/// A definition's claim can lose its reference row to another claim at its span while it keeps
+/// its declaration binding: the row's proof is still fused. Whether that claim or the other one
+/// owns the row follows the proof IDs, so several spellings cover both orders.
+fn fused_definition(world: &World, spelling: usize) -> (DocSpec, DocSpec) {
+    let target = format!("pkg target{spelling}.");
+    let a = DocSpec::new("src/A.js")
+        .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
+        .occurrence(&[0, 9, 12], &[], &target, 0)
+        .occurrence(&[0, 16, 22], &[0, 16, 24], &target, 0)
+        .symbol("pkg run.", 17, &[]);
+    let b = DocSpec::new("src/B.js")
+        .occurrence(&[0, 9, 15], &[], &target, 1)
+        .symbol(&target, 17, &[]);
+    let _ = world;
+    (a, b)
+}
+
+#[test]
+fn a_fused_definition_stays_on_the_fast_path_and_matches_full() {
+    for spelling in 0..6 {
+        let world = definitions_world();
+        let (a, b) = fused_definition(&world, spelling);
+        let mut fixture = world.fixture().reference("scip-typescript");
+        fixture.artifact("javascript", vec![a, b]);
+        let descriptor = world.write(&fixture);
+        world.publish(&descriptor).unwrap();
+        let counts = world._state.path().join("work-counts.json");
+        // SAFETY: each test runs in its own process under nextest, and no other thread reads
+        // these.
+        unsafe {
+            std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+            std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+        }
+        let work = local_edit(&world, "src/C.js", "function other(){ }\n", &counts);
+        assert_eq!(work["witnessedRejoins"], 1, "{spelling}: {work}");
+        assert_eq!(work["fullFallbacks"], 0, "{spelling}: {work}");
+    }
+}
+
+/// The row fused from the definition and the call-free claim loses a target only the second one
+/// named. The row cannot say what survives, so FULL decides, and the oracle confirms the result.
+#[test]
+fn a_target_lost_under_a_fused_definition_takes_full() {
+    for spelling in 0..6 {
+        let world = definitions_world();
+        let (a, b) = fused_definition(&world, spelling);
+        let mut fixture = world.fixture().reference("scip-typescript");
+        fixture.artifact("javascript", vec![a, b]);
+        let descriptor = world.write(&fixture);
+        world.publish(&descriptor).unwrap();
+        let counts = world._state.path().join("work-counts.json");
+        // SAFETY: each test runs in its own process under nextest, and no other thread reads
+        // these.
+        unsafe {
+            std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+            std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+        }
+        fs::remove_file(world.root.join("src/B.js")).unwrap();
+        let options = IndexOptions::new(world.root.clone());
+        let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+        let leader = world.store.publication_for_tests().unwrap();
+        world
+            .store
+            .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+            .unwrap();
+    }
+}
+
 /// Releases `pin`, whose garbage collection proceeds in bounded steps.
 fn release(world: &World, pin: IndexPin, leader: &trellis::store::topology::WriterGuard) {
     for _ in 0..64 {

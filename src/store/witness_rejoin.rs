@@ -100,12 +100,11 @@ fn document_claims(
     .map_err(Into::into)
 }
 
-/// Every captured declaration and the symbols that name it, from the admitted tuples.
+/// Every symbol the admitted tuples declare.
 fn witness_scope(
     tx: &Connection,
     original: &str,
     producer_id: &str,
-    source_set_id: &str,
     destination_manifest_hash: String,
 ) -> Result<WitnessScope> {
     let mut scope = WitnessScope {
@@ -114,28 +113,15 @@ fn witness_scope(
         destination_manifest_hash,
     };
     let mut statement = tx.prepare(
-        "SELECT b.syntax_id,c.language,c.path,s.symbol
+        "SELECT DISTINCT s.symbol
          FROM semantic_coverage c
          JOIN semantic_declaration_bindings b ON b.tuple_id=c.tuple_id
-         LEFT JOIN semantic_declaration_binding_symbols s ON s.binding_id=b.binding_id
+         JOIN semantic_declaration_binding_symbols s ON s.binding_id=b.binding_id
          WHERE c.revision_id=?1 AND c.producer_id=?2 AND b.syntax_id IS NOT NULL",
     )?;
     let mut rows = statement.query(params![original, producer_id])?;
     while let Some(row) = rows.next()? {
-        let syntax_id: Vec<u8> = row.get(0)?;
-        scope.declarations.insert((
-            DocumentKey {
-                source_set_id: source_set_id.to_owned(),
-                language: row.get(1)?,
-                path: row.get(2)?,
-            },
-            id_codec::decode_sid(&syntax_id).context(SelectedIntegrity(
-                "incompatible_index: corrupt semantic declaration ID".into(),
-            ))?,
-        ));
-        if let Some(symbol) = row.get::<_, Option<String>>(3)? {
-            scope.internal_symbols.insert(symbol);
-        }
+        scope.internal_symbols.insert(row.get(0)?);
     }
     Ok(scope)
 }
@@ -248,18 +234,23 @@ fn shares_a_span(
     Ok(false)
 }
 
-/// Looks up the current declarations `keys` name, once each. An absent one stays absent from
-/// `targets`, which is how the rejoin learns it.
+/// Looks up the captured and current declarations `keys` name, once each. An absent one stays
+/// absent from `scope.declarations` or `targets`, which is how the rejoin learns it.
 fn current_targets(
     input: &WitnessedInput<'_>,
     validator: &sem::WitnessValidator<'_>,
     keys: BTreeSet<(DocumentKey, String)>,
+    scope: &mut WitnessScope,
     targets: &mut BTreeMap<(DocumentKey, String), sem::TargetDeclaration>,
     absent: &mut BTreeSet<(DocumentKey, String)>,
 ) -> Result<()> {
     for key in keys {
         if targets.contains_key(&key) || absent.contains(&key) {
             continue;
+        }
+        if targeted_current_declaration(input.tx, input.raw.captured_pin, &key.0, &key.1)?.is_some()
+        {
+            scope.declarations.insert(key.clone());
         }
         match targeted_current_declaration(input.tx, input.pin, &key.0, &key.1)? {
             Some(target) => {
@@ -435,11 +426,10 @@ pub(super) fn publish_with_witness(
     .map_err(|error| witness_validation_failed(&error))?;
     // The tuple writers' statements, each target table's included, stay prepared.
     tx.set_prepared_statement_cache_capacity(64);
-    let scope = witness_scope(
+    let mut scope = witness_scope(
         tx,
         &original_key,
         &raw.producer_id,
-        &raw.source_set_id,
         manifest_hash(&destination.revision),
     )?;
     let facts = input.changed.over_manifest(destination);
@@ -518,6 +508,7 @@ pub(super) fn publish_with_witness(
                     input,
                     &validator,
                     required_original_targets(&reused),
+                    &mut scope,
                     &mut targets,
                     &mut absent,
                 )?;

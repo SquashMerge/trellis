@@ -3155,7 +3155,10 @@ pub(crate) fn original_document_associations(
     document: &native::DocumentKey,
 ) -> Option<JoinedFacts> {
     let mut by_provenance = BTreeMap::new();
-    let mut unclaimed = BTreeMap::new();
+    let mut kinds = BTreeMap::new();
+    // One raw proof can stand behind several evidence kinds: a definition's binding and its
+    // reference. A proof is fused when a kind of it has no row.
+    let mut unclaimed = BTreeSet::new();
     let proofs = inventory.proof_lookup();
     for row in snapshot
         .provenance
@@ -3171,14 +3174,20 @@ pub(crate) fn original_document_associations(
             return None;
         }
         by_provenance.insert(row.id.as_str(), derived.provenance_id.as_str());
-        unclaimed.insert(derived.provenance_id.as_str(), row.evidence_kind);
+        kinds.insert(row.id.as_str(), row.evidence_kind);
+        unclaimed.insert((derived.provenance_id.as_str(), row.evidence_kind));
     }
     let mut facts = JoinedFacts::default();
+    let mut claimed = |id: &str, raw: &str| {
+        if let Some(kind) = kinds.get(id) {
+            unclaimed.retain(|entry: &(&str, semantic::EvidenceKind)| *entry != (raw, *kind));
+        }
+    };
     for row in &snapshot.symbols {
         if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
-            unclaimed.remove(*raw);
+            claimed(&row.provenance_id, raw);
             facts.symbols.push(value);
         }
     }
@@ -3186,7 +3195,7 @@ pub(crate) fn original_document_associations(
         if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
-            unclaimed.remove(*raw);
+            claimed(&row.provenance_id, raw);
             facts.declaration_bindings.push(value);
         }
     }
@@ -3197,7 +3206,7 @@ pub(crate) fn original_document_associations(
             }
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
-            unclaimed.remove(*raw);
+            claimed(&row.provenance_id, raw);
             facts
                 .reference_claims
                 .insert((*raw).to_owned(), value.clone());
@@ -3213,10 +3222,11 @@ pub(crate) fn original_document_associations(
                     .references
                     .iter()
                     .find(|reference| {
-                        reference.range == anchor.range
-                            || (anchor.kind == semantic::JoinKind::Invocation
-                                && anchor.range.start <= reference.range.start
-                                && reference.range.end <= anchor.range.end)
+                        reference.roles.contains(&semantic::Role::Call)
+                            && (reference.range == anchor.range
+                                || (anchor.kind == semantic::JoinKind::Invocation
+                                    && anchor.range.start <= reference.range.start
+                                    && reference.range.end <= anchor.range.end))
                     })?
                     .clone();
                 facts.fused_calls.insert(reference.provenance_id.clone());
@@ -3226,7 +3236,7 @@ pub(crate) fn original_document_associations(
             }
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
-            unclaimed.remove(*raw);
+            claimed(&row.provenance_id, raw);
             facts.call_bindings.push(value);
         }
     }
@@ -3234,7 +3244,7 @@ pub(crate) fn original_document_associations(
         if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
-            unclaimed.remove(*raw);
+            claimed(&row.provenance_id, raw);
             facts.type_relationships.push(value);
         }
     }
@@ -4695,7 +4705,8 @@ pub(crate) struct WitnessScope {
     /// Every symbol with a captured internal declaration: an external target naming one is an
     /// internal target that went absent, never a genuine external.
     pub internal_symbols: BTreeSet<String>,
-    /// Every captured declaration, as `(document, syntax ID)`.
+    /// The captured measured declarations the rejoin has asked about, as `(document, syntax
+    /// ID)`: a target's declaration must have been measured at the capture.
     pub declarations: BTreeSet<(native::DocumentKey, String)>,
     pub destination_manifest_hash: String,
 }
@@ -4827,6 +4838,7 @@ pub(crate) fn rejoin_document_with_witness(
         let kept: BTreeSet<_> = publication
             .provenance
             .iter()
+            .filter(|row| row.evidence_kind == semantic::EvidenceKind::SemanticReference)
             .filter_map(|row| row.derived_from.as_ref())
             .map(|derived| &derived.provenance_id)
             .collect();
