@@ -79,19 +79,32 @@ fn publish(
     expected: IndexPin,
     leader: &trellis::store::topology::WriterGuard,
 ) -> anyhow::Result<IndexPin> {
-    let (graph, native, capture) = index_workspace_bundle(
+    publish_with(
+        store,
         &IndexOptions::new(root.to_owned()),
-        store.root_id(),
         cancel,
-        |_| {},
-    )?;
+        expected,
+        leader,
+    )
+}
+#[cfg(feature = "test-support")]
+fn publish_with(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+    expected: IndexPin,
+    leader: &trellis::store::topology::WriterGuard,
+) -> anyhow::Result<IndexPin> {
+    let (graph, native, capture) =
+        index_workspace_bundle(options, store.root_id(), cancel, |_| {})?;
     assert_eq!(capture.graph_projection_count(), 1);
+    // A source over the size cap is never opened (#576); every other one is read once.
     assert!(
         capture
             .source_operations
             .values()
-            .all(|operations| operations.opens == 1
-                && operations.complete_reads == 1
+            .all(|operations| operations.opens <= 1
+                && operations.complete_reads == operations.opens
                 && operations.hashes == 1)
     );
     let revision = store.publish_native(&graph, &capture, &native, leader, expected, cancel)?;
@@ -978,6 +991,79 @@ fn a_file_past_the_evidence_budget_publishes_as_a_gap_and_needs_no_reconciliatio
     .unwrap();
     assert_eq!(metrics(&store).partial_files.len(), 1);
     assert!(!store.recovery_pending_for_tests());
+}
+
+/// #576: one source over `--max-file-bytes`, or one that isn't UTF-8, in any language, is
+/// skipped with a typed diagnostic, the rest of the checkout publishes, and the file recovers
+/// when it changes back.
+#[test]
+#[cfg(feature = "test-support")]
+fn a_skipped_source_publishes_as_a_gap_and_recovers() {
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let mut options = IndexOptions::new(root.path().to_owned());
+    options.max_file_bytes = 512;
+    let metrics = |store: &Store| {
+        store
+            .evidence_response()
+            .unwrap()
+            .metrics_at(&Default::default(), &mut || Ok(()))
+            .unwrap()
+    };
+    for (path, good) in [
+        ("flow.js", "function hello(x) { if (x) { obj.go(); } }\n"),
+        (
+            "flow.java",
+            "class Demo { void go() { if (true) { run(); } } }\n",
+        ),
+        ("flow.rs", "fn main() { if true { run(); } }\n"),
+        ("flow.py", "def go():\n    if True:\n        run()\n"),
+    ] {
+        let file = root.path().join(path);
+        let oversized = format!("{good}{}", " ".repeat(600)).into_bytes();
+        let mut latin1 = good.as_bytes().to_vec();
+        latin1.extend_from_slice(b"\n\xe9\n");
+        for (bytes, reason) in [(oversized, "oversized"), (latin1, "not_utf8")] {
+            fs::write(&file, &bytes).unwrap();
+            publish_with(
+                &store,
+                &options,
+                &cancel,
+                store.index_baseline().unwrap(),
+                &leader,
+            )
+            .unwrap();
+            assert!(!store.recovery_pending_for_tests());
+            let partial = metrics(&store).partial_files;
+            assert_eq!(partial.len(), 1, "{path} {reason}");
+            assert_eq!(partial[0].path, path);
+            assert_eq!(partial[0].reason, reason);
+            let status = store.status().unwrap();
+            assert_eq!(status.stats.files, 4, "{path} {reason}");
+            assert!(
+                status
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.path.as_deref() == Some(path) && d.message.contains("was not read")),
+                "{path} {reason}: {:?}",
+                status.diagnostics
+            );
+            // Every other file keeps its facts.
+            assert!(status.stats.calls >= 3, "{path} {reason}");
+
+            fs::write(&file, good).unwrap();
+            publish_with(
+                &store,
+                &options,
+                &cancel,
+                store.index_baseline().unwrap(),
+                &leader,
+            )
+            .unwrap();
+            assert!(metrics(&store).partial_files.is_empty(), "{path} {reason}");
+            assert!(store.status().unwrap().diagnostics.is_empty());
+        }
+    }
 }
 
 #[test]

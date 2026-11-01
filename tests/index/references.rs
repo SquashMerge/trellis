@@ -8,17 +8,27 @@ use trellis::{
 };
 
 fn snapshot(files: &[(&str, &str)]) -> Snapshot {
+    let files: Vec<_> = files
+        .iter()
+        .map(|(path, text)| (*path, text.as_bytes().to_vec()))
+        .collect();
+    snapshot_with(&files, IndexOptions::new(Default::default()).max_file_bytes)
+}
+/// A snapshot as a store read builds it, of files of any bytes captured with this size cap.
+fn snapshot_with(files: &[(&str, Vec<u8>)], max_file_bytes: u64) -> Snapshot {
     let root = tempfile::tempdir().unwrap();
-    for (path, text) in files {
+    for (path, bytes) in files {
         let path = root.path().join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
+        std::fs::write(path, bytes).unwrap();
     }
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
+    let mut options = IndexOptions::new(root.path().to_owned());
+    options.max_file_bytes = max_file_bytes;
     let (graph, native) = index_workspace_with_native(
-        &IndexOptions::new(root.path().to_owned()),
+        &options,
         &identity.record_id,
         &Arc::new(AtomicBool::new(false)),
         |_| {},
@@ -57,6 +67,29 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
             }
         })
         .collect();
+    // The store names a skipped file (#576) by its coverage diagnostic.
+    let evidence_gaps = native
+        .coverage
+        .iter()
+        .filter_map(|coverage| {
+            let diagnostic = coverage.diagnostic.as_deref()?;
+            let reason = if diagnostic.starts_with("source is larger than --max-file-bytes") {
+                "oversized"
+            } else if diagnostic.starts_with("source is not UTF-8") {
+                "not_utf8"
+            } else {
+                return None;
+            };
+            let key = native
+                .revision
+                .documents
+                .iter()
+                .find(|d| d.key.path == coverage.document_path)?
+                .key
+                .clone();
+            Some((key, reason))
+        })
+        .collect();
     Snapshot {
         pin: IndexPin {
             index_generation: uuid::Uuid::new_v4(),
@@ -64,7 +97,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
         },
         documents,
         manifests: Vec::new(),
-        evidence_gaps: Default::default(),
+        evidence_gaps,
     }
 }
 // Snapshot construction is outside the deadline. Each run covers references and
@@ -6855,12 +6888,26 @@ fn a_source_cut_anywhere_or_missing_a_token_never_fails_a_view() {
     }
 }
 
-/// Checkouts with competing bindings: a broken spelling of any file may lose edges, but a
-/// site must never resolve to a target its valid control doesn't have (#563).
-#[test]
-fn breaking_any_file_at_any_byte_only_loses_edges() {
-    const STRIDE: usize = 3;
-    let checkouts: [&[(&str, &str)]; 5] = [
+/// Each production edge with its site count, so one lost site can't hide a false one on the
+/// same edge.
+fn counted(data: &Value) -> std::collections::BTreeMap<(String, String), u64> {
+    data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| {
+            let path = |end: &str| edge[end]["path"].as_str().unwrap_or("").to_owned();
+            (
+                (path("source"), path("target")),
+                edge["count"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Checkouts whose sites have competing bindings, one or two per language.
+fn competing_checkouts() -> [&'static [(&'static str, &'static str)]; 5] {
+    [
         &[
             ("src/lib.rs", "mod p; mod q; mod user;\n"),
             (
@@ -6906,22 +6953,15 @@ fn breaking_any_file_at_any_byte_only_loses_edges() {
             ("q.py", "n = 2\n"),
             ("use.py", "from a import n, m\nn\nm\n"),
         ],
-    ];
-    // Each edge with its site count, so one lost site can't hide a false one on the same edge.
-    let counted = |data: &serde_json::Value| -> std::collections::BTreeMap<(String, String), u64> {
-        data["production"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|edge| {
-                let path = |end: &str| edge[end]["path"].as_str().unwrap_or("").to_owned();
-                (
-                    (path("source"), path("target")),
-                    edge["count"].as_u64().unwrap(),
-                )
-            })
-            .collect()
-    };
+    ]
+}
+
+/// Checkouts with competing bindings: a broken spelling of any file may lose edges, but a
+/// site must never resolve to a target its valid control doesn't have (#563).
+#[test]
+fn breaking_any_file_at_any_byte_only_loses_edges() {
+    const STRIDE: usize = 3;
+    let checkouts = competing_checkouts();
     let project = |files: &[(&str, &str)]| {
         references::project(&snapshot(files), &[], 5, &mut || Ok(()))
             .unwrap()
@@ -6954,6 +6994,249 @@ fn breaking_any_file_at_any_byte_only_loses_edges() {
         }
     }
     assert!(failures.is_empty(), "{}: {failures:#?}", failures.len());
+}
+
+/// The two ways a source is skipped (#576), each with the size cap its capture uses: past
+/// `--max-file-bytes`, and not UTF-8. Every other file of these checkouts is under the cap.
+fn skipped_spellings(path: &str, source: &str) -> [(Vec<u8>, u64, &'static str); 2] {
+    const CAP: u64 = 1024;
+    let comment = if path.ends_with(".py") { "#" } else { "//" };
+    let oversized = format!("{source}{comment} {}\n", "x".repeat(CAP as usize)).into_bytes();
+    let mut latin1 = format!("{source}{comment} caf").into_bytes();
+    latin1.extend_from_slice(b"\xe9\n");
+    [(oversized, CAP, "oversized"), (latin1, CAP, "not_utf8")]
+}
+
+/// `files` with the file at `skipped` spelled as `bytes`.
+fn with_bytes(
+    files: &[(&'static str, &str)],
+    skipped: &str,
+    bytes: &[u8],
+) -> Vec<(&'static str, Vec<u8>)> {
+    files
+        .iter()
+        .map(|(path, text)| {
+            let bytes = if *path == skipped {
+                bytes
+            } else {
+                text.as_bytes()
+            };
+            (*path, bytes.to_vec())
+        })
+        .collect()
+}
+
+fn project_bytes(files: &[(&str, Vec<u8>)], cap: u64) -> Value {
+    references::project(&snapshot_with(files, cap), &[], 5, &mut || Ok(()))
+        .unwrap()
+        .data
+}
+
+/// Skipping any one file of a competing-binding checkout, either way, only loses edges and
+/// sites: a skipped file never proves a competing binding absent (#576, the #562/#575 rule).
+#[test]
+fn skipping_any_file_only_loses_edges() {
+    let mut failures = Vec::new();
+    for files in competing_checkouts() {
+        let control = counted(&project_bytes(&with_bytes(files, "", b""), 1024));
+        for (path, source) in files {
+            for (bytes, cap, reason) in skipped_spellings(path, source) {
+                let data = project_bytes(&with_bytes(files, path, &bytes), cap);
+                let partial = data["partialFiles"].as_array().unwrap();
+                assert_eq!(partial.len(), 1, "{path} {reason}: {partial:?}");
+                assert_eq!(partial[0]["path"], *path);
+                assert_eq!(partial[0]["reason"], reason);
+                failures.extend(
+                    counted(&data)
+                        .into_iter()
+                        .filter(|(edge, count)| control.get(edge).is_none_or(|c| c < count))
+                        .map(|edge| format!("{path} {reason}: {edge:?}")),
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Targets a skipped file could hide, per language: the readable control resolves elsewhere
+/// or not at all, and so must each skipped spelling.
+#[test]
+fn a_skipped_file_never_proves_a_competing_binding_absent() {
+    type Case = (
+        &'static [(&'static str, &'static str)],
+        &'static str,
+        (&'static str, &'static str),
+    );
+    let cases: [Case; 6] = [
+        // Rust: losing q's `f` must not leave p's glob alone.
+        (
+            &[
+                ("src/lib.rs", "pub mod p; pub mod q; pub mod consumer;\n"),
+                ("src/p.rs", "pub fn f() {}\n"),
+                ("src/q.rs", "pub fn f() {}\n"),
+                (
+                    "src/consumer.rs",
+                    "use crate::p::*; use crate::q::*; fn run() { f(); }\n",
+                ),
+            ],
+            "src/q.rs",
+            ("src/consumer.rs", "src/p.rs"),
+        ),
+        // Rust: a binary that wasn't read could own any module below it.
+        (
+            &[
+                ("src/lib.rs", "mod x; mod y;\n"),
+                ("src/x.rs", "fn run() { crate::y::f(); }\n"),
+                ("src/y.rs", "pub fn f() {}\n"),
+                (
+                    "src/main.rs",
+                    "mod x; mod y { pub fn f() {} } fn main() {}\n",
+                ),
+            ],
+            "src/main.rs",
+            ("src/x.rs", "src/y.rs"),
+        ),
+        // Java: an unread file could declare a second `p.Target`.
+        (
+            &[
+                ("p/One.java", "package p; public class Target {}\n"),
+                ("q/Two.java", "package p; public class Target {}\n"),
+                ("c/Use.java", "package c; import p.Target; class Use {}\n"),
+            ],
+            "q/Two.java",
+            ("c/Use.java", "p/One.java"),
+        ),
+        // Java: or a type that shadows a package.
+        (
+            &[
+                ("pkg/Target.java", "package pkg; public class Target {}\n"),
+                (
+                    "c/Shadow.java",
+                    "package c; class pkg { static class Target {} }\n",
+                ),
+                (
+                    "c/Use.java",
+                    "package c; class Use { pkg.Target target; }\n",
+                ),
+            ],
+            "c/Shadow.java",
+            ("c/Use.java", "pkg/Target.java"),
+        ),
+        // JavaScript: an unread module behind a star export could export the same name.
+        (
+            &[
+                (
+                    "barrel.js",
+                    "export * from './p.js';\nexport * from './q.js';\n",
+                ),
+                ("p.js", "export const name = 1;\n"),
+                ("q.js", "export const name = 2;\n"),
+                ("use.js", "import { name } from './barrel.js';\nname;\n"),
+            ],
+            "q.js",
+            ("use.js", "p.js"),
+        ),
+        // Python: the same through star imports.
+        (
+            &[
+                ("barrel.py", "from p import *\nfrom q import *\n"),
+                ("p.py", "name = 1\n"),
+                ("q.py", "name = 2\n"),
+                ("use.py", "from barrel import name\n"),
+            ],
+            "q.py",
+            ("use.py", "p.py"),
+        ),
+    ];
+    for (files, skipped, (from, to)) in cases {
+        let control = outcome(files).0;
+        assert!(!has(&control, from, to), "{skipped}: {control:?}");
+        let source = files.iter().find(|(path, _)| *path == skipped).unwrap().1;
+        for (bytes, cap, reason) in skipped_spellings(skipped, source) {
+            let data = project_bytes(&with_bytes(files, skipped, &bytes), cap);
+            let edges: Vec<_> = counted(&data).into_keys().collect();
+            assert!(!has(&edges, from, to), "{skipped} {reason}: {edges:?}");
+            for edge in &edges {
+                assert!(control.contains(edge), "{skipped} {reason}: {edge:?}");
+            }
+        }
+    }
+    // A Java file that wasn't read could be in any package, so nothing falls back to the
+    // standard library either.
+    let files: &[(&str, &str)] = &[
+        (
+            "Hidden.java",
+            "package javax.swing; public class Local {}\n",
+        ),
+        (
+            "app/Use.java",
+            "package app; import javax.swing.*; class Use { Local local; }\n",
+        ),
+    ];
+    for (bytes, cap, reason) in skipped_spellings(files[0].0, files[0].1) {
+        let data = project_bytes(&with_bytes(files, "Hidden.java", &bytes), cap);
+        assert!(
+            counted(&data)
+                .keys()
+                .all(|(from, _)| from != "app/Use.java"),
+            "{reason}: {data}"
+        );
+        assert!(
+            !data["unresolved"].as_array().unwrap().is_empty(),
+            "{reason}"
+        );
+    }
+}
+
+/// A skipped file has no sites of its own, and the rest of the checkout is served.
+#[test]
+fn a_skipped_file_is_partial_and_the_rest_of_the_checkout_is_served() {
+    let files: &[(&str, &str)] = &[
+        ("src/lib.rs", "pub mod ok; pub mod other; pub mod gone;\n"),
+        ("src/ok.rs", "pub fn run() { crate::other::run(); }\n"),
+        ("src/other.rs", "pub fn run() {}\n"),
+        ("src/gone.rs", "pub fn run() { crate::other::run(); }\n"),
+        ("a.py", "import b\n"),
+        ("b.py", "VALUE = 1\n"),
+        ("gone.py", "import b\n"),
+        ("a.js", "import './b.js';\n"),
+        ("b.js", "export const value = 1;\n"),
+        ("gone.js", "import './b.js';\n"),
+        ("p/A.java", "package p; import q.B; class A {}\n"),
+        ("q/B.java", "package q; public class B {}\n"),
+        ("p/Gone.java", "package p; import q.B; class Gone {}\n"),
+    ];
+    for (path, source) in files.iter().filter(|(path, _)| path.contains("one")) {
+        for (bytes, cap, reason) in skipped_spellings(path, source) {
+            let data = project_bytes(&with_bytes(files, path, &bytes), cap);
+            assert_eq!(data["partialFiles"][0]["path"], *path, "{reason}");
+            assert_eq!(data["partialFiles"][0]["reason"], reason);
+            assert!(
+                data["limitations"].to_string().contains("--max-file-bytes"),
+                "{reason}"
+            );
+            let edges: Vec<_> = counted(&data).into_keys().collect();
+            for (from, to) in [
+                ("src/ok.rs", "src/other.rs"),
+                ("a.py", "b.py"),
+                ("a.js", "b.js"),
+                ("p/A.java", "q/B.java"),
+            ] {
+                // An unread Java file could be in any package, with a second `q.B`, so the
+                // Java of its source set stays unknown, as for a broken file that spells
+                // `package` (#575).
+                if path.ends_with(".java") && from.ends_with(".java") {
+                    assert!(!has(&edges, from, to), "{path} {reason}: {edges:?}");
+                    continue;
+                }
+                assert!(
+                    has(&edges, from, to),
+                    "{path} {reason}: {from} -> {to}: {edges:?}"
+                );
+            }
+            assert!(edges.iter().all(|(from, _)| from != path), "{edges:?}");
+        }
+    }
 }
 
 /// Production edges and unresolved sites, for comparing a shallow and a deep spelling.

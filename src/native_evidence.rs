@@ -2662,7 +2662,7 @@ fn extract_document(
         gaps: Vec::new(),
         bound_gaps: Vec::new(),
         bounded: false,
-        over_budget: false,
+        module_only: None,
         name_owners: BTreeMap::new(),
         lexical_owners: BTreeMap::from([(canonical(&json!([])), module_id.clone())]),
         header_witness,
@@ -2676,15 +2676,18 @@ fn extract_document(
         reserved_until: 0,
     };
     let mut macros = Vec::new();
-    state.walk(
-        tree.root_node(),
-        &module_id,
-        &[],
-        &[],
-        0,
-        (file_test, false),
-        &mut macros,
-    )?;
+    let skipped = crate::skipped_source::skipped(&f.language, &f.text);
+    if skipped.is_none() {
+        state.walk(
+            tree.root_node(),
+            &module_id,
+            &[],
+            &[],
+            0,
+            (file_test, false),
+            &mut macros,
+        )?;
+    }
     // Allowlisted expression macros are measured only after every ordinary fact, so their
     // declarations take later sibling ordinals and everything outside them is unchanged.
     state.expanding = true;
@@ -2699,7 +2702,10 @@ fn extract_document(
         .gaps
         .sort_by_key(|gap| (gap.range.start, gap.range.end));
     state.finish_occurrences()?;
-    state.keep_within_budget(declaration_start);
+    match skipped {
+        Some(skip) => state.keep_file_module(declaration_start, skip.diagnostic()),
+        None => state.keep_within_budget(declaration_start),
+    }
     state
         .artifact
         .search_cards
@@ -2743,7 +2749,7 @@ fn extract_document(
         state: if tree.root_node().has_error()
             || state.opaque_rust
             || state.bounded
-            || state.over_budget
+            || state.module_only.is_some()
         {
             "partial"
         } else {
@@ -2757,7 +2763,7 @@ fn extract_document(
             state.opaque_rust,
             state.bounded,
         ) {
-            _ if state.over_budget => Some(crate::evidence_budget::DIAGNOSTIC.into()),
+            _ if state.module_only.is_some() => state.module_only.map(str::to_owned),
             (true, true, false) => Some("parser recovered from invalid source; opaque Rust macro/attribute token trees skipped".into()),
             (true, false, false) => Some("parser recovered from invalid source".into()),
             (false, true, false) => Some("opaque Rust macro/attribute token trees skipped; calls and definitions inside were not measured".into()),
@@ -2811,8 +2817,9 @@ struct ParserState<'a> {
     /// Subtrees skipped at the walk bounds, at most [`BOUND_GAPS`], and whether any was.
     bound_gaps: Vec<Range>,
     bounded: bool,
-    /// The facts exceeded the document's stored budgets, so only its file module was kept.
-    over_budget: bool,
+    /// Why only the document's file module was kept: its facts exceeded the stored budgets
+    /// (#564), or its source was not read (#576).
+    module_only: Option<&'static str>,
     name_owners: BTreeMap<(usize, usize), String>,
     lexical_owners: BTreeMap<Vec<u8>, String>,
     header_witness: &'a mut dyn FnMut(&str, String, Range),
@@ -3338,10 +3345,14 @@ impl ParserState<'_> {
             gaps: &self.gaps,
             macro_expansions: self.macro_expansions.len(),
         };
-        if !crate::evidence_budget::exceeded(self.file, &artifact.source_set.id, facts) {
-            return;
+        if crate::evidence_budget::exceeded(self.file, &artifact.source_set.id, facts) {
+            self.keep_file_module(declaration_start, crate::evidence_budget::DIAGNOSTIC);
         }
-        self.over_budget = true;
+    }
+
+    /// Keep only the file module, with a whole-file gap that says why.
+    fn keep_file_module(&mut self, declaration_start: usize, diagnostic: &'static str) {
+        self.module_only = Some(diagnostic);
         self.artifact.declarations.truncate(declaration_start + 1);
         self.artifact.calls.truncate(self.call_start);
         self.artifact.control_regions.truncate(self.control_start);
@@ -3356,7 +3367,7 @@ impl ParserState<'_> {
                 start: 0,
                 end: self.file.text.len(),
             },
-            diagnostic: crate::evidence_budget::DIAGNOSTIC.into(),
+            diagnostic: diagnostic.into(),
         }];
     }
 

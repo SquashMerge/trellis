@@ -989,6 +989,28 @@ pub struct ArtifactSummary {
     pub external_symbols: u64,
     pub relationships: u64,
 }
+/// Whether Trellis admitted this source without reading it (#576). The producer read the real
+/// file, so its positions can't be checked against the captured placeholder.
+fn unread(source: &DocumentSource<'_>) -> bool {
+    std::str::from_utf8(&source.bytes)
+        .is_ok_and(|text| crate::skipped_source::skipped(&source.language, text).is_some())
+}
+/// Admit a document of an unread source with no claims: nothing the producer said about it can
+/// be anchored, and a symbol defined only there stays unresolved for its users.
+fn skip_document(
+    sink: &mut dyn ClaimSink,
+    path: &str,
+    language: &str,
+    wire_digest: &str,
+) -> Result<(), ScipCaptureError> {
+    sink.begin_document(&UnitDocument {
+        path,
+        language,
+        wire_digest,
+        occurrence_cap_exceeded: false,
+    })?;
+    sink.end_document()
+}
 /// Receiver of one artifact's claims, one document unit at a time.
 pub trait ClaimSink {
     fn begin_document(&mut self, doc: &UnitDocument<'_>) -> Result<(), ScipCaptureError>;
@@ -1393,6 +1415,11 @@ pub fn decode_streaming<'s, R: Read>(
                         return Err(invalid("unlisted document"));
                     }
                     let source = resolve(&path, &language)?;
+                    if unread(&source) {
+                        skip_document(sink, &path, &source.language, &wire_digest)?;
+                        documents += 1;
+                        continue;
+                    }
                     let text = std::str::from_utf8(&source.bytes)
                         .map_err(|_| invalid("non-UTF8 source"))?;
                     cap_document(
@@ -1419,6 +1446,11 @@ pub fn decode_streaming<'s, R: Read>(
                     let source = resolve(&d.relative_path, &d.language)?;
                     (d, source)
                 };
+                if unread(&source) {
+                    skip_document(sink, &d.relative_path, &source.language, &wire_digest)?;
+                    documents += 1;
+                    continue;
+                }
                 sink.begin_document(&UnitDocument {
                     path: &d.relative_path,
                     language: &source.language,

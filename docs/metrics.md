@@ -134,8 +134,8 @@ Select from canonical order `loc,sloc,commentLines,cyclomatic,cognitive,maxNesti
 
 `GET /api/checkouts/{rootKey}/metrics` returns `{catchingUp,payload}`. The payload carries
 `metricsVersion,indexGeneration,indexRevision,scope,aggregate,role,selectedMetrics,declarations,files,directories`,
-plus `partialFiles` when a selected file has a syntax error, exceeds the syntax walk bounds or
-was published without evidence. Its rows are the
+plus `partialFiles` when a selected file has a syntax error, exceeds the syntax walk bounds,
+was published without evidence or wasn't read (#576). Its rows are the
 [`PartialFile`](rules.md#work-bounds-and-located-failures) rows of references: scores stay
 exact within their own bound of 512 levels and 2,000,000 visits per callable, and skip what
 lies past it, a file without evidence has no scores, and one bad file never refuses the

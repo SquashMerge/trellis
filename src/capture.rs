@@ -2,6 +2,7 @@
 use crate::{
     indexer::IndexOptions,
     model::{CancelFlag, IndexProgress, SourceFile},
+    skipped_source::{self, Skip},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -171,6 +172,13 @@ pub struct SourceOperations {
     pub opens: usize,
     pub complete_reads: usize,
     pub hashes: usize,
+}
+impl SourceOperations {
+    /// Read whole at most once and hashed once. A source over the size cap is never opened
+    /// (#576); every other one is opened and read exactly once.
+    pub fn read_once(&self) -> bool {
+        self.opens <= 1 && self.complete_reads == self.opens && self.hashes == 1
+    }
 }
 
 #[cfg(test)]
@@ -791,24 +799,32 @@ impl Capture {
                 .get(path)
                 .context("source absent from inventory")?;
             let mut counts = SourceOperations::default();
-            let bytes = regular_read(
-                path,
-                options.max_file_bytes.min(256 * 1024 * 1024),
-                state,
-                cancel,
-                Some(&mut counts),
-            )?;
-            total_bytes += bytes.len() as u64;
-            ensure!(
-                total_bytes <= 256 * 1024 * 1024,
-                "workspace source exceeds 256 MiB"
-            );
+            let language = match path.extension().and_then(|e| e.to_str()) {
+                Some("rs") => "rust",
+                Some("java") => "java",
+                Some("py") => "python",
+                _ => "javascript",
+            };
+            // One source past the per-file cap, or not UTF-8, is admitted unread rather than
+            // failing the capture (#576): its text is the placeholder that marks it skipped.
+            let cap = options.max_file_bytes.min(256 * 1024 * 1024);
+            let text = if state.len > cap {
+                skipped_source::placeholder(language, Skip::Oversized)
+            } else {
+                let bytes = regular_read(path, cap, state, cancel, Some(&mut counts))?;
+                total_bytes += bytes.len() as u64;
+                ensure!(
+                    total_bytes <= 256 * 1024 * 1024,
+                    "workspace source exceeds 256 MiB"
+                );
+                String::from_utf8(bytes)
+                    .unwrap_or_else(|_| skipped_source::placeholder(language, Skip::NotUtf8))
+            };
             let rel = path
                 .strip_prefix(&root)?
                 .to_str()
                 .context("non-UTF8 source path")?
                 .replace('\\', "/");
-            let text = String::from_utf8(bytes).context("non-UTF8 source text")?;
             let digest = hash(text.as_bytes());
             counts.hashes += 1;
             source_operations.insert(rel.clone(), counts);
@@ -816,13 +832,7 @@ impl Capture {
             files.push(SourceFile {
                 path: rel,
                 hash: digest,
-                language: match path.extension().and_then(|e| e.to_str()) {
-                    Some("rs") => "rust",
-                    Some("java") => "java",
-                    Some("py") => "python",
-                    _ => "javascript",
-                }
-                .into(),
+                language: language.into(),
                 text,
             });
             progress(IndexProgress {

@@ -35,8 +35,9 @@ pub struct Snapshot {
     pub pin: IndexPin,
     pub documents: Vec<DocumentInput>,
     pub manifests: Vec<external::ManifestInput>,
-    /// Documents published with no evidence but their file module (#564).
-    pub evidence_gaps: BTreeSet<DocumentKey>,
+    /// Documents published with no evidence but their file module, and their `partialFiles`
+    /// reason: over the evidence budget (#564), or not read (#576).
+    pub evidence_gaps: BTreeMap<DocumentKey, &'static str>,
 }
 
 /// Fresh bindings of one document under its language's selected producer (#483, #523).
@@ -321,8 +322,8 @@ fn project_inner(
         .filter_map(|(doc, gap)| {
             snapshot
                 .evidence_gaps
-                .contains(&doc.key)
-                .then(|| syntax_bounds::SyntaxGap::evidence_budget(doc.file.text.len()))
+                .get(&doc.key)
+                .map(|&reason| syntax_bounds::SyntaxGap::module_only(reason, doc.file.text.len()))
                 .as_ref()
                 .or(gap.as_ref())
                 .map(|gap| gap.file(&doc.key))
@@ -334,7 +335,7 @@ fn project_inner(
         .filter_map(|(i, doc)| {
             // A document with no evidence has no sites either: only `partialFiles` names it.
             ((paths.is_empty() || globs.is_match(&doc.key.path))
-                && !snapshot.evidence_gaps.contains(&doc.key))
+                && !snapshot.evidence_gaps.contains_key(&doc.key))
             .then_some(i)
         })
         .collect();

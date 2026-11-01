@@ -1933,7 +1933,7 @@ impl EvidenceResponse {
         )?;
         let mut cursor = statement.query([&selected.key])?;
         let mut documents = Vec::new();
-        let mut evidence_gaps = BTreeSet::new();
+        let mut evidence_gaps = BTreeMap::new();
         let mut pending = Vec::new();
         let mut source_bytes = 0u64;
         let mut stored_bytes = 0u64;
@@ -1985,8 +1985,8 @@ impl EvidenceResponse {
                 }
                 fetched?
             };
-            if diagnostic.as_deref() == Some(crate::evidence_budget::DIAGNOSTIC) {
-                evidence_gaps.insert(key.clone());
+            if let Some(reason) = crate::syntax_bounds::module_only_reason(diagnostic.as_deref()) {
+                evidence_gaps.insert(key.clone(), reason);
             }
             pending.push((key, std::sync::Mutex::new(Some(fetched))));
         }
@@ -2222,7 +2222,7 @@ impl EvidenceResponse {
             WHERE m.revision_id=?1 ORDER BY r.source_set_id,m.language,m.path",
         )?;
         let mut documents = Vec::new();
-        let mut evidence_gaps = BTreeSet::new();
+        let mut evidence_gaps = BTreeMap::new();
         let mut cursor = stmt.query([&selected.key])?;
         while let Some(row) = cursor.next()? {
             progress.check()?;
@@ -2231,10 +2231,10 @@ impl EvidenceResponse {
                 language: row.get(1)?,
                 path: row.get(2)?,
             };
-            if row.get::<_, Option<String>>(3)?.as_deref()
-                == Some(crate::evidence_budget::DIAGNOSTIC)
-            {
-                evidence_gaps.insert(key.clone());
+            if let Some(reason) = crate::syntax_bounds::module_only_reason(
+                row.get::<_, Option<String>>(3)?.as_deref(),
+            ) {
+                evidence_gaps.insert(key.clone(), reason);
             }
             documents.push(key);
         }
@@ -2414,9 +2414,10 @@ impl EvidenceResponse {
             };
             partial_files.extend(
                 evidence_gaps
-                    .contains(key)
-                    .then(|| {
-                        crate::syntax_bounds::SyntaxGap::evidence_budget(physical_bytes).file(key)
+                    .get(key)
+                    .map(|&reason| {
+                        crate::syntax_bounds::SyntaxGap::module_only(reason, physical_bytes)
+                            .file(key)
                     })
                     .or_else(|| computed.gap().map(|gap| gap.file(key))),
             );
@@ -15828,10 +15829,8 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(|counts| counts.opens == 1
-                        && counts.complete_reads == 1
-                        && counts.hashes == 1),
-            "native_evidence_required: each source must open, read, and hash once"
+                    .all(crate::capture::SourceOperations::read_once),
+            "native_evidence_required: each source must open and read at most once, and hash once"
         );
         ensure!(
             spool.len() == spool.header().revision.documents.len()
@@ -16335,7 +16334,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1),
+                    .all(crate::capture::SourceOperations::read_once),
             "native_evidence_required: incomplete selected capture"
         );
         let mut native = prepared.native.clone();
@@ -16498,10 +16497,8 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(|counts| counts.opens == 1
-                        && counts.complete_reads == 1
-                        && counts.hashes == 1),
-            "native_evidence_required: each source must open, read, and hash once"
+                    .all(crate::capture::SourceOperations::read_once),
+            "native_evidence_required: each source must open and read at most once, and hash once"
         );
         crate::indexer::validate_native_graph(graph, capture, native, cancel)?;
         Ok(())
@@ -16963,7 +16960,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1),
+                    .all(crate::capture::SourceOperations::read_once),
             "native_evidence_required: final inventory must freshly read and hash every admitted source"
         );
         leader.belongs_to(&self.identity)?;
@@ -17037,7 +17034,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1),
+                    .all(crate::capture::SourceOperations::read_once),
             "native_evidence_required: every unchanged source must be read and hashed"
         );
         let db = self.cache_write()?;

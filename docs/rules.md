@@ -501,12 +501,13 @@ the source filter, because any document can feed resolution:
 
 ```text
 PartialFile = {sourceSetId,language,path,
-               reason:"syntax_error"|"depth_limit"|"visit_limit"|"evidence_budget",
+               reason:"syntax_error"|"depth_limit"|"visit_limit"|"evidence_budget"|
+                      "oversized"|"not_utf8",
                range:Range,subtrees:UInt}
 ```
 
-A file has one row: `evidence_budget` wins over `syntax_error`, and `syntax_error` over the
-bounds.
+A file has one row: `oversized` and `not_utf8` win over `evidence_budget`, `evidence_budget`
+over `syntax_error`, and `syntax_error` over the bounds.
 `range` is the first skipped subtree or parser error, and `subtrees` counts subtrees skipped
 over the depth bound, or the file's parser errors. References and declarations inside them
 are missing, so absence there proves nothing, and a partial file's names stay unknown
@@ -538,6 +539,13 @@ its facts exceed a [per-file budget](daemon-v1.md#current-limits) (#564). `range
 `subtrees` is 0. Its source is still read for what others resolve through it, but it has no
 sites, scores, or declarations for rules to select, so nothing resolves to a declaration
 inside it.
+
+`oversized` and `not_utf8` name a source that wasn't read, because it's larger than
+`--max-file-bytes` or isn't UTF-8 (#576). Like `evidence_budget`, it has only its file module,
+`range` is the whole stored placeholder and `subtrees` is 0. Unlike it, nothing of its syntax is
+known, so it proves less than a file with a syntax error: every rule above for a broken file
+applies, a Rust file below it has no proved crate whatever its name, and a Java file's package
+is unknown, which leaves every package of its source set unknown.
 
 Reference work has one request-wide allowance of
 `min(100_000_000, 5_000_000 + 20_000*N + 512*K)` units. Rules use a separate
