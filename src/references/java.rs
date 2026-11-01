@@ -575,7 +575,9 @@ fn path(
     let mut pending = vec![(node, 0)];
     while let Some((node, depth)) = pending.pop() {
         owner_step(work, check)?;
-        ensure!(depth <= DEPTH, "bounded_work: reference AST");
+        if depth > DEPTH {
+            return Ok(None);
+        }
         match node.kind() {
             "identifier" | "type_identifier" => {
                 owner_step(work, check)?;

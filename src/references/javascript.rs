@@ -1166,10 +1166,9 @@ fn pattern_names(
     while let Some((node, depth)) = pending.pop() {
         check()?;
         visits += 1;
-        ensure!(
-            visits <= VISITS && depth <= DEPTH,
-            "bounded_work: reference AST"
-        );
+        if visits > VISITS || depth > DEPTH {
+            continue;
+        }
         if matches!(
             node.kind(),
             "identifier" | "shorthand_property_identifier_pattern"

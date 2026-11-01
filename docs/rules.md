@@ -487,13 +487,26 @@ named collection and 8,192 aggregate glob patterns. The locked TOML parser keeps
 its default recursion guard of 80; unbounded parsing is not enabled. Structural
 accounting is iterative. Projection admits at most 2 MiB per captured source or
 retained manifest and 256 MiB total admitted captured source and present
-retained-manifest bytes, before source filters. AST depth remains 128. Reference
-walks retain the 1,000,000-visit bound per walk; rule selector walks retain it per
-document. The 250,000-site bound applies both to each raw source extraction and
-to deduplicated selected sites across the request. Reference samples accept at
-most 50 sites per edge. Snapshot admission also caps the inventory at 100,000
-documents and 512 MiB of aggregate stored input. These bounds refuse the entire
-result rather than silently dropping evidence.
+retained-manifest bytes, before source filters. The 250,000-site bound applies both
+to each raw source extraction and to deduplicated selected sites across the request.
+Reference samples accept at most 50 sites per edge. Snapshot admission also caps the
+inventory at 100,000 documents and 512 MiB of aggregate stored input. These bounds
+refuse the entire result rather than silently dropping evidence.
+
+Syntax walks are bounded per document, to 128 levels and 1,000,000 visits, but one
+pathological file doesn't refuse the result (#554). Walks skip what lies past the bounds, and
+`partialFiles` names each such document in the snapshot, whatever the source filter,
+because any document can feed resolution:
+
+```text
+PartialFile = {sourceSetId,language,path,reason:"depth_limit"|"visit_limit",
+               range:Range,subtrees:UInt}
+```
+
+`range` is the first skipped subtree, and `subtrees` counts subtrees skipped over the depth
+bound. References and declarations inside them are missing, so absence there proves
+nothing. The field is empty when every document was read whole, a `limitations` entry appears
+when it isn't, and it never changes a verdict or exit status.
 
 Reference work has one request-wide allowance of
 `min(100_000_000, 5_000_000 + 20_000*N + 512*K)` units. Rules use a separate
@@ -566,7 +579,7 @@ is invented for a package. A config descriptor is exactly
  modules:Module[],externalPackages:ExternalPackage[],
  production:Edge[],tests:Edge[],unresolved:Unresolved[],
  counts:{scannedDocuments:UInt,mappedSites:UInt,unresolvedSites:UInt,semanticSites:UInt},
- limitations:string[]}
+ partialFiles:PartialFile[],limitations:string[]}
 Module = {identity:Target,revisionId,contentHash,provenanceId}
 ExternalPackage = {identity:ExternalIdentity,ecosystem:"cargo"|"rust"|"java"|"python"|"npm"|"node",evidence:PackageEvidence[]}
 ExternalIdentity = {kind:"externalPackage",sourceSetId,language,package,standardLibrary:boolean}
@@ -758,7 +771,8 @@ Both tools return exactly:
 {rulesVersion:"rules:v2",indexGeneration,indexRevision,
  rulesFile:ConfigDescriptor,externalPackages:ExternalPackage[],
  instances:Instance[],testOnly:Instance[],
- counts:Counts,testCounts:Counts,unassigned:Destination[],limitations:string[]}
+ counts:Counts,testCounts:Counts,unassigned:Destination[],
+ partialFiles:PartialFile[],limitations:string[]}
 Instance = {rule:string,target:Target,destination:Destination|null,
             sourceLayer:string|null,destinationLayer:string|null,
             status:"conforms"|"deviates"|"unknown",excepted:boolean,

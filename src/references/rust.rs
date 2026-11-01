@@ -387,7 +387,9 @@ impl Catalog {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         self.step(check)?;
-        ensure!(depth <= DEPTH, "bounded_work: reference AST");
+        if depth > DEPTH {
+            return Ok(());
+        }
         let document = self.scopes[scope].document;
         let doc = docs[document];
         let mut cursor = node.walk();
@@ -601,7 +603,9 @@ impl Catalog {
         while let Some(node) = ancestor {
             self.step(check)?;
             depth += 1;
-            ensure!(depth <= DEPTH, "bounded_work: reference AST");
+            if depth > DEPTH {
+                break;
+            }
             if node.kind() == "mod_item" || node.kind() == "source_file" {
                 break;
             }
@@ -643,7 +647,9 @@ impl Catalog {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         self.step(check)?;
-        ensure!(depth <= DEPTH, "bounded_work: reference AST");
+        if depth > DEPTH {
+            return Ok(());
+        }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() == "block" {
@@ -1568,6 +1574,10 @@ fn imports(
     let mut result = Vec::new();
     while let Some((node, prefix)) = pending.pop() {
         owner_step(work, check)?;
+        // Each nesting level clones the prefix, so a deep list is bounded here too.
+        if prefix.len() > DEPTH {
+            continue;
+        }
         let combine = |value: &str| -> Vec<String> {
             let mut combined = prefix.clone();
             if let Some(tail) = parts(value) {

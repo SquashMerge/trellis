@@ -1310,10 +1310,9 @@ fn scan(
     while let Some((node, module_scope, conditional, decorated, depth)) = pending.pop() {
         check()?;
         visits += 1;
-        ensure!(
-            visits <= VISITS && depth <= DEPTH,
-            "bounded_work: reference AST"
-        );
+        if visits > VISITS || depth > DEPTH {
+            continue;
+        }
         let kind = node.kind();
         if matches!(kind, "comment" | "string" | "concatenated_string") {
             continue;

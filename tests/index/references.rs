@@ -6070,3 +6070,160 @@ fn references_javascript_review_500_consumers_share_a_200_name_barrel_within_bud
     assert!(data["tests"].as_array().unwrap().is_empty());
     assert!(data["externalPackages"].as_array().unwrap().is_empty());
 }
+
+/// One compile-shaped file of each kind that nests past the walk bounds.
+fn over_deep_sources(depth: usize) -> Vec<(&'static str, String)> {
+    let nest = |open: &str, close: &str, inner: &str| {
+        format!("{}{inner}{}", open.repeat(depth), close.repeat(depth))
+    };
+    vec![
+        (
+            "deep.rs",
+            format!("pub fn deep() {{ custom!({}); }}\n", nest("(", ")", "")),
+        ),
+        (
+            "deep.rs",
+            format!("pub fn deep() -> i32 {{ {} }}\n", nest("(", ")", "1")),
+        ),
+        (
+            "deep.rs",
+            format!(
+                "pub fn deep() {{ {} }}\n",
+                nest("{", "}", "crate::ok::run();")
+            ),
+        ),
+        (
+            "deep.rs",
+            format!("{}\n", nest("mod a {", "}", "pub fn run() {}")),
+        ),
+        ("deep.rs", format!("use a::{};\n", nest("{b::", "}", "c"))),
+        (
+            "deep.js",
+            format!("function deep() {{ return {}; }}\n", nest("[", "]", "")),
+        ),
+        (
+            "deep.js",
+            format!("function deep() {{ let {} = 1; }}\n", nest("[", "]", "x")),
+        ),
+        (
+            "deep.js",
+            format!("function deep() {{ return a{}; }}\n", ".b".repeat(depth)),
+        ),
+        (
+            "Deep.java",
+            format!(
+                "class Deep {{ int d() {{ return {}; }} }}\n",
+                nest("(", ")", "1")
+            ),
+        ),
+        ("Deep.java", format!("{}\n", nest("class A {", "}", ""))),
+        (
+            "deep.py",
+            format!("def deep():\n    return {}\n", nest("(", ")", "1")),
+        ),
+    ]
+}
+
+#[test]
+fn an_over_deep_file_is_partial_and_the_rest_of_the_checkout_is_served() {
+    for (path, source) in over_deep_sources(400) {
+        let input = snapshot(&[
+            ("src/lib.rs", "pub mod ok; pub mod other;"),
+            ("src/ok.rs", "pub fn run() { crate::other::run(); }"),
+            ("src/other.rs", "pub fn run() {}"),
+            (path, source.as_str()),
+        ]);
+        let projection = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+        let data = &projection.data;
+        let partial = data["partialFiles"].as_array().unwrap();
+        assert_eq!(partial.len(), 1, "{path}: {source:.60}: {partial:?}");
+        assert_eq!(partial[0]["path"], path);
+        assert_eq!(partial[0]["reason"], "depth_limit");
+        assert!(partial[0]["subtrees"].as_u64().unwrap() >= 1);
+        let range = partial[0]["range"]["start"].as_u64().unwrap() as usize
+            ..partial[0]["range"]["end"].as_u64().unwrap() as usize;
+        assert!(range.start > 0 && range.end <= source.len());
+        assert!(
+            data["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|limit| limit.as_str().unwrap().contains("partialFiles"))
+        );
+        assert!(
+            data["production"].as_array().unwrap().iter().any(|edge| {
+                edge["source"]["path"] == "src/ok.rs" && edge["target"]["path"] == "src/other.rs"
+            }),
+            "{path}: {data}"
+        );
+    }
+}
+
+#[test]
+fn a_path_filter_still_reports_a_partial_file_that_feeds_resolution() {
+    let (path, source) = over_deep_sources(400).remove(5);
+    let input = snapshot(&[("ok.js", "export const ok = 1;"), (path, source.as_str())]);
+    let projection = references::project(&input, &["ok.js".to_owned()], 5, &mut || Ok(())).unwrap();
+    assert_eq!(projection.data["partialFiles"][0]["path"], path);
+}
+
+#[test]
+fn nesting_at_any_depth_around_the_bound_indexes_and_projects() {
+    // An enclosing node records its name, callee and invocation before walking its children,
+    // so a child skipped at the bound can span one: the gap must not claim that candidate.
+    let shapes: [(&str, &str, &str, &str, &str); 7] = [
+        ("deep.rs", "fn f() { ", "g(", "1", ")"),
+        ("deep.rs", "fn f() { ", "a::g(", "1", ")"),
+        ("deep.rs", "fn f() { ", "x.g(", "1", ")"),
+        ("deep.rs", "", "fn g() {", "", "}"),
+        ("deep.js", "function f() { ", "a.g(", "1", ")"),
+        (
+            "Deep.java",
+            "class Deep { int d() { return ",
+            "a.g(",
+            "1",
+            ")",
+        ),
+        ("deep.py", "x = ", "a.g(", "1", ")"),
+    ];
+    for (path, prefix, open, inner, close) in shapes {
+        for depth in 30..140 {
+            let tail = match (prefix, path) {
+                ("", _) => "",
+                (_, "deep.rs") => "; }",
+                (_, "deep.js") => "; }",
+                (_, "Deep.java") => "; } }",
+                _ => "",
+            };
+            let source = format!(
+                "{prefix}{}{inner}{}{tail}\n",
+                open.repeat(depth),
+                close.repeat(depth)
+            );
+            let input = snapshot(&[(path, source.as_str())]);
+            references::project(&input, &[], 5, &mut || Ok(()))
+                .unwrap_or_else(|error| panic!("{path} {open} at {depth}: {error:#}"));
+        }
+    }
+}
+
+#[test]
+fn extremely_deep_sources_stay_bounded_and_never_overflow_the_stack() {
+    for (path, source) in over_deep_sources(50_000) {
+        let input = snapshot(&[("ok.rs", "pub fn run() {}"), (path, source.as_str())]);
+        let projection = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+        assert_eq!(projection.data["partialFiles"][0]["path"], path);
+    }
+}
+
+#[test]
+fn a_file_past_the_visit_bound_is_partial_too() {
+    let source = format!("const v = [{}];\n", "0,".repeat(1_000_001));
+    let input = snapshot(&[
+        ("ok.js", "export const ok = 1;"),
+        ("wide.js", source.as_str()),
+    ]);
+    let projection = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    assert_eq!(projection.data["partialFiles"][0]["path"], "wide.js");
+    assert_eq!(projection.data["partialFiles"][0]["reason"], "visit_limit");
+}

@@ -255,9 +255,9 @@ ancestor-directory replacement**, nor a defense against another process with the
 user's privileges. Do not expose it through a tunnel or untrusted proxy.
 
 Caps: 2 MiB per source by default (`--max-file-bytes`, up to 16 MiB through the CLI),
-256 MiB aggregate source, 100,000 discovered source files, 256 MiB SCIP and nesting under
-512 levels. Oversized/unreadable individual files are diagnosed; aggregate limits fail
-without publishing. These are guardrails, not a proven hostile-input resource sandbox.
+256 MiB aggregate source, 100,000 discovered source files and 256 MiB SCIP. Oversized or
+unreadable individual files are diagnosed, and syntax past 128 levels or 1,000,000 visits is a
+per-file coverage gap (#554); aggregate limits fail without publishing. These are guardrails, not a proven hostile-input resource sandbox.
 
 | Method | Path | Response / behavior |
 | --- | --- | --- |

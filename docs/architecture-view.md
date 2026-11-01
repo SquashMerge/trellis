@@ -140,9 +140,13 @@ detail. On this repository it went from about 35 MB to about 0.75 MB. Its fields
   `evidenceTier` (`syntax`, `semantic` or `mixed`) and `coverage`, its source layer and
   role's coverage row plus `complete` (no unresolved site) (#523);
 - `evidenceTier` (`syntax` or `mixed`) at the top level, as in the references payload;
+- `partialFiles` at the top level and in `references` and `rules`: the files whose syntax exceeds
+  the walk bounds (see [Work bounds](rules.md#work-bounds-and-located-failures)). One pathological
+  file is a reported gap here, never a refusal of the whole view (#554). Only a `ready` payload
+  carries it;
 - `references`: `referencesVersion`, `evidenceTier`, `semanticComplete`,
   `semanticProducers`, `counts` (`scannedDocuments`, `mappedSites`,
-  `unresolvedSites`, `semanticSites`), `limitations` and `externalPackages`, each descriptor with the
+  `unresolvedSites`, `semanticSites`), `partialFiles`, `limitations` and `externalPackages`, each descriptor with the
   display `layer` its `$layers` instances report (null when unassigned);
 - `references.coverage` (#449): one row per source layer (null when unassigned) and
   stored site role, `{layer, role, sites, mappedSites, unresolvedSites, semanticSites}`. `sites` counts
@@ -152,7 +156,7 @@ detail. On this repository it went from about 35 MB to about 0.75 MB. Its fields
   counts sites a fresh binding mapped or bound outside the checkout. The rows sum to
   `counts.mappedSites`, `counts.unresolvedSites` and `counts.semanticSites`, and there are at most two per layer;
 - `exceptionCount`: the authored `[[exceptions]]` entries (null without a rules file);
-- `rules`: `rulesVersion`, `rulesFile`, `counts`, `testCounts`, `unassignedCount` and
+- `rules`: `rulesVersion`, `rulesFile`, `counts`, `testCounts`, `unassignedCount`, `partialFiles` and
   `limitations`.
 
 `counts`, `testCounts` and `unassignedCount` (the length of `unassigned`) equal

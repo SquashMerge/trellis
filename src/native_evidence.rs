@@ -2660,6 +2660,8 @@ fn extract_document(
         visits: 0,
         opaque_rust: false,
         gaps: Vec::new(),
+        bound_gaps: Vec::new(),
+        bounded: false,
         name_owners: BTreeMap::new(),
         lexical_owners: BTreeMap::from([(canonical(&json!([])), module_id.clone())]),
         header_witness,
@@ -2691,6 +2693,7 @@ fn extract_document(
             state.macro_expansions.push(range);
         }
     }
+    state.finish_bound_gaps(declaration_start);
     state
         .gaps
         .sort_by_key(|gap| (gap.range.start, gap.range.end));
@@ -2735,7 +2738,7 @@ fn extract_document(
         revision_id: state.artifact.revision.id.clone(),
         requested: true,
         selected: true,
-        state: if tree.root_node().has_error() || state.opaque_rust {
+        state: if tree.root_node().has_error() || state.opaque_rust || state.bounded {
             "partial"
         } else {
             "complete"
@@ -2743,11 +2746,17 @@ fn extract_document(
         .into(),
         supported_roles: vec!["definition".into(), "call".into()],
         observed_roles,
-        diagnostic: match (tree.root_node().has_error(), state.opaque_rust) {
-            (true, true) => Some("parser recovered from invalid source; opaque Rust macro/attribute token trees skipped".into()),
-            (true, false) => Some("parser recovered from invalid source".into()),
-            (false, true) => Some("opaque Rust macro/attribute token trees skipped; calls and definitions inside were not measured".into()),
-            (false, false) => None,
+        diagnostic: match (
+            tree.root_node().has_error(),
+            state.opaque_rust,
+            state.bounded,
+        ) {
+            (true, true, false) => Some("parser recovered from invalid source; opaque Rust macro/attribute token trees skipped".into()),
+            (true, false, false) => Some("parser recovered from invalid source".into()),
+            (false, true, false) => Some("opaque Rust macro/attribute token trees skipped; calls and definitions inside were not measured".into()),
+            (false, false, false) => None,
+            (true, _, true) => Some(format!("parser recovered from invalid source; {BOUND_DIAGNOSTIC}")),
+            (false, _, true) => Some(BOUND_DIAGNOSTIC.into()),
         },
     });
     Ok(())
@@ -2792,6 +2801,9 @@ struct ParserState<'a> {
     visits: usize,
     opaque_rust: bool,
     gaps: Vec<MeasurementGap>,
+    /// Subtrees skipped at the walk bounds, at most [`BOUND_GAPS`], and whether any was.
+    bound_gaps: Vec<Range>,
+    bounded: bool,
     name_owners: BTreeMap<(usize, usize), String>,
     lexical_owners: BTreeMap<Vec<u8>, String>,
     header_witness: &'a mut dyn FnMut(&str, String, Range),
@@ -2809,10 +2821,16 @@ struct ParserState<'a> {
     visit_ceiling: usize,
     reserved_until: usize,
 }
-/// Per-document walk bounds. Exceeding them fails the document, so a macro expansion reserves
-/// its measured extent first and stays opaque rather than cross them.
+/// Per-document walk bounds. The walk skips what lies past them and leaves a gap (#554). A
+/// macro expansion measures completely or not at all, so it reserves its extent first and
+/// stays opaque rather than cross them.
 const VISIT_LIMIT: usize = 1_000_000;
 const DEPTH_LIMIT: usize = 128;
+/// A pathological file can have a skipped subtree per node: past this many it is partial
+/// without a further range.
+const BOUND_GAPS: usize = 1024;
+const BOUND_DIAGNOSTIC: &str =
+    "syntax beyond native walk bounds skipped; calls and definitions inside were not measured";
 /// An allowlisted Rust expression macro, measured after the ordinary walk in its own context.
 struct MacroSite<'t> {
     node: Node<'t>,
@@ -2967,10 +2985,14 @@ impl ParserState<'_> {
         test_flags: (bool, bool),
         macros: &mut Vec<MacroSite<'t>>,
     ) -> Result<()> {
-        ensure!(
-            depth < DEPTH_LIMIT && self.visits < VISIT_LIMIT,
-            "native extraction work budget exceeded"
-        );
+        if depth >= DEPTH_LIMIT || self.visits >= VISIT_LIMIT {
+            ensure!(!self.expanding, "native expansion exceeded its reservation");
+            self.bounded = true;
+            if self.bound_gaps.len() < BOUND_GAPS && n.start_byte() < n.end_byte() {
+                self.bound_gaps.push(Range::node(n));
+            }
+            return Ok(());
+        }
         self.visits += 1;
         // Rust token trees and attributes are opaque source syntax: a call-shaped token
         // inside one is not a measured call. Only allowlisted expression macros are
@@ -3251,6 +3273,46 @@ impl ParserState<'_> {
             marked = false;
         }
         Ok(())
+    }
+
+    /// Publish the skipped subtrees as gaps. An enclosing node records its name, callee and
+    /// invocation before walking its children, so a skipped child can span one of those
+    /// measured candidates; a gap must not claim a measured candidate, so that child is not
+    /// one. The document stays partial either way.
+    fn finish_bound_gaps(&mut self, declaration_start: usize) {
+        if self.bound_gaps.is_empty() {
+            return;
+        }
+        let artifact = &*self.artifact;
+        let mut candidates: Vec<_> = artifact.declarations[declaration_start..]
+            .iter()
+            .filter_map(|d| d.name_range.as_ref())
+            .chain(
+                artifact.calls[self.call_start..]
+                    .iter()
+                    .flat_map(|c| std::iter::once(&c.range).chain(c.callee_range.as_ref())),
+            )
+            .chain(
+                artifact.references[self.reference_start..]
+                    .iter()
+                    .map(|r| &r.range),
+            )
+            .map(|range| (range.start, range.end))
+            .collect();
+        candidates.sort_unstable();
+        for range in std::mem::take(&mut self.bound_gaps) {
+            let first = candidates.partition_point(|&(start, _)| start < range.start);
+            let claimed = candidates[first..]
+                .iter()
+                .take_while(|&&(start, _)| start < range.end)
+                .any(|&(_, end)| end <= range.end);
+            if !claimed {
+                self.gaps.push(MeasurementGap {
+                    range,
+                    diagnostic: format!("{BOUND_DIAGNOSTIC}; nesting exceeds {DEPTH_LIMIT} levels or {VISIT_LIMIT} visits"),
+                });
+            }
+        }
     }
 
     fn opaque_gap(&mut self, n: Node<'_>, diagnostic: String) {

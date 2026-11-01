@@ -58,12 +58,14 @@ fn scope(mut n: Node<'_>, var: bool) -> Node<'_> {
 fn text<'a>(source: &'a str, n: Node<'_>) -> &'a str {
     &source[n.byte_range()]
 }
-fn root(n: Node<'_>) -> Option<Node<'_>> {
-    match n.kind() {
-        "identifier" => Some(n),
-        "member_expression" | "subscript_expression" => root(n.child_by_field_name("object")?),
-        "parenthesized_expression" => root(*children(n).first()?),
-        _ => None,
+fn root(mut n: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match n.kind() {
+            "identifier" => return Some(n),
+            "member_expression" | "subscript_expression" => n = n.child_by_field_name("object")?,
+            "parenthesized_expression" => n = *children(n).first()?,
+            _ => return None,
+        }
     }
 }
 impl Bindings {
@@ -251,54 +253,43 @@ impl Bindings {
             import,
         });
     }
+    // Iterative, like `write`: repository nesting has no bound here.
     fn pattern(&mut self, n: Node<'_>, s: Node<'_>, source: &str) {
-        match n.kind() {
-            "identifier" | "shorthand_property_identifier_pattern" => self.add(n, s, None, source),
-            "assignment_pattern" | "object_assignment_pattern" => {
-                if let Some(left) = n.child_by_field_name("left") {
-                    self.pattern(left, s, source);
+        let mut pending = vec![n];
+        while let Some(n) = pending.pop() {
+            match n.kind() {
+                "identifier" | "shorthand_property_identifier_pattern" => {
+                    self.add(n, s, None, source)
                 }
-            }
-            "pair_pattern" => {
-                if let Some(value) = n.child_by_field_name("value") {
-                    self.pattern(value, s, source);
+                "assignment_pattern" | "object_assignment_pattern" => {
+                    pending.extend(n.child_by_field_name("left"));
                 }
-            }
-            _ => {
-                for child in children(n) {
-                    self.pattern(child, s, source);
-                }
+                "pair_pattern" => pending.extend(n.child_by_field_name("value")),
+                _ => pending.extend(children(n).into_iter().rev()),
             }
         }
     }
     fn write(&mut self, n: Node<'_>, source: &str) {
-        if let Some(id) = root(n) {
-            let name = text(source, id);
-            self.writes.insert(name.into());
-            if matches!(name, "globalThis" | "window" | "global" | "self") {
-                self.unsafe_globals = true;
+        let mut pending = vec![n];
+        while let Some(n) = pending.pop() {
+            if let Some(id) = root(n) {
+                let name = text(source, id);
+                self.writes.insert(name.into());
+                if matches!(name, "globalThis" | "window" | "global" | "self") {
+                    self.unsafe_globals = true;
+                }
+                continue;
             }
-        } else {
             // Destructuring write targets: ignore RHS/default expressions only when known.
             match n.kind() {
                 "assignment_pattern" | "object_assignment_pattern" => {
-                    if let Some(left) = n.child_by_field_name("left") {
-                        self.write(left, source);
-                    }
+                    pending.extend(n.child_by_field_name("left"));
                 }
-                "pair_pattern" => {
-                    if let Some(value) = n.child_by_field_name("value") {
-                        self.write(value, source);
-                    }
-                }
+                "pair_pattern" => pending.extend(n.child_by_field_name("value")),
                 "shorthand_property_identifier_pattern" => {
                     self.writes.insert(text(source, n).into());
                 }
-                _ => {
-                    for child in children(n) {
-                        self.write(child, source);
-                    }
-                }
+                _ => pending.extend(children(n).into_iter().rev()),
             }
         }
     }
@@ -379,5 +370,30 @@ impl Bindings {
             });
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod deep_input_tests {
+    use super::*;
+
+    #[test]
+    fn extremely_deep_patterns_and_targets_do_not_recurse() {
+        let depth = 200_000;
+        let source = format!(
+            "let {}x{} = 1; {}y{} = 2; a{} = 3;",
+            "[".repeat(depth),
+            "]".repeat(depth),
+            "[".repeat(depth),
+            "]".repeat(depth),
+            ".b".repeat(depth)
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let bindings = Bindings::new(tree.root_node(), &source);
+        assert!(bindings.writes.contains("y") && bindings.writes.contains("a"));
     }
 }

@@ -320,28 +320,31 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
         let Some(body) = function.child_by_field_name("body") else {
             return false;
         };
-        fn has_binding(root: Node<'_>, name: &[u8], before: usize, source: &[u8]) -> bool {
-            if root.start_byte() >= before {
-                return false;
-            }
+        fn is_binding(root: Node<'_>, name: &[u8], source: &[u8]) -> bool {
             let field = match root.kind() {
                 "variable_declarator" => "name",
                 "let_declaration" => "pattern",
                 "assignment" => "left",
                 _ => "",
             };
-            if !field.is_empty()
+            !field.is_empty()
                 && root.child_by_field_name(field).is_some_and(|bound| {
                     bound.kind() == "identifier" && &source[bound.byte_range()] == name
                 })
-            {
+        }
+        // Iterative: repository nesting has no bound here.
+        let mut pending = vec![body];
+        while let Some(root) = pending.pop() {
+            if root.start_byte() >= node.start_byte() {
+                continue;
+            }
+            if is_binding(root, name, source) {
                 return true;
             }
-            (0..root.child_count())
-                .filter_map(|i| root.child(i))
-                .any(|child| has_binding(child, name, before, source))
+            let mut cursor = root.walk();
+            pending.extend(root.children(&mut cursor));
         }
-        has_binding(body, name, node.start_byte(), source)
+        false
     }
     let returned_identifier =
         left.kind() == "identifier" && local_binding(left, a) && local_binding(right, b);
@@ -408,14 +411,24 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
     }
     // Identical tree shape is necessary, not sufficient: the exact bytes outside the
     // one measured leaf must also be unchanged, including the enclosing header/scope.
-    fn shape<'tree>(node: Node<'tree>, result: &mut Vec<&'tree str>) {
-        result.push(node.kind());
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                shape(child, result);
+    // Iterative: repository nesting has no bound here.
+    fn shape<'tree>(root: Node<'tree>, result: &mut Vec<&'tree str>) {
+        let mut cursor = root.walk();
+        loop {
+            result.push(cursor.node().kind());
+            if cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                result.push("/");
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    return;
+                }
             }
         }
-        result.push("/");
     }
     let mut old_shape = vec![];
     let mut new_shape = vec![];
@@ -1218,6 +1231,17 @@ mod local_classification_tests {
             hash: String::new(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn the_shape_proof_is_iterative() {
+        let deep = format!("const v = {}{};", "[".repeat(200_000), "]".repeat(200_000));
+        let before = format!("function f() {{ return 1; }}\n{deep}\n");
+        let after = format!("function f() {{ return 2; }}\n{deep}\n");
+        assert!(proved_body_only(
+            &file("javascript", &before),
+            &file("javascript", &after)
+        ));
     }
 
     #[test]

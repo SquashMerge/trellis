@@ -1523,3 +1523,22 @@ fn warm_memo_rebinds_reordered_callables_by_source_range_and_current_role() {
         );
     }
 }
+
+#[test]
+fn syntax_past_the_score_bounds_is_unmeasured_not_refused() {
+    let text = format!(
+        "def calc():\n    return {}1{}\n",
+        "(".repeat(50_000),
+        ")".repeat(50_000)
+    );
+    let rows = metrics::compute(
+        "python",
+        &text,
+        &[declaration("python", text.trim_end().len())],
+        &[],
+        &[],
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+}
