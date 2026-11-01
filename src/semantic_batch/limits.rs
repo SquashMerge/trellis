@@ -62,7 +62,9 @@ impl BatchLimits {
         pages: 1_024,
         total_page_bytes: 64 * MIB,
         artifacts: 64,
-        artifact_bytes: 64 * MIB,
+        // Owner ruling 2026-10-31 (#555): 256 MiB (was 64 MiB), so a rust-analyzer artifact of a
+        // mid-size repository with its test lanes fits.
+        artifact_bytes: 256 * MIB,
         total_artifact_bytes: 512 * MIB,
         candidates: 4_000_000,
         wire_fields: 64_000_000,

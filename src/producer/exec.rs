@@ -59,7 +59,7 @@ impl Default for Limits {
         Self {
             timeout: Duration::from_secs(1800),
             memory_bytes: 8192 * 1024 * 1024,
-            artifact_bytes: 64 * 1024 * 1024,
+            artifact_bytes: crate::semantic_batch::limits::BatchLimits::PRODUCTION.artifact_bytes,
             log_bytes: 4 * 1024 * 1024,
             grace: Duration::from_secs(2),
             sample: Duration::from_millis(500),

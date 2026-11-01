@@ -54,7 +54,7 @@ function emulateDetails(full, url) {
     nextOffset:offset + limit < items.length ? offset + limit : null, items:items.slice(offset, offset + limit)}};
 }
 function harness() {
-  const elements = new Map(), calls = [], detailCalls = [], renders = [], reads = [], conflicts = [];
+  const elements = new Map(), calls = [], detailCalls = [], renders = [], reads = [], conflicts = [], timers = [];
   let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null, detailError = null;
   // Created nodes with an id (the inspector's review chips, #449) resolve by that id; the newest wins.
   const created = [];
@@ -76,7 +76,7 @@ function harness() {
     clearArchitectureInspector:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
     showArchitectureInspector:() => {get("architecture-inspector").hidden=false;},
   }};
-  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console});
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
   const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
     if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; return emulateDetails(full, url); }
     calls.push({url,current,options}); const data = await response(url,options);
@@ -89,7 +89,7 @@ function harness() {
   },context:() => context,
     readSource:(site,revision,current) => reads.push({site,revision,current}),onConflict:() => conflicts.push(true)});
   const button = label => {const found = descendants(get("architecture-inspector-content")).find(item => item.tagName === "button" && item.textContent === label);assert.ok(found, `Missing ${label}`);return found;};
-  return {window,controller,calls,detailCalls,renders,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;},setDetailError:error => {detailError=error;}};
+  return {timers,window,controller,calls,detailCalls,renders,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;},setDetailError:error => {detailError=error;}};
 }
 
 test("init is inert; one owned pin/digest supplies metric values and explicit sampled source actions", async () => {
@@ -178,6 +178,42 @@ test("metric role is independent of test-reference overlay and fences old source
   h.setResponse(async () => ({payload:fixture()})); h.get("architecture-metric-tests").checked = false;
   await h.get("architecture-metric-tests").fire("change");
   assert.match(h.calls.at(-1).url, /role=production/); assert.equal(h.renders.at(-1).options.showTests, true);
+});
+
+test("a building answer shows progress, and refresh settles only on the result", async () => {
+  const h = harness(), building = progress => ({payload:{state:"building",...pin,progress,retryAfterMs:250},catchingUp:false});
+  const answers = [building({phase:"reading",completed:120,total:604}), building({phase:"measuring",completed:0,total:604})];
+  h.setResponse(async () => answers.shift() || {payload:fixture(),catchingUp:false});
+  const tick = () => new Promise(setImmediate);
+  let settled = false;
+  const refreshed = h.controller.refresh().then(() => { settled = true; });
+  await tick();
+  assert.equal(h.get("architecture-state").textContent, "Building Architecture for this revision: reading indexed files 120 of 604…");
+  assert.equal(h.get("architecture-state").dataset.state, "loading");
+  assert.equal(h.get("architecture-diagram").attrs["aria-busy"], "true");
+  assert.equal(h.renders.length, 0);
+  assert.equal(h.timers.at(-1).delay, 250);
+  h.timers.at(-1).run(); await tick();
+  assert.equal(h.get("architecture-state").textContent, "Building Architecture for this revision: measuring code…");
+  assert.equal(settled, false);
+  h.timers.at(-1).run();
+  await refreshed;
+  assert.equal(h.calls.length, 3);
+  assert.equal(h.renders.length, 1);
+  assert.equal(h.get("architecture-state").textContent, "");
+  assert.equal(h.get("architecture-diagram").attrs["aria-busy"], "false");
+});
+
+test("leaving Architecture cancels the pending building read and settles its refresh", async () => {
+  const h = harness();
+  h.setResponse(async () => ({payload:{state:"building",...pin,progress:null,retryAfterMs:250},catchingUp:false}));
+  const refreshed = h.controller.refresh();
+  await new Promise(setImmediate);
+  const pending = h.timers.at(-1);
+  h.controller.reset();
+  assert.equal(pending.run, null);
+  await refreshed;
+  assert.equal(h.calls.length, 1);
 });
 
 test("same-pin role changes fence both late request outcomes and async Pele completion", async () => {

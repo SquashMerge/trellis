@@ -185,3 +185,10 @@ aggregate. These come from the same indexed document as the callable metrics. Ph
 lines include blank/comment lines and inline test lines; zero is valid for an empty
 file. They are not summed callable LOC or physical production-only LOC. `roleCounts`
 keeps its original callable-population meaning. See [Treemap](treemap.md).
+
+## Rows shared with Architecture (#556)
+
+When the checkout's [Architecture build](architecture-view.md#one-computation-per-revision-556)
+has been published for the requested revision, a metrics read of any scope takes its rows from
+that build instead of reading and measuring the documents again. The answer is the same, and a
+failed or missing build leaves the read to compute its own rows.

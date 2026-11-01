@@ -88,6 +88,15 @@ fn reversed(value: &Value) -> Value {
     }
 }
 
+/// A producer run admits exactly what batch import admits, so a run past the old cap imports.
+#[test]
+fn run_artifact_bound_is_the_batch_artifact_limit() {
+    assert_eq!(
+        super::exec::Limits::default().artifact_bytes,
+        crate::semantic_batch::limits::BatchLimits::PRODUCTION.artifact_bytes
+    );
+}
+
 #[test]
 fn plan_hash_is_canonical_and_stable() {
     let plan = build("revision:v2:a", TrustProfile::Restricted);

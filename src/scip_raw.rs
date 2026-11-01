@@ -995,22 +995,6 @@ fn unread(source: &DocumentSource<'_>) -> bool {
     std::str::from_utf8(&source.bytes)
         .is_ok_and(|text| crate::skipped_source::skipped(&source.language, text).is_some())
 }
-/// Admit a document of an unread source with no claims: nothing the producer said about it can
-/// be anchored, and a symbol defined only there stays unresolved for its users.
-fn skip_document(
-    sink: &mut dyn ClaimSink,
-    path: &str,
-    language: &str,
-    wire_digest: &str,
-) -> Result<(), ScipCaptureError> {
-    sink.begin_document(&UnitDocument {
-        path,
-        language,
-        wire_digest,
-        occurrence_cap_exceeded: false,
-    })?;
-    sink.end_document()
-}
 /// Receiver of one artifact's claims, one document unit at a time.
 pub trait ClaimSink {
     fn begin_document(&mut self, doc: &UnitDocument<'_>) -> Result<(), ScipCaptureError>;
@@ -1224,7 +1208,7 @@ fn cap_document(
     artifact: &AuthenticatedArtifact<'_>,
     language: &str,
     path: &str,
-    text: &str,
+    text: Option<&str>,
     cap: u64,
     traversed: &mut usize,
     cancel: &CancelFlag,
@@ -1258,7 +1242,9 @@ fn cap_document(
                 unresolved_markers.push((positions[first], positions[first + 1]));
             }
             if positions.len() >= CAPPED_POSITION_BATCH {
-                validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
+                if let Some(text) = text {
+                    validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
+                }
                 positions.clear();
             }
             keep_definitions && o.symbol_roles & 1 != 0
@@ -1272,13 +1258,15 @@ fn cap_document(
             write += len;
         }
     }
-    validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
-    check_module_markers(
-        text,
-        artifact.position_encoding,
-        &unresolved_markers,
-        cancel,
-    )?;
+    if let Some(text) = text {
+        validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
+        check_module_markers(
+            text,
+            artifact.position_encoding,
+            &unresolved_markers,
+            cancel,
+        )?;
+    }
     bytes.truncate(write);
     Ok(())
 }
@@ -1415,13 +1403,14 @@ pub fn decode_streaming<'s, R: Read>(
                         return Err(invalid("unlisted document"));
                     }
                     let source = resolve(&path, &language)?;
-                    if unread(&source) {
-                        skip_document(sink, &path, &source.language, &wire_digest)?;
-                        documents += 1;
-                        continue;
-                    }
-                    let text = std::str::from_utf8(&source.bytes)
-                        .map_err(|_| invalid("non-UTF8 source"))?;
+                    let text = if unread(&source) {
+                        None
+                    } else {
+                        Some(
+                            std::str::from_utf8(&source.bytes)
+                                .map_err(|_| invalid("non-UTF8 source"))?,
+                        )
+                    };
                     cap_document(
                         &mut unit.bytes,
                         artifact,
@@ -1446,18 +1435,17 @@ pub fn decode_streaming<'s, R: Read>(
                     let source = resolve(&d.relative_path, &d.language)?;
                     (d, source)
                 };
-                if unread(&source) {
-                    skip_document(sink, &d.relative_path, &source.language, &wire_digest)?;
-                    documents += 1;
-                    continue;
-                }
+                // An unread source (#576) is admitted with no claims: the producer read the real
+                // file, so its text and positions can't be bound to the stored placeholder, and
+                // nothing it said there can be anchored. Every source-independent check still runs.
+                let read = !unread(&source);
                 sink.begin_document(&UnitDocument {
                     path: &d.relative_path,
                     language: &source.language,
                     wire_digest: &wire_digest,
-                    occurrence_cap_exceeded: capped,
+                    occurrence_cap_exceeded: capped && read,
                 })?;
-                if !d.text.is_empty() && d.text.as_bytes() != source.bytes.as_ref() {
+                if read && !d.text.is_empty() && d.text.as_bytes() != source.bytes.as_ref() {
                     return Err(invalid("document source binding"));
                 }
                 let raw = known(d.position_encoding)?;
@@ -1471,8 +1459,14 @@ pub fn decode_streaming<'s, R: Read>(
                     .counters
                     .unit_reservation_high_water_bytes
                     .max(reserved as u64);
-                let text =
-                    std::str::from_utf8(&source.bytes).map_err(|_| invalid("non-UTF8 source"))?;
+                let text = if read {
+                    Some(
+                        std::str::from_utf8(&source.bytes)
+                            .map_err(|_| invalid("non-UTF8 source"))?,
+                    )
+                } else {
+                    None
+                };
                 let mut positions = Vec::with_capacity(d.occurrences.len() * 4);
                 let mut unresolved_markers = Vec::new();
                 for o in &d.occurrences {
@@ -1485,21 +1479,25 @@ pub fn decode_streaming<'s, R: Read>(
                     if unresolved_module_marker(artifact, &source.language, &d.relative_path, o) {
                         unresolved_markers.push((positions[first], positions[first + 1]));
                     }
-                    sink.claim(make_claim(
-                        artifact,
-                        &d,
-                        &source.language,
-                        "occurrence",
-                        raw,
-                    ))?;
+                    if read {
+                        sink.claim(make_claim(
+                            artifact,
+                            &d,
+                            &source.language,
+                            "occurrence",
+                            raw,
+                        ))?;
+                    }
                 }
-                validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
-                check_module_markers(
-                    text,
-                    artifact.position_encoding,
-                    &unresolved_markers,
-                    cancel,
-                )?;
+                if let Some(text) = text {
+                    validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
+                    check_module_markers(
+                        text,
+                        artifact.position_encoding,
+                        &unresolved_markers,
+                        cancel,
+                    )?;
+                }
                 for s in &d.symbols {
                     traversed += 1;
                     if traversed.is_multiple_of(1024) {
@@ -1507,6 +1505,9 @@ pub fn decode_streaming<'s, R: Read>(
                     }
                     let (info, rels) =
                         symbol(s, artifact.position_encoding, cancel, &mut traversed, true)?;
+                    if !read {
+                        continue;
+                    }
                     sink.claim(make_claim(
                         artifact,
                         &d,

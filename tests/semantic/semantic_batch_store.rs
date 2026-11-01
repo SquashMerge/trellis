@@ -585,6 +585,37 @@ fn page_artifact_and_staging_limits_are_typed() {
     }
 }
 
+/// The real cap, not a test override: the first byte past 256 MiB is refused typed before any
+/// artifact byte is read, and the last byte within it is not.
+#[test]
+fn production_artifact_cap_refuses_one_byte_over_256_mib() {
+    let world = world(two_languages);
+    let written = world.write(&full_fixture(&world));
+    let declare = |byte_length: u64| {
+        edit_descriptor(&written.0, |descriptor| {
+            let others: u64 = descriptor["artifacts"].as_array().unwrap()[1..]
+                .iter()
+                .map(|artifact| artifact["byteLength"].as_u64().unwrap())
+                .sum();
+            descriptor["artifacts"][0]["byteLength"] = json!(byte_length);
+            descriptor["totals"]["artifactBytes"] = json!(byte_length + others);
+        })
+    };
+    let cap = 256 * 1024 * 1024;
+    assert_eq!(BatchLimits::PRODUCTION.artifact_bytes, cap);
+    let error = expect_err(world.admit(&declare(cap + 1)));
+    assert!(
+        matches!(error.downcast_ref::<ScipCaptureError>(),
+            Some(ScipCaptureError::LimitExceeded(name)) if name == "artifact bytes"),
+        "{error:#}"
+    );
+    assert!(world.stage_dirs().is_empty());
+    // At the cap the descriptor passes and only the actual bytes disagree with it.
+    let error = expect_err(world.admit(&declare(cap)));
+    assert_eq!(detail(&error), "artifact length", "{error:#}");
+    assert!(world.stage_dirs().is_empty());
+}
+
 #[test]
 fn partial_coverage_stages_exclusions() {
     let world = world(two_languages);
@@ -3546,7 +3577,7 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
         callees
     };
     {
-        use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+        use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Dynamic};
         assert_eq!(
             callees(&staged.call_bindings),
             [
@@ -3555,7 +3586,7 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
                 ("plain", Direct),
                 ("plain", Direct),
                 ("register", Direct),
-                ("run", Unknown),
+                ("run", Dynamic),
             ]
         );
     }
@@ -3594,7 +3625,7 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
 #[test]
 fn real_typescript_explicit_symbol_kind_is_checked_identically_in_batch_and_memory() {
     use protobuf::EnumOrUnknown;
-    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Dynamic, Unknown};
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/semantic-import/issue444-javascript-calls");
     let read = |path: &str| fs::read_to_string(fixture_dir.join(path)).unwrap();
@@ -3608,7 +3639,7 @@ fn real_typescript_explicit_symbol_kind_is_checked_identically_in_batch_and_memo
         (
             26,
             (Resolution::Resolved, Constructor),
-            (Resolution::Resolved, Unknown),
+            (Resolution::Resolved, Dynamic),
         ),
         (
             17,
@@ -4320,6 +4351,581 @@ fn replaced_batch_world() -> (World, IndexPin, IndexPin) {
     assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_captures"), 3);
     world.store.set_retention_clock_for_tests(1_902, 902);
     (world, older, head)
+}
+
+/// One LOCAL publication of `text` at `path`; returns its work counts.
+fn local_edit(world: &World, path: &str, text: &str, counts: &Path) -> Value {
+    let _ = fs::remove_file(counts);
+    write_files(&world.root, &[(path, text)]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    serde_json::from_slice(&fs::read(counts).unwrap()).unwrap()
+}
+
+/// Runs the due revision maintenance until nothing is left to do.
+fn run_maintenance(world: &World) {
+    let leader = world.store.publication_for_tests().unwrap();
+    world.store.maintain_revisions(&leader).unwrap();
+}
+
+/// #567: the admitted tuples the fast path reuses live on the revision that took the import, so
+/// that revision outlasts the grace while its batch stays selected, and no longer.
+#[test]
+fn the_import_revision_outlasts_the_grace_while_its_batch_is_selected() {
+    let world = definitions_world();
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let descriptor = world.write(&fixture);
+    world.publish(&descriptor).unwrap();
+    let import = world.head_key();
+    let tuples = |world: &World| {
+        world.count(&format!(
+            "SELECT COUNT(*) FROM semantic_coverage WHERE revision_id='{import}'"
+        ))
+    };
+    let admitted = tuples(&world);
+    assert!(admitted > 0);
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.store.set_retention_clock_for_tests(1_001, 1);
+    local_edit(&world, "src/C.js", "function other(){ }\n", &counts);
+    world.store.set_retention_clock_for_tests(1_902, 902);
+    local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 2; }\n",
+        &counts,
+    );
+    world.store.set_retention_clock_for_tests(2_803, 1_803);
+    run_maintenance(&world);
+    assert_eq!(tuples(&world), admitted);
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 3; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+    // A new batch replaces the selection: the old tuples are ordinary retained rows again.
+    let (a, b) = definitions_docs();
+    let a = a.occurrence(&[0, 0, 1], &[], "pkg extra.", 0);
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let replacement = world.write(&fixture);
+    world.publish(&replacement).unwrap();
+    world.store.set_retention_clock_for_tests(3_704, 2_704);
+    run_maintenance(&world);
+    assert_eq!(tuples(&world), 0);
+}
+
+/// A new batch over the same documents, then one local edit of `src/C.js`.
+fn edit_and_import(world: &World, ordinal: usize, counts: &Path) -> IndexPin {
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let descriptor = world.write(&fixture);
+    let imported = world.publish(&descriptor).unwrap().0;
+    local_edit(
+        world,
+        "src/C.js",
+        &format!("function other(){{ return {ordinal}; }}\n"),
+        counts,
+    );
+    imported
+}
+
+fn revision_state(world: &World, pin: IndexPin) -> String {
+    world
+        .db()
+        .query_row(
+            "SELECT state FROM native_revision_supersessions WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                pin.index_generation, pin.index_revision
+            )],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn unreleased_revisions(world: &World) -> i64 {
+    world.count(
+        "SELECT COUNT(*) FROM native_revisions r
+         LEFT JOIN native_revision_supersessions s ON s.revision_id=r.id
+         WHERE COALESCE(s.state,'head')<>'released'",
+    )
+}
+
+/// Owner ruling 2026-11-01: holds are rooted at the head, so what survives the grace does not
+/// grow with the number of imports, and the next edit still stands on its admitted tuples.
+#[test]
+fn sequential_imports_leave_no_chain_of_held_revisions() {
+    let world = definitions_world();
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    world.republish();
+    let mut clock = 1_000;
+    let mut bounds = Vec::new();
+    for imports in 1..=5 {
+        clock += 10;
+        world
+            .store
+            .set_retention_clock_for_tests(clock, (clock - 1_000) as u64);
+        edit_and_import(&world, imports, &counts);
+        clock += 1_000;
+        world
+            .store
+            .set_retention_clock_for_tests(clock, (clock - 1_000) as u64);
+        run_maintenance(&world);
+        bounds.push((
+            unreleased_revisions(&world),
+            world.count("SELECT COUNT(*) FROM semantic_raw_batches"),
+        ));
+    }
+    // The head, its batch's capture and import; the capture still selects the batch before.
+    assert_eq!(bounds[4], bounds[2], "{bounds:?}");
+    assert_eq!(bounds[4], bounds[3], "{bounds:?}");
+    assert!(bounds[4].0 <= 3 && bounds[4].1 <= 2, "{bounds:?}");
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1") };
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 9; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+}
+
+/// A revision in its grace outlives the capture its selection names: it reads its own stored
+/// basis and proofs, never the captured manifest. Past its grace its pin stops resolving.
+#[test]
+fn a_revision_in_its_grace_reads_after_its_capture_is_released() {
+    let world = definitions_world();
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let capture = world.store.index_baseline().unwrap();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let descriptor = world.write(&fixture);
+    world.publish(&descriptor).unwrap();
+    world.store.set_retention_clock_for_tests(1_001, 1);
+    local_edit(&world, "src/C.js", "function other(){ }\n", &counts);
+    let in_grace = world.store.index_baseline().unwrap();
+    world.store.set_retention_clock_for_tests(1_900, 900);
+    local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 2; }\n",
+        &counts,
+    );
+    world.store.set_retention_clock_for_tests(1_901, 901);
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let replacement = world.write(&fixture);
+    world.publish(&replacement).unwrap();
+
+    let semantic = world.store.semantic_at(in_grace).unwrap();
+    let raw = world.store.selected_raw_inputs_at(in_grace).unwrap();
+    let source = world.store.source_at("src/C.js", Some(in_grace)).unwrap();
+    assert_eq!(raw.len(), 1);
+    assert_ne!(raw[0].captured_pin, world.store.index_baseline().unwrap());
+    world.store.set_retention_clock_for_tests(1_950, 950);
+    run_maintenance(&world);
+    assert_eq!(revision_state(&world, capture), "released");
+
+    assert_eq!(world.store.semantic_at(in_grace).unwrap(), semantic);
+    assert_eq!(
+        world.store.source_at("src/C.js", Some(in_grace)).unwrap(),
+        source
+    );
+    let proof = semantic
+        .provenance
+        .iter()
+        .find_map(|row| row.derived_from.as_ref())
+        .unwrap();
+    assert!(
+        world
+            .store
+            .semantic_raw_proof_at(
+                &raw[0].producer_id,
+                &raw[0].captures[0].artifact_hash,
+                &raw[0].source_set_id,
+                &raw[0].captured_revision,
+                &proof.provenance_id,
+            )
+            .unwrap()
+            .is_some(),
+        "the batch a retained revision selects keeps its proofs"
+    );
+
+    world.store.set_retention_clock_for_tests(2_802, 1_802);
+    run_maintenance(&world);
+    assert_eq!(revision_state(&world, in_grace), "released");
+    let error = world.store.semantic_at(in_grace).unwrap_err();
+    assert!(format!("{error:#}").starts_with("pin_expired"), "{error:#}");
+}
+
+/// Two producers imported at different revisions keep each one's capture and import.
+#[test]
+fn each_head_selected_batch_keeps_its_capture_and_import_past_the_grace() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+                ("src/C.py", "def helper(): return 1\n"),
+            ],
+        )
+    });
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+    }
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let javascript = world.write(&fixture);
+    world.publish(&javascript).unwrap();
+    world.store.set_retention_clock_for_tests(1_001, 1);
+    local_edit(&world, "src/D.js", "function later(){ }\n", &counts);
+    world.store.set_retention_clock_for_tests(1_002, 2);
+    let mut fixture = world.fixture().reference("scip-python");
+    fixture.artifact("python", vec![DocSpec::new("src/C.py")]);
+    let python = world.write(&fixture);
+    world.publish(&python).unwrap();
+    world.store.set_retention_clock_for_tests(2_003, 1_003);
+    local_edit(
+        &world,
+        "src/D.js",
+        "function later(){ return 1; }\n",
+        &counts,
+    );
+    world.store.set_retention_clock_for_tests(3_904, 2_904);
+    run_maintenance(&world);
+    assert_eq!(
+        world.count(
+            "SELECT COUNT(DISTINCT s.producer_id) FROM semantic_revision_raw_selections s
+             JOIN index_metadata m ON m.singleton=1
+             WHERE s.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision"
+        ),
+        2
+    );
+    let work = local_edit(
+        &world,
+        "src/D.js",
+        "function later(){ return 2; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 2, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+}
+
+/// A release the daemon stops midway resumes after a publication, and takes only what the head
+/// no longer holds.
+#[test]
+fn an_interrupted_release_resumes_without_touching_what_the_head_holds() {
+    let world = definitions_world();
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    world.republish();
+    edit_and_import(&world, 1, &counts);
+    world.store.set_retention_clock_for_tests(1_010, 10);
+    edit_and_import(&world, 2, &counts);
+    world.store.set_retention_clock_for_tests(2_020, 1_020);
+    {
+        let leader = world.store.publication_for_tests().unwrap();
+        let permit = world.store.maintenance_try_enter().unwrap();
+        let probe = world.store.open_maintenance_queue_probe().unwrap();
+        world
+            .store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap();
+    }
+    assert!(world.count("SELECT COUNT(*) FROM native_revision_release_debt") <= 1);
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 3; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    world.store.set_retention_clock_for_tests(3_030, 2_030);
+    run_maintenance(&world);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM native_revision_release_debt"),
+        0
+    );
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 4; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+}
+
+/// A batch reselected while the revision that took its import is pending release: that
+/// revision is held again and returns to retained, so the next edit still stands on its
+/// admitted tuples (#573 review).
+#[test]
+fn a_reselected_batch_brings_its_pending_import_revision_back() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+                ("src/Q.py", "def q(): return 1\n"),
+            ],
+        )
+    });
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let mut q = world.fixture().reference("scip-python");
+    q.artifact("python", vec![DocSpec::new("src/Q.py")]);
+    world.publish(&world.write(&q)).unwrap();
+    let captured = world.store.index_baseline().unwrap();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let first = world.write(&fixture);
+    let import = world.publish(&first).unwrap().0;
+    world.store.set_retention_clock_for_tests(1_001, 1);
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    local_edit(&world, "src/C.js", "function unrelated(){}\n", &counts);
+    let (a, b) = definitions_docs();
+    let a = a.occurrence(&[0, 0, 1], &[], "pkg extra.", 0);
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    world.publish(&world.write(&fixture)).unwrap();
+    world.store.set_retention_clock_for_tests(2_002, 1_002);
+    // Stop between maintenance units, as soon as the import revision is pending.
+    for _ in 0..100 {
+        if revision_state(&world, import) == "pending" {
+            break;
+        }
+        let leader = world.store.publication_for_tests().unwrap();
+        if !world
+            .store
+            .maintain_one_revision_step_for_tests(&leader)
+            .unwrap()
+        {
+            break;
+        }
+    }
+    assert_eq!(revision_state(&world, import), "pending");
+    assert_eq!(revision_state(&world, captured), "retained");
+    world.publish(&first).unwrap();
+    let head = world.store.index_baseline().unwrap();
+    let semantic = world.store.semantic_at(head).unwrap();
+    run_maintenance(&world);
+    assert_eq!(revision_state(&world, import), "retained");
+    assert_eq!(world.store.semantic_at(head).unwrap(), semantic);
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1") };
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function unrelated(){ return 2; }\n",
+        &counts,
+    );
+    // Both producers, Q and the reselected one.
+    assert_eq!(work["witnessedRejoins"], 2, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+}
+
+/// Release past its first unit cannot be undone: a revision that no longer selects anything is
+/// no witness, and a reselection of its batch leaves it to finish releasing.
+#[test]
+fn a_partly_released_import_revision_is_not_brought_back() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+                ("src/Q.py", "def q(): return 1\n"),
+            ],
+        )
+    });
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let mut q = world.fixture().reference("scip-python");
+    q.artifact("python", vec![DocSpec::new("src/Q.py")]);
+    world.publish(&world.write(&q)).unwrap();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let first = world.write(&fixture);
+    let import = world.publish(&first).unwrap().0;
+    world.store.set_retention_clock_for_tests(1_001, 1);
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    local_edit(&world, "src/C.js", "function unrelated(){}\n", &counts);
+    let (a, b) = definitions_docs();
+    let a = a.occurrence(&[0, 0, 1], &[], "pkg extra.", 0);
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    world.publish(&world.write(&fixture)).unwrap();
+    world.store.set_retention_clock_for_tests(2_002, 1_002);
+    let leader = world.store.publication_for_tests().unwrap();
+    for _ in 0..100 {
+        if revision_state(&world, import) == "pending" {
+            break;
+        }
+        assert!(
+            world
+                .store
+                .maintain_one_revision_step_for_tests(&leader)
+                .unwrap()
+        );
+    }
+    // One more unit releases its selections.
+    assert!(
+        world
+            .store
+            .maintain_one_revision_step_for_tests(&leader)
+            .unwrap()
+    );
+    drop(leader);
+    world.publish(&first).unwrap();
+    run_maintenance(&world);
+    assert_eq!(revision_state(&world, import), "released");
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function unrelated(){ return 2; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 0, "{work}");
+    assert_eq!(
+        work["fallbackReasons"],
+        json!(["original_import_missing"]),
+        "{work}"
+    );
+}
+
+/// A definition's claim can lose its reference row to another claim at its span while it keeps
+/// its declaration binding: the row's proof is still fused. Whether that claim or the other one
+/// owns the row follows the proof IDs, so several spellings cover both orders.
+fn fused_definition(world: &World, spelling: usize) -> (DocSpec, DocSpec) {
+    fused_definition_with(world, spelling, |doc, target| {
+        doc.occurrence(&[0, 9, 12], &[], target, 0)
+    })
+}
+
+/// `fused_definition`, with the claim that shares the definition's span built by `shape`.
+fn fused_definition_with(
+    world: &World,
+    spelling: usize,
+    shape: fn(DocSpec, &str) -> DocSpec,
+) -> (DocSpec, DocSpec) {
+    let target = format!("pkg target{spelling}.");
+    let a = DocSpec::new("src/A.js").occurrence(&[0, 9, 12], &[], "pkg run.", 1);
+    let a = shape(a, &target)
+        .occurrence(&[0, 16, 22], &[0, 16, 24], &target, 0)
+        .symbol("pkg run.", 17, &[]);
+    let b = DocSpec::new("src/B.js")
+        .occurrence(&[0, 9, 15], &[], &target, 1)
+        .symbol(&target, 17, &[]);
+    let _ = world;
+    (a, b)
+}
+
+#[test]
+fn a_fused_definition_stays_on_the_fast_path_and_matches_full() {
+    for spelling in 0..6 {
+        let world = definitions_world();
+        let (a, b) = fused_definition(&world, spelling);
+        let mut fixture = world.fixture().reference("scip-typescript");
+        fixture.artifact("javascript", vec![a, b]);
+        let descriptor = world.write(&fixture);
+        world.publish(&descriptor).unwrap();
+        let counts = world._state.path().join("work-counts.json");
+        // SAFETY: each test runs in its own process under nextest, and no other thread reads
+        // these.
+        unsafe {
+            std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+            std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+        }
+        let work = local_edit(&world, "src/C.js", "function other(){ }\n", &counts);
+        assert_eq!(work["witnessedRejoins"], 1, "{spelling}: {work}");
+        assert_eq!(work["fullFallbacks"], 0, "{spelling}: {work}");
+    }
+}
+
+/// The row fused from the definition and the call-free claim loses a target only the second one
+/// named. The row cannot say what survives, so FULL decides, and the oracle confirms the result.
+#[test]
+fn a_target_lost_under_a_fused_definition_takes_full() {
+    a_lost_target_takes_full(|doc, target| doc.occurrence(&[0, 9, 12], &[], target, 0));
+}
+
+/// One span has several valid wire shapes, each kept verbatim in its raw proof: two claims of
+/// one span must be recognized as such whichever shapes they arrived in.
+#[test]
+fn a_target_lost_under_a_fused_row_takes_full_across_equivalent_range_shapes() {
+    a_lost_target_takes_full(|doc, target| doc.occurrence(&[0, 9, 0, 12], &[], target, 0));
+    a_lost_target_takes_full(|doc, target| doc.typed_occurrence(&[0, 9, 12], target, 0));
+    a_lost_target_takes_full(|doc, target| doc.typed_occurrence(&[0, 9, 0, 12], target, 0));
+}
+
+/// The FULL oracle checks each published result; the spellings cover both proof owners.
+fn a_lost_target_takes_full(shape: fn(DocSpec, &str) -> DocSpec) {
+    for spelling in 0..6 {
+        let world = definitions_world();
+        let (a, b) = fused_definition_with(&world, spelling, shape);
+        let mut fixture = world.fixture().reference("scip-typescript");
+        fixture.artifact("javascript", vec![a, b]);
+        let descriptor = world.write(&fixture);
+        world.publish(&descriptor).unwrap();
+        let counts = world._state.path().join("work-counts.json");
+        // SAFETY: each test runs in its own process under nextest, and no other thread reads
+        // these.
+        unsafe {
+            std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+            std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+        }
+        fs::remove_file(world.root.join("src/B.js")).unwrap();
+        let options = IndexOptions::new(world.root.clone());
+        let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+        let leader = world.store.publication_for_tests().unwrap();
+        world
+            .store
+            .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+            .unwrap();
+        let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
+        assert_eq!(
+            work["fallbackReasons"],
+            json!(["fused_reference_target_lost"]),
+            "{spelling}: {work}"
+        );
+    }
 }
 
 /// Releases `pin`, whose garbage collection proceeds in bounded steps.
@@ -5498,8 +6104,8 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
         // #470's owner ruling: a resolved plain call to a free function is `Direct`, so the
         // graph follows it (no boundary), as it does `new Widget(3)`, which binds the class
         // constructor and is `Constructor` (#473: scip-typescript's unspecified kind defers to
-        // the native kind). The member call `w.run()` binds the method with `Unknown`
-        // dispatch, so it keeps a `dispatch` boundary.
+        // the native kind). The member call `w.run()` binds the method with `Dynamic`
+        // dispatch (#557), so it keeps a `dispatch` boundary that shows the declaration.
         let resolved = |name: &str, dispatch: &str, boundary, target: &str| {
             (
                 name.to_owned(),
@@ -5519,7 +6125,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
                 followed("plain", "plain"),
                 followed("plain", "plain"),
                 followed("register", "register"),
-                resolved("run", "Unknown", BoundaryReason::Dispatch, "run"),
+                resolved("run", "Dynamic", BoundaryReason::Dispatch, "run"),
             ]
         );
         for binding in &view.semantic.bindings {
@@ -5656,7 +6262,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
         assert_eq!(widget["binding"]["dispatch"], "constructor", "{widget}");
         assert_eq!(widget["boundaryReason"], "none", "{widget}");
         assert_eq!(widget["targetId"], ids["constructor"], "{widget}");
-        assert_eq!(run["binding"]["dispatch"], "unknown", "{run}");
+        assert_eq!(run["binding"]["dispatch"], "dynamic", "{run}");
         let unbound = calls.iter().find(|c| c["calleeText"] == "method").unwrap();
         assert_eq!(unbound["binding"], Value::Null);
         assert_eq!(unbound["boundaryReason"], "missingEvidence");
@@ -5928,6 +6534,10 @@ fn rust_analyzer_world() -> World {
 }
 
 fn rust_analyzer_artifact(world: &World) -> Vec<u8> {
+    rust_analyzer_artifact_of(world, RUST_ANALYZER)
+}
+
+fn rust_analyzer_artifact_of(world: &World, fixture: &str) -> Vec<u8> {
     let mut index = scip::types::Index::new();
     let mut metadata = scip::types::Metadata::new();
     metadata.project_root = format!("file://{}", world.root.display());
@@ -5938,7 +6548,7 @@ fn rust_analyzer_artifact(world: &World) -> Vec<u8> {
     metadata.tool_info = Some(tool).into();
     index.metadata = Some(metadata).into();
     let mut bytes = index.write_to_bytes().unwrap();
-    bytes.extend(fs::read(Path::new(RUST_ANALYZER).join("documents.scip")).unwrap());
+    bytes.extend(fs::read(Path::new(fixture).join("documents.scip")).unwrap());
     bytes
 }
 
@@ -6044,19 +6654,18 @@ fn real_rust_analyzer_artifact_imports_and_its_enclosing_range_references_bind_c
     // Before #394 none of the three bound a call. The recursive `spin(value)` carries its own
     // definition's range, which encloses the reference but joins no invocation: under owner
     // ruling 4 (2026-10-30, #394) that range is absent and the exact callee span binds it.
-    // Dispatch (owner ruling 2026-10-30, #470): plain and path calls of free functions are
-    // direct; the method call `counter.add(..)` and unresolved or external calls are unknown.
+    // Dispatch (owner rulings 2026-10-30, #470, and 2026-10-31, #557): plain and path calls of
+    // free functions are direct, and so are the inherent `counter.add(..)` and `Counter::new()`.
+    // External calls are unknown.
     let call = |path: &str, callee: &str, resolution: &str, dispatch: &str| {
         [path, callee, resolution, dispatch].map(str::to_owned)
     };
     assert_eq!(
         rust_calls(&world, &staged.call_bindings),
         [
-            call("src/lib.rs", "add", "Resolved", "Unknown"),
+            call("src/lib.rs", "add", "Resolved", "Direct"),
             call("src/lib.rs", "double", "Resolved", "Direct"),
-            // rust-analyzer's associated-function kind does not bind the measured method
-            // declaration, so `Counter::new()` binds its call but resolves no target.
-            call("src/lib.rs", "new", "Unresolved", "Unknown"),
+            call("src/lib.rs", "new", "Resolved", "Direct"),
             call("src/lib.rs", "saturating", "Resolved", "Direct"),
             call("src/util.rs", "saturating", "Resolved", "Direct"),
             call("src/util.rs", "saturating_add", "External", "Unknown"),
@@ -6085,10 +6694,11 @@ fn real_rust_analyzer_artifact_imports_and_its_enclosing_range_references_bind_c
     );
 }
 
-/// Owner ruling 2026-10-30 (#470) through the #40 call graph and the sequence view, on the real
-/// rust-analyzer fixture: `run` -> `util::double` -> `saturating` are direct path and plain
-/// calls of free functions, so the graph expands into them under the depth and node bounds,
-/// while `counter.add(..)` stays a dispatch boundary and `Counter::new()` an unresolved one.
+/// Owner rulings 2026-10-30 (#470) and 2026-10-31 (#557) through the #40 call graph and the
+/// sequence view, on the real rust-analyzer fixture: `run` -> `util::double` -> `saturating`
+/// are direct path and plain calls of free functions and `Counter::new()` and
+/// `counter.add(..)` are direct inherent calls, so the graph expands into them under the depth
+/// and node bounds.
 #[test]
 fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
     use trellis::graph_query::{BoundaryReason, FrontierReason, GraphQuery, Visit};
@@ -6116,6 +6726,16 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
         found[0].syntax_id.clone()
     };
     let (run, double, saturating) = (id_of("run"), id_of("double"), id_of("saturating"));
+    let method_of = |name: &str| {
+        native
+            .declarations
+            .iter()
+            .find(|d| d.name.as_deref() == Some(name) && d.kind == "method")
+            .unwrap()
+            .syntax_id
+            .clone()
+    };
+    let (new, add) = (method_of("new"), method_of("add"));
     let graph = |depth: u64, max_nodes: u64| {
         world
             .store
@@ -6145,32 +6765,36 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
             .map(|n| (n.declaration.syntax_id.clone(), n.depth))
             .collect::<Vec<_>>()
     };
-    let edge = |result: &trellis::graph_query::GraphResult, callee: &str| {
+    let edge = |result: &trellis::graph_query::GraphResult, from: &str, callee: &str| {
         let found: Vec<_> = result
             .edges
             .iter()
-            .filter(|e| e.call.spelling.as_deref() == Some(callee))
+            .filter(|e| e.from == from && e.call.spelling.as_deref() == Some(callee))
             .cloned()
             .collect();
         assert_eq!(found.len(), 1, "{callee}");
         found.into_iter().next().unwrap()
     };
 
-    // Depth 2 follows the direct edge into `double`, then `double`'s into `saturating`.
+    // Depth 2 follows the direct edges into `new`, `add` and `double`, then into `saturating`.
     let deep = graph(2, 150);
     assert_eq!(
         nodes(&deep),
         [
             (run.clone(), 0),
+            (new.clone(), 1),
+            (add.clone(), 1),
             (double.clone(), 1),
             (saturating.clone(), 2)
         ]
     );
     for (callee, from, to) in [
+        ("new", &run, &new),
+        ("add", &run, &add),
         ("double", &run, &double),
-        ("saturating", &double, &saturating),
+        ("saturating", &add, &saturating),
     ] {
-        let e = edge(&deep, callee);
+        let e = edge(&deep, from, callee);
         assert_eq!(
             (e.visit, e.boundary_reason),
             (Visit::New, BoundaryReason::None)
@@ -6182,18 +6806,6 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
             trellis::semantic_evidence::Dispatch::Direct
         );
     }
-    for (callee, reason) in [
-        ("add", BoundaryReason::Dispatch),
-        ("new", BoundaryReason::Unresolved),
-    ] {
-        let e = edge(&deep, callee);
-        assert_eq!(
-            (e.visit, e.boundary_reason),
-            (Visit::Boundary, reason),
-            "{callee}"
-        );
-        assert_eq!(e.to, None);
-    }
     // The depth bound stops at `saturating`: its own call is depth frontier, not expanded.
     assert!(
         deep.frontier
@@ -6202,9 +6814,17 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
     );
     assert!(deep.edges.iter().all(|e| e.from != saturating));
 
-    // Depth 1 admits `double` and leaves its call on the depth frontier.
+    // Depth 1 admits `run`'s callees and leaves `double`'s call on the depth frontier.
     let shallow = graph(1, 150);
-    assert_eq!(nodes(&shallow), [(run.clone(), 0), (double.clone(), 1)]);
+    assert_eq!(
+        nodes(&shallow),
+        [
+            (run.clone(), 0),
+            (new.clone(), 1),
+            (add.clone(), 1),
+            (double.clone(), 1)
+        ]
+    );
     assert!(
         shallow
             .frontier
@@ -6213,11 +6833,11 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
     );
     assert!(shallow.edges.iter().all(|e| e.from == run));
 
-    // The node bound holds: with room for two nodes the direct call into `saturating` is a
+    // The node bound holds: with room for two nodes the direct call into `double` is a
     // node-limit boundary and the result is partial.
     let bounded = graph(2, 2);
-    assert_eq!(nodes(&bounded), [(run.clone(), 0), (double.clone(), 1)]);
-    let e = edge(&bounded, "saturating");
+    assert_eq!(nodes(&bounded), [(run.clone(), 0), (new.clone(), 1)]);
+    let e = edge(&bounded, &run, "double");
     assert_eq!(
         (e.visit, e.boundary_reason, e.to),
         (Visit::Boundary, BoundaryReason::NodeLimit, None)
@@ -6235,15 +6855,18 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
             })
             .collect()
     }
-    let find = |view: &trellis::behavior::SequenceView, label: &str| {
-        let found: Vec<_> = steps(&view.steps)
+    let find_all = |view: &trellis::behavior::SequenceView, label: &str| -> Vec<_> {
+        steps(&view.steps)
             .into_iter()
             .filter(|s| {
                 s.call_evidence.is_some()
                     && (s.label == label || s.label.ends_with(&format!("::{label}")))
             })
             .cloned()
-            .collect();
+            .collect()
+    };
+    let find = |view: &trellis::behavior::SequenceView, label: &str| {
+        let found = find_all(view, label);
         assert_eq!(found.len(), 1, "{label}");
         found.into_iter().next().unwrap()
     };
@@ -6258,11 +6881,11 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
         evidence("double"),
         (Some(double.clone()), BoundaryReason::None)
     );
-    assert_eq!(evidence("add"), (None, BoundaryReason::Dispatch));
-    assert_eq!(evidence("new"), (None, BoundaryReason::Unresolved));
+    assert_eq!(evidence("add"), (Some(add.clone()), BoundaryReason::None));
+    assert_eq!(evidence("new"), (Some(new.clone()), BoundaryReason::None));
 
     // #522: participants come from the resolved targets, and each direct callee's own
-    // body is expanded beneath its call on the callee's lane: `run` -> `double` ->
+    // body is expanded beneath its call on the callee's lane: `run` -> `add` ->
     // `saturating`, whose `saturating_add` is a standard-library call and so incidental.
     assert_eq!(
         view.semantic.tier,
@@ -6273,18 +6896,24 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
         Some(producer.as_str())
     );
     let lanes: Vec<_> = view.participants.iter().map(|p| p.id.clone()).collect();
-    assert_eq!(lanes, [run.clone(), double.clone(), saturating.clone()]);
-    let into_double = find(&view, "double");
-    assert!(into_double.lane.is_none());
-    let into_saturating = find(&view, "saturating");
-    assert_eq!(into_saturating.lane.as_deref(), Some(double.as_str()));
-    assert_eq!(into_saturating.target.as_deref(), Some(saturating.as_str()));
-    assert!(
-        into_double
-            .children
-            .iter()
-            .any(|s| s.id == into_saturating.id)
+    assert_eq!(
+        lanes,
+        [
+            run.clone(),
+            new.clone(),
+            add.clone(),
+            saturating.clone(),
+            double.clone()
+        ]
     );
+    let into_add = find(&view, "add");
+    assert!(into_add.lane.is_none());
+    let into_saturating = find_all(&view, "saturating")
+        .into_iter()
+        .find(|s| s.lane.as_deref() == Some(add.as_str()))
+        .unwrap();
+    assert_eq!(into_saturating.target.as_deref(), Some(saturating.as_str()));
+    assert!(into_add.children.iter().any(|s| s.id == into_saturating.id));
     let std_call = find(&view, "saturating_add");
     assert_eq!(std_call.lane.as_deref(), Some(saturating.as_str()));
     let std_evidence = std_call.call_evidence.as_ref().unwrap();
@@ -6309,6 +6938,328 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
     let call = find(&recursive, "spin");
     assert_eq!(call.target.as_deref(), Some(spin.as_str()));
     assert!(call.children.is_empty());
+}
+
+// Real rust-analyzer 1.98.1 output for `tests/fixtures/scip-rust-analyzer-dispatch/workspace`,
+// Metadata unit dropped as for `RUST_ANALYZER`: inherent, trait and trait-impl methods, a
+// trait object, a type parameter and a macro argument (#557).
+const RUST_ANALYZER_DISPATCH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/scip-rust-analyzer-dispatch"
+);
+
+fn rust_dispatch_batch(world: &World) -> (PathBuf, String) {
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let docs = fixture.paths("rust");
+    assert_eq!(docs.len(), 2);
+    let ordinal = fixture.artifact("rust", docs);
+    fixture.override_artifact_raw(
+        ordinal,
+        rust_analyzer_artifact_of(world, RUST_ANALYZER_DISPATCH),
+    );
+    world.write(&fixture)
+}
+
+fn dispatch_declaration(world: &World, name: &str, ancestor: Option<&str>) -> String {
+    let (_, native, _) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let found: Vec<_> = native
+        .declarations
+        .iter()
+        .filter(|d| {
+            d.name.as_deref() == Some(name)
+                && ancestor.is_none_or(|ancestor| {
+                    d.ancestors.last().and_then(|a| a.name.as_deref()) == Some(ancestor)
+                })
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "{name}");
+    found[0].syntax_id.clone()
+}
+
+/// Owner ruling 2026-10-31 (#557) on real rust-analyzer bytes, identically in the staged and
+/// in-memory joins. Inherent calls are direct, including through `self.m()`, `Type::f()` and
+/// `assert!`; a trait object's and a type parameter's calls name the trait's declaration and
+/// are dynamic; the statically selected trait impl stays unknown.
+#[test]
+fn real_rust_analyzer_dispatch_follows_the_measured_method_parent() {
+    let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_DISPATCH).join("workspace"), root));
+    let descriptor = rust_dispatch_batch(&world);
+    let staged = rust_analyzer_publications(
+        &world,
+        &descriptor,
+        &BatchLimits::PRODUCTION,
+        "rust dispatch",
+    );
+    let calls = rust_calls(&world, &staged.call_bindings);
+    let dispatch = |path: &str, callee: &str| -> Vec<String> {
+        calls
+            .iter()
+            .filter(|call| call[0] == path && call[1] == callee)
+            .map(|call| format!("{} {}", call[2], call[3]))
+            .collect()
+    };
+    let (lib, shapes) = ("src/lib.rs", "src/shapes.rs");
+    assert_eq!(dispatch(lib, "new"), ["Resolved Direct"]);
+    // One through `assert!`, one plain.
+    assert_eq!(
+        dispatch(lib, "navigation_at"),
+        ["Resolved Direct", "Resolved Direct"]
+    );
+    assert_eq!(dispatch(shapes, "navigation_in"), ["Resolved Direct"]);
+    assert_eq!(dispatch(lib, "total"), ["Resolved Direct"]);
+    // `shape.area()` on the trait object and `square.area()` on the concrete type.
+    assert_eq!(
+        dispatch(lib, "area"),
+        ["Resolved Dynamic", "Resolved Unknown"]
+    );
+    assert_eq!(dispatch(lib, "twice"), ["Resolved Dynamic"]);
+    assert_eq!(dispatch(shapes, "area"), ["Resolved Dynamic"]);
+}
+
+/// #557: call graph and Sequence expand through `navigation_at -> navigation_in`-shaped
+/// inherent calls. A dynamic call shows the trait's declaration, marked dynamic, and neither
+/// expands through it nor fans out to the implementation.
+#[test]
+fn real_rust_analyzer_inherent_calls_expand_and_trait_calls_stay_boundaries() {
+    use trellis::graph_query::{BoundaryReason, GraphQuery, Visit};
+    use trellis::semantic_evidence::Dispatch;
+    let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_DISPATCH).join("workspace"), root));
+    let (pin, admitted, _) = world.publish(&rust_dispatch_batch(&world)).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(pin).unwrap().producers[0]
+        .id
+        .clone();
+    let id = |name: &str| dispatch_declaration(&world, name, None);
+    let graph = |root: &str| {
+        world
+            .store
+            .evidence_response()
+            .unwrap()
+            .graph_query(
+                &GraphQuery {
+                    root_syntax_id: root.to_owned(),
+                    semantic_producer_id: Some(producer.clone()),
+                    depth: 2,
+                    max_nodes: 150,
+                    max_calls: 500,
+                    include_external: true,
+                    include_tests: true,
+                },
+                None,
+                &mut || Ok(()),
+            )
+            .unwrap()
+            .outcome
+            .expect("contract success")
+    };
+    let nodes = |result: &trellis::graph_query::GraphResult| {
+        result
+            .nodes
+            .iter()
+            .map(|n| (n.declaration.syntax_id.clone(), n.depth))
+            .collect::<Vec<_>>()
+    };
+    let (at, inner, scaled) = (id("navigation_at"), id("navigation_in"), id("scaled"));
+    let deep = graph(&at);
+    assert_eq!(
+        nodes(&deep),
+        [(at.clone(), 0), (inner.clone(), 1), (scaled.clone(), 2)]
+    );
+
+    // The trait's bodiless `area`: the only `area` whose parent is named.
+    let declared = dispatch_declaration(&world, "area", Some("Shape"));
+    let twice = id("twice");
+    let total = id("total");
+    let result = graph(&total);
+    assert_eq!(nodes(&result), [(total.clone(), 0), (declared.clone(), 1)]);
+    assert_eq!(result.edges.len(), 1);
+    let edge = &result.edges[0];
+    assert_eq!(edge.to.as_deref(), Some(declared.as_str()));
+    assert_eq!(
+        (edge.visit, edge.boundary_reason),
+        (Visit::Boundary, BoundaryReason::Dispatch)
+    );
+    assert_eq!(edge.binding.as_ref().unwrap().dispatch, Dispatch::Dynamic);
+    assert!(result.partial);
+
+    // A provided method has a body, and the declaration still is not expanded through.
+    let generic = id("generic");
+    let result = graph(&generic);
+    assert_eq!(nodes(&result), [(generic.clone(), 0), (twice.clone(), 1)]);
+    assert!(result.edges.iter().all(|e| e.from == generic));
+
+    // Sequence expands through `self.navigation_in(..)`, and the boundary names the
+    // declaration in its evidence, with no lane and no expansion.
+    let view = world.store.sequence_at(&at, pin, false).unwrap().unwrap();
+    let lanes: Vec<_> = view.participants.iter().map(|p| p.id.clone()).collect();
+    assert_eq!(lanes, [at.clone(), inner.clone(), scaled.clone()]);
+    let view = world
+        .store
+        .sequence_at(&total, pin, false)
+        .unwrap()
+        .unwrap();
+    let lanes: Vec<_> = view.participants.iter().map(|p| p.id.clone()).collect();
+    assert_eq!(lanes, std::slice::from_ref(&total));
+    let step = view
+        .steps
+        .iter()
+        .find(|s| s.call_evidence.is_some())
+        .unwrap();
+    assert_eq!(step.target, None);
+    assert!(step.children.is_empty());
+    let evidence = step.call_evidence.as_ref().unwrap();
+    assert_eq!(evidence.boundary_reason, BoundaryReason::Dispatch);
+    assert_eq!(evidence.dispatch, Some(Dispatch::Dynamic));
+    let target = evidence.dispatch_target.as_ref().unwrap();
+    assert_eq!(target.id, declared);
+    assert_eq!(target.name.as_deref(), Some("area"));
+    assert_eq!(target.path, "src/shapes.rs");
+}
+
+/// #557: rejoin keeps the #470 rule, except that a method's `direct` needs a destination
+/// classification: its `impl`'s bases and its modifiers are outside its syntax ID. An edit of
+/// the target's document keeps the unchanged caller's free-function `direct` and trait
+/// `dynamic`, and drops an inherent `direct` until the next import, whether or not the impl
+/// gained a trait. A target that is gone leaves no classified call.
+#[test]
+fn rejoin_keeps_inherent_and_trait_dispatch_only_for_the_same_declaration() {
+    let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_DISPATCH).join("workspace"), root));
+    let (_, admitted, _) = world.publish(&rust_dispatch_batch(&world)).unwrap();
+    drop(admitted);
+    let lib_calls = |world: &World| {
+        let head = world.store.index_baseline().unwrap();
+        rust_calls(world, &world.store.semantic_at(head).unwrap().call_bindings)
+            .into_iter()
+            .filter(|call| call[0] == "src/lib.rs")
+            .collect::<Vec<_>>()
+    };
+    let before = lib_calls(&world);
+    let shapes = fs::read_to_string(world.root.join("src/shapes.rs")).unwrap();
+
+    write_files(
+        &world.root,
+        &[("src/shapes.rs", &format!("{shapes}// edited\n"))],
+    );
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    let expected: Vec<_> = before
+        .iter()
+        .cloned()
+        .map(|mut call| {
+            if ["new", "navigation_at"].contains(&call[1].as_str()) {
+                call[3] = "Unknown".to_owned();
+            }
+            call
+        })
+        .collect();
+    assert_eq!(lib_calls(&world), expected);
+
+    // The impl gains a trait under the same method IDs: nothing keeps calling it direct.
+    write_files(
+        &world.root,
+        &[(
+            "src/shapes.rs",
+            &shapes.replace("impl Square {", "pub trait Nav {}\nimpl Nav for Square {"),
+        )],
+    );
+    world.republish_with_rejoin();
+    assert_eq!(lib_calls(&world), expected);
+
+    // The renamed method's declaration is gone, so the caller's call to it keeps no target.
+    write_files(
+        &world.root,
+        &[(
+            "src/shapes.rs",
+            &shapes.replace("navigation_at", "navigation_renamed"),
+        )],
+    );
+    world.republish_with_rejoin();
+    assert!(
+        lib_calls(&world)
+            .iter()
+            .filter(|call| call[1] == "navigation_at")
+            .all(|call| call[3] == "Unknown")
+    );
+    assert!(lib_calls(&world).contains(&[
+        "src/lib.rs".to_owned(),
+        "total".to_owned(),
+        "Resolved".to_owned(),
+        "Direct".to_owned()
+    ]));
+}
+
+/// #557: a witnessed LOCAL rejoin takes the same rule as a full one. Its reused rows are no
+/// destination classification of a target in the edited document, so the method's `direct`
+/// drops while the free function's holds.
+#[test]
+fn witnessed_local_rejoin_does_not_keep_a_method_direct_in_an_edited_document() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+            ],
+        )
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g) = (symbol("r()."), symbol("impl#[S]f()."), symbol("g()."));
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 15, 16], &[], &f, 0)
+                .occurrence(&[0, 20, 21], &[], &g, 0)
+                .symbol(&r, 17, &[]),
+            DocSpec::new("src/b.rs")
+                .occurrence(&[1, 12, 13], &[], &f, 1)
+                .occurrence(&[2, 3, 4], &[], &g, 1)
+                .symbol(&f, 26, &[])
+                .symbol(&g, 17, &[]),
+        ],
+    );
+    let descriptor = world.write(&fixture);
+    drop(world.publish(&descriptor).unwrap());
+    let calls = |world: &World| {
+        let head = world.store.index_baseline().unwrap();
+        rust_calls(world, &world.store.semantic_at(head).unwrap().call_bindings)
+    };
+    let call = |callee: &str, dispatch: &str| {
+        ["src/a.rs", callee, "Resolved", dispatch].map(str::to_owned)
+    };
+    assert_eq!(calls(&world), [call("f", "Direct"), call("g", "Direct")]);
+
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    write_files(
+        &world.root,
+        &[(
+            "src/b.rs",
+            "struct S;\nimpl T for S { fn f(&self) { } }\nfn g() { }\n",
+        )],
+    );
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(calls(&world), [call("f", "Unknown"), call("g", "Direct")]);
 }
 
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the
@@ -7241,7 +8192,12 @@ async fn each_language_selects_its_own_published_producer() {
     assert_eq!(view.semantic.producer_id.as_deref(), Some("rust-analyzer"));
     assert_eq!(view.semantic.note, None);
     let nodes: Vec<_> = view.nodes.iter().map(|n| n.id.clone()).collect();
-    assert_eq!(nodes, [run.clone(), double.clone(), saturating.clone()]);
+    let new = declaration_in(&world, "new", "src/lib.rs");
+    let add = declaration_in(&world, "add", "src/lib.rs");
+    assert_eq!(
+        nodes,
+        [run.clone(), new, add, double.clone(), saturating.clone()]
+    );
     assert!(
         view.nodes
             .iter()

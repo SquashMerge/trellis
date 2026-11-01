@@ -1599,32 +1599,141 @@ fn evaluate_with_layers_workers<'a>(
     check: &mut (impl FnMut() -> Result<()> + Send),
     workers: usize,
 ) -> Result<Evaluation<'a>> {
-    let limit = work::rules_limit(
-        snapshot.documents.len(),
-        work::snapshot_bytes(snapshot, check)?,
-    );
+    let base = prepare_with_workers(config, snapshot, paths, check, workers)?;
+    evaluate_prepared(config, &base, refs, paths, check)
+}
+
+/// What rule evaluation needs from a snapshot: the budget it sets and each document's
+/// declaration rows, so that later evaluations need no source (#556).
+pub(crate) struct RulesBase {
+    limit: usize,
+    source_set: Option<String>,
+    semantic: bool,
+    declarations: Vec<Value>,
+    test_declarations: Vec<Value>,
+    work_used: usize,
+}
+
+/// Evaluate every document's declaration rules once; `evaluate_prepared` selects from them.
+pub(crate) fn prepare(
+    config: &Config,
+    snapshot: &Snapshot,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<RulesBase> {
+    prepare_with_workers(
+        config,
+        snapshot,
+        &[],
+        check,
+        crate::parallel::default_workers(),
+    )
+}
+
+fn path_filter(config: &Config, paths: &[String]) -> Result<Vec<GlobSet>> {
     let path_values: Vec<_> = paths
         .iter()
         .map(|p| Spanned::new(0..0, p.clone()))
         .collect();
     let mut budget = 0;
-    let filter = path_values
+    path_values
         .iter()
         .map(|p| pattern(&config.text, p, true, &mut budget))
         .collect::<Result<Vec<_>>>()
-        .map_err(|_| anyhow::anyhow!("invalid_request: invalid rules source path glob"))?;
+        .map_err(|_| anyhow::anyhow!("invalid_request: invalid rules source path glob"))
+}
+
+fn prepare_with_workers(
+    config: &Config,
+    snapshot: &Snapshot,
+    paths: &[String],
+    check: &mut (impl FnMut() -> Result<()> + Send),
+    workers: usize,
+) -> Result<RulesBase> {
+    let limit = work::rules_limit(
+        snapshot.documents.len(),
+        work::snapshot_bytes(snapshot, check)?,
+    );
+    let filter = path_filter(config, paths)?;
+    let mut work = Work::new(limit);
+    let source_set = portable_source_set(config, snapshot, &mut work, check)?;
+    let inheritance = config
+        .roles
+        .values()
+        .any(|s| s.extends.is_some() || s.implements.is_some());
+    let mut source_bytes = 0usize;
+    let mut documents = Vec::new();
+    for doc in &snapshot.documents {
+        check()?;
+        if !glob_matches(&filter, &doc.key.path) {
+            continue;
+        }
+        source_bytes = source_bytes.saturating_add(doc.file.text.len());
+        ensure!(
+            source_bytes <= 256 * 1024 * 1024,
+            "bounded_work: selector total source bound"
+        );
+        documents.push(doc);
+    }
+    let mut targets: Targets<'_> = BTreeMap::new();
+    let semantic = snapshot
+        .documents
+        .iter()
+        .any(|doc| doc.semantic.producer_id.is_some());
+    if semantic && !config.rules.is_empty() {
+        for (index, doc) in snapshot.documents.iter().enumerate() {
+            for d in &doc.declarations {
+                check()?;
+                ensure!(work.charge(1), "bounded_work: rules selection budget");
+                targets.insert((index, d.syntax_id.as_str()), d);
+            }
+        }
+    }
+    let (declarations, test_declarations) = DocumentEvaluation {
+        config,
+        targets: &targets,
+        inheritance,
+        source_set,
+        #[cfg(test)]
+        before_document: None,
+    }
+    .run(&documents, &mut work, workers, check)?;
+    Ok(RulesBase {
+        limit,
+        source_set: source_set.map(str::to_owned),
+        semantic,
+        declarations,
+        test_declarations,
+        work_used: work.used,
+    })
+}
+
+/// Layer and external policy over `refs`, joined with the prepared declaration rows of the
+/// documents `paths` selects.
+pub(crate) fn evaluate_prepared<'a>(
+    config: &'a Config,
+    base: &RulesBase,
+    refs: &'a Projection,
+    paths: &[String],
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<Evaluation<'a>> {
+    let filter = path_filter(config, paths)?;
+    let source_set = base.source_set.as_deref();
+    let semantic = base.semantic;
     let modules = &refs.modules;
     let layer_patterns: usize = config
         .layers
         .values()
         .map(|layer| layer.patterns.len())
         .sum();
-    let mut work = Work::new(limit);
+    let mut work = Work::new(base.limit);
+    ensure!(
+        work.charge(base.work_used),
+        "bounded_work: rules document budget"
+    );
     ensure!(
         work.charge(modules.len().saturating_mul(layer_patterns)),
         "bounded_work: layer assignment pattern budget"
     );
-    let source_set = portable_source_set(config, snapshot, &mut work, check)?;
     let mut matcher = LayerMatcher::new(config);
     let mut unassigned = Vec::new();
     let mut unassigned_files = 0usize;
@@ -1800,49 +1909,21 @@ fn evaluate_with_layers_workers<'a>(
             }
         }
     }
-    let inheritance = config
-        .roles
-        .values()
-        .any(|s| s.extends.is_some() || s.implements.is_some());
-    let mut source_bytes = 0usize;
-    let mut documents = Vec::new();
-    for doc in &snapshot.documents {
-        check()?;
-        if !glob_matches(&filter, &doc.key.path) {
-            continue;
-        }
-        source_bytes = source_bytes.saturating_add(doc.file.text.len());
-        ensure!(
-            source_bytes <= 256 * 1024 * 1024,
-            "bounded_work: selector total source bound"
-        );
-        documents.push(doc);
-    }
-    let mut targets: Targets<'_> = BTreeMap::new();
-    let semantic = snapshot
-        .documents
-        .iter()
-        .any(|doc| doc.semantic.producer_id.is_some());
-    if semantic && !config.rules.is_empty() {
-        for (index, doc) in snapshot.documents.iter().enumerate() {
-            for d in &doc.declarations {
-                check()?;
-                ensure!(work.charge(1), "bounded_work: rules selection budget");
-                targets.insert((index, d.syntax_id.as_str()), d);
+    // Prepared rows carry their document in `target`.
+    for (prepared, rows) in [
+        (&base.declarations, &mut instances),
+        (&base.test_declarations, &mut test_only),
+    ] {
+        for row in prepared {
+            check()?;
+            let path = row["target"]["path"]
+                .as_str()
+                .context("store_unavailable: rule target path absent")?;
+            if glob_matches(&filter, path) {
+                rows.push(row.clone());
             }
         }
     }
-    let (declarations, test_declarations) = DocumentEvaluation {
-        config,
-        targets: &targets,
-        inheritance,
-        source_set,
-        #[cfg(test)]
-        before_document: None,
-    }
-    .run(&documents, &mut work, workers, check)?;
-    instances.extend(declarations);
-    test_only.extend(test_declarations);
     let sort_rows = |rows: &mut Vec<Value>| {
         rows.sort_by_cached_key(|row| {
             (
@@ -1871,7 +1952,7 @@ fn evaluate_with_layers_workers<'a>(
         limitations.push(crate::syntax_bounds::limitation(partial));
     }
     Ok(Evaluation {
-        data: json!({"rulesVersion":"rules:v2","indexGeneration":snapshot.pin.index_generation.to_string(),"indexRevision":snapshot.pin.index_revision,"rulesFile":descriptor(config),
+        data: json!({"rulesVersion":"rules:v2","indexGeneration":refs.data["indexGeneration"],"indexRevision":refs.data["indexRevision"],"rulesFile":descriptor(config),
         "counts":counts(&instances),"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"unassignedFileCount":unassigned_files,"externalPackages":external_packages,
         "partialFiles":partial_files,"limitations":limitations}),
         layers: assignments,
@@ -2121,6 +2202,39 @@ mod document_parallel_tests {
         ]);
         assert_eq!(snapshot.documents.len(), 2);
         (config, snapshot)
+    }
+
+    /// #556: rows prepared for every document select what a scoped evaluation returns.
+    #[test]
+    fn prepared_rows_select_what_a_scoped_evaluation_returns() {
+        let snapshot = snapshot(&[
+            ("src/lib.rs", "mod a; mod b;"),
+            ("src/a.rs", "pub fn a() {}"),
+            ("src/b.rs", "pub fn b() { crate::a::a(); }"),
+        ]);
+        let config = parse(
+            "version=1\n[layers.high]\norder=1\npaths=['src/b.rs']\n\
+             [layers.low]\norder=2\npaths=['src/a.rs']\n\
+             [roles.handler]\nselect={paths=['src/**'],name='*'}\n\
+             [roles.target]\nselect={paths=['src/a.rs']}\n\
+             [[rules]]\nid='calls'\nfor_each='handler'\nrequire=[{calls='target'}]\n",
+        )
+        .unwrap();
+        let prepared = prepare(&config, &snapshot, &mut || Ok(())).unwrap();
+        assert!(!prepared.declarations.is_empty());
+        for paths in [
+            vec![],
+            vec!["src/a.rs".to_owned()],
+            vec!["src/b.rs".to_owned()],
+            vec!["missing/**".to_owned()],
+        ] {
+            let refs = crate::references::project(&snapshot, &paths, 5, &mut || Ok(())).unwrap();
+            let scoped = evaluate(&config, &snapshot, &refs, &paths, &mut || Ok(())).unwrap();
+            let selected = evaluate_prepared(&config, &prepared, &refs, &paths, &mut || Ok(()))
+                .unwrap()
+                .data;
+            assert_eq!(scoped, selected, "{paths:?}");
+        }
     }
 
     #[test]

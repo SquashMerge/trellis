@@ -138,6 +138,10 @@ pub fn failure(id: &Value, error: &anyhow::Error) -> Value {
     if let Some(diagnostic) = diagnostic {
         envelope["error"]["diagnostic"] = diagnostic;
     }
+    if let Some(building) = error.downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
+    {
+        envelope["error"]["message"] = json!(building.message());
+    }
     envelope
 }
 

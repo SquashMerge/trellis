@@ -1575,16 +1575,16 @@ impl StagedJoin<'_> {
         rev: u8,
         document: &native::DocumentKey,
         syntax_id: &str,
-    ) -> Result<Vec<(bool, bool)>> {
+    ) -> Result<Vec<(bool, bool, bool)>> {
         self.ctx.charge(1)?;
         let mut statement = self.conn().prepare_cached(
-            "SELECT n.named, n.name_ok FROM nat_declarations n JOIN nat_docs d \
+            "SELECT n.named, n.name_ok, n.method FROM nat_declarations n JOIN nat_docs d \
              ON d.rev=n.rev AND d.ord=n.doc_ord WHERE n.rev=?1 AND d.language=?2 AND d.path=?3 AND n.syntax_id=?4",
         )?;
         Ok(statement
             .query_map(
                 params![rev, document.language, document.path, codec::sid(syntax_id)],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?
             .collect::<rusqlite::Result<_>>()?)
     }

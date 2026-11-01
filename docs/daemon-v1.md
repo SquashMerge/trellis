@@ -263,7 +263,8 @@ read names it in `partialFiles` with reason `oversized` or `not_utf8`. It could 
 anything, so it proves no binding absent, as for a file with a syntax error; for Java that leaves
 every package of its source set unknown. A SCIP artifact that names it is admitted with no
 claims for it, and while a source of a language is unread, a symbol the artifact never defines
-is unresolved rather than external in that language. It recovers when the file changes back. Config
+is unresolved rather than external in that language, and an unread Rust file a Cargo target
+reaches leaves every file of the workspace without a Cargo target. It recovers when the file changes back. Config
 inputs (the root `package.json`, `package-lock.json`, `Cargo.lock` and other root build and
 lock files, and nested `package.json` and `Cargo.toml` manifests) are read for dependency and
 package-root facts, not as source, so `--max-file-bytes` doesn't apply to them: each has its

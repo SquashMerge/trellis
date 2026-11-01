@@ -29,6 +29,9 @@ A measured call step may contain `callEvidence`:
   field of the selected binding's SCIP symbol (`version` null for `.`); absent for local or
   malformed symbols. It is a producer claim for in-context library lookup, never a target,
   lane or resolved library declaration.
+- Optional `dispatchTarget` `{id,name,kind,path}` (#557): only for a `dispatch` boundary with
+  an exact internal binding, the declaration it names (a trait, interface or prototype
+  method), not a runtime body. It takes no lane and never expands.
 - `target`: present only for a fresh exact resolved internal direct/constructor target
   located in this snapshot. It is the exact participant ID, not lexical receiver text.
 

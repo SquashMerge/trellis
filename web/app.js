@@ -901,7 +901,8 @@ async function refreshView() {
     }
   }
   if (section !== "files" && !$("treemap-panel").hidden) await treemap?.refresh();
-  else if (section !== "files" && !$("architecture-panel").hidden) await architecture?.refresh();
+  // Not awaited: Architecture may be building, and this view shows that itself (#556).
+  else if (section !== "files" && !$("architecture-panel").hidden) void architecture?.refresh();
   else if (section !== "files" && selectedMethod) await loadSequence();
   schedulePoll();
 }
@@ -1025,7 +1026,7 @@ async function setSection(name, view = null) {
     const cached = workspaceSource, surface = sectionSerial, session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
     const current = () => section === "diagrams" && surface === sectionSerial && session === epoch && root === selectedRootKey && sourceAtStart === sourceSerial && IndexPin.equal(cached?.data.revision, status?.revision);
     if (!$("treemap-panel").hidden) await treemap?.refresh();
-    else if (!$("architecture-panel").hidden) await architecture?.refresh();
+    else if (!$("architecture-panel").hidden) void architecture?.refresh();
     else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
     if (cached && current()) paintCachedSource(cached.data, cached.range, current, cached.range?.startLine || 1, cached.navigation?.snapshot?.());
     return;
@@ -1825,7 +1826,9 @@ async function revisionRead(path, current = () => true) {
   if (!entry) {
     entry = api(path, "GET", undefined);
     revisionReads.set(path, entry);
-    entry.catch(() => { if (revisionReads.get(path) === entry) revisionReads.delete(path); });
+    // A failed read and a `building` answer (#556) are not results of this revision.
+    const forget = () => { if (revisionReads.get(path) === entry) revisionReads.delete(path); };
+    entry.then(data => { if (data?.payload?.state === "building") forget(); }, forget);
   }
   const data = await entry;
   if (!current()) throw aborted();

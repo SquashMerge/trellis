@@ -1,4 +1,4 @@
-# JavaScript conformance corpus — native-v13 DRAFT
+# JavaScript conformance corpus — native-v15 DRAFT
 
 An independently authored event-processing workbench for #28: ten ES modules
 cover parsing, normalization, stages, editing, history and runtime extensions.
@@ -18,7 +18,7 @@ family, dropped record or artificial tagged-template gap is used to meet a floor
 - 10 production capability reports; every family is available with no gaps.
 - Two independent command runs are byte-identical. Semantic counts remain zero.
 
-The raw capture comes from Trellis's actual `trellis.native.syntax@native-v13`
+The raw capture comes from Trellis's actual `trellis.native.syntax@native-v15`
 extractor through the #95 `native-capture` command. It uses UTF-8 byte coordinates,
 not the old helper's UTF-16 offsets. Native identifier-site candidates carry no
 inferred semantic role or target. Narrow explicit renamed imports have measured
@@ -31,7 +31,34 @@ barrel. Zero calls is not unsupported. Annotations contain native coverage only;
 scenario arrays, semantic artifacts, dispositions, callable negatives and rooted
 answers are empty. `generated/manifest.json` selects the content-addressed bundle.
 
-## Current native-v13 recapture
+## Current native-v15 recapture
+
+The #576 slice (a source that wasn't read keeps only its file module and a coverage gap, and
+a file whose bytes equal its placeholder now measures the same way) re-ran the production
+`native-capture` command twice on these unchanged snapshots using pinned Rust 1.99.1 and
+`test-support`. Both outputs were byte-identical (SHA-256
+`5ccf4b7f2c9d12e9ecc913f5cca18be69f28eed45cfc59d62c5ff9b561727c87`). The compiled native extractor hash is
+`1349b2d70fb9e954065952c42e307fcf14910aa7c2b295152678c1056d701470`, pinned as
+`trellis-native-v15-javascript-test-support` in the hardware profile.
+
+JavaScript measurement is unchanged: only the producer version, extractor hash and
+occurrence IDs (which include the producer version) differ from the native-v14
+capture.
+
+## Historical native-v14 recapture
+
+The #557 slice (a Rust `impl Trait for Type` measures its trait in `Header.bases`)
+re-ran the production `native-capture` command twice on these unchanged snapshots
+using pinned Rust 1.99.1 and `test-support`. Both outputs were byte-identical
+(SHA-256 `0df4db6d0e354000a364814db5d4e19203694f4ad9ffa273fa88473150d509f9`). The compiled native extractor hash is
+`077ebac85b868be6c429bed60bbb00ecf9b4499349c5a41d4a8b7a9dbdc51b38`, pinned as
+`trellis-native-v14-javascript-test-support` in the hardware profile.
+
+JavaScript measurement is unchanged: only the producer version, extractor hash and
+occurrence IDs (which include the producer version) differ from the native-v13
+capture, and the scenario table below uses the new occurrence refs.
+
+## Historical native-v13 recapture
 
 The #564 slice (a document past its stored evidence budgets keeps only its file
 module and a coverage gap) re-ran the production `native-capture` command twice on
@@ -86,7 +113,7 @@ No executable, parser archive or fixture-local replacement extractor is vendored
 The obsolete TypeScript capture script and script-plus-parser archive pins are
 removed. F7's Python/tarfile reproducibility dependency no longer exists.
 
-## Reproduce the current native-v13 capture
+## Reproduce the current native-v15 capture
 
 The commands below reproduce the current capture, not the historical native-v10
 or native-v11 hashes above. From the repository root, use an owned target directory and the

@@ -122,7 +122,10 @@ async function published(config, callback, extra = new Map(), base = sources) {
 }
 async function architecture(selected, aggregate = "max", role = "production") {
   const query = new URLSearchParams({aggregate, role, workbench:"true", indexGeneration:selected.pin.indexGeneration, indexRevision:selected.pin.indexRevision});
-  return H.api(selected.server.base, selected.paths.token, "GET", H.scoped(selected.server.rootKey, `architecture?${query}`));
+  for (;;) {
+    const answer = await H.api(selected.server.base, selected.paths.token, "GET", H.scoped(selected.server.rootKey, `architecture?${query}`));
+    if (answer.data?.payload?.state !== "building") return answer;
+  }
 }
 const identityKey = identity => JSON.stringify([identity.sourceSetId, identity.language, identity.path, identity.sid]);
 const siteTotal = edges => edges.reduce((sum, edge) => sum + edge.count, 0);
@@ -412,6 +415,28 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.equal(await page.locator("#architecture-inspector").isVisible(), true);
   await noOverflow(page);
 }));
+
+test("Architecture shows the daemon's building state with progress, then the diagram", {timeout:240000}, async () => {
+  await published(rules, async selected => {
+    const page = selected.page;
+    await ready(page);
+    let held = 2;
+    await page.route(url => new URL(url).pathname.endsWith("/architecture"), async route => {
+      if (held-- <= 0) return route.continue();
+      await route.fulfill({status:202, contentType:"application/json", body:JSON.stringify({catchingUp:false, payload:{
+        state:"building", ...selected.pin, retryAfterMs:400, progress:{phase:"reading", completed:300, total:604}}})});
+    });
+    await page.locator("#architecture-aggregate").selectOption("sum");
+    const status = page.locator("#architecture-state");
+    await status.filter({hasText:"Building Architecture for this revision: reading indexed files 300 of 604"}).waitFor();
+    assert.equal(await page.locator("#architecture-diagram").getAttribute("aria-busy"), "true");
+    assert.equal(await page.locator("#error").isVisible(), false);
+    await capture(page, "architecture-building");
+    await ready(page);
+    assert.equal(await status.textContent(), "");
+    assert.equal(held, -1, "the page asked again until it had the result");
+  });
+});
 
 test("Architecture rejects a route-gated production response after all-callable heat wins", {timeout:240000}, async () => published(rules, async selected => {
   const {page} = selected;

@@ -827,6 +827,8 @@ pub fn evaluate(
         depth: 0,
     }];
     let mut admitted = BTreeSet::from([request.root_syntax_id.clone()]);
+    // Declarations admitted only as a dispatch boundary's target (#557): never expanded.
+    let mut declared_only = BTreeSet::new();
     let mut edges = Vec::new();
     let mut frontier = Vec::new();
     let mut filtered_hints: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -840,8 +842,11 @@ pub fn evaluate(
             let node = &nodes[head];
             let node_id = node.declaration.syntax_id.clone();
             let node_depth = node.depth;
-            let doc = source.document(&node.declaration.document)?;
             head += 1;
+            if declared_only.contains(&node_id) {
+                continue;
+            }
+            let doc = source.document(&node.declaration.document)?;
             let mut local: Vec<_> = doc
                 .calls
                 .get(&node_id)
@@ -933,7 +938,7 @@ pub fn evaluate(
                     owner_depth: node_depth,
                     owner_document: doc.key.clone(),
                     group,
-                    target: (reason == BoundaryReason::None)
+                    target: matches!(reason, BoundaryReason::None | BoundaryReason::Dispatch)
                         .then_some(exact_target)
                         .flatten()
                         .map(|(id, key)| (id.clone(), key.clone())),
@@ -963,11 +968,21 @@ pub fn evaluate(
             break;
         }
         let mut candidate = pending.remove(0);
+        // A dispatch boundary shows its exact declaration as its target and stays a boundary:
+        // no fan-out, no expansion (#557). It ranks after every eligible edge, so no later
+        // edge can need to expand a declaration admitted this way.
+        let boundary = candidate.edge.boundary_reason == BoundaryReason::Dispatch;
         if let Some((id, key)) = candidate.target {
             if admitted.contains(&id) {
                 candidate.edge.to = Some(id);
-                candidate.edge.visit = Visit::Seen;
+                if !boundary {
+                    candidate.edge.visit = Visit::Seen;
+                }
             } else if nodes.len() as u64 == request.max_nodes {
+                if boundary {
+                    edges.push(candidate.edge);
+                    continue;
+                }
                 candidate.edge.boundary_reason = BoundaryReason::NodeLimit;
                 frontier.push(Frontier {
                     reason: FrontierReason::NodeLimit,
@@ -989,8 +1004,12 @@ pub fn evaluate(
                     declaration,
                     depth: candidate.owner_depth + 1,
                 });
-                candidate.edge.to = Some(id);
-                candidate.edge.visit = Visit::New;
+                candidate.edge.to = Some(id.clone());
+                if boundary {
+                    declared_only.insert(id);
+                } else {
+                    candidate.edge.visit = Visit::New;
+                }
             }
         }
         edges.push(candidate.edge);
@@ -1057,7 +1076,8 @@ fn shortest_depths(nodes: &mut [GraphNode], edges: &[GraphEdge]) {
     let mut depths = BTreeMap::from([(nodes[0].declaration.syntax_id.clone(), 0)]);
     loop {
         let mut changed = false;
-        for edge in edges {
+        // A boundary is not an included path: only traversed edges set a traversed depth.
+        for edge in edges.iter().filter(|edge| edge.visit != Visit::Boundary) {
             if let (Some(from), Some(to)) = (depths.get(&edge.from).copied(), &edge.to)
                 && depths.get(to).is_none_or(|depth| *depth > from + 1)
             {
@@ -1067,6 +1087,16 @@ fn shortest_depths(nodes: &mut [GraphNode], edges: &[GraphEdge]) {
         }
         if !changed {
             break;
+        }
+    }
+    // A declaration reached only by dispatch boundaries sits one past its nearest owner.
+    let traversed: BTreeSet<String> = depths.keys().cloned().collect();
+    for edge in edges.iter().filter(|edge| edge.visit == Visit::Boundary) {
+        if let (Some(from), Some(to)) = (depths.get(&edge.from).copied(), &edge.to)
+            && !traversed.contains(to)
+        {
+            let depth = depths.entry(to.clone()).or_insert(from + 1);
+            *depth = (*depth).min(from + 1);
         }
     }
     for node in nodes {

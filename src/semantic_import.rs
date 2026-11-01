@@ -72,6 +72,16 @@ struct MeasuredAnchors<'a> {
 }
 
 impl<'a> MeasuredFacts<'a> {
+    /// These facts over `destination`'s whole manifest: reused documents have no facts here,
+    /// only their native document.
+    pub(crate) fn over_manifest(&self, destination: &'a native::Artifact) -> Self {
+        let mut facts = self.clone();
+        for doc in &destination.revision.documents {
+            facts.documents.insert(doc.key.clone(), doc);
+        }
+        facts
+    }
+
     pub fn new(
         native: &'a native::Artifact,
         sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
@@ -578,8 +588,8 @@ pub(crate) fn compose_join(
     })
 }
 
-type Position = (i32, i32);
-type Endpoints = (Position, Position);
+pub(crate) type Position = (i32, i32);
+pub(crate) type Endpoints = (Position, Position);
 type CoordinateMap = BTreeMap<Position, usize>;
 
 fn occurrence_endpoints(claim: &CapturedClaim, admitted_encoding: u8) -> Result<(u8, Endpoints)> {
@@ -652,6 +662,25 @@ fn range_endpoints(
         )
     };
     Ok((encoding, endpoints))
+}
+
+/// The normalized endpoints of a stored occurrence's canonical envelope. One span has several
+/// valid wire shapes, each kept verbatim in the envelope, so spans are compared only as these.
+pub(crate) fn stored_occurrence_endpoints(
+    envelope: &serde_json::Value,
+    admitted_encoding: u8,
+) -> Result<Endpoints> {
+    let position_encoding = u8::try_from(
+        envelope["positionEncoding"]
+            .as_u64()
+            .context("raw position encoding")?,
+    )?;
+    let (_, endpoints) = range_endpoints(
+        &envelope["raw"]["range"],
+        position_encoding,
+        admitted_encoding,
+    )?;
+    Ok(endpoints)
 }
 
 /// Recognize the pinned producers' raw file/module markers, not a measured name anchor.
@@ -1167,6 +1196,11 @@ pub struct JoinedFacts {
     pub type_relationships: Vec<semantic::TypeRelationship>,
     pub joins: Vec<(String, semantic::Join)>,
     pub diagnostics: BTreeMap<native::DocumentKey, BTreeSet<String>>,
+    /// Raw proofs of a reused document fused into another proof's reference row: they keep
+    /// their minted proof but own no row.
+    pub fused_proofs: BTreeSet<String>,
+    /// The proofs of a reference row that a fused call proof also claims.
+    pub fused_calls: BTreeSet<String>,
 }
 
 /// Classify admitted occurrence claims against a measured native snapshot. The caller owns
@@ -1272,8 +1306,9 @@ struct MeasuredOccurrence {
 }
 
 /// How a call's exact bound target declaration can be called, measured from its native
-/// declaration kind alone (owner ruling 2026-10-30, #470). Only JavaScript and Rust are
-/// classified; every other declaration is `Other`.
+/// declaration (owner rulings 2026-10-30, #470, and 2026-10-31, #557). Python and a Rust
+/// `impl Trait for Type` method are not classified; they, like every other declaration, are
+/// `Other`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum TargetCallable {
     #[default]
@@ -1283,10 +1318,17 @@ pub(super) enum TargetCallable {
     FreeFunction = 1,
     /// A JavaScript class, or its `constructor` method.
     Constructor = 2,
+    /// One fixed body: a Rust method of an inherent `impl`, or a Java `static`, `private` or
+    /// `final` method.
+    FixedMethod = 3,
+    /// A declaration, not the runtime body: a Rust `trait` method, a JavaScript method other
+    /// than `constructor`, or any other Java method.
+    DynamicMethod = 4,
 }
 
 impl TargetCallable {
-    fn of(declaration: &native::Declaration) -> Self {
+    /// `parent` is the immediate parent declaration of a Rust `implementation` method.
+    fn of(declaration: &native::Declaration, parent: Option<&native::Declaration>) -> Self {
         match (
             declaration.document.language.as_str(),
             declaration.kind.as_str(),
@@ -1296,7 +1338,59 @@ impl TargetCallable {
             ("javascript", "method") if declaration.name.as_deref() == Some("constructor") => {
                 Self::Constructor
             }
+            ("javascript", "method") => Self::DynamicMethod,
+            // The only native `type` that holds a method is a trait.
+            ("rust", "method")
+                if declaration
+                    .ancestors
+                    .last()
+                    .is_some_and(|parent| parent.kind == "type") =>
+            {
+                Self::DynamicMethod
+            }
+            // `impl Type` measures no trait base; `impl Trait for Type` stays unclassified.
+            ("rust", "method")
+                if parent.is_some_and(|parent| {
+                    parent.kind == "implementation" && parent.header.bases.is_empty()
+                }) =>
+            {
+                Self::FixedMethod
+            }
+            ("java", "method")
+                if declaration.header.modifiers.iter().any(|modifier| {
+                    matches!(modifier.as_str(), "static" | "private" | "final")
+                }) =>
+            {
+                Self::FixedMethod
+            }
+            ("java", "method") => Self::DynamicMethod,
             _ => Self::Other,
+        }
+    }
+
+    /// The immediate parent a Rust method's classification reads, which is only its
+    /// `implementation`: a method's measured ancestors name the parent's identity input.
+    fn parent<'s, S: JoinStore>(
+        store: &'s S,
+        declaration: &native::Declaration,
+    ) -> Result<Option<std::borrow::Cow<'s, native::Declaration>>> {
+        let document = &declaration.document;
+        match declaration.ancestors.split_last() {
+            Some((parent, ancestors))
+                if document.language == "rust"
+                    && declaration.kind == "method"
+                    && parent.kind == "implementation" =>
+            {
+                let id = native_ids::syntax_id(&serde_json::json!({
+                    "sourceSet": store.source_set_id(),
+                    "path": document.path,
+                    "language": document.language,
+                    "ancestors": ancestors,
+                    "declaration": parent,
+                }))?;
+                store.declaration_of(document, &id)
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1305,6 +1399,8 @@ impl TargetCallable {
             0 => Self::Other,
             1 => Self::FreeFunction,
             2 => Self::Constructor,
+            3 => Self::FixedMethod,
+            4 => Self::DynamicMethod,
             _ => anyhow::bail!("corrupt staged target callable"),
         })
     }
@@ -1321,7 +1417,9 @@ enum CallShape {
     Path,
     /// A JavaScript `new` expression whose constructor is an identifier or dotted name.
     New,
-    /// Member or method-call syntax, a compound callee, or anything not proved above.
+    /// The callee token follows a `.`: `x.m()`, `self.m()`, `a?.b()`, Java `this.m()`.
+    Member,
+    /// A compound callee, a call without a measured callee token, or anything not proved above.
     Other,
 }
 
@@ -1350,6 +1448,7 @@ fn call_shape(language: &str, call: &native::Call, source: &[u8]) -> CallShape {
             {
                 CallShape::New
             }
+            _ if member_prefix(prefix) => CallShape::Member,
             _ => CallShape::Other,
         },
         // A path callee's native token is its `scoped_identifier` name, so the prefix is path
@@ -1365,23 +1464,36 @@ fn call_shape(language: &str, call: &native::Call, source: &[u8]) -> CallShape {
         {
             CallShape::Path
         }
+        "rust" | "java" if member_prefix(prefix) => CallShape::Member,
         _ => CallShape::Other,
     }
 }
 
-/// A call binding's dispatch (owner ruling 2026-10-30, #470), from the measured native call
-/// shape and the exact bound target's declaration kind only: a plain JavaScript call, or a
-/// plain or path Rust call, to a free function is `direct`; a JavaScript `new` of a class or
-/// its constructor is `constructor`; everything else, member calls included, stays `unknown`.
+/// A call whose callee token directly follows a `.`. The receiver before it can be any
+/// expression; only the separator is read.
+fn member_prefix(prefix: &[u8]) -> bool {
+    prefix.trim_ascii_end().ends_with(b".")
+}
+
+/// A call binding's dispatch (owner rulings 2026-10-30, #470, and 2026-10-31, #557), from the
+/// measured native call shape and the exact bound target's native declaration only: a plain
+/// JavaScript call, or a plain or path Rust call, to a free function is `direct`, and so is a
+/// Rust member or path call to an inherent method and a Java plain or member call to a
+/// `static`, `private` or `final` method; a JavaScript `new` of a class or its constructor is
+/// `constructor`; a Rust trait method, a JavaScript member call to a method and any other Java
+/// method call is `dynamic`; everything else stays `unknown`.
 fn call_dispatch(language: &str, shape: CallShape, callable: TargetCallable) -> semantic::Dispatch {
+    use CallShape::{Member, New, Path, Plain};
+    use TargetCallable::{Constructor, DynamicMethod, FixedMethod, FreeFunction};
     match (language, shape, callable) {
-        ("javascript", CallShape::Plain, TargetCallable::FreeFunction)
-        | ("rust", CallShape::Plain | CallShape::Path, TargetCallable::FreeFunction) => {
-            semantic::Dispatch::Direct
-        }
-        ("javascript", CallShape::New, TargetCallable::Constructor) => {
-            semantic::Dispatch::Constructor
-        }
+        ("javascript", Plain, FreeFunction)
+        | ("rust", Plain | Path, FreeFunction)
+        | ("rust", Member | Path, FixedMethod)
+        | ("java", Plain | Member, FixedMethod) => semantic::Dispatch::Direct,
+        ("javascript", New, Constructor) => semantic::Dispatch::Constructor,
+        ("javascript", Member, DynamicMethod)
+        | ("rust", Member | Path, DynamicMethod)
+        | ("java", Plain | Member, DynamicMethod) => semantic::Dispatch::Dynamic,
         _ => semantic::Dispatch::Unknown,
     }
 }
@@ -1394,7 +1506,17 @@ pub(super) fn settled_dispatch(
     joined_target: Option<&semantic::Target>,
     settled: &semantic::CallBinding,
 ) -> semantic::Dispatch {
-    match (joined_target, &settled.declared_target) {
+    if resolves_to(joined_target, settled) {
+        joined
+    } else {
+        semantic::Dispatch::Unknown
+    }
+}
+
+/// Whether the settled row still resolves, with a verified target, to `joined_target`.
+fn resolves_to(joined_target: Option<&semantic::Target>, settled: &semantic::CallBinding) -> bool {
+    matches!(
+        (joined_target, &settled.declared_target),
         (
             Some(semantic::Target::Internal {
                 syntax_id: a,
@@ -1409,29 +1531,44 @@ pub(super) fn settled_dispatch(
         ) if settled.resolution == semantic::Resolution::Resolved
             && settled.stale_target == Some(false)
             && a == b
-            && x == y =>
-        {
-            joined
-        }
-        _ => semantic::Dispatch::Unknown,
-    }
+            && x == y
+    )
 }
 
 /// A rejoined call's dispatch: the classification of whichever join, destination first then
 /// captured, was made against the settled target. A rejoin can settle a call on a captured
 /// target retargeted to the destination (its syntax ID verified unchanged) that the
 /// destination join alone did not resolve; the call's document bytes are unchanged, so the
-/// captured shape and target kind still hold.
+/// captured shape and target kind still hold. A method's `direct` is the exception: the facts
+/// behind it, its `impl`'s bases and its modifiers, are outside its syntax ID, so it does not
+/// survive without a destination classification (#557). `target_is_method` reads the
+/// destination's declaration of the settled target.
 pub(super) fn rejoined_dispatch(
-    joins: [Option<(semantic::Dispatch, Option<&semantic::Target>)>; 2],
+    destination: Option<(semantic::Dispatch, Option<&semantic::Target>)>,
+    captured: Option<(semantic::Dispatch, Option<&semantic::Target>)>,
     settled: &semantic::CallBinding,
-) -> semantic::Dispatch {
-    joins
-        .into_iter()
-        .flatten()
-        .map(|(dispatch, target)| settled_dispatch(dispatch, target, settled))
-        .find(|dispatch| *dispatch != semantic::Dispatch::Unknown)
-        .unwrap_or(semantic::Dispatch::Unknown)
+    target_is_method: impl FnOnce(&str, &native::DocumentKey) -> Result<bool>,
+) -> Result<semantic::Dispatch> {
+    if let Some((dispatch, target)) = destination
+        && resolves_to(target, settled)
+    {
+        return Ok(dispatch);
+    }
+    let Some((dispatch, target)) = captured.filter(|(_, target)| resolves_to(*target, settled))
+    else {
+        return Ok(semantic::Dispatch::Unknown);
+    };
+    if dispatch == semantic::Dispatch::Direct
+        && let Some(semantic::Target::Internal {
+            syntax_id,
+            document,
+            ..
+        }) = target
+        && target_is_method(syntax_id, document)?
+    {
+        return Ok(semantic::Dispatch::Unknown);
+    }
+    Ok(dispatch)
 }
 
 fn measure_occurrence<S: JoinStore>(
@@ -1462,7 +1599,8 @@ fn measure_occurrence<S: JoinStore>(
         let candidate = store
             .declaration_of(doc, &binding.candidate_ids[0])?
             .context("missing exact native declaration")?;
-        callable = TargetCallable::of(&candidate);
+        let parent = TargetCallable::parent(store, &candidate)?;
+        callable = TargetCallable::of(&candidate, parent.as_deref());
         // A stated SCIP kind must agree with the measured native kind. An unspecified kind
         // (`0`, as scip-typescript 0.4.0 emits for every symbol) states nothing to conflict,
         // so it defers to the measured native kind of this exact, authenticated target (#473).
@@ -1479,7 +1617,9 @@ fn measure_occurrence<S: JoinStore>(
                 {
                     matches!(kind, 9 | 26)
                 }
-                "method" => kind == 26,
+                // rust-analyzer 1.98.1 states `TraitMethod` for a bodiless trait method and
+                // `StaticMethod` for an associated function without `self` (#557).
+                "method" => matches!(kind, 26 | 70 | 80),
                 _ => true,
             });
         if compatible {
@@ -3138,12 +3278,21 @@ fn direct_script_types(
     })
 }
 
-pub(crate) fn original_associations_from_selected(
+/// The original associations of one reused document, keyed by raw proof, from its admitted
+/// tuple. `inventory` holds the document's claims. A claim that authored nothing was unmatched
+/// or unsupported at admission and stays so against the same document version. `None` sends
+/// the rejoin to FULL when a stored row cannot be tied to one claim.
+pub(crate) fn original_document_associations(
     snapshot: &semantic::SemanticSnapshot,
     inventory: &crate::scip_raw::ProofInventory,
     producer_id: &str,
+    document: &native::DocumentKey,
 ) -> Option<JoinedFacts> {
     let mut by_provenance = BTreeMap::new();
+    let mut kinds = BTreeMap::new();
+    // One raw proof can stand behind several evidence kinds: a definition's binding and its
+    // reference. A proof is fused when a kind of it has no row.
+    let mut unclaimed = BTreeSet::new();
     let proofs = inventory.proof_lookup();
     for row in snapshot
         .provenance
@@ -3159,21 +3308,20 @@ pub(crate) fn original_associations_from_selected(
             return None;
         }
         by_provenance.insert(row.id.as_str(), derived.provenance_id.as_str());
-    }
-    let expected: BTreeSet<_> = inventory
-        .claims
-        .iter()
-        .map(|claim| claim.proof_id.as_str())
-        .collect();
-    let observed: BTreeSet<_> = by_provenance.values().copied().collect();
-    if expected != observed {
-        return None;
+        kinds.insert(row.id.as_str(), row.evidence_kind);
+        unclaimed.insert((derived.provenance_id.as_str(), row.evidence_kind));
     }
     let mut facts = JoinedFacts::default();
+    let mut claimed = |id: &str| {
+        if let (Some(raw), Some(kind)) = (by_provenance.get(id), kinds.get(id)) {
+            unclaimed.remove(&(*raw, *kind));
+        }
+    };
     for row in &snapshot.symbols {
         if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
+            claimed(&row.provenance_id);
             facts.symbols.push(value);
         }
     }
@@ -3181,6 +3329,7 @@ pub(crate) fn original_associations_from_selected(
         if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
+            claimed(&row.provenance_id);
             facts.declaration_bindings.push(value);
         }
     }
@@ -3191,6 +3340,7 @@ pub(crate) fn original_associations_from_selected(
             }
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
+            claimed(&row.provenance_id);
             facts
                 .reference_claims
                 .insert((*raw).to_owned(), value.clone());
@@ -3199,8 +3349,28 @@ pub(crate) fn original_associations_from_selected(
     }
     for row in &snapshot.call_bindings {
         if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
+            if !facts.reference_claims.contains_key(*raw) {
+                // The call's reference was fused into another proof's row at the call's span.
+                let anchor = &row.join.anchor;
+                let mut reference = facts
+                    .references
+                    .iter()
+                    .find(|reference| {
+                        reference.roles.contains(&semantic::Role::Call)
+                            && (reference.range == anchor.range
+                                || (anchor.kind == semantic::JoinKind::Invocation
+                                    && anchor.range.start <= reference.range.start
+                                    && reference.range.end <= anchor.range.end))
+                    })?
+                    .clone();
+                facts.fused_calls.insert(reference.provenance_id.clone());
+                facts.fused_calls.insert((*raw).to_owned());
+                reference.provenance_id = (*raw).to_owned();
+                facts.reference_claims.insert((*raw).to_owned(), reference);
+            }
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
+            claimed(&row.provenance_id);
             facts.call_bindings.push(value);
         }
     }
@@ -3208,44 +3378,30 @@ pub(crate) fn original_associations_from_selected(
         if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
+            claimed(&row.provenance_id);
             facts.type_relationships.push(value);
         }
     }
-    // A selected tuple is not a complete original inventory when claims were
-    // fused, omitted, unsupported or unmatched. Fall back instead of guessing.
-    let fact_proofs: BTreeSet<_> = facts
-        .symbols
-        .iter()
-        .map(|row| row.provenance_id.as_str())
-        .chain(
-            facts
-                .declaration_bindings
-                .iter()
-                .map(|row| row.provenance_id.as_str()),
-        )
-        .chain(facts.reference_claims.keys().map(String::as_str))
-        .chain(
-            facts
-                .call_bindings
-                .iter()
-                .map(|row| row.provenance_id.as_str()),
-        )
-        .chain(
-            facts
-                .type_relationships
-                .iter()
-                .map(|row| row.provenance_id.as_str()),
-        )
-        .collect();
-    (expected == fact_proofs).then_some(facts)
+    for (raw, kind) in unclaimed {
+        if kind != semantic::EvidenceKind::SemanticReference {
+            return None;
+        }
+        facts.fused_proofs.insert(raw.to_owned());
+    }
+    if snapshot.coverage.iter().any(|row| {
+        row.reasons
+            .as_ref()
+            .is_some_and(|reasons| reasons.captured_diagnostics)
+    }) {
+        facts.diagnostics.insert(document.clone(), BTreeSet::new());
+    }
+    Some(facts)
 }
 
+/// The internal targets `facts` name.
 pub(crate) fn required_original_targets(
-    snapshot: &semantic::SemanticSnapshot,
-    inventory: &crate::scip_raw::ProofInventory,
-    producer_id: &str,
-) -> Option<BTreeSet<(native::DocumentKey, String)>> {
-    let facts = original_associations_from_selected(snapshot, inventory, producer_id)?;
+    facts: &JoinedFacts,
+) -> BTreeSet<(native::DocumentKey, String)> {
     let mut keys = BTreeSet::new();
     let mut add = |target: &semantic::Target| {
         if let semantic::Target::Internal {
@@ -3285,7 +3441,7 @@ pub(crate) fn required_original_targets(
         add(&row.source);
         add(&row.target);
     }
-    Some(keys)
+    keys
 }
 
 fn reuse_captured_source_associations(
@@ -3326,6 +3482,16 @@ fn reuse_captured_source_associations(
     facts
         .call_bindings
         .retain(|row| is_reused(&row.join.anchor.document));
+    // A reused row is no destination classification of a target outside the reused documents:
+    // the rejoin takes the captured one under its own rule, as a full rejoin would (#557).
+    for row in &mut facts.call_bindings {
+        if matches!(
+            &row.declared_target,
+            Some(semantic::Target::Internal { document, .. }) if !is_reused(document)
+        ) {
+            row.declared_target = None;
+        }
+    }
     facts.type_relationships.retain(|row| {
         proof_documents
             .get(row.provenance_id.as_str())
@@ -3777,6 +3943,7 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
         unsupported_claims,
         unsupported_documents,
         &mut publication,
+        None,
     )?;
     Ok(RejoinResult {
         publication,
@@ -3908,7 +4075,7 @@ fn document_coordinates<'c>(
     Ok(maps)
 }
 
-fn empty_publication(producer: &semantic::Producer) -> semantic::SemanticPublication {
+pub(crate) fn empty_publication(producer: &semantic::Producer) -> semantic::SemanticPublication {
     semantic::SemanticPublication {
         producers: vec![producer.clone()],
         coverage: Vec::new(),
@@ -3980,6 +4147,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     unsupported_claims: BTreeSet<String>,
     unsupported_documents: BTreeMap<native::DocumentKey, [u64; 4]>,
     sink: &mut impl PublicationSink,
+    scope: Option<&WitnessScope>,
 ) -> Result<serde_json::Value> {
     let mut captured_targets: BTreeMap<(native::DocumentKey, String), Vec<semantic::Target>> =
         BTreeMap::new();
@@ -4027,11 +4195,12 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
                 .map(|id| (row.join.anchor.document.clone(), id.clone()))
         })
         .collect();
+    let internal_symbols =
+        scope.map_or(&captured_internal_symbols, |scope| &scope.internal_symbols);
+    let prior_declarations = scope.map_or(&prior_declarations, |scope| &scope.declarations);
     let retarget = |target: &mut semantic::Target| -> bool {
         match target {
-            semantic::Target::External { symbol }
-                if captured_internal_symbols.contains(&symbol.symbol) =>
-            {
+            semantic::Target::External { symbol } if internal_symbols.contains(&symbol.symbol) => {
                 false
             }
             semantic::Target::Internal {
@@ -4099,6 +4268,9 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     };
     let facts = destination;
     let mut provenance_sources = BTreeSet::<(String, semantic::EvidenceKind)>::new();
+    for raw_id in &captured.fused_proofs {
+        provenance_sources.insert((raw_id.clone(), semantic::EvidenceKind::SemanticReference));
+    }
     let mut symbol_rows = Vec::new();
     for mut symbol in facts.symbols {
         let raw = filtered_index.proof(&symbol.provenance_id)?;
@@ -4295,6 +4467,18 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     }
     let references_by_id: BTreeMap<_, _> =
         references.iter().map(|row| (row.id.clone(), row)).collect();
+    let target_is_method = |syntax_id: &str, document: &native::DocumentKey| {
+        Ok(match target_projection {
+            Some(projection) => projection
+                .get(&(document.clone(), syntax_id.to_owned()))
+                .is_some_and(|declaration| declaration.kind == "method"),
+            None => r2
+                .declarations_by_id(syntax_id)
+                .iter()
+                .any(|d| d.document == *document && d.kind == "method"),
+        })
+    };
+    let mut rejoin_failure = None;
     calls.retain_mut(|call| {
         let Some(reference) = accepted_reference_ids
             .get(&call.provenance_id)
@@ -4312,9 +4496,15 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             .get(&call.provenance_id)
             .map(|(dispatch, target)| (*dispatch, target.as_ref()));
         let original = captured_dispatch.get(call.provenance_id.as_str()).copied();
-        call.dispatch = rejoined_dispatch([destination, original], call);
+        match rejoined_dispatch(destination, original, call, target_is_method) {
+            Ok(dispatch) => call.dispatch = dispatch,
+            Err(error) => rejoin_failure = Some(error),
+        }
         true
     });
+    if let Some(error) = rejoin_failure {
+        return Err(error);
+    }
     let eligible_proofs: BTreeSet<_> = filtered
         .claims
         .iter()
@@ -4344,7 +4534,10 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         }
     }
     let mut provenance = Vec::new();
-    let destination_manifest_hash = manifest_hash(&destination_native.revision);
+    let destination_manifest_hash = scope.map_or_else(
+        || manifest_hash(&destination_native.revision),
+        |scope| scope.destination_manifest_hash.clone(),
+    );
     let mut ids = BTreeMap::new();
     for (raw_id, kind) in provenance_sources {
         let claim = raw_index
@@ -4669,46 +4862,81 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     Ok(report)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn rejoin_inventory_with_original_witness(
-    inventory: &crate::scip_raw::ProofInventory,
-    captured_native: &native::Artifact,
-    destination_native: &native::Artifact,
-    producer: semantic::Producer,
-    basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
-    original: &semantic::SemanticSnapshot,
-    reusable: &BTreeSet<native::DocumentKey>,
-    current_targets: &BTreeMap<(native::DocumentKey, String), semantic::TargetDeclaration>,
-    shared_changed_index: &MeasuredFacts<'_>,
-) -> Result<Option<RejoinResult>> {
-    if inventory.source_manifest_hash != manifest_hash(&captured_native.revision)
-        || captured_native.revision.source_set_id != destination_native.revision.source_set_id
-    {
-        return Ok(None);
-    }
-    let Some(captured) = original_associations_from_selected(original, inventory, &producer.id)
-    else {
-        return Ok(None);
-    };
+/// What a one-document witnessed rejoin needs from the whole captured publication.
+pub(crate) struct WitnessScope {
+    /// Every symbol with a captured internal declaration: an external target naming one is an
+    /// internal target that went absent, never a genuine external.
+    pub internal_symbols: BTreeSet<String>,
+    /// The captured measured declarations the rejoin has asked about, as `(document, syntax
+    /// ID)`: a target's declaration must have been measured at the capture.
+    pub declarations: BTreeSet<(native::DocumentKey, String)>,
+    pub destination_manifest_hash: String,
+}
+
+/// One destination document of a witnessed rejoin.
+pub(crate) struct WitnessedRejoin<'a> {
+    pub document: &'a native::DocumentKey,
+    /// The document's claims, exclusions and capped mark.
+    pub inventory: &'a crate::scip_raw::ProofInventory,
+    /// The captured and destination headers, each listing just this document (the captured one
+    /// none when the document was not captured).
+    pub captured_native: &'a native::Artifact,
+    pub destination_native: &'a native::Artifact,
+    pub producer: &'a semantic::Producer,
+    pub basis: &'a BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
+    /// The document's original associations when it is reused; `None` when it changed.
+    pub reused: Option<JoinedFacts>,
+    /// The native gap counts its admission recorded.
+    pub gaps: [u64; 4],
+    pub current_targets: &'a BTreeMap<(native::DocumentKey, String), semantic::TargetDeclaration>,
+    pub destination: &'a MeasuredFacts<'a>,
+    pub scope: &'a WitnessScope,
+}
+
+/// One document's rejoin.
+pub(crate) struct DocumentRejoin {
+    pub publication: semantic::SemanticPublication,
+    /// The reference proofs an absent target dropped, when the document holds fused proofs: a
+    /// row fused from several claims keeps only its merged targets and roles, so dropping one
+    /// claim of it cannot be told from here. The caller compares their spans.
+    pub dropped: BTreeSet<String>,
+    pub fused: BTreeSet<String>,
+}
+
+/// Rejoins one document from its admitted associations against the current targets. `None`
+/// sends the rejoin to FULL: a target went absent under a fused call.
+pub(crate) fn rejoin_document_with_witness(
+    rejoin: WitnessedRejoin<'_>,
+) -> Result<Option<DocumentRejoin>> {
+    let WitnessedRejoin {
+        document,
+        inventory,
+        captured_native,
+        destination_native,
+        producer,
+        basis,
+        reused,
+        gaps,
+        current_targets,
+        destination,
+        scope,
+    } = rejoin;
+    let is_reused = reused.is_some();
+    let captured = reused.unwrap_or_default();
+    let reusable = BTreeSet::from_iter(is_reused.then(|| document.clone()));
     let raw_index = ProofIdentityIndex::new(inventory)?;
     let mut filtered = inventory.clone();
-    filtered.claims.retain(|claim| {
-        reusable
-            .iter()
-            .any(|doc| doc.language == claim.language && doc.path == claim.path)
-    });
+    if !is_reused {
+        filtered.claims.clear();
+    }
     let filtered_index = ProofIdentityIndex::new(&filtered)?;
-    let destination = reuse_captured_source_associations(
+    let joined = reuse_captured_source_associations(
         &captured,
-        reusable,
+        &reusable,
         inventory,
         &destination_native.revision.source_set_id,
         &destination_native.revision.id,
     );
-    let mut r2 = shared_changed_index.clone();
-    for doc in &destination_native.revision.documents {
-        r2.documents.insert(doc.key.clone(), doc);
-    }
     let exclusions: BTreeMap<_, _> = inventory
         .exclusions
         .iter()
@@ -4721,53 +4949,74 @@ pub(crate) fn rejoin_inventory_with_original_witness(
         .collect();
     let mut requested = BTreeSet::new();
     let mut failed = BTreeSet::new();
-    for doc in &captured_native.revision.documents {
-        let language: semantic::Language =
-            serde_json::from_value(serde_json::json!(doc.key.language))?;
-        if producer.languages.contains(&language) {
-            let reason = exclusions.get(&(doc.key.language.as_str(), doc.key.path.as_str()));
-            if reason != Some(&"notRequested") {
-                requested.insert(doc.key.clone());
-            }
-            if reason == Some(&"failed")
-                || (reason != Some(&"notRequested") && !reusable.contains(&doc.key))
-            {
-                failed.insert(doc.key.clone());
-            }
+    if !captured_native.revision.documents.is_empty() {
+        let reason = exclusions.get(&(document.language.as_str(), document.path.as_str()));
+        if reason != Some(&"notRequested") {
+            requested.insert(document.clone());
+        }
+        if reason == Some(&"failed") || (reason != Some(&"notRequested") && !is_reused) {
+            failed.insert(document.clone());
         }
     }
-    for claim in &inventory.claims {
-        requested.insert(native::DocumentKey {
-            source_set_id: captured_native.revision.source_set_id.clone(),
-            language: claim.language.clone(),
-            path: claim.path.clone(),
-        });
+    if !inventory.claims.is_empty() {
+        requested.insert(document.clone());
     }
-    let mut publication = empty_publication(&producer);
-    let report = finish_rejoin(
+    let fused = captured.fused_proofs.clone();
+    let fused_calls = captured.fused_calls.clone();
+    let reference_proofs: BTreeSet<_> = captured.reference_claims.keys().cloned().collect();
+    let unsupported_documents = (gaps != [0; 4])
+        .then(|| (document.clone(), gaps))
+        .into_iter()
+        .collect();
+    let mut publication = empty_publication(producer);
+    finish_rejoin(
         inventory,
         captured_native,
         destination_native,
-        producer,
+        producer.clone(),
         basis,
         None,
-        &r2,
+        destination,
         Some(current_targets),
         &raw_index,
         &filtered_index,
         &filtered,
         &exclusions,
         captured,
-        destination,
+        joined,
         requested,
         failed,
         BTreeSet::new(),
-        BTreeMap::new(),
+        unsupported_documents,
         &mut publication,
+        Some(scope),
     )?;
-    Ok(Some(RejoinResult {
+    let omitted = publication
+        .coverage
+        .iter()
+        .any(|row| row.reasons.as_ref().is_some_and(|reasons| reasons.omitted));
+    let mut dropped = BTreeSet::new();
+    if omitted && !(fused.is_empty() && fused_calls.is_empty()) {
+        let kept: BTreeSet<_> = publication
+            .provenance
+            .iter()
+            .filter(|row| row.evidence_kind == semantic::EvidenceKind::SemanticReference)
+            .filter_map(|row| row.derived_from.as_ref())
+            .map(|derived| &derived.provenance_id)
+            .collect();
+        dropped.extend(
+            reference_proofs
+                .into_iter()
+                .filter(|proof| !kept.contains(proof)),
+        );
+    }
+    if dropped.iter().any(|proof| fused_calls.contains(proof)) {
+        return Ok(None);
+    }
+    Ok(Some(DocumentRejoin {
         publication,
-        report,
+        dropped,
+        fused,
     }))
 }
 
