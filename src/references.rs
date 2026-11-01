@@ -1,6 +1,7 @@
 //! View-time, source-witnessed module references. Structural mappings are not bindings.
 use crate::model::{IndexPin, SourceFile};
 use crate::native_evidence::{Call, Declaration, DeclarationRole, DocumentKey};
+use crate::syntax_bounds::{self, DEPTH, VISITS};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -20,8 +21,6 @@ const FOLLOW: usize = 4;
 
 const SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const TOTAL_BYTES: usize = 256 * 1024 * 1024;
-const VISITS: usize = 1_000_000;
-const DEPTH: usize = 128;
 const SITES: usize = 250_000;
 
 pub struct DocumentInput {
@@ -305,9 +304,20 @@ fn project_inner(
         );
     }
     // Parsing is unbudgeted, so one pass over every document keeps all workers busy.
-    let trees = map_all(&docs, workers, request, |doc| {
-        parse(doc, &mut request.worker())
-    })?;
+    let (trees, gaps): (Vec<_>, Vec<_>) = map_all(&docs, workers, request, |doc| {
+        let check = &mut request.worker();
+        let tree = parse(doc, check)?;
+        let gap = syntax_bounds::scan(tree.root_node(), check)?;
+        Ok((tree, gap))
+    })?
+    .into_iter()
+    .unzip();
+    // Every snapshot document feeds resolution, so path filters do not narrow this list.
+    let partial_files: Vec<_> = docs
+        .iter()
+        .zip(&gaps)
+        .filter_map(|(doc, gap)| gap.as_ref().map(|gap| gap.file(&doc.key)))
+        .collect();
     let selected: Vec<_> = docs
         .iter()
         .enumerate()
@@ -585,6 +595,10 @@ fn project_inner(
         "Python expands proved checkout-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
         "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability.",
     ];
+    let bounds_limitation = syntax_bounds::limitation(partial_files.len());
+    if !partial_files.is_empty() {
+        limitations.push(&bounds_limitation);
+    }
     if producers.is_empty() {
         limitations.push("No selected semantic producer has fresh bindings for these documents; every site is structural syntax evidence.");
     } else {
@@ -603,6 +617,7 @@ fn project_inner(
                 "semanticProducers":semantic_producers,
                 "modules":emitted_modules,"externalPackages":external_packages.into_values().collect::<Vec<_>>(),"production":production,"tests":tests,"unresolved":unresolved,
                 "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len(),"semanticSites":semantic_sites},
+                "partialFiles":partial_files,
                 "limitations":limitations
             }),
             modules,
@@ -941,16 +956,11 @@ fn parse(doc: &DocumentInput, check: &mut impl FnMut() -> Result<()>) -> Result<
     }
     let tree = tree.context("bounded_work: reference parser stopped")?;
     ensure!(!tree.root_node().has_error(), "invalid_source_syntax");
-    walk(tree.root_node(), check, &mut |node, _check| {
-        ensure!(
-            !node.is_error() && !node.is_missing(),
-            "invalid_source_syntax"
-        );
-        Ok(false)
-    })?;
     Ok(tree)
 }
-fn walk<'a, C: FnMut() -> Result<()>>(
+/// Depth-first over named syntax. What lies past the bounds is skipped: the projection's
+/// scan of this tree reported it.
+pub(crate) fn walk<'a, C: FnMut() -> Result<()>>(
     root: Node<'a>,
     check: &mut C,
     visit: &mut impl FnMut(Node<'a>, &mut C) -> Result<bool>,
@@ -960,10 +970,12 @@ fn walk<'a, C: FnMut() -> Result<()>>(
     while let Some((node, depth)) = stack.pop() {
         check()?;
         visits += 1;
-        ensure!(
-            visits <= VISITS && depth <= DEPTH,
-            "bounded_work: reference AST"
-        );
+        if visits > VISITS {
+            break;
+        }
+        if depth > DEPTH {
+            continue;
+        }
         if !visit(node, check)? {
             let mut cursor = node.walk();
             let children: Vec<_> = node.named_children(&mut cursor).collect();

@@ -1872,3 +1872,39 @@ fn rust_method_type_parameter_text_is_detail_text_not_registry_text() {
         );
     }
 }
+
+#[test]
+fn over_deep_files_limit_the_catalog_and_never_fail_it() {
+    let nest = |open: &str, close: &str| format!("{}{}", open.repeat(50_000), close.repeat(50_000));
+    for (path, source) in [
+        ("deep.rs", format!("{}\n", nest("mod a {", "}"))),
+        (
+            "deep.rs",
+            format!(
+                "pub struct S {{ x: {}u8{} }}\n",
+                "Vec<".repeat(50_000),
+                ">".repeat(50_000)
+            ),
+        ),
+        (
+            "deep.rs",
+            format!("use a::{}c{};\n", "{b::".repeat(50_000), "}".repeat(50_000)),
+        ),
+        ("Deep.java", format!("{}\n", nest("class A {", "}"))),
+        (
+            "deep.js",
+            format!("{}\n", nest("class A { m() { return class {", "} } }")),
+        ),
+        ("deep.py", format!("x = {}\n", nest("[", "]"))),
+    ] {
+        let (_graph, catalog) = index(&[("Ok.java", "class Ok {}\n"), (path, source.as_str())]);
+        assert!(
+            catalog
+                .classes
+                .iter()
+                .any(|class| class.qualified_name.ends_with("Ok")),
+            "{path}: {:?}",
+            catalog.warnings
+        );
+    }
+}

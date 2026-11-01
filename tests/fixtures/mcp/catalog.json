@@ -12365,6 +12365,41 @@
             "ecosystem",
             "evidence"
           ]
+        },
+        "PartialFile": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "reason": {
+              "enum": [
+                "depth_limit",
+                "visit_limit"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "subtrees": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path",
+            "reason",
+            "range",
+            "subtrees"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -12499,6 +12534,12 @@
                       "producerId"
                     ]
                   }
+                },
+                "partialFiles": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/PartialFile"
+                  }
                 }
               },
               "required": [
@@ -12513,6 +12554,7 @@
                 "tests",
                 "unresolved",
                 "counts",
+                "partialFiles",
                 "limitations",
                 "externalPackages",
                 "page"
@@ -14475,6 +14517,41 @@
             "ecosystem",
             "evidence"
           ]
+        },
+        "PartialFile": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "reason": {
+              "enum": [
+                "depth_limit",
+                "visit_limit"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "subtrees": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path",
+            "reason",
+            "range",
+            "subtrees"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -14560,6 +14637,12 @@
                     "nextOffset",
                     "total"
                   ]
+                },
+                "partialFiles": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/PartialFile"
+                  }
                 }
               },
               "required": [
@@ -14572,6 +14655,7 @@
                 "counts",
                 "testCounts",
                 "unassigned",
+                "partialFiles",
                 "limitations",
                 "externalPackages",
                 "page"
@@ -16805,6 +16889,41 @@
             "ecosystem",
             "evidence"
           ]
+        },
+        "PartialFile": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "reason": {
+              "enum": [
+                "depth_limit",
+                "visit_limit"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "subtrees": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path",
+            "reason",
+            "range",
+            "subtrees"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -16890,6 +17009,12 @@
                     "nextOffset",
                     "total"
                   ]
+                },
+                "partialFiles": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/PartialFile"
+                  }
                 }
               },
               "required": [
@@ -16902,6 +17027,7 @@
                 "counts",
                 "testCounts",
                 "unassigned",
+                "partialFiles",
                 "limitations",
                 "externalPackages",
                 "page"

@@ -20,8 +20,6 @@ pub const RULES_PATH: &str = ".trellis/rules.toml";
 pub(crate) const CONFIG_BYTES: usize = 2 * 1024 * 1024;
 const COLLECTION_LIMIT: usize = 1024;
 const PATTERN_LIMIT: usize = 8192;
-const AST_VISITS: usize = 1_000_000;
-const AST_DEPTH: usize = 128;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1110,26 +1108,15 @@ fn parse_bases(
         return Err(e);
     }
     let tree = tree.context("bounded_work: selector parser stopped")?;
-    let mut stack = vec![(tree.root_node(), 0usize)];
-    let mut visits = 0;
+    ensure!(!tree.root_node().has_error(), "invalid_source_syntax");
     let mut types = BTreeMap::new();
-    while let Some((node, depth)) = stack.pop() {
-        check()?;
-        visits += 1;
-        ensure!(
-            visits <= AST_VISITS && depth <= AST_DEPTH,
-            "bounded_work: selector AST budget"
-        );
-        ensure!(
-            !node.is_error() && !node.is_missing(),
-            "invalid_source_syntax"
-        );
+    // A type past the walk's bounds is unknown here, and references report its file.
+    crate::references::walk(tree.root_node(), check, &mut |node, _check| {
         if has_bases(node) {
             types.insert((node.start_byte(), node.end_byte()), node);
         }
-        let mut cursor = node.walk();
-        stack.extend(node.children(&mut cursor).map(|n| (n, depth + 1)));
-    }
+        Ok(false)
+    })?;
     let mut expansions = crate::native_rust_macros::Expansions::new(source);
     let mut result = BTreeMap::new();
     for d in &doc.declarations {
@@ -1866,16 +1853,22 @@ fn evaluate_with_layers_workers<'a>(
         check,
     )?;
     check()?;
+    let partial_files = &refs.data["partialFiles"];
+    let mut limitations = limitations(semantic);
+    let partial = partial_files.as_array().map_or(0, Vec::len);
+    if partial > 0 {
+        limitations.push(crate::syntax_bounds::limitation(partial));
+    }
     Ok(Evaluation {
         data: json!({"rulesVersion":"rules:v2","indexGeneration":snapshot.pin.index_generation.to_string(),"indexRevision":snapshot.pin.index_revision,"rulesFile":descriptor(config),
         "counts":counts(&instances),"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"externalPackages":external_packages,
-        "limitations":limitations(semantic)}),
+        "partialFiles":partial_files,"limitations":limitations}),
         layers: assignments,
     })
 }
 /// The evaluation's limitations: the bindings note says whether any were admitted (#523).
-fn limitations(semantic: bool) -> Vec<&'static str> {
-    vec![
+fn limitations(semantic: bool) -> Vec<String> {
+    [
         "Layer results describe observed mapped references, not absence of dependencies.",
         if semantic {
             "Call and type constraints use fresh bindings of each language's selected producer; unbound, stale, dispatched and ambiguous calls and missing relationships remain unknown, and absence of a required edge is never a violation."
@@ -1885,6 +1878,8 @@ fn limitations(semantic: bool) -> Vec<&'static str> {
         "testOnly policy statuses are hypothetical and never production violations.",
         "Structural reference provenance attests captured source bytes, not a semantic target association; semantic sites carry their binding's provenance.",
     ]
+    .map(str::to_owned)
+    .to_vec()
 }
 
 pub fn explain(

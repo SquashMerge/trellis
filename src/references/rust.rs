@@ -129,6 +129,8 @@ struct Scope {
     explicit: BTreeMap<Name, Vec<Binding>>,
     imports: Vec<Import>,
     opaque: bool,
+    /// Something past the walk bounds was skipped here, so even an explicit name can collide.
+    cut: bool,
 }
 struct ModuleEdge {
     scope: usize,
@@ -372,6 +374,7 @@ impl Catalog {
             explicit: BTreeMap::new(),
             imports: Vec::new(),
             opaque: false,
+            cut: false,
         });
         Ok(id)
     }
@@ -387,7 +390,12 @@ impl Catalog {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         self.step(check)?;
-        ensure!(depth <= DEPTH, "bounded_work: reference AST");
+        // A skipped item could bind any name here, as an unknown attribute could.
+        if depth > DEPTH {
+            self.scopes[scope].opaque = true;
+            self.scopes[scope].cut = true;
+            return Ok(());
+        }
         let document = self.scopes[scope].document;
         let doc = docs[document];
         let mut cursor = node.walk();
@@ -464,7 +472,7 @@ impl Catalog {
                 let public = visibility(doc, child).is_some();
                 let restricted = visibility(doc, child).is_some_and(|v| v != "pub");
                 if let Some(argument) = child.child_by_field_name("argument") {
-                    let imports = imports(
+                    let (imports, cut) = imports(
                         doc,
                         argument,
                         public,
@@ -473,6 +481,9 @@ impl Catalog {
                         check,
                     )?;
                     self.scopes[scope].imports.extend(imports);
+                    // A skipped import could bind any name, so nothing here is proved absent.
+                    self.scopes[scope].opaque |= cut;
+                    self.scopes[scope].cut |= cut;
                 }
                 continue;
             }
@@ -601,7 +612,11 @@ impl Catalog {
         while let Some(node) = ancestor {
             self.step(check)?;
             depth += 1;
-            ensure!(depth <= DEPTH, "bounded_work: reference AST");
+            if depth > DEPTH {
+                self.scopes[scope].opaque = true;
+                self.scopes[scope].cut = true;
+                break;
+            }
             if node.kind() == "mod_item" || node.kind() == "source_file" {
                 break;
             }
@@ -643,7 +658,12 @@ impl Catalog {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         self.step(check)?;
-        ensure!(depth <= DEPTH, "bounded_work: reference AST");
+        // A skipped item could bind any name here, as an unknown attribute could.
+        if depth > DEPTH {
+            self.scopes[scope].opaque = true;
+            self.scopes[scope].cut = true;
+            return Ok(());
+        }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() == "block" {
@@ -828,7 +848,7 @@ impl Catalog {
         }
         if self.scopes[scope].opaque {
             for namespace in [TYPE, VALUE] {
-                if !explicit_namespaces.contains(&namespace) {
+                if self.scopes[scope].cut || !explicit_namespaces.contains(&namespace) {
                     result
                         .names
                         .entry((namespace, name.to_owned()))
@@ -1563,11 +1583,17 @@ fn imports(
     uncertain: bool,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<Vec<Import>> {
-    let mut pending = vec![(root, Vec::<String>::new())];
+) -> Result<(Vec<Import>, bool)> {
+    let mut pending = vec![(root, Vec::<String>::new(), 0usize)];
     let mut result = Vec::new();
-    while let Some((node, prefix)) = pending.pop() {
+    let mut cut = false;
+    while let Some((node, prefix, depth)) = pending.pop() {
         owner_step(work, check)?;
+        // Each nesting level clones the prefix, so a deep list is bounded here too.
+        if depth > DEPTH {
+            cut = true;
+            continue;
+        }
         let combine = |value: &str| -> Vec<String> {
             let mut combined = prefix.clone();
             if let Some(tail) = parts(value) {
@@ -1585,14 +1611,14 @@ fn imports(
                     .map(|n| text(doc, n))
                     .unwrap_or("");
                 if let Some(list) = node.child_by_field_name("list") {
-                    pending.push((list, combine(path)));
+                    pending.push((list, combine(path), depth + 1));
                 }
             }
             "use_list" => {
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
                     owner_step(work, check)?;
-                    pending.push((child, prefix.clone()));
+                    pending.push((child, prefix.clone(), depth + 1));
                 }
             }
             _ => {
@@ -1628,7 +1654,7 @@ fn imports(
             }
         }
     }
-    Ok(result)
+    Ok((result, cut))
 }
 
 pub(super) fn extract(
@@ -1644,7 +1670,7 @@ pub(super) fn extract(
         }
         if node.kind() == "use_declaration" {
             if let Some(argument) = node.child_by_field_name("argument") {
-                for import in imports(doc, argument, false, false, work, check)? {
+                for import in imports(doc, argument, false, false, work, check)?.0 {
                     ensure!(result.len() < SITES, "bounded_work: reference site count");
                     result.push(RawSite {
                         start: import.start,
@@ -1692,6 +1718,7 @@ mod cache_tests {
             explicit: BTreeMap::new(),
             imports: Vec::new(),
             opaque: false,
+            cut: false,
         }
     }
 

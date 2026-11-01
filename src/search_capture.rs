@@ -4,7 +4,7 @@ use crate::{
     native_evidence::{Call, Declaration},
     search_card::{self, Ancestor, CardInput, MeasuredFacts, SearchCard},
 };
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
@@ -326,10 +326,10 @@ impl Collector<'_> {
         depth: usize,
         in_string: bool,
     ) -> Result<()> {
-        ensure!(
-            depth < 128 && self.visits < 1_000_000,
-            "native extraction work budget exceeded"
-        );
+        // The native walk stopped at the same bounds and reported the gap.
+        if depth >= 128 || self.visits >= 1_000_000 {
+            return Ok(());
+        }
         self.visits += 1;
         if opaque(&self.file.language, node) {
             return self.walk_macro(node, stack, depth);

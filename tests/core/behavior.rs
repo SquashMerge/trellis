@@ -708,3 +708,14 @@ fn external_participant_cap_preserves_every_measured_call() {
         25
     );
 }
+
+#[test]
+fn an_over_deep_body_keeps_its_sequence_bounded() {
+    let source = format!(
+        "function seed() {{ first(); return {}{}; }}\nfunction first() {{}}\n",
+        "[".repeat(50_000),
+        "]".repeat(50_000)
+    );
+    let (_graph, view) = fixture(&source, "seed");
+    assert!(calls(&view.steps).contains(&"first"), "{:?}", view.warnings);
+}
