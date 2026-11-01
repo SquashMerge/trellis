@@ -1,6 +1,7 @@
 //! Syntactic participant identification only. Never resolves a call implementation.
 //! All analysis uses the already parsed, cached JavaScript source.
 use crate::behavior::Participant;
+use crate::syntax_bounds::{DEPTH, VISITS};
 use std::collections::HashSet;
 use tree_sitter::Node;
 
@@ -75,8 +76,16 @@ impl Bindings {
             writes: HashSet::new(),
             unsafe_globals: tree.has_error(),
         };
-        let mut todo = vec![tree];
-        while let Some(n) = todo.pop() {
+        // `scope` climbs with `Node::parent`, itself a walk from the root, so this walk stays
+        // within the syntax bounds. What it skips could shadow or write, so proof is withheld.
+        let mut todo = vec![(tree, 0usize)];
+        let mut visits = 0usize;
+        while let Some((n, depth)) = todo.pop() {
+            visits += 1;
+            if depth > DEPTH || visits > VISITS {
+                out.unsafe_globals = true;
+                continue;
+            }
             // Escaped identifiers need ECMAScript name decoding. Until supported,
             // suppress proof rather than miss an escaped shadow/write target.
             if matches!(
@@ -240,7 +249,7 @@ impl Bindings {
                     out.add(name, n, None, source);
                 }
             }
-            todo.extend(children(n));
+            todo.extend(children(n).into_iter().map(|child| (child, depth + 1)));
         }
         out
     }
@@ -395,5 +404,22 @@ mod deep_input_tests {
         let tree = parser.parse(&source, None).unwrap();
         let bindings = Bindings::new(tree.root_node(), &source);
         assert!(bindings.writes.contains("y") && bindings.writes.contains("a"));
+    }
+
+    #[test]
+    fn declarations_past_the_bounds_withhold_proof_in_bounded_time() {
+        // Unbounded, each declaration would climb 100,000 levels through `Node::parent`.
+        let source = format!(
+            "{}{}{}",
+            "{".repeat(100_000),
+            "var a;".repeat(10_000),
+            "}".repeat(100_000)
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        assert!(Bindings::new(tree.root_node(), &source).unsafe_globals);
     }
 }

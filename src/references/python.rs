@@ -326,6 +326,9 @@ impl Catalog {
         }
         for document in seen.into_keys() {
             let unit = self.units.get_mut(&document).expect("followed Python unit");
+            // A hazard past the walk bounds goes unseen, so the file proves nothing.
+            unit.dynamic |=
+                crate::syntax_bounds::scan(trees[document].root_node(), check)?.is_some();
             // Only followed/selected units need body hazards. Bounded syntax walking is
             // cancellation-aware, but irrelevant AST nodes are not charged as owner work.
             walk(trees[document].root_node(), check, &mut |node, check| {

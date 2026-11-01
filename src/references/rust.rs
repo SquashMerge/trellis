@@ -387,7 +387,9 @@ impl Catalog {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         self.step(check)?;
+        // A skipped item could bind any name here, as an unknown attribute could.
         if depth > DEPTH {
+            self.scopes[scope].opaque = true;
             return Ok(());
         }
         let document = self.scopes[scope].document;
@@ -647,7 +649,9 @@ impl Catalog {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         self.step(check)?;
+        // A skipped item could bind any name here, as an unknown attribute could.
         if depth > DEPTH {
+            self.scopes[scope].opaque = true;
             return Ok(());
         }
         let mut cursor = node.walk();
@@ -1570,12 +1574,12 @@ fn imports(
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<Import>> {
-    let mut pending = vec![(root, Vec::<String>::new())];
+    let mut pending = vec![(root, Vec::<String>::new(), 0usize)];
     let mut result = Vec::new();
-    while let Some((node, prefix)) = pending.pop() {
+    while let Some((node, prefix, depth)) = pending.pop() {
         owner_step(work, check)?;
         // Each nesting level clones the prefix, so a deep list is bounded here too.
-        if prefix.len() > DEPTH {
+        if depth > DEPTH {
             continue;
         }
         let combine = |value: &str| -> Vec<String> {
@@ -1595,14 +1599,14 @@ fn imports(
                     .map(|n| text(doc, n))
                     .unwrap_or("");
                 if let Some(list) = node.child_by_field_name("list") {
-                    pending.push((list, combine(path)));
+                    pending.push((list, combine(path), depth + 1));
                 }
             }
             "use_list" => {
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
                     owner_step(work, check)?;
-                    pending.push((child, prefix.clone()));
+                    pending.push((child, prefix.clone(), depth + 1));
                 }
             }
             _ => {

@@ -136,8 +136,8 @@ Select from canonical order `loc,sloc,commentLines,cyclomatic,cognitive,maxNesti
 `metricsVersion,indexGeneration,indexRevision,scope,aggregate,role,selectedMetrics,declarations,files,directories`,
 plus `partialFiles` when a selected file exceeds the syntax walk bounds. Its rows are the
 [`PartialFile`](rules.md#work-bounds-and-located-failures) rows of references: scores stay
-exact within their own bound of 512 levels and 2,000,000 visits and skip what lies past it,
-and one pathological file never refuses the request (#554).
+exact within their own bound of 512 levels and 2,000,000 visits per callable, and skip what
+lies past it, and one pathological file never refuses the request (#554).
 The optional paired pin is supplied as `indexGeneration` and `indexRevision`. File selectors require
 `sourceSetId,language,path`; directory selectors require `sourceSetId,path` (empty path means the
 source-set root); declaration selectors require `sourceSetId,path,sid` and no language. Source-set IDs

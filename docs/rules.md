@@ -505,8 +505,9 @@ PartialFile = {sourceSetId,language,path,reason:"depth_limit"|"visit_limit",
 
 `range` is the first skipped subtree, and `subtrees` counts subtrees skipped over the depth
 bound. References and declarations inside them are missing, so absence there proves
-nothing. The field is empty when every document was read whole, a `limitations` entry appears
-when it isn't, and it never changes a verdict or exit status.
+nothing, and what a partial file exports stays unknown wherever a proof would need the
+skipped syntax. The field is empty when every document was read whole, and a `limitations` entry
+appears when it isn't. A partial file alone doesn't change the exit status.
 
 Reference work has one request-wide allowance of
 `min(100_000_000, 5_000_000 + 20_000*N + 512*K)` units. Rules use a separate

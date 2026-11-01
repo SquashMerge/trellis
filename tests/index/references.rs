@@ -6227,3 +6227,62 @@ fn a_file_past_the_visit_bound_is_partial_too() {
     assert_eq!(projection.data["partialFiles"][0]["path"], "wide.js");
     assert_eq!(projection.data["partialFiles"][0]["reason"], "visit_limit");
 }
+
+#[test]
+fn a_hazard_past_the_walk_bounds_keeps_the_export_proof_unknown() {
+    let resolve = |deep: usize| {
+        let barrel = format!(
+            "export * from './p.js';\nconst d = {}module{};\n",
+            "[".repeat(deep),
+            "]".repeat(deep)
+        );
+        let input = snapshot(&[
+            ("barrel.js", barrel.as_str()),
+            ("p.js", "export const name = 1;\n"),
+            ("use.js", "import { name } from './barrel.js';\nname;\n"),
+        ]);
+        let data = references::project(&input, &[], 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        (
+            data["production"].clone(),
+            data["unresolved"].as_array().unwrap().len(),
+        )
+    };
+    let (shallow, shallow_unresolved) = resolve(2);
+    let (deep, deep_unresolved) = resolve(200);
+    assert!(shallow_unresolved >= 1);
+    assert_eq!(deep_unresolved, shallow_unresolved);
+    assert_eq!(
+        deep.as_array().unwrap().len(),
+        shallow.as_array().unwrap().len()
+    );
+
+    let resolve = |deep: usize| {
+        let module = format!(
+            "from p import *\n{}exec(code){}\n",
+            "[".repeat(deep),
+            "]".repeat(deep)
+        );
+        let input = snapshot(&[
+            ("a.py", module.as_str()),
+            ("p.py", "name = 1\n"),
+            ("use.py", "from a import name\n"),
+        ]);
+        let data = references::project(&input, &[], 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        data["unresolved"].as_array().unwrap().len()
+    };
+    assert_eq!(resolve(200), resolve(2));
+}
+
+#[test]
+fn a_rust_use_list_past_the_walk_bounds_names_its_file() {
+    let deep = format!("use a::{}c{};\n", "{b::".repeat(100), "}".repeat(100));
+    let input = snapshot(&[("deep.rs", deep.as_str())]);
+    let data = references::project(&input, &[], 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(data["partialFiles"][0]["path"], "deep.rs");
+}

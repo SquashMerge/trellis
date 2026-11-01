@@ -8,14 +8,15 @@ use anyhow::Result;
 use serde::Serialize;
 use tree_sitter::Node;
 
-/// Deepest syntax level a walk enters.
+/// Syntax levels a walk enters. Native extraction stops one level sooner, so a [`scan`]
+/// reports from that level on, and a file it does not name lost nothing to either.
 pub(crate) const DEPTH: usize = 128;
 /// Syntax nodes one walk visits.
 pub(crate) const VISITS: usize = 1_000_000;
 
 /// How one document's syntax exceeds the bounds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct SyntaxGap {
+pub struct SyntaxGap {
     reason: &'static str,
     /// The first skipped subtree.
     range: Range,
@@ -51,7 +52,7 @@ pub struct PartialFile {
 /// The limitation a result carries when it has partial files.
 pub(crate) fn limitation(files: usize) -> String {
     format!(
-        "{files} source file(s) exceed the syntax bounds ({DEPTH} levels, {VISITS} nodes); evidence inside the subtrees named by partialFiles is missing, the rest of the checkout is complete."
+        "{files} source file(s) exceed the syntax bounds ({DEPTH} levels, {VISITS} nodes); evidence inside partialFiles is missing, and resolution that depends on a partial file stays unknown."
     )
 }
 
@@ -66,7 +67,7 @@ pub(crate) fn scan(
     let mut subtrees = 0usize;
     while let Some((node, depth)) = stack.pop() {
         check()?;
-        if depth > DEPTH {
+        if depth >= DEPTH {
             subtrees += 1;
             first.get_or_insert(range(node));
             continue;

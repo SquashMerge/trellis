@@ -844,6 +844,7 @@ fn resident_memo_limit_evicts_fifo_and_never_caches_oversized_score() {
     assert!(tiny.is_empty());
     let entry_bytes = 4 * std::mem::size_of::<metrics::Score>()
         + std::mem::size_of::<((String, String, String), Vec<metrics::Score>, usize)>()
+        + std::mem::size_of::<Option<trellis::syntax_bounds::SyntaxGap>>()
         + metrics::VERSION.len()
         + "rust".len()
         + "a".len();

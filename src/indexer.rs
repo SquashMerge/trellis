@@ -189,6 +189,9 @@ pub enum CapturedChange {
 /// inside a function body may change. Every other edit takes the full-native path.
 /// This reads only the changed document's source bytes and never queries lookup owners.
 fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
+    // `Node::parent` walks from the root, so a climb is quadratic in depth. An edit deeper than
+    // this takes the full-native path.
+    const ANCESTRY_LIMIT: usize = 128;
     if old.path != new.path || old.language != new.language || old.text == new.text {
         return false;
     }
@@ -302,10 +305,15 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
         }
         let name = &source[node.byte_range()];
         let mut parent = node.parent();
+        let mut climbed = 0;
         let function = loop {
             let Some(current) = parent else {
                 return false;
             };
+            climbed += 1;
+            if climbed > ANCESTRY_LIMIT {
+                return false;
+            }
             if matches!(
                 current.kind(),
                 "function_declaration"
@@ -355,7 +363,12 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
         let mut body = false;
         let mut function = false;
         let mut returned = false;
+        let mut climbed = 0;
         while let Some(parent) = node.parent() {
+            climbed += 1;
+            if climbed > ANCESTRY_LIMIT {
+                return false;
+            }
             let kind = parent.kind();
             // Rust's final bare expression is a returned value, but only when
             // the edited leaf itself is the last named child of this exact

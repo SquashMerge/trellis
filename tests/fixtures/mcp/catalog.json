@@ -12554,6 +12554,7 @@
                 "tests",
                 "unresolved",
                 "counts",
+                "partialFiles",
                 "limitations",
                 "externalPackages",
                 "page"
@@ -14654,6 +14655,7 @@
                 "counts",
                 "testCounts",
                 "unassigned",
+                "partialFiles",
                 "limitations",
                 "externalPackages",
                 "page"
@@ -17025,6 +17027,7 @@
                 "counts",
                 "testCounts",
                 "unassigned",
+                "partialFiles",
                 "limitations",
                 "externalPackages",
                 "page"

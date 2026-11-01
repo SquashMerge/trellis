@@ -1441,6 +1441,8 @@ fn body_hazards(
             "comment" | "string" | "string_fragment"
         ))
     })?;
+    // A hazard past the walk bounds went unseen, so the file proves nothing about its exports.
+    hazards.dynamic |= crate::syntax_bounds::scan(root, check)?.is_some();
     Ok(hazards)
 }
 pub(super) fn extract(

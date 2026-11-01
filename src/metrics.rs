@@ -908,7 +908,7 @@ fn score(
     Ok(s)
 }
 
-/// FIFO memo contains only complete source-derived scores, never native identity or calls.
+/// FIFO memo contains only source-derived scores and gaps, never native identity or calls.
 type MemoEntry = ((String, String, String), SourceScores, usize);
 pub struct MetricsMemo {
     entries: VecDeque<MemoEntry>,
