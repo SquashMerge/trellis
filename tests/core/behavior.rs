@@ -147,10 +147,17 @@ fn short_circuit_and_ternary_calls_stay_in_guarded_arms() {
 #[test]
 fn guards_fold_only_after_a_drawn_exit_and_spend_no_depth() {
     let (_, view) = fixture(
-        "function run(x) { try { work(); } finally { return stop(); } }",
+        "function run(x) { try { if (x) return; } catch (e) { work(); } after(); }",
         "run",
     );
-    assert!(flatten(&view.steps).iter().all(|s| s.folded.is_empty()));
+    assert!(
+        view.steps
+            .last()
+            .unwrap()
+            .label
+            .contains("continues normally")
+    );
+    assert_eq!(calls(&view.steps[view.steps.len() - 1..]), vec!["after"]);
     let (_, view) = fixture(
         "function run(x) { for (const y of x) { if (y) break; } after(); }",
         "run",

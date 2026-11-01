@@ -177,11 +177,20 @@ fn impl_target(node: tree_sitter::Node<'_>, text: &[u8]) -> Option<String> {
     let name = type_name(node.child_by_field_name("type")?)?;
     Some(name.utf8_text(text).ok()?.to_owned())
 }
+/// The self type of an `impl` block, as written (#558).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ImplTarget {
+    /// The last segment: what a type declaration of that name would be called.
+    pub name: String,
+    /// The path as written, without generics.
+    pub written: String,
+    /// The path does not start at `crate`, `self` or `super`, so it may leave this crate.
+    pub relative: bool,
+}
 /// The type one `impl` block implements (#558), from its header alone: an `impl` can be most
 /// of a very large file. A header with a brace of its own does not parse, and names nothing.
-/// Nor does a blanket `impl<A: X> Y for A`: `A` is no type. A path that does not start at this
-/// crate keeps its path (`fmt::Error`), so it never reads as a local type of that last name.
-pub(crate) fn impl_block_target(block: &str) -> Option<String> {
+/// Nor does a blanket `impl<A: X> Y for A`: `A` is no type.
+pub(crate) fn impl_block_target(block: &str) -> Option<ImplTarget> {
     let header = format!("{}{{}}", &block[..block.find('{')?]);
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -198,27 +207,34 @@ pub(crate) fn impl_block_target(block: &str) -> Option<String> {
         .find(|node| node.kind() == "impl_item")?;
     let text = header.as_bytes();
     let name = type_name(item.child_by_field_name("type")?)?;
-    let scope = name
+    let bare = name.utf8_text(text).ok()?;
+    let scoped = name
         .parent()
         .filter(|parent| parent.kind() == "scoped_type_identifier");
-    if let Some(scoped) = scope {
+    if let Some(scoped) = scoped {
         let path = scoped.child_by_field_name("path")?.utf8_text(text).ok()?;
         let root = path.split("::").next().unwrap_or(path);
-        if !matches!(root, "crate" | "self" | "super") {
-            return Some(scoped.utf8_text(text).ok()?.to_owned());
-        }
-    } else if let Some(parameters) = item.child_by_field_name("type_parameters") {
-        let name = name.utf8_text(text).ok()?;
+        return Some(ImplTarget {
+            name: bare.to_owned(),
+            written: scoped.utf8_text(text).ok()?.to_owned(),
+            relative: !matches!(root, "crate" | "self" | "super"),
+        });
+    }
+    if let Some(parameters) = item.child_by_field_name("type_parameters") {
         let mut cursor = parameters.walk();
         if parameters.named_children(&mut cursor).any(|node| {
             let own = node.child_by_field_name("name");
             let own = own.or_else(|| node.child_by_field_name("left"));
-            own.unwrap_or(node).utf8_text(text).ok() == Some(name)
+            own.unwrap_or(node).utf8_text(text).ok() == Some(bare)
         }) {
             return None;
         }
     }
-    Some(name.utf8_text(text).ok()?.to_owned())
+    Some(ImplTarget {
+        name: bare.to_owned(),
+        written: bare.to_owned(),
+        relative: false,
+    })
 }
 /// The identifier naming a Rust type: `Foo`, `a::Foo`, `Foo<T>`, `&Foo`, `&mut a::Foo<T>`.
 fn type_name(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {

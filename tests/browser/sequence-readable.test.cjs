@@ -197,6 +197,16 @@ test("a branch that folds its guard is marked at its own row and nowhere else", 
   for (const [id, text] of texts) assert.equal(/may exit early/.test(text), id.startsWith("if:"), `${id}: ${text}`);
 });
 
+test("a depth-capped if keeps its exit mark; a call keeps its return mark", async () => {
+  const early = step => page.evaluate(step => TrellisSequence.earlyReturn(step), step);
+  const folded = [{label:"only if the preceding path continues normally"}];
+  assert.equal(await early({kind:"boundary", folded}), " · may exit early");
+  assert.equal(await early({kind:"branch", folded}), " · may exit early");
+  assert.equal(await early({kind:"call", callId:"c", folded}), " · may return early");
+  assert.equal(await early({kind:"boundary", callId:"c", folded}), " · may return early");
+  assert.equal(await early({kind:"branch", folded:[]}), "");
+});
+
 test("the empty state names what is hidden", async () => {
   const summary = view => page.evaluate(view => TrellisSequence.emptySummary(view), view);
   const hidden = (incidental, name) => ({id:name, kind:"call", hidden:true, incidental, children:[], alternate:[], callEvidence:{boundaryReason:"external", externalPackage:name ? {manager:"cargo", name, version:"1"} : undefined}});

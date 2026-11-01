@@ -2,6 +2,7 @@
 //! type's methods share a lifeline and the method is named on the arrow. A display grouping
 //! over measured declarations: it never changes a step's exact target.
 use crate::behavior::{MAX_COLUMNS, Participant, SequenceColumn};
+use crate::files_view::ImplTarget;
 use crate::model::{Symbol, SymbolKind};
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -17,7 +18,7 @@ pub(crate) struct DocumentColumns {
 /// A Rust type, whose `impl` blocks may span files, or a class or module of one document.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Owner {
-    RustType { name: String, scope: String },
+    RustType { target: ImplTarget, scope: String },
     Column(SequenceColumn),
 }
 
@@ -42,11 +43,16 @@ impl DocumentColumns {
                 continue;
             }
             let block = self.text.get(node.range.start_byte..node.range.end_byte);
-            let name = block.and_then(crate::files_view::impl_block_target);
-            if let Some(name) = name.or(named.then(|| node.name.clone())) {
+            let target = block.and_then(crate::files_view::impl_block_target);
+            let declared = named.then(|| ImplTarget {
+                name: node.name.clone(),
+                written: node.name.clone(),
+                relative: false,
+            });
+            if let Some(target) = target.or(declared) {
                 let scope = self.inline_modules(node, &symbol.path);
                 return Owner::RustType {
-                    name,
+                    target,
                     scope: format!("{}{scope}", symbol.path),
                 };
             }
@@ -80,21 +86,30 @@ impl Owner {
     /// The column of this owner. A Rust type's name joins its `impl` blocks across files
     /// when it names one type in the snapshot, the ordinary case. `declarations` counts the
     /// types of that name; when several exist, nothing here says which an `impl` implements,
-    /// so its blocks stay apart by file and module rather than conflate two types.
+    /// so its blocks stay apart by file, module and the path as written rather than conflate
+    /// two types. A relative path may name a foreign type, so it never joins a local name.
     pub(crate) fn column(
         self,
         declarations: &mut dyn FnMut(&str) -> Result<usize>,
     ) -> Result<SequenceColumn> {
         Ok(match self {
             Owner::Column(column) => column,
-            Owner::RustType { name, scope } => SequenceColumn {
-                id: if declarations(&name)? > 1 {
-                    format!("type:{scope}:{name}")
+            Owner::RustType { target, scope } => {
+                let ImplTarget {
+                    name,
+                    written,
+                    relative,
+                } = target;
+                let id = if declarations(&name)? > 1 {
+                    format!("type:{scope}:{written}")
+                } else if relative {
+                    format!("type:{written}")
                 } else {
                     format!("type:{name}")
-                },
-                label: name,
-            },
+                };
+                let label = if relative { written } else { name };
+                SequenceColumn { id, label }
+            }
         })
     }
 }
@@ -230,7 +245,11 @@ mod tests {
             assert_eq!(
                 columns.owner(&columns.nodes[id]),
                 Owner::RustType {
-                    name: "Store".into(),
+                    target: ImplTarget {
+                        name: "Store".into(),
+                        written: "crate::a::Store".into(),
+                        relative: false,
+                    },
                     scope: path.into()
                 }
             );
@@ -270,25 +289,44 @@ mod tests {
             };
             let label = match columns.owner(&columns.nodes["m"]) {
                 Owner::Column(column) => column.label,
-                Owner::RustType { name, .. } => name,
+                Owner::RustType { target, .. } => target.name,
             };
             assert_eq!(label, expected, "{text}");
         }
     }
 
+    fn target(name: &str, written: &str, relative: bool) -> ImplTarget {
+        ImplTarget {
+            name: name.into(),
+            written: written.into(),
+            relative,
+        }
+    }
+
     #[test]
-    fn a_foreign_path_keeps_its_path_and_a_crate_path_reads_as_its_type() {
-        let target = crate::files_view::impl_block_target;
-        assert_eq!(
-            target("impl Tr for fmt::Error {").as_deref(),
-            Some("fmt::Error")
-        );
-        assert_eq!(
-            target("impl Tr for &other::a::E<T> {").as_deref(),
-            Some("other::a::E")
-        );
-        assert_eq!(target("impl Tr for crate::a::E {").as_deref(), Some("E"));
-        assert_eq!(target("impl super::Tr for self::E {").as_deref(), Some("E"));
+    fn an_impl_target_is_read_as_written() {
+        let read = crate::files_view::impl_block_target;
+        for (header, expected) in [
+            (
+                "impl Tr for fmt::Error {",
+                target("Error", "fmt::Error", true),
+            ),
+            (
+                "impl Tr for &other::a::E<T> {",
+                target("E", "other::a::E", true),
+            ),
+            (
+                "impl Tr for crate::a::E {",
+                target("E", "crate::a::E", false),
+            ),
+            (
+                "impl super::Tr for self::E {",
+                target("E", "self::E", false),
+            ),
+            ("impl Tr for E {", target("E", "E", false)),
+        ] {
+            assert_eq!(read(header), Some(expected), "{header}");
+        }
     }
 
     #[test]
@@ -338,17 +376,51 @@ mod tests {
         assert_eq!(columns.owner(&columns.nodes["outer"]), outer);
     }
 
+    fn id(written: &str, relative: bool, scope: &str, count: usize) -> SequenceColumn {
+        let name = written.rsplit("::").next().unwrap();
+        Owner::RustType {
+            target: target(name, written, relative),
+            scope: scope.into(),
+        }
+        .column(&mut |counted| {
+            assert_eq!(counted, name, "the count is by the declared name");
+            Ok(count)
+        })
+        .unwrap()
+    }
+
     #[test]
     fn a_rust_type_name_joins_files_only_while_it_names_one_type() {
-        let owner = |scope: &str| Owner::RustType {
-            name: "Store".into(),
-            scope: scope.into(),
-        };
-        let column = |scope, count: usize| owner(scope).column(&mut |_| Ok(count)).unwrap();
-        assert_eq!(column("a.rs", 1), column("b.rs", 1));
-        assert_ne!(column("a.rs", 2), column("b.rs", 2));
-        assert_eq!(column("a.rs", 2), column("a.rs", 2));
-        assert_eq!(column("a.rs", 2).label, "Store");
+        assert_eq!(id("S", false, "a.rs", 1), id("S", false, "b.rs", 1));
+        assert_eq!(
+            id("S", false, "a.rs", 1),
+            id("crate::m::S", false, "b.rs", 1)
+        );
+        assert_ne!(id("S", false, "a.rs", 2), id("S", false, "b.rs", 2));
+        assert_eq!(id("S", false, "a.rs", 2), id("S", false, "a.rs", 2));
+        assert_eq!(id("S", false, "a.rs", 2).label, "S");
+    }
+
+    #[test]
+    fn two_paths_to_two_declared_types_are_never_conflated() {
+        // One file, two crate paths to two types of one name.
+        assert_ne!(
+            id("crate::a::S", false, "c.rs", 2),
+            id("crate::b::S", false, "c.rs", 2)
+        );
+        // One relative path written in two files, resolving to two types.
+        assert_ne!(
+            id("types::Config", true, "a/x.rs", 2),
+            id("types::Config", true, "b/x.rs", 2)
+        );
+    }
+
+    #[test]
+    fn a_relative_path_never_joins_a_local_name() {
+        let foreign = id("fmt::Error", true, "a.rs", 1);
+        assert_ne!(foreign, id("Error", false, "a.rs", 1));
+        assert_eq!(foreign.label, "fmt::Error");
+        assert_eq!(foreign, id("fmt::Error", true, "b.rs", 1));
     }
 
     fn participant(id: &str, column: &str, label: &str, path: &str) -> Participant {

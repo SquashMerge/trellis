@@ -226,13 +226,15 @@ and #542's "any other guard is unchanged".
     else the module (the file stem, or the directory of a `mod.rs`, plus inline modules).
     An `impl` block whose type has no name (`impl Tr for [u8]`) or is its own type parameter
     (`impl<A> Tr for A`) is its module's. A self type by a path that does not start at
-    `crate`, `self` or `super` keeps its path (`fmt::Error`).
+    `crate`, `self` or `super` may be foreign, so it keeps that path (`fmt::Error`) and
+    never joins a local type's column.
   - JavaScript, Java and Python: the class, else the file (Python: the module).
   - A closure or nested function is in the column of whatever encloses it; an anonymous
     class defers outward.
   - A Rust type's `impl` blocks join across files when the snapshot declares at most one
     type of that name. With several, nothing says which an `impl` implements, so its blocks
-    stay apart by file and inline module: two declared types are never conflated. Types
+    stay apart by file, inline module and the path as written: two declared types are never
+    conflated. Types
     are not resolved here, so an imported foreign type with a local type's bare name
     (`use other::Error; impl Tr for Error`) reads as the local one.
   - Two columns that read the same are told apart in `column.label`: by path, and by line

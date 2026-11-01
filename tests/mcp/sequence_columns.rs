@@ -109,6 +109,25 @@ fn rust_types_that_share_a_name_are_never_conflated() {
     assert_eq!(columns(&view), [("run", "S (a.rs)"), ("one", "S (b.rs)")]);
 }
 
+/// The same relative path in two files can name two types: the store counts the bare name.
+#[test]
+fn a_relative_path_to_two_declared_types_is_not_conflated() {
+    let view = publish(
+        &[
+            ("a/types.rs", "pub struct Config;\n"),
+            ("b/types.rs", "pub struct Config;\n"),
+            (
+                "a/x.rs",
+                "impl types::Config {\n    fn run(&self) { self.one(); }\n}\n",
+            ),
+            ("b/x.rs", "impl types::Config {\n    fn one(&self) {}\n}\n"),
+        ],
+        s::Language::Rust,
+        vec![bind("run", 0, "one")],
+    );
+    assert_eq!(drawn(&view), 2);
+}
+
 #[test]
 fn javascript_methods_share_their_class_and_functions_their_file() {
     let source = "class A {\n  run() { this.one(); free(); }\n  one() {}\n}\nfunction free() {}\n";
