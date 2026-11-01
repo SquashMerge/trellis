@@ -1026,6 +1026,22 @@ impl Enrichment<'_, '_> {
                     step.target = Some(id.clone());
                 }
             }
+            let dispatch_target = disposition
+                .exact_target
+                .filter(|_| reason == BoundaryReason::Dispatch)
+                .map(|(id, key)| {
+                    let document = self.source.document(key)?;
+                    let declaration = document.declarations.get(id).ok_or_else(|| {
+                        SelectedIntegrity("selected sequence target missing".into())
+                    })?;
+                    Ok::<_, anyhow::Error>(crate::behavior::DispatchTarget {
+                        id: id.clone(),
+                        name: declaration.name.clone(),
+                        kind: declaration.kind.clone(),
+                        path: key.path.clone(),
+                    })
+                })
+                .transpose()?;
             let selected = disposition.selected;
             step.call_evidence = Some(crate::behavior::CallEvidence {
                 boundary_reason: reason,
@@ -1042,6 +1058,7 @@ impl Enrichment<'_, '_> {
                         _ => None,
                     }),
                 semantic_basis: selected.and_then(|(_, proof)| proof.basis.clone()),
+                dispatch_target,
             });
             self.edges.push(GraphEdge {
                 call_site_count: 1,

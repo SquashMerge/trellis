@@ -18,7 +18,7 @@ and frames as well as the existing full-step behavior. Source reads remain expli
 ## Classes
 
 Start with the focus and its indexed inheritance hierarchy. Use its context menu to choose other
-related type references. Reveal members only when needed. Search results, notices and original relationship evidence stay folded. The optional
+related type references. Members show by default within the diagram size bounds, and fold from **Members** or the class menu. Search results, notices and original relationship evidence stay folded. The optional
 **Show all returned classes** control exposes the bounded API result, not all classes in the workspace.
 One arrow represents the returned declaration kinds for an ordered class pair. It does not infer a
 runtime relationship, composition, dispatch or multiplicity. Full original returned records stay available.

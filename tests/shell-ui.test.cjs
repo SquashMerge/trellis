@@ -481,6 +481,15 @@ function resolvedView() {
   step.callEvidence = {boundaryReason:"none",resolution:"resolved",dispatch:"direct",freshness:"fresh",provenanceId:"proof"};
   return {data,step,declaration};
 }
+test("a dispatch boundary's inspector names its declaration, marked dynamic, with no target action", () => {
+  const h = harness(), step = call("dyn", "area"), data = view([step]);
+  step.callEvidence = {boundaryReason:"dispatch",resolution:"resolved",dispatch:"dynamic",freshness:"fresh",provenanceId:"proof",
+    dispatchTarget:{id:"decl",name:"area",kind:"method",path:"src/shapes.rs"}};
+  h.shell.selectStep(step,data,()=>{},()=>assert.fail("a boundary opens no target"));
+  assert.equal(h.get("inspector-target").textContent,"dynamic dispatch · declaration area · src/shapes.rs");
+  assert.match(h.get("inspector-evidence").textContent,/^Dispatch boundary · dynamic · fresh · proof/);
+  assert.equal(all(h.get("inspector-detail")).some(n=>n.attrs["data-trellis-target-id"]),false);
+});
 test("resolved inspector distinguishes callee action, original call site and engine evidence; detached action is inert", () => {
   const h = harness(), {data,step,declaration} = resolvedView(), opened = [];
   let sources = 0;

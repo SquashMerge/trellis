@@ -1678,7 +1678,37 @@ test("Classes shows when production code is in a class-catalog language, read on
   await h.run("viewerMetrics.refresh()"); await new Promise(resolve => setImmediate(resolve));
   assert.equal(classRequests.length, 1, "supported languages are read once per pin");
   h.run("viewerMetrics.reset()");
-  assert.equal(h.get("view-classes").hidden, true, "unknown languages hide Classes");
+  assert.equal(h.get("view-classes").hidden, false, "unknown languages keep the checkout's last answer (#559)");
+  h.run("resetCheckout()");
+  assert.equal(h.get("view-classes").hidden, true, "no checkout, no Classes");
+});
+test("the Classes answer is remembered per checkout, shown before metrics return, and corrected by the next answer", async () => {
+  const stored = new Map(), storage = {getItem:key => stored.get(key) ?? null, setItem:(key, value) => stored.set(key, value)};
+  const page = (languages, stale) => {
+    const h = harness({}, true);
+    h.context.localStorage = storage;
+    h.context.fetch = async request => {
+      if (request.startsWith("/api/metrics?")) return response({payload:{...metricPin,workbench:true,metricsVersion:"metrics:v1",scope:"revision",aggregate:"max",role:"production",files:languages.map(language => languageFile(language)),directories:[],topCognitive:[]},catchingUp:false});
+      if (request.startsWith("/api/classes?")) return response({revision:metricPin,items:[],supportedLanguages:["java"]});
+      throw new Error("Unexpected " + request);
+    };
+    h.run("updateViewAvailability()");
+    assert.equal(h.get("view-classes").hidden, !stale, "before metrics return");
+    return h;
+  };
+  const settle = async h => { await h.run("viewerMetrics.refresh()"); await new Promise(resolve => setImmediate(resolve)); };
+  const first = page(["java"], false);
+  await settle(first);
+  assert.equal(first.get("view-classes").hidden, false);
+  assert.deepEqual([...stored.keys()], [`trellis.classes.tab.v1:${ROOT}`]);
+  first.run(`selectedRootKey='${"b".repeat(64)}'; updateViewAvailability()`);
+  assert.equal(first.get("view-classes").hidden, true, "another checkout does not inherit the answer");
+  first.run(`selectedRootKey='${ROOT}'; updateViewAvailability()`);
+  assert.equal(first.get("view-classes").hidden, false);
+  const reload = page([], true);
+  await settle(reload);
+  assert.equal(reload.get("view-classes").hidden, true, "a known answer replaces the hint");
+  page([], false);
 });
 test("Classes stays hidden for production code outside the catalog's supported languages", async () => {
   const {h, classRequests} = await classGate([languageFile("rust")]);

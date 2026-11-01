@@ -1736,6 +1736,7 @@ pub(crate) fn evaluate_prepared<'a>(
     );
     let mut matcher = LayerMatcher::new(config);
     let mut unassigned = Vec::new();
+    let mut unassigned_files = 0usize;
     let mut assignments = BTreeMap::new();
     let mut module_by_id = BTreeMap::new();
     for module in modules {
@@ -1746,8 +1747,13 @@ pub(crate) fn evaluate_prepared<'a>(
         let layer = matcher.select(path, &mut work, check)?;
         assignments.insert(path, layer);
         module_by_id.insert(module["identity"].to_string(), module);
+        // Owner ruling 2026-10-31 (#559): the list follows the source filter; the total does not.
+        // Destinations still resolve across the snapshot.
         if layer.is_none() {
-            unassigned.push(module["identity"].clone());
+            unassigned_files += 1;
+            if glob_matches(&filter, path) {
+                unassigned.push(module["identity"].clone());
+            }
         }
     }
     let mut external_assignments = BTreeMap::new();
@@ -1947,7 +1953,7 @@ pub(crate) fn evaluate_prepared<'a>(
     }
     Ok(Evaluation {
         data: json!({"rulesVersion":"rules:v2","indexGeneration":refs.data["indexGeneration"],"indexRevision":refs.data["indexRevision"],"rulesFile":descriptor(config),
-        "counts":counts(&instances),"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"externalPackages":external_packages,
+        "counts":counts(&instances),"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"unassignedFileCount":unassigned_files,"externalPackages":external_packages,
         "partialFiles":partial_files,"limitations":limitations}),
         layers: assignments,
     })

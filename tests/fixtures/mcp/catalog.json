@@ -14593,6 +14593,9 @@
                 "testCounts": {
                   "$ref": "#/$defs/RuleCounts"
                 },
+                "unassignedFileCount": {
+                  "$ref": "#/$defs/UInt"
+                },
                 "unassigned": {
                   "type": "array",
                   "items": {
@@ -14654,6 +14657,7 @@
                 "testOnly",
                 "counts",
                 "testCounts",
+                "unassignedFileCount",
                 "unassigned",
                 "partialFiles",
                 "limitations",
@@ -16965,6 +16969,9 @@
                 "testCounts": {
                   "$ref": "#/$defs/RuleCounts"
                 },
+                "unassignedFileCount": {
+                  "$ref": "#/$defs/UInt"
+                },
                 "unassigned": {
                   "type": "array",
                   "items": {
@@ -17026,6 +17033,7 @@
                 "testOnly",
                 "counts",
                 "testCounts",
+                "unassignedFileCount",
                 "unassigned",
                 "partialFiles",
                 "limitations",

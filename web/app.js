@@ -450,6 +450,7 @@ async function refreshStatus(followup = false) {
   $("catching-up").hidden = data.catchingUp !== true || !nextPin;
   updateCheckoutOptions();
   if (browseChanged && nextPin) {
+    updateViewAvailability();
     void viewerMetrics?.refresh();
     if (section === "diagrams" && !$("architecture-panel").hidden) void architecture?.refresh();
     if (section === "diagrams" && !$("treemap-panel").hidden) void treemap?.refresh();
@@ -2392,8 +2393,26 @@ $("dependency-next")?.addEventListener("click", () => { if (!$("dependency-next"
 // language the class catalog extracts (#450, #524): the workbench metrics projection's
 // stored roles (which leave out fixtures and authored hidden layers such as tooling)
 // joined with the catalog's supportedLanguages, read once per pin after that code is known.
-// Unknown (loading or failed) hides the tab; explicit class menus still work.
-let classSupport = null;
+// Unknown (loading or failed) keeps the checkout's last answer, and with none hides the tab;
+// explicit class menus still work. That answer arrives only after metrics, which can take
+// seconds, so a new revision holds the tab steady and this browser remembers it for reloads (#559).
+// A stale hint costs little: Classes still opens and says what it finds.
+let classSupport = null, classTab = null;
+const classTabKey = root => `trellis.classes.tab.v1:${root}`;
+function lastClassTab() {
+  if (!selectedRootKey) return false;
+  if (classTab?.root !== selectedRootKey) {
+    let saved = null;
+    try { saved = localStorage.getItem(classTabKey(selectedRootKey)); } catch (_) { /* No hint; the answer still comes. */ }
+    classTab = {root:selectedRootKey, available:saved === "true"};
+  }
+  return classTab.available;
+}
+function rememberClassTab(available) {
+  if (!selectedRootKey || available === lastClassTab()) return;
+  classTab = {root:selectedRootKey, available};
+  try { localStorage.setItem(classTabKey(selectedRootKey), String(available)); } catch (_) { /* This page still holds it. */ }
+}
 async function refreshClassSupport(pin) {
   const guard = browseGuard(), attempt = {pin, languages:null};
   classSupport = attempt;
@@ -2417,7 +2436,8 @@ function updateViewAvailability() {
   const known = classSupport && IndexPin.equal(classSupport.pin, pin);
   if (languages?.size && pin && token && !known) void refreshClassSupport(IndexPin.copy(pin));
   const supported = known ? classSupport.languages : null;
-  window.TrellisShell?.setViewAvailable?.("classes", !!languages && !!supported && [...supported].some(language => languages.has(language)));
+  if (languages && (!languages.size || supported)) rememberClassTab([...supported || []].some(language => languages.has(language)));
+  window.TrellisShell?.setViewAvailable?.("classes", lastClassTab());
 }
 // With no method selected, Sequence offers the highest-cognitive named callables of the
 // current metrics projection as starting points (#450): application layers only, since

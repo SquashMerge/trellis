@@ -2,7 +2,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {mkdirSync, writeFileSync, rmSync, renameSync} = require("node:fs");
-const {join} = require("node:path");
+const {dirname, join} = require("node:path");
 const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
 
@@ -35,7 +35,10 @@ test.after(async () => H.cleanup());
 
 async function published({git = false, width = 1440, sourceText = source, files = {}} = {}, callback) {
   const paths = H.fixture(sourceText, "Watcher.java");
-  for (const [name, text] of Object.entries(files)) writeFileSync(join(paths.workspace, name), text);
+  for (const [name, text] of Object.entries(files)) {
+    mkdirSync(dirname(join(paths.workspace, name)), {recursive:true});
+    writeFileSync(join(paths.workspace, name), text);
+  }
   writeFileSync(join(paths.workspace, "Uses.java"), uses);
   writeFileSync(join(paths.workspace, "clean.js"), "const clean = 1;\n");
   writeFileSync(join(paths.workspace, hostileName), "// <script>globalThis.sourceExecuted=true</script>\nconst safe = 'λ';\n");
@@ -184,7 +187,7 @@ test("published Files outlines types and callables with members under an expande
   assert.deepEqual(await rows(), [type.symbol.id, ...members.map(item => item.symbol.id)], "members follow their type in source order");
   assert.deepEqual(new Set(members.map(item => item.nativeKind)), new Set(["field", "constructor", "method"]));
   for (const item of [type, ...members]) {
-    const label = await page.locator(`.files-symbol-pick[data-symbol-id="${item.symbol.id}"]`).textContent();
+    const label = await page.locator(`.files-symbol-pick[data-symbol-id="${item.symbol.id}"]`).getAttribute("title");
     assert.ok(label.includes(item.symbol.name)); assert.ok(label.includes(item.nativeKind));
   }
   for (const parameter of dto.items.filter(item => item.nativeKind === "parameter")) {
@@ -461,7 +464,7 @@ test("Files outlines function-valued bindings and Rust impl targets from the par
   assert.deepEqual(await page.locator(".files-symbol-pick .files-symbol-name").allTextContents(), ["Budget", "held", "reserve", "Remote"]);
 }));
 
-// #426: icon plus name on one line, with kind and line right-aligned.
+// #426, #559: icon plus name on one line; kind and line are in the tooltip and accessible name.
 async function assertOneLineRows(page, items) {
   await expandOutline(page);
   const shown = new Set(await page.locator(".files-symbol-pick").evaluateAll(nodes => nodes.map(node => node.dataset.symbolId)));
@@ -471,22 +474,22 @@ async function assertOneLineRows(page, items) {
     const row = await page.locator(`.files-symbol-pick[data-symbol-id="${item.symbol.id}"]`).evaluate(node => {
       const style = getComputedStyle(node), box = node.getBoundingClientRect(), part = selector => {
         const child = node.querySelector(selector), rect = child?.getBoundingClientRect();
-        return child && {text:child.textContent, left:rect.left, right:rect.right, top:rect.top, bottom:rect.bottom, hidden:child.getAttribute("aria-hidden"),
-          title:child.title, clipped:child.scrollWidth > child.clientWidth, elements:child.children.length};
+        return child && {text:child.textContent, left:rect.left, right:rect.right, top:rect.top, bottom:rect.bottom, hidden:child.getAttribute("aria-hidden"), elements:child.children.length};
       };
       // Geometry, not a row height: the shell's button min-height may exceed one text line.
-      return {lineHeight:parseFloat(style.lineHeight), contentRight:box.right - parseFloat(style.paddingRight), label:node.getAttribute("aria-label"), html:node.innerHTML.includes("<img"),
-        icon:part(".files-symbol-icon"), name:part(".files-symbol-name"), kind:part(".files-symbol-kind"), line:part(".files-symbol-line")};
+      return {lineHeight:parseFloat(style.lineHeight), contentRight:box.right - parseFloat(style.paddingRight), title:node.title, label:node.getAttribute("aria-label"), html:node.innerHTML.includes("<img"),
+        children:node.children.length, icon:part(".files-symbol-icon"), name:part(".files-symbol-name")};
     });
     const where = `${item.symbol.name} row ${JSON.stringify(row)}`;
-    for (const key of ["icon", "name", "kind", "line"]) assert.ok(row[key].bottom - row[key].top <= row.lineHeight + 1, `${where} ${key} does not wrap`);
+    for (const key of ["icon", "name"]) assert.ok(row[key].bottom - row[key].top <= row.lineHeight + 1, `${where} ${key} does not wrap`);
     assert.equal(row.icon.hidden, "true", where);
-    assert.equal(row.name.text, item.symbol.name); assert.equal(row.name.title, item.symbol.name); assert.equal(row.name.elements, 0);
-    assert.equal(row.kind.text, item.nativeKind); assert.equal(row.line.text, `L${item.symbol.range.startLine}`);
-    assert.equal(row.label, `${item.symbol.name} · ${item.nativeKind} · L${item.symbol.range.startLine}`, `${where} accessible name contains the visible line label`);
-    assert.ok(row.icon.right <= row.name.left && row.name.right <= row.kind.left + 0.5 && row.kind.right <= row.line.left, `${where} reads icon, name, kind, line`);
-    assert.ok(Math.abs(row.line.right - row.contentRight) <= 1, `${where} line is right-aligned`);
-    for (const key of ["icon", "name", "kind", "line"]) assert.ok(Math.abs(row[key].top - row.name.top) <= 2, `${where} ${key} shares the name's line`);
+    assert.equal(row.name.text, item.symbol.name); assert.equal(row.name.elements, 0);
+    assert.equal(row.title, `${item.symbol.name} · ${item.nativeKind} · L${item.symbol.range.startLine}`, `${where} the tooltip carries kind and line`);
+    assert.equal(row.label, row.title, `${where} so does the accessible name`);
+    assert.equal(row.children, 2, `${where} nothing but icon and name takes row width`);
+    assert.ok(row.icon.right <= row.name.left, `${where} reads icon, name`);
+    assert.ok(Math.abs(row.name.right - row.contentRight) <= 1, `${where} the name takes the rest of the row`);
+    assert.ok(Math.abs(row.icon.top - row.name.top) <= 2, `${where} icon shares the name's line`);
     assert.equal(row.html, false);
   }
 }
@@ -520,7 +523,7 @@ test("Files symbol rows are one line and source lines get subtle text-only synta
   await selectSymbol(page, long);
   await assertSource(page, usesText, long.symbol.range);
   assert.equal(await selectedRow.getAttribute("aria-pressed"), "true");
-  assert.deepEqual(await selectedRow.evaluate(node => [...node.children].map(child => getComputedStyle(child).color)), Array(4).fill(await selectedRow.evaluate(node => getComputedStyle(node).color)), "selected rows keep ink text on the selection fill");
+  assert.deepEqual(await selectedRow.evaluate(node => [...node.children].map(child => getComputedStyle(child).color)), Array(2).fill(await selectedRow.evaluate(node => getComputedStyle(node).color)), "selected rows keep ink text on the selection fill");
   // #451: the quiet raised selection keeps the subtle syntax colouring.
   const selectedLines = await syntaxClasses(page);
   assert.equal(selectedLines[annotation].kind, "attribute", "selection keeps the line class");
@@ -540,6 +543,37 @@ test("Files symbol rows are one line and source lines get subtle text-only synta
   await page.waitForFunction(() => !document.body.classList.contains("files-section"));
   // Diagrams repaints the cached snapshot after its current view (Architecture on arrival) refreshes.
   await page.waitForFunction(() => document.querySelectorAll("#source .source-line").length > 0 && document.querySelectorAll("#source .syntax-comment, #source .syntax-attribute").length === 0);
+}));
+
+// #559: a nested Rust function at the default 1440 rail once showed 'relev…', because
+// 'function L170' took the row.
+const scoring = `${"// padding\n".repeat(169)}pub fn relevance_score_of(hits: usize) -> usize {\n    hits\n}\n\npub struct RankedSearchHitsBuffer {\n    pub remaining_budget_bytes: usize,\n}\n`;
+test("at the default rail width an outline name gets the row: nested names show whole, kind and line on hover", {timeout:240000}, async () => published({files:{"src/search/scoring.rs":scoring}}, async selected => {
+  const {page} = selected;
+  await enterFiles(selected);
+  for (const directory of ["src", "search"]) {
+    const summary = page.locator("#file-tree summary").filter({hasText:directory}).first();
+    if (!await summary.evaluate(node => node.parentElement.open)) await summary.click();
+  }
+  await openFile(selected, "scoring.rs");
+  const dto = await outline(selected, "src/search/scoring.rs");
+  await expandOutline(page);
+  const rail = await page.locator(".file-browser").evaluate(node => node.getBoundingClientRect().width);
+  assert.equal(Math.round(rail), 244, "the default rail at 1440");
+  const geometry = name => page.locator(".files-symbol-pick").filter({hasText:name}).first().evaluate(pick => {
+    const label = pick.querySelector(".files-symbol-name");
+    return {full:label.scrollWidth <= label.clientWidth, width:label.getBoundingClientRect().width, pick:pick.getBoundingClientRect().width, title:pick.title, text:pick.textContent};
+  });
+  const score = dto.items.find(item => item.symbol.name === "relevance_score_of");
+  assert.equal(score.symbol.range.startLine, 170);
+  const row = await geometry("relevance_score_of");
+  assert.equal(row.full, true, `the whole name shows: ${JSON.stringify(row)}`);
+  assert.equal(row.title, `relevance_score_of · ${score.nativeKind} · L170`, "hover names the kind and line");
+  assert.doesNotMatch(row.text, /L170|function/, "no label takes the name's width");
+  assert.ok(row.width / row.pick > 0.75, `the name has the row: ${JSON.stringify(row)}`);
+  // A member, one level deeper, keeps its kind and line in the tooltip.
+  const member = await geometry("remaining_budget_bytes");
+  assert.match(member.title, /^remaining_budget_bytes · field · L175$/, JSON.stringify(member));
 }));
 
 test("mini Full from Working tree explains Back to an unsaved blank route and Forward restores its pinned sequence", {timeout:240000}, async () => published({git:true}, async selected => {

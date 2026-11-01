@@ -57,6 +57,20 @@
     if (source.length > MAX_SOURCE) unsupported("Class Mermaid source too large");
     return {source, classes};
   }
+  // Members show by default. A class the reader toggled keeps that choice; the others open in
+  // diagram order, focus first, while the projection stays within its bounds, so the default
+  // alone never costs a diagram its Pele rendering. A diagram Pele cannot draw at all is cards.
+  function membersShown(nodes, options = {}) {
+    const choices = options.memberChoices || new Map(), ids = nodes.map(node => node?.id);
+    const chosen = ids.filter(id => choices.get(id)), defaults = ids.filter(id => !choices.has(id));
+    const fits = list => { try { project(nodes, {seed:options.seed, membersOpen:new Set(list)}); return true; } catch { return false; } };
+    if (fits([...chosen, ...defaults]) || !fits(chosen)) return new Set([...chosen, ...defaults]);
+    const open = chosen;
+    for (const id of [...defaults].sort((a, b) => (b === options.seed) - (a === options.seed))) {
+      if (fits([...open, id])) open.push(id);
+    }
+    return new Set(open);
+  }
   function validatedSvg(raw, projection) {
     if (typeof raw !== "string" || new TextEncoder().encode(raw).length > 8 * 1024 * 1024) unsupported("Class SVG output too large");
     const start = /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" class="pele pele-class"/;
@@ -112,7 +126,7 @@
       return {status:"unsupported", reason:String(error?.message || error)};
     }
   }
-  window.TrellisPeleClasses = Object.freeze({project, validatedSvg, render});
+  window.TrellisPeleClasses = Object.freeze({project, membersShown, validatedSvg, render});
 })();
 (function () {
   "use strict";
@@ -122,7 +136,8 @@
   let positions = new Map(), cards = new Map(), stage = null, menu = null, menuAnchor = null, warningBox = null;
   let menuContext = null, menuExpanded = null, menuOnClose = null, menuScroll = new Map();
   let bound = false, snapshot = null, diagramGeneration = 0, displayTicket = 0;
-  let controls, changeButton, allButton, chooser = null, showAll = false, membersOpen = new Set();
+  // membersOpen is what the current render shows; memberChoices holds the reader's toggles.
+  let controls, changeButton, allButton, chooser = null, showAll = false, membersOpen = new Set(), memberChoices = new Map();
   // "pele" or "cards". Cards remain the visible fallback when Pele cannot
   // represent the returned declarations faithfully (Decision 0014 §2).
   let renderer = null, rendererNote = "";
@@ -255,7 +270,7 @@
   function reset() {
     if (api && api.onChange) api.onChange();
     serial++; searchSerial++; diagramGeneration++; closeContextMenu(false);
-    seed = null; expanded = []; diagram = null; snapshot = null; showAll = false; membersOpen.clear(); closeChooser();
+    seed = null; expanded = []; diagram = null; snapshot = null; showAll = false; memberChoices.clear(); closeChooser();
     if (controls) controls.hidden = true;
     if (ui) ui.results.hidden = false;
     positions = new Map(); cards = new Map(); stage = null;
@@ -338,7 +353,7 @@
       serial++; closeContextMenu(false); closeChooser(); ui.results.hidden = false;
       controls.hidden = true;
       if (!offset) {
-        showAll = false; membersOpen.clear(); expanded = [];
+        showAll = false; memberChoices.clear(); expanded = [];
         seed = null; diagram = null; snapshot = null; diagramGeneration++; ui.diagram.replaceChildren();
         stage = null; cards = new Map(); positions = new Map(); ui.results.replaceChildren();
       }
@@ -390,7 +405,7 @@
         reset(); api.onStale?.("Workspace revision changed. Open the class again.");
         state("Workspace revision changed. Open the class again.", "stale"); return;
       }
-      if (fresh) { positions = new Map(); cards = new Map(); stage = null; showAll = false; membersOpen.clear(); ui.diagram.replaceChildren(); }
+      if (fresh) { positions = new Map(); cards = new Map(); stage = null; showAll = false; memberChoices.clear(); ui.diagram.replaceChildren(); }
       ui.results.hidden = true; changeButton.setAttribute("aria-expanded", "false");
       seed = data.seed; expanded = expansion; diagram = data; snapshot = c; diagramGeneration++; displayTicket = ticket;
       render(data); renderWarnings(data.warnings || []);
@@ -534,7 +549,7 @@
   function toggleMembers(id) {
     if (!currentView()) return;
     const top = ui.diagram.scrollTop, left = ui.diagram.scrollLeft;
-    if (membersOpen.has(id)) membersOpen.delete(id); else membersOpen.add(id);
+    memberChoices.set(id, !membersOpen.has(id));
     render(diagram); updateStatus();
     ui.diagram.scrollTop = top; ui.diagram.scrollLeft = left;
     const anchor = cards.get(id);
@@ -583,11 +598,14 @@
       }
       if (definition.truncated) notices.append(el("li", `${fullName}: partial declaration · read source for details.`));
     }
+    const collapsed = outcome.controls.filter(({item}) => !item.open && !memberChoices.has(item.node.id) && item.node.class.fields.length + item.node.class.methods.length).length;
+    if (collapsed) notices.prepend(el("li", `${collapsed} ${collapsed === 1 ? "class" : "classes"} collapsed so the diagram can be drawn. Open a class to show its members.`));
     ui.diagram.replaceChildren(outcome.root, ...(notices.children.length ? [notices] : []), relationshipLedger());
   }
   function render(data) {
     const nodes = visibleNodes(data), ids = new Set(nodes.map(node => node.id));
-    const outcome = window.TrellisPeleClasses ? window.TrellisPeleClasses.render(nodes, {seed, membersOpen}) : {status: "unsupported", reason: "Pele asset unavailable"};
+    membersOpen = window.TrellisPeleClasses.membersShown(nodes, {seed, memberChoices});
+    const outcome = window.TrellisPeleClasses.render(nodes, {seed, membersOpen});
     if (outcome.status === "rendered") { rendererNote = " Pele rendered."; renderPele(outcome); return; }
     rendererNote = ` Pele fell back: ${outcome.reason}.`;
     if (renderer !== "cards") { ui.diagram.replaceChildren(); stage = null; positions = new Map(); cards = new Map(); }

@@ -8396,7 +8396,7 @@ fn targeted_current_declaration(
     #[cfg(feature = "test-support")]
     crate::semantic_import::note_current_target_lookup(document);
     let mut query = tx.prepare(
-        "SELECT d.name,d.name_start,d.name_end FROM revision_documents m
+        "SELECT d.name,d.name_start,d.name_end,d.kind FROM revision_documents m
          JOIN document_versions v ON v.vid=m.vid AND v.language=m.language AND v.path=m.path
          JOIN native_version_declarations d ON d.vid=v.vid
          WHERE m.revision_id=?1 AND m.language=?2 AND m.path=?3 AND d.syntax_id=?4
@@ -8414,7 +8414,8 @@ fn targeted_current_declaration(
             let name: Option<String> = row.get(0)?;
             let start: Option<i64> = row.get(1)?;
             let end: Option<i64> = row.get(2)?;
-            Ok::<_, rusqlite::Error>((name, start, end))
+            let kind: String = row.get(3)?;
+            Ok::<_, rusqlite::Error>((name, start, end, kind))
         })
         .transpose()?;
     ensure!(
@@ -8424,10 +8425,11 @@ fn targeted_current_declaration(
     #[cfg(feature = "test-support")]
     crate::semantic_import::note_current_target_rows(usize::from(first.is_some()));
     match first {
-        Some((Some(name), Some(start), Some(end))) => {
+        Some((Some(name), Some(start), Some(end), kind)) => {
             Ok(Some(crate::semantic_evidence::TargetDeclaration {
                 syntax_id: syntax_id.to_owned(),
                 document: document.clone(),
+                kind,
                 name,
                 name_range: crate::native_evidence::Range {
                     start: usize::try_from(start)?,
@@ -8435,7 +8437,7 @@ fn targeted_current_declaration(
                 },
             }))
         }
-        Some((None, None, None)) | None => Ok(None),
+        Some((None, None, None, _)) | None => Ok(None),
         _ => Err(SelectedIntegrity(
             "incompatible_index: malformed targeted current declaration".into(),
         )

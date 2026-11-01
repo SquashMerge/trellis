@@ -57,7 +57,7 @@ test("Files opens pinned catalog without choosing source; explicit file reads ze
   assert.ok(h.requests.every(request=>!request.url.includes("/source?")&&!request.url.endsWith("/sequence")));
   assert.match(h.requests[0].url,/indexGeneration=.*indexRevision=1/);
   h.run('files[0].methodCount=0'); await h.run('selectFilesFile(files[0])');
-  assert.match(text(h.get("source")),/int measured/); assert.match(text(h.get("file-tree")),/◆ Holder type L1/);
+  assert.match(text(h.get("source")),/int measured/); assert.match(text(h.get("file-tree")),/◆ Holder/);
   assert.equal(h.get("files-working").hidden,true); assert.match(h.get("files-git-state").textContent,/not_repository/);
   h.context.item=item; await h.run('selectFilesSymbol(item)');
   assert.match(h.get("files-mini-state").textContent,/noncallable/);
@@ -300,10 +300,10 @@ test("retained outline More and Retry intents cannot read a successor checkout/s
 test("selecting another file collapses previous outline; interrupted outline exposes retry on return", async () => {
   const h=harness(), first=outline("First","class"), second=outline("Second","class","other.java"); indexedNetwork(h,first);
   await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');
-  assert.match(text(h.get("file-tree")),/◆ First type L1/);
+  assert.match(text(h.get("file-tree")),/◆ First/);
   h.context.secondFile={path:"other.java",methodCount:0}; h.run('files.push(secondFile)'); indexedNetwork(h,second);
-  await h.run('selectFilesFile(secondFile)'); assert.doesNotMatch(text(h.get("file-tree")),/◆ First type L1/);
-  assert.match(text(h.get("file-tree")),/◆ Second type L1/);
+  await h.run('selectFilesFile(secondFile)'); assert.doesNotMatch(text(h.get("file-tree")),/◆ First/);
+  assert.match(text(h.get("file-tree")),/◆ Second/);
   const held=deferred(); indexedNetwork(h,second,url=>url.startsWith("/api/symbols?")?held.promise:undefined);
   const pending=h.run('loadFilesOutline(secondFile)'); await h.run('setSection("diagrams")');
   held.resolve(response({revision:pin,path:"other.java",items:[second],nextOffset:null,truncated:false,warnings:[]})); await pending;
