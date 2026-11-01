@@ -126,9 +126,11 @@ fn selected_case(change_b: &str) {
         change_b,
         "corrupt_capture_new_document" | "two_producers_new_document"
     );
+    let over_old_cap = change_b == "oracle_fork_over_old_cap";
     let change_b = match change_b {
         "corrupt_capture_new_document" => "corrupt_capture",
         "two_producers_new_document" => "two_producers",
+        "oracle_fork_over_old_cap" => "oracle_fork_body",
         other => other,
     };
     let temp = Builder::new()
@@ -299,7 +301,12 @@ fn selected_case(change_b: &str) {
             binary.documents[0].symbols.clear();
         }
     }
+    if over_old_cap {
+        // Presentation text costs no facts, so the artifact is large and the join stays small.
+        binary.documents[0].symbols[0].documentation = vec!["d".repeat(1 << 20); 65];
+    }
     let bytes = binary.write_to_bytes().unwrap();
+    assert!(!over_old_cap || bytes.len() > 64 << 20);
     let covered: &[&str] = if partial {
         &[covered_path]
     } else {
@@ -2271,6 +2278,13 @@ fn two_healthy_producers_share_one_incremental_destination() {
 #[test]
 fn successive_local_publications_reuse_original_capture_without_unchanged_work() {
     selected_case("oracle_fork_successive_local");
+}
+
+/// #555: past the old 64 MiB cap the CLI import selects the artifact, retains it, and a later
+/// publication still takes the witnessed fast path instead of silently falling back.
+#[test]
+fn artifact_over_the_old_cap_imports_and_rejoins_on_the_fast_path() {
+    selected_case("oracle_fork_over_old_cap");
 }
 
 #[test]
