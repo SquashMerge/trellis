@@ -1324,6 +1324,9 @@ pub struct EvidenceResponse {
     db: IndexConnection,
     fence: ReadFence,
     optional_recovery: OptionalRecovery,
+    stable_lookup_keys: std::cell::RefCell<
+        BTreeMap<crate::native_evidence::DocumentKey, Arc<BTreeMap<String, String>>>,
+    >,
 }
 /// Optional evidence cannot invalidate the required answer already being read.
 /// Publish its repair request after that answer's fence, or on an early exit.
@@ -3221,6 +3224,7 @@ impl EvidenceResponse {
             db,
             fence,
             optional_recovery,
+            stable_lookup_keys: _,
         } = self;
         let snapshot_valid = fence.verify(&store, Some(&db)).is_ok();
         let snapshot = if matches!(policy, EvidenceFencePolicy::ExactPin(_)) {
@@ -15032,6 +15036,7 @@ impl Store {
                 db,
                 fence: ReadFence(selected.pin),
                 optional_recovery,
+                stable_lookup_keys: std::cell::RefCell::new(BTreeMap::new()),
             })
         })()
         .map_err(|error| self.report_index_failure(error))

@@ -544,6 +544,12 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
         let data = &envelope["data"];
         let (name, count, items) = if data.get("languages").is_some() {
             ("trellis_workspace_describe", 1, "workspace")
+        } else if let Some(candidates) = data.get("candidates") {
+            (
+                text.split_once(": ").unwrap().0,
+                candidates.as_array().unwrap().len(),
+                "candidates",
+            )
         } else if let Some(symbols) = data.get("symbols") {
             (
                 "trellis_find_symbols",
@@ -14312,6 +14318,7 @@ struct GraphMcp {
     root: PathBuf,
     pins: Vec<trellis::model::IndexPin>,
     names: std::collections::BTreeMap<String, String>,
+    revision_names: Vec<std::collections::BTreeMap<String, String>>,
     runtime: std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
     client: std::os::unix::net::UnixStream,
     reader: BufReader<std::os::unix::net::UnixStream>,
@@ -14341,7 +14348,22 @@ impl GraphMcp {
             .store
             .mcp_prepare_virgin_queue_for_tests()
             .unwrap();
-        let pins = specs.iter().map(|spec| publisher.publish(spec)).collect();
+        let mut revision_names = Vec::new();
+        let pins = specs
+            .iter()
+            .map(|spec| {
+                let pin = publisher.publish(spec);
+                revision_names.push(
+                    publisher
+                        .native()
+                        .declarations
+                        .iter()
+                        .filter_map(|d| Some((d.syntax_id.clone(), d.name.clone()?)))
+                        .collect(),
+                );
+                pin
+            })
+            .collect();
         let names = publisher
             .native()
             .declarations
@@ -14382,6 +14404,7 @@ impl GraphMcp {
             root,
             pins,
             names,
+            revision_names,
             runtime,
             client,
             reader,
@@ -15582,6 +15605,315 @@ fn call_graph_cancel_child() {
             tool(&reply, None, true);
             mcp.finish();
         });
+}
+
+// #593: exercise the wire contract against real indexed Rust declarations, not hand-made IDs.
+const LOOKUP_ROOT_TOOLS: [&str; 4] = [
+    "trellis_declaration",
+    "trellis_outgoing_calls",
+    "trellis_incoming_calls",
+    "trellis_call_graph",
+];
+
+fn lookup_reply(mcp: &mut GraphMcp, name: &str, arguments: Value, code: Option<&str>) -> Value {
+    mcp.next_id += 1;
+    let id = mcp.next_id;
+    writeln!(
+        mcp.client,
+        "{}",
+        modern(
+            json!(id),
+            "tools/call",
+            json!({"name":name,"arguments":arguments})
+        )
+    )
+    .unwrap();
+    let reply = next_reply(&mut mcp.reader);
+    assert_eq!(reply["id"], id);
+    tool(&reply, code, true);
+    let envelope = reply["result"]["structuredContent"].clone();
+    mcp.pairs
+        .push(json!({"name":name,"structuredContent":envelope}));
+    envelope
+}
+
+fn lookup_basis(pin: trellis::model::IndexPin) -> Value {
+    json!({"indexGeneration":pin.index_generation.to_string(),"indexRevision":pin.index_revision})
+}
+
+fn assert_lookup_symbol_closure(data: &Value, field: &str, count: usize) {
+    let symbols = data[field].as_array().unwrap();
+    assert_eq!(symbols.len(), count);
+    assert!(!data["scopeCoverage"].as_array().unwrap().is_empty());
+    let documents = data["documents"].as_array().unwrap();
+    let coverage = data["coverage"].as_array().unwrap();
+    let provenance = data["provenance"].as_array().unwrap();
+    assert_eq!(documents.len(), 1);
+    assert_eq!(coverage.len(), 1);
+    assert_eq!(provenance.len(), 1);
+    for symbol in symbols {
+        let document = emitted_document(data, symbol);
+        assert_eq!(document["document"]["path"], "src/lib.rs");
+        assert!(symbol["lines"]["start"].as_u64().is_some());
+        assert!(
+            symbol["range"]["end"].as_u64().unwrap() > symbol["range"]["start"].as_u64().unwrap()
+        );
+        assert_eq!(symbol["evidenceTier"], "syntax");
+        assert!(
+            coverage
+                .iter()
+                .any(|row| row["documentPath"] == "src/lib.rs")
+        );
+        assert!(
+            provenance
+                .iter()
+                .any(|row| row["document"] == document["document"])
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stable_lookup_recovers_moved_impl_without_changing_sid_semantics() {
+    let first = graph_fixtures::Spec::syntax_only(&[(
+        "src/lib.rs",
+        "struct Store;\nimpl Store { fn run() { helper(); } }\nfn helper() {}\nfn caller() { Store::run(); }\n",
+    )]);
+    let moved = graph_fixtures::Spec::syntax_only(&[(
+        "src/lib.rs",
+        "struct Other;\nimpl Other { fn unrelated() {} }\nstruct Store;\nimpl Store { fn run() { helper(); } }\nfn helper() {}\nfn caller() { Store::run(); }\n",
+    )]);
+    let mut mcp = GraphMcp::start(5931, &[first, moved], Default::default()).await;
+    let old_id = mcp.revision_names[0]
+        .iter()
+        .find(|(_, name)| name.as_str() == "run")
+        .unwrap()
+        .0
+        .clone();
+    let current_id = mcp.id_of("run");
+    assert_ne!(
+        old_id, current_id,
+        "the unrelated impl changes the SID owner ordinal"
+    );
+    let key = "src/lib.rs::Store::run";
+    let basis = lookup_basis(mcp.pins[1]);
+    let found = mcp.call_tool(
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"run","expectedBasis":basis}),
+    );
+    let symbol = &found["data"]["symbols"][0];
+    assert_eq!(symbol["symbolId"], current_id);
+    assert_eq!(symbol["stableLookupKey"], key);
+    let exact = mcp.call_tool(
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"lookupKey":key,"expectedBasis":basis}),
+    );
+    assert_eq!(exact["data"], found["data"]);
+    let search = mcp.call_tool(
+        "trellis_search_symbols",
+        json!({"schemaVersion":1,"query":"run","expectedBasis":basis}),
+    );
+    let hit = search["data"]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hit| hit["symbolId"] == current_id)
+        .unwrap();
+    assert_eq!(hit["stableLookupKey"], key);
+    for name in LOOKUP_ROOT_TOOLS {
+        lookup_reply(
+            &mut mcp,
+            name,
+            json!({"schemaVersion":1,"symbolId":old_id,"expectedBasis":basis}),
+            Some("not_found"),
+        );
+        let by_key = mcp.call_tool(
+            name,
+            json!({"schemaVersion":1,"lookupKey":key,"expectedBasis":basis}),
+        );
+        let by_id = mcp.call_tool(
+            name,
+            json!({"schemaVersion":1,"symbolId":current_id,"expectedBasis":basis}),
+        );
+        assert_eq!(by_key["data"], by_id["data"], "{name}");
+        assert_eq!(by_key["data"]["stableLookupKey"], key, "{name}");
+        assert_eq!(by_key["evidenceBasis"], basis);
+        match name {
+            "trellis_declaration" => {
+                assert_eq!(by_key["data"]["declaration"]["syntaxId"], current_id)
+            }
+            "trellis_outgoing_calls" => {
+                assert_eq!(by_key["data"]["calls"].as_array().unwrap().len(), 1)
+            }
+            "trellis_incoming_calls" => {
+                assert_eq!(by_key["data"]["callers"].as_array().unwrap().len(), 1)
+            }
+            "trellis_call_graph" => assert_eq!(
+                by_key["data"]["result"]["request"]["rootSyntaxId"],
+                current_id
+            ),
+            _ => unreachable!(),
+        }
+    }
+    mcp.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stable_lookup_preserves_delimiters_in_source_paths() {
+    let spec = graph_fixtures::Spec::syntax_only(&[(
+        "src::lib.rs",
+        "struct Store;\nimpl Store { fn run() {} }\n",
+    )]);
+    let mut mcp = GraphMcp::start(5934, &[spec], Default::default()).await;
+    let id = mcp.id_of("run");
+    let key = "src::lib.rs::Store::run";
+    let found = mcp.call_tool(
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"run"}),
+    );
+    assert_eq!(found["data"]["symbols"].as_array().unwrap().len(), 1);
+    let symbol = &found["data"]["symbols"][0];
+    assert_eq!(symbol["symbolId"], id);
+    assert_eq!(symbol["stableLookupKey"], key);
+    assert_eq!(
+        emitted_document(&found["data"], symbol)["document"]["path"],
+        "src::lib.rs"
+    );
+    let exact = mcp.call_tool(
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"lookupKey":key}),
+    );
+    assert_eq!(exact["data"], found["data"]);
+    let by_key = mcp.call_tool(
+        "trellis_declaration",
+        json!({"schemaVersion":1,"lookupKey":key}),
+    );
+    let by_id = mcp.call_tool(
+        "trellis_declaration",
+        json!({"schemaVersion":1,"symbolId":id}),
+    );
+    assert_eq!(by_key["data"], by_id["data"]);
+    assert_eq!(by_key["data"]["declaration"]["syntaxId"], id);
+    assert_eq!(by_key["data"]["stableLookupKey"], key);
+    mcp.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stable_lookup_ambiguity_returns_all_candidates_and_never_runs_the_operation() {
+    let spec = graph_fixtures::Spec::syntax_only(&[(
+        "src/lib.rs",
+        "struct Foo;\nimpl Foo { fn run() {} }\nimpl Foo { fn run() {} }\n",
+    )]);
+    let mut mcp = GraphMcp::start(5932, &[spec], Default::default()).await;
+    let key = "src/lib.rs::Foo::run";
+    let expected_ids: std::collections::BTreeSet<_> = mcp
+        .names
+        .iter()
+        .filter(|(_, name)| name.as_str() == "run")
+        .map(|(id, _)| json!(id).to_string())
+        .collect();
+    assert_eq!(expected_ids.len(), 2);
+    let found = mcp.call_tool(
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"lookupKey":key,"limit":1}),
+    );
+    assert_lookup_symbol_closure(&found["data"], "symbols", 2);
+    assert_eq!(found["truncated"], false);
+    for name in LOOKUP_ROOT_TOOLS {
+        let result = mcp.call_tool(name, json!({"schemaVersion":1,"lookupKey":key}));
+        let data = &result["data"];
+        assert_eq!(data["lookupKey"], key);
+        assert_lookup_symbol_closure(data, "candidates", 2);
+        assert_eq!(data["candidates"], found["data"]["symbols"]);
+        let ids: std::collections::BTreeSet<_> = data["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| {
+                assert_eq!(candidate["stableLookupKey"], key);
+                candidate["symbolId"].to_string()
+            })
+            .collect();
+        assert_eq!(ids, expected_ids);
+        for operation_field in [
+            "declaration",
+            "calls",
+            "callers",
+            "result",
+            "requested",
+            "symbolId",
+        ] {
+            assert!(
+                data.get(operation_field).is_none(),
+                "{name} executed: {data}"
+            );
+        }
+        assert_eq!(result["truncated"], false);
+        assert!(result["truncationReason"].is_null());
+        assert_eq!(result["evidenceBasis"], found["evidenceBasis"]);
+    }
+    mcp.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stable_lookup_selector_validation_missing_and_revision_conflict() {
+    let old = graph_fixtures::Spec::syntax_only(&[("src/lib.rs", "fn run() {}\n")]);
+    let head = graph_fixtures::Spec::syntax_only(&[("src/lib.rs", "fn run() {}\nfn added() {}\n")]);
+    let mut mcp = GraphMcp::start(5933, &[old, head], Default::default()).await;
+    let id = mcp.id_of("run");
+    let basis = lookup_basis(mcp.pins[1]);
+    let old_basis = lookup_basis(mcp.pins[0]);
+    assert_ne!(basis, old_basis);
+    let missing = "src/lib.rs::missing";
+    let empty = mcp.call_tool(
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"lookupKey":missing,"expectedBasis":basis}),
+    );
+    for field in ["symbols", "documents", "coverage", "provenance"] {
+        assert_eq!(empty["data"][field], json!([]));
+    }
+    assert_eq!(empty["truncated"], false);
+    for name in LOOKUP_ROOT_TOOLS
+        .into_iter()
+        .chain(["trellis_find_symbols"])
+    {
+        let selector = if name == "trellis_find_symbols" {
+            "query"
+        } else {
+            "symbolId"
+        };
+        let primary = if selector == "query" {
+            json!("run")
+        } else {
+            json!(id)
+        };
+        let mut both = json!({"schemaVersion":1,"lookupKey":"src/lib.rs::run"});
+        both[selector] = primary;
+        for arguments in [
+            both,
+            json!({"schemaVersion":1}),
+            json!({"schemaVersion":1,"lookupKey":null}),
+            json!({"schemaVersion":1,"lookupKey":7}),
+            json!({"schemaVersion":1,"lookupKey":""}),
+        ] {
+            lookup_reply(&mut mcp, name, arguments, Some("invalid_request"));
+        }
+        let conflict = lookup_reply(
+            &mut mcp,
+            name,
+            json!({"schemaVersion":1,"lookupKey":"src/lib.rs::run","expectedBasis":old_basis}),
+            Some("revision_conflict"),
+        );
+        assert!(conflict.get("data").is_none());
+        if name != "trellis_find_symbols" {
+            lookup_reply(
+                &mut mcp,
+                name,
+                json!({"schemaVersion":1,"lookupKey":missing,"expectedBasis":basis}),
+                Some("not_found"),
+            );
+        }
+    }
+    mcp.finish();
 }
 
 /// A child test's libtest name in the grouped test binary, which names this

@@ -825,7 +825,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 3
+                  "const": 4
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -986,13 +986,38 @@
         "workspace": {
           "type": "string",
           "maxLength": 4096
+        },
+        "lookupKey": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [
-        "schemaVersion",
-        "query"
+        "schemaVersion"
       ],
-      "type": "object"
+      "type": "object",
+      "oneOf": [
+        {
+          "required": [
+            "query"
+          ],
+          "not": {
+            "required": [
+              "lookupKey"
+            ]
+          }
+        },
+        {
+          "required": [
+            "lookupKey"
+          ],
+          "not": {
+            "required": [
+              "query"
+            ]
+          }
+        }
+      ]
     },
     "name": "trellis_find_symbols",
     "outputSchema": {
@@ -1494,6 +1519,17 @@
                 "test",
                 "production"
               ]
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -1509,7 +1545,8 @@
             "staleBecause",
             "doc",
             "lines",
-            "role"
+            "role",
+            "stableLookupKey"
           ],
           "type": "object"
         },
@@ -2742,6 +2779,17 @@
                 "test",
                 "production"
               ]
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -2757,7 +2805,8 @@
             "staleBecause",
             "doc",
             "lines",
-            "role"
+            "role",
+            "stableLookupKey"
           ],
           "type": "object"
         },
@@ -3385,6 +3434,17 @@
                   ]
                 }
               ]
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -3401,6 +3461,7 @@
             "doc",
             "lines",
             "role",
+            "stableLookupKey",
             "rank",
             "matchedBy"
           ],
@@ -3676,11 +3737,36 @@
         "workspace": {
           "type": "string",
           "maxLength": 4096
+        },
+        "lookupKey": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [
-        "schemaVersion",
-        "symbolId"
+        "schemaVersion"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "symbolId"
+          ],
+          "not": {
+            "required": [
+              "lookupKey"
+            ]
+          }
+        },
+        {
+          "required": [
+            "lookupKey"
+          ],
+          "not": {
+            "required": [
+              "symbolId"
+            ]
+          }
+        }
       ]
     },
     "name": "trellis_declaration",
@@ -4777,6 +4863,222 @@
               "type": "integer"
             }
           ]
+        },
+        "Symbol": {
+          "additionalProperties": false,
+          "properties": {
+            "displayKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "freshness": {
+              "const": "fresh"
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "nameRange": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Range"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "semanticBasis": {
+              "const": null
+            },
+            "staleBecause": {
+              "maxItems": 0,
+              "type": "array"
+            },
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "doc": {
+              "$ref": "#/$defs/UInt"
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "symbolId",
+            "name",
+            "displayKey",
+            "kind",
+            "range",
+            "nameRange",
+            "evidenceTier",
+            "semanticBasis",
+            "freshness",
+            "staleBecause",
+            "doc",
+            "lines",
+            "role",
+            "stableLookupKey"
+          ],
+          "type": "object"
+        },
+        "LanguageStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "coverage": {
+              "additionalProperties": false,
+              "properties": {
+                "complete": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "failed": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "partial": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "selected": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "unselected": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "selected",
+                "complete",
+                "partial",
+                "failed",
+                "unselected"
+              ],
+              "type": "object"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "semantic": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "producerId": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "freshness": {
+                  "enum": [
+                    "fresh",
+                    "possiblyStale",
+                    "stale",
+                    "unavailable"
+                  ]
+                },
+                "coverage": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "selected": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "complete": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "partial": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "failed": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "unselected": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "selected",
+                    "complete",
+                    "partial",
+                    "failed",
+                    "unselected"
+                  ],
+                  "type": "object"
+                },
+                "note": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "producerId",
+                "freshness",
+                "coverage",
+                "note"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "language",
+            "evidenceTier",
+            "coverage",
+            "semantic"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4826,6 +5128,17 @@
                       "type": "null"
                     }
                   ]
+                },
+                "stableLookupKey": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -4836,7 +5149,8 @@
                 "provenance",
                 "documents",
                 "doc",
-                "lines"
+                "lines",
+                "stableLookupKey"
               ],
               "type": "object"
             },
@@ -4875,6 +5189,111 @@
                   "type": "null"
                 }
               ]
+            },
+            "warnings": {
+              "items": {
+                "$ref": "#/$defs/Warning"
+              },
+              "type": "array"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "evidenceBasis",
+            "data",
+            "warnings",
+            "partial",
+            "truncated",
+            "truncationReason",
+            "workspace",
+            "catchingUp"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "additionalProperties": false,
+              "properties": {
+                "coverage": {
+                  "items": {
+                    "$ref": "#/$defs/Coverage"
+                  },
+                  "type": "array"
+                },
+                "provenance": {
+                  "items": {
+                    "$ref": "#/$defs/Provenance"
+                  },
+                  "type": "array"
+                },
+                "scopeCoverage": {
+                  "items": {
+                    "$ref": "#/$defs/LanguageStatus"
+                  },
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "type": "array"
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentRef"
+                  }
+                },
+                "candidates": {
+                  "items": {
+                    "$ref": "#/$defs/Symbol"
+                  },
+                  "type": "array"
+                },
+                "lookupKey": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "candidates",
+                "coverage",
+                "scopeCoverage",
+                "provenance",
+                "documents",
+                "lookupKey"
+              ],
+              "type": "object"
+            },
+            "evidenceBasis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Basis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            },
+            "truncated": {
+              "const": false
+            },
+            "truncationReason": {
+              "const": null
             },
             "warnings": {
               "items": {
@@ -4990,11 +5409,36 @@
         "compact": {
           "type": "boolean",
           "default": false
+        },
+        "lookupKey": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [
-        "schemaVersion",
-        "symbolId"
+        "schemaVersion"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "symbolId"
+          ],
+          "not": {
+            "required": [
+              "lookupKey"
+            ]
+          }
+        },
+        {
+          "required": [
+            "lookupKey"
+          ],
+          "not": {
+            "required": [
+              "symbolId"
+            ]
+          }
+        }
       ]
     },
     "name": "trellis_outgoing_calls",
@@ -6274,6 +6718,389 @@
             "lookupDependencies"
           ],
           "type": "object"
+        },
+        "Symbol": {
+          "additionalProperties": false,
+          "properties": {
+            "displayKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "freshness": {
+              "const": "fresh"
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "nameRange": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Range"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "semanticBasis": {
+              "const": null
+            },
+            "staleBecause": {
+              "maxItems": 0,
+              "type": "array"
+            },
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "doc": {
+              "$ref": "#/$defs/UInt"
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "symbolId",
+            "name",
+            "displayKey",
+            "kind",
+            "range",
+            "nameRange",
+            "evidenceTier",
+            "semanticBasis",
+            "freshness",
+            "staleBecause",
+            "doc",
+            "lines",
+            "role",
+            "stableLookupKey"
+          ],
+          "type": "object"
+        },
+        "Kind": {
+          "enum": [
+            "module",
+            "namespace",
+            "type",
+            "implementation",
+            "function",
+            "method",
+            "constructor",
+            "field",
+            "variable",
+            "parameter",
+            "typeParameter",
+            "alias",
+            "anonymousFunction"
+          ]
+        },
+        "LanguageStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "coverage": {
+              "additionalProperties": false,
+              "properties": {
+                "complete": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "failed": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "partial": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "selected": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "unselected": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "selected",
+                "complete",
+                "partial",
+                "failed",
+                "unselected"
+              ],
+              "type": "object"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "semantic": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "producerId": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "freshness": {
+                  "enum": [
+                    "fresh",
+                    "possiblyStale",
+                    "stale",
+                    "unavailable"
+                  ]
+                },
+                "coverage": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "selected": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "complete": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "partial": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "failed": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "unselected": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "selected",
+                    "complete",
+                    "partial",
+                    "failed",
+                    "unselected"
+                  ],
+                  "type": "object"
+                },
+                "note": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "producerId",
+                "freshness",
+                "coverage",
+                "note"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "language",
+            "evidenceTier",
+            "coverage",
+            "semantic"
+          ],
+          "type": "object"
+        },
+        "LookupProvenance": {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "evidenceKind": {
+                    "const": "measuredSyntax"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": null
+                  },
+                  "derivedFrom": {
+                    "const": null
+                  },
+                  "freshness": {
+                    "const": "fresh"
+                  }
+                }
+              }
+            }
+          ],
+          "properties": {
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "id": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "id",
+            "producerId",
+            "document",
+            "revisionId",
+            "contentHash",
+            "evidenceKind",
+            "basis",
+            "freshness",
+            "derivedFrom"
+          ],
+          "type": "object"
+        },
+        "SemanticBasis": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "lookupDependencies": {
+              "items": {
+                "$ref": "#/$defs/Text"
+              },
+              "type": "array"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            }
+          },
+          "required": [
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6319,13 +7146,25 @@
                   "items": {
                     "$ref": "#/$defs/SemanticBasisEntry"
                   }
+                },
+                "stableLookupKey": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
                 "symbolId",
                 "displayKey",
                 "calls",
-                "documents"
+                "documents",
+                "stableLookupKey"
               ],
               "type": "object"
             },
@@ -6364,6 +7203,111 @@
                   "type": "null"
                 }
               ]
+            },
+            "warnings": {
+              "items": {
+                "$ref": "#/$defs/Warning"
+              },
+              "type": "array"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "evidenceBasis",
+            "data",
+            "warnings",
+            "partial",
+            "truncated",
+            "truncationReason",
+            "workspace",
+            "catchingUp"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "additionalProperties": false,
+              "properties": {
+                "coverage": {
+                  "items": {
+                    "$ref": "#/$defs/Coverage"
+                  },
+                  "type": "array"
+                },
+                "provenance": {
+                  "items": {
+                    "$ref": "#/$defs/LookupProvenance"
+                  },
+                  "type": "array"
+                },
+                "scopeCoverage": {
+                  "items": {
+                    "$ref": "#/$defs/LanguageStatus"
+                  },
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "type": "array"
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentRef"
+                  }
+                },
+                "candidates": {
+                  "items": {
+                    "$ref": "#/$defs/Symbol"
+                  },
+                  "type": "array"
+                },
+                "lookupKey": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "candidates",
+                "coverage",
+                "scopeCoverage",
+                "provenance",
+                "documents",
+                "lookupKey"
+              ],
+              "type": "object"
+            },
+            "evidenceBasis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Basis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            },
+            "truncated": {
+              "const": false
+            },
+            "truncationReason": {
+              "const": null
             },
             "warnings": {
               "items": {
@@ -6479,11 +7423,36 @@
         "compact": {
           "type": "boolean",
           "default": false
+        },
+        "lookupKey": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [
-        "schemaVersion",
-        "symbolId"
+        "schemaVersion"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "symbolId"
+          ],
+          "not": {
+            "required": [
+              "lookupKey"
+            ]
+          }
+        },
+        {
+          "required": [
+            "lookupKey"
+          ],
+          "not": {
+            "required": [
+              "symbolId"
+            ]
+          }
+        }
       ]
     },
     "name": "trellis_incoming_calls",
@@ -7846,6 +8815,271 @@
             "lookupDependencies"
           ],
           "type": "object"
+        },
+        "Symbol": {
+          "additionalProperties": false,
+          "properties": {
+            "displayKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "freshness": {
+              "const": "fresh"
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "nameRange": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Range"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "semanticBasis": {
+              "const": null
+            },
+            "staleBecause": {
+              "maxItems": 0,
+              "type": "array"
+            },
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "doc": {
+              "$ref": "#/$defs/UInt"
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "symbolId",
+            "name",
+            "displayKey",
+            "kind",
+            "range",
+            "nameRange",
+            "evidenceTier",
+            "semanticBasis",
+            "freshness",
+            "staleBecause",
+            "doc",
+            "lines",
+            "role",
+            "stableLookupKey"
+          ],
+          "type": "object"
+        },
+        "Kind": {
+          "enum": [
+            "module",
+            "namespace",
+            "type",
+            "implementation",
+            "function",
+            "method",
+            "constructor",
+            "field",
+            "variable",
+            "parameter",
+            "typeParameter",
+            "alias",
+            "anonymousFunction"
+          ]
+        },
+        "LookupProvenance": {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "evidenceKind": {
+                    "const": "measuredSyntax"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": null
+                  },
+                  "derivedFrom": {
+                    "const": null
+                  },
+                  "freshness": {
+                    "const": "fresh"
+                  }
+                }
+              }
+            }
+          ],
+          "properties": {
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "id": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "id",
+            "producerId",
+            "document",
+            "revisionId",
+            "contentHash",
+            "evidenceKind",
+            "basis",
+            "freshness",
+            "derivedFrom"
+          ],
+          "type": "object"
+        },
+        "SemanticBasis": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "lookupDependencies": {
+              "items": {
+                "$ref": "#/$defs/Text"
+              },
+              "type": "array"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            }
+          },
+          "required": [
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7902,6 +9136,17 @@
                   "items": {
                     "$ref": "#/$defs/SemanticBasisEntry"
                   }
+                },
+                "stableLookupKey": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -7910,7 +9155,8 @@
                 "match",
                 "callers",
                 "documents",
-                "scopeCoverage"
+                "scopeCoverage",
+                "stableLookupKey"
               ],
               "type": "object"
             },
@@ -7949,6 +9195,111 @@
                   "type": "null"
                 }
               ]
+            },
+            "warnings": {
+              "items": {
+                "$ref": "#/$defs/Warning"
+              },
+              "type": "array"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "evidenceBasis",
+            "data",
+            "warnings",
+            "partial",
+            "truncated",
+            "truncationReason",
+            "workspace",
+            "catchingUp"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "additionalProperties": false,
+              "properties": {
+                "coverage": {
+                  "items": {
+                    "$ref": "#/$defs/Coverage"
+                  },
+                  "type": "array"
+                },
+                "provenance": {
+                  "items": {
+                    "$ref": "#/$defs/LookupProvenance"
+                  },
+                  "type": "array"
+                },
+                "scopeCoverage": {
+                  "items": {
+                    "$ref": "#/$defs/LanguageStatus"
+                  },
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "type": "array"
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentRef"
+                  }
+                },
+                "candidates": {
+                  "items": {
+                    "$ref": "#/$defs/Symbol"
+                  },
+                  "type": "array"
+                },
+                "lookupKey": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "candidates",
+                "coverage",
+                "scopeCoverage",
+                "provenance",
+                "documents",
+                "lookupKey"
+              ],
+              "type": "object"
+            },
+            "evidenceBasis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Basis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            },
+            "truncated": {
+              "const": false
+            },
+            "truncationReason": {
+              "const": null
             },
             "warnings": {
               "items": {
@@ -8802,11 +10153,36 @@
         "includeTests": {
           "type": "boolean",
           "default": false
+        },
+        "lookupKey": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [
-        "schemaVersion",
-        "symbolId"
+        "schemaVersion"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "symbolId"
+          ],
+          "not": {
+            "required": [
+              "lookupKey"
+            ]
+          }
+        },
+        {
+          "required": [
+            "lookupKey"
+          ],
+          "not": {
+            "required": [
+              "symbolId"
+            ]
+          }
+        }
       ]
     },
     "name": "trellis_call_graph",
@@ -10461,6 +11837,266 @@
             "hints"
           ],
           "type": "object"
+        },
+        "Symbol": {
+          "additionalProperties": false,
+          "properties": {
+            "displayKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "freshness": {
+              "const": "fresh"
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "nameRange": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Range"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "semanticBasis": {
+              "const": null
+            },
+            "staleBecause": {
+              "maxItems": 0,
+              "type": "array"
+            },
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "doc": {
+              "$ref": "#/$defs/UInt"
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "symbolId",
+            "name",
+            "displayKey",
+            "kind",
+            "range",
+            "nameRange",
+            "evidenceTier",
+            "semanticBasis",
+            "freshness",
+            "staleBecause",
+            "doc",
+            "lines",
+            "role",
+            "stableLookupKey"
+          ],
+          "type": "object"
+        },
+        "LineSpan": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "start": {
+              "$ref": "#/$defs/UInt"
+            },
+            "end": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ]
+        },
+        "LanguageStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "coverage": {
+              "additionalProperties": false,
+              "properties": {
+                "complete": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "failed": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "partial": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "selected": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "unselected": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "selected",
+                "complete",
+                "partial",
+                "failed",
+                "unselected"
+              ],
+              "type": "object"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "semantic": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "producerId": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "freshness": {
+                  "enum": [
+                    "fresh",
+                    "possiblyStale",
+                    "stale",
+                    "unavailable"
+                  ]
+                },
+                "coverage": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "selected": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "complete": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "partial": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "failed": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "unselected": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "selected",
+                    "complete",
+                    "partial",
+                    "failed",
+                    "unselected"
+                  ],
+                  "type": "object"
+                },
+                "note": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "producerId",
+                "freshness",
+                "coverage",
+                "note"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "language",
+            "evidenceTier",
+            "coverage",
+            "semantic"
+          ],
+          "type": "object"
+        },
+        "DocumentRef": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ref": {
+              "$ref": "#/$defs/UInt"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "ref",
+            "document",
+            "revisionId",
+            "contentHash",
+            "provenanceId"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -10476,11 +12112,23 @@
                 },
                 "result": {
                   "$ref": "#/$defs/GraphResult"
+                },
+                "stableLookupKey": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
                 "requested",
-                "result"
+                "result",
+                "stableLookupKey"
               ],
               "type": "object"
             },
@@ -10518,6 +12166,111 @@
                   "type": "null"
                 }
               ]
+            },
+            "warnings": {
+              "items": {
+                "$ref": "#/$defs/Warning"
+              },
+              "type": "array"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "evidenceBasis",
+            "data",
+            "warnings",
+            "partial",
+            "truncated",
+            "truncationReason",
+            "workspace",
+            "catchingUp"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "additionalProperties": false,
+              "properties": {
+                "coverage": {
+                  "items": {
+                    "$ref": "#/$defs/Coverage"
+                  },
+                  "type": "array"
+                },
+                "provenance": {
+                  "items": {
+                    "$ref": "#/$defs/Provenance"
+                  },
+                  "type": "array"
+                },
+                "scopeCoverage": {
+                  "items": {
+                    "$ref": "#/$defs/LanguageStatus"
+                  },
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "type": "array"
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentRef"
+                  }
+                },
+                "candidates": {
+                  "items": {
+                    "$ref": "#/$defs/Symbol"
+                  },
+                  "type": "array"
+                },
+                "lookupKey": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "candidates",
+                "coverage",
+                "scopeCoverage",
+                "provenance",
+                "documents",
+                "lookupKey"
+              ],
+              "type": "object"
+            },
+            "evidenceBasis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Basis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            },
+            "truncated": {
+              "const": false
+            },
+            "truncationReason": {
+              "const": null
             },
             "warnings": {
               "items": {

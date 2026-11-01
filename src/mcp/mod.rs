@@ -346,6 +346,33 @@ type EvidenceToolReadFn<'a> = dyn Fn(
     ) -> anyhow::Result<serde_json::Value>
     + 'a;
 type EvidenceToolRead<'a> = Box<EvidenceToolReadFn<'a>>;
+
+/// Resolve a selector only inside the operation's admitted snapshot.
+#[allow(clippy::too_many_arguments)]
+fn lookup_root(
+    response: &crate::daemon::registry::CheckoutEvidence,
+    id: &serde_json::Value,
+    name: &str,
+    key: &str,
+    expected: Option<crate::model::IndexPin>,
+    root: &std::path::Path,
+    sampled: bool,
+    modern: bool,
+) -> anyhow::Result<Result<String, serde_json::Value>> {
+    let found = response.mcp_resolve_lookup_with_lines(key, expected)?;
+    match found.symbols.as_slice() {
+        [] => Ok(Err(tools::failure(id, "not_found"))),
+        [symbol] => Ok(Ok(symbol.symbol.declaration.syntax_id.clone())),
+        _ => {
+            let tiers = response.mcp_language_tiers()?;
+            let envelope =
+                projection::lookup_candidates(id, name, key, found, &tiers, root, sampled, modern)
+                    .map_err(|error| anyhow::anyhow!(error))?
+                    .unwrap_or_else(|| tools::failure(id, "range_too_large"));
+            Ok(Err(envelope))
+        }
+    }
+}
 /// Work of a tool before read admission, outside any read transaction.
 type BeforeEvidenceRead<'a> = dyn Fn(&crate::daemon::registry::CheckoutRuntime) + 'a;
 
@@ -1343,23 +1370,57 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     }))
                 }
                 ("trellis_find_symbols", Some(args)) => {
-                    let query = args["query"].as_str().expect("validated find query");
+                    let query = args.get("query").and_then(|value| value.as_str());
+                    let lookup_key = args.get("lookupKey").and_then(|value| value.as_str());
                     let limit = args
                         .get("limit")
                         .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |_, response, sampled, _query| {
-                        let found = response.mcp_find_with_lines(query, limit, expected)?;
+                        let found = if let Some(key) = lookup_key {
+                            response.mcp_resolve_lookup_with_lines(key, expected)?
+                        } else {
+                            response.mcp_find_with_lines(
+                                query.expect("validated query"),
+                                limit,
+                                expected,
+                            )?
+                        };
                         let tiers = response.mcp_language_tiers()?;
-                        Ok(projection::find(id, found, &tiers, root, sampled, modern)
+                        let projected = if lookup_key.is_some() {
+                            projection::find_lookup(id, found, &tiers, root, sampled, modern)
+                        } else {
+                            projection::find(id, found, &tiers, root, sampled, modern)
+                        };
+                        Ok(projected
                             .map_err(|error| anyhow::anyhow!(error))?
                             .unwrap_or_else(|| tools::failure(id, "range_too_large")))
                     }))
                 }
                 ("trellis_declaration", Some(args)) => {
-                    let symbol_id = args["symbolId"].as_str().expect("validated declaration ID");
+                    let symbol_id = args.get("symbolId").and_then(|value| value.as_str());
+                    let lookup_key = args.get("lookupKey").and_then(|value| value.as_str());
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |_, response, sampled, _query| {
+                        let resolved;
+                        let symbol_id = if let Some(key) = lookup_key {
+                            resolved = match lookup_root(
+                                response,
+                                id,
+                                "trellis_declaration",
+                                key,
+                                expected,
+                                root,
+                                sampled,
+                                modern,
+                            )? {
+                                Ok(sid) => sid,
+                                Err(envelope) => return Ok(envelope),
+                            };
+                            resolved.as_str()
+                        } else {
+                            symbol_id.expect("validated symbol ID")
+                        };
                         Ok(
                             match response.mcp_declaration_with_lines(symbol_id, expected)? {
                                 Some(found) => projection::declaration(
@@ -1377,7 +1438,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     }))
                 }
                 ("trellis_outgoing_calls", Some(args)) => {
-                    let symbol_id = args["symbolId"].as_str().expect("validated outgoing ID");
+                    let symbol_id = args.get("symbolId").and_then(|value| value.as_str());
+                    let lookup_key = args.get("lookupKey").and_then(|value| value.as_str());
                     let limit = args.get("limit").map_or(CALL_DEFAULT_LIMIT, |v| {
                         wire::uint(v).expect("validated limit") as usize
                     });
@@ -1385,6 +1447,25 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let expected = validated_expected_basis(args);
                     let producer = args.get("semanticProducerId").and_then(|v| v.as_str());
                     Some(Box::new(move |runtime, response, sampled, _query| {
+                        let resolved;
+                        let symbol_id = if let Some(key) = lookup_key {
+                            resolved = match lookup_root(
+                                response,
+                                id,
+                                "trellis_outgoing_calls",
+                                key,
+                                expected,
+                                root,
+                                sampled,
+                                modern,
+                            )? {
+                                Ok(sid) => sid,
+                                Err(envelope) => return Ok(envelope),
+                            };
+                            resolved.as_str()
+                        } else {
+                            symbol_id.expect("validated symbol ID")
+                        };
                         let Some(found) = response.mcp_outgoing_with_lines(
                             symbol_id,
                             limit,
@@ -1413,7 +1494,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     }))
                 }
                 ("trellis_incoming_calls", Some(args)) => {
-                    let symbol_id = args["symbolId"].as_str().expect("validated incoming ID");
+                    let symbol_id = args.get("symbolId").and_then(|value| value.as_str());
+                    let lookup_key = args.get("lookupKey").and_then(|value| value.as_str());
                     let limit = args.get("limit").map_or(CALL_DEFAULT_LIMIT, |v| {
                         wire::uint(v).expect("validated limit") as usize
                     });
@@ -1421,6 +1503,25 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let expected = validated_expected_basis(args);
                     let producer = args.get("semanticProducerId").and_then(|v| v.as_str());
                     Some(Box::new(move |_, response, sampled, _query| {
+                        let resolved;
+                        let symbol_id = if let Some(key) = lookup_key {
+                            resolved = match lookup_root(
+                                response,
+                                id,
+                                "trellis_incoming_calls",
+                                key,
+                                expected,
+                                root,
+                                sampled,
+                                modern,
+                            )? {
+                                Ok(sid) => sid,
+                                Err(envelope) => return Ok(envelope),
+                            };
+                            resolved.as_str()
+                        } else {
+                            symbol_id.expect("validated symbol ID")
+                        };
                         let Some(found) =
                             response.mcp_incoming_with_lines(symbol_id, limit, expected)?
                         else {
@@ -1452,8 +1553,25 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 }
                 ("trellis_call_graph", Some(args)) => {
                     let query = tools::call_graph_query(&serde_json::Value::Object(args.clone()));
+                    let lookup_key = args.get("lookupKey").and_then(|value| value.as_str());
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |runtime, response, sampled, _query| {
+                        let mut query = query.clone();
+                        if let Some(key) = lookup_key {
+                            query.root_syntax_id = match lookup_root(
+                                response,
+                                id,
+                                "trellis_call_graph",
+                                key,
+                                expected,
+                                root,
+                                sampled,
+                                modern,
+                            )? {
+                                Ok(sid) => sid,
+                                Err(envelope) => return Ok(envelope),
+                            };
+                        }
                         let mut check = || {
                             if cancel.load(std::sync::atomic::Ordering::Acquire)
                                 || runtime.mcp_clock_now() >= deadline
@@ -1466,11 +1584,18 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         if let Err(error) = &answer.outcome {
                             return Ok(call_graph_failure(id, error));
                         }
-                        Ok(
-                            projection::call_graph(id, &mut answer, root, sampled, modern)
-                                .map_err(|error| anyhow::anyhow!(error))?
-                                .unwrap_or_else(|| tools::failure(id, "range_too_large")),
+                        let stable_lookup_key =
+                            response.mcp_stable_lookup_key(&query.root_syntax_id, expected)?;
+                        Ok(projection::call_graph(
+                            id,
+                            &mut answer,
+                            stable_lookup_key.as_deref(),
+                            root,
+                            sampled,
+                            modern,
                         )
+                        .map_err(|error| anyhow::anyhow!(error))?
+                        .unwrap_or_else(|| tools::failure(id, "range_too_large")))
                     }))
                 }
                 ("trellis_read_source", Some(args)) => {

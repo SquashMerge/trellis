@@ -1,4 +1,4 @@
-//! Closed W1 wire projection; no Store admission occurs in this layer.
+//! Closed MCP wire projection; no Store admission occurs in this layer.
 use serde_json::{Value, json};
 
 /// Build refs from precisely the items that survive the wire byte budget.
@@ -138,7 +138,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":3,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":4,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
@@ -170,7 +170,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 3);
+        assert_eq!(ready["data"]["toolVersion"], 4);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -389,7 +389,7 @@ pub fn declaration(
         "indexRevision":result.pin.index_revision});
     let envelope = json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
         "evidenceBasis":basis,
-        "data":{"displayKey":display_key(&result.declaration),"declaration":compact,"doc":doc,"lines":source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),"documents":documents,
+        "data":{"stableLookupKey":source.stable_lookup_key,"displayKey":display_key(&result.declaration),"declaration":compact,"doc":doc,"lines":source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),"documents":documents,
             "evidence":{"evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]},
             "coverage":result.coverage,"provenance":result.provenance},
         "warnings":warnings,"partial":incomplete,"truncated":false,"truncationReason":null});
@@ -407,7 +407,65 @@ pub fn find(
     catching_up: bool,
     modern: bool,
 ) -> Result<Option<Value>, &'static str> {
-    symbols(id, result, tiers, root, catching_up, modern, None)
+    symbols(
+        id,
+        result,
+        tiers,
+        root,
+        catching_up,
+        modern,
+        SymbolMode::Find,
+    )
+}
+
+/// Exact resolution never emits a candidate prefix or uses the ordinary find limit.
+pub fn find_lookup(
+    id: &Value,
+    result: crate::store::mcp_read::McpFindWithLines,
+    tiers: &Tiers,
+    root: &std::path::Path,
+    catching_up: bool,
+    modern: bool,
+) -> Result<Option<Value>, &'static str> {
+    symbols(
+        id,
+        result,
+        tiers,
+        root,
+        catching_up,
+        modern,
+        SymbolMode::ExactFind,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn lookup_candidates(
+    id: &Value,
+    name: &str,
+    key: &str,
+    result: crate::store::mcp_read::McpFindWithLines,
+    tiers: &Tiers,
+    root: &std::path::Path,
+    catching_up: bool,
+    modern: bool,
+) -> Result<Option<Value>, &'static str> {
+    symbols(
+        id,
+        result,
+        tiers,
+        root,
+        catching_up,
+        modern,
+        SymbolMode::Candidates(name, key),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SymbolMode<'a> {
+    Find,
+    ExactFind,
+    Candidates(&'a str, &'a str),
+    Search(&'a [Vec<String>], &'a Value, crate::search_rank::SearchRole),
 }
 
 /// Search relevance decorates syntax evidence; it never changes native completeness.
@@ -442,7 +500,7 @@ pub fn search(
         root,
         catching_up,
         modern,
-        Some((&result.matched_by, &status, result.role)),
+        SymbolMode::Search(&result.matched_by, &status, result.role),
     )
 }
 
@@ -454,8 +512,16 @@ fn symbols(
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
-    search: Option<(&[Vec<String>], &Value, crate::search_rank::SearchRole)>,
+    mode: SymbolMode<'_>,
 ) -> Result<Option<Value>, &'static str> {
+    let search = match mode {
+        SymbolMode::Search(matched_by, status, role) => Some((matched_by, status, role)),
+        _ => None,
+    };
+    let atomic = matches!(mode, SymbolMode::ExactFind | SymbolMode::Candidates(..));
+    if atomic && result.has_more {
+        return Err("store_unavailable: incomplete lookup resolution");
+    }
     // #156: completeness is a property of the whole searched scope, carried by
     // `scopeCoverage`; per-document coverage covers only the emitted symbols.
     let incomplete = result.scope.iter().any(|row| row[2] != 0 || row[3] != 0);
@@ -495,7 +561,8 @@ fn symbols(
     let mut last = None;
     // The empty prefix carries only the fixed envelope and the scope rows; if
     // even it cannot fit, the answer is range_too_large.
-    for n in 0..=result.symbols.len() {
+    let start = if atomic { result.symbols.len() } else { 0 };
+    for n in start..=result.symbols.len() {
         let (documents, refs) = document_table(
             result.symbols[..n]
                 .iter()
@@ -503,7 +570,7 @@ fn symbols(
         )?;
         let mut symbols: Vec<Value> = result.symbols[..n].iter().map(|symbol| {
             let d = &symbol.symbol.declaration;
-            Ok(json!({"symbolId":d.syntax_id,"name":d.name,"displayKey":display_key(d),
+            Ok(json!({"symbolId":d.syntax_id,"name":d.name,"displayKey":display_key(d),"stableLookupKey":symbol.source.stable_lookup_key,
                 "kind":d.kind,"role":d.role,"doc":document_ref(&refs, &symbol.source.document).ok_or("store_unavailable: missing document ref")?,
                 "range":d.range,"nameRange":d.name_range,
                 "lines":symbol.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),
@@ -581,6 +648,12 @@ fn symbols(
             data.insert("searchIndex".into(), status.clone());
             data.insert("role".into(), json!(role));
             "trellis_search_symbols"
+        } else if let SymbolMode::Candidates(name, key) = mode {
+            let data = envelope["data"].as_object_mut().expect("symbol data");
+            let candidates = data.remove("symbols").expect("symbol list");
+            data.insert("candidates".into(), candidates);
+            data.insert("lookupKey".into(), json!(key));
+            name
         } else {
             "trellis_find_symbols"
         };
@@ -687,6 +760,7 @@ mod find_tests {
                         .unwrap();
                     McpFindSymbolWithLines {
                         source: McpItemSource {
+                            stable_lookup_key: None,
                             document: McpDocumentVersion {
                                 document: symbol.declaration.document.clone(),
                                 revision_id: symbol.declaration.revision_id.clone(),
@@ -743,6 +817,100 @@ mod find_tests {
         assert!(bytes.len() <= RESPONSE_BYTES);
         assert_eq!(bytes.last(), Some(&b'\n'));
         envelope
+    }
+
+    #[test]
+    fn exact_lookup_candidates_are_complete_or_atomic_failure() {
+        let root = std::path::Path::new("/workspace");
+        let key = "src/a.rs::a";
+        let hits: Vec<_> = (0..51).map(|_| hit("a", "a.js")).collect();
+        let result = || {
+            let mut result = fixture(&hits, COMPLETE_SCOPE, false);
+            for symbol in &mut result.symbols {
+                symbol.source.stable_lookup_key = Some(key.into());
+            }
+            result
+        };
+        for modern in [false, true] {
+            let envelope = lookup_candidates(
+                &json!(1),
+                "trellis_call_graph",
+                key,
+                result(),
+                &Default::default(),
+                root,
+                false,
+                modern,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(envelope["data"]["candidates"].as_array().unwrap().len(), 51);
+            assert_eq!(envelope["data"]["candidates"][0]["stableLookupKey"], key);
+            assert!(envelope["data"].get("symbols").is_none());
+            assert_eq!(envelope["truncated"], false);
+            let symbols = find_lookup(
+                &json!(1),
+                result(),
+                &Default::default(),
+                root,
+                false,
+                modern,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(symbols["data"]["symbols"].as_array().unwrap().len(), 51);
+        }
+        let oversized = || fixture(&[hit("x".repeat(70_000), "a.js")], COMPLETE_SCOPE, false);
+        assert!(
+            lookup_candidates(
+                &json!(1),
+                "trellis_declaration",
+                key,
+                oversized(),
+                &Default::default(),
+                root,
+                false,
+                true
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            find_lookup(
+                &json!(1),
+                oversized(),
+                &Default::default(),
+                root,
+                false,
+                true
+            )
+            .unwrap()
+            .is_none()
+        );
+        let incomplete = fixture(&[], COMPLETE_SCOPE, true);
+        assert!(
+            find_lookup(
+                &json!(1),
+                incomplete,
+                &Default::default(),
+                root,
+                false,
+                true
+            )
+            .is_err()
+        );
+        let empty = find_lookup(
+            &json!(1),
+            fixture(&[], COMPLETE_SCOPE, false),
+            &Default::default(),
+            root,
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(empty["data"]["symbols"], json!([]));
+        assert_eq!(empty["truncated"], false);
     }
 
     #[test]
@@ -1696,7 +1864,7 @@ pub fn outgoing(
         );
         let (bases, provenance) = intern_bases(&mut calls, provenance.into_values())?;
         let mut data = json!({"symbolId":result.owner.selected.declaration.syntax_id,
-            "displayKey":owner_display,"calls":calls,"documents":documents,
+            "stableLookupKey":result.owner.source.stable_lookup_key,"displayKey":owner_display,"calls":calls,"documents":documents,
             "semanticBases":bases,"coverage":coverage,"provenance":provenance});
         if compacted {
             compact_data(&mut data, "calls");
@@ -1756,6 +1924,7 @@ pub fn outgoing(
 pub fn call_graph(
     id: &Value,
     answer: &mut crate::graph_query::GraphAnswer,
+    stable_lookup_key: Option<&str>,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
@@ -1779,7 +1948,7 @@ pub fn call_graph(
             Ok(
                 json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
             "evidenceBasis":basis,
-            "data":{"requested":requested,"result":result},
+            "data":{"stableLookupKey":stable_lookup_key,"requested":requested,"result":result},
             "warnings":result.warnings,"partial":result.partial,"truncated":result.truncated,
             "truncationReason":reason}),
             )
@@ -1973,6 +2142,7 @@ pub fn incoming(
         let (bases, provenance) = intern_bases(&mut callers, provenance.into_values())?;
         let mut data = json!({
             "symbolId":owner.declaration.syntax_id,"displayKey":display_key(&owner.declaration),
+            "stableLookupKey":result.selected.source.stable_lookup_key,
             "match":{"basis":"name","sameNameDeclarations":result.same_name_declarations,
                 "limitations":["aliases","functionValues","reExports","dynamicDispatch",
                     "opaqueMacros","sameNameDeclarations"]},
@@ -2041,6 +2211,7 @@ mod outgoing_tests {
                 McpOutgoingCallWithLines {
                     selected,
                     source: McpItemSource {
+                        stable_lookup_key: None,
                         document: owner_doc.clone(),
                         lines: Some(McpLines { start: 1, end: 1 }),
                     },
@@ -2052,6 +2223,7 @@ mod outgoing_tests {
             owner: McpDeclarationWithLines {
                 selected: result.owner,
                 source: McpItemSource {
+                    stable_lookup_key: None,
                     document: owner_doc,
                     lines: Some(McpLines { start: 1, end: 1 }),
                 },
@@ -2859,6 +3031,7 @@ mod call_graph_tests {
         call_graph(
             &json!("graph"),
             answer,
+            None,
             std::path::Path::new("/w"),
             false,
             modern,
@@ -3084,6 +3257,7 @@ mod size_tests {
                 .unwrap(),
             },
             source: McpItemSource {
+                stable_lookup_key: None,
                 document: version(owner_path, 0),
                 lines: Some(McpLines { start: 10, end: 40 }),
             },
@@ -3138,6 +3312,7 @@ mod size_tests {
                 caller,
                 content_hash: hex(file + 7, 64),
                 source: McpItemSource {
+                    stable_lookup_key: None,
                     document: version(&path, file),
                     lines: Some(McpLines {
                         start: 40 + i as u64,

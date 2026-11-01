@@ -364,6 +364,7 @@ pub struct McpLines {
 pub struct McpItemSource {
     pub document: McpDocumentVersion,
     pub lines: Option<McpLines>,
+    pub stable_lookup_key: Option<String>,
 }
 
 struct McpCheckedSource {
@@ -376,6 +377,7 @@ impl McpCheckedSource {
         Ok(McpItemSource {
             document: self.document.clone(),
             lines: self.lines.range(range)?,
+            stable_lookup_key: None,
         })
     }
 }
@@ -551,6 +553,123 @@ impl EvidenceResponse {
             has_more,
             &mut || Ok(()),
         )
+    }
+}
+
+impl EvidenceResponse {
+    fn mcp_document_lookup_keys(
+        &self,
+        selected: &ReadRevision,
+        scope: &V8NativeScope,
+        source: Option<&[u8]>,
+    ) -> Result<Arc<BTreeMap<String, String>>> {
+        if let Some(keys) = self.stable_lookup_keys.borrow().get(&scope.key) {
+            return Ok(keys.clone());
+        }
+        let declarations = read_native_declarations_v8(&self.db, scope, None, true)?;
+        let needs_source = scope.key.language == "rust"
+            && declarations.iter().any(|declaration| {
+                declaration.name.is_some()
+                    && declaration
+                        .ancestors
+                        .iter()
+                        .any(|key| key.kind == "implementation" && key.name.is_none())
+            });
+        let owned;
+        let text = if needs_source {
+            let bytes = match source {
+                Some(bytes) => bytes,
+                None => {
+                    #[cfg(test)]
+                    super::count_selected_read(|counts| counts.source_reads += 1);
+                    owned = self
+                        .store
+                        .mcp_selected_raw_source_for(&self.db, &scope.key.path, selected)?
+                        .ok_or_else(|| {
+                            self.corrupt_evidence("store_unavailable: lookup source absent")
+                        })?
+                        .1;
+                    &owned
+                }
+            };
+            std::str::from_utf8(bytes)
+                .map_err(|_| anyhow::anyhow!("unsupported_encoding: lookup source"))?
+        } else {
+            ""
+        };
+        let keys = Arc::new(crate::symbol_lookup::keys_from_source(
+            &scope.key.path,
+            &scope.key.language,
+            text,
+            &declarations,
+        )?);
+        self.stable_lookup_keys
+            .borrow_mut()
+            .insert(scope.key.clone(), keys.clone());
+        Ok(keys)
+    }
+
+    fn mcp_checked_lookup_key(
+        &self,
+        selected: &ReadRevision,
+        declaration: &crate::native_evidence::Declaration,
+        source: &McpCheckedSource,
+    ) -> Result<Option<String>> {
+        let scope = v8_native_scope_for(&self.db, &declaration.document, selected)?
+            .ok_or_else(|| self.corrupt_evidence("store_unavailable: lookup scope absent"))?;
+        Ok(self
+            .mcp_document_lookup_keys(selected, &scope, Some(&source.lines.bytes))?
+            .get(&declaration.syntax_id)
+            .cloned())
+    }
+
+    pub fn mcp_stable_lookup_key(
+        &self,
+        symbol_id: &str,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<String>> {
+        let Some(found) = self.mcp_declaration(symbol_id, expected)? else {
+            return Ok(None);
+        };
+        let selected = self.selected(Some(found.pin))?;
+        let scope = v8_native_scope_for(&self.db, &found.declaration.document, &selected)?
+            .ok_or_else(|| self.corrupt_evidence("store_unavailable: lookup scope absent"))?;
+        Ok(self
+            .mcp_document_lookup_keys(&selected, &scope, None)?
+            .get(symbol_id)
+            .cloned())
+    }
+
+    /// Enumerate the complete exact-key set before deciding whether a selector is unique.
+    /// Every possible path prefix is considered: valid repository paths may contain `::`.
+    pub fn mcp_resolve_lookup_with_lines(
+        &self,
+        lookup_key: &str,
+        expected: Option<IndexPin>,
+    ) -> Result<McpFindWithLines> {
+        let selected = self.selected(None)?;
+        ensure!(
+            expected.is_none_or(|pin| pin == selected.pin),
+            "revision conflict: expected basis differs from admitted head"
+        );
+        let scope = self.mcp_find_scope(&selected, &mut || Ok(()))?;
+        let mut hits = Vec::new();
+        for (version, document) in &scope.scopes {
+            if !lookup_key
+                .strip_prefix(&document.key.path)
+                .is_some_and(|suffix| suffix.starts_with("::"))
+            {
+                continue;
+            }
+            let keys = self.mcp_document_lookup_keys(&selected, document, None)?;
+            for (id, key) in keys.iter() {
+                if key == lookup_key {
+                    hits.push((version.clone(), id.clone()));
+                }
+            }
+        }
+        let found = self.mcp_hydrate_find(&selected, &scope, hits, false, &mut || Ok(()))?;
+        self.mcp_find_lines(found, &mut || Ok(()))
     }
 }
 
@@ -813,6 +932,9 @@ impl EvidenceResponse {
         for indexes in by_document.into_values() {
             check()?;
             let mut source_cache = BTreeMap::new();
+            let first = &found.symbols[indexes[0]].declaration;
+            let document_scope = v8_native_scope_for(&self.db, &first.document, &selected)?
+                .ok_or_else(|| self.corrupt_evidence("store_unavailable: lookup scope absent"))?;
             for index in indexes {
                 check()?;
                 let symbol = &found.symbols[index];
@@ -823,16 +945,23 @@ impl EvidenceResponse {
                     .ok_or_else(|| {
                         self.corrupt_evidence("store_unavailable: find provenance absent")
                     })?;
-                sources[index] = Some(
-                    self.mcp_checked_source(
-                        &mut source_cache,
+                let checked = self.mcp_checked_source(
+                    &mut source_cache,
+                    &selected,
+                    &symbol.declaration,
+                    &symbol.content_hash,
+                    proof,
+                )?;
+                let mut source = checked.item(&symbol.declaration.range)?;
+                source.stable_lookup_key = self
+                    .mcp_document_lookup_keys(
                         &selected,
-                        &symbol.declaration,
-                        &symbol.content_hash,
-                        proof,
+                        &document_scope,
+                        Some(&checked.lines.bytes),
                     )?
-                    .item(&symbol.declaration.range)?,
-                );
+                    .get(&symbol.declaration.syntax_id)
+                    .cloned();
+                sources[index] = Some(source);
             }
         }
         let symbols = found
@@ -979,14 +1108,15 @@ impl EvidenceResponse {
             .ok_or_else(|| {
                 self.corrupt_evidence("store_unavailable: declaration provenance absent")
             })?;
-        let source = self
-            .mcp_document_version(
-                &selected,
-                &declaration.declaration,
-                &declaration.content_hash,
-                proof,
-            )?
-            .item(&declaration.declaration.range)?;
+        let checked = self.mcp_document_version(
+            &selected,
+            &declaration.declaration,
+            &declaration.content_hash,
+            proof,
+        )?;
+        let mut source = checked.item(&declaration.declaration.range)?;
+        source.stable_lookup_key =
+            self.mcp_checked_lookup_key(&selected, &declaration.declaration, &checked)?;
         Ok(Some(McpDeclarationWithLines {
             selected: declaration,
             source,
@@ -1561,15 +1691,16 @@ impl EvidenceResponse {
                 self.corrupt_evidence("store_unavailable: outgoing owner provenance absent")
             })?;
         let mut source_cache = BTreeMap::new();
-        let owner_source = self
-            .mcp_checked_source(
-                &mut source_cache,
-                &selected,
-                &outgoing.owner.declaration,
-                &outgoing.owner.content_hash,
-                proof,
-            )?
-            .item(&outgoing.owner.declaration.range)?;
+        let checked = self.mcp_checked_source(
+            &mut source_cache,
+            &selected,
+            &outgoing.owner.declaration,
+            &outgoing.owner.content_hash,
+            proof,
+        )?;
+        let mut owner_source = checked.item(&outgoing.owner.declaration.range)?;
+        owner_source.stable_lookup_key =
+            self.mcp_checked_lookup_key(&selected, &outgoing.owner.declaration, checked)?;
         let calls = outgoing
             .calls
             .into_iter()
@@ -1745,7 +1876,9 @@ impl EvidenceResponse {
             &owner.content_hash,
             proof,
         )?;
-        let owner_lines = selected_source.item(&owner.declaration.range)?;
+        let mut owner_lines = selected_source.item(&owner.declaration.range)?;
+        owner_lines.stable_lookup_key =
+            self.mcp_checked_lookup_key(&selected, &owner.declaration, selected_source)?;
         let mut calls = Vec::new();
         let mut same_name_declarations = 0;
         let mut has_more = false;

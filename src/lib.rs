@@ -62,6 +62,7 @@ pub mod semantic_import;
 pub mod skipped_config;
 pub(crate) mod skipped_source;
 pub mod store;
+mod symbol_lookup;
 pub mod syntax_bounds;
 #[cfg(test)]
 mod test_alloc;
