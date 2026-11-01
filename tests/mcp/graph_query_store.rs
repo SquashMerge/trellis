@@ -192,10 +192,12 @@ fn direct_and_constructor_expand_virtual_does_not() {
         vec![
             syntax_id(native, "a"),
             syntax_id(native, "b"),
-            syntax_id(native, "c")
+            syntax_id(native, "c"),
+            syntax_id(native, "d")
         ]
     );
-    assert_eq!(result.edges[2].to, None);
+    // The boundary shows the declaration it reached (#557), not a possible target.
+    assert_eq!(result.edges[2].to, Some(syntax_id(native, "d")));
 }
 
 /// #483: the CLI query walks traversable bindings (`boundaryReason: none`) to its depth, as

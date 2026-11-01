@@ -78,7 +78,6 @@ test("Pele draws each measured class with native IDs mapped back to Trellis clas
   assert.equal(await page.locator(".pele-node .pele-label").first().textContent(), "Alpha");
   assert.equal(await page.locator(".pele-node .pele-annotation").first().textContent(), "«java · class · focus · 1 field · 2 methods»");
   assert.equal(await page.locator(".pele-edge, .pele-edge-label").count(), 0, "no relation is drawn");
-  assert.equal(await page.locator(".pele-member").count(), 0, "members start collapsed");
   assert.equal(await page.locator("#classes-diagram svg [style]").count() + await page.locator("#classes-diagram svg[style]").count(), 0);
   assert.deepEqual(cspErrors(), []);
 });
@@ -90,8 +89,6 @@ test("repository text is shown literally through encoded labels and never become
   await open(dto);
   const source = await page.evaluate(dto => window.TrellisPeleClasses.render(dto.nodes, {seed: "H", membersOpen: new Set(["H"])}).source, dto);
   for (const raw of ["<T>", "&", "\"q\"", "{x}", "<script", "<<interface>>", "Map<", "m$", "x()]"]) assert.ok(!source.includes(raw), `encoded: ${raw}`);
-  await classMenu("H");
-  await page.getByRole("menuitem", {name: /Show members/}).click();
   assert.equal(await page.locator(".pele-node .pele-label").textContent(), Array.from(hostile).length > 60 ? hostile.slice(0, 59) + "…" : hostile);
   assert.deepEqual(await page.locator(".pele-member").allTextContents(), ["f <<interface>>: Map<K, V> | None", "m$() : List[int] *", "x()]()"]);
   assert.deepEqual(await page.locator(".pele-member").evaluateAll(n => n.map(x => x.dataset.trellisMemberKind)), ["field", "method", "method"]);
@@ -106,13 +103,11 @@ test("class menu, members, method and member navigation act on original DTO reco
   const cls = page.locator('.pele-node[data-trellis-class-id="A"]');
   assert.equal(await cls.getAttribute("role"), "button"); assert.equal(await cls.getAttribute("aria-haspopup"), "menu");
   await cls.focus(); await page.keyboard.press("Enter");
-  assert.deepEqual(await page.locator(".classes-context-menu [role=menuitem]").allTextContents(), ["Show members · 1 field · 2 methods", "Read class source", "Focus this class"]);
+  assert.deepEqual(await page.locator(".classes-context-menu [role=menuitem]").allTextContents(), ["Hide members", "Read class source", "Focus this class"]);
   assert.equal(await cls.getAttribute("aria-expanded"), "true");
   await page.keyboard.press("ArrowDown"); await page.keyboard.press("Enter");
   assert.deepEqual(await page.evaluate(() => window.harness.reads.map(r => [r.item.path, r.item.range.startLine, r.revision.indexRevision])), [["src/A.java", 2, 1]]);
-  await classMenu("A"); await page.getByRole("menuitem", {name: "Show members · 1 field · 2 methods"}).click();
-  assert.deepEqual(await page.locator(".pele-member").allTextContents(), ["count: int", "run() : void", "helper()"]);
-  assert.equal(await page.evaluate(() => document.activeElement?.dataset.trellisClassId), "A", "focus returns to the redrawn class");
+  assert.deepEqual(await page.locator(".pele-member").allTextContents(), ["count: int", "run() : void", "helper()"], "members show by default (#559)");
   const run = page.locator('.pele-member[data-trellis-symbol-id="A#run"]');
   await run.click(); await run.focus(); await page.keyboard.press("Enter");
   assert.deepEqual(await page.evaluate(() => window.harness.methods.map(m => [m.id, m.parent, m.path, m.range.startByte])), [["A#run", "A", "src/A.java", 40], ["A#run", "A", "src/A.java", 40]]);
@@ -123,12 +118,63 @@ test("class menu, members, method and member navigation act on original DTO reco
   assert.deepEqual(await page.evaluate(() => window.harness.navigations), [{classId: "A", memberName: "run", startByte: 40, endByte: 90, memberPath: "src/A.java"}, {classId: "A", memberName: "count", startByte: 20, endByte: 30, memberPath: "src/A.java"}]);
   await classMenu("A"); await page.getByRole("menuitem", {name: "Hide members"}).click();
   assert.equal(await page.locator(".pele-member").count(), 0);
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.trellisClassId), "A", "focus returns to the redrawn class");
+  await classMenu("A"); await page.getByRole("menuitem", {name: "Show members · 1 field · 2 methods"}).click();
+  assert.equal(await page.locator(".pele-member").count(), 3);
   assert.deepEqual(cspErrors(), []);
+});
+
+test("members show by default, and the reader's toggle survives a redraw but not a new diagram", async () => {
+  await open(diagram([node("A", "Alpha"), node("B", "Beta")]));
+  const shown = () => page.locator(".pele-node").evaluateAll(nodes => nodes.map(n => [n.dataset.trellisClassId, n.querySelectorAll(".pele-member").length]));
+  assert.deepEqual(await shown(), [["A", 3]]);
+  assert.match(await page.locator('.pele-node[data-trellis-class-id="A"]').getAttribute("aria-label"), /members shown/);
+  await classMenu("A"); await page.getByRole("menuitem", {name: "Hide members"}).click();
+  assert.deepEqual(await shown(), [["A", 0]]);
+  await page.getByRole("button", {name: "Show all returned classes"}).click();
+  assert.deepEqual(await shown(), [["A", 0], ["B", 3]], "the choice holds; the other class gets the default");
+  assert.equal(await page.locator(".classes-pele-notices").count(), 0, "a reader's choice is not a size notice");
+  await open(diagram([node("A", "Alpha")]));
+  assert.deepEqual(await shown(), [["A", 3]]);
+});
+
+test("the default opens classes only while Pele's source bound holds, focus first, and says what stayed collapsed", async () => {
+  // Each class fits alone; together they pass the 50,000-character source bound.
+  const wide = id => ({...node(id, id), class: {...definition(id, id), fields: Array.from({length: 190}, (_, i) => ({name: `f${i}<>`.repeat(8), typeHint: "<>".repeat(20), path: `src/${id}.java`, range}))}});
+  const members = () => page.locator(".pele-node").evaluateAll(nodes => Object.fromEntries(nodes.map(n => [n.dataset.trellisClassId, n.querySelectorAll(".pele-member").length])));
+  const budget = await page.evaluate(nodes => {
+    const P = window.TrellisPeleClasses;
+    return {alone: P.project(nodes.slice(0, 1), {membersOpen: new Set(["A"])}).source.length, bound: 50000};
+  }, [wide("A")]);
+  assert.ok(budget.alone < budget.bound && budget.alone * 2 > budget.bound, `fixture straddles the bound: ${budget.alone}`);
+  await open(diagram([wide("A"), wide("B"), wide("C")], "B"));
+  await page.getByRole("button", {name: "Show all returned classes"}).click();
+  assert.match(await state(), /Pele rendered/, "the default never costs the diagram its Pele rendering");
+  assert.deepEqual(await members(), {A: 0, B: 192, C: 0});
+  // A reader's choice comes first, even over the focus class's default.
+  await classMenu("A"); await page.getByRole("menuitem", {name: /Show members/}).click();
+  assert.match(await state(), /Pele rendered/);
+  assert.deepEqual(await members(), {A: 192, B: 0, C: 0});
+  assert.deepEqual(await page.locator(".classes-pele-notices li").allTextContents(), ["2 classes collapsed so the diagram can be drawn. Open a class to show its members."]);
+});
+
+test("a class whose members Pele cannot represent stays collapsed; the rest open", async () => {
+  await open(diagram([node("A", "Alpha"), node("X", "Blank", {fields: [{name: "   ", typeHint: null, path: "src/X.java", range}], methods: []})]));
+  await page.getByRole("button", {name: "Show all returned classes"}).click();
+  assert.match(await state(), /Pele rendered/);
+  assert.equal(await page.locator('.pele-node[data-trellis-class-id="A"] .pele-member').count(), 3);
+  assert.equal(await page.locator('.pele-node[data-trellis-class-id="X"] .pele-member').count(), 0);
+});
+
+test("a diagram Pele cannot draw at all falls back to cards with members shown", async () => {
+  await open(diagram([{...node("A", "Alpha"), class: {...definition("A", "Alpha"), symbol: {...definition("A", "Alpha").symbol, range: {startLine: 0, endLine: 1}}}}]));
+  assert.match(await state(), /Pele fell back: Unsupported class declaration/);
+  assert.equal(await page.locator(".classes-node .classes-members-toggle").getAttribute("aria-expanded"), "true");
+  assert.equal(await page.locator(".classes-node .classes-member").count(), 3);
 });
 
 test("actions are inert after the pinned revision changes", async () => {
   await open(diagram([node("A", "Alpha")]));
-  await classMenu("A"); await page.getByRole("menuitem", {name: /Show members/}).click();
   await page.evaluate(() => { window.harness.revision = {...window.harness.revision, indexRevision: 2}; });
   await page.locator('.pele-member[data-trellis-symbol-id="A#run"]').click({force: true});
   await page.locator('.pele-member[data-trellis-member-kind="field"]').click({force: true});
@@ -164,9 +210,10 @@ test("validation fails closed and the view falls back visibly to cards", async (
   assert.equal(reasons.bigSource, "Class Mermaid source too large");
   assert.equal(reasons.badWitness, "Unsupported class declaration");
   // An unrepresentable declaration keeps the card renderer and says why.
-  // Collapsed, it fits Pele; expanding its members exceeds Pele's source limit.
+  // Collapsed, it fits Pele, so the default leaves it collapsed; expanding it exceeds Pele's source limit.
   await open(diagram([{...node("W", "Wide"), class: {...definition("W", "Wide"), fields: Array.from({length: 200}, (_, i) => ({name: `f${i}<>`.repeat(8), typeHint: "<>".repeat(20), path: "src/W.java", range}))}}]));
   assert.match(await state(), /Pele rendered/);
+  assert.deepEqual(await page.locator(".classes-pele-notices li").allTextContents(), ["1 class collapsed so the diagram can be drawn. Open a class to show its members."]);
   await classMenu("W"); await page.getByRole("menuitem", {name: /Show members/}).click();
   assert.match(await state(), /Pele fell back: Class Mermaid source too large/);
   assert.equal(await page.locator("#classes-diagram svg.pele").count(), 0);
@@ -186,7 +233,6 @@ for (const [fields, methods, shown, omitted] of [
 ]) test(`member bounds disclose only overflowing lists: ${fields} fields and ${methods} methods`, async () => {
   const members = (count, kind) => Array.from({length: count}, (_, i) => ({name: `${kind}${i}`, typeHint: null, path: "src/P.java", range}));
   await open(diagram([node("P", "Partial", {fields: members(fields, "f"), methods: members(methods, "m"), truncated: true})]));
-  await classMenu("P"); await page.getByRole("menuitem", {name: /Show members/}).click();
   assert.match(await state(), /Pele rendered/);
   assert.equal(await page.locator(".pele-member.pele-attribute").count(), Math.min(fields, 200));
   assert.equal(await page.locator(".pele-member.pele-method").count(), Math.min(methods, 200));

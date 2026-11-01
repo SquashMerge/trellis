@@ -76,7 +76,7 @@ test("init is inert; global search and file open only read catalog/diagram",asyn
  await h.controller.open({path:"src/A.java"});assert.equal(h.calls.length,3);assert.equal(h.calls[2].options.body.seed,"A");assert.equal(h.reads.length,0);assert.equal(h.methods.length,0);
  assert.equal(new URL(h.calls[1].url,"http://local").searchParams.get("path"),"src/A.java");
  assert.match(text(h.get("classes-diagram")),/Members · 1 field · 1 method/);
- assert.equal(h.card("B"),undefined); assert.equal(h.card("A").querySelector(".classes-member-detail").hidden,true);
+ assert.equal(h.card("B"),undefined); assert.equal(h.card("A").querySelector(".classes-member-detail").hidden,false);
  assert.equal(h.get("classes-results").hidden,true);
 });
 async function assertTerminalClassGraph(kind, nodes = ["A", "B", "C"]) {
@@ -247,13 +247,13 @@ test("queued pre-menu scroll is ignored but actual subsequent scrolling dismisse
 
 test("members reveal is reversible and preserves measured source/method actions without requests", async () => {
  const h=harness();await h.controller.open({seed:"A"});const a=h.card("A"),calls=h.calls.length;
- let reveal=a.querySelector(".classes-members-toggle");assert.equal(reveal.getAttribute("aria-expanded"),"false");
- assert.equal(a.querySelector(".classes-member-detail").hidden,true);assert.equal(a.style.height,"116px");
- await reveal.fire("click");assert.equal(h.card("A"),a);assert.equal(a.querySelector(".classes-member-detail").hidden,false);
- assert.equal(a.querySelector(".classes-members-toggle").getAttribute("aria-expanded"),"true");assert.equal(a.style.height,"390px");
- assert.equal(h.document.activeElement,a.querySelector(".classes-members-toggle"));
+ assert.equal(a.querySelector(".classes-members-toggle").getAttribute("aria-expanded"),"true","members show by default (#559)");
+ assert.equal(a.querySelector(".classes-member-detail").hidden,false);assert.equal(a.style.height,"390px");
  await h.button(a,"execute()").fire("click");assert.equal(h.methods[0].range.startLine,range.startLine);assert.equal(h.methods[0].id,"A.execute");
- await a.querySelector(".classes-members-toggle").fire("click");assert.equal(a.querySelector(".classes-member-detail").hidden,true);
+ await a.querySelector(".classes-members-toggle").fire("click");assert.equal(h.card("A"),a);assert.equal(a.querySelector(".classes-member-detail").hidden,true);
+ assert.equal(a.querySelector(".classes-members-toggle").getAttribute("aria-expanded"),"false");assert.equal(a.style.height,"116px");
+ assert.equal(h.document.activeElement,a.querySelector(".classes-members-toggle"));
+ await a.querySelector(".classes-members-toggle").fire("click");assert.equal(a.querySelector(".classes-member-detail").hidden,false);
  assert.equal(h.calls.length,calls);assert.equal(h.reads.length,0);
 });
 test("old extends class relation remains terminal (4)",async()=>assertTerminalClassGraph("extends"));
@@ -326,18 +326,18 @@ test("old field class relation remains terminal (14)",async()=>assertTerminalCla
 
 // Member navigation delegates cached resolution; the class UI never searches type text.
 const memberRows = (h, id = "A") => descendants(h.card(id)).filter(n=>n.className==="classes-member");
-async function revealMembers(h, id = "A") { await h.card(id).querySelector(".classes-members-toggle").fire("click"); }
+async function toggleMembers(h, id = "A") { await h.card(id).querySelector(".classes-members-toggle").fire("click"); }
 test("member navigation is optional; method name stays direct and type text is inert without a hook",async()=>{
- const h=harness();await h.controller.open({seed:"A"});await revealMembers(h);
+ const h=harness();await h.controller.open({seed:"A"});
  const [field,method]=memberRows(h);
  assert.equal(field.querySelector(".classes-member-type").tagName,"span");assert.equal(field.querySelector(".classes-member-menu"),null);
  await method.querySelector(".classes-member-name").fire("click");assert.equal(h.methods[0].id,"A.execute");
  assert.deepEqual(JSON.parse(JSON.stringify(h.methods[0].range)),range);assert.equal(h.calls.length,1);assert.equal(h.reads.length,0);
 });
-test("opening, revealing and refolding members never fetches navigation or source",async()=>{
+test("opening, folding and revealing members never fetches navigation or source",async()=>{
  const h=harness({navigation:true});await h.controller.open({seed:"A"});assert.equal(h.navigations.length,0);
- await revealMembers(h);await revealMembers(h);assert.equal(h.navigations.length,0);assert.equal(h.calls.length,1);assert.equal(h.reads.length,0);
- await revealMembers(h);const [field,method]=memberRows(h);
+ await toggleMembers(h);await toggleMembers(h);assert.equal(h.navigations.length,0);assert.equal(h.calls.length,1);assert.equal(h.reads.length,0);
+ const [field,method]=memberRows(h);
  await field.querySelector(".classes-member-name").fire("click");assert.equal(h.navigations.length,0);
  await method.querySelector(".classes-member-name").fire("click");assert.equal(h.methods[0].id,"A.execute");assert.equal(h.navigations.length,0);
  await method.querySelector(".classes-member-type").fire("click");assert.equal(h.methods.length,1);assert.equal(h.navigations.length,1);
@@ -348,7 +348,7 @@ test("type hint and member menu pass only exact recorded owner/name/byte selecto
  data.nodes[0].class.fields[0]={name:"数据",typeHint:"same.Name<Δ>",path:"src/A.java",range:{startByte:13,endByte:39,startLine:2,endLine:2}};
  data.nodes[0].class.methods=[{name:"运行",symbolId:"A.运行#1",path:"src/A.java",range:{startByte:40,endByte:70,startLine:3,endLine:5}},
  {name:"运行",symbolId:"A.运行#2",typeHint:"same.Name<Δ>",path:"src/A.java",range:{startByte:75,endByte:115,startLine:6,endLine:8}}];
- freeze(data);const before=JSON.stringify(data);h.setRequest(async()=>data);await h.controller.open({seed:"A"});await revealMembers(h);
+ freeze(data);const before=JSON.stringify(data);h.setRequest(async()=>data);await h.controller.open({seed:"A"});
  const [field,one,two]=memberRows(h);await field.querySelector(".classes-member-type").fire("click");
  await one.querySelector(".classes-member-menu").fire("click");await two.querySelector(".classes-member-type").fire("click");
  assert.deepEqual(h.navigations.map(n=>JSON.parse(JSON.stringify(n.selector))),[
@@ -360,7 +360,7 @@ test("type hint and member menu pass only exact recorded owner/name/byte selecto
  assert.equal(JSON.stringify(data),before);assert.equal(h.calls.length,1);assert.equal(h.reads.length,0);
 });
 test("member right-click, keyboard and visible touch action stop bubbling into class actions",async()=>{
- const h=harness({navigation:true});await h.controller.open({seed:"A"});await revealMembers(h);
+ const h=harness({navigation:true});await h.controller.open({seed:"A"});
  const [field,method]=memberRows(h);
  for(const [target,type,details] of [[field,"contextmenu",{clientX:88,clientY:99}],
   [method.querySelector(".classes-member-name"),"keydown",{key:"F10",shiftKey:true}],
@@ -376,7 +376,7 @@ test("member right-click, keyboard and visible touch action stop bubbling into c
 });
 test("shared member menu preserves focus and safe labels without nested buttons",async()=>{
  const h=harness({navigation:true}),data=diagram();data.nodes[0].class.fields[0].typeHint="<img src=x onerror=bad()>";
- data.nodes[0].class.methods[0].name="<script>运行</script>";h.setRequest(async()=>freeze(data));await h.controller.open({seed:"A"});await revealMembers(h);
+ data.nodes[0].class.methods[0].name="<script>运行</script>";h.setRequest(async()=>freeze(data));await h.controller.open({seed:"A"});
  let run=0;h.setNavigate((event,selector,{isCurrent})=>h.controller.showContextMenu(event,[{label:`Declared type ${data.nodes[0].class.fields[0].typeHint}`,run:()=>{if(isCurrent())run++;}}]));
  const anchor=memberRows(h)[0].querySelector(".classes-member-type");anchor.focus();await anchor.fire("click");
  assert.match(text(h.menu()),/<img src=x onerror=bad\(\)>/);
@@ -387,14 +387,14 @@ test("shared member menu preserves focus and safe labels without nested buttons"
  assert.equal(h.calls.length,1);assert.equal(h.reads.length,0);
 });
 for(const change of ["session","revision","reset","hidden","fold","rerender","new diagram","pending diagram"])test(`member scope rejects stale ${change} and old triggers`,async()=>{
- const h=harness({navigation:true});await h.controller.open({seed:"A"});await revealMembers(h);
+ const h=harness({navigation:true});await h.controller.open({seed:"A"});
  const trigger=memberRows(h)[0].querySelector(".classes-member-type");await trigger.fire("click");const {isCurrent}=h.navigations[0].scope;assert.equal(isCurrent(),true);
  let work,pending;
  if(change==="session")h.setSession("two");
  if(change==="revision")h.setRevision({indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2});
  if(change==="reset")h.controller.reset();
  if(change==="hidden")h.get("classes-panel").hidden=true;
- if(change==="fold")await revealMembers(h);
+ if(change==="fold")await toggleMembers(h);
  if(change==="rerender")await allReturned(h);
  if(change==="new diagram")await h.controller.open({seed:"A"});
  if(change==="pending diagram"){pending=deferred();h.setRequest(()=>pending.promise);work=h.controller.open({seed:"B"});}
@@ -402,14 +402,14 @@ for(const change of ["session","revision","reset","hidden","fold","rerender","ne
  if(pending){pending.resolve(diagram(["B"]));await work;assert.equal(isCurrent(),false);}
 });
 test("recoverable requests cannot revive a captured navigation ticket; fresh member intents can retry",async()=>{
- const h=harness({navigation:true});await h.controller.open({seed:"A"});await revealMembers(h);
+ const h=harness({navigation:true});await h.controller.open({seed:"A"});
  const trigger=memberRows(h)[0].querySelector(".classes-member-type");await trigger.fire("click");const {isCurrent}=h.navigations[0].scope;
  h.setRequest(async()=>{const error=Error("Temporary failure");error.status=400;throw error;});await h.controller.open({seed:"B"});
  assert.equal(isCurrent(),false);await trigger.fire("click");assert.equal(h.navigations.length,2);assert.equal(h.navigations[1].scope.isCurrent(),true);
  assert.equal(h.reads.length,0);
 });
 test("delayed shared navigation work cannot publish or act after panel changes",async()=>{
- const h=harness({navigation:true});await h.controller.open({seed:"A"});await revealMembers(h);
+ const h=harness({navigation:true});await h.controller.open({seed:"A"});
  const pending=deferred();let published=0;
  h.setNavigate(async(event,selector,{isCurrent})=>{await pending.promise;if(isCurrent())published++;});
  const work=memberRows(h)[0].querySelector(".classes-member-type").fire("click");
@@ -471,7 +471,7 @@ for(const replacement of [false,true])test(`actual shared navigation never reope
  assert.equal(h.selected.length,0);assert.equal(h.reads.length,0);
 });
 test("shared navigation does not select an inferred class relation or call",async()=>{
- const h=integratedNavigation();await h.controller.open({seed:"A"});await revealMembers(h);
+ const h=integratedNavigation();await h.controller.open({seed:"A"});
  const trigger=memberRows(h)[0].querySelector(".classes-member-type");await trigger.fire("click");
  assert.equal(h.selected.length,0);assert.equal(h.reads.length,0);
  assert.ok(h.menu());

@@ -161,12 +161,12 @@ impl StagedJoin<'_> {
                             || self
                                 .declaration_status(self.captured.rev, document, syntax_id)?
                                 .iter()
-                                .any(|(named, _)| *named);
+                                .any(|status| status.0);
                         let kept = original && {
                             let candidates: Vec<_> = self
                                 .declaration_status(self.destination.rev, document, syntax_id)?
                                 .into_iter()
-                                .filter(|(named, _)| *named)
+                                .filter(|status| status.0)
                                 .collect();
                             candidates.len() == 1
                                 && candidates[0].1
@@ -713,15 +713,19 @@ impl StagedJoin<'_> {
             });
             // `row` is the destination join's row, classified at join time.
             call.dispatch = super::super::rejoined_dispatch(
-                [
-                    Some((row.dispatch, row.declared_target.as_ref())),
-                    Some((
-                        captured_call.dispatch,
-                        captured_call.declared_target.as_ref(),
-                    )),
-                ],
+                Some((row.dispatch, row.declared_target.as_ref())),
+                Some((
+                    captured_call.dispatch,
+                    captured_call.declared_target.as_ref(),
+                )),
                 &call,
-            );
+                |syntax_id, document| {
+                    Ok(self
+                        .declaration_status(self.destination.rev, document, syntax_id)?
+                        .iter()
+                        .any(|status| status.2))
+                },
+            )?;
             #[cfg(feature = "test-support")]
             crate::semantic_batch::testing::edit_row("callResolution", &mut call)?;
             // The kept copy's payload moves to the owner; its root moves into a slot of
