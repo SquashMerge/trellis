@@ -416,14 +416,15 @@ fn write_target_status(
             group.text.get(range.start..range.end) == declaration.name.as_deref()
         });
         ctx.conn
-            .prepare_cached("INSERT INTO nat_declarations VALUES(?1,?2,?3,?4,?5,?6)")?
+            .prepare_cached("INSERT INTO nat_declarations VALUES(?1,?2,?3,?4,?5,?6,?7)")?
             .execute(params![
                 rev,
                 ord,
                 codec::sid(&declaration.syntax_id),
                 i64::try_from(n)?,
                 declaration.name_range.is_some(),
-                name_ok
+                name_ok,
+                declaration.kind == "method"
             ])?;
     }
     Ok(())

@@ -1076,7 +1076,8 @@ fn shortest_depths(nodes: &mut [GraphNode], edges: &[GraphEdge]) {
     let mut depths = BTreeMap::from([(nodes[0].declaration.syntax_id.clone(), 0)]);
     loop {
         let mut changed = false;
-        for edge in edges {
+        // A boundary is not an included path: only traversed edges set a traversed depth.
+        for edge in edges.iter().filter(|edge| edge.visit != Visit::Boundary) {
             if let (Some(from), Some(to)) = (depths.get(&edge.from).copied(), &edge.to)
                 && depths.get(to).is_none_or(|depth| *depth > from + 1)
             {
@@ -1086,6 +1087,16 @@ fn shortest_depths(nodes: &mut [GraphNode], edges: &[GraphEdge]) {
         }
         if !changed {
             break;
+        }
+    }
+    // A declaration reached only by dispatch boundaries sits one past its nearest owner.
+    let traversed: BTreeSet<String> = depths.keys().cloned().collect();
+    for edge in edges.iter().filter(|edge| edge.visit == Visit::Boundary) {
+        if let (Some(from), Some(to)) = (depths.get(&edge.from).copied(), &edge.to)
+            && !traversed.contains(to)
+        {
+            let depth = depths.entry(to.clone()).or_insert(from + 1);
+            *depth = (*depth).min(from + 1);
         }
     }
     for node in nodes {

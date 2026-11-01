@@ -731,6 +731,38 @@ fn dispatch_boundary_target_yields_to_direct_calls_and_the_node_limit() {
 }
 const DISPATCH: BoundaryReason = BoundaryReason::Dispatch;
 
+/// #557: a boundary is not an included path. B stays at its traversed depth, with its depth
+/// frontier at the requested depth, though a dynamic call from the root also names it.
+#[test]
+fn dispatch_boundary_does_not_shorten_a_traversed_depth() {
+    let (c, d) = (5, 6);
+    let mut w = world(true);
+    for n in [A, B, c, d] {
+        w.decl(n, "src/lib.rs");
+    }
+    w.call(A, 10, 10);
+    w.bind(
+        10,
+        Bind {
+            dispatch: Dispatch::Dynamic,
+            ..direct(B)
+        },
+    );
+    w.call(A, 11, 20);
+    w.bind(11, direct(c));
+    w.call(c, 12, 30);
+    w.bind(12, direct(B));
+    w.call(B, 13, 40);
+    w.bind(13, direct(d));
+    let mut facts = w.build();
+    let mut deep = request(A, true);
+    deep.depth = 2;
+    let r = run(&mut facts, &deep);
+    assert_eq!(nodes(&r), [(A, 0), (c, 1), (B, 2)]);
+    assert_eq!(r.frontier.len(), 1);
+    assert_eq!(r.frontier[0].reason, FrontierReason::Depth);
+}
+
 #[test]
 fn case8b_possibly_stale_precedes_dispatch() {
     let v = 5;

@@ -6461,9 +6461,11 @@ fn real_rust_analyzer_inherent_calls_expand_and_trait_calls_stay_boundaries() {
     assert_eq!(target.path, "src/shapes.rs");
 }
 
-/// #557: rejoin keeps the same rule as #470. An edit of the target's document that keeps its
-/// syntax ID retargets the unchanged caller's call and keeps the join-time `direct` or
-/// `dynamic`; a target that is gone leaves no classified call.
+/// #557: rejoin keeps the #470 rule, except that a method's `direct` needs a destination
+/// classification: its `impl`'s bases and its modifiers are outside its syntax ID. An edit of
+/// the target's document keeps the unchanged caller's free-function `direct` and trait
+/// `dynamic`, and drops an inherent `direct` until the next import, whether or not the impl
+/// gained a trait. A target that is gone leaves no classified call.
 #[test]
 fn rejoin_keeps_inherent_and_trait_dispatch_only_for_the_same_declaration() {
     let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_DISPATCH).join("workspace"), root));
@@ -6485,7 +6487,28 @@ fn rejoin_keeps_inherent_and_trait_dispatch_only_for_the_same_declaration() {
     );
     world.republish_with_rejoin();
     assert_eq!(world.rejoin_failures(), 0);
-    assert_eq!(lib_calls(&world), before);
+    let expected: Vec<_> = before
+        .iter()
+        .cloned()
+        .map(|mut call| {
+            if ["new", "navigation_at"].contains(&call[1].as_str()) {
+                call[3] = "Unknown".to_owned();
+            }
+            call
+        })
+        .collect();
+    assert_eq!(lib_calls(&world), expected);
+
+    // The impl gains a trait under the same method IDs: nothing keeps calling it direct.
+    write_files(
+        &world.root,
+        &[(
+            "src/shapes.rs",
+            &shapes.replace("impl Square {", "pub trait Nav {}\nimpl Nav for Square {"),
+        )],
+    );
+    world.republish_with_rejoin();
+    assert_eq!(lib_calls(&world), expected);
 
     // The renamed method's declaration is gone, so the caller's call to it keeps no target.
     write_files(
@@ -6504,7 +6527,7 @@ fn rejoin_keeps_inherent_and_trait_dispatch_only_for_the_same_declaration() {
     );
     assert!(lib_calls(&world).contains(&[
         "src/lib.rs".to_owned(),
-        "new".to_owned(),
+        "total".to_owned(),
         "Resolved".to_owned(),
         "Direct".to_owned()
     ]));

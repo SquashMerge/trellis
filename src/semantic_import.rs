@@ -1472,7 +1472,17 @@ pub(super) fn settled_dispatch(
     joined_target: Option<&semantic::Target>,
     settled: &semantic::CallBinding,
 ) -> semantic::Dispatch {
-    match (joined_target, &settled.declared_target) {
+    if resolves_to(joined_target, settled) {
+        joined
+    } else {
+        semantic::Dispatch::Unknown
+    }
+}
+
+/// Whether the settled row still resolves, with a verified target, to `joined_target`.
+fn resolves_to(joined_target: Option<&semantic::Target>, settled: &semantic::CallBinding) -> bool {
+    matches!(
+        (joined_target, &settled.declared_target),
         (
             Some(semantic::Target::Internal {
                 syntax_id: a,
@@ -1487,29 +1497,44 @@ pub(super) fn settled_dispatch(
         ) if settled.resolution == semantic::Resolution::Resolved
             && settled.stale_target == Some(false)
             && a == b
-            && x == y =>
-        {
-            joined
-        }
-        _ => semantic::Dispatch::Unknown,
-    }
+            && x == y
+    )
 }
 
 /// A rejoined call's dispatch: the classification of whichever join, destination first then
 /// captured, was made against the settled target. A rejoin can settle a call on a captured
 /// target retargeted to the destination (its syntax ID verified unchanged) that the
 /// destination join alone did not resolve; the call's document bytes are unchanged, so the
-/// captured shape and target kind still hold.
+/// captured shape and target kind still hold. A method's `direct` is the exception: the facts
+/// behind it, its `impl`'s bases and its modifiers, are outside its syntax ID, so it does not
+/// survive without a destination classification (#557). `target_is_method` reads the
+/// destination's declaration of the settled target.
 pub(super) fn rejoined_dispatch(
-    joins: [Option<(semantic::Dispatch, Option<&semantic::Target>)>; 2],
+    destination: Option<(semantic::Dispatch, Option<&semantic::Target>)>,
+    captured: Option<(semantic::Dispatch, Option<&semantic::Target>)>,
     settled: &semantic::CallBinding,
-) -> semantic::Dispatch {
-    joins
-        .into_iter()
-        .flatten()
-        .map(|(dispatch, target)| settled_dispatch(dispatch, target, settled))
-        .find(|dispatch| *dispatch != semantic::Dispatch::Unknown)
-        .unwrap_or(semantic::Dispatch::Unknown)
+    target_is_method: impl FnOnce(&str, &native::DocumentKey) -> Result<bool>,
+) -> Result<semantic::Dispatch> {
+    if let Some((dispatch, target)) = destination
+        && resolves_to(target, settled)
+    {
+        return Ok(dispatch);
+    }
+    let Some((dispatch, target)) = captured.filter(|(_, target)| resolves_to(*target, settled))
+    else {
+        return Ok(semantic::Dispatch::Unknown);
+    };
+    if dispatch == semantic::Dispatch::Direct
+        && let Some(semantic::Target::Internal {
+            syntax_id,
+            document,
+            ..
+        }) = target
+        && target_is_method(syntax_id, document)?
+    {
+        return Ok(semantic::Dispatch::Unknown);
+    }
+    Ok(dispatch)
 }
 
 fn measure_occurrence<S: JoinStore>(
@@ -4367,6 +4392,18 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     }
     let references_by_id: BTreeMap<_, _> =
         references.iter().map(|row| (row.id.clone(), row)).collect();
+    let target_is_method = |syntax_id: &str, document: &native::DocumentKey| {
+        Ok(match target_projection {
+            Some(projection) => projection
+                .get(&(document.clone(), syntax_id.to_owned()))
+                .is_some_and(|declaration| declaration.kind == "method"),
+            None => r2
+                .declarations_by_id(syntax_id)
+                .iter()
+                .any(|d| d.document == *document && d.kind == "method"),
+        })
+    };
+    let mut rejoin_failure = None;
     calls.retain_mut(|call| {
         let Some(reference) = accepted_reference_ids
             .get(&call.provenance_id)
@@ -4384,9 +4421,15 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             .get(&call.provenance_id)
             .map(|(dispatch, target)| (*dispatch, target.as_ref()));
         let original = captured_dispatch.get(call.provenance_id.as_str()).copied();
-        call.dispatch = rejoined_dispatch([destination, original], call);
+        match rejoined_dispatch(destination, original, call, target_is_method) {
+            Ok(dispatch) => call.dispatch = dispatch,
+            Err(error) => rejoin_failure = Some(error),
+        }
         true
     });
+    if let Some(error) = rejoin_failure {
+        return Err(error);
+    }
     let eligible_proofs: BTreeSet<_> = filtered
         .claims
         .iter()
