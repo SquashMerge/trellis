@@ -755,6 +755,23 @@ impl DaemonState {
         })
     }
 
+    /// A lease for the Architecture owner's read. Unlike a client's lease it never cancels
+    /// a requested retirement: nothing is waiting for this work.
+    pub(super) fn background_lease(&self) -> Option<AdmissionLease> {
+        let state = self.runtime.lock().unwrap();
+        if matches!(
+            *state,
+            RuntimeState::RetireRequested { .. } | RuntimeState::Closing | RuntimeState::Retired
+        ) {
+            return None;
+        }
+        self.leases.fetch_add(1, Ordering::AcqRel);
+        Some(AdmissionLease {
+            count: self.leases.clone(),
+            lifecycle: self.lifecycle.clone(),
+        })
+    }
+
     /// Ask the worker to retire this runtime. `idle` decides, under the state
     /// lock, whether nothing keeps it active (Decision 0009 §5). Startup
     /// reconciliation in progress, a lease or accepted FIFO work declines.
@@ -886,6 +903,7 @@ impl DaemonState {
     pub(super) fn close(&self, held: Option<Arc<WriterSession>>) {
         self.cancel_active();
         self.search_fill.lock().unwrap().take();
+        self.architecture.0.shut_down();
         self.note_state_change();
         *self.watch_status.lock().unwrap() = None;
         *self.watcher_work.lock().unwrap() = None;

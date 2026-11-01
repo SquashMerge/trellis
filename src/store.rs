@@ -1,5 +1,6 @@
 //! SQLite index snapshots and request queues. Connections are never shared between threads.
 pub mod anchors;
+mod architecture_core;
 mod graph_read;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
@@ -24,6 +25,10 @@ pub mod topology;
 use crate::model::*;
 use crate::native_evidence::DeclarationRole;
 use anyhow::{Context, Result, ensure};
+pub(crate) use architecture_core::{
+    ArchitectureArguments, ArchitectureCore, ArchitectureMetrics, ArchitectureProgress,
+    ArchitectureSummary, ArchitectureView, CoreFailure,
+};
 pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
@@ -1301,6 +1306,14 @@ pub struct MetricsPayload {
     pub partial_files: Vec<crate::syntax_bounds::PartialFile>,
 }
 
+/// How one architecture operation evaluates rules over its references.
+type EvaluateRules<'a> = dyn FnMut(
+        &crate::rules::Config,
+        &crate::references::Projection,
+        &mut (dyn FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value>
+    + 'a;
+
 /// One coherent native read snapshot retained until its owned result passes T03.
 pub struct EvidenceResponse {
     store: Store,
@@ -1433,6 +1446,69 @@ impl MetricsReadCheck<'_> {
     }
 }
 
+impl Store {
+    /// Metrics of one document's stored source and native rows.
+    fn metrics_document(
+        &self,
+        key: &crate::native_evidence::DocumentKey,
+        file: &SourceFile,
+        declarations: &[crate::native_evidence::Declaration],
+        calls: &[crate::native_evidence::Call],
+        regions: &[crate::native_evidence::ControlRegion],
+        expired: &dyn Fn() -> bool,
+    ) -> std::result::Result<MetricsComputedDocument, MetricsDocumentFailure> {
+        // Metrics use the stored source and native rows as fetched.
+        if file.language != key.language {
+            return Err(MetricsDocumentFailure::Other(
+                SelectedIntegrity("incompatible_index: metrics language mismatch".into()).into(),
+            ));
+        }
+        if expired() {
+            return Err(MetricsDocumentFailure::Stopped);
+        }
+        let mut roots = declarations
+            .iter()
+            .filter(|row| row.kind == "module" && row.ancestors.is_empty());
+        let file_role = roots.next().map(|row| row.role);
+        let Some(file_role) = file_role.filter(|_| roots.next().is_none()) else {
+            return Err(MetricsDocumentFailure::Read(
+                SelectedIntegrity("incompatible_index: metrics file module".into()).into(),
+            ));
+        };
+        let physical_lines = file.text.lines().count();
+        let source = crate::metrics::SourceInput {
+            language: &key.language,
+            content_hash: &file.hash,
+            text: &file.text,
+        };
+        let cached = self
+            .metrics_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lookup(&source);
+        crate::metrics::compute_with_cached(
+            cached,
+            source,
+            declarations,
+            calls,
+            regions,
+            &mut || {
+                if expired() {
+                    anyhow::bail!("cancelled")
+                }
+                Ok(())
+            },
+        )
+        .map(|computed| MetricsComputedDocument {
+            computed,
+            physical_lines,
+            physical_bytes: file.text.len(),
+            file_role,
+        })
+        .map_err(MetricsDocumentFailure::Other)
+    }
+}
+
 /// Metrics and file metadata from one fetched indexed document.
 struct MetricsComputedDocument {
     computed: crate::metrics::Computed,
@@ -1503,13 +1579,11 @@ fn trace_metrics_resident(documents: usize, bytes: u64) {
 }
 
 impl EvidenceResponse {
-    /// Materialize one captured-source architecture view in this admitted snapshot.
-    pub fn architecture_response(
-        &self,
+    /// The checked arguments of one architecture operation.
+    pub(crate) fn architecture_arguments(
         kind: &str,
         arguments: &serde_json::Value,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ArchitectureArguments> {
         ensure!(
             matches!(kind, "references" | "check" | "explain" | "prompt"),
             "invalid_request"
@@ -1546,7 +1620,36 @@ impl EvidenceResponse {
             })
             .transpose()?
             .unwrap_or(5);
+        Ok(ArchitectureArguments {
+            pin,
+            paths,
+            sample_limit,
+        })
+    }
+
+    /// Materialize one captured-source architecture view in this admitted snapshot.
+    pub fn architecture_response(
+        &self,
+        kind: &str,
+        arguments: &serde_json::Value,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
+        let parsed = Self::architecture_arguments(kind, arguments)?;
         check()?;
+        let config = self.architecture_config(kind)?;
+        let selected = self.selected(parsed.pin)?;
+        let core = self.architecture_core_at(
+            selected.pin,
+            config.as_ref(),
+            false,
+            &mut *check,
+            &|_: ArchitectureProgress| {},
+        )?;
+        self.architecture_response_at(kind, arguments, &parsed, config.as_ref(), &core, check)
+    }
+
+    /// The rules this operation reads; a check or explanation fails without them.
+    pub(crate) fn architecture_config(&self, kind: &str) -> Result<Option<crate::rules::Config>> {
         let config = if kind == "references" {
             None
         } else {
@@ -1555,20 +1658,98 @@ impl EvidenceResponse {
         if matches!(kind, "check" | "explain") && config.is_none() {
             anyhow::bail!("rules_not_found");
         }
+        Ok(config)
+    }
+
+    /// One architecture operation over a computed core.
+    pub(crate) fn architecture_response_at(
+        &self,
+        kind: &str,
+        arguments: &serde_json::Value,
+        parsed: &ArchitectureArguments,
+        config: Option<&crate::rules::Config>,
+        core: &ArchitectureCore,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
+        let references = core.references(&parsed.paths, parsed.sample_limit, check)?;
+        let mut evaluate =
+            |config: &crate::rules::Config,
+             references: &crate::references::Projection,
+             check: &mut (dyn FnMut() -> Result<()> + Send)| {
+                let mut check = || check();
+                Ok(crate::rules::evaluate_prepared(
+                    config,
+                    core.rules(config)?,
+                    references,
+                    &parsed.paths,
+                    &mut check,
+                )?
+                .data)
+            };
+        Self::architecture_payload(
+            kind,
+            arguments,
+            config,
+            references,
+            core.pin,
+            &mut evaluate,
+            check,
+        )
+    }
+
+    /// One path-scoped operation computed from its own scope, under the budgets of that
+    /// scope. For a revision too large for a core.
+    pub(crate) fn architecture_response_scoped(
+        &self,
+        kind: &str,
+        arguments: &serde_json::Value,
+        parsed: &ArchitectureArguments,
+        config: Option<&crate::rules::Config>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
         let snapshot = self
-            .architecture_snapshot(pin, check)
+            .architecture_snapshot(parsed.pin, check)
             .map_err(|error| self.store.report_index_failure(error))?;
-        let references = crate::references::project(&snapshot, &paths, sample_limit, check)?;
+        let references =
+            crate::references::project(&snapshot, &parsed.paths, parsed.sample_limit, check)?;
+        let mut evaluate =
+            |config: &crate::rules::Config,
+             references: &crate::references::Projection,
+             check: &mut (dyn FnMut() -> Result<()> + Send)| {
+                let mut check = || check();
+                crate::rules::evaluate(config, &snapshot, references, &parsed.paths, &mut check)
+            };
+        Self::architecture_payload(
+            kind,
+            arguments,
+            config,
+            references,
+            snapshot.pin,
+            &mut evaluate,
+            check,
+        )
+    }
+
+    /// One operation's answer from its references and its way of evaluating the rules.
+    fn architecture_payload(
+        kind: &str,
+        arguments: &serde_json::Value,
+        config: Option<&crate::rules::Config>,
+        references: crate::references::Projection,
+        pin: IndexPin,
+        evaluate: &mut EvaluateRules<'_>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
         let mut payload = match kind {
             "references" => references.data,
             "prompt" => serde_json::json!({
-                "rulesText": config.as_ref().map(|config| &config.text),
-                "rulesFile": config.as_ref().map(crate::rules::descriptor),
+                "rulesText": config.map(|config| &config.text),
+                "rulesFile": config.map(crate::rules::descriptor),
                 "references": references.data,
             }),
             "check" | "explain" => {
-                let config = config.as_ref().expect("checked rules presence");
-                let result = crate::rules::evaluate(config, &snapshot, &references, &paths, check)?;
+                let config = config.expect("checked rules presence");
+                let result = evaluate(config, &references, &mut *check)?;
                 if kind == "explain" {
                     crate::rules::explain(
                         result,
@@ -1585,8 +1766,8 @@ impl EvidenceResponse {
             }
             _ => unreachable!(),
         };
-        payload["indexGeneration"] = serde_json::json!(snapshot.pin.index_generation.to_string());
-        payload["indexRevision"] = serde_json::json!(snapshot.pin.index_revision);
+        payload["indexGeneration"] = serde_json::json!(pin.index_generation.to_string());
+        payload["indexRevision"] = serde_json::json!(pin.index_revision);
         check()?;
         Ok(payload)
     }
@@ -1600,32 +1781,82 @@ impl EvidenceResponse {
         options.validate()?;
         check()?;
         let config = crate::rules::load(Path::new(self.store.workspace_root()))?;
+        let view = self.architecture_view_head(options, config.as_ref())?;
+        let pin = match &view {
+            ArchitectureView::Ready { pin, .. } => *pin,
+            ArchitectureView::Done(payload) => {
+                check()?;
+                return Ok(payload.clone());
+            }
+        };
+        let core = self.architecture_core_at(
+            pin,
+            config.as_ref(),
+            true,
+            &mut *check,
+            &|_: ArchitectureProgress| {},
+        )?;
+        let summary = self.architecture_view_at(
+            options,
+            view,
+            config.as_ref().expect("ready config"),
+            &core,
+            check,
+        )?;
+        Ok(summary.as_ref().clone())
+    }
+
+    /// The summary's revision and rules state. Only a ready summary needs a core.
+    pub(crate) fn architecture_view_head(
+        &self,
+        options: &MetricsOptions,
+        config: Option<&crate::rules::Config>,
+    ) -> Result<ArchitectureView> {
         let selected = self.selected(options.pin)?;
-        let layers = config
-            .as_ref()
-            .map(crate::rules::view_layers)
-            .unwrap_or_default();
-        let mut payload = serde_json::json!({
+        let layers = config.map(crate::rules::view_layers).unwrap_or_default();
+        let payload = serde_json::json!({
             "indexGeneration": selected.pin.index_generation.to_string(),
             "indexRevision": selected.pin.index_revision,
             "state": if config.is_none() { "missing_rules" } else if layers.is_empty() { "no_layers" } else { "ready" },
-            "rulesFile": config.as_ref().map(crate::rules::descriptor),
-            "exceptionCount": config.as_ref().map(crate::rules::Config::exception_count),
+            "rulesFile": config.map(crate::rules::descriptor),
+            "exceptionCount": config.map(crate::rules::Config::exception_count),
             "aggregate": options.aggregate, "metricsVersion": "metrics:v1",
             "role": options.role, "workbench": options.workbench, "evidenceTier": "syntax", "semanticComplete": false,
             "layers": layers, "modules": [], "edges": [], "references": null, "rules": null
         });
-        if payload["state"] != "ready" {
-            check()?;
-            return Ok(payload);
+        Ok(if payload["state"] == "ready" {
+            ArchitectureView::Ready {
+                pin: selected.pin,
+                payload,
+            }
+        } else {
+            ArchitectureView::Done(payload)
+        })
+    }
+
+    /// The summary at a computed core. A core serves each role and aggregate once.
+    pub(crate) fn architecture_view_at(
+        &self,
+        options: &MetricsOptions,
+        view: ArchitectureView,
+        config: &crate::rules::Config,
+        core: &ArchitectureCore,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<Arc<serde_json::Value>> {
+        let key = (
+            options.role.clone(),
+            options.aggregate.clone(),
+            options.workbench,
+        );
+        if let Some(summary) = core.summary(&key) {
+            return Ok(summary);
         }
-        let config = config.as_ref().expect("ready config");
-        let snapshot = self
-            .architecture_snapshot(Some(selected.pin), check)
-            .map_err(|error| self.store.report_index_failure(error))?;
-        let references = crate::references::project(&snapshot, &[], 5, check)?;
+        let ArchitectureView::Ready { mut payload, .. } = view else {
+            anyhow::bail!("store_unavailable: architecture summary state");
+        };
+        let references = core.references(&[], 5, check)?;
         let evaluated =
-            crate::rules::evaluate_with_layers(config, &snapshot, &references, &[], check)?;
+            crate::rules::evaluate_prepared(config, core.rules(config)?, &references, &[], check)?;
         payload["evidenceTier"] = references.data["evidenceTier"].clone();
         payload["partialFiles"] = references.data["partialFiles"].clone();
         let references_coverage = &references.coverage;
@@ -1633,7 +1864,7 @@ impl EvidenceResponse {
         let assignments = evaluated.layers;
         let metrics = self.metrics_at_with_config(
             &MetricsOptions {
-                pin: Some(snapshot.pin),
+                pin: Some(core.pin),
                 role: options.role.clone(),
                 workbench: options.workbench,
                 aggregate: options.aggregate.clone(),
@@ -1641,6 +1872,7 @@ impl EvidenceResponse {
             },
             Some(config),
             true,
+            Some(core.metrics()?),
             check,
         )?;
         let files: BTreeMap<_, _> = metrics
@@ -1654,20 +1886,6 @@ impl EvidenceResponse {
                         file.path.as_str(),
                     ),
                     file,
-                )
-            })
-            .collect();
-        let documents: BTreeMap<_, _> = snapshot
-            .documents
-            .iter()
-            .map(|doc| {
-                (
-                    (
-                        doc.key.source_set_id.as_str(),
-                        doc.key.language.as_str(),
-                        doc.key.path.as_str(),
-                    ),
-                    doc,
                 )
             })
             .collect();
@@ -1692,16 +1910,13 @@ impl EvidenceResponse {
             let file = files
                 .get(&key)
                 .context("store_unavailable: architecture metrics join")?;
-            let doc = documents
-                .get(&key)
-                .context("store_unavailable: architecture source join")?;
             let mut row = module.clone();
             row["layer"] = serde_json::json!(
                 assignments
                     .get(key.2)
                     .context("store_unavailable: architecture layer assignment absent")?
             );
-            row["physicalLines"] = serde_json::json!(doc.file.text.lines().count());
+            row["physicalLines"] = serde_json::json!(file.physical_lines);
             row["declarationCount"] = serde_json::json!(file.declaration_count);
             row["roleCounts"] = serde_json::json!(file.role_counts);
             row["metrics"] = file.metrics.clone();
@@ -1845,15 +2060,15 @@ impl EvidenceResponse {
         );
         drop(assignments);
         for value in [&mut references, &mut rules] {
-            value["indexGeneration"] = serde_json::json!(snapshot.pin.index_generation.to_string());
-            value["indexRevision"] = serde_json::json!(snapshot.pin.index_revision);
+            value["indexGeneration"] = serde_json::json!(core.pin.index_generation.to_string());
+            value["indexRevision"] = serde_json::json!(core.pin.index_revision);
         }
         payload["modules"] = serde_json::json!(modules);
         payload["edges"] = serde_json::json!(summaries.into_values().collect::<Vec<_>>());
         payload["references"] = references;
         payload["rules"] = rules;
         check()?;
-        Ok(payload)
+        Ok(core.remember_summary(key, payload))
     }
 
     /// One bounded page of Architecture detail at the summary's pin and rules hash.
@@ -1864,18 +2079,43 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<serde_json::Value> {
         check()?;
+        let config = self.architecture_details_config(query)?;
+        let core = self.architecture_core_at(
+            query.pin,
+            Some(&config),
+            false,
+            &mut *check,
+            &|_: ArchitectureProgress| {},
+        )?;
+        self.architecture_details_at(query, &config, &core, check)
+    }
+
+    /// The rules file a detail read pins, or `rules_conflict`.
+    pub(crate) fn architecture_details_config(
+        &self,
+        query: &crate::architecture_details::Query,
+    ) -> Result<crate::rules::Config> {
         let config = crate::rules::load(Path::new(self.store.workspace_root()))?
             .context("rules_conflict: rules file missing")?;
         ensure!(
             config.content_hash == query.rules_hash,
             "rules_conflict: rules changed since the summary"
         );
-        let snapshot = self
-            .architecture_snapshot(Some(query.pin), check)
-            .map_err(|error| self.store.report_index_failure(error))?;
-        let references = crate::references::project(&snapshot, &[], 5, check)?;
+        self.selected(Some(query.pin))?;
+        Ok(config)
+    }
+
+    /// One bounded detail page at a computed core.
+    pub(crate) fn architecture_details_at(
+        &self,
+        query: &crate::architecture_details::Query,
+        config: &crate::rules::Config,
+        core: &ArchitectureCore,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
+        let references = core.references(&[], 5, check)?;
         let evaluated =
-            crate::rules::evaluate_with_layers(&config, &snapshot, &references, &[], check)?;
+            crate::rules::evaluate_prepared(config, core.rules(config)?, &references, &[], check)?;
         let layers = crate::architecture_details::Layers::new(&evaluated.layers, &evaluated.data);
         let page = crate::architecture_details::page(
             query,
@@ -1922,9 +2162,28 @@ impl EvidenceResponse {
         pin: Option<IndexPin>,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<crate::references::Snapshot> {
+        self.architecture_snapshot_regions(pin, check, &|_, _| {})
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    /// The snapshot and each document's control regions, in snapshot order.
+    fn architecture_snapshot_regions(
+        &self,
+        pin: Option<IndexPin>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+        progress: &dyn Fn(usize, usize),
+    ) -> Result<(
+        crate::references::Snapshot,
+        Vec<Vec<crate::native_evidence::ControlRegion>>,
+    )> {
         use crate::native_evidence::DocumentKey;
         check()?;
         let selected = self.selected(pin)?;
+        let total = self.db.query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [&selected.key],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
         let mut statement = self.db.prepare(
             "SELECT r.source_set_id,m.language,m.path,m.coverage_diagnostic
              FROM revision_documents m
@@ -1933,6 +2192,7 @@ impl EvidenceResponse {
         )?;
         let mut cursor = statement.query([&selected.key])?;
         let mut documents = Vec::new();
+        let mut regions = Vec::new();
         let mut evidence_gaps = BTreeMap::new();
         let mut pending = Vec::new();
         let mut source_bytes = 0u64;
@@ -1989,6 +2249,7 @@ impl EvidenceResponse {
                 evidence_gaps.insert(key.clone(), reason);
             }
             pending.push((key, std::sync::Mutex::new(Some(fetched))));
+            progress(pending.len(), total);
         }
         // SQLite reads stay on this connection; decoding needs no connection, so
         // it runs in parallel. The first decode failure in document order is reported.
@@ -2042,6 +2303,7 @@ impl EvidenceResponse {
                     fetched.file.language == key.language,
                     "incompatible_index: architecture language mismatch"
                 );
+                regions.push(fetched.regions);
                 documents.push(crate::references::DocumentInput {
                     key,
                     file: fetched.file,
@@ -2160,18 +2422,31 @@ impl EvidenceResponse {
         }
         semantic_display::architecture_semantic(&self.db, &selected.key, &mut documents, check)?;
         check()?;
-        Ok(crate::references::Snapshot {
-            pin: selected.pin,
-            documents,
-            manifests: manifests.into_values().collect(),
-            evidence_gaps,
-        })
+        Ok((
+            crate::references::Snapshot {
+                pin: selected.pin,
+                documents,
+                manifests: manifests.into_values().collect(),
+                evidence_gaps,
+            },
+            regions,
+        ))
     }
 
     /// Compute metrics from one selected revision in this response's read transaction.
     pub fn metrics_at(
         &self,
         options: &MetricsOptions,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<MetricsPayload> {
+        self.metrics_at_prepared(options, None, check)
+    }
+
+    /// `metrics_at`, taking this revision's rows from `prepared` when it has them.
+    pub(crate) fn metrics_at_prepared(
+        &self,
+        options: &MetricsOptions,
+        prepared: Option<&ArchitectureMetrics>,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<MetricsPayload> {
         options.validate()?;
@@ -2185,7 +2460,8 @@ impl EvidenceResponse {
         } else {
             (None, false)
         };
-        let mut payload = self.metrics_at_with_config(options, config.as_ref(), false, check)?;
+        let mut payload =
+            self.metrics_at_with_config(options, config.as_ref(), false, prepared, check)?;
         if invalid_rules {
             payload.layer_exclusions_warning = Some(LAYER_EXCLUSIONS_WARNING);
         }
@@ -2197,6 +2473,7 @@ impl EvidenceResponse {
         options: &MetricsOptions,
         config: Option<&crate::rules::Config>,
         strict_rules: bool,
+        prepared: Option<&ArchitectureMetrics>,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<MetricsPayload> {
         let progress = MetricsReadCheck {
@@ -2328,57 +2605,14 @@ impl EvidenceResponse {
              -> std::result::Result<MetricsComputedDocument, MetricsDocumentFailure> {
                 let calls = std::cell::Cell::new(0);
                 let expired = || progress.expired_every(&calls, check_every);
-                // Metrics use the stored source and native rows as fetched.
-                if fetched.file.language != key.language {
-                    return Err(MetricsDocumentFailure::Other(
-                        SelectedIntegrity("incompatible_index: metrics language mismatch".into())
-                            .into(),
-                    ));
-                }
-                if expired() {
-                    return Err(MetricsDocumentFailure::Stopped);
-                }
-                let mut roots = fetched
-                    .declarations
-                    .iter()
-                    .filter(|row| row.kind == "module" && row.ancestors.is_empty());
-                let file_role = roots.next().map(|row| row.role);
-                let Some(file_role) = file_role.filter(|_| roots.next().is_none()) else {
-                    return Err(MetricsDocumentFailure::Read(
-                        SelectedIntegrity("incompatible_index: metrics file module".into()).into(),
-                    ));
-                };
-                let physical_lines = fetched.file.text.lines().count();
-                let source = crate::metrics::SourceInput {
-                    language: &key.language,
-                    content_hash: &fetched.file.hash,
-                    text: &fetched.file.text,
-                };
-                let cached = store
-                    .metrics_memo
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .lookup(&source);
-                crate::metrics::compute_with_cached(
-                    cached,
-                    source,
+                store.metrics_document(
+                    key,
+                    &fetched.file,
                     &fetched.declarations,
                     &fetched.calls,
                     &fetched.regions,
-                    &mut || {
-                        if expired() {
-                            anyhow::bail!("cancelled")
-                        }
-                        Ok(())
-                    },
+                    &expired,
                 )
-                .map(|computed| MetricsComputedDocument {
-                    computed,
-                    physical_lines,
-                    physical_bytes: fetched.file.text.len(),
-                    file_role,
-                })
-                .map_err(MetricsDocumentFailure::Other)
             };
         let compute = |fetched: FetchedDocument, key: &DocumentKey| {
             #[cfg(test)]
@@ -2575,7 +2809,30 @@ impl EvidenceResponse {
             }
             Ok(())
         };
+        if let Some(prepared) = prepared {
+            for &key in &included {
+                let document = prepared
+                    .get(key)
+                    .context("store_unavailable: prepared metrics document")?;
+                progress.check()?;
+                accept(
+                    key,
+                    Some(Ok(MetricsComputedDocument {
+                        computed: crate::metrics::Computed::ready(
+                            document.rows.clone(),
+                            document.gap.clone(),
+                        ),
+                        physical_lines: document.physical_lines,
+                        physical_bytes: document.physical_bytes,
+                        file_role: document.file_role,
+                    })),
+                )?;
+            }
+        }
         std::thread::scope(|scope| -> Result<()> {
+            if prepared.is_some() {
+                return Ok(());
+            }
             type Fetched = std::result::Result<FetchedDocument, MetricsDocumentFailure>;
             let mut remaining = included.iter();
             let mut exhausted = false;
@@ -8140,7 +8397,7 @@ fn targeted_current_declaration(
     #[cfg(feature = "test-support")]
     crate::semantic_import::note_current_target_lookup(document);
     let mut query = tx.prepare(
-        "SELECT d.name,d.name_start,d.name_end FROM revision_documents m
+        "SELECT d.name,d.name_start,d.name_end,d.kind FROM revision_documents m
          JOIN document_versions v ON v.vid=m.vid AND v.language=m.language AND v.path=m.path
          JOIN native_version_declarations d ON d.vid=v.vid
          WHERE m.revision_id=?1 AND m.language=?2 AND m.path=?3 AND d.syntax_id=?4
@@ -8158,7 +8415,8 @@ fn targeted_current_declaration(
             let name: Option<String> = row.get(0)?;
             let start: Option<i64> = row.get(1)?;
             let end: Option<i64> = row.get(2)?;
-            Ok::<_, rusqlite::Error>((name, start, end))
+            let kind: String = row.get(3)?;
+            Ok::<_, rusqlite::Error>((name, start, end, kind))
         })
         .transpose()?;
     ensure!(
@@ -8168,10 +8426,11 @@ fn targeted_current_declaration(
     #[cfg(feature = "test-support")]
     crate::semantic_import::note_current_target_rows(usize::from(first.is_some()));
     match first {
-        Some((Some(name), Some(start), Some(end))) => {
+        Some((Some(name), Some(start), Some(end), kind)) => {
             Ok(Some(crate::semantic_evidence::TargetDeclaration {
                 syntax_id: syntax_id.to_owned(),
                 document: document.clone(),
+                kind,
                 name,
                 name_range: crate::native_evidence::Range {
                     start: usize::try_from(start)?,
@@ -8179,7 +8438,7 @@ fn targeted_current_declaration(
                 },
             }))
         }
-        Some((None, None, None)) | None => Ok(None),
+        Some((None, None, None, _)) | None => Ok(None),
         _ => Err(SelectedIntegrity(
             "incompatible_index: malformed targeted current declaration".into(),
         )

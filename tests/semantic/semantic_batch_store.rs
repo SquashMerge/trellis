@@ -3546,7 +3546,7 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
         callees
     };
     {
-        use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+        use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Dynamic};
         assert_eq!(
             callees(&staged.call_bindings),
             [
@@ -3555,7 +3555,7 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
                 ("plain", Direct),
                 ("plain", Direct),
                 ("register", Direct),
-                ("run", Unknown),
+                ("run", Dynamic),
             ]
         );
     }
@@ -3594,7 +3594,7 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
 #[test]
 fn real_typescript_explicit_symbol_kind_is_checked_identically_in_batch_and_memory() {
     use protobuf::EnumOrUnknown;
-    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Dynamic, Unknown};
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/semantic-import/issue444-javascript-calls");
     let read = |path: &str| fs::read_to_string(fixture_dir.join(path)).unwrap();
@@ -3608,7 +3608,7 @@ fn real_typescript_explicit_symbol_kind_is_checked_identically_in_batch_and_memo
         (
             26,
             (Resolution::Resolved, Constructor),
-            (Resolution::Resolved, Unknown),
+            (Resolution::Resolved, Dynamic),
         ),
         (
             17,
@@ -5498,8 +5498,8 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
         // #470's owner ruling: a resolved plain call to a free function is `Direct`, so the
         // graph follows it (no boundary), as it does `new Widget(3)`, which binds the class
         // constructor and is `Constructor` (#473: scip-typescript's unspecified kind defers to
-        // the native kind). The member call `w.run()` binds the method with `Unknown`
-        // dispatch, so it keeps a `dispatch` boundary.
+        // the native kind). The member call `w.run()` binds the method with `Dynamic`
+        // dispatch (#557), so it keeps a `dispatch` boundary that shows the declaration.
         let resolved = |name: &str, dispatch: &str, boundary, target: &str| {
             (
                 name.to_owned(),
@@ -5519,7 +5519,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
                 followed("plain", "plain"),
                 followed("plain", "plain"),
                 followed("register", "register"),
-                resolved("run", "Unknown", BoundaryReason::Dispatch, "run"),
+                resolved("run", "Dynamic", BoundaryReason::Dispatch, "run"),
             ]
         );
         for binding in &view.semantic.bindings {
@@ -5656,7 +5656,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
         assert_eq!(widget["binding"]["dispatch"], "constructor", "{widget}");
         assert_eq!(widget["boundaryReason"], "none", "{widget}");
         assert_eq!(widget["targetId"], ids["constructor"], "{widget}");
-        assert_eq!(run["binding"]["dispatch"], "unknown", "{run}");
+        assert_eq!(run["binding"]["dispatch"], "dynamic", "{run}");
         let unbound = calls.iter().find(|c| c["calleeText"] == "method").unwrap();
         assert_eq!(unbound["binding"], Value::Null);
         assert_eq!(unbound["boundaryReason"], "missingEvidence");
@@ -5928,6 +5928,10 @@ fn rust_analyzer_world() -> World {
 }
 
 fn rust_analyzer_artifact(world: &World) -> Vec<u8> {
+    rust_analyzer_artifact_of(world, RUST_ANALYZER)
+}
+
+fn rust_analyzer_artifact_of(world: &World, fixture: &str) -> Vec<u8> {
     let mut index = scip::types::Index::new();
     let mut metadata = scip::types::Metadata::new();
     metadata.project_root = format!("file://{}", world.root.display());
@@ -5938,7 +5942,7 @@ fn rust_analyzer_artifact(world: &World) -> Vec<u8> {
     metadata.tool_info = Some(tool).into();
     index.metadata = Some(metadata).into();
     let mut bytes = index.write_to_bytes().unwrap();
-    bytes.extend(fs::read(Path::new(RUST_ANALYZER).join("documents.scip")).unwrap());
+    bytes.extend(fs::read(Path::new(fixture).join("documents.scip")).unwrap());
     bytes
 }
 
@@ -6044,19 +6048,18 @@ fn real_rust_analyzer_artifact_imports_and_its_enclosing_range_references_bind_c
     // Before #394 none of the three bound a call. The recursive `spin(value)` carries its own
     // definition's range, which encloses the reference but joins no invocation: under owner
     // ruling 4 (2026-10-30, #394) that range is absent and the exact callee span binds it.
-    // Dispatch (owner ruling 2026-10-30, #470): plain and path calls of free functions are
-    // direct; the method call `counter.add(..)` and unresolved or external calls are unknown.
+    // Dispatch (owner rulings 2026-10-30, #470, and 2026-10-31, #557): plain and path calls of
+    // free functions are direct, and so are the inherent `counter.add(..)` and `Counter::new()`.
+    // External calls are unknown.
     let call = |path: &str, callee: &str, resolution: &str, dispatch: &str| {
         [path, callee, resolution, dispatch].map(str::to_owned)
     };
     assert_eq!(
         rust_calls(&world, &staged.call_bindings),
         [
-            call("src/lib.rs", "add", "Resolved", "Unknown"),
+            call("src/lib.rs", "add", "Resolved", "Direct"),
             call("src/lib.rs", "double", "Resolved", "Direct"),
-            // rust-analyzer's associated-function kind does not bind the measured method
-            // declaration, so `Counter::new()` binds its call but resolves no target.
-            call("src/lib.rs", "new", "Unresolved", "Unknown"),
+            call("src/lib.rs", "new", "Resolved", "Direct"),
             call("src/lib.rs", "saturating", "Resolved", "Direct"),
             call("src/util.rs", "saturating", "Resolved", "Direct"),
             call("src/util.rs", "saturating_add", "External", "Unknown"),
@@ -6085,10 +6088,11 @@ fn real_rust_analyzer_artifact_imports_and_its_enclosing_range_references_bind_c
     );
 }
 
-/// Owner ruling 2026-10-30 (#470) through the #40 call graph and the sequence view, on the real
-/// rust-analyzer fixture: `run` -> `util::double` -> `saturating` are direct path and plain
-/// calls of free functions, so the graph expands into them under the depth and node bounds,
-/// while `counter.add(..)` stays a dispatch boundary and `Counter::new()` an unresolved one.
+/// Owner rulings 2026-10-30 (#470) and 2026-10-31 (#557) through the #40 call graph and the
+/// sequence view, on the real rust-analyzer fixture: `run` -> `util::double` -> `saturating`
+/// are direct path and plain calls of free functions and `Counter::new()` and
+/// `counter.add(..)` are direct inherent calls, so the graph expands into them under the depth
+/// and node bounds.
 #[test]
 fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
     use trellis::graph_query::{BoundaryReason, FrontierReason, GraphQuery, Visit};
@@ -6116,6 +6120,16 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
         found[0].syntax_id.clone()
     };
     let (run, double, saturating) = (id_of("run"), id_of("double"), id_of("saturating"));
+    let method_of = |name: &str| {
+        native
+            .declarations
+            .iter()
+            .find(|d| d.name.as_deref() == Some(name) && d.kind == "method")
+            .unwrap()
+            .syntax_id
+            .clone()
+    };
+    let (new, add) = (method_of("new"), method_of("add"));
     let graph = |depth: u64, max_nodes: u64| {
         world
             .store
@@ -6145,32 +6159,36 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
             .map(|n| (n.declaration.syntax_id.clone(), n.depth))
             .collect::<Vec<_>>()
     };
-    let edge = |result: &trellis::graph_query::GraphResult, callee: &str| {
+    let edge = |result: &trellis::graph_query::GraphResult, from: &str, callee: &str| {
         let found: Vec<_> = result
             .edges
             .iter()
-            .filter(|e| e.call.spelling.as_deref() == Some(callee))
+            .filter(|e| e.from == from && e.call.spelling.as_deref() == Some(callee))
             .cloned()
             .collect();
         assert_eq!(found.len(), 1, "{callee}");
         found.into_iter().next().unwrap()
     };
 
-    // Depth 2 follows the direct edge into `double`, then `double`'s into `saturating`.
+    // Depth 2 follows the direct edges into `new`, `add` and `double`, then into `saturating`.
     let deep = graph(2, 150);
     assert_eq!(
         nodes(&deep),
         [
             (run.clone(), 0),
+            (new.clone(), 1),
+            (add.clone(), 1),
             (double.clone(), 1),
             (saturating.clone(), 2)
         ]
     );
     for (callee, from, to) in [
+        ("new", &run, &new),
+        ("add", &run, &add),
         ("double", &run, &double),
-        ("saturating", &double, &saturating),
+        ("saturating", &add, &saturating),
     ] {
-        let e = edge(&deep, callee);
+        let e = edge(&deep, from, callee);
         assert_eq!(
             (e.visit, e.boundary_reason),
             (Visit::New, BoundaryReason::None)
@@ -6182,18 +6200,6 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
             trellis::semantic_evidence::Dispatch::Direct
         );
     }
-    for (callee, reason) in [
-        ("add", BoundaryReason::Dispatch),
-        ("new", BoundaryReason::Unresolved),
-    ] {
-        let e = edge(&deep, callee);
-        assert_eq!(
-            (e.visit, e.boundary_reason),
-            (Visit::Boundary, reason),
-            "{callee}"
-        );
-        assert_eq!(e.to, None);
-    }
     // The depth bound stops at `saturating`: its own call is depth frontier, not expanded.
     assert!(
         deep.frontier
@@ -6202,9 +6208,17 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
     );
     assert!(deep.edges.iter().all(|e| e.from != saturating));
 
-    // Depth 1 admits `double` and leaves its call on the depth frontier.
+    // Depth 1 admits `run`'s callees and leaves `double`'s call on the depth frontier.
     let shallow = graph(1, 150);
-    assert_eq!(nodes(&shallow), [(run.clone(), 0), (double.clone(), 1)]);
+    assert_eq!(
+        nodes(&shallow),
+        [
+            (run.clone(), 0),
+            (new.clone(), 1),
+            (add.clone(), 1),
+            (double.clone(), 1)
+        ]
+    );
     assert!(
         shallow
             .frontier
@@ -6213,11 +6227,11 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
     );
     assert!(shallow.edges.iter().all(|e| e.from == run));
 
-    // The node bound holds: with room for two nodes the direct call into `saturating` is a
+    // The node bound holds: with room for two nodes the direct call into `double` is a
     // node-limit boundary and the result is partial.
     let bounded = graph(2, 2);
-    assert_eq!(nodes(&bounded), [(run.clone(), 0), (double.clone(), 1)]);
-    let e = edge(&bounded, "saturating");
+    assert_eq!(nodes(&bounded), [(run.clone(), 0), (new.clone(), 1)]);
+    let e = edge(&bounded, &run, "double");
     assert_eq!(
         (e.visit, e.boundary_reason, e.to),
         (Visit::Boundary, BoundaryReason::NodeLimit, None)
@@ -6235,15 +6249,18 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
             })
             .collect()
     }
-    let find = |view: &trellis::behavior::SequenceView, label: &str| {
-        let found: Vec<_> = steps(&view.steps)
+    let find_all = |view: &trellis::behavior::SequenceView, label: &str| -> Vec<_> {
+        steps(&view.steps)
             .into_iter()
             .filter(|s| {
                 s.call_evidence.is_some()
                     && (s.label == label || s.label.ends_with(&format!("::{label}")))
             })
             .cloned()
-            .collect();
+            .collect()
+    };
+    let find = |view: &trellis::behavior::SequenceView, label: &str| {
+        let found = find_all(view, label);
         assert_eq!(found.len(), 1, "{label}");
         found.into_iter().next().unwrap()
     };
@@ -6258,11 +6275,11 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
         evidence("double"),
         (Some(double.clone()), BoundaryReason::None)
     );
-    assert_eq!(evidence("add"), (None, BoundaryReason::Dispatch));
-    assert_eq!(evidence("new"), (None, BoundaryReason::Unresolved));
+    assert_eq!(evidence("add"), (Some(add.clone()), BoundaryReason::None));
+    assert_eq!(evidence("new"), (Some(new.clone()), BoundaryReason::None));
 
     // #522: participants come from the resolved targets, and each direct callee's own
-    // body is expanded beneath its call on the callee's lane: `run` -> `double` ->
+    // body is expanded beneath its call on the callee's lane: `run` -> `add` ->
     // `saturating`, whose `saturating_add` is a standard-library call and so incidental.
     assert_eq!(
         view.semantic.tier,
@@ -6273,18 +6290,24 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
         Some(producer.as_str())
     );
     let lanes: Vec<_> = view.participants.iter().map(|p| p.id.clone()).collect();
-    assert_eq!(lanes, [run.clone(), double.clone(), saturating.clone()]);
-    let into_double = find(&view, "double");
-    assert!(into_double.lane.is_none());
-    let into_saturating = find(&view, "saturating");
-    assert_eq!(into_saturating.lane.as_deref(), Some(double.as_str()));
-    assert_eq!(into_saturating.target.as_deref(), Some(saturating.as_str()));
-    assert!(
-        into_double
-            .children
-            .iter()
-            .any(|s| s.id == into_saturating.id)
+    assert_eq!(
+        lanes,
+        [
+            run.clone(),
+            new.clone(),
+            add.clone(),
+            saturating.clone(),
+            double.clone()
+        ]
     );
+    let into_add = find(&view, "add");
+    assert!(into_add.lane.is_none());
+    let into_saturating = find_all(&view, "saturating")
+        .into_iter()
+        .find(|s| s.lane.as_deref() == Some(add.as_str()))
+        .unwrap();
+    assert_eq!(into_saturating.target.as_deref(), Some(saturating.as_str()));
+    assert!(into_add.children.iter().any(|s| s.id == into_saturating.id));
     let std_call = find(&view, "saturating_add");
     assert_eq!(std_call.lane.as_deref(), Some(saturating.as_str()));
     let std_evidence = std_call.call_evidence.as_ref().unwrap();
@@ -6309,6 +6332,328 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
     let call = find(&recursive, "spin");
     assert_eq!(call.target.as_deref(), Some(spin.as_str()));
     assert!(call.children.is_empty());
+}
+
+// Real rust-analyzer 1.98.1 output for `tests/fixtures/scip-rust-analyzer-dispatch/workspace`,
+// Metadata unit dropped as for `RUST_ANALYZER`: inherent, trait and trait-impl methods, a
+// trait object, a type parameter and a macro argument (#557).
+const RUST_ANALYZER_DISPATCH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/scip-rust-analyzer-dispatch"
+);
+
+fn rust_dispatch_batch(world: &World) -> (PathBuf, String) {
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let docs = fixture.paths("rust");
+    assert_eq!(docs.len(), 2);
+    let ordinal = fixture.artifact("rust", docs);
+    fixture.override_artifact_raw(
+        ordinal,
+        rust_analyzer_artifact_of(world, RUST_ANALYZER_DISPATCH),
+    );
+    world.write(&fixture)
+}
+
+fn dispatch_declaration(world: &World, name: &str, ancestor: Option<&str>) -> String {
+    let (_, native, _) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let found: Vec<_> = native
+        .declarations
+        .iter()
+        .filter(|d| {
+            d.name.as_deref() == Some(name)
+                && ancestor.is_none_or(|ancestor| {
+                    d.ancestors.last().and_then(|a| a.name.as_deref()) == Some(ancestor)
+                })
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "{name}");
+    found[0].syntax_id.clone()
+}
+
+/// Owner ruling 2026-10-31 (#557) on real rust-analyzer bytes, identically in the staged and
+/// in-memory joins. Inherent calls are direct, including through `self.m()`, `Type::f()` and
+/// `assert!`; a trait object's and a type parameter's calls name the trait's declaration and
+/// are dynamic; the statically selected trait impl stays unknown.
+#[test]
+fn real_rust_analyzer_dispatch_follows_the_measured_method_parent() {
+    let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_DISPATCH).join("workspace"), root));
+    let descriptor = rust_dispatch_batch(&world);
+    let staged = rust_analyzer_publications(
+        &world,
+        &descriptor,
+        &BatchLimits::PRODUCTION,
+        "rust dispatch",
+    );
+    let calls = rust_calls(&world, &staged.call_bindings);
+    let dispatch = |path: &str, callee: &str| -> Vec<String> {
+        calls
+            .iter()
+            .filter(|call| call[0] == path && call[1] == callee)
+            .map(|call| format!("{} {}", call[2], call[3]))
+            .collect()
+    };
+    let (lib, shapes) = ("src/lib.rs", "src/shapes.rs");
+    assert_eq!(dispatch(lib, "new"), ["Resolved Direct"]);
+    // One through `assert!`, one plain.
+    assert_eq!(
+        dispatch(lib, "navigation_at"),
+        ["Resolved Direct", "Resolved Direct"]
+    );
+    assert_eq!(dispatch(shapes, "navigation_in"), ["Resolved Direct"]);
+    assert_eq!(dispatch(lib, "total"), ["Resolved Direct"]);
+    // `shape.area()` on the trait object and `square.area()` on the concrete type.
+    assert_eq!(
+        dispatch(lib, "area"),
+        ["Resolved Dynamic", "Resolved Unknown"]
+    );
+    assert_eq!(dispatch(lib, "twice"), ["Resolved Dynamic"]);
+    assert_eq!(dispatch(shapes, "area"), ["Resolved Dynamic"]);
+}
+
+/// #557: call graph and Sequence expand through `navigation_at -> navigation_in`-shaped
+/// inherent calls. A dynamic call shows the trait's declaration, marked dynamic, and neither
+/// expands through it nor fans out to the implementation.
+#[test]
+fn real_rust_analyzer_inherent_calls_expand_and_trait_calls_stay_boundaries() {
+    use trellis::graph_query::{BoundaryReason, GraphQuery, Visit};
+    use trellis::semantic_evidence::Dispatch;
+    let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_DISPATCH).join("workspace"), root));
+    let (pin, admitted, _) = world.publish(&rust_dispatch_batch(&world)).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(pin).unwrap().producers[0]
+        .id
+        .clone();
+    let id = |name: &str| dispatch_declaration(&world, name, None);
+    let graph = |root: &str| {
+        world
+            .store
+            .evidence_response()
+            .unwrap()
+            .graph_query(
+                &GraphQuery {
+                    root_syntax_id: root.to_owned(),
+                    semantic_producer_id: Some(producer.clone()),
+                    depth: 2,
+                    max_nodes: 150,
+                    max_calls: 500,
+                    include_external: true,
+                    include_tests: true,
+                },
+                None,
+                &mut || Ok(()),
+            )
+            .unwrap()
+            .outcome
+            .expect("contract success")
+    };
+    let nodes = |result: &trellis::graph_query::GraphResult| {
+        result
+            .nodes
+            .iter()
+            .map(|n| (n.declaration.syntax_id.clone(), n.depth))
+            .collect::<Vec<_>>()
+    };
+    let (at, inner, scaled) = (id("navigation_at"), id("navigation_in"), id("scaled"));
+    let deep = graph(&at);
+    assert_eq!(
+        nodes(&deep),
+        [(at.clone(), 0), (inner.clone(), 1), (scaled.clone(), 2)]
+    );
+
+    // The trait's bodiless `area`: the only `area` whose parent is named.
+    let declared = dispatch_declaration(&world, "area", Some("Shape"));
+    let twice = id("twice");
+    let total = id("total");
+    let result = graph(&total);
+    assert_eq!(nodes(&result), [(total.clone(), 0), (declared.clone(), 1)]);
+    assert_eq!(result.edges.len(), 1);
+    let edge = &result.edges[0];
+    assert_eq!(edge.to.as_deref(), Some(declared.as_str()));
+    assert_eq!(
+        (edge.visit, edge.boundary_reason),
+        (Visit::Boundary, BoundaryReason::Dispatch)
+    );
+    assert_eq!(edge.binding.as_ref().unwrap().dispatch, Dispatch::Dynamic);
+    assert!(result.partial);
+
+    // A provided method has a body, and the declaration still is not expanded through.
+    let generic = id("generic");
+    let result = graph(&generic);
+    assert_eq!(nodes(&result), [(generic.clone(), 0), (twice.clone(), 1)]);
+    assert!(result.edges.iter().all(|e| e.from == generic));
+
+    // Sequence expands through `self.navigation_in(..)`, and the boundary names the
+    // declaration in its evidence, with no lane and no expansion.
+    let view = world.store.sequence_at(&at, pin, false).unwrap().unwrap();
+    let lanes: Vec<_> = view.participants.iter().map(|p| p.id.clone()).collect();
+    assert_eq!(lanes, [at.clone(), inner.clone(), scaled.clone()]);
+    let view = world
+        .store
+        .sequence_at(&total, pin, false)
+        .unwrap()
+        .unwrap();
+    let lanes: Vec<_> = view.participants.iter().map(|p| p.id.clone()).collect();
+    assert_eq!(lanes, std::slice::from_ref(&total));
+    let step = view
+        .steps
+        .iter()
+        .find(|s| s.call_evidence.is_some())
+        .unwrap();
+    assert_eq!(step.target, None);
+    assert!(step.children.is_empty());
+    let evidence = step.call_evidence.as_ref().unwrap();
+    assert_eq!(evidence.boundary_reason, BoundaryReason::Dispatch);
+    assert_eq!(evidence.dispatch, Some(Dispatch::Dynamic));
+    let target = evidence.dispatch_target.as_ref().unwrap();
+    assert_eq!(target.id, declared);
+    assert_eq!(target.name.as_deref(), Some("area"));
+    assert_eq!(target.path, "src/shapes.rs");
+}
+
+/// #557: rejoin keeps the #470 rule, except that a method's `direct` needs a destination
+/// classification: its `impl`'s bases and its modifiers are outside its syntax ID. An edit of
+/// the target's document keeps the unchanged caller's free-function `direct` and trait
+/// `dynamic`, and drops an inherent `direct` until the next import, whether or not the impl
+/// gained a trait. A target that is gone leaves no classified call.
+#[test]
+fn rejoin_keeps_inherent_and_trait_dispatch_only_for_the_same_declaration() {
+    let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_DISPATCH).join("workspace"), root));
+    let (_, admitted, _) = world.publish(&rust_dispatch_batch(&world)).unwrap();
+    drop(admitted);
+    let lib_calls = |world: &World| {
+        let head = world.store.index_baseline().unwrap();
+        rust_calls(world, &world.store.semantic_at(head).unwrap().call_bindings)
+            .into_iter()
+            .filter(|call| call[0] == "src/lib.rs")
+            .collect::<Vec<_>>()
+    };
+    let before = lib_calls(&world);
+    let shapes = fs::read_to_string(world.root.join("src/shapes.rs")).unwrap();
+
+    write_files(
+        &world.root,
+        &[("src/shapes.rs", &format!("{shapes}// edited\n"))],
+    );
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    let expected: Vec<_> = before
+        .iter()
+        .cloned()
+        .map(|mut call| {
+            if ["new", "navigation_at"].contains(&call[1].as_str()) {
+                call[3] = "Unknown".to_owned();
+            }
+            call
+        })
+        .collect();
+    assert_eq!(lib_calls(&world), expected);
+
+    // The impl gains a trait under the same method IDs: nothing keeps calling it direct.
+    write_files(
+        &world.root,
+        &[(
+            "src/shapes.rs",
+            &shapes.replace("impl Square {", "pub trait Nav {}\nimpl Nav for Square {"),
+        )],
+    );
+    world.republish_with_rejoin();
+    assert_eq!(lib_calls(&world), expected);
+
+    // The renamed method's declaration is gone, so the caller's call to it keeps no target.
+    write_files(
+        &world.root,
+        &[(
+            "src/shapes.rs",
+            &shapes.replace("navigation_at", "navigation_renamed"),
+        )],
+    );
+    world.republish_with_rejoin();
+    assert!(
+        lib_calls(&world)
+            .iter()
+            .filter(|call| call[1] == "navigation_at")
+            .all(|call| call[3] == "Unknown")
+    );
+    assert!(lib_calls(&world).contains(&[
+        "src/lib.rs".to_owned(),
+        "total".to_owned(),
+        "Resolved".to_owned(),
+        "Direct".to_owned()
+    ]));
+}
+
+/// #557: a witnessed LOCAL rejoin takes the same rule as a full one. Its reused rows are no
+/// destination classification of a target in the edited document, so the method's `direct`
+/// drops while the free function's holds.
+#[test]
+fn witnessed_local_rejoin_does_not_keep_a_method_direct_in_an_edited_document() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+            ],
+        )
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g) = (symbol("r()."), symbol("impl#[S]f()."), symbol("g()."));
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 15, 16], &[], &f, 0)
+                .occurrence(&[0, 20, 21], &[], &g, 0)
+                .symbol(&r, 17, &[]),
+            DocSpec::new("src/b.rs")
+                .occurrence(&[1, 12, 13], &[], &f, 1)
+                .occurrence(&[2, 3, 4], &[], &g, 1)
+                .symbol(&f, 26, &[])
+                .symbol(&g, 17, &[]),
+        ],
+    );
+    let descriptor = world.write(&fixture);
+    drop(world.publish(&descriptor).unwrap());
+    let calls = |world: &World| {
+        let head = world.store.index_baseline().unwrap();
+        rust_calls(world, &world.store.semantic_at(head).unwrap().call_bindings)
+    };
+    let call = |callee: &str, dispatch: &str| {
+        ["src/a.rs", callee, "Resolved", dispatch].map(str::to_owned)
+    };
+    assert_eq!(calls(&world), [call("f", "Direct"), call("g", "Direct")]);
+
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    write_files(
+        &world.root,
+        &[(
+            "src/b.rs",
+            "struct S;\nimpl T for S { fn f(&self) { } }\nfn g() { }\n",
+        )],
+    );
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(calls(&world), [call("f", "Unknown"), call("g", "Direct")]);
 }
 
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the
@@ -7241,7 +7586,12 @@ async fn each_language_selects_its_own_published_producer() {
     assert_eq!(view.semantic.producer_id.as_deref(), Some("rust-analyzer"));
     assert_eq!(view.semantic.note, None);
     let nodes: Vec<_> = view.nodes.iter().map(|n| n.id.clone()).collect();
-    assert_eq!(nodes, [run.clone(), double.clone(), saturating.clone()]);
+    let new = declaration_in(&world, "new", "src/lib.rs");
+    let add = declaration_in(&world, "add", "src/lib.rs");
+    assert_eq!(
+        nodes,
+        [run.clone(), new, add, double.clone(), saturating.clone()]
+    );
     assert!(
         view.nodes
             .iter()

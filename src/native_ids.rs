@@ -355,6 +355,17 @@ pub(crate) fn mint_stable(input: &Value) -> Result<Minted> {
     Ok(mint(STABLE_DOMAIN, input, Namespace::Syntax))
 }
 
+/// The syntax ID of `input`, without registering it: a declaration's ID from its identity
+/// input, as native extraction spelled it.
+pub(crate) fn syntax_id(input: &Value) -> Result<String> {
+    let minted = mint_stable(input)?;
+    Ok(format!(
+        "{}{}",
+        minted.key.0.prefix(),
+        hex::encode(minted.key.1)
+    ))
+}
+
 /// Validate and mint an occurrence ID without registering it.
 pub(crate) fn mint_occurrence(input: &Value) -> Result<Minted> {
     validate_occurrence(input)?;

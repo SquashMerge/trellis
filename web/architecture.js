@@ -53,8 +53,9 @@
     }
     return [...groups].sort(([a], [b]) => a.localeCompare(b));
   }
+  const BUILD_PHASES = {reading:"reading indexed files", resolving:"resolving references", evaluating:"evaluating rules", measuring:"measuring code"};
   function create({request, context, readSource, openTreemap, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}}) {
-    let serial = 0, renderSerial = 0, selectionSerial = 0, reviewSerial = 0, view = null, basis = null;
+    let serial = 0, renderSerial = 0, selectionSerial = 0, reviewSerial = 0, view = null, basis = null, buildingTimer = null, buildingWake = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
     const callables = () => role === "all" ? "indexed callables" : "production callables";
@@ -84,6 +85,7 @@
       if (!keepDraft) { draft = null; get("architecture-review-panel").hidden = true; get("architecture-editor").hidden = true; }
       get("architecture-preview-result").hidden = true;
       serial++; renderSerial++; clearInspection(); view = null; basis = null;
+      clearTimeout(buildingTimer); buildingWake?.(); buildingTimer = buildingWake = null;
       get("architecture-diagram").replaceChildren(); get("architecture-diagram").setAttribute("aria-busy", "false");
       get("architecture-legend").replaceChildren(); get("architecture-notice-content").replaceChildren();
       get("architecture-notices").open = false;
@@ -95,6 +97,7 @@
       if (!payload || !window.TrellisIndexPin.equal(payload, c.pin)) {
         const error = new Error("Architecture snapshot changed. Refresh status."); error.code = "revision_conflict"; error.status = 409; throw error;
       }
+      if (payload.state === "building") return payload;
       if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || payload.aggregate !== c.aggregate || payload.role !== c.role ||
           payload.workbench !== true || payload.metricsVersion !== "metrics:v1" ||
           !["syntax", "mixed"].includes(payload.evidenceTier) || payload.semanticComplete !== false ||
@@ -495,17 +498,38 @@
         return false;
       }
     }
+    // The daemon computes Architecture once per revision (#556). Until it has, a read answers
+    // `building` with progress. `refresh` asks again and settles only on the outcome, which
+    // the daemon answers as soon as it is done.
+    function buildingMessage(progress) {
+      const phase = BUILD_PHASES[progress?.phase] || "preparing";
+      const count = progress?.completed > 0 && progress?.total > 0 ? ` ${progress.completed} of ${progress.total}` : "";
+      return `Building Architecture for this revision: ${phase}${count}…`;
+    }
     async function refresh(options = {}) {
       reset(undefined, options.keepDraft === true);
       const c = capture();
       if (!c.rootKey || !c.pin) { state("Choose an indexed checkout, then open Architecture.", "empty"); return; }
       loadDisplay(c.rootKey);
       state("Reading indexed architecture and reviewed rules…", "loading"); get("architecture-diagram").setAttribute("aria-busy", "true");
+      return read(c, options);
+    }
+    function pause(delay) {
+      return new Promise(resolve => { buildingWake = resolve; buildingTimer = setTimeout(resolve, delay); });
+    }
+    async function read(c, options) {
       try {
         const query = new URLSearchParams({aggregate:c.aggregate, role:c.role, workbench:"true", indexGeneration:c.pin.indexGeneration, indexRevision:String(c.pin.indexRevision)});
-        const data = await request(`/api/architecture?${query}`, () => current(c));
-        if (!current(c)) return;
-        const payload = payloadOf(data, c);
+        let data, payload;
+        for (;;) {
+          data = await request(`/api/architecture?${query}`, () => current(c));
+          if (!current(c)) return;
+          payload = payloadOf(data, c);
+          if (payload.state !== "building") break;
+          state(buildingMessage(payload.progress), "loading");
+          await pause(Number.isSafeInteger(payload.retryAfterMs) && payload.retryAfterMs > 0 ? payload.retryAfterMs : 250);
+          if (!current(c)) return;
+        }
         if (payload.state === "missing_rules") {
           state("No reviewed rules file. Create or review .trellis/rules.toml. The trellis_propose_layers MCP prompt can help propose layers; this browser does not call it.", "empty"); return;
         }

@@ -220,6 +220,9 @@
   function targetText(step, view) {
     const target = window.TrellisSequence?.target(view, step);
     if (target) return `Resolved declaration · ${target.declaration.name} · ${location(target.declaration)}`;
+    // A dynamic call names a declaration, not a runtime body (#557).
+    const declared = step?.callEvidence?.dispatchTarget;
+    if (declared) return `${step.callEvidence.dispatch} dispatch · declaration ${declared.name || declared.kind} · ${declared.path}`;
     return step?.callEvidence ? window.TrellisSequence.evidenceLabel(step, view) : "Terminal syntax only · no verified target";
   }
   function sourceWitness(item) {

@@ -1,6 +1,6 @@
 //! In-memory checkout admission. Retained entries never own checkout resources.
 use crate::http::RuntimePhase;
-use crate::model::MAX_ACTIVE_CHECKOUTS;
+use crate::model::{IndexPin, MAX_ACTIVE_CHECKOUTS};
 use crate::store::{
     Store,
     topology::{TopologyRoots, WorkspaceIdentity},
@@ -1645,6 +1645,27 @@ pub struct MetricsResponseHooks<'a> {
     pub on_progress: &'a mut (dyn FnMut() + Send),
 }
 
+/// How an Architecture read that waits for the owner depends on the rules file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArchitectureRules {
+    Unused,
+    /// It needs this file's rule rows.
+    Evaluated,
+    /// A summary: it needs them only if the file has layers.
+    Layers,
+}
+
+/// What one Architecture read uses from a core.
+#[derive(Clone, Copy)]
+struct CoreNeeds {
+    /// The core must have evaluated the read's rules file.
+    rules: bool,
+    /// A core computed for this read alone also measures metrics.
+    metrics: bool,
+    /// An older retained pin is computed on the request.
+    compute_older_pin: bool,
+}
+
 pub struct CheckoutEvidence {
     response: crate::store::EvidenceResponse,
     /// Held against release until this evidence drops.
@@ -2414,8 +2435,20 @@ impl CheckoutRuntime {
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
     ) -> anyhow::Result<(Vec<u8>, bool)> {
+        // A running build makes these rows anyway; a narrow read does not wait for it.
+        if matches!(options.scope.as_str(), "revision" | "directory") {
+            self.await_architecture_metrics(options.pin, check);
+        }
         self.projected_response(check, hooks, max_bytes, |response, check| {
-            response.metrics_at(options, &mut || check())
+            options.validate()?;
+            let pin = response.selected_pin(options.pin)?;
+            let core = self.resources()?.scheduler.architecture_core_if_available(
+                pin,
+                Duration::ZERO,
+                &mut || Ok(()),
+            );
+            let prepared = core.as_ref().and_then(|core| core.metrics_if_computed());
+            response.metrics_at_prepared(options, prepared, &mut || check())
         })
     }
 
@@ -2494,6 +2527,8 @@ impl CheckoutRuntime {
             resources.store.verify_root()?;
             response.finish(())
         })?;
+        // The next summary needs this file's core: start it now.
+        resources.scheduler.architecture_hint();
         let bytes = if outcome == "committed" {
             committed_bytes
         } else {
@@ -2509,9 +2544,210 @@ impl CheckoutRuntime {
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
     ) -> anyhow::Result<(Vec<u8>, bool)> {
+        if options.validate().is_ok() {
+            let wait = self.resources()?.scheduler.architecture_browser_wait();
+            self.await_architecture(options.pin, ArchitectureRules::Layers, true, wait, check);
+        }
         self.projected_response(check, hooks, max_bytes, |response, check| {
-            response.architecture_view(options, &mut || check())
+            options.validate()?;
+            check()?;
+            let resources = self.resources()?;
+            let root = Path::new(resources.store.workspace_root());
+            let config = crate::rules::load(root)?;
+            use crate::store::ArchitectureSummary;
+            let view = response.architecture_view_head(options, config.as_ref())?;
+            let pin = match &view {
+                crate::store::ArchitectureView::Ready { pin, .. } => *pin,
+                crate::store::ArchitectureView::Done(payload) => {
+                    return Ok(ArchitectureSummary(Arc::new(payload.clone())));
+                }
+            };
+            let config = config.as_ref().expect("ready config");
+            let mut check = || check();
+            let core = self.architecture_core_for_read(
+                response,
+                pin,
+                Some(config),
+                CoreNeeds {
+                    rules: true,
+                    metrics: true,
+                    compute_older_pin: false,
+                },
+                &mut check,
+            )?;
+            response
+                .architecture_view_at(options, view, config, &core, &mut check)
+                .map(ArchitectureSummary)
         })
+    }
+
+    /// Wait for the owner before admitting a read. Waiting inside one would hold SQLite's
+    /// shared lock against the publication and the other readers. The read that follows
+    /// decides what to answer, so this needs no outcome and reports no failure.
+    fn await_architecture(
+        &self,
+        pin: Option<IndexPin>,
+        rules: ArchitectureRules,
+        older: bool,
+        wait: Duration,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+    ) {
+        let Ok(resources) = self.resources() else {
+            return;
+        };
+        let target = (|| {
+            let (response, _) = self.evidence_response()?;
+            let pin = response.selected_pin(pin)?;
+            let current = pin == response.selected_pin(None)?;
+            let root = Path::new(resources.store.workspace_root());
+            let config = if rules == ArchitectureRules::Unused {
+                None
+            } else {
+                crate::rules::load(root)?
+            };
+            response.finish((pin, current, config))
+        })();
+        let Ok((pin, current, config)) = target else {
+            return;
+        };
+        // An MCP or CLI read of an older revision computes it, in its admitted read.
+        if !current && !older {
+            return;
+        }
+        // A read of rules there are none of fails at once. So does a summary without layers.
+        if rules != ArchitectureRules::Unused && config.is_none()
+            || rules == ArchitectureRules::Layers
+                && config
+                    .as_ref()
+                    .is_some_and(|config| crate::rules::view_layers(config).is_empty())
+        {
+            return;
+        }
+        let hash = config.as_ref().map(|config| config.content_hash.as_str());
+        if !current {
+            resources.scheduler.architecture_request_older(pin, hash);
+        }
+        resources
+            .scheduler
+            .architecture_wait(pin, hash, wait, check);
+    }
+
+    fn await_architecture_metrics(
+        &self,
+        pin: Option<IndexPin>,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+    ) {
+        let Ok(resources) = self.resources() else {
+            return;
+        };
+        let target = (|| {
+            let (response, _) = self.evidence_response()?;
+            let pin = response.selected_pin(pin)?;
+            response.finish(pin)
+        })();
+        if let Ok(pin) = target {
+            resources.scheduler.architecture_core_if_available(
+                pin,
+                crate::http::architecture::METRICS_WAIT,
+                check,
+            );
+        }
+    }
+
+    /// Before an MCP or CLI architecture read: wait at most `wait` for the owner.
+    pub fn await_architecture_tool(
+        &self,
+        kind: &str,
+        arguments: &serde_json::Value,
+        wait: Duration,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+    ) {
+        if let Ok(parsed) = crate::store::EvidenceResponse::architecture_arguments(kind, arguments)
+        {
+            let rules = if matches!(kind, "check" | "explain") {
+                ArchitectureRules::Evaluated
+            } else {
+                ArchitectureRules::Unused
+            };
+            self.await_architecture(parsed.pin(), rules, false, wait, check);
+        }
+    }
+
+    /// One read's core. The owner computes the head's once, and an admitted read does not
+    /// wait for it. An older retained pin keeps the page's reads with the owner too, which
+    /// builds it after the head; a tool read computes it, which is rare.
+    fn architecture_core_for_read(
+        &self,
+        response: &CheckoutEvidence,
+        pin: IndexPin,
+        config: Option<&crate::rules::Config>,
+        needs: CoreNeeds,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+    ) -> anyhow::Result<Arc<crate::store::ArchitectureCore>> {
+        let hash = config
+            .filter(|_| needs.rules)
+            .map(|config| config.content_hash.as_str());
+        let scheduler = self.resources()?.scheduler.clone();
+        if pin == response.selected_pin(None)? {
+            return scheduler.architecture_core(pin, hash, Duration::ZERO, check);
+        }
+        if let Some(core) =
+            scheduler.architecture_core_if_available(pin, Duration::ZERO, &mut || Ok(()))
+            && hash.is_none_or(|hash| core.rules_hash() == Some(hash))
+        {
+            return Ok(core);
+        }
+        if !needs.compute_older_pin {
+            scheduler.architecture_request_older(pin, hash);
+            return scheduler.architecture_core(pin, hash, Duration::ZERO, check);
+        }
+        response
+            .architecture_core_at(pin, config, needs.metrics, check, &|_| {})
+            .map(Arc::new)
+    }
+
+    /// An MCP or CLI architecture operation in this admitted read.
+    pub fn architecture_tool(
+        &self,
+        response: &CheckoutEvidence,
+        kind: &str,
+        arguments: &serde_json::Value,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+    ) -> anyhow::Result<serde_json::Value> {
+        let parsed = crate::store::EvidenceResponse::architecture_arguments(kind, arguments)?;
+        check()?;
+        let config = response.architecture_config(kind)?;
+        let pin = response.selected_pin(parsed.pin())?;
+        let needs = CoreNeeds {
+            rules: matches!(kind, "check" | "explain"),
+            metrics: false,
+            compute_older_pin: true,
+        };
+        let answer = self
+            .architecture_core_for_read(response, pin, config.as_ref(), needs, check)
+            .and_then(|core| {
+                response.architecture_response_at(
+                    kind,
+                    arguments,
+                    &parsed,
+                    config.as_ref(),
+                    &core,
+                    check,
+                )
+            });
+        match answer {
+            // The revision is over a whole-revision budget. A narrow read may not be.
+            Err(error) if parsed.scoped() && error.to_string().starts_with("bounded_work") => {
+                response.architecture_response_scoped(
+                    kind,
+                    arguments,
+                    &parsed,
+                    config.as_ref(),
+                    check,
+                )
+            }
+            answer => answer,
+        }
     }
 
     /// One paged Architecture detail read, bounded like the summary.
@@ -2522,8 +2758,30 @@ impl CheckoutRuntime {
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
     ) -> anyhow::Result<(Vec<u8>, bool)> {
+        let wait = self.resources()?.scheduler.architecture_browser_wait();
+        self.await_architecture(
+            Some(query.pin),
+            ArchitectureRules::Evaluated,
+            true,
+            wait,
+            check,
+        );
         self.projected_response(check, hooks, max_bytes, |response, check| {
-            response.architecture_details(query, &mut || check())
+            check()?;
+            let config = response.architecture_details_config(query)?;
+            let mut check = || check();
+            let core = self.architecture_core_for_read(
+                response,
+                query.pin,
+                Some(&config),
+                CoreNeeds {
+                    rules: true,
+                    metrics: false,
+                    compute_older_pin: false,
+                },
+                &mut check,
+            )?;
+            response.architecture_details_at(query, &config, &core, &mut check)
         })
     }
 

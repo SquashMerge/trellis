@@ -170,6 +170,19 @@ pub struct CallEvidence {
     /// The captured basis of the selected binding's provenance (#522), as MCP reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_basis: Option<crate::semantic_evidence::SemanticBasis>,
+    /// A `dispatch` boundary's exact declaration (#557): the trait, interface or prototype
+    /// method the binding names, not a runtime body. It takes no lane and never expands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_target: Option<DispatchTarget>,
+}
+/// The declaration a dynamic call names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchTarget {
+    pub id: String,
+    pub name: Option<String>,
+    pub kind: String,
+    pub path: String,
 }
 /// The `<manager> <name> <version>` package of a global SCIP symbol.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

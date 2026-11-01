@@ -274,7 +274,7 @@ function specimen({ state = "complete", old = false, changed = false } = {}) {
     call: pair.call,
     callSiteCount: 1,
     from: sid(from),
-    to: reason === "none" ? to : null,
+    to: ["none", "dispatch"].includes(reason) ? to : null,
     binding,
     visit: reason === "none" ? visit : "boundary",
     boundaryReason: reason,
@@ -433,7 +433,10 @@ test("eight hand-authored priority, cycle, diamond, callback, depth, node and ca
         possibleDispatch: [2],
       }),
       stale = s.add(1, 2, { staleTarget: true });
+    // The dispatch boundary admits its declaration, never expanded; a stale one does not (#557).
     const e = s.authored({
+      names: ["A", "B"],
+      depths: [0, 1],
       edges: [
         s.edge(dispatch, 1, { reason: "dispatch" }),
         s.edge(stale, 1, { reason: "stale" }),
@@ -450,6 +453,29 @@ test("eight hand-authored priority, cycle, diamond, callback, depth, node and ca
     });
     assert.equal(verify(s, e), true);
   }
+});
+
+test("a dispatch boundary does not shorten a traversed depth (#557)", () => {
+  const s = specimen();
+  const boundary = s.add(1, 2, { dispatch: "dynamic" }),
+    c = s.add(1, 3),
+    b = s.add(3, 2);
+  const e = s.authored({
+    names: ["A", "C", "B"],
+    depths: [0, 1, 2],
+    edges: [
+      s.edge(c, 1),
+      s.edge(b, 3),
+      s.edge(boundary, 1, { reason: "dispatch" }),
+    ],
+    proofIds: [
+      boundary.binding.provenanceId,
+      c.binding.provenanceId,
+      b.binding.provenanceId,
+    ],
+    partial: true,
+  });
+  assert.equal(verify(s, e), true);
 });
 
 test("typed request failures preserve pinned order and no fallback", () => {
