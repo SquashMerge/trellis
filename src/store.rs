@@ -6321,9 +6321,10 @@ const RAW_PROOF_RELEASE_SQL: &str = "SELECT p.rowid FROM semantic_raw_captures c
         WHERE v.capture_id=p.capture_id AND v.derived_from_provenance_id=p.proof_id)
     LIMIT 64";
 
-/// How long one maintenance unit keeps releasing chunks before it commits. Each chunk is
-/// bounded by rows, so a unit may overrun by one chunk; a waiting publisher still interrupts
-/// mid-statement, and a higher class of work ends the unit at the next chunk (#583).
+/// How long one maintenance unit keeps releasing chunks before it commits. This bounds the
+/// chunk loop only: a unit also spends time on its last chunk, its opens and its commit. A
+/// waiting publisher still interrupts mid-statement, and a higher class of work ends the unit
+/// at the next chunk, which rolls the unit back (#583).
 const MAINTENANCE_UNIT_BUDGET: Duration = Duration::from_millis(100);
 
 /// Whether a pending revision is held again and still whole. Its release starts by deleting

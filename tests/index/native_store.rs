@@ -2701,6 +2701,76 @@ fn one_maintenance_unit_releases_many_chunks_within_its_budget() {
     assert_eq!(store.status().unwrap().revision, head);
 }
 
+/// Priority is rechecked between chunks, so a higher class of work ends a unit at the next
+/// chunk rather than when its budget passes (#583).
+#[test]
+#[cfg(feature = "test-support")]
+fn a_priority_change_ends_a_unit_at_the_next_chunk() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use trellis::store::MaintenanceOutcome;
+    let (state, root, store, cancel) = fixture();
+    for number in 0..200 {
+        fs::write(
+            root.path().join(format!("extra{number}.js")),
+            format!("function extra{number}() {{ return {number}; }}"),
+        )
+        .unwrap();
+    }
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::from_secs(10));
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.publication_for_tests().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_901, 901);
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Progress
+    );
+    let priority = Arc::new(AtomicBool::new(false));
+    let signal = priority.clone();
+    store.set_maintenance_after_first_delete_hook_for_tests(move || {
+        signal.store(true, Ordering::Release)
+    });
+    let checks_after_change = AtomicUsize::new(0);
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || {
+                let changed = priority.load(Ordering::Acquire);
+                if changed {
+                    checks_after_change.fetch_add(1, Ordering::Relaxed);
+                }
+                !changed
+            })
+            .unwrap(),
+        MaintenanceOutcome::Deferred
+    );
+    // One check ends the chunk loop and one refuses the commit. Without the first, the loop
+    // would release all 200 documents before the second.
+    assert_eq!(checks_after_change.load(Ordering::Relaxed), 2);
+    let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let manifest: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(manifest > 3 * 64, "the unit rolled back whole: {manifest}");
+}
+
 #[test]
 #[cfg(feature = "test-support")]
 fn maintenance_first_delete_priority_change_rolls_back_to_whole_pending_state() {
