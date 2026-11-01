@@ -264,8 +264,17 @@ anything, so it proves no binding absent, as for a file with a syntax error; for
 every package of its source set unknown. A SCIP artifact that names it is admitted with no
 claims for it, and while a source of a language is unread, a symbol the artifact never defines
 is unresolved rather than external in that language, and an unread Rust file a Cargo target
-reaches leaves every file of the workspace without a Cargo target. It recovers when the file changes back. Root
-configuration inputs such as `package.json` over the cap still fail the index. Syntax past 128
+reaches leaves every file of the workspace without a Cargo target. It recovers when the file changes back. Config
+inputs (the root `package.json`, `package-lock.json`, `Cargo.lock` and other root build and
+lock files, and nested `package.json` and `Cargo.toml` manifests) are read for dependency and
+package-root facts, not as source, so `--max-file-bytes` doesn't apply to them: each has its
+own 16 MiB cap (#581). One over it isn't read; it is skipped with a `config-input-oversized`
+status diagnostic and the rest of the checkout indexes. Its stored bytes are a short
+placeholder that no config format parses, so the facts it would supply are unknown, as for a
+manifest with a syntax error: no external package and no absent dependency is inferred from it.
+A skipped `Cargo.toml` also leaves every workspace document without a Cargo target: its
+unread explicit target paths could cross package directories. These facts recover when the
+input shrinks back under the cap. Syntax past 128
 levels or 1,000,000 visits is a per-file coverage gap (#554). So is a file whose evidence exceeds a selected read's budgets: 16
 rows per source byte in a table, at most 1,000,000, and 64 bytes per source byte plus 256 KiB of
 native rows, the same of graph rows and the same of class rows (#564). It publishes its file module, `partial` coverage and a whole-file capability gap,

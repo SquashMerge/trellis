@@ -253,7 +253,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        33
+        34
     );
     let count: i64 = db
         .query_row(
@@ -855,7 +855,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        33
+        34
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -1064,6 +1064,129 @@ fn a_skipped_source_publishes_as_a_gap_and_recovers() {
             assert!(store.status().unwrap().diagnostics.is_empty());
         }
     }
+}
+
+/// #581: config inputs have their own cap, separate from `--max-file-bytes`. One under it is
+/// read in full; one over it is skipped with a typed status diagnostic, the checkout still
+/// publishes, the facts it would supply are unknown (never a false external), and it recovers
+/// when it shrinks back.
+#[test]
+#[cfg(feature = "test-support")]
+fn a_config_input_over_its_cap_is_skipped_with_a_diagnostic_and_recovers() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let write = |path: &str, text: &str| {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(
+        "src/app.js",
+        "import chunk from 'lodash';\nexport function app() { return chunk([1]); }\n",
+    );
+    write("pkg/util.js", "export function util() { return 1; }\n");
+    write("pkg/package.json", "{\"name\":\"pkg\"}");
+    write(
+        "src/lib.rs",
+        "use serde::Deserialize;\npub fn lib() { Deserialize::f(); }\n",
+    );
+    // Real manifests are small but past this test's --max-file-bytes, and under its config cap.
+    let pad = " ".repeat(400);
+    let package_json =
+        format!("{{\"name\":\"app\",\"dependencies\":{{\"lodash\":\"4.17.21\"}}}}{pad}\n");
+    let cargo_toml = format!(
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1.0.0\"\n#{pad}\n"
+    );
+    let oversized = |text: &str| format!("{text}{}", " ".repeat(5000));
+    write("package.json", &package_json);
+    write("Cargo.toml", &cargo_toml);
+    write("package-lock.json", "{\"lockfileVersion\":3}\n");
+    write("Cargo.lock", "version = 4\n");
+
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let leader = store.publication_for_tests().unwrap();
+    let mut options = IndexOptions::new(root.path().to_owned());
+    options.max_file_bytes = 256;
+    options.max_config_bytes = 4096;
+    let publish = || {
+        publish_with(
+            &store,
+            &options,
+            &cancel,
+            store.index_baseline().unwrap(),
+            &leader,
+        )
+        .unwrap();
+        assert!(!store.recovery_pending_for_tests());
+    };
+    let skipped = || {
+        let status = store.status().unwrap();
+        assert_eq!(status.stats.files, 3);
+        status
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "config-input-oversized")
+            .map(|d| {
+                assert!(d.message.contains("was not read"), "{}", d.message);
+                d.path.clone().unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let externals = || {
+        let references = store
+            .evidence_response()
+            .unwrap()
+            .architecture_response("references", &serde_json::json!({}), &mut || Ok(()))
+            .unwrap();
+        let mut packages: Vec<String> = references["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|package| package["identity"]["package"].as_str().unwrap().to_owned())
+            .collect();
+        packages.sort();
+        packages
+    };
+
+    // Every config input is read in full, though two are past --max-file-bytes.
+    publish();
+    assert!(skipped().is_empty());
+    assert_eq!(externals(), ["lodash", "serde"]);
+
+    // Lockfiles over the cap are skipped; the manifests still supply their dependencies.
+    write("package-lock.json", &oversized("{\"lockfileVersion\":3}"));
+    write("Cargo.lock", &oversized("version = 4"));
+    publish();
+    assert_eq!(skipped(), ["Cargo.lock", "package-lock.json"]);
+    assert_eq!(externals(), ["lodash", "serde"]);
+
+    // A manifest over the cap supplies nothing: its dependencies are unknown, not external.
+    write("package.json", &oversized(&package_json));
+    write("Cargo.toml", &oversized(&cargo_toml));
+    write("pkg/package.json", &oversized("{\"name\":\"pkg\"}"));
+    publish();
+    assert_eq!(
+        skipped(),
+        [
+            "Cargo.lock",
+            "Cargo.toml",
+            "package-lock.json",
+            "package.json",
+            "pkg/package.json"
+        ]
+    );
+    assert!(externals().is_empty());
+
+    // Each recovers when it shrinks back under the cap.
+    write("package.json", &package_json);
+    write("Cargo.toml", &cargo_toml);
+    write("pkg/package.json", "{\"name\":\"pkg\"}");
+    write("package-lock.json", "{\"lockfileVersion\":3}\n");
+    write("Cargo.lock", "version = 4\n");
+    publish();
+    assert!(skipped().is_empty());
+    assert_eq!(externals(), ["lodash", "serde"]);
 }
 
 #[test]
@@ -2590,6 +2713,8 @@ fn due_release_blocked_by_maintenance_admission_must_not_report_success() {
 fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_tombstone() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
+    // One chunk per unit, so the first unit leaves a partial manifest.
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::ZERO);
     for number in 0..65 {
         fs::write(
             root.path().join(format!("extra{number}.js")),
@@ -2715,6 +2840,144 @@ fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_t
         .unwrap();
     assert_eq!(exact, ("released".into(), 1, 0, 0));
     assert_eq!(store.status().unwrap().revision, head);
+}
+
+/// A unit keeps releasing chunks in one transaction until its budget passes, so a revision of
+/// more than one chunk is released by a single unit when the budget allows (#583). Committing
+/// one 64-row chunk per unit spent each unit on its open and commit cost.
+#[test]
+#[cfg(feature = "test-support")]
+fn one_maintenance_unit_releases_many_chunks_within_its_budget() {
+    use trellis::store::MaintenanceOutcome;
+    let (state, root, store, cancel) = fixture();
+    for number in 0..200 {
+        fs::write(
+            root.path().join(format!("extra{number}.js")),
+            format!("function extra{number}() {{ return {number}; }}"),
+        )
+        .unwrap();
+    }
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::from_secs(10));
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.publication_for_tests().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    let head = publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let manifest = |db: &Connection| -> i64 {
+        db.query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(manifest(&db) > 3 * 64, "{}", manifest(&db));
+    store.set_retention_clock_for_tests(1_901, 901);
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    // The first unit only marks the revision pending; the second releases all of it.
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .maintenance_step(&leader, &permit, &probe, || true)
+                .unwrap(),
+            MaintenanceOutcome::Progress
+        );
+    }
+    let state: String = db
+        .query_row(
+            "SELECT state FROM native_revision_supersessions WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((state.as_str(), manifest(&db)), ("released", 0));
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Idle
+    );
+    assert_eq!(store.status().unwrap().revision, head);
+}
+
+/// Priority is rechecked between chunks, so a higher class of work ends a unit at the next
+/// chunk rather than when its budget passes (#583).
+#[test]
+#[cfg(feature = "test-support")]
+fn a_priority_change_ends_a_unit_at_the_next_chunk() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use trellis::store::MaintenanceOutcome;
+    let (state, root, store, cancel) = fixture();
+    for number in 0..200 {
+        fs::write(
+            root.path().join(format!("extra{number}.js")),
+            format!("function extra{number}() {{ return {number}; }}"),
+        )
+        .unwrap();
+    }
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::from_secs(10));
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.publication_for_tests().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_901, 901);
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Progress
+    );
+    let priority = Arc::new(AtomicBool::new(false));
+    let signal = priority.clone();
+    store.set_maintenance_after_first_delete_hook_for_tests(move || {
+        signal.store(true, Ordering::Release)
+    });
+    let checks_after_change = AtomicUsize::new(0);
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || {
+                let changed = priority.load(Ordering::Acquire);
+                if changed {
+                    checks_after_change.fetch_add(1, Ordering::Relaxed);
+                }
+                !changed
+            })
+            .unwrap(),
+        MaintenanceOutcome::Deferred
+    );
+    // One check ends the chunk loop and one refuses the commit. Without the first, the loop
+    // would release all 200 documents before the second.
+    assert!(checks_after_change.load(Ordering::Relaxed) >= 2);
+    let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let manifest: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(manifest > 3 * 64, "the unit rolled back whole: {manifest}");
 }
 
 #[test]
@@ -3266,7 +3529,7 @@ fn schemas16_19_23_24_26_27_28_29_30_and31_recreate_exclusively_without_migratio
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            33
+            34
         );
         assert_eq!(
             rebuilt
@@ -3275,7 +3538,7 @@ fn schemas16_19_23_24_26_27_28_29_30_and31_recreate_exclusively_without_migratio
                     0
                 ))
                 .unwrap(),
-            33
+            34
         );
         for table in [
             "native_version_references",
@@ -3420,7 +3683,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=34").unwrap();
+    db.execute_batch("PRAGMA user_version=35").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3440,13 +3703,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 34);
+    assert_eq!(version, 35);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 33);
+    assert_eq!(metadata_version, 34);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
@@ -3455,6 +3718,8 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
 fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
+    // One chunk per unit, so the large prior document is still partly drained when the next revision publishes.
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::ZERO);
     let source = root.path().join("large.js");
     let body: String = (0..20_000)
         .map(|n| format!("function f{n}() {{ return {n}; }}\n"))
@@ -3546,6 +3811,8 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
 fn large_revision_releases_in_batched_units_while_edits_continue() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
+    // One chunk per unit, so the old manifest is still partly drained when the edits publish.
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::ZERO);
     for n in 0..400 {
         fs::write(
             root.path().join(format!("batch{n}.js")),
@@ -4857,6 +5124,8 @@ fn duplicate_reference_artifact_does_not_publish() {
 #[cfg(feature = "test-support")]
 fn reference_release_resumes_after_primary_key_batch_and_reopen() {
     let (state, root, store, cancel) = fixture();
+    // One chunk per unit, so a unit stops after one 256-row reference batch.
+    store.set_maintenance_unit_budget_for_tests(std::time::Duration::ZERO);
     let source = format!("function many() {{ {} }}\n", "value;".repeat(300));
     fs::write(root.path().join("flow.js"), source).unwrap();
     store.set_retention_clock_for_tests(1_000, 0);

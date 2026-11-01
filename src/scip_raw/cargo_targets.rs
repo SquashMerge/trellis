@@ -54,6 +54,7 @@ struct FileModules {
 struct Manifest {
     dir: String,
     table: Option<toml::Table>,
+    unread: bool,
 }
 
 /// Collects the manifests and module references of one captured revision.
@@ -98,13 +99,15 @@ impl CargoTargetsBuilder {
             if manifests.iter().any(|m: &Manifest| m.dir == dir) {
                 continue;
             }
-            let table = hex::decode(bytes)
-                .ok()
+            let bytes = hex::decode(bytes).ok();
+            let unread = bytes.as_deref() == Some(crate::skipped_config::PLACEHOLDER);
+            let table = bytes
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .and_then(|text| toml::from_str::<toml::Table>(&text).ok());
             manifests.push(Manifest {
                 dir: dir.to_owned(),
                 table,
+                unread,
             });
         }
         Self {
@@ -139,6 +142,10 @@ impl CargoTargetsBuilder {
 
     /// Resolves every document's target.
     pub fn finish(self) -> CargoTargets {
+        // A skipped manifest may name any workspace file as an explicit target via `../`.
+        if self.manifests.iter().any(|manifest| manifest.unread) {
+            return CargoTargets::default();
+        }
         let documents: BTreeSet<&str> = self.files.keys().map(String::as_str).collect();
         let mut targets: Vec<(usize, CargoTarget)> = Vec::new();
         let mut poisoned = BTreeSet::new();
@@ -751,6 +758,82 @@ mod tests {
                 owned("lib", "other/src/lib.rs"),
                 "{skip:?}"
             );
+        }
+    }
+
+    #[test]
+    fn an_unread_manifest_leaves_outside_targets_unknown() {
+        let shared = "[package]\nname='a'\n[[bin]]\nname='shared'\npath='../b/src/lib.rs'\n";
+        let files = [
+            ("a/src/lib.rs", "pub fn a() {}\n"),
+            ("b/src/lib.rs", "pub fn shared() {}\nfn main() {}\n"),
+        ];
+        let build = |a: &str| {
+            targets(
+                &[
+                    ("Cargo.toml", "[workspace]\nmembers=['a','b']\n"),
+                    ("a/Cargo.toml", a),
+                    ("b/Cargo.toml", "[package]\nname='b'\n"),
+                ],
+                &files,
+            )
+        };
+        assert_eq!(of(&build(shared), "b/src/lib.rs"), None);
+        assert_eq!(
+            of(&build("[package]\nname='a'\n"), "b/src/lib.rs"),
+            owned("lib", "b/src/lib.rs")
+        );
+        let skipped = build(std::str::from_utf8(crate::skipped_config::PLACEHOLDER).unwrap());
+        assert_eq!(of(&skipped, "a/src/lib.rs"), None);
+        assert_eq!(of(&skipped, "b/src/lib.rs"), None);
+    }
+
+    #[test]
+    fn a_captured_unread_manifest_leaves_outside_targets_unknown() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let root = tempfile::tempdir().unwrap();
+        for package in ["a", "b"] {
+            std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+            std::fs::write(
+                root.path().join(package).join("src/lib.rs"),
+                "pub fn f() {}\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers=['a','b']\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("b/Cargo.toml"), "[package]\nname='b'\n").unwrap();
+        let manifest = format!(
+            "[package]\nname='a'\n[[bin]]\nname='shared'\npath='../b/src/lib.rs'\n# {}\n",
+            "x".repeat(400)
+        );
+        std::fs::write(root.path().join("a/Cargo.toml"), manifest).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        for cap in [4096, 256] {
+            let mut options = crate::indexer::IndexOptions::new(root.path().to_owned());
+            options.max_config_bytes = cap;
+            let capture = crate::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
+            let config = crate::native_evidence::captured_components(&capture, "")
+                .unwrap()
+                .1;
+            let a = config
+                .iter()
+                .find(|entry| entry["path"] == "a/Cargo.toml")
+                .unwrap();
+            assert_eq!(
+                a["bytes"] == hex::encode(crate::skipped_config::PLACEHOLDER),
+                cap == 256
+            );
+            let mut builder = CargoTargetsBuilder::from_native_config(&config);
+            for file in &capture.files {
+                if file.language == "rust" {
+                    builder.add_document(&file.path, file.text.as_bytes());
+                }
+            }
+            assert_eq!(of(&builder.finish(), "b/src/lib.rs"), None, "cap={cap}");
         }
     }
 

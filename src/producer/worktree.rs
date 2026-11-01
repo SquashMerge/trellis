@@ -187,6 +187,22 @@ pub fn materialize(
     let worktree = run_dir.join("worktree");
     private_dirs(&worktree)?;
     let inputs = RetainedInputs::read(source)?;
+    // A config input over its cap was captured unread (#581): the producer would get the
+    // placeholder as that file, so the run is refused rather than fail on it or run without it.
+    if let Some(file) = inputs
+        .config
+        .iter()
+        .chain(&inputs.dependencies)
+        .find(|file| {
+            file.bytes == crate::skipped_config::PLACEHOLDER
+                && omission(rules, &file.path).is_none()
+        })
+    {
+        anyhow::bail!(
+            "capture_unavailable: config input {} is over the config input cap and was not read",
+            file.path
+        );
+    }
     let mut written = std::collections::BTreeSet::new();
     let mut put = |path: &str, bytes: &[u8]| -> Result<()> {
         check_cancel(cancel)?;
