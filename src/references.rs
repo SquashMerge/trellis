@@ -106,6 +106,36 @@ pub(crate) struct SiteCoverage {
     /// Sites mapped or bound outside the checkout by a fresh semantic binding (#523).
     pub semantic: usize,
 }
+/// Every resolved reference of one revision, by source document, before path selection and
+/// sampling (#556). It keeps no source text, so a checkout can hold it between reads.
+/// `select` turns it into a `Projection`; `project` is exactly these two steps.
+pub struct ReferenceBase {
+    pin: IndexPin,
+    /// Every snapshot document feeds resolution, so path selection does not narrow these.
+    partial_files: Vec<syntax_bounds::PartialFile>,
+    identities: Vec<Identity>,
+    modules: Vec<Value>,
+    /// The sources in `identities` order; a source outside the scan stays `None`.
+    sources: Vec<Option<SourceReferences>>,
+    /// Language to selected producer.
+    producers: BTreeMap<String, String>,
+    /// The most sites each edge keeps; `select` samples at most this many.
+    sample_limit: usize,
+    work_used: usize,
+}
+/// One source document's resolved sites.
+struct SourceReferences {
+    /// (target, test) -> (sites, semantic sites, samples)
+    edges: BTreeMap<(Target, bool), (usize, usize, Vec<Site>)>,
+    unresolved: Vec<(Site, &'static str)>,
+    /// Modules that prove this source's mapped sites.
+    proof: BTreeSet<usize>,
+    packages: BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
+    /// Coverage per role (test = true).
+    coverage: BTreeMap<bool, SiteCoverage>,
+    mapped: usize,
+    semantic: usize,
+}
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Identity {
@@ -205,6 +235,20 @@ pub fn project_with_workers(
         .map(|(projection, _)| projection)
 }
 
+/// The most sites a reference read may sample per edge.
+pub const MAX_SAMPLE_LIMIT: usize = 50;
+
+/// Resolve every document of `snapshot` for later selection by any paths and sample limit.
+pub fn resolve_all(
+    snapshot: &Snapshot,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<ReferenceBase> {
+    let request = parallel_check::RequestCheck::new(check);
+    let workers = crate::parallel::default_workers().clamp(1, crate::parallel::MAX_WORKERS);
+    let result = resolve(snapshot, &[], MAX_SAMPLE_LIMIT, workers, &request);
+    request.result(result)
+}
+
 fn project_configured(
     snapshot: &Snapshot,
     paths: &[String],
@@ -214,22 +258,17 @@ fn project_configured(
 ) -> Result<(Projection, usize)> {
     let request = parallel_check::RequestCheck::new(check);
     let workers = workers.clamp(1, crate::parallel::MAX_WORKERS);
-    let result = project_inner(snapshot, paths, sample_limit, workers, &request);
+    let result = resolve(snapshot, paths, sample_limit, workers, &request).and_then(|base| {
+        let projection = base.select_inner(paths, sample_limit, &mut request.worker())?;
+        Ok((projection, base.work_used))
+    });
     request.result(result)
 }
 
-fn project_inner(
-    snapshot: &Snapshot,
+fn path_globs(
     paths: &[String],
-    sample_limit: usize,
-    workers: usize,
-    request: &parallel_check::RequestCheck<'_>,
-) -> Result<(Projection, usize)> {
-    let check = &mut request.worker();
-    ensure!(
-        (1..=50).contains(&sample_limit),
-        "invalid_request: reference sample limit"
-    );
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<globset::GlobSet> {
     let mut globs = globset::GlobSetBuilder::new();
     for path in paths {
         check()?;
@@ -245,7 +284,22 @@ fn project_inner(
                 .context("invalid_request: reference path glob")?,
         );
     }
-    let globs = globs.build()?;
+    Ok(globs.build()?)
+}
+
+fn resolve(
+    snapshot: &Snapshot,
+    paths: &[String],
+    sample_limit: usize,
+    workers: usize,
+    request: &parallel_check::RequestCheck<'_>,
+) -> Result<ReferenceBase> {
+    let check = &mut request.worker();
+    ensure!(
+        (1..=MAX_SAMPLE_LIMIT).contains(&sample_limit),
+        "invalid_request: reference sample limit"
+    );
+    let globs = path_globs(paths, check)?;
     let mut order: Vec<usize> = (0..snapshot.documents.len()).collect();
     order.sort_by(|&a, &b| snapshot.documents[a].key.cmp(&snapshot.documents[b].key));
     let docs: Vec<_> = order.iter().map(|&i| &snapshot.documents[i]).collect();
@@ -400,10 +454,10 @@ fn project_inner(
     // Exact internal targets of semantic bindings: every declaration of the snapshot by
     // document, so a binding whose target is not in this snapshot is not used (#523).
     let mut declared: BTreeSet<(usize, &str)> = BTreeSet::new();
-    let mut producers: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut producers: BTreeMap<String, String> = BTreeMap::new();
     for doc in &docs {
         if let Some(producer) = &doc.semantic.producer_id {
-            producers.insert(&doc.key.language, producer);
+            producers.insert(doc.key.language.clone(), producer.clone());
         }
     }
     if !producers.is_empty() {
@@ -420,17 +474,9 @@ fn project_inner(
             .copied()
             .filter(|&index| declared.contains(&(index, sid)))
     };
-    let mut external_packages = BTreeMap::new();
-    // (source, target, test) -> (sites, semantic sites, samples)
-    type Edges = BTreeMap<(usize, Target, bool), (usize, usize, Vec<Site>)>;
-    let mut edges = Edges::new();
-    let mut emitted_modules = BTreeSet::new();
-    let mut unresolved = Vec::new();
+    let mut sources: Vec<Option<SourceReferences>> = Vec::new();
+    sources.resize_with(docs.len(), || None);
     let mut site_count = 0usize;
-    let mut scanned = 0usize;
-    let mut mapped = 0usize;
-    let mut semantic_sites = 0usize;
-    let mut coverage: BTreeMap<(String, bool), SiteCoverage> = BTreeMap::new();
     for batch in selected.chunks(workers) {
         let remaining = rust.work.remaining();
         let prepared = map_batch(batch, workers, request, |&source| {
@@ -451,8 +497,15 @@ fn project_inner(
             let doc = docs[source];
             request.check()?;
             merge_work(&mut rust.work, work.used, check)?;
-            emitted_modules.insert(source);
-            scanned += 1;
+            let mut found = SourceReferences {
+                edges: BTreeMap::new(),
+                unresolved: Vec::new(),
+                proof: BTreeSet::new(),
+                packages: BTreeMap::new(),
+                coverage: BTreeMap::new(),
+                mapped: 0,
+                semantic: 0,
+            };
             for PreparedSite {
                 raw,
                 mut site,
@@ -470,21 +523,21 @@ fn project_inner(
                         source,
                         item,
                         &packages,
-                        &mut external_packages,
+                        &mut found.packages,
                         &docs,
                         check,
                     )?),
                     Some(item) if doc.key.language == "java" => Some(java.resolve(
                         source,
                         item,
-                        &mut external_packages,
+                        &mut found.packages,
                         &mut rust.work,
                         check,
                     )?),
                     Some(item) if doc.key.language == "python" => Some(python.resolve(
                         source,
                         item,
-                        &mut external_packages,
+                        &mut found.packages,
                         &mut rust.work,
                         check,
                     )?),
@@ -492,7 +545,7 @@ fn project_inner(
                         javascript
                             .as_ref()
                             .expect("selected JavaScript catalog")
-                            .resolve(source, item, &mut external_packages, &mut rust.work, check)?,
+                            .resolve(source, item, &mut found.packages, &mut rust.work, check)?,
                     ),
                     Some(_) => Some(SiteResolution::unknown("module_mapping_unavailable")),
                 };
@@ -518,25 +571,21 @@ fn project_inner(
                 site_count += 1;
                 ensure!(site_count <= SITES, "bounded_work: reference site count");
                 let role = site.role;
-                let covered = coverage
-                    .entry((doc.key.path.clone(), role == Some("test")))
-                    .or_default();
-                covered.sites += 1;
+                let test = role == Some("test");
                 let bound = site.mapping == "semantic";
-                if bound && resolution.residual.is_none() {
-                    semantic_sites += 1;
-                    covered.semantic += 1;
-                }
-                if !resolution.targets.is_empty() {
-                    mapped += 1;
-                    covered.mapped += 1;
-                    emitted_modules.extend(resolution.proof);
-                }
+                let semantic = bound && resolution.residual.is_none();
+                let mapped = !resolution.targets.is_empty();
+                let covered = found.coverage.entry(test).or_default();
+                covered.sites += 1;
+                covered.semantic += usize::from(semantic);
+                covered.mapped += usize::from(mapped);
+                covered.unresolved += usize::from(resolution.residual.is_some());
+                found.semantic += usize::from(semantic);
+                found.mapped += usize::from(mapped);
+                found.proof.extend(resolution.proof);
                 for target in resolution.targets {
                     owner_step(&mut rust.work, check)?;
-                    let edge = edges
-                        .entry((source, target, role == Some("test")))
-                        .or_default();
+                    let edge = found.edges.entry((target, test)).or_default();
                     edge.0 += 1;
                     edge.1 += usize::from(bound);
                     if edge.2.len() < sample_limit {
@@ -544,11 +593,10 @@ fn project_inner(
                     }
                 }
                 if let Some(reason) = resolution.residual {
-                    covered.unresolved += 1;
-                    unresolved
-                        .push(json!({"source":identities[source],"site":site,"reason":reason}));
+                    found.unresolved.push((site, reason));
                 }
             }
+            sources[source] = Some(found);
         }
     }
     // Freeing every syntax tree is serial native work; spread it across workers.
@@ -562,69 +610,150 @@ fn project_inner(
         &std::sync::atomic::AtomicBool::new(false),
         |_, tree| drop(tree.lock().unwrap_or_else(|e| e.into_inner()).take()),
     );
-    let mut production = Vec::new();
-    let mut tests = Vec::new();
-    for ((source, target, test), (count, semantic, sites)) in edges {
-        check()?;
-        let target = match target {
-            Target::Native(target) => {
-                emitted_modules.insert(target);
-                json!(identities[target])
+    Ok(ReferenceBase {
+        pin: snapshot.pin,
+        partial_files,
+        identities,
+        modules,
+        sources,
+        producers,
+        sample_limit,
+        work_used: rust.work.used,
+    })
+}
+
+impl ReferenceBase {
+    /// The references of the sources `paths` selects, with at most `sample_limit` sites per
+    /// edge: what `project` returns for the same arguments.
+    pub fn select(
+        &self,
+        paths: &[String],
+        sample_limit: usize,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<Projection> {
+        self.select_inner(paths, sample_limit, check)
+    }
+
+    fn select_inner(
+        &self,
+        paths: &[String],
+        sample_limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Projection> {
+        ensure!(
+            (1..=self.sample_limit).contains(&sample_limit),
+            "invalid_request: reference sample limit"
+        );
+        let globs = path_globs(paths, check)?;
+        let identities = &self.identities;
+        let mut emitted_modules = BTreeSet::new();
+        let mut external_packages: BTreeMap<_, external::ExternalPackage> = BTreeMap::new();
+        let mut coverage: BTreeMap<(String, bool), SiteCoverage> = BTreeMap::new();
+        let mut production = Vec::new();
+        let mut tests = Vec::new();
+        let mut unresolved = Vec::new();
+        let (mut scanned, mut mapped, mut semantic_sites) = (0usize, 0usize, 0usize);
+        for (source, found) in self.sources.iter().enumerate() {
+            check()?;
+            let Some(found) = found else { continue };
+            let path = &identities[source].path;
+            if !paths.is_empty() && !globs.is_match(path) {
+                continue;
             }
-            Target::External(identity) => json!(identity),
-        };
-        let omitted = count - sites.len();
-        let tier = match semantic {
-            0 => "syntax",
-            n if n == count => "semantic",
-            _ => "mixed",
-        };
-        let edge = json!({"source":identities[source],"target":target,"count":count,
-            "sites":sites,"omittedSites":omitted,"evidenceTier":tier,"semanticSites":semantic});
-        if test {
-            tests.push(edge);
-        } else {
-            production.push(edge);
+            scanned += 1;
+            mapped += found.mapped;
+            semantic_sites += found.semantic;
+            emitted_modules.insert(source);
+            emitted_modules.extend(found.proof.iter().copied());
+            for (test, row) in &found.coverage {
+                let total = coverage.entry((path.clone(), *test)).or_default();
+                total.sites += row.sites;
+                total.mapped += row.mapped;
+                total.unresolved += row.unresolved;
+                total.semantic += row.semantic;
+            }
+            for (identity, package) in &found.packages {
+                match external_packages.get_mut(identity) {
+                    Some(existing) if existing.evidence != package.evidence => {
+                        existing.evidence.extend(package.evidence.iter().cloned());
+                        existing.evidence.sort();
+                        existing.evidence.dedup();
+                    }
+                    Some(_) => {}
+                    None => {
+                        external_packages.insert(identity.clone(), package.clone());
+                    }
+                }
+            }
+            for ((target, test), (count, semantic, sites)) in &found.edges {
+                check()?;
+                let target = match target {
+                    Target::Native(target) => {
+                        emitted_modules.insert(*target);
+                        json!(identities[*target])
+                    }
+                    Target::External(identity) => json!(identity),
+                };
+                let sampled = &sites[..sites.len().min(sample_limit)];
+                let omitted = count - sampled.len();
+                let tier = match semantic {
+                    0 => "syntax",
+                    n if n == count => "semantic",
+                    _ => "mixed",
+                };
+                let edge = json!({"source":identities[source],"target":target,"count":count,
+                    "sites":sampled,"omittedSites":omitted,"evidenceTier":tier,"semanticSites":semantic});
+                if *test {
+                    tests.push(edge);
+                } else {
+                    production.push(edge);
+                }
+            }
+            for (site, reason) in &found.unresolved {
+                check()?;
+                unresolved.push(json!({"source":identities[source],"site":site,"reason":reason}));
+            }
         }
-    }
-    let emitted_modules: Vec<_> = emitted_modules.into_iter().map(|i| &modules[i]).collect();
-    let mut limitations = vec![
-        "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
-        "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
-        "JavaScript expands captured named ESM exports through bounded relative forwarding; stars exclude default. Ambiguous names, dynamic namespaces and unproved bindings remain uncertain. Static sources retain module evidence; declared npm roots and the partial pinned Node catalog identify packages only.",
-        "Python expands proved checkout-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
-        "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability.",
-    ];
-    let bounds_limitation = syntax_bounds::limitation(partial_files.len());
-    if !partial_files.is_empty() {
-        limitations.push(&bounds_limitation);
-    }
-    if producers.is_empty() {
-        limitations.push("No selected semantic producer has fresh bindings for these documents; every site is structural syntax evidence.");
-    } else {
-        limitations.push("Semantic sites use fresh bindings of each language's selected producer: a site's final name or callee, measured calls and type references with an exact internal target in this snapshot. Bindings outside the checkout resolve a site without naming a package; stale, unselected or missing bindings fall back to structural evidence, and calls the producer did not bind are not counted.");
-    }
-    let semantic_producers: Vec<_> = producers
-        .iter()
-        .map(|(language, producer)| json!({"language":language,"producerId":producer}))
-        .collect();
-    request.check()?;
-    Ok((
-        Projection {
+        let emitted_modules: Vec<_> = emitted_modules
+            .into_iter()
+            .map(|i| &self.modules[i])
+            .collect();
+        let mut limitations = vec![
+            "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
+            "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
+            "JavaScript expands captured named ESM exports through bounded relative forwarding; stars exclude default. Ambiguous names, dynamic namespaces and unproved bindings remain uncertain. Static sources retain module evidence; declared npm roots and the partial pinned Node catalog identify packages only.",
+            "Python expands proved checkout-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
+            "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability.",
+        ];
+        let bounds_limitation = syntax_bounds::limitation(self.partial_files.len());
+        if !self.partial_files.is_empty() {
+            limitations.push(&bounds_limitation);
+        }
+        if self.producers.is_empty() {
+            limitations.push("No selected semantic producer has fresh bindings for these documents; every site is structural syntax evidence.");
+        } else {
+            limitations.push("Semantic sites use fresh bindings of each language's selected producer: a site's final name or callee, measured calls and type references with an exact internal target in this snapshot. Bindings outside the checkout resolve a site without naming a package; stale, unselected or missing bindings fall back to structural evidence, and calls the producer did not bind are not counted.");
+        }
+        let semantic_producers: Vec<_> = self
+            .producers
+            .iter()
+            .map(|(language, producer)| json!({"language":language,"producerId":producer}))
+            .collect();
+        check()?;
+        Ok(Projection {
             data: json!({
-                "referencesVersion":"references:v2","indexGeneration":snapshot.pin.index_generation.to_string(),
-                "indexRevision":snapshot.pin.index_revision,"evidenceTier":if semantic_sites > 0 { "mixed" } else { "syntax" },"semanticComplete":false,
+                "referencesVersion":"references:v2","indexGeneration":self.pin.index_generation.to_string(),
+                "indexRevision":self.pin.index_revision,"evidenceTier":if semantic_sites > 0 { "mixed" } else { "syntax" },"semanticComplete":false,
                 "semanticProducers":semantic_producers,
                 "modules":emitted_modules,"externalPackages":external_packages.into_values().collect::<Vec<_>>(),"production":production,"tests":tests,"unresolved":unresolved,
                 "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len(),"semanticSites":semantic_sites},
-                "partialFiles":partial_files,
+                "partialFiles":self.partial_files,
                 "limitations":limitations
             }),
-            modules,
+            modules: self.modules.clone(),
             coverage,
-        },
-        rust.work.used,
-    ))
+        })
+    }
 }
 
 /// How a fresh semantic binding resolves a site, or `None` to keep its structural result
@@ -1313,6 +1442,31 @@ mod parallel_tests {
             },
             documents,
             manifests: Vec::new(),
+        }
+    }
+
+    /// #556: a read selects from one whole-revision base instead of resolving its own paths.
+    #[test]
+    fn a_resolved_base_selects_what_a_scoped_projection_returns() {
+        let snapshot = snapshot();
+        let base = resolve_all(&snapshot, &mut || Ok(())).unwrap();
+        for paths in [
+            vec![],
+            vec!["src/**".to_owned()],
+            vec!["use.js".to_owned()],
+            vec!["*.py".to_owned(), "Use.java".to_owned()],
+            vec!["missing/**".to_owned()],
+        ] {
+            for limit in [1, 5, MAX_SAMPLE_LIMIT] {
+                let scoped = project(&snapshot, &paths, limit, &mut || Ok(())).unwrap();
+                let selected = base.select(&paths, limit, &mut || Ok(())).unwrap();
+                assert_eq!(scoped.data, selected.data, "{paths:?} {limit}");
+                assert_eq!(
+                    format!("{:?}", scoped.coverage),
+                    format!("{:?}", selected.coverage),
+                    "{paths:?} {limit}"
+                );
+            }
         }
     }
 

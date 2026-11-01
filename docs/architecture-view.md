@@ -130,6 +130,48 @@ verdicts, exceptions and source-site samples. Omitted sample counts stay visible
 sampling never changes totals. Explicit source actions read cached indexed text at
 the displayed revision. They never fall back to the live file.
 
+## One computation per revision (#556)
+
+The daemon computes what Architecture needs once per published revision and rules file, in the
+background, on one per-checkout owner thread. Each worker step hints the owner, which compares
+the head and the rules file's hash with what it last published and starts a build when they
+differ; a newer head stops a build that is under way. The owner starts for a checkout with a
+rules file, or once any read asks. Reads never compute the head: any number of them wait for
+the same build, and each rechecks the pin and rules hash, so a new revision or an edited rules
+file is never served from an older result. A daemon restart or an idle checkout's retirement
+drops the result, and the next activation builds it again.
+
+A build reads each document once in one read transaction, ends it, and only then resolves
+references, prepares rule rows and measures metrics. A publication or a retirement waits for
+that read at most, never for the computing, and a read waits for the owner before it admits
+its own transaction. A build keeps no source text, syntax trees or semantic rows, only the
+per-source reference rows (up to 50 sampled sites per edge), rule rows, metric rows and each
+finished summary, so a checkout holds one result, bounded by the existing reference and rule
+budgets. A checkout keeps at most two: the head's, and the one it replaced or an older retained
+revision a page is showing. Those budgets cover the whole revision: a path-scoped read of a
+repository over them fails `bounded_work` with the whole-revision read. Every read projects
+from the result:
+
+| Read | While the build runs |
+| --- | --- |
+| `GET architecture` | Waits 1 s for the owner, then answers **202** with `{"state":"building","progress":{"phase","completed","total"},"retryAfterMs"}`. The view shows `Building Architecture for this revision: reading indexed files 120 of 604…` and asks again; the daemon answers as soon as the build is done. |
+| `GET architecture/details` | Waits 1 s, then answers **503** `architecture_building`. |
+| MCP `trellis_rules_check`, `trellis_rules_explain`, `trellis_references`, the layer prompt | Waits until one second before the 5 s call deadline, then returns the existing retryable `deadline_exceeded` with a message that says the build is running. |
+| CLI `trellis rules check`, `trellis references` | Waits up to 30 s, then fails `deadline_exceeded`. |
+| `metrics` (revision or directory scope) | Waits up to 5 s for a running build, then computes its own rows. It uses a published build's rows at once, and never asks for a build. |
+
+The periods above are bounds on one read's wait: a waiter wakes on the owner's signal, and
+looks at its own cancellation and deadline every 100 ms because those have no signal of their
+own. The page asks again because a browser has no push channel to the daemon.
+
+A failure this revision would repeat (`invalid_rules` found while evaluating, `bounded_work`,
+`invalid_source_syntax`, a corrupt row) is kept and answered like a result. Contention retries
+on the owner within a bound. A panicked build is reported once as `store_unavailable`, and the
+next read starts over. The page does not move to a new head until it reloads, so the owner
+also serves an older retained revision: the core it replaced stays readable, and it builds a
+revision a page asks for once the head is done. An MCP or CLI read of such a revision computes
+it on the request unless the owner holds it.
+
 ## Summary and detail reads (#448)
 
 `GET architecture` returns what the view draws plus exact counts, not per-site

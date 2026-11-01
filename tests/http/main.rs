@@ -11,6 +11,7 @@ mod common;
 mod graph_fixtures;
 
 mod architecture_http;
+mod architecture_precompute;
 mod browse_http;
 mod browser_route_admission;
 mod browser_selection;

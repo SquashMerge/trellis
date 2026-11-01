@@ -1,5 +1,5 @@
 //! View-time, source-only complexity metrics. No index or revision identity is cached here.
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Write};
 use std::time::Instant;
 
@@ -110,6 +110,14 @@ pub(crate) struct SourceScores {
 }
 
 impl Computed {
+    /// Rows computed earlier, with nothing left to record.
+    pub(crate) fn ready(rows: Vec<DeclarationMetrics>, gap: Option<SyntaxGap>) -> Self {
+        Self {
+            rows,
+            uncached: None,
+            gap,
+        }
+    }
     /// How this document's syntax exceeded the traversal bounds, if it did.
     pub(crate) fn gap(&self) -> Option<&SyntaxGap> {
         self.gap.as_ref()
@@ -189,13 +197,32 @@ fn bind(
     source_only: Vec<Score>,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<DeclarationMetrics>> {
-    let syntax = if calls.iter().any(|call| {
-        declarations.iter().any(|d| {
-            callable(&d.kind)
-                && d.name.as_deref() == call.spelling.as_deref()
-                && call.owner_syntax_id == d.syntax_id
-        })
-    }) {
+    // One pass over the rows per document: a generated or large file has thousands of
+    // declarations and tens of thousands of calls, so a scan per declaration is too slow.
+    let mut calls_by_owner: HashMap<&str, Vec<&Call>> = HashMap::new();
+    for call in calls {
+        calls_by_owner
+            .entry(&call.owner_syntax_id)
+            .or_default()
+            .push(call);
+    }
+    let mut regions_by_owner: HashMap<&str, Vec<&ControlRegion>> = HashMap::new();
+    for region in regions {
+        regions_by_owner
+            .entry(&region.owner_syntax_id)
+            .or_default()
+            .push(region);
+    }
+    let owned_calls = |d: &Declaration| {
+        calls_by_owner
+            .get(d.syntax_id.as_str())
+            .map_or(&[][..], Vec::as_slice)
+    };
+    let self_call = |d: &Declaration, call: &Call| d.name.as_deref() == call.spelling.as_deref();
+    let syntax = if declarations
+        .iter()
+        .any(|d| callable(&d.kind) && owned_calls(d).iter().any(|call| self_call(d, call)))
+    {
         check()?;
         let language = declarations
             .first()
@@ -222,17 +249,14 @@ fn bind(
         .zip(source_only)
     {
         check()?;
-        metrics.fan_out = calls
-            .iter()
-            .filter(|c| c.owner_syntax_id == d.syntax_id)
-            .count();
+        let owned = owned_calls(d);
+        metrics.fan_out = owned.len();
         // Exact unqualified self-call spelling is syntactic evidence, not call resolution.
         if let Some(name) = &d.name {
-            let mut self_calls = calls
+            let mut self_calls = owned
                 .iter()
-                .filter(|c| {
-                    c.owner_syntax_id == d.syntax_id && c.spelling.as_deref() == Some(name.as_str())
-                })
+                .copied()
+                .filter(|c| c.spelling.as_deref() == Some(name.as_str()))
                 .peekable();
             if self_calls.peek().is_some()
                 && let Some((tree, rust)) = &syntax
@@ -243,17 +267,19 @@ fn bind(
                     .count();
             }
         }
-        metrics.max_nesting = regions
+        let owned_regions = regions_by_owner
+            .get(d.syntax_id.as_str())
+            .map_or(&[][..], Vec::as_slice);
+        metrics.max_nesting = owned_regions
             .iter()
-            .filter(|r| r.owner_syntax_id == d.syntax_id)
             .map(|r| {
                 let mut depth = 1;
                 let mut parent = r.parent_id.as_deref();
                 while let Some(id) = parent {
                     depth += 1;
-                    parent = regions
+                    parent = owned_regions
                         .iter()
-                        .find(|other| other.id == id && other.owner_syntax_id == d.syntax_id)
+                        .find(|other| other.id == id)
                         .and_then(|other| other.parent_id.as_deref());
                     if depth > regions.len() {
                         break;

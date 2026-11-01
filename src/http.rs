@@ -34,6 +34,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+pub(crate) mod architecture;
 mod config;
 mod worker;
 pub use config::BrowserConfig;
@@ -248,6 +249,8 @@ pub struct DaemonState {
     jobs: Mutex<Jobs>,
     worker_started: AtomicBool,
     search_fill: Mutex<Option<crate::daemon::search_fill::FillRegistration>>,
+    /// The checkout's one Architecture owner (#556).
+    architecture: architecture::ArchitectureHandle,
     /// Watcher inventories run on the worker and are never cancelled from
     /// outside it (Decision 0009 §1).
     watcher_cancel: CancelFlag,
@@ -472,6 +475,7 @@ pub fn new_with_config(
         explicit_pending: Mutex::new(None),
         worker_started: AtomicBool::new(false),
         search_fill: Mutex::new(None),
+        architecture: architecture::ArchitectureHandle(architecture::ArchitectureOwner::new()),
         watcher_cancel: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "test-support")]
         startup_hook: Mutex::new(None),
@@ -1331,6 +1335,7 @@ impl DaemonState {
         if let Some(fill) = self.search_fill.lock().unwrap().as_ref() {
             fill.notify();
         }
+        self.architecture_hint();
         #[cfg(feature = "test-support")]
         if result.is_ok() {
             self.report_causal_startup_ready();
@@ -4683,6 +4688,25 @@ async fn provisioned_core_answer(
                             (
                                 StatusCode::UNPROCESSABLE_ENTITY,
                                 Json(json!({"error": diagnostic})),
+                            )
+                                .into_response(),
+                            false,
+                        ));
+                    }
+                    if let Some(building) =
+                        error.downcast_ref::<architecture::ArchitectureBuilding>()
+                    {
+                        if detail_read {
+                            return Err(ApiError(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "architecture_building",
+                                "Architecture is being computed for this revision; retry shortly",
+                            ));
+                        }
+                        return Ok((
+                            (
+                                StatusCode::ACCEPTED,
+                                Json(json!({"payload": building.payload(), "catchingUp": false})),
                             )
                                 .into_response(),
                             false,
