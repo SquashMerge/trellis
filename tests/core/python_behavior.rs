@@ -106,12 +106,10 @@ fn branches_elif_return_and_raise_guard_suffix() {
         calls(&branch.alternate),
         ["other", "failure", "cause", "fallback"]
     );
-    assert!(!view.steps.iter().any(|s| s.label == "after"));
-    assert!(
-        view.steps
-            .iter()
-            .any(|s| s.label.contains("continues normally") && calls(&s.children) == ["after"])
-    );
+    // The `if` draws its return: the guard folds into it and the suffix follows (#558).
+    assert_eq!(branch.folded.len(), 1);
+    assert!(branch.folded[0].label.contains("continues normally"));
+    assert!(view.steps.iter().any(|s| s.label == "after"));
     let (_, view) = fixture(
         "def run():\n    if check():\n        return yes()\n    else:\n        return no()\n    forbidden()\n",
         "run",

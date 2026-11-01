@@ -242,6 +242,50 @@ test("logging macro hides under the incidental toggle with its reason",{timeout:
  assert.match(await page.locator("#inspector-evidence").textContent(),/^hidden: logging \(naming heuristic\) \(shown by Show all\)/);
 }));
 
+// #558: every step hidden draws no lone box: the panel says what is hidden and shows it.
+test("a method whose every step is hidden says so and shows them on request",{timeout:240000},async()=>published("fn measured() {\n    work();\n}\nfn quiet() {\n    log::info!(\"x\");\n}\n",async({page})=>{
+ await page.locator(".method-pick").filter({hasText:"quiet"}).first().click();
+ const empty=page.locator("#sequence-diagram .sequence-empty");await empty.waitFor();
+ assert.equal(await empty.textContent(),"Only incidental calls (1 hidden). Show them");
+ assert.equal(await page.locator("#sequence-diagram svg").count(),0);
+ assert.doesNotMatch(await page.locator("#sequence-state").innerText(),/Pele/);
+ assert.equal(await page.locator("#sequence-fit").isVisible(),false);
+ await empty.locator("button").click();
+ await page.locator("#sequence-diagram .pele-note[data-trellis-step-id]").first().waitFor();
+ assert.equal(await page.locator("#all-steps").isChecked(),true);
+}));
+
+// #558: a large diagram opens at its own size in the real panel; Fit is explicit and undoes.
+const longSource=`fn measured() {\n${Array.from({length:40},(_,i)=>`    if a_condition_with_a_name_long_enough_to_be_wider_than_the_narrow_panel_${i}() { return; }\n`).join("")}}\n`;
+test("a large sequence scrolls at readable size until Fit is asked for",{timeout:240000},async()=>published(longSource,async({page})=>{
+ await page.setViewportSize({width:800,height:700});
+ const fit=page.locator("#sequence-fit");await fit.waitFor();
+ const measure=()=>page.locator("#sequence-diagram").evaluate(box=>{const svg=box.querySelector("svg"),scale=svg.getScreenCTM().a;
+  return {scale,smallest:Math.min(...[...svg.querySelectorAll("text")].filter(t=>t.textContent.trim()).map(t=>parseFloat(getComputedStyle(t).fontSize)*scale)),width:svg.getBoundingClientRect().width,clientWidth:box.clientWidth,clientHeight:box.clientHeight,scrollHeight:box.scrollHeight};});
+ const opened=await measure();
+ assert.ok(Math.abs(opened.scale-1)<.001,JSON.stringify(opened));assert.ok(opened.smallest>=12,JSON.stringify(opened));
+ assert.ok(opened.scrollHeight>opened.clientHeight,JSON.stringify(opened));assert.ok(opened.width>opened.clientWidth,JSON.stringify(opened));
+ assert.equal(await fit.getAttribute("aria-pressed"),"false");
+ await fit.click();
+ const fitted=await measure();
+ assert.ok(fitted.width<=fitted.clientWidth,JSON.stringify(fitted));assert.equal(await fit.getAttribute("aria-pressed"),"true");
+ await fit.click();
+ assert.ok(Math.abs((await measure()).scale-1)<.001);assert.equal(await fit.getAttribute("aria-pressed"),"false");
+}));
+
+// #558: the guard after an `if` that returns folds into it. The suffix follows at one level,
+// the row says the path may end, and the inspector keeps the guard.
+test("the guard after an if that returns folds into it and stays in the inspector",{timeout:240000},async()=>published("fn measured(c: bool) {\n    if c {\n        return;\n    }\n    after();\n}\n",async({page,dto})=>{
+ const [branch,after]=dto.steps;
+ assert.equal(branch.label,"if c");assert.equal(after.label,"after");assert.equal(dto.steps.length,2);
+ assert.deepEqual(branch.folded.map(f=>f.label),["only if the preceding path continues normally"]);
+ const note=page.locator(`#sequence-diagram .pele-note[data-trellis-step-id="${branch.id}"]`);
+ assert.match(await note.textContent(),/may exit early/);
+ await note.click();
+ const folded=page.locator("#inspector-detail details > summary").filter({hasText:"Folded control flow"});
+ assert.deepEqual(await folded.allTextContents(),["Folded control flow · branch: only if the preceding path continues normally"]);
+}));
+
 const truncatedSource=`function measured() {\n${Array.from({length:202},(_,i)=>`  observed_${i}();\n`).join("")}}\n`;
 test("published truncated producer shows bound while retaining original call witness",{timeout:240000},async()=>published(truncatedSource,async({page,dto,pin})=>{
  assert.equal(dto.truncated,true,"the actual producer must reach its 200-step cap");

@@ -118,10 +118,10 @@ fn branches_returns_throws_and_short_circuit_guard_suffixes() {
         .unwrap();
     assert_eq!(calls(&branch.children), ["done"]);
     assert_eq!(calls(&branch.alternate), ["other"]);
-    assert!(!view.steps.iter().any(|s| s.label == "after"));
-    assert!(view.steps.iter().any(
-        |s| s.label.contains("continues normally") && calls(&s.children) == ["after", "error"]
-    ));
+    assert!(view.steps.iter().any(|s| s.label == "after"));
+    // The `if` draws its return: the guard folds into it and the suffix follows (#558).
+    assert_eq!(branch.folded.len(), 1);
+    assert!(branch.folded[0].label.contains("continues normally"));
     assert!(flatten(&view.steps).iter().any(|s| s.kind == "throw"));
     let (_, both) = fixture(
         "class Fixture { void run() { if (check()) return; else throw error(); gone(); } }",

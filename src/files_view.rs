@@ -177,6 +177,25 @@ fn impl_target(node: tree_sitter::Node<'_>, text: &[u8]) -> Option<String> {
     let name = type_name(node.child_by_field_name("type")?)?;
     Some(name.utf8_text(text).ok()?.to_owned())
 }
+/// The type one `impl` block implements (#558), from its header alone: an `impl` can be most
+/// of a very large file. A header with a brace of its own does not parse, and names nothing.
+pub(crate) fn impl_block_target(block: &str) -> Option<String> {
+    let header = format!("{}{{}}", &block[..block.find('{')?]);
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(&header, None)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let mut cursor = root.walk();
+    let item = root
+        .named_children(&mut cursor)
+        .find(|node| node.kind() == "impl_item")?;
+    impl_target(item, header.as_bytes())
+}
 /// The identifier naming a Rust type: `Foo`, `a::Foo`, `Foo<T>`, `&Foo`, `&mut a::Foo<T>`.
 fn type_name(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     let mut node = node;

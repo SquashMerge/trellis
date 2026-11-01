@@ -1,6 +1,6 @@
 //! Python-only adapter. No execution, filesystem reads, or model calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
-use crate::behavior::{Participant, SequenceStep, SequenceView};
+use crate::behavior::{CONTINUES_LABEL, Participant, SequenceStep, SequenceView, fold_guard};
 use crate::model::{CallSite, IndexPin, SourceFile, SourceRange, Symbol, SymbolKind};
 use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
@@ -215,16 +215,18 @@ impl Builder<'_> {
                     self.limit();
                     break;
                 }
-                if let Some(mut guard) = self.step(
-                    nodes[i + 1],
-                    "branch",
-                    "only if the preceding path continues normally",
-                ) {
+                if let Some(guard) = self.step(nodes[i + 1], "branch", CONTINUES_LABEL) {
                     let rest = self.block(&nodes[i + 1..], depth + 1);
-                    guard.children = rest.steps;
                     out.continues = rest.continues;
                     out.exits |= rest.exits;
-                    out.steps.push(guard);
+                    // After a branch that draws its exit the suffix stays here (#558).
+                    match fold_guard(&mut out.steps, guard) {
+                        None => out.steps.extend(rest.steps),
+                        Some(mut guard) => {
+                            guard.children = rest.steps;
+                            out.steps.push(guard);
+                        }
+                    }
                 }
                 break;
             }
@@ -238,11 +240,14 @@ impl Builder<'_> {
             return first;
         }
         if first.exits && !next.steps.is_empty() {
-            if let Some(mut guard) =
-                self.step(n, "branch", "only if the preceding path continues normally")
-            {
-                guard.children = next.steps;
-                first.steps.push(guard);
+            if let Some(guard) = self.step(n, "branch", CONTINUES_LABEL) {
+                match fold_guard(&mut first.steps, guard) {
+                    None => first.steps.extend(next.steps),
+                    Some(mut guard) => {
+                        guard.children = next.steps;
+                        first.steps.push(guard);
+                    }
+                }
             }
         } else {
             first.steps.extend(next.steps);
@@ -698,6 +703,7 @@ fn call_label<'a>(n: Node<'_>, file: &'a SourceFile) -> &'a str {
 fn unresolved_boundary() -> Participant {
     Participant {
         declaration: None,
+        column: None,
         id: "boundary:python-unknown".into(),
         label: "Unresolved calls".into(),
         kind: "boundary".into(),
@@ -718,7 +724,7 @@ fn unresolved_participant(n: Node<'_>, file: &SourceFile) -> Participant {
         ("unresolvedCallee", function)
     };
     let text = &file.text[hint.byte_range()];
-    Participant { declaration: None, id: format!("python:source:{kind}:{}", hex::encode(Sha256::digest(text.as_bytes()))), label: bounded(text), kind: kind.into(),
+    Participant { declaration: None, column: None, id: format!("python:source:{kind}:{}", hex::encode(Sha256::digest(text.as_bytes()))), label: bounded(text), kind: kind.into(),
         identification: "Source expression only; type, descriptors and dispatch unresolved. Visual group, not object identity or a constructor claim.".into() }
 }
 pub fn build(
@@ -738,7 +744,7 @@ pub fn build(
         "invalid symbol source range"
     );
     let mut b = Builder { file, seed, calls, count: 0, visits: 0, future_annotations: false, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
-        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
+        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, column: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Python types, imports, dispatch, descriptors, operator/truthiness protocols and implicit exceptions are not resolved. Async/generator bodies show possible execution on await/iteration, not call-time execution. Unsupported definition-time effects remain opaque; function bodies are deferred.".into()], hidden_steps: 0, truncated: false, truncated_by: vec![],
     }};
     let mut parser = tree_sitter::Parser::new();

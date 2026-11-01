@@ -1,6 +1,6 @@
 //! JavaScript-only adapter. No execution, filesystem reads, or model calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
-use crate::behavior::{Participant, SequenceStep, SequenceView};
+use crate::behavior::{CONTINUES_LABEL, Participant, SequenceStep, SequenceView, fold_guard};
 use crate::model::{CallSite, IndexPin, SourceFile, SourceRange, Symbol, SymbolKind};
 use anyhow::{Context, Result, ensure};
 use tree_sitter::Node;
@@ -165,16 +165,18 @@ impl Builder<'_> {
                     self.limit();
                     break;
                 }
-                if let Some(mut guard) = self.step(
-                    nodes[i + 1],
-                    "branch",
-                    "only if the preceding path continues normally",
-                ) {
+                if let Some(guard) = self.step(nodes[i + 1], "branch", CONTINUES_LABEL) {
                     let rest = self.block(&nodes[i + 1..], depth + 1);
-                    guard.children = rest.steps;
                     out.continues = rest.continues;
                     out.exits |= rest.exits;
-                    out.steps.push(guard);
+                    // After a branch that draws its exit the suffix stays here (#558).
+                    match fold_guard(&mut out.steps, guard) {
+                        None => out.steps.extend(rest.steps),
+                        Some(mut guard) => {
+                            guard.children = rest.steps;
+                            out.steps.push(guard);
+                        }
+                    }
                 }
                 break;
             }
@@ -426,6 +428,7 @@ impl Builder<'_> {
             .identify(n, &self.file.text, &self.file.path)
             .unwrap_or_else(|| Participant {
                 declaration: None,
+                column: None,
                 id: "boundary:unknown".into(),
                 label: "Unknown/external operations (visual group, not object identity)".into(),
                 kind: "boundary".into(),
@@ -609,7 +612,7 @@ pub fn build(
         }
     }
     let mut b = Builder { file, seed, calls, bindings: crate::behavior_bindings::Bindings::new(tree.root_node(), &file.text), count: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
-        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
+        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, column: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not observed runtime order. Selectivity is an uncalibrated conservative heuristic. Implicit getters, coercions, iteration protocols, and other runtime effects are not expanded.".into()],
         hidden_steps: 0, truncated: false, truncated_by: vec![],
     }};

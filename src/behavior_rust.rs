@@ -1,6 +1,8 @@
 //! Rust-only adapter. No execution, filesystem reads, or model calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
-use crate::behavior::{Participant, SequenceStep, SequenceView};
+use crate::behavior::{
+    CONTINUES_LABEL, Participant, SequenceStep, SequenceView, TRY_LABEL, fold_guard, measured_call,
+};
 use crate::model::{CallSite, IndexPin, SourceFile, SourceRange, Symbol, SymbolKind};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
@@ -495,7 +497,7 @@ fn call_label<'a>(n: Node<'_>, file: &'a SourceFile) -> &'a str {
     &file.text[callee.byte_range()]
 }
 fn unresolved_boundary() -> Participant {
-    Participant { declaration: None,
+    Participant { declaration: None, column: None,
         id: "boundary:rust-unknown".into(),
         label: "Unresolved calls".into(),
         kind: "boundary".into(),
@@ -505,7 +507,7 @@ fn unresolved_boundary() -> Participant {
 fn source_hint(kind: &str, expression: &str) -> Participant {
     // The full source spelling, not its shortened label, identifies a visual
     // group. Stable across call sites; deliberately not a binding/object ID.
-    Participant { declaration: None,
+    Participant { declaration: None, column: None,
         id: format!("rust:source:{kind}:{}", hex::encode(Sha256::digest(expression.as_bytes()))),
         label: bounded(expression),
         kind: kind.into(),
@@ -555,7 +557,7 @@ fn unresolved_participant(n: Node<'_>, file: &SourceFile) -> Participant {
             if simple_receiver(receiver) {
                 source_hint("unresolvedReceiver", &file.text[receiver.byte_range()])
             } else if chain_result(receiver) {
-                Participant { declaration: None,
+                Participant { declaration: None, column: None,
                     id: "rust:syntax:chain-results".into(),
                     label: "Chain results".into(),
                     kind: "unresolvedReceiver".into(),
@@ -723,18 +725,6 @@ fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<Sequ
                 || wrap_chain(n, chain, label, &mut step.alternate)
         })
 }
-const TRY_LABEL: &str = "?: continue only on success; otherwise early return";
-const CONTINUES_LABEL: &str = "only if the preceding path continues normally";
-
-/// A call step that may carry a folded `?` (#542): a measured call, drawn as a call or, when
-/// its source-hint lanes were full, as a boundary.
-fn measured_call(step: &SequenceStep) -> bool {
-    matches!(step.kind.as_str(), "call" | "boundary")
-        && step.call_id.is_some()
-        && step.children.is_empty()
-        && step.alternate.is_empty()
-}
-
 /// The byte range of a `?`'s direct operand, through transparent parentheses, when that
 /// operand is a call (#542). A field, tuple index, await or other value is not.
 fn try_operand(n: Node<'_>) -> Option<(usize, usize)> {
@@ -775,26 +765,6 @@ fn fold_try(
             None
         }
         None => Some(branch),
-    }
-}
-
-/// Folds a "continues normally" guard into the nearest call before it in `steps` that may
-/// return early (#542), when only plain calls, which cannot leave the path themselves, come
-/// between them: that `?` is the exit the guard guards against. The guard is kept on the
-/// call's `folded` (its label and range); its children, the guarded suffix, then follow the
-/// call at the same level. Returns the guard when it could not be folded.
-fn fold_guard(steps: &mut [SequenceStep], guard: SequenceStep) -> Option<SequenceStep> {
-    let call = steps
-        .iter_mut()
-        .rev()
-        .find(|step| !(measured_call(step) && step.folded.is_empty()))
-        .filter(|step| measured_call(step) && step.folded.iter().any(|f| f.label == TRY_LABEL));
-    match call {
-        Some(call) => {
-            call.folded.push(guard);
-            None
-        }
-        None => Some(guard),
     }
 }
 
@@ -840,7 +810,7 @@ pub fn build(
         }
     }
     let mut b = Builder { file, seed, calls, count: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
-        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
+        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, column: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Rust types, traits, dispatch, cfg/attributes, implicit drops, coercions and iterator protocols are not resolved. Async bodies describe possible execution when polled, not future construction. Calls may panic or diverge; those implicit paths are not expanded.".into()], hidden_steps: 0, truncated: false, truncated_by: vec![],
     }};
     let f = if !callable(node)

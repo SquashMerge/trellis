@@ -37,7 +37,7 @@ pub enum SequenceLimit {
     WorkSteps,
     /// [`MAX_STEP_DEPTH`] step levels.
     Depth,
-    /// 20 resolved participants.
+    /// 20 participant columns (#558): many methods of one type share a column.
     Participants,
 }
 impl SequenceView {
@@ -90,6 +90,20 @@ pub struct Participant {
     pub identification: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration: Option<Symbol>,
+    /// The type or module whose column this participant is drawn in (#558). Set for the
+    /// seed and every exact target of an enriched view; a syntax hint has none and keeps
+    /// its own column. This participant stays the exact identity of the call's target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<SequenceColumn>,
+}
+/// One drawn column of a sequence (#558): a type or a module, holding one or more
+/// participants. A display grouping: it proves nothing about receivers at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SequenceColumn {
+    /// Identity within the view: equal for two participants of one type or module.
+    pub id: String,
+    pub label: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -113,11 +127,12 @@ pub struct SequenceStep {
     /// an expanded direct/constructor callee (#522). Absent for the seed's own steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<String>,
-    /// Control-flow steps folded into this call (#542): a Rust `?` early-return branch (its
-    /// `alternate` keeps the early return) and the "only if the preceding path continues
-    /// normally" guard that followed it, whose `children` now follow this step directly.
-    /// The call is marked "may return early"; nothing is dropped. Folded steps are not
-    /// counted against any step bound.
+    /// Control-flow steps folded into this step. On a call (#542): a Rust `?` early-return
+    /// branch (its `alternate` keeps the early return) and the "only if the preceding path
+    /// continues normally" guard that followed it, whose `children` now follow this step
+    /// directly. On a branch that draws an exit (#558): that guard. The step is marked as
+    /// one that may leave the path; nothing is dropped. Folded steps are not counted
+    /// against any step bound but the work bound.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folded: Vec<SequenceStep>,
     /// Why this step is incidental (#543): hidden unless `showAll`, and counted in
@@ -303,6 +318,9 @@ pub(crate) fn build_sequence_work(
 
 /// The step levels a view may carry: top-level steps are at depth 0, the deepest at 23.
 pub const MAX_STEP_DEPTH: usize = 24;
+/// The drawn participant columns of one view, the seed's included (#558). Participants are
+/// bounded by the steps that target them; a target of a column already drawn costs none.
+pub const MAX_COLUMNS: usize = 20;
 /// The visible step bound of one view, expanded callee bodies included. Hidden steps (an
 /// incidental call, a hidden logging wrapper) do not count (#536).
 pub const MAX_STEPS: usize = 200;
@@ -323,6 +341,56 @@ pub(crate) fn adapter_limit(view: &mut SequenceView, count: usize) {
     view.truncated = true;
     if count >= MAX_WORK_STEPS {
         view.limit(SequenceLimit::WorkSteps);
+    }
+}
+
+pub(crate) const TRY_LABEL: &str = "?: continue only on success; otherwise early return";
+pub(crate) const CONTINUES_LABEL: &str = "only if the preceding path continues normally";
+
+/// A measured call step, drawn as a call or, when its source-hint lanes were full, as a
+/// boundary: it may carry a folded `?` (#542).
+pub(crate) fn measured_call(step: &SequenceStep) -> bool {
+    matches!(step.kind.as_str(), "call" | "boundary")
+        && step.call_id.is_some()
+        && step.children.is_empty()
+        && step.alternate.is_empty()
+}
+
+/// Whether `steps` draw a way off the path: a `return` or `throw` step, or a call carrying
+/// a folded `?`. An opaque boundary, a `break` and an unbounded loop may leave it too, but
+/// they say nothing the reader can follow, so they do not count.
+fn draws_exit(steps: &[SequenceStep]) -> bool {
+    steps.iter().any(|step| {
+        matches!(step.kind.as_str(), "return" | "throw")
+            || !step.folded.is_empty() && measured_call(step)
+            || draws_exit(&step.children)
+            || draws_exit(&step.alternate)
+    })
+}
+
+/// Folds a "continues normally" guard into the step it guards against, when that step is
+/// drawn and says so, leaving the guarded suffix to follow it at the same level. Only plain
+/// calls, which cannot leave the path themselves, may stand between them. The step is:
+///
+/// - a call carrying a folded `?` (#542): that `?` is the exit; or
+/// - an `if` or `match` whose own frame draws an exit (#558).
+///
+/// Anything else keeps its guard, returned here. Lossless: the guard stays on the step's
+/// `folded`, with its label and range, and the step is marked as one that may leave.
+pub(crate) fn fold_guard(steps: &mut [SequenceStep], guard: SequenceStep) -> Option<SequenceStep> {
+    let plain = |step: &&mut SequenceStep| measured_call(step) && step.folded.is_empty();
+    let Some(step) = steps.iter_mut().rev().find(|step| !plain(step)) else {
+        return Some(guard);
+    };
+    let may_return = step.folded.iter().any(|f| f.label == TRY_LABEL);
+    let control = step.kind == "branch"
+        && (step.label.starts_with("if ") || step.label.starts_with("match:"))
+        && (draws_exit(&step.children) || draws_exit(&step.alternate));
+    if measured_call(step) && may_return || control {
+        step.folded.push(guard);
+        None
+    } else {
+        Some(guard)
     }
 }
 

@@ -90,12 +90,10 @@ fn branches_and_return_guard_suffix() {
         .unwrap();
     assert_eq!(calls(&branch.children), ["failed"]);
     assert_eq!(calls(&branch.alternate), ["other"]);
-    assert!(!view.steps.iter().any(|s| s.label == "after"));
-    assert!(
-        view.steps
-            .iter()
-            .any(|s| s.label.contains("continues normally") && calls(&s.children) == ["after"])
-    );
+    // The `if` draws its return: the guard folds into it and the suffix follows (#558).
+    assert_eq!(branch.folded.len(), 1);
+    assert!(branch.folded[0].label.contains("continues normally"));
+    assert!(view.steps.iter().any(|s| s.label == "after"));
 }
 #[test]
 fn question_mark_guards_arguments_outer_call_and_suffix() {
@@ -127,22 +125,91 @@ fn question_mark_guards_arguments_outer_call_and_suffix() {
     assert!(view.steps[1..].iter().all(|s| s.folded.is_empty()));
 }
 
-/// #542: a guard folds only into the `?` call it guards against: after an `if` that
-/// returns, the guard stays and nests the rest.
+const GUARD: &str = "only if the preceding path continues normally";
+
+fn guards(steps: &[SequenceStep]) -> Vec<&SequenceStep> {
+    flatten(steps)
+        .into_iter()
+        .filter(|s| s.label == GUARD)
+        .collect()
+}
+
+/// #558: a guard folds into the `if` it guards against, each into its own, and the rest
+/// follows at the same level.
 #[test]
-fn guard_after_another_exit_is_not_folded() {
+fn guard_folds_into_the_if_that_draws_its_exit() {
     let (_, view) = fixture(
-        "fn run(c: bool) -> Option<()> { a()?; if c { return None; } b(); None }",
+        "fn run(c: bool, d: bool) -> Option<()> { a()?; if c { return None; } b(); if d { return None; } e(); None }",
         "run",
     );
-    assert_eq!(view.steps[0].label, "a");
+    let labels: Vec<_> = view.steps.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels, ["a", "if c", "b", "if d", "e"]);
     assert_eq!(view.steps[0].folded.len(), 2);
-    let guard = view
-        .steps
+    for at in [1, 3] {
+        let folded: Vec<_> = view.steps[at].folded.iter().map(|f| &f.label).collect();
+        assert_eq!(folded, [GUARD], "{}", view.steps[at].label);
+        assert!(view.steps[at].folded[0].children.is_empty());
+    }
+    assert!(view.steps[2].folded.is_empty(), "a plain call is unmarked");
+    assert!(guards(&view.steps).is_empty(), "no guard frame is drawn");
+}
+
+/// #558: a `match` draws its exit in an arm; a `?` call inside an `if` draws it too.
+#[test]
+fn guard_folds_into_a_match_or_an_if_holding_a_question_mark() {
+    let (_, view) = fixture(
+        "fn run(x: Option<u8>, c: bool) -> Option<u8> { match x { Some(_) => a(), None => return None }; b(); if c { d()?; } e(); None }",
+        "run",
+    );
+    let at = |label: &str| view.steps.iter().find(|s| s.label.starts_with(label));
+    assert_eq!(at("match:").unwrap().folded.len(), 1);
+    assert_eq!(at("if c").unwrap().folded.len(), 1);
+    assert!(at("b").is_some() && at("e").is_some());
+    assert!(guards(&view.steps).is_empty());
+}
+
+/// #558: an exit the frame does not draw keeps its guard: an opaque macro, a `break`, a
+/// loop. Folding would mark a step for an exit nothing on it shows.
+#[test]
+fn guard_stays_after_an_exit_the_step_does_not_draw() {
+    for (source, rest) in [
+        ("fn run(c: bool) { if c { custom!(); } after(); }", "after"),
+        (
+            "fn run(c: bool) { loop { if c { break; } after(); } }",
+            "after",
+        ),
+        (
+            "fn run(xs: Vec<u8>) { for x in xs { y(x); } after(); }",
+            "after",
+        ),
+    ] {
+        let (_, view) = fixture(source, "run");
+        let frames = guards(&view.steps);
+        assert_eq!(frames.len(), 1, "{source}: {view:#?}");
+        assert_eq!(calls(&frames[0].children), [rest], "{source}");
+        assert!(
+            flatten(&view.steps).iter().all(|s| s.folded.is_empty()),
+            "{source}"
+        );
+    }
+}
+
+/// #558: a kept guard does not absorb the next one, and the `if` inside it folds its own.
+#[test]
+fn guard_after_an_opaque_step_stays_and_nests_the_fold_inside_it() {
+    let (_, view) = fixture(
+        "fn run(c: bool) { custom!(); if c { return; } after(); }",
+        "run",
+    );
+    let frames = guards(&view.steps);
+    assert_eq!(frames.len(), 1, "{view:#?}");
+    let labels: Vec<_> = frames[0]
+        .children
         .iter()
-        .find(|s| s.label == "only if the preceding path continues normally")
-        .expect("the guard after the if stays");
-    assert_eq!(calls(&guard.children), ["b"]);
+        .map(|s| s.label.as_str())
+        .collect();
+    assert_eq!(labels, ["if c", "after"]);
+    assert_eq!(frames[0].children[0].folded.len(), 1);
 }
 
 /// #546 review: a `?` folds only into the call that is its direct operand. A tuple index or
@@ -219,7 +286,9 @@ fn match_guards_remain_inside_alternatives() {
     assert_eq!(branch.alternate.len(), 3);
     assert_eq!(calls(&branch.alternate[0].children), ["check", "yes"]);
     assert_eq!(calls(&branch.alternate[1].children), ["no"]);
-    assert!(!view.steps.iter().any(|s| s.label == "after"));
+    // The arm draws its return: the guard folds into the match (#558).
+    assert_eq!(branch.folded.len(), 1);
+    assert!(view.steps.iter().any(|s| s.label == "after"));
 }
 #[test]
 fn loops_are_not_unrolled_and_return_hides_iteration_tail() {

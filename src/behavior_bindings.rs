@@ -329,6 +329,7 @@ impl Bindings {
             if let Some((module, symbol)) = binding.and_then(|b| b.import.as_ref()) {
                 return Some(Participant {
                     declaration: None,
+                    column: None,
                     id: format!("import:{}:{}", module.len(), module),
                     label: module.clone(),
                     kind: "import".into(),
@@ -356,13 +357,14 @@ impl Bindings {
                         | "Error"
                 )
             {
-                return Some(Participant { declaration: None, id:format!("builtin:{name}"), label:name.into(), kind:"builtin".into(), identification:"Unshadowed standard JavaScript global in cached syntax; no detected writes. Member implementation and runtime identity are not resolved.".into() });
+                return Some(Participant { declaration: None, column: None, id:format!("builtin:{name}"), label:name.into(), kind:"builtin".into(), identification:"Unshadowed standard JavaScript global in cached syntax; no detected writes. Member implementation and runtime identity are not resolved.".into() });
             }
         }
         if callee.kind() == "member_expression" || (name == "Buffer" && binding.is_none() && clean)
         {
             return Some(Participant {
                 declaration: None,
+                column: None,
                 id: format!(
                     "receiver:{}:{}:{}:{name}",
                     path.len(),

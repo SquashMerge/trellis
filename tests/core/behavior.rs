@@ -148,10 +148,10 @@ fn exits_omit_unreachable_and_guard_remaining_paths() {
         "function run(x) { if (x) return early(); later(); return done(); forbidden(); }",
         "run",
     );
-    assert_eq!(view.steps.len(), 2);
-    assert_eq!(view.steps[1].kind, "branch");
-    assert!(view.steps[1].label.contains("continues normally"));
-    assert_eq!(calls(&view.steps[1].children), vec!["later", "done"]);
+    // The `if` draws its return: the guard folds into it and the suffix follows (#558).
+    assert_eq!(view.steps[0].folded.len(), 1);
+    assert!(view.steps[0].folded[0].label.contains("continues normally"));
+    assert_eq!(calls(&view.steps[1..]), vec!["later", "done"]);
     assert!(!calls(&view.steps).contains(&"forbidden"));
     assert!(view.warnings.iter().any(|s| s.contains("unreachable")));
     let (_, both) = fixture(

@@ -1208,13 +1208,15 @@ async function renderFilesMini(current) {
   const readSource = step => { if (current()) return openFilesLocation(step, revision); };
   const options = {showDetails:false, isCurrent:current, onOpenTarget:sequenceTargetAction(data, current)};
   options.onUnsupported = reason => { if (current()) { window.TrellisSequence.render(container, data, readSource, expanded, options); $("files-mini-state").textContent += ` · Pele fell back: ${reason}`; } };
-  const outcome = window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
+  const empty = window.TrellisSequence.emptySummary(data);
+  const outcome = empty ? {status:"empty"} : window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
   if (!current() || outcome.status === "stale") return;
-  if (outcome.status !== "rendered") window.TrellisSequence.render(container, data, readSource, expanded, options);
+  if (outcome.status === "empty") window.TrellisSequence.renderEmpty(container, empty);
+  else if (outcome.status !== "rendered") window.TrellisSequence.render(container, data, readSource, expanded, options);
   // One short status line; the sequence's caveats and diagnostics live behind the ⓘ (#526).
   const notes = [...(data.warnings || [])];
   if (data.truncated) notes.push("Truncated by sequence limits; Open full shows the same bounded steps.");
-  if (outcome.status !== "rendered") notes.push(`Pele fell back: ${outcome.reason}`);
+  if (outcome.status !== "rendered" && !empty) notes.push(`Pele fell back: ${outcome.reason}`);
   $("files-mini-notes").replaceChildren(...notes.map(note => element("li", note, "detail")));
   $("files-mini-state").textContent = `Indexed revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps" : ""}${notes.length ? ` · ${notes.length} ${notes.length === 1 ? "note" : "notes"} in ⓘ` : ""}`;
   fitFilesMini();
@@ -1586,17 +1588,20 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     };
     const diagram = $("sequence-diagram");
     const expanded = new Set();
-    const outcome = window.TrellisPeleSequence
+    // Every step hidden draws no diagram: one box would say nothing happens (#558).
+    const empty = window.TrellisSequence.emptySummary(data);
+    const outcome = empty ? {status:"empty"} : window.TrellisPeleSequence
       ? await window.TrellisPeleSequence.render(diagram, data, readSource, expanded, options)
       : {status:"unsupported", reason:"Pele asset unavailable"};
     if (!current() || !IndexPin.equal(status?.revision, revision)) return;
     if (outcome.status === "stale") return;
-    if (outcome.status !== "rendered") {
+    if (outcome.status === "empty") window.TrellisSequence.renderEmpty(diagram, empty, () => { $("all-steps").checked = true; void loadSequence(); });
+    else if (outcome.status !== "rendered") {
       window.TrellisSequence.render(diagram, data, readSource, expanded, options);
     }
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
     renderIncidentalToggle(data);
-    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
+    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
     published = true;
   }, current, "sequence-state");
@@ -1644,6 +1649,18 @@ $("show-hidden-files").addEventListener("change", event => {
 $("all-methods").addEventListener("change", renderFiles);
 $("all-steps").addEventListener("change", () => loadSequence());
 $("sequence-incidental")?.addEventListener("click", () => { $("all-steps").checked = !$("all-steps").checked; void loadSequence(); });
+// Fit is offered only while the diagram is wider than the panel, or to undo itself (#558).
+// Every drawing replaces the panel's children, whichever renderer drew it.
+function renderSequenceFit() {
+  const diagram = $("sequence-diagram"), button = $("sequence-fit");
+  if (!diagram || !button) return;
+  const fitted = diagram.hasAttribute("data-fit"), width = diagram.querySelector(":scope > svg")?.viewBox?.baseVal?.width || 0;
+  button.hidden = !width || !fitted && width <= diagram.clientWidth;
+  button.setAttribute("aria-pressed", String(fitted));
+}
+$("sequence-fit")?.addEventListener("click", () => { $("sequence-diagram").toggleAttribute("data-fit"); renderSequenceFit(); });
+if (typeof MutationObserver === "function" && $("sequence-diagram")) new MutationObserver(renderSequenceFit).observe($("sequence-diagram"), {childList:true});
+if (typeof ResizeObserver === "function" && $("sequence-diagram")) new ResizeObserver(renderSequenceFit).observe($("sequence-diagram"));
 $("more-files").addEventListener("click", () => perform(() => $("file-filter").value.trim() && filterResults?.next != null ? searchFiles(filterResults.next) : loadFiles(), $("more-files")));
 
 $("method-source").addEventListener("click", () => { if (selectedMethod && status) perform(() => showSource(selectedMethod, status.revision)); });
