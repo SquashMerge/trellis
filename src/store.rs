@@ -9818,8 +9818,9 @@ fn write_semantic_tuple(
 }
 
 fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
-    // The selection goes first, in a step of its own: a pending revision that still selects a
-    // batch has had nothing released, so a reselection can still return it to retained.
+    // The selection goes first, in a chunk of its own that later chunks of the unit commit
+    // with: a pending revision that still selects a batch has had nothing released, so a
+    // reselection can still return it to retained.
     if db.execute(
         "DELETE FROM semantic_revision_raw_selections WHERE revision_id=?1",
         [revision],

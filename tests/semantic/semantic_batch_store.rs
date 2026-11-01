@@ -4738,6 +4738,10 @@ fn a_partly_released_import_revision_is_not_brought_back() {
     fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
     world.publish(&world.write(&fixture)).unwrap();
     world.store.set_retention_clock_for_tests(2_002, 1_002);
+    // One chunk per unit, so the reselection lands on a partly released revision.
+    world
+        .store
+        .set_maintenance_unit_budget_for_tests(std::time::Duration::ZERO);
     let leader = world.store.publication_for_tests().unwrap();
     for _ in 0..100 {
         if revision_state(&world, import) == "pending" {
@@ -4750,13 +4754,14 @@ fn a_partly_released_import_revision_is_not_brought_back() {
                 .unwrap()
         );
     }
-    // One more unit releases its selections.
+    // One more unit releases its selections and nothing else.
     assert!(
         world
             .store
             .maintain_one_revision_step_for_tests(&leader)
             .unwrap()
     );
+    assert_eq!(revision_state(&world, import), "pending");
     drop(leader);
     world.publish(&first).unwrap();
     run_maintenance(&world);
