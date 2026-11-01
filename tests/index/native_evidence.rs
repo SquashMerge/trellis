@@ -1250,7 +1250,7 @@ fn direct_native_opaque_macro_does_not_overflow_or_invent_calls() {
 }
 
 #[test]
-fn nonopaque_rust_nesting_retains_fail_closed_depth_guard() {
+fn over_deep_syntax_is_a_gap_and_the_rest_of_the_document_is_measured() {
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
@@ -1260,23 +1260,47 @@ fn nonopaque_rust_nesting_retains_fail_closed_depth_guard() {
     };
     let root = tempfile::tempdir().unwrap();
     let source = format!(
-        "fn run() {{ {} actual(); {} }}",
+        "fn run() {{ {} actual(); {} }}\nfn after() {{ measured(); }}\n",
         "{".repeat(150),
         "}".repeat(150)
     );
-    fs::write(root.path().join("deep.rs"), source).unwrap();
+    fs::write(root.path().join("deep.rs"), &source).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
-    let error = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap_err();
+    let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
+    let coverage = &artifact.coverage[0];
+    assert_eq!(coverage.state, "partial");
     assert!(
-        error
-            .to_string()
-            .contains("native extraction work budget exceeded"),
-        "{error:#}"
+        coverage.diagnostic.as_deref().unwrap().contains("bounds"),
+        "{coverage:?}"
     );
+    let spellings: Vec<_> = artifact
+        .calls
+        .iter()
+        .filter_map(|call| call.spelling.as_deref())
+        .collect();
+    assert_eq!(spellings, ["measured"]);
+    let after = artifact
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("after"))
+        .unwrap();
+    assert!(
+        artifact
+            .search_cards
+            .iter()
+            .any(|card| card.syntax_id == after.syntax_id)
+    );
+    for family in &artifact.capability_reports[0].families {
+        let [gap] = family.gaps.as_slice() else {
+            panic!("{family:?}");
+        };
+        assert!(source[gap.range.start..gap.range.end].contains("actual"));
+        assert!(!source[gap.range.start..gap.range.end].contains("measured"));
+    }
 }
 
 #[test]

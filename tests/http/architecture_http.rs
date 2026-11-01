@@ -252,6 +252,101 @@ async fn architecture_succeeds_for_callables_inside_measured_macros() {
         "{measured}"
     );
 }
+async fn view(app: axum::Router, key: &str, route: &str) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/checkouts/{key}/{route}"))
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// #554: repository content is untrusted, but one pathological file is a gap in the
+/// views, never a refusal of the whole checkout.
+#[tokio::test]
+async fn one_over_deep_file_is_partial_and_every_whole_checkout_view_is_served() {
+    let nest = |open: &str, close: &str, inner: &str| {
+        format!("{}{inner}{}", open.repeat(400), close.repeat(400))
+    };
+    let cases = [
+        (
+            "src/deep.rs",
+            format!("pub fn deep() {{ custom!({}); }}\n", nest("(", ")", "")),
+        ),
+        (
+            "src/deep.rs",
+            format!("pub fn deep() -> i32 {{ {} }}\n", nest("(", ")", "1")),
+        ),
+        (
+            "src/deep.js",
+            format!("function deep() {{ return {}; }}\n", nest("[", "]", "")),
+        ),
+        (
+            "src/Deep.java",
+            format!(
+                "class Deep {{ int d() {{ return {}; }} }}\n",
+                nest("(", ")", "1")
+            ),
+        ),
+        (
+            "src/deep.py",
+            format!("def deep():\n    return {}\n", nest("(", ")", "1")),
+        ),
+    ];
+    for (path, source) in cases {
+        let (base, _runtime, browser, key) = fixture_with_sources(
+            false,
+            &[
+                (path, source.as_str()),
+                ("src/a.js", "import { b } from './b.js'; b();\n"),
+                ("src/b.js", "export function b() {}\n"),
+            ],
+        )
+        .await;
+        write_rules(
+            &base,
+            "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js','deep/**','zero/**']",
+        );
+        let app = browser.router();
+        let (status, body) = request(app.clone(), &key, "").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        let payload = &body["payload"];
+        assert_eq!(payload["partialFiles"][0]["path"], path, "{payload}");
+        assert_eq!(payload["references"]["partialFiles"][0]["path"], path);
+        assert_eq!(payload["rules"]["partialFiles"][0]["path"], path);
+        assert!(
+            payload["references"]["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|limit| limit.as_str().unwrap().contains("partialFiles"))
+        );
+        assert!(
+            payload["references"]["counts"]["mappedSites"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        let modules = payload["modules"].as_array().unwrap();
+        assert!(modules.iter().any(|m| m["identity"]["path"] == "src/a.js"));
+        let (status, metrics) = view(app.clone(), &key, "metrics").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {metrics}");
+        assert_eq!(metrics["payload"]["partialFiles"][0]["path"], path);
+        let (status, classes) = view(app.clone(), &key, "classes").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {classes}");
+    }
+}
+
 #[tokio::test]
 async fn architecture_role_filters_metrics_without_changing_reference_evidence() {
     let (base, _runtime, browser, key) = fixture_with_roles(true).await;

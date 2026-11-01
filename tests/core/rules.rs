@@ -1561,3 +1561,45 @@ require=[{calls="any"}]
     let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
     rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
 }
+
+#[test]
+fn an_over_deep_file_is_partial_and_rules_evaluate_the_rest() {
+    let deep = format!(
+        "class Deep {{ int d() {{ return {}1{}; }} }}\nclass Later extends Base {{}}\n",
+        "(".repeat(400),
+        ")".repeat(400)
+    );
+    let input = snapshot(&[("A.java", "class A extends Base {}"), ("Deep.java", &deep)]);
+    let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    let config = rules::parse(
+        r#"version=1
+[roles.inherited]
+select={extends="Base"}
+[roles.any]
+select={paths=["**"]}
+[[rules]]
+id="inherited-calls"
+for_each="inherited"
+require=[{calls="any"}]
+"#,
+    )
+    .unwrap();
+    let evaluated = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    assert_eq!(evaluated["partialFiles"][0]["path"], "Deep.java");
+    assert_eq!(evaluated["partialFiles"][0]["reason"], "depth_limit");
+    assert!(
+        evaluated["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|limit| limit.as_str().unwrap().contains("partialFiles"))
+    );
+    let targets: Vec<_> = evaluated["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|instance| instance["target"]["path"].as_str().unwrap())
+        .collect();
+    assert!(targets.contains(&"A.java"), "{evaluated}");
+    assert!(targets.contains(&"Deep.java"), "{evaluated}");
+}

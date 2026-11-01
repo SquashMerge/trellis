@@ -6070,3 +6070,402 @@ fn references_javascript_review_500_consumers_share_a_200_name_barrel_within_bud
     assert!(data["tests"].as_array().unwrap().is_empty());
     assert!(data["externalPackages"].as_array().unwrap().is_empty());
 }
+
+/// One compile-shaped file of each kind that nests past the walk bounds.
+fn over_deep_sources(depth: usize) -> Vec<(&'static str, String)> {
+    let nest = |open: &str, close: &str, inner: &str| {
+        format!("{}{inner}{}", open.repeat(depth), close.repeat(depth))
+    };
+    vec![
+        (
+            "deep.rs",
+            format!("pub fn deep() {{ custom!({}); }}\n", nest("(", ")", "")),
+        ),
+        (
+            "deep.rs",
+            format!("pub fn deep() -> i32 {{ {} }}\n", nest("(", ")", "1")),
+        ),
+        (
+            "deep.rs",
+            format!(
+                "pub fn deep() {{ {} }}\n",
+                nest("{", "}", "crate::ok::run();")
+            ),
+        ),
+        (
+            "deep.rs",
+            format!("{}\n", nest("mod a {", "}", "pub fn run() {}")),
+        ),
+        ("deep.rs", format!("use a::{};\n", nest("{b::", "}", "c"))),
+        (
+            "deep.js",
+            format!("function deep() {{ return {}; }}\n", nest("[", "]", "")),
+        ),
+        (
+            "deep.js",
+            format!("function deep() {{ let {} = 1; }}\n", nest("[", "]", "x")),
+        ),
+        (
+            "deep.js",
+            format!("function deep() {{ return a{}; }}\n", ".b".repeat(depth)),
+        ),
+        (
+            "Deep.java",
+            format!(
+                "class Deep {{ int d() {{ return {}; }} }}\n",
+                nest("(", ")", "1")
+            ),
+        ),
+        ("Deep.java", format!("{}\n", nest("class A {", "}", ""))),
+        (
+            "deep.py",
+            format!("def deep():\n    return {}\n", nest("(", ")", "1")),
+        ),
+    ]
+}
+
+#[test]
+fn an_over_deep_file_is_partial_and_the_rest_of_the_checkout_is_served() {
+    for (path, source) in over_deep_sources(400) {
+        let input = snapshot(&[
+            ("src/lib.rs", "pub mod ok; pub mod other;"),
+            ("src/ok.rs", "pub fn run() { crate::other::run(); }"),
+            ("src/other.rs", "pub fn run() {}"),
+            (path, source.as_str()),
+        ]);
+        let projection = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+        let data = &projection.data;
+        let partial = data["partialFiles"].as_array().unwrap();
+        assert_eq!(partial.len(), 1, "{path}: {source:.60}: {partial:?}");
+        assert_eq!(partial[0]["path"], path);
+        assert_eq!(partial[0]["reason"], "depth_limit");
+        assert!(partial[0]["subtrees"].as_u64().unwrap() >= 1);
+        let range = partial[0]["range"]["start"].as_u64().unwrap() as usize
+            ..partial[0]["range"]["end"].as_u64().unwrap() as usize;
+        assert!(range.start > 0 && range.end <= source.len());
+        assert!(
+            data["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|limit| limit.as_str().unwrap().contains("partialFiles"))
+        );
+        assert!(
+            data["production"].as_array().unwrap().iter().any(|edge| {
+                edge["source"]["path"] == "src/ok.rs" && edge["target"]["path"] == "src/other.rs"
+            }),
+            "{path}: {data}"
+        );
+    }
+}
+
+#[test]
+fn a_path_filter_still_reports_a_partial_file_that_feeds_resolution() {
+    let (path, source) = over_deep_sources(400).remove(5);
+    let input = snapshot(&[("ok.js", "export const ok = 1;"), (path, source.as_str())]);
+    let projection = references::project(&input, &["ok.js".to_owned()], 5, &mut || Ok(())).unwrap();
+    assert_eq!(projection.data["partialFiles"][0]["path"], path);
+}
+
+#[test]
+fn nesting_at_any_depth_around_the_bound_indexes_and_projects() {
+    // An enclosing node records its name, callee and invocation before walking its children,
+    // so a child skipped at the bound can span one: the gap must not claim that candidate.
+    let shapes: [(&str, &str, &str, &str, &str); 7] = [
+        ("deep.rs", "fn f() { ", "g(", "1", ")"),
+        ("deep.rs", "fn f() { ", "a::g(", "1", ")"),
+        ("deep.rs", "fn f() { ", "x.g(", "1", ")"),
+        ("deep.rs", "", "fn g() {", "", "}"),
+        ("deep.js", "function f() { ", "a.g(", "1", ")"),
+        (
+            "Deep.java",
+            "class Deep { int d() { return ",
+            "a.g(",
+            "1",
+            ")",
+        ),
+        ("deep.py", "x = ", "a.g(", "1", ")"),
+    ];
+    for (path, prefix, open, inner, close) in shapes {
+        for depth in 30..140 {
+            let tail = match (prefix, path) {
+                ("", _) => "",
+                (_, "deep.rs") => "; }",
+                (_, "deep.js") => "; }",
+                (_, "Deep.java") => "; } }",
+                _ => "",
+            };
+            let source = format!(
+                "{prefix}{}{inner}{}{tail}\n",
+                open.repeat(depth),
+                close.repeat(depth)
+            );
+            let input = snapshot(&[(path, source.as_str())]);
+            references::project(&input, &[], 5, &mut || Ok(()))
+                .unwrap_or_else(|error| panic!("{path} {open} at {depth}: {error:#}"));
+        }
+    }
+}
+
+#[test]
+fn extremely_deep_sources_stay_bounded_and_never_overflow_the_stack() {
+    for (path, source) in over_deep_sources(50_000) {
+        let input = snapshot(&[("ok.rs", "pub fn run() {}"), (path, source.as_str())]);
+        let projection = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+        assert_eq!(projection.data["partialFiles"][0]["path"], path);
+    }
+}
+
+#[test]
+fn a_file_past_the_visit_bound_is_partial_too() {
+    let source = format!("const v = [{}];\n", "0,".repeat(1_000_001));
+    let input = snapshot(&[
+        ("ok.js", "export const ok = 1;"),
+        ("wide.js", source.as_str()),
+    ]);
+    let projection = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    assert_eq!(projection.data["partialFiles"][0]["path"], "wide.js");
+    assert_eq!(projection.data["partialFiles"][0]["reason"], "visit_limit");
+}
+
+#[test]
+fn a_hazard_past_the_walk_bounds_keeps_the_export_proof_unknown() {
+    let resolve = |deep: usize| {
+        let barrel = format!(
+            "export * from './p.js';\nconst d = {}module{};\n",
+            "[".repeat(deep),
+            "]".repeat(deep)
+        );
+        let input = snapshot(&[
+            ("barrel.js", barrel.as_str()),
+            ("p.js", "export const name = 1;\n"),
+            ("use.js", "import { name } from './barrel.js';\nname;\n"),
+        ]);
+        let data = references::project(&input, &[], 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        (
+            data["production"].clone(),
+            data["unresolved"].as_array().unwrap().len(),
+        )
+    };
+    let (shallow, shallow_unresolved) = resolve(2);
+    let (deep, deep_unresolved) = resolve(200);
+    assert!(shallow_unresolved >= 1);
+    assert_eq!(deep_unresolved, shallow_unresolved);
+    assert_eq!(
+        deep.as_array().unwrap().len(),
+        shallow.as_array().unwrap().len()
+    );
+
+    let resolve = |deep: usize| {
+        let module = format!(
+            "from p import *\n{}exec(code){}\n",
+            "[".repeat(deep),
+            "]".repeat(deep)
+        );
+        let input = snapshot(&[
+            ("a.py", module.as_str()),
+            ("p.py", "name = 1\n"),
+            ("use.py", "from a import name\n"),
+        ]);
+        let data = references::project(&input, &[], 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        data["unresolved"].as_array().unwrap().len()
+    };
+    assert_eq!(resolve(200), resolve(2));
+}
+
+#[test]
+fn a_rust_use_list_past_the_walk_bounds_names_its_file() {
+    let deep = format!("use a::{}c{};\n", "{b::".repeat(100), "}".repeat(100));
+    let input = snapshot(&[("deep.rs", deep.as_str())]);
+    let data = references::project(&input, &[], 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(data["partialFiles"][0]["path"], "deep.rs");
+}
+
+/// Production edges and unresolved sites, for comparing a shallow and a deep spelling.
+fn outcome(files: &[(&str, &str)]) -> (Vec<(String, String)>, usize) {
+    let input = snapshot(files);
+    let data = references::project(&input, &[], 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let mut edges: Vec<_> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| {
+            (
+                edge["source"]["path"].as_str().unwrap().to_owned(),
+                edge["target"]["path"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    edges.sort();
+    (edges, data["unresolved"].as_array().unwrap().len())
+}
+
+#[test]
+fn a_rust_import_past_the_bound_never_lets_a_wildcard_win() {
+    let target = |depth: usize| {
+        let consumer = format!(
+            "use crate::p::*; use {}crate::q as foo{}; fn run() {{ foo::f(); }}\n",
+            "{".repeat(depth),
+            "}".repeat(depth)
+        );
+        outcome(&[
+            ("src/lib.rs", "mod p; mod q; mod consumer;\n"),
+            ("src/p.rs", "pub mod foo { pub fn f() {} }\n"),
+            ("src/q.rs", "pub fn f() {}\n"),
+            ("src/consumer.rs", consumer.as_str()),
+        ])
+        .0
+    };
+    let wrong = ("src/consumer.rs".to_owned(), "src/p.rs".to_owned());
+    let right = ("src/consumer.rs".to_owned(), "src/q.rs".to_owned());
+    assert!(target(2).contains(&right));
+    assert!(!target(2).contains(&wrong));
+    assert!(!target(130).contains(&wrong), "{:?}", target(130));
+}
+
+#[test]
+fn a_java_import_past_the_bound_keeps_the_type_root_unknown() {
+    let edges = |depth: usize| {
+        let package = "a.".repeat(depth);
+        let path = format!("{}Outer.java", package.replace('.', "/"));
+        let outer = format!(
+            "package {};\npublic class Outer {{ public static class pkg {{ public static class Target {{}} }} }}\n",
+            package.trim_end_matches('.')
+        );
+        let consumer =
+            format!("import static {package}Outer.pkg;\nclass Use {{ pkg.Target value; }}\n");
+        outcome(&[
+            (path.as_str(), outer.as_str()),
+            ("pkg/Target.java", "package pkg;\npublic class Target {}\n"),
+            ("Use.java", consumer.as_str()),
+        ])
+        .0
+    };
+    let wrong = ("Use.java".to_owned(), "pkg/Target.java".to_owned());
+    assert!(!edges(2).contains(&wrong));
+    assert!(!edges(140).contains(&wrong), "{:?}", edges(140));
+}
+
+#[test]
+fn a_java_package_past_the_bound_leaves_its_own_names_unknown() {
+    let deep = format!(
+        "package {};\nclass Use {{ pkg.Target value; }}\nclass pkg {{ static class Target {{}} }}\n",
+        ["a"; 140].join(".")
+    );
+    let (edges, _) = outcome(&[
+        ("pkg/Target.java", "package pkg;\npublic class Target {}\n"),
+        ("Use.java", deep.as_str()),
+    ]);
+    assert!(
+        edges.iter().all(|(_, target)| target != "pkg/Target.java"),
+        "{edges:?}"
+    );
+}
+
+#[test]
+fn a_binding_past_the_bound_never_lets_a_star_export_win() {
+    // A deep explicit export shadows the star's name, as a shallow one does.
+    let target = |depth: usize| {
+        let barrel = format!(
+            "export * from './p.js';\nexport const {}name{} = [];\n",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        outcome(&[
+            ("barrel.js", barrel.as_str()),
+            ("p.js", "export const name = 1;\n"),
+            ("use.js", "import { name } from './barrel.js';\nname;\n"),
+        ])
+    };
+    let wrong = ("barrel.js".to_owned(), "p.js".to_owned());
+    assert_eq!(target(2).0.contains(&wrong), target(130).0.contains(&wrong));
+
+    let target = |depth: usize| {
+        let module = format!(
+            "from p import *\n{}name{} = 1\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        outcome(&[
+            ("a.py", module.as_str()),
+            ("p.py", "name = 1\n"),
+            ("use.py", "from a import name\n"),
+        ])
+    };
+    let shallow = target(2);
+    let deep = target(130);
+    assert!(
+        !deep
+            .0
+            .iter()
+            .any(|(source, target)| source == "use.py" && target == "p.py")
+            || shallow
+                .0
+                .iter()
+                .any(|(source, target)| source == "use.py" && target == "p.py"),
+        "{shallow:?} {deep:?}"
+    );
+
+    // A Python import nested past the bound shadows a star the same way.
+    let target = |depth: usize| {
+        let nest: String = (0..depth)
+            .map(|level| format!("{}if x:\n", " ".repeat(level)))
+            .collect();
+        let module = format!(
+            "from p import *\n{nest}{}from q import name\n",
+            " ".repeat(depth)
+        );
+        outcome(&[
+            ("a.py", module.as_str()),
+            ("p.py", "name = 1\n"),
+            ("q.py", "name = 2\n"),
+            ("use.py", "from a import name\n"),
+        ])
+    };
+    let wrong = ("use.py".to_owned(), "p.py".to_owned());
+    assert!(!target(130).0.contains(&wrong), "{:?}", target(130));
+}
+
+#[test]
+fn a_rust_import_past_the_bound_leaves_an_explicit_duplicate_unknown() {
+    let run = |depth: usize| {
+        let consumer = format!(
+            "use crate::p as foo;\nuse {}crate::q as foo{};\npub fn run() {{ foo::f(); }}\n",
+            "{".repeat(depth),
+            "}".repeat(depth)
+        );
+        let input = snapshot(&[
+            ("src/lib.rs", "pub mod p; pub mod q; pub mod consumer;\n"),
+            ("src/p.rs", "pub fn f() {}\n"),
+            ("src/q.rs", "pub fn f() {}\n"),
+            ("src/consumer.rs", consumer.as_str()),
+        ]);
+        let data = references::project(&input, &[], 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        let proved = data["production"].as_array().unwrap().iter().any(|edge| {
+            edge["target"]["path"] == "src/p.rs"
+                && edge["sites"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|site| site["spelling"] == "foo::f")
+        });
+        let unknown = data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["site"]["spelling"] == "foo::f");
+        (proved, unknown)
+    };
+    assert_eq!(run(2), (false, true));
+    assert_eq!(run(130), (false, true));
+}
