@@ -45,6 +45,8 @@ struct FileModules {
     refs: Vec<ModRef>,
     /// A construct that names a module file this module cannot resolve exactly.
     uncertain: bool,
+    /// The source wasn't read (#576): it could declare any module, anywhere in the workspace.
+    unread: bool,
 }
 
 /// One package manifest: its directory (`""` for the workspace root) and its parsed table,
@@ -121,8 +123,7 @@ impl CargoTargetsBuilder {
         if self.is_empty() {
             return;
         }
-        // A source Trellis didn't read (#576) could declare any module: its placeholder names
-        // none, so it is as uncertain as one that can't be parsed.
+        // A source Trellis didn't read (#576) names no modules, but it could declare any.
         let unread = std::str::from_utf8(source)
             .is_ok_and(|text| crate::skipped_source::skipped("rust", text).is_some());
         let modules = (!unread).then(|| module_refs(source)).flatten();
@@ -131,6 +132,7 @@ impl CargoTargetsBuilder {
             modules.unwrap_or(FileModules {
                 refs: vec![],
                 uncertain: true,
+                unread,
             }),
         );
     }
@@ -159,6 +161,14 @@ impl CargoTargetsBuilder {
             let (reached, complete) = reach(&target.root, &self.files, &documents);
             if !complete {
                 poisoned.insert(*package);
+            }
+            // An unread module of a target can reach past its package with `#[path]`, so no
+            // file of the workspace is proved to have one owner (#576).
+            if reached
+                .iter()
+                .any(|path| self.files.get(*path).is_some_and(|file| file.unread))
+            {
+                return CargoTargets::default();
             }
             for path in reached {
                 owners.entry(path).or_default().insert(index);
@@ -691,6 +701,56 @@ mod tests {
         for skip in [Skip::Oversized, Skip::NotUtf8] {
             let unread = files(&placeholder("rust", skip));
             assert_eq!(of(&unread, "src/shared.rs"), None, "{skip:?}");
+        }
+    }
+
+    /// #576 re-review: `#[path]` reaches past a package, so directory poisoning isn't enough. An
+    /// unread module could own any file of the workspace, in this package or another.
+    #[test]
+    fn an_unread_module_leaves_every_file_of_the_workspace_without_a_target() {
+        use crate::skipped_source::{Skip, placeholder};
+        let manifests = [
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"pkg\", \"other\"]\n",
+            ),
+            ("pkg/Cargo.toml", PACKAGE),
+            ("other/Cargo.toml", PACKAGE),
+        ];
+        let common = "#[path = \"../../shared/common.rs\"] mod common;\n";
+        let main = format!("{common}fn main() {{}}\n");
+        let files = |lib: &str, orphan: &str| {
+            targets(
+                &manifests,
+                &[
+                    ("pkg/src/lib.rs", lib),
+                    ("pkg/src/main.rs", &main),
+                    ("pkg/src/orphan.rs", orphan),
+                    ("shared/common.rs", "pub fn f() {}\n"),
+                    ("other/src/lib.rs", "mod own;\n"),
+                    ("other/src/own.rs", ""),
+                ],
+            )
+        };
+        let control = files(common, "");
+        assert_eq!(of(&control, "shared/common.rs"), None);
+        assert_eq!(
+            of(&control, "other/src/own.rs"),
+            owned("lib", "other/src/lib.rs")
+        );
+        for skip in [Skip::Oversized, Skip::NotUtf8] {
+            let unread = placeholder("rust", skip);
+            let skipped = files(&unread, "");
+            assert_eq!(of(&skipped, "shared/common.rs"), None, "{skip:?}");
+            assert_eq!(of(&skipped, "other/src/own.rs"), None, "{skip:?}");
+            // A file no target reaches is compiled by nothing, so it owns nothing.
+            let orphaned = files(common, &unread);
+            assert_eq!(of(&orphaned, "shared/common.rs"), None, "{skip:?}");
+            assert_eq!(
+                of(&orphaned, "other/src/own.rs"),
+                owned("lib", "other/src/lib.rs"),
+                "{skip:?}"
+            );
         }
     }
 
