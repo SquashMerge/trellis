@@ -11,6 +11,7 @@ use tree_sitter::{Node, Parser};
 use crate::native_evidence::{Call, ControlRegion, Declaration, DeclarationRole, Range};
 use crate::native_rust_macros::Expansions;
 use crate::store::SelectedIntegrity;
+use crate::syntax_bounds::SyntaxGap;
 
 #[cfg(feature = "test-support")]
 thread_local! {
@@ -39,6 +40,9 @@ pub fn in_parser_progress_for_tests() -> bool {
 }
 
 pub const VERSION: &str = "metrics:v1";
+/// Bounds of one declaration's score walk; past them it is partial, never refused (#554).
+const MAX_DEPTH: usize = 512;
+const MAX_VISITS: usize = 2_000_000;
 pub const FAN_IN_REASON: &str = "call resolution not yet produced (#40/#68)";
 pub const METRIC_ORDER: [&str; 12] = [
     "loc",
@@ -56,7 +60,8 @@ pub const METRIC_ORDER: [&str; 12] = [
 ];
 
 /// The caller's deadline and cancellation signal are checked during parsing and every walk.
-/// An error aborts the entire selected document, never returning partial scores.
+/// An error aborts the entire selected document. Syntax past the traversal bounds is not an
+/// error: it goes unmeasured and the document reports a [`SyntaxGap`] (#554).
 pub fn compute(
     language: &str,
     source: &str,
@@ -66,7 +71,14 @@ pub fn compute(
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<DeclarationMetrics>> {
     let source_only = compute_source(language, source, declarations, check)?;
-    bind(source, declarations, calls, regions, source_only, check)
+    bind(
+        source,
+        declarations,
+        calls,
+        regions,
+        source_only.scores,
+        check,
+    )
 }
 
 /// A memo hit still binds the caller's current declarations, calls and regions.
@@ -86,10 +98,22 @@ pub fn compute_memoized(
 /// computed rather than taken from the memo.
 pub(crate) struct Computed {
     rows: Vec<DeclarationMetrics>,
-    uncached: Option<(MemoKey, Vec<Score>)>,
+    gap: Option<SyntaxGap>,
+    uncached: Option<(MemoKey, SourceScores)>,
+}
+
+/// The source-only scores of one document and how its syntax exceeded the bounds, if it did.
+#[derive(Clone)]
+pub(crate) struct SourceScores {
+    scores: Vec<Score>,
+    gap: Option<SyntaxGap>,
 }
 
 impl Computed {
+    /// How this document's syntax exceeded the traversal bounds, if it did.
+    pub(crate) fn gap(&self) -> Option<&SyntaxGap> {
+        self.gap.as_ref()
+    }
     /// Accept this document: record its new scores in `memo`, return its rows.
     pub(crate) fn commit(self, memo: &mut MetricsMemo) -> Result<Vec<DeclarationMetrics>> {
         memo.commit(self.uncached)?;
@@ -101,7 +125,7 @@ impl Computed {
 /// from its source. The memo itself is untouched: `MetricsMemo::commit`
 /// records new scores once the caller accepts this document.
 pub(crate) fn compute_with_cached(
-    cached: Option<Vec<Score>>,
+    cached: Option<SourceScores>,
     source: SourceInput<'_>,
     declarations: &[Declaration],
     calls: &[Call],
@@ -118,12 +142,13 @@ pub(crate) fn compute_with_cached(
         declarations,
         calls,
         regions,
-        scores.clone(),
+        scores.scores.clone(),
         check,
     )?;
     check()?;
     Ok(Computed {
         rows,
+        gap: scores.gap.clone(),
         uncached: (!was_cached).then(|| (memo_key(&source), scores)),
     })
 }
@@ -414,25 +439,12 @@ fn grammar(language: &str) -> Result<tree_sitter::Language> {
         _ => return Err(SelectedIntegrity("corrupt: unknown stored language".into()).into()),
     })
 }
-fn syntax_ok(root: Node<'_>, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        check()?;
-        ensure!(
-            !node.is_error() && !node.is_missing(),
-            "invalid_source_syntax"
-        );
-        let mut c = node.walk();
-        stack.extend(node.children(&mut c));
-    }
-    Ok(())
-}
 fn compute_source(
     language: &str,
     source: &str,
     declarations: &[Declaration],
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<Vec<Score>> {
+) -> Result<SourceScores> {
     check()?;
     let mut parser = Parser::new();
     parser.set_language(&grammar(language)?)?;
@@ -458,7 +470,7 @@ fn compute_source(
     }
     check()?;
     let tree = tree.context("bounded_work: parser stopped")?;
-    syntax_ok(tree.root_node(), check)?;
+    let gap = crate::syntax_bounds::scan(tree.root_node(), check)?;
     let newline_offsets: Vec<usize> = source
         .bytes()
         .enumerate()
@@ -495,10 +507,14 @@ fn compute_source(
             d,
             &nested,
             &newline_offsets,
+            gap.is_some(),
             check,
         )?);
     }
-    Ok(result)
+    Ok(SourceScores {
+        scores: result,
+        gap,
+    })
 }
 // Native callable ranges are declaration ranges. Find the executable body within that
 // declaration before counting Halstead leaves; the full range still supplies line counts.
@@ -506,15 +522,23 @@ fn callable_body(
     root: Node<'_>,
     source: &str,
     d: &Declaration,
+    partial: bool,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Range> {
+    let unmeasured = Range {
+        start: d.range.end,
+        end: d.range.end,
+    };
     let mut stack = vec![root];
     let mut selected = None;
     let mut visits = 0;
     while let Some(node) = stack.pop() {
         check()?;
         visits += 1;
-        ensure!(visits <= 2_000_000, "bounded_work: body traversal");
+        if visits > MAX_VISITS {
+            // The scan already reported this file; the body goes unmeasured.
+            return Ok(unmeasured);
+        }
         if node.end_byte() <= d.range.start || node.start_byte() >= d.range.end {
             continue;
         }
@@ -525,10 +549,7 @@ fn callable_body(
                 .child_by_field_name("name")
                 .is_some_and(|name| d.name.as_deref() == Some(&source[name.byte_range()]))
         {
-            return Ok(Range {
-                start: d.range.end,
-                end: d.range.end,
-            });
+            return Ok(unmeasured);
         }
         if let Some(body) = node.child_by_field_name("body")
             && node.start_byte() >= d.range.start
@@ -554,6 +575,10 @@ fn callable_body(
         let mut cursor = node.walk();
         stack.extend(node.children(&mut cursor));
     }
+    // Recovered syntax can lose the body of a declaration measured around it.
+    if partial && selected.is_none() {
+        return Ok(unmeasured);
+    }
     selected.with_context(|| {
         SelectedIntegrity(format!(
             "corrupt: callable body not found: {} {} {:?} {:?}",
@@ -562,6 +587,7 @@ fn callable_body(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // One callable's measured context stays explicit.
 fn score(
     language: &str,
     source: &str,
@@ -569,9 +595,10 @@ fn score(
     d: &Declaration,
     nested: &[&Range],
     newline_offsets: &[usize],
+    partial: bool,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Score> {
-    let body = callable_body(root, source, d, check)?;
+    let body = callable_body(root, source, d, partial, check)?;
     let mut s = empty();
     let mut code_lines = std::collections::BTreeSet::new();
     let mut comments = std::collections::BTreeSet::new();
@@ -582,10 +609,12 @@ fn score(
     while let Some((node, depth)) = stack.pop() {
         check()?;
         visits += 1;
-        ensure!(
-            visits <= 2_000_000 && depth <= 512,
-            "bounded_work: syntax traversal"
-        );
+        if visits > MAX_VISITS {
+            break;
+        }
+        if depth > MAX_DEPTH {
+            continue;
+        }
         if node.end_byte() <= d.range.start
             || node.start_byte() >= d.range.end
             || nested
@@ -884,8 +913,8 @@ fn score(
     Ok(s)
 }
 
-/// FIFO memo contains only complete source-derived scores, never native identity or calls.
-type MemoEntry = ((String, String, String), Vec<Score>, usize);
+/// FIFO memo contains only source-derived scores and gaps, never native identity or calls.
+type MemoEntry = ((String, String, String), SourceScores, usize);
 pub struct MetricsMemo {
     entries: VecDeque<MemoEntry>,
     bytes: usize,
@@ -899,7 +928,7 @@ impl MetricsMemo {
             limit,
         }
     }
-    fn insert(&mut self, key: (String, String, String), value: Vec<Score>) -> Result<()> {
+    fn insert(&mut self, key: (String, String, String), value: SourceScores) -> Result<()> {
         let size = key
             .0
             .capacity()
@@ -907,6 +936,7 @@ impl MetricsMemo {
             .saturating_add(key.2.capacity())
             .saturating_add(
                 value
+                    .scores
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Score>()),
             )
@@ -914,7 +944,7 @@ impl MetricsMemo {
                 String,
                 String,
                 String,
-                Vec<Score>,
+                SourceScores,
                 usize,
             )>());
         if size <= self.limit.min(64 * 1024 * 1024) {
@@ -931,7 +961,7 @@ impl MetricsMemo {
         Ok(())
     }
     /// Source-only scores already recorded for this source, if any.
-    pub(crate) fn lookup(&self, source: &SourceInput<'_>) -> Option<Vec<Score>> {
+    pub(crate) fn lookup(&self, source: &SourceInput<'_>) -> Option<SourceScores> {
         let key = memo_key(source);
         self.entries
             .iter()
@@ -940,7 +970,7 @@ impl MetricsMemo {
     }
     /// Record a document's newly computed scores, unless an equal source was
     /// recorded since they were computed.
-    pub(crate) fn commit(&mut self, computed: Option<(MemoKey, Vec<Score>)>) -> Result<()> {
+    pub(crate) fn commit(&mut self, computed: Option<(MemoKey, SourceScores)>) -> Result<()> {
         match computed {
             Some((key, scores)) if !self.entries.iter().any(|(k, _, _)| *k == key) => {
                 self.insert(key, scores)

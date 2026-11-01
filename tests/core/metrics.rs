@@ -82,9 +82,9 @@ fn four_grammars_hand_checked_branches_and_fan_in() {
     }
 }
 #[test]
-fn malformed_source_fails_even_outside_callable() {
+fn malformed_source_is_partial_even_outside_a_callable() {
     let text = "def calc():\n    return 1\ninvalid = (\n";
-    let err = metrics::compute(
+    let rows = metrics::compute(
         "python",
         text,
         &[declaration("python", 24)],
@@ -92,8 +92,23 @@ fn malformed_source_fails_even_outside_callable() {
         &[],
         &mut || Ok(()),
     )
-    .unwrap_err();
-    assert!(err.to_string().contains("invalid_source_syntax"));
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+}
+#[test]
+fn a_callable_whose_body_the_parser_lost_is_unmeasured_not_corrupt() {
+    // The declaration covers bytes with no callable left in the recovered tree.
+    let text = "def calc(:\n    return 1\n";
+    let rows = metrics::compute(
+        "python",
+        text,
+        &[declaration("python", text.len())],
+        &[],
+        &[],
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
 }
 #[test]
 fn cancelled_parse_never_enters_memo() {
@@ -844,6 +859,7 @@ fn resident_memo_limit_evicts_fifo_and_never_caches_oversized_score() {
     assert!(tiny.is_empty());
     let entry_bytes = 4 * std::mem::size_of::<metrics::Score>()
         + std::mem::size_of::<((String, String, String), Vec<metrics::Score>, usize)>()
+        + std::mem::size_of::<Option<trellis::syntax_bounds::SyntaxGap>>()
         + metrics::VERSION.len()
         + "rust".len()
         + "a".len();
@@ -1522,4 +1538,23 @@ fn warm_memo_rebinds_reordered_callables_by_source_range_and_current_role() {
             "current identity/range and score association for {name}"
         );
     }
+}
+
+#[test]
+fn syntax_past_the_score_bounds_is_unmeasured_not_refused() {
+    let text = format!(
+        "def calc():\n    return {}1{}\n",
+        "(".repeat(50_000),
+        ")".repeat(50_000)
+    );
+    let rows = metrics::compute(
+        "python",
+        &text,
+        &[declaration("python", text.trim_end().len())],
+        &[],
+        &[],
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
 }

@@ -1209,13 +1209,15 @@ async function renderFilesMini(current) {
   const readSource = step => { if (current()) return openFilesLocation(step, revision); };
   const options = {showDetails:false, isCurrent:current, onOpenTarget:sequenceTargetAction(data, current)};
   options.onUnsupported = reason => { if (current()) { window.TrellisSequence.render(container, data, readSource, expanded, options); $("files-mini-state").textContent += ` · Pele fell back: ${reason}`; } };
-  const outcome = window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
+  const empty = window.TrellisSequence.emptySummary(data);
+  const outcome = empty ? {status:"empty"} : window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
   if (!current() || outcome.status === "stale") return;
-  if (outcome.status !== "rendered") window.TrellisSequence.render(container, data, readSource, expanded, options);
+  if (outcome.status === "empty") window.TrellisSequence.renderEmpty(container, empty);
+  else if (outcome.status !== "rendered") window.TrellisSequence.render(container, data, readSource, expanded, options);
   // One short status line; the sequence's caveats and diagnostics live behind the ⓘ (#526).
   const notes = [...(data.warnings || [])];
   if (data.truncated) notes.push("Truncated by sequence limits; Open full shows the same bounded steps.");
-  if (outcome.status !== "rendered") notes.push(`Pele fell back: ${outcome.reason}`);
+  if (outcome.status !== "rendered" && !empty) notes.push(`Pele fell back: ${outcome.reason}`);
   $("files-mini-notes").replaceChildren(...notes.map(note => element("li", note, "detail")));
   $("files-mini-state").textContent = `Indexed revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps" : ""}${notes.length ? ` · ${notes.length} ${notes.length === 1 ? "note" : "notes"} in ⓘ` : ""}`;
   fitFilesMini();
@@ -1549,6 +1551,8 @@ function renderIncidentalToggle(data) {
   button.title = "Calls bound to the standard library or another external package, logging calls (a naming rule) and trivial accessors";
   button.setAttribute("aria-pressed", String(showing));
 }
+// The method Fit was asked for: a redraw of it keeps Fit, another opens at its own size (#558).
+let sequenceFitted = null;
 async function loadSequence(admitted = null, preserveSource = false, callerCurrent = () => true) {
   viewerMetrics?.clearInspection();
   window.TrellisShell?.resetInspector();
@@ -1559,6 +1563,7 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
   let published = false;
   const current = () => (published || callerCurrent()) && guard() && section === "diagrams" && surface === sectionSerial && serial === diagramSerial && selectedMethod === symbol;
   if (!preserveSource) clearSource();
+  if (sequenceFitted !== symbol.id) { sequenceFitted = null; $("sequence-diagram").removeAttribute?.("data-fit"); }
   $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
   if ($("sequence-incidental")) $("sequence-incidental").hidden = true;
   $("sequence-state").textContent = `Loading ${symbol.name}…`;
@@ -1587,17 +1592,20 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     };
     const diagram = $("sequence-diagram");
     const expanded = new Set();
-    const outcome = window.TrellisPeleSequence
+    // Every step hidden draws no diagram: one box would say nothing happens (#558).
+    const empty = window.TrellisSequence.emptySummary(data);
+    const outcome = empty ? {status:"empty"} : window.TrellisPeleSequence
       ? await window.TrellisPeleSequence.render(diagram, data, readSource, expanded, options)
       : {status:"unsupported", reason:"Pele asset unavailable"};
     if (!current() || !IndexPin.equal(status?.revision, revision)) return;
     if (outcome.status === "stale") return;
-    if (outcome.status !== "rendered") {
+    if (outcome.status === "empty") window.TrellisSequence.renderEmpty(diagram, empty, () => { $("all-steps").checked = true; void loadSequence(); });
+    else if (outcome.status !== "rendered") {
       window.TrellisSequence.render(diagram, data, readSource, expanded, options);
     }
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
     renderIncidentalToggle(data);
-    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
+    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
     published = true;
   }, current, "sequence-state");
@@ -1645,6 +1653,47 @@ $("show-hidden-files").addEventListener("change", event => {
 $("all-methods").addEventListener("change", renderFiles);
 $("all-steps").addEventListener("change", () => loadSequence());
 $("sequence-incidental")?.addEventListener("click", () => { $("all-steps").checked = !$("all-steps").checked; void loadSequence(); });
+// Fit is offered only while the diagram is wider than the panel, or to undo itself (#558).
+// Every drawing replaces the panel's children, whichever renderer drew it.
+function renderSequenceFit() {
+  const diagram = $("sequence-diagram"), button = $("sequence-fit");
+  if (!diagram || !button) return;
+  const fitted = diagram.hasAttribute("data-fit"), width = diagram.querySelector(":scope > svg")?.viewBox?.baseVal?.width || 0;
+  button.hidden = !width || !fitted && width <= diagram.clientWidth;
+  button.setAttribute("aria-pressed", String(fitted));
+}
+// A tall diagram scrolls its headers away; a copy of the column names stays over the panel
+// once they have gone. It reads what either renderer drew, so it needs no renderer's help.
+let sequenceHeaderEnd = 0;
+function positionSequenceColumns() {
+  const diagram = $("sequence-diagram"), strip = $("sequence-columns");
+  if (!strip) return;
+  strip.hidden = !sequenceHeaderEnd || diagram.scrollTop < sequenceHeaderEnd;
+  strip.style.transform = `translateX(${-diagram.scrollLeft}px)`;
+}
+function renderSequenceColumns() {
+  const diagram = $("sequence-diagram"), strip = $("sequence-columns");
+  if (!strip || !diagram?.getBoundingClientRect) return;
+  const box = diagram.getBoundingClientRect();
+  const headers = [...diagram.querySelectorAll(":scope > svg .pele-actor:not(.pele-actor-footer), :scope > svg .sequence-participant-label")];
+  sequenceHeaderEnd = 0;
+  strip.replaceChildren(...headers.map(header => {
+    const rect = header.getBoundingClientRect();
+    const name = element("span", header.matches(".pele-actor") ? header.textContent : header.firstChild.textContent);
+    name.style.left = `${rect.left + rect.width / 2 - box.left + diagram.scrollLeft}px`;
+    sequenceHeaderEnd = Math.max(sequenceHeaderEnd, rect.bottom - box.top + diagram.scrollTop);
+    return name;
+  }));
+  positionSequenceColumns();
+}
+function renderSequenceChrome() { renderSequenceFit(); renderSequenceColumns(); }
+$("sequence-fit")?.addEventListener("click", () => {
+  sequenceFitted = $("sequence-diagram").toggleAttribute("data-fit") ? selectedMethod?.id : null;
+  renderSequenceChrome();
+});
+$("sequence-diagram")?.addEventListener("scroll", positionSequenceColumns, {passive:true});
+if (typeof MutationObserver === "function" && $("sequence-diagram")) new MutationObserver(renderSequenceChrome).observe($("sequence-diagram"), {childList:true});
+if (typeof ResizeObserver === "function" && $("sequence-diagram")) new ResizeObserver(renderSequenceChrome).observe($("sequence-diagram"));
 $("more-files").addEventListener("click", () => perform(() => $("file-filter").value.trim() && filterResults?.next != null ? searchFiles(filterResults.next) : loadFiles(), $("more-files")));
 
 $("method-source").addEventListener("click", () => { if (selectedMethod && status) perform(() => showSource(selectedMethod, status.revision)); });

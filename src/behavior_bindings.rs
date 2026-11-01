@@ -1,6 +1,7 @@
 //! Syntactic participant identification only. Never resolves a call implementation.
 //! All analysis uses the already parsed, cached JavaScript source.
 use crate::behavior::Participant;
+use crate::syntax_bounds::{DEPTH, VISITS};
 use std::collections::HashSet;
 use tree_sitter::Node;
 
@@ -58,12 +59,14 @@ fn scope(mut n: Node<'_>, var: bool) -> Node<'_> {
 fn text<'a>(source: &'a str, n: Node<'_>) -> &'a str {
     &source[n.byte_range()]
 }
-fn root(n: Node<'_>) -> Option<Node<'_>> {
-    match n.kind() {
-        "identifier" => Some(n),
-        "member_expression" | "subscript_expression" => root(n.child_by_field_name("object")?),
-        "parenthesized_expression" => root(*children(n).first()?),
-        _ => None,
+fn root(mut n: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match n.kind() {
+            "identifier" => return Some(n),
+            "member_expression" | "subscript_expression" => n = n.child_by_field_name("object")?,
+            "parenthesized_expression" => n = *children(n).first()?,
+            _ => return None,
+        }
     }
 }
 impl Bindings {
@@ -73,8 +76,16 @@ impl Bindings {
             writes: HashSet::new(),
             unsafe_globals: tree.has_error(),
         };
-        let mut todo = vec![tree];
-        while let Some(n) = todo.pop() {
+        // `scope` climbs with `Node::parent`, itself a walk from the root, so this walk stays
+        // within the syntax bounds. What it skips could shadow or write, so proof is withheld.
+        let mut todo = vec![(tree, 0usize)];
+        let mut visits = 0usize;
+        while let Some((n, depth)) = todo.pop() {
+            visits += 1;
+            if depth > DEPTH || visits > VISITS {
+                out.unsafe_globals = true;
+                continue;
+            }
             // Escaped identifiers need ECMAScript name decoding. Until supported,
             // suppress proof rather than miss an escaped shadow/write target.
             if matches!(
@@ -238,7 +249,7 @@ impl Bindings {
                     out.add(name, n, None, source);
                 }
             }
-            todo.extend(children(n));
+            todo.extend(children(n).into_iter().map(|child| (child, depth + 1)));
         }
         out
     }
@@ -251,54 +262,43 @@ impl Bindings {
             import,
         });
     }
+    // Iterative, like `write`: repository nesting has no bound here.
     fn pattern(&mut self, n: Node<'_>, s: Node<'_>, source: &str) {
-        match n.kind() {
-            "identifier" | "shorthand_property_identifier_pattern" => self.add(n, s, None, source),
-            "assignment_pattern" | "object_assignment_pattern" => {
-                if let Some(left) = n.child_by_field_name("left") {
-                    self.pattern(left, s, source);
+        let mut pending = vec![n];
+        while let Some(n) = pending.pop() {
+            match n.kind() {
+                "identifier" | "shorthand_property_identifier_pattern" => {
+                    self.add(n, s, None, source)
                 }
-            }
-            "pair_pattern" => {
-                if let Some(value) = n.child_by_field_name("value") {
-                    self.pattern(value, s, source);
+                "assignment_pattern" | "object_assignment_pattern" => {
+                    pending.extend(n.child_by_field_name("left"));
                 }
-            }
-            _ => {
-                for child in children(n) {
-                    self.pattern(child, s, source);
-                }
+                "pair_pattern" => pending.extend(n.child_by_field_name("value")),
+                _ => pending.extend(children(n).into_iter().rev()),
             }
         }
     }
     fn write(&mut self, n: Node<'_>, source: &str) {
-        if let Some(id) = root(n) {
-            let name = text(source, id);
-            self.writes.insert(name.into());
-            if matches!(name, "globalThis" | "window" | "global" | "self") {
-                self.unsafe_globals = true;
+        let mut pending = vec![n];
+        while let Some(n) = pending.pop() {
+            if let Some(id) = root(n) {
+                let name = text(source, id);
+                self.writes.insert(name.into());
+                if matches!(name, "globalThis" | "window" | "global" | "self") {
+                    self.unsafe_globals = true;
+                }
+                continue;
             }
-        } else {
             // Destructuring write targets: ignore RHS/default expressions only when known.
             match n.kind() {
                 "assignment_pattern" | "object_assignment_pattern" => {
-                    if let Some(left) = n.child_by_field_name("left") {
-                        self.write(left, source);
-                    }
+                    pending.extend(n.child_by_field_name("left"));
                 }
-                "pair_pattern" => {
-                    if let Some(value) = n.child_by_field_name("value") {
-                        self.write(value, source);
-                    }
-                }
+                "pair_pattern" => pending.extend(n.child_by_field_name("value")),
                 "shorthand_property_identifier_pattern" => {
                     self.writes.insert(text(source, n).into());
                 }
-                _ => {
-                    for child in children(n) {
-                        self.write(child, source);
-                    }
-                }
+                _ => pending.extend(children(n).into_iter().rev()),
             }
         }
     }
@@ -329,6 +329,7 @@ impl Bindings {
             if let Some((module, symbol)) = binding.and_then(|b| b.import.as_ref()) {
                 return Some(Participant {
                     declaration: None,
+                    column: None,
                     id: format!("import:{}:{}", module.len(), module),
                     label: module.clone(),
                     kind: "import".into(),
@@ -356,13 +357,14 @@ impl Bindings {
                         | "Error"
                 )
             {
-                return Some(Participant { declaration: None, id:format!("builtin:{name}"), label:name.into(), kind:"builtin".into(), identification:"Unshadowed standard JavaScript global in cached syntax; no detected writes. Member implementation and runtime identity are not resolved.".into() });
+                return Some(Participant { declaration: None, column: None, id:format!("builtin:{name}"), label:name.into(), kind:"builtin".into(), identification:"Unshadowed standard JavaScript global in cached syntax; no detected writes. Member implementation and runtime identity are not resolved.".into() });
             }
         }
         if callee.kind() == "member_expression" || (name == "Buffer" && binding.is_none() && clean)
         {
             return Some(Participant {
                 declaration: None,
+                column: None,
                 id: format!(
                     "receiver:{}:{}:{}:{name}",
                     path.len(),
@@ -379,5 +381,47 @@ impl Bindings {
             });
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod deep_input_tests {
+    use super::*;
+
+    #[test]
+    fn extremely_deep_patterns_and_targets_do_not_recurse() {
+        let depth = 200_000;
+        let source = format!(
+            "let {}x{} = 1; {}y{} = 2; a{} = 3;",
+            "[".repeat(depth),
+            "]".repeat(depth),
+            "[".repeat(depth),
+            "]".repeat(depth),
+            ".b".repeat(depth)
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let bindings = Bindings::new(tree.root_node(), &source);
+        assert!(bindings.writes.contains("y") && bindings.writes.contains("a"));
+    }
+
+    #[test]
+    fn declarations_past_the_bounds_withhold_proof_in_bounded_time() {
+        // Unbounded, each declaration would climb 100,000 levels through `Node::parent`.
+        let source = format!(
+            "{}{}{}",
+            "{".repeat(100_000),
+            "var a;".repeat(10_000),
+            "}".repeat(100_000)
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        assert!(Bindings::new(tree.root_node(), &source).unsafe_globals);
     }
 }

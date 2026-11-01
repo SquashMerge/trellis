@@ -454,12 +454,13 @@ sites, #523). Bounded site samples retain exact counts/omissions in the payload;
 this is not top-level verdict truncation or proof of semantic completeness.
 
 Only these new output schemas add nonretryable codes `invalid_rules`,
-`rules_not_found`, `bounded_work`, `invalid_source_syntax` and `response_too_large`.
+`rules_not_found`, `bounded_work` and `response_too_large`. A file with a syntax error is a
+`partialFiles` row, not a failure (owner ruling 2026-10-31, #563).
 A located `invalid_rules` failure has the ordinary resolved error fields **plus**
 required `diagnostic:{code,kind,path,range,line,column,attribution,message}` as
 [defined for rules](rules.md#work-bounds-and-located-failures). Other failures do
 not acquire this field. No partial instances accompany malformed configuration,
-source parse/work failure or overflow. The full JSON-RPC line, summary and LF must
+work failure or overflow. The full JSON-RPC line, summary and LF must
 fit 65,536 bytes. Larger results page as described above. An item that cannot fit
 alone fails atomically with `response_too_large` rather than clip verdicts,
 unresolved sites, proof or TOML. This does not change the original

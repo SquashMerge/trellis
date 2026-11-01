@@ -107,6 +107,10 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
     ),
     ("src/references.rs", "read-time structural references"),
     ("src/rules.rs", "read-time architecture rules"),
+    (
+        "src/syntax_bounds.rs",
+        "read-time traversal bounds of parsed trees",
+    ),
 ];
 
 fn root() -> &'static Path {

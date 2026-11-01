@@ -129,6 +129,8 @@ struct Scope {
     explicit: BTreeMap<Name, Vec<Binding>>,
     imports: Vec<Import>,
     opaque: bool,
+    /// Something past the walk bounds was skipped here, so even an explicit name can collide.
+    cut: bool,
 }
 struct ModuleEdge {
     scope: usize,
@@ -229,6 +231,13 @@ impl Catalog {
                 check,
             )?;
         }
+        // A parser error can hide an item from any scope of its file, or move it to another.
+        for scope in &mut result.scopes {
+            if trees[scope.document].root_node().has_error() {
+                scope.opaque = true;
+                scope.cut = true;
+            }
+        }
         for edge in &mut edges {
             result.step(check)?;
             if edge.child.is_none() {
@@ -303,6 +312,7 @@ impl Catalog {
                 }
             }
         }
+        result.keep_lost_owners_unknown(docs, trees, &edges, check)?;
         for id in 0..result.scopes.len() {
             result.step(check)?;
             let scope = &result.scopes[id];
@@ -323,6 +333,56 @@ impl Catalog {
             index.build(0, index.ranges.len(), &mut result.work, check)?;
         }
         Ok(result)
+    }
+    /// A parser error can hide a `mod` from its file, and a file with two owners has no proved
+    /// crate. So a file a broken module could declare, because its text names it, has no root
+    /// unless that broken file still declares it, and neither has anything below it.
+    fn keep_lost_owners_unknown(
+        &mut self,
+        docs: &[&DocumentInput],
+        trees: &[Tree],
+        edges: &[ModuleEdge],
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let mut pending = Vec::new();
+        for (&document, &owner) in &self.files.clone() {
+            if !trees[document].root_node().has_error() {
+                continue;
+            }
+            let (names, unnamed) = possible_module_names(&docs[document].file.text);
+            let below = format!("{}/", self.scopes[owner].directory);
+            for (&other, &child) in &self.files.clone() {
+                self.step(check)?;
+                let path = &docs[other].key.path;
+                let name = path
+                    .strip_suffix("/mod.rs")
+                    .or_else(|| path.strip_suffix(".rs"))
+                    .and_then(|module| module.rsplit('/').next());
+                if other != document
+                    && path.starts_with(&below)
+                    && (unnamed || name.is_some_and(|name| names.contains(name)))
+                    && !edges
+                        .iter()
+                        .any(|edge| edge.scope == owner && edge.child == Some(child))
+                {
+                    pending.push(child);
+                }
+            }
+        }
+        let mut visited = BTreeSet::new();
+        while let Some(scope) = pending.pop() {
+            self.step(check)?;
+            if visited.insert(scope) {
+                self.ambiguous.insert(scope);
+                pending.extend(
+                    edges
+                        .iter()
+                        .filter(|edge| edge.scope == scope)
+                        .filter_map(|edge| edge.child),
+                );
+            }
+        }
+        Ok(())
     }
     fn step(&mut self, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
         check()?;
@@ -372,6 +432,7 @@ impl Catalog {
             explicit: BTreeMap::new(),
             imports: Vec::new(),
             opaque: false,
+            cut: false,
         });
         Ok(id)
     }
@@ -387,7 +448,12 @@ impl Catalog {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         self.step(check)?;
-        ensure!(depth <= DEPTH, "bounded_work: reference AST");
+        // A skipped item could bind any name here, as an unknown attribute could.
+        if depth > DEPTH {
+            self.scopes[scope].opaque = true;
+            self.scopes[scope].cut = true;
+            return Ok(());
+        }
         let document = self.scopes[scope].document;
         let doc = docs[document];
         let mut cursor = node.walk();
@@ -464,7 +530,7 @@ impl Catalog {
                 let public = visibility(doc, child).is_some();
                 let restricted = visibility(doc, child).is_some_and(|v| v != "pub");
                 if let Some(argument) = child.child_by_field_name("argument") {
-                    let imports = imports(
+                    let (imports, cut) = imports(
                         doc,
                         argument,
                         public,
@@ -473,6 +539,9 @@ impl Catalog {
                         check,
                     )?;
                     self.scopes[scope].imports.extend(imports);
+                    // A skipped import could bind any name, so nothing here is proved absent.
+                    self.scopes[scope].opaque |= cut;
+                    self.scopes[scope].cut |= cut;
                 }
                 continue;
             }
@@ -601,7 +670,11 @@ impl Catalog {
         while let Some(node) = ancestor {
             self.step(check)?;
             depth += 1;
-            ensure!(depth <= DEPTH, "bounded_work: reference AST");
+            if depth > DEPTH {
+                self.scopes[scope].opaque = true;
+                self.scopes[scope].cut = true;
+                break;
+            }
             if node.kind() == "mod_item" || node.kind() == "source_file" {
                 break;
             }
@@ -643,7 +716,12 @@ impl Catalog {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         self.step(check)?;
-        ensure!(depth <= DEPTH, "bounded_work: reference AST");
+        // A skipped item could bind any name here, as an unknown attribute could.
+        if depth > DEPTH {
+            self.scopes[scope].opaque = true;
+            self.scopes[scope].cut = true;
+            return Ok(());
+        }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() == "block" {
@@ -828,7 +906,7 @@ impl Catalog {
         }
         if self.scopes[scope].opaque {
             for namespace in [TYPE, VALUE] {
-                if !explicit_namespaces.contains(&namespace) {
+                if self.scopes[scope].cut || !explicit_namespaces.contains(&namespace) {
                     result
                         .names
                         .entry((namespace, name.to_owned()))
@@ -1563,11 +1641,17 @@ fn imports(
     uncertain: bool,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<Vec<Import>> {
-    let mut pending = vec![(root, Vec::<String>::new())];
+) -> Result<(Vec<Import>, bool)> {
+    let mut pending = vec![(root, Vec::<String>::new(), 0usize)];
     let mut result = Vec::new();
-    while let Some((node, prefix)) = pending.pop() {
+    let mut cut = false;
+    while let Some((node, prefix, depth)) = pending.pop() {
         owner_step(work, check)?;
+        // Each nesting level clones the prefix, so a deep list is bounded here too.
+        if depth > DEPTH {
+            cut = true;
+            continue;
+        }
         let combine = |value: &str| -> Vec<String> {
             let mut combined = prefix.clone();
             if let Some(tail) = parts(value) {
@@ -1585,14 +1669,14 @@ fn imports(
                     .map(|n| text(doc, n))
                     .unwrap_or("");
                 if let Some(list) = node.child_by_field_name("list") {
-                    pending.push((list, combine(path)));
+                    pending.push((list, combine(path), depth + 1));
                 }
             }
             "use_list" => {
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
                     owner_step(work, check)?;
-                    pending.push((child, prefix.clone()));
+                    pending.push((child, prefix.clone(), depth + 1));
                 }
             }
             _ => {
@@ -1628,7 +1712,25 @@ fn imports(
             }
         }
     }
-    Ok(result)
+    Ok((result, cut))
+}
+
+/// The words of a source's text, whatever its syntax, and whether a `mod` has no name left to
+/// read. A parser error can break the keyword too, so any word could have been a module.
+fn possible_module_names(text: &str) -> (BTreeSet<&str>, bool) {
+    let identifier = |c: char| c.is_alphanumeric() || c == '_';
+    let words: BTreeSet<_> = text
+        .split(|c| !identifier(c))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let unnamed = text.match_indices("mod").any(|(at, _)| {
+        let tail = text[at + 3..].trim_start();
+        !text[..at].ends_with(identifier)
+            && !text[at + 3..].starts_with(identifier)
+            && !tail.starts_with(identifier)
+            && !tail.starts_with("r#")
+    });
+    (words, unnamed)
 }
 
 pub(super) fn extract(
@@ -1644,7 +1746,7 @@ pub(super) fn extract(
         }
         if node.kind() == "use_declaration" {
             if let Some(argument) = node.child_by_field_name("argument") {
-                for import in imports(doc, argument, false, false, work, check)? {
+                for import in imports(doc, argument, false, false, work, check)?.0 {
                     ensure!(result.len() < SITES, "bounded_work: reference site count");
                     result.push(RawSite {
                         start: import.start,
@@ -1692,6 +1794,7 @@ mod cache_tests {
             explicit: BTreeMap::new(),
             imports: Vec::new(),
             opaque: false,
+            cut: false,
         }
     }
 

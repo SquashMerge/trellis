@@ -255,9 +255,14 @@ ancestor-directory replacement**, nor a defense against another process with the
 user's privileges. Do not expose it through a tunnel or untrusted proxy.
 
 Caps: 2 MiB per source by default (`--max-file-bytes`, up to 16 MiB through the CLI),
-256 MiB aggregate source, 100,000 discovered source files, 256 MiB SCIP and nesting under
-512 levels. Oversized/unreadable individual files are diagnosed; aggregate limits fail
-without publishing. These are guardrails, not a proven hostile-input resource sandbox.
+256 MiB aggregate source, 100,000 discovered source files and 256 MiB SCIP. Oversized or
+unreadable individual files are diagnosed, and syntax past 128 levels or 1,000,000 visits is a
+per-file coverage gap (#554). So is a file whose evidence exceeds a selected read's budgets: 16
+rows per source byte in a table, at most 1,000,000, and 64 bytes per source byte plus 256 KiB of
+native rows, the same of graph rows and the same of class rows (#564). It publishes its file module, `partial` coverage and a whole-file capability gap,
+and nothing that would make a read refuse it. A class row past its budget loses its last
+members and is marked truncated, and a file whose class extraction would pass 64 MiB keeps no
+classes. Aggregate limits fail without publishing. These are guardrails, not a proven hostile-input resource sandbox.
 
 | Method | Path | Response / behavior |
 | --- | --- | --- |

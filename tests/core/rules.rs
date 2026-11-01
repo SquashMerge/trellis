@@ -63,6 +63,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
         },
         documents,
         manifests: vec![],
+        evidence_gaps: Default::default(),
     }
 }
 fn evaluate(text: &str, snapshot: &Snapshot) -> Value {
@@ -777,22 +778,83 @@ require=[{calls="any"}]
         .iter()
         .position(|doc| doc.key.path == "Z.java")
         .unwrap();
-    for (source, code) in [
-        ("class Z extends {".to_owned(), "invalid_source_syntax"),
-        (" ".repeat(2 * 1024 * 1024 + 1), "bounded_work"),
-    ] {
-        input.documents[last].file.text = source;
-        for workers in [1, 4] {
-            // Evaluation must fail rather than publish assignments for A/B/C.
-            let error =
-                rules::evaluate_with_workers(&config, &input, &refs, &[], workers, &mut || Ok(()))
-                    .unwrap_err();
-            assert!(
-                error.to_string().starts_with(code),
-                "workers={workers}: {error:#}"
-            );
-        }
+    input.documents[last].file.text = " ".repeat(2 * 1024 * 1024 + 1);
+    for workers in [1, 4] {
+        // Evaluation must fail rather than publish assignments for A/B/C.
+        let error =
+            rules::evaluate_with_workers(&config, &input, &refs, &[], workers, &mut || Ok(()))
+                .unwrap_err();
+        assert!(
+            error.to_string().starts_with("bounded_work"),
+            "workers={workers}: {error:#}"
+        );
     }
+}
+
+const INHERITED: &str = r#"version=1
+[roles.inherited]
+select={extends="Base"}
+[roles.any]
+select={paths=["**"]}
+[[rules]]
+id="inherited-calls"
+for_each="inherited"
+require=[{calls="any"}]
+"#;
+
+#[test]
+fn a_file_with_a_syntax_error_is_partial_and_rules_evaluate_the_rest() {
+    let input = snapshot(&[
+        ("A.java", "class A extends Base {}"),
+        ("Broken.java", "class Broken extends Base { void f( { } }"),
+    ]);
+    let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    let config = rules::parse(INHERITED).unwrap();
+    let evaluated = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    assert_eq!(evaluated["partialFiles"][0]["path"], "Broken.java");
+    assert_eq!(evaluated["partialFiles"][0]["reason"], "syntax_error");
+    assert!(
+        evaluated["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|limit| limit.as_str().unwrap().contains("partialFiles"))
+    );
+    let row = |path: &str| {
+        evaluated["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["target"]["path"] == path)
+            .cloned()
+    };
+    assert!(row("A.java").is_some(), "{evaluated}");
+    // Its base clause may be the error, so `Broken` is neither selected nor excluded.
+    let broken = row("Broken.java").expect("an unknown selection stays an instance");
+    assert!(
+        broken["unresolved"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("selector_relationship_unavailable")),
+        "{broken}"
+    );
+}
+
+#[test]
+fn a_base_clause_lost_to_a_syntax_error_never_proves_the_type_has_no_base() {
+    // Valid, `Hidden` extends Base. Broken, the clause is gone from the recovered tree.
+    let input = snapshot(&[("Hidden.java", "class Hidden extends Base( { void f() {} }")]);
+    let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    let config = rules::parse(INHERITED).unwrap();
+    let evaluated = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    assert!(
+        evaluated["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["target"]["path"] == "Hidden.java"),
+        "{evaluated}"
+    );
 }
 
 #[test]
@@ -1620,4 +1682,46 @@ require=[{calls="any"}]
     let config = rules::parse(text).unwrap();
     let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
     rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+}
+
+#[test]
+fn an_over_deep_file_is_partial_and_rules_evaluate_the_rest() {
+    let deep = format!(
+        "class Deep {{ int d() {{ return {}1{}; }} }}\nclass Later extends Base {{}}\n",
+        "(".repeat(400),
+        ")".repeat(400)
+    );
+    let input = snapshot(&[("A.java", "class A extends Base {}"), ("Deep.java", &deep)]);
+    let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    let config = rules::parse(
+        r#"version=1
+[roles.inherited]
+select={extends="Base"}
+[roles.any]
+select={paths=["**"]}
+[[rules]]
+id="inherited-calls"
+for_each="inherited"
+require=[{calls="any"}]
+"#,
+    )
+    .unwrap();
+    let evaluated = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    assert_eq!(evaluated["partialFiles"][0]["path"], "Deep.java");
+    assert_eq!(evaluated["partialFiles"][0]["reason"], "depth_limit");
+    assert!(
+        evaluated["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|limit| limit.as_str().unwrap().contains("partialFiles"))
+    );
+    let targets: Vec<_> = evaluated["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|instance| instance["target"]["path"].as_str().unwrap())
+        .collect();
+    assert!(targets.contains(&"A.java"), "{evaluated}");
+    assert!(targets.contains(&"Deep.java"), "{evaluated}");
 }

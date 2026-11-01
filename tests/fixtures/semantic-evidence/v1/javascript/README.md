@@ -1,4 +1,4 @@
-# JavaScript conformance corpus — native-v12 DRAFT
+# JavaScript conformance corpus — native-v13 DRAFT
 
 An independently authored event-processing workbench for #28: ten ES modules
 cover parsing, normalization, stages, editing, history and runtime extensions.
@@ -18,7 +18,7 @@ family, dropped record or artificial tagged-template gap is used to meet a floor
 - 10 production capability reports; every family is available with no gaps.
 - Two independent command runs are byte-identical. Semantic counts remain zero.
 
-The raw capture comes from Trellis's actual `trellis.native.syntax@native-v12`
+The raw capture comes from Trellis's actual `trellis.native.syntax@native-v13`
 extractor through the #95 `native-capture` command. It uses UTF-8 byte coordinates,
 not the old helper's UTF-16 offsets. Native identifier-site candidates carry no
 inferred semantic role or target. Narrow explicit renamed imports have measured
@@ -31,20 +31,19 @@ barrel. Zero calls is not unsupported. Annotations contain native coverage only;
 scenario arrays, semantic artifacts, dispositions, callable negatives and rooted
 answers are empty. `generated/manifest.json` selects the content-addressed bundle.
 
-## Current native-v12 recapture
+## Current native-v13 recapture
 
-The #519 slice (Rust expression macros, Decision 0019) re-ran the production
-`native-capture` command twice on these unchanged snapshots using pinned Rust
-1.99.1 and `test-support`. Both outputs were byte-identical (SHA-256
-`ba74cbddfe9d866238855bde5cf13b7223bff63fc67e2851ff3da55877c6d004`). The compiled native extractor hash is
-`bc3f08d161f930264f534db8beb56fd608a0985e8bfcef32fb6db496af0bc393`, pinned as
-`trellis-native-v12-javascript-test-support` in the hardware profile. The
-descriptor and both captures are retained under the 519 evidence (`js-recapture`).
+The #564 slice (a document past its stored evidence budgets keeps only its file
+module and a coverage gap) re-ran the production `native-capture` command twice on
+these unchanged snapshots using pinned Rust 1.99.1 and `test-support`. Both outputs
+were byte-identical (SHA-256
+`5200774bbed03e6124abe34d0730e1ea3ad946a9ffb0777c8fde955fec5c715f`). The compiled native extractor hash is
+`ad5cf3093f15759ede50c5f1922e21d1b139d527482e2aba0638f7ef6e6ee195`, pinned as
+`trellis-native-v13-javascript-test-support` in the hardware profile.
 
-JavaScript measurement is unchanged. After substituting the producer version,
-extractor hash and the 2,613 occurrence IDs (which include the producer
-version), the capture is byte-identical to the native-v11 capture. The
-scenario table below uses the new occurrence refs; nothing else changed.
+JavaScript measurement is unchanged: only the producer version, extractor hash and
+occurrence IDs (which include the producer version) differ from the native-v12
+capture, and the scenario table below uses the new occurrence refs.
 
 ## Historical native-v11 recapture
 
@@ -87,7 +86,7 @@ No executable, parser archive or fixture-local replacement extractor is vendored
 The obsolete TypeScript capture script and script-plus-parser archive pins are
 removed. F7's Python/tarfile reproducibility dependency no longer exists.
 
-## Reproduce the current native-v12 capture
+## Reproduce the current native-v13 capture
 
 The commands below reproduce the current capture, not the historical native-v10
 or native-v11 hashes above. From the repository root, use an owned target directory and the
@@ -124,34 +123,34 @@ not fabricated JavaScript overloads. Scoped shadowing also remains in the projec
 | N2 | same-name/overload | EventEditor.payload getter/setter | `src/editor.js:10` — `get payload()` | `2:r1:sid:v1:302f9d6c22b6ef053921d300360d67d2` | EventEditor.payload getter/setter share one class owner. Reads retain the event payload; writes normalize whitespace through clean. The property contract provides natural sibling declarations. |
 | N3 | same-name/overload | EventEditor.label getter/setter | `src/editor.js:12` — `get label()` | `2:r1:sid:v1:94de098569fe8c3ad8247f8717e72c93` | EventEditor.label getter/setter share one class owner. Reads fall back to the event key; writes clean and Unicode-normalize a display label. Distinct accessor bodies must retain their source identities. |
 | N4 | same-name/overload | EventEditor.tags getter/setter | `src/editor.js:14` — `get tags()` | `2:r1:sid:v1:6e9398d62a78b31a178f4e7400a6ed2c` | EventEditor.tags getter/setter share one class owner. Reads return a copy; writes canonicalize and deduplicate tags. These protect editable collection state rather than padding same-name declarations. |
-| I1 | imports/aliases | inspectBatch | `src/workbench.js:19` — `summary: summarize(events)` | `2:r1:occ:v2:533cfd1eec755736e6aa8173248e96c6` | The default import summarize is called by inspectBatch; producer binding must resolve through the default export in text.js. |
-| I2 | imports/aliases | exportSelection → map callback | `src/workbench.js:48` — `key: keyOf(event.key)` | `2:r1:occ:v2:fbdb02a9367d88091e2fa5a15666522c` | keyOf imports the exported eventKey alias of canonicalKey, while serialize aliases formatLine. Both are real source aliases, not renamed normalized facts. |
-| I3 | imports/aliases | runWorkbench | `src/workbench.js:36` — `const output = sendBatch(quiet, events);` | `2:r1:occ:v2:41459b464e67d3cb3a52414d0cef3dbb` | sendBatch is imported from public.js, which re-exports adapters.deliver. The barrel contains no wrapper call to confuse with the target. |
-| I4 | imports/aliases | compareLabels | `src/workbench.js:53` — `text.describe(event)];` | `2:r1:occ:v2:19f8d3ec2995d447d6125e20bafab8b1` | Namespace import text selects describe independently of compareLabels nested same-name function. Exact callee join must preserve the qualification. |
-| V1 | callable values | toolPalette | `src/pipeline.js:7` — `clean, canonicalKey, parseLine, hasPayload, stamp, redact, formatLine, describe, café, 𐐀label,` | `2:r1:occ:v2:a4291f8e1ede5141117209a8f0941ef0` | toolPalette retains ten helper function values in object shorthand properties. None of these reads invokes the helpers. |
-| V2 | callable values | historyActions | `src/history.js:55` — `return { flatten, checksum, replayEvent, replayCheckpoint, findBatch,` | `2:r1:occ:v2:fd2f0ae8ac8360ef53ecb7f84d19aa1e` | historyActions exposes recursive helpers as values. Merely opening action metadata must not traverse the history or create recursion edges. |
-| V3 | callable values | previewTools | `src/workbench.js:43` — `return { ...palette, ...actions, prepare, inspectBatch, captions, runWorkbench,` | `2:r1:occ:v2:5fb58e9bc04fda2942ca3520a41f2042` | previewTools returns workbench functions and more helpers as values. The toolPalette/historyActions calls occur before these reads and are distinct invocations. |
-| V4 | callable values | adapterMethods | `src/legacy.js:32` — `return { append: source.append, drain: source.drain };` | `2:r1:occ:v2:43d71b78db2f7528d61730dd09ed8733` | adapterMethods reads prototype-provided callable properties. Read syntax alone must not create append or drain execution; binding may remain dynamic. |
-| R1 | recursion | checksum | `src/history.js:11` — `return text.charCodeAt(index) + checksum(text, index + 1);` | `2:r1:occ:v2:7f2222b0a186052cdc7644fd78a8c5b1` | checksum has one direct self-call behind a terminating base case. The external charCodeAt call is a distinct earlier sibling. |
-| R2 | recursion | History.lookup | `src/history.js:47` — `return local ?? this.parent?.lookup(key);` | `2:r1:occ:v2:1583172b1f80853f35724f77bb52d3ac` | History.lookup walks the parent chain through its own method. Future counting needs an exact internal self-target on this optional call; the callback-only flatten reference is not a direct self-call. |
-| R3 | recursion | replayCheckpoint | `src/history.js:22` — `return cursor.checkpoint ? replayEvent(cursor.next) : replayCheckpoint(cursor.next);` | `2:r1:occ:v2:1e892549094c8d2bd6f10998faa09e04` | replayCheckpoint has a direct self-call and a separate mutual edge to replayEvent. Only exact self-target proof establishes this recursion scenario; future rooted answers must retain cycle boundaries. |
-| R4 | recursion | findBatch → visit | `src/history.js:29` — `const found = visit(child);` | `2:r1:occ:v2:4be96c80ffba7762f12deb808e866a0f` | findBatch owns a nested recursive visit. Its recursive call and initial visit(root) have the nested owner target, not the outer findBatch symbol. |
+| I1 | imports/aliases | inspectBatch | `src/workbench.js:19` — `summary: summarize(events)` | `2:r1:occ:v2:ddb73acd44cf9e7f54dcdf93e1266ade` | The default import summarize is called by inspectBatch; producer binding must resolve through the default export in text.js. |
+| I2 | imports/aliases | exportSelection → map callback | `src/workbench.js:48` — `key: keyOf(event.key)` | `2:r1:occ:v2:41ca2d7d8d810af63e6445fa929e873b` | keyOf imports the exported eventKey alias of canonicalKey, while serialize aliases formatLine. Both are real source aliases, not renamed normalized facts. |
+| I3 | imports/aliases | runWorkbench | `src/workbench.js:36` — `const output = sendBatch(quiet, events);` | `2:r1:occ:v2:7a4a564dc7383a4095305557b338c575` | sendBatch is imported from public.js, which re-exports adapters.deliver. The barrel contains no wrapper call to confuse with the target. |
+| I4 | imports/aliases | compareLabels | `src/workbench.js:53` — `text.describe(event)];` | `2:r1:occ:v2:547f469099b86e838ac16ed00c9cda00` | Namespace import text selects describe independently of compareLabels nested same-name function. Exact callee join must preserve the qualification. |
+| V1 | callable values | toolPalette | `src/pipeline.js:7` — `clean, canonicalKey, parseLine, hasPayload, stamp, redact, formatLine, describe, café, 𐐀label,` | `2:r1:occ:v2:917a5cb9e456099fe38581ea9eb89a97` | toolPalette retains ten helper function values in object shorthand properties. None of these reads invokes the helpers. |
+| V2 | callable values | historyActions | `src/history.js:55` — `return { flatten, checksum, replayEvent, replayCheckpoint, findBatch,` | `2:r1:occ:v2:72aebb87f86b043b2936115418f4d8b8` | historyActions exposes recursive helpers as values. Merely opening action metadata must not traverse the history or create recursion edges. |
+| V3 | callable values | previewTools | `src/workbench.js:43` — `return { ...palette, ...actions, prepare, inspectBatch, captions, runWorkbench,` | `2:r1:occ:v2:ab33b83a60fc1a34cd2c12a0e0190af8` | previewTools returns workbench functions and more helpers as values. The toolPalette/historyActions calls occur before these reads and are distinct invocations. |
+| V4 | callable values | adapterMethods | `src/legacy.js:32` — `return { append: source.append, drain: source.drain };` | `2:r1:occ:v2:aeeb87c71f16ae21e55128e85c41fb49` | adapterMethods reads prototype-provided callable properties. Read syntax alone must not create append or drain execution; binding may remain dynamic. |
+| R1 | recursion | checksum | `src/history.js:11` — `return text.charCodeAt(index) + checksum(text, index + 1);` | `2:r1:occ:v2:4d6bfead0f7caf525997a733c32c81cb` | checksum has one direct self-call behind a terminating base case. The external charCodeAt call is a distinct earlier sibling. |
+| R2 | recursion | History.lookup | `src/history.js:47` — `return local ?? this.parent?.lookup(key);` | `2:r1:occ:v2:4ea50f3ffac75feaccb08b58eb600e06` | History.lookup walks the parent chain through its own method. Future counting needs an exact internal self-target on this optional call; the callback-only flatten reference is not a direct self-call. |
+| R3 | recursion | replayCheckpoint | `src/history.js:22` — `return cursor.checkpoint ? replayEvent(cursor.next) : replayCheckpoint(cursor.next);` | `2:r1:occ:v2:17cbb3ddcb9d3552255e4da7e4bfe57b` | replayCheckpoint has a direct self-call and a separate mutual edge to replayEvent. Only exact self-target proof establishes this recursion scenario; future rooted answers must retain cycle boundaries. |
+| R4 | recursion | findBatch → visit | `src/history.js:29` — `const found = visit(child);` | `2:r1:occ:v2:d10ec5fc3dcab4d5720632a5fc98c0fb` | findBatch owns a nested recursive visit. Its recursive call and initial visit(root) have the nested owner target, not the outer findBatch symbol. |
 | D1 | relationships/dispatch | module (ParseStage declaration) | `src/stages.js:12` — `export class ParseStage extends Stage` | `2:r1:sid:v1:951c7e24ad1e2928d600c6211c31a26f` | ParseStage has an explicit extends edge. Four other functional stages share the base for real parse/filter/stamp/redact/format operations. |
 | D2 | relationships/dispatch | StampStage.transform | `src/stages.js:26` — `transform(value) { return stamp(value); }` | `2:r1:sid:v1:107a78c7787a15353a66e41d4197f0bb` | StampStage overrides Stage.transform. Each stage overrides accepts/transform/describe; future relationships require independent emitted relationship records. |
-| D3 | relationships/dispatch | planRetry | `src/adapters.js:73` — `wait: policy.delay(attempt),` | `2:r1:occ:v2:8a0103e7ac5422ed940de069a3c03642` | planRetry picks ImmediatePolicy or RetryPolicy and calls delay on that union. Two real declarations are possible; ambiguity requires observed conflicting exact producer targets. |
-| D4 | relationships/dispatch | Pipeline.run | `src/pipeline.js:21` — `value = stage.run(value);` | `2:r1:occ:v2:202403541542358aacda431434f1b154` | Pipeline executes stages through inherited Stage.run. Calls to this.accepts/this.transform inside the base must not automatically promote subclass possibilities to direct execution. |
+| D3 | relationships/dispatch | planRetry | `src/adapters.js:73` — `wait: policy.delay(attempt),` | `2:r1:occ:v2:3faa94c0f8791a8fa2a44582c793bebd` | planRetry picks ImmediatePolicy or RetryPolicy and calls delay on that union. Two real declarations are possible; ambiguity requires observed conflicting exact producer targets. |
+| D4 | relationships/dispatch | Pipeline.run | `src/pipeline.js:21` — `value = stage.run(value);` | `2:r1:occ:v2:f3edd80eb9cd91c977e0e3a3ba30eec0` | Pipeline executes stages through inherited Stage.run. Calls to this.accepts/this.transform inside the base must not automatically promote subclass possibilities to direct execution. |
 | U1 | Unicode/coordinates | module (café declaration) | `src/text.js:36` — `export function café(event)` | `2:r1:sid:v1:17e2f06c2a644eac1ccc70c8a217a2e0` | The precomposed accented function name occupies different UTF-8-byte and UTF-16-column widths; exact declaration-name witnesses must preserve spelling. |
 | U2 | Unicode/coordinates | module (𐐀label declaration) | `src/text.js:40` — `export function 𐐀label(event)` | `2:r1:sid:v1:67a313e3952c7a74d18d5870a91cbe56` | The astral letter is a valid identifier at ES2022. Its name range spans a surrogate pair in the SCIP producer encoding. |
-| U3 | Unicode/coordinates | captions | `src/workbench.js:24` — `const heading = 𐐀label(event);` | `2:r1:occ:v2:01d99dae92e2d3d4c247ffa5a869cb42` | An imported astral identifier is called, distinct from its declaration. Exact callee and invocation ranges must map through UTF-16 correctly. |
-| U4 | Unicode/coordinates | captions | `src/workbench.js:25` — `const emoji = "📨"; return text.describe(event)` | `2:r1:occ:v2:4b9530bac7a4bbbbc6c121b38a443f61` | An astral string literal precedes a namespace call on the same physical line; byte and UTF-16 columns diverge before that callee. |
-| F1 | coverage/freshness | receive | `src/plugins.js:10` — `const decoded = extension.decode(message);` | `2:r1:occ:v2:d02de4a006bc89f07c1acd3dbd9f952a` | A valid measured invocation on an untyped runtime extension. Future unresolved disposition needs a complete producer tuple plus no exact occurrence; absence alone in an omitted tuple proves nothing. |
-| F2 | coverage/freshness | stamp | `src/text.js:20` — `return { ...event, observedAt: Date.now() };` | `2:r1:occ:v2:acd3d83572fa2efb6b49531f70f8bb8c` | Small isolated stamp body is a future changed-bytes case: replacing only this call must invalidate old document content/occurrence evidence. No second revision or stale fact is claimed now. |
+| U3 | Unicode/coordinates | captions | `src/workbench.js:24` — `const heading = 𐐀label(event);` | `2:r1:occ:v2:9f7fc246d301236602c1e02b2d8ce89f` | An imported astral identifier is called, distinct from its declaration. Exact callee and invocation ranges must map through UTF-16 correctly. |
+| U4 | Unicode/coordinates | captions | `src/workbench.js:25` — `const emoji = "📨"; return text.describe(event)` | `2:r1:occ:v2:11b95820019af04ec80d5e1ef0e2a397` | An astral string literal precedes a namespace call on the same physical line; byte and UTF-16 columns diverge before that callee. |
+| F1 | coverage/freshness | receive | `src/plugins.js:10` — `const decoded = extension.decode(message);` | `2:r1:occ:v2:59e9948d233b295c8b1faf11586332f7` | A valid measured invocation on an untyped runtime extension. Future unresolved disposition needs a complete producer tuple plus no exact occurrence; absence alone in an omitted tuple proves nothing. |
+| F2 | coverage/freshness | stamp | `src/text.js:20` — `return { ...event, observedAt: Date.now() };` | `2:r1:occ:v2:582ae636fa9a16ed7278b5f07ea99022` | Small isolated stamp body is a future changed-bytes case: replacing only this call must invalidate old document content/occurrence evidence. No second revision or stale fact is claimed now. |
 | F3 | coverage/freshness | Pipeline.constructor | `src/pipeline.js:12` — `constructor(stages = defaultStages())` | `2:r1:sid:v1:6d9e73cd12f32529ea92143d9b4ac3b3` | Native extraction declares extractionInputs:[] and does not read project configuration. A future semantic config-only mutation must invalidate the semantic basis/config provenance, not claim a native extraction-context change. |
-| F4 | coverage/freshness | module (export-clause identifier) | `src/public.js:3` — `export { Pipeline as EventPipeline }` | `2:r1:occ:v2:a04b4d2c285f6cdb83e6cd93f87f68cd` | The re-export alias EventPipeline has a measured identifier site, not an invented alias declaration. The barrel has no calls and no capability gaps; future coverage checks must preserve that distinction rather than manufacture unsupported. |
-| C1 | compatibility/control | Pipeline.run | `src/pipeline.js:20` — `if (value === undefined) break;` | `2:r1:occ:v2:75ee3458daf64d6d33565cb15a22764e` | Pipeline.run has a loop and early break. stage.run is inside the loop and after the guard; controls and order remain native facts. |
-| C2 | compatibility/control | withSession | `src/plugins.js:53` — `await consume(event);` | `2:r1:occ:v2:79a453d44946eaabc4d9e21810361752` | withSession has awaited callback execution inside a loop under try, with catch host.report and finally disconnect. Callback bodies must not be folded into caller ownership. |
-| C3 | compatibility/control | schedulePreview → then callback (nested map callback) | `src/pipeline.js:54` — `const events = batch.map((line) => pipeline.run(line));` | `2:r1:occ:v2:d022ce56908917d06088a4091cef98ea` | schedulePreview nests a map callback inside a Promise.then callback. The pipeline.run call belongs to the inner callback boundary, not schedulePreview directly. |
-| C4 | compatibility/control | module (assigned function expression) | `src/legacy.js:22` — `LegacySource.prototype.append.call(this,` | `2:r1:occ:v2:ad8a5a9d29e4c5f1f4abddca03f0ff9c` | TaggedSource uses prototype assignment and explicit .call delegation. Production attributes this call to the module; it does not emit a separate anonymous-function declaration for the assigned function expression. Preserve that measured owner. Prototype metadata is not a fabricated ES extends relationship and .call syntax is not silently rewritten to direct execution. |
+| F4 | coverage/freshness | module (export-clause identifier) | `src/public.js:3` — `export { Pipeline as EventPipeline }` | `2:r1:occ:v2:0bfdbd2deb2ec82af3191a14b7f66008` | The re-export alias EventPipeline has a measured identifier site, not an invented alias declaration. The barrel has no calls and no capability gaps; future coverage checks must preserve that distinction rather than manufacture unsupported. |
+| C1 | compatibility/control | Pipeline.run | `src/pipeline.js:20` — `if (value === undefined) break;` | `2:r1:occ:v2:cb3856b8abda74615e0e1a592024bb46` | Pipeline.run has a loop and early break. stage.run is inside the loop and after the guard; controls and order remain native facts. |
+| C2 | compatibility/control | withSession | `src/plugins.js:53` — `await consume(event);` | `2:r1:occ:v2:ff600f02f3574df3d7f163938a1ec331` | withSession has awaited callback execution inside a loop under try, with catch host.report and finally disconnect. Callback bodies must not be folded into caller ownership. |
+| C3 | compatibility/control | schedulePreview → then callback (nested map callback) | `src/pipeline.js:54` — `const events = batch.map((line) => pipeline.run(line));` | `2:r1:occ:v2:eca0cf807b4b44c1b950575aecc10934` | schedulePreview nests a map callback inside a Promise.then callback. The pipeline.run call belongs to the inner callback boundary, not schedulePreview directly. |
+| C4 | compatibility/control | module (assigned function expression) | `src/legacy.js:22` — `LegacySource.prototype.append.call(this,` | `2:r1:occ:v2:84905acd94e8cdc761a0e5e5ed49a385` | TaggedSource uses prototype assignment and explicit .call delegation. Production attributes this call to the module; it does not emit a separate anonymous-function declaration for the assigned function expression. Preserve that measured owner. Prototype metadata is not a fabricated ES extends relationship and .call syntax is not silently rewritten to direct execution. |
 
 ## Deferred floor plan and producer quirks
 

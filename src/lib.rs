@@ -2,6 +2,7 @@ pub mod architecture_details;
 pub mod auth;
 pub mod behavior;
 mod behavior_bindings;
+mod behavior_columns;
 mod behavior_incidental;
 mod behavior_java;
 pub mod behavior_js;
@@ -16,6 +17,7 @@ pub mod dependencies;
 pub mod dependency_links;
 mod dependency_rust;
 pub mod dependency_rust_symbols;
+pub(crate) mod evidence_budget;
 #[cfg(test)]
 mod extractor_inputs_tests;
 pub mod file_tree;
@@ -58,6 +60,7 @@ pub mod semantic_batch;
 pub mod semantic_evidence;
 pub mod semantic_import;
 pub mod store;
+pub mod syntax_bounds;
 #[cfg(test)]
 mod test_alloc;
 #[doc(hidden)]
