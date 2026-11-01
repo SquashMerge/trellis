@@ -142,6 +142,9 @@ The full-corpus utility/checker, not this seven-row test, supplies the all-card 
 
 ## Observed results
 
+These results were measured on Candle 0.11.0; the full-corpus run has not been repeated on
+0.11.1.
+
 Release Metal inference covered all **6,722 cards in each form (`a`, `b`, `c`)**
 and 50 queries. Every card exceeded cosine 0.999:
 
