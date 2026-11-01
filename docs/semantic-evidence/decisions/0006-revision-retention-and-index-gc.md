@@ -59,6 +59,26 @@ Durable per-reader pin leases were considered and rejected for now. Renewing a l
 - Route unchanged explicit requests through the guarded unchanged path after their FIFO claim.
 - Release retained SQLite check handles for deleted or recreated files (see #16's scope).
 
+## Amendment (2026-11-01): head-rooted release holds
+
+Owner ruling on #573, 2026-11-01. It amends §1.
+
+**What holds a revision past the grace.** Two exceptions to the 15-minute release, both rooted at the head:
+- the captured revision of a batch the head selects; a rejoin rebuilds from its native header, manifest and version links;
+- the revision that took the import of a batch the head selects, the earliest revision selecting it; its admitted tuples are what a witnessed rejoin reuses (Decision 0002).
+
+A selection row on any other revision holds nothing, so sequential imports leave no chain. The holds are whole revisions, not extracted witness data, and no thinning of a held revision is done.
+
+**Old pins.** A superseded revision keeps its full 15-minute grace, and a read pinned to it still works if its captured revision is released first: it reads its own stored basis and raw proofs, and raw cleanup stays scoped to every remaining selection. Past the grace, a pin to a revision no hold keeps stops resolving, as in §1. A held revision is a dependency of the head, not a promise of history, and fewer revisions are available to historical declaration lookups.
+
+**Storage.** With P producer slots, after the grace and once release has drained: the head plus at most 2P full revisions, plus revisions still in their grace and unfinished release debt. This is independent of the number of imports, but it isn't literally zero growth and isn't a deadline:
+- Held revisions keep their own incidental selections, so more raw batches survive than the head selects: two for one producer, and possibly O(P²).
+- A released revision keeps its `native_revisions` header row as a tombstone.
+- Freed SQLite pages need not shrink the file.
+- New producer identities raise P.
+
+The "Storage" and §1 statements above that retained revisions are the head plus the last 15 minutes are read with these holds.
+
 ## Amendment (2026-10-20): no revision for an unchanged capture
 
 Approved by the owner on #199 (items R-3 and S-4). Decision 0009 §2 is amended with it.

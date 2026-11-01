@@ -161,7 +161,7 @@ fn both_full_routes_persist_summaries_and_unchanged_copies_completeness() {
         drop(db);
         let original = selections(store, first);
         let before = counters();
-        let unchanged = reindex(store, &options, false);
+        let unchanged = reindex(store, &options, true);
         assert_eq!(selections(store, unchanged), original);
         assert_eq!(counters(), before);
     }
