@@ -17,7 +17,7 @@ A user must provide a directory containing the pinned files; a missing or differ
 is unavailable, not a request to fetch one. The custom Python file is provenance only:
 Trellis never executes it.
 
-The Rust port uses Candle core/nn **0.11.0** and tokenizers **0.22.2**. Candle's public
+The Rust port uses Candle core/nn **0.11.1** and tokenizers **0.23.2**. Candle's public
 Qwen3 model exposes only causal attention, so a small private adaptation supplies the
 bidirectional key-padding mask. It retains the explicit 128-wide heads, per-head Q/K
 normalization, split-half RoPE and learned tokenwise 1024→2048 projection. Masked mean pooling
