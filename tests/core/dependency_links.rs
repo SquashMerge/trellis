@@ -243,6 +243,7 @@ fn participant_cap_retains_original_target_on_overflow() {
     while view.participants.len() < 20 {
         view.participants.push(Participant {
             declaration: None,
+            column: None,
             id: format!("padding:{}", view.participants.len()),
             label: "padding".into(),
             kind: "boundary".into(),

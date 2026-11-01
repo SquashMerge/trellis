@@ -118,10 +118,10 @@ fn branches_returns_throws_and_short_circuit_guard_suffixes() {
         .unwrap();
     assert_eq!(calls(&branch.children), ["done"]);
     assert_eq!(calls(&branch.alternate), ["other"]);
-    assert!(!view.steps.iter().any(|s| s.label == "after"));
-    assert!(view.steps.iter().any(
-        |s| s.label.contains("continues normally") && calls(&s.children) == ["after", "error"]
-    ));
+    assert!(view.steps.iter().any(|s| s.label == "after"));
+    // The `if` draws its return: the guard folds into it and the suffix follows (#558).
+    assert_eq!(branch.folded.len(), 1);
+    assert!(branch.folded[0].label.contains("continues normally"));
     assert!(flatten(&view.steps).iter().any(|s| s.kind == "throw"));
     let (_, both) = fixture(
         "class Fixture { void run() { if (check()) return; else throw error(); gone(); } }",
@@ -333,4 +333,19 @@ fn exhausted_argument_visit_budget_never_implies_enclosing_invocation() {
     );
     assert!(calls(&view.steps).is_empty(), "{:?}", view.steps);
     assert!(!view.warnings.iter().any(|w| w.contains("unreachable")));
+}
+
+/// #558: only a drawn `return` or `throw` folds a guard; many sequential guards spend no depth.
+#[test]
+fn guards_fold_only_after_a_drawn_exit_and_spend_no_depth() {
+    let (_, view) = fixture(
+        "class Fixture { void run() { for (int i : xs()) { if (i > 0) break; } after(); } }",
+        "run",
+    );
+    assert!(flatten(&view.steps).iter().all(|s| s.folded.is_empty()));
+    let ifs: String = (0..40).map(|n| format!("if (x{n}) return; ")).collect();
+    let source = format!("class Fixture {{ void run() {{ {ifs} a(b(c())); }} }}");
+    let (_, view) = fixture(&source, "run");
+    assert_eq!(calls(&view.steps), ["c", "b", "a"]);
+    assert!(!view.truncated, "{:?}", view.warnings);
 }

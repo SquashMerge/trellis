@@ -45,8 +45,8 @@ represent only their first measured call, not a guessed terminal target.
 
 `semanticWarnings` carries the engine's structured warnings (omitted when empty); their
 messages also appear in `warnings`. Existing syntax warnings are preserved. No warning
-code or resolution is invented by the browser. Bounds remain 200 shown steps, 20 participants
-and depth 24, with a separate 2000-step work bound (#536, below). If a resolved target cannot fit, its boundary is `nodeLimit`, its target is
+code or resolution is invented by the browser. Bounds remain 200 shown steps, 20 participant
+columns (#558, below) and depth 24, with a separate 2000-step work bound (#536, below). If a resolved target cannot fit, its boundary is `nodeLimit`, its target is
 absent, and the view is truncated with an explicit participant-limit warning.
 
 ### Participants, expansion and incidental calls (#522)
@@ -213,6 +213,65 @@ Owner rulings 2026-10-31 (#543). They amend the #522, #536 and #542 sections abo
 - Rust `::log::`/`::tracing::` macro paths and JavaScript optional calls (`console?.log`)
   match the same rule. Constructors (Java constructors, a JavaScript `constructor`, Python
   `__init__`) are never accessors, and a setter assigns with plain `=` only.
+
+### Readable large sequences (#558)
+
+Owner issue #558 (2026-10-31 re-dogfood). It amends the sections above: the participant bound
+and #542's "any other guard is unchanged".
+
+- **One column per type or module.** Every participant of an enriched view (the seed and each
+  exact target) carries `column` `{id,label}`, and the browser draws one lifeline per
+  `column.id`:
+  - Rust: the `impl` type (`impl Trait for Foo` is `Foo`), else the trait, struct or enum,
+    else the module (the file stem, or the directory of a `mod.rs`, plus inline modules).
+    An `impl` block whose type has no name (`impl Tr for [u8]`) or is its own type parameter
+    (`impl<A> Tr for A`) is its module's. A self type by a path that does not start at
+    `crate`, `self` or `super` may be foreign, so it keeps that path (`fmt::Error`) and
+    never joins a local type's column.
+  - JavaScript, Java and Python: the class, else the file (Python: the module).
+  - A closure or nested function is in the column of whatever encloses it; an anonymous
+    class defers outward.
+  - A Rust type's `impl` blocks join across files when the snapshot declares at most one
+    type of that name. With several, nothing says which an `impl` implements, so its blocks
+    stay apart by file, inline module and the path as written: two module-level types are
+    never conflated. Types are not resolved here, so an imported foreign type with a local type's bare name
+    (`use other::Error; impl Tr for Error`) reads as the local one.
+  - Two columns that read the same are told apart in `column.label`: by path, and by line
+    within one file.
+  - A syntax hint has no `column` and stays its own lane; a syntax-only view is unchanged.
+- **Identity.** A column is a display grouping that proves nothing about receivers. `target`,
+  `lane`, `participants[].declaration` and the inspector keep the exact method. Each exact
+  target stays a participant. A column of one method keeps that method's open action; a
+  column of several has none, and its arrows open their own targets from the inspector.
+- **Bound.** The 20-participant bound counts drawn columns (`MAX_COLUMNS`), the seed's included.
+  A target in a drawn column always fits, so `participants` may hold more than 20 entries;
+  a target needing a 21st column is `nodeLimit` as before, typed `participants`.
+- **Arrow labels.** In both renderers the compact diagram labels an arrow with its row number
+  and the target declaration's name, not the call's source spelling. Rows and frame headers
+  use the compact labels, at most 72 characters; a collapsed chain whose entry call draws no
+  arrow keeps its entry call ID and may run longer. Options → Show all steps keeps the
+  exact DTO text.
+- **Size.** Each method opens at its own size (no text under 12 px) and the panel scrolls.
+  "Fit to width", offered only while the diagram is wider than the panel, shrinks it on
+  request, for that method and its redraws. The Files preview keeps fitting its column.
+  Once a tall diagram has scrolled its headers away, a copy of the column names stays over
+  the panel, whichever renderer drew it.
+- **Folded guards after `if` and `match`.** An "only if the preceding path continues normally"
+  guard also folds into the nearest `if` or `match` before it, in every language, provided
+  only plain calls come between them and that step's own frame draws an exit: a `return` or
+  `throw` step, or a call carrying a folded `?`. The guard moves to that step's `folded`
+  list and its children follow the step at the same level, exactly as under #542. The row
+  is marked "may exit early". A guard after anything else is unchanged: an `if` whose only
+  exit is an opaque boundary or a `break`, a loop, a kept `x?` branch, an opaque boundary,
+  or a guard frame that was kept.
+- **Empty state.** When a view has steps and every one is hidden, the browser draws no
+  diagram. It says "Only standard-library calls (N hidden)." when every hidden step is an
+  external call into Rust's `std`, `core` or `alloc` by its `externalPackage`, "Only external
+  calls" when all are external, and "Only incidental calls" otherwise. The full view offers
+  "Show them", the same request as Show all.
+- **JavaScript source hints.** As in the other adapters, the last syntax lane is reserved:
+  excess hints share the unknown-operations lane and stay measured calls, so a view with
+  many hints is neither truncated nor loses its arrows once enrichment resolves them.
 
 The browser draws an expanded step's arrows and notes from its `lane`, shows the tier and
 reason in the sequence status line, and offers a "Show/Hide N incidental calls" toggle

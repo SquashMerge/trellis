@@ -3,7 +3,7 @@
 (() => {
   const ROOT_STYLE = "max-width:100%;height:auto;--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg);--_r:var(--pele-radius,4px);--_hw:var(--pele-heading-weight,bold);--_fm:var(--pele-font-mono,monospace);font:16px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)";
   const SVG_NS = "http://www.w3.org/2000/svg";
-  const kinds = new Set(["call", "group", "branch", "loop", "try", "effect", "return", "throw", "await", "note", "boundary", "definition"]);
+  const kinds = new Set(["call", "group", "branch", "loop", "try", "effect", "return", "throw", "exit", "await", "note", "boundary", "definition"]);
   const tags = new Set(["svg", "g", "path", "rect", "text", "tspan"]);
   const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "fill-opacity", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "stroke-dasharray", "stroke-linecap", "xml:space"]);
   function unsupported(reason) { const error = new Error(reason); error.code = "unsupported"; throw error; }
@@ -24,26 +24,34 @@
     if (!view || !view.seed || !Array.isArray(view.steps) || !Array.isArray(view.participants) || !view.revision) unsupported("Invalid sequence view");
     const seen = new Set(), rows = [], frames = [], frameHeaders = [], closeFrames = [], closeHeaders = [], noteOrder = [null];
     const intro = "Static possible paths - not a runtime trace";
-    const lanes = [{alias:"S", id:view.seed.id, label:view.seed.name || view.seed.id, participant:view.participants.find(p => p.id === view.seed.id), proof:null}];
+    // One lane per type or module (#558); its targets are the exact methods drawn in it.
+    const columnOf = participant => window.TrellisSequence.column(participant);
+    const seed = view.participants.find(p => p.id === view.seed.id);
+    const lanes = [{alias:"S", id:columnOf(seed).id ?? view.seed.id, label:seed?.column ? columnOf(seed).label : view.seed.name || view.seed.id, targets:new Map([[view.seed.id, {participant:seed, proof:null}]])}];
     const lines = ["sequenceDiagram", `Note over S: ${intro}`];
     let separators = 1;
     const targetFor = step => window.TrellisSequence?.target(view, step);
     const laneFor = (target, proof) => {
-      let lane = lanes.find(item => item.id === target.id);
+      const column = columnOf(target);
+      let lane = lanes.find(item => item.id === column.id);
       if (!lane) {
         if (lanes.length >= 20) unsupported("Too many sequence participants");
-        lane = {alias:`P${lanes.length}`, id:target.id, label:target.declaration.name || target.label, participant:target, proof}; lanes.push(lane);
-      } else if (!lane.proof) lane.proof = proof;
+        lane = {alias:`P${lanes.length}`, id:column.id, label:target.column ? column.label : target.declaration.name || target.label, targets:new Map()}; lanes.push(lane);
+      }
+      const member = lane.targets.get(target.id);
+      if (member) member.proof ||= proof; else lane.targets.set(target.id, {participant:target, proof});
       return lane;
     };
+    const shorten = (text, max) => text.length > max ? text.slice(0, Math.max(1, max - 3)) + "..." : text;
+    const shortened = text => shorten(text, window.TrellisSequence.labelLimit);
     const add = (step, preview) => {
       const ordinal = rows.length + 1;
       if (ordinal > 200) unsupported("Too many source notes");
-      let label = step.label || step.kind;
+      const early = window.TrellisSequence.earlyReturn?.(step) || "";
+      let label = options.showDetails ? step.label || step.kind : window.TrellisSequence.compactLabel(step);
       if (step.kind === "call" || step.kind === "boundary" && step.callId) label = step.callEvidence
         ? `${window.TrellisSequence.evidenceLabel(step, view)} - ${label}`
         : `${label} - ${window.TrellisSequence.evidenceLabel(step, view)}`;
-      const shorten = (text, max) => text.length > max ? text.slice(0, Math.max(1, max - 3)) + "..." : text;
       let displayLabel;
       if (preview) {
         // Source labels are encoded separately; the app-generated count and
@@ -58,16 +66,20 @@
         displayLabel = `${shorten(label, groupLimit)} - first measured entry: ${shorten(preview.label, entryLimit)} - call ${entryId} -${suffix}`;
         if (preview.callEvidence) displayLabel = `${window.TrellisSequence.evidenceLabel(preview, view)} - ${displayLabel}`;
       } else {
-        if (!options.showDetails) label = shorten(label, 160);
+        // The row number and any mark count toward the limit.
+        if (!options.showDetails) label = shorten(label, window.TrellisSequence.labelLimit - 6 - early.length);
         displayLabel = label;
       }
       const marker = `[${String(ordinal).padStart(3, "0")}]`;
-      const display = `${marker} ${step.kind} ${displayLabel}${window.TrellisSequence.earlyReturn?.(step) || ""}`;
       const evidence = preview || step, target = targetFor(evidence), lane = target && laneFor(target, evidence);
-      // An expanded callee body runs on the callee's lane, opened by the call before it (#522).
-      const owner = step.lane == null ? lanes[0] : lanes.find(item => item.id === step.lane);
-      if (!owner) unsupported("Unknown sequence lane");
       const message = lane && evidence.kind === "call", type = message ? "message" : "note";
+      const display = message && !options.showDetails
+        ? window.TrellisSequence.arrowLabel(ordinal, target, preview ? step.children.length - 1 : 0, early)
+        : `${marker} ${options.showDetails ? `${step.kind} ` : ""}${displayLabel}${early}`;
+      // An expanded callee body runs on the callee's lane, opened by the call before it (#522).
+      const ownerId = step.lane == null ? null : columnOf(view.participants.find(p => p.id === step.lane)).id;
+      const owner = step.lane == null ? lanes[0] : lanes.find(item => item.id === ownerId);
+      if (!owner) unsupported("Unknown sequence lane");
       lines.push(message ? `${owner.alias}->>${lane.alias}: ${encode(display)}` : `Note right of ${owner.alias}: ${encode(display)}`);
       const row = {ordinal, marker, display, step, id:step.id, callId:step.callId, path:step.path, range:step.range, revision:view.revision, previewEntryCallId:preview?.callId, preview, evidence, target, type};
       rows.push(row); if (!message) noteOrder.push(row);
@@ -92,9 +104,10 @@
         if (step.kind === "branch") frame = alternate.length ? "alt" : "opt";
         else if (step.kind === "loop") frame = "loop";
         else if (step.kind === "try" || (step.kind !== "group" && (children.length || alternate.length))) frame = "rect";
-        const header = frame && frame !== "rect" ? {kind:frame, header:`[${step.label}]`, alternate:frame === "alt" ? "[alternate path]" : null} : null;
+        const heading = options.showDetails ? step.label : shortened(window.TrellisSequence.compactLabel(step));
+        const header = frame && frame !== "rect" ? {kind:frame, header:`[${heading}]`, alternate:frame === "alt" ? "[alternate path]" : null} : null;
         if (frame) {
-          lines.push(frame === "rect" ? "rect" : `${frame} ${encode(step.label)}`);
+          lines.push(frame === "rect" ? "rect" : `${frame} ${encode(heading)}`);
           frames.push(frame);
           if (header) frameHeaders.push(header);
         }
@@ -220,13 +233,15 @@
       const {root, notes, messages, messageLabels, actors} = validatedSvg(result, projection);
       const rowNodes = [...notes, ...messageLabels];
       for (const lane of projection.lanes) {
-        if (!lane.proof || typeof options.onOpenTarget !== "function") continue;
+        // A column of several methods names no one target: its arrows do, in the inspector.
+        const [{participant, proof} = {}] = lane.targets.size === 1 ? lane.targets.values() : [];
+        if (!proof || typeof options.onOpenTarget !== "function") continue;
         for (const actor of actors.filter(node => node.getAttribute("data-id") === lane.alias)) {
           actor.setAttribute("role", "button"); actor.setAttribute("tabindex", "0");
-          actor.setAttribute("data-trellis-target-id", lane.id);
-          actor.setAttribute("aria-label", `${window.TrellisSequence.targetActionLabel(lane.participant.declaration)}: ${lane.participant.declaration.name}`);
+          actor.setAttribute("data-trellis-target-id", participant.id);
+          actor.setAttribute("aria-label", `${window.TrellisSequence.targetActionLabel(participant.declaration)}: ${participant.declaration.name}`);
           const open = () => {
-            if (active() && window.TrellisSequence.target(view, lane.proof) === lane.participant) options.onOpenTarget(lane.participant.declaration, lane.proof);
+            if (active() && window.TrellisSequence.target(view, proof) === participant) options.onOpenTarget(participant.declaration, proof);
           };
           actor.addEventListener("click", open);
           actor.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });

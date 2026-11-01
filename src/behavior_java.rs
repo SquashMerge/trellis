@@ -1,6 +1,6 @@
 //! Java syntax-only possible paths. No execution, class loading or provider calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
-use crate::behavior::{Participant, SequenceStep, SequenceView};
+use crate::behavior::{CONTINUES_LABEL, Participant, SequenceStep, SequenceView, fold_guard};
 use crate::model::{CallSite, IndexPin, SourceFile, SourceRange, Symbol, SymbolKind};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
@@ -130,21 +130,22 @@ impl Builder<'_> {
             }
             if f.exits && i + 1 < nodes.len() {
                 // Do not draw the suffix after a return/throw alternative as unconditional.
+                let Some(guard) = self.step(nodes[i + 1], "branch", CONTINUES_LABEL) else {
+                    break;
+                };
+                // After a branch that draws its exit the suffix stays at this level (#558).
+                let Some(mut guard) = fold_guard(&mut out.steps, guard) else {
+                    continue;
+                };
                 if depth >= MAX_DEPTH {
                     self.limit();
                     break;
                 }
-                if let Some(mut guard) = self.step(
-                    nodes[i + 1],
-                    "branch",
-                    "only if the preceding path continues normally",
-                ) {
-                    let rest = self.block(&nodes[i + 1..], depth + 1);
-                    guard.children = rest.steps;
-                    out.continues = rest.continues;
-                    out.exits |= rest.exits;
-                    out.steps.push(guard);
-                }
+                let rest = self.block(&nodes[i + 1..], depth + 1);
+                guard.children = rest.steps;
+                out.continues = rest.continues;
+                out.exits |= rest.exits;
+                out.steps.push(guard);
                 break;
             }
         }
@@ -157,11 +158,14 @@ impl Builder<'_> {
             return first;
         }
         if first.exits && !next.steps.is_empty() {
-            if let Some(mut guard) =
-                self.step(n, "branch", "only if the preceding path continues normally")
-            {
-                guard.children = next.steps;
-                first.steps.push(guard);
+            if let Some(guard) = self.step(n, "branch", CONTINUES_LABEL) {
+                match fold_guard(&mut first.steps, guard) {
+                    None => first.steps.extend(next.steps),
+                    Some(mut guard) => {
+                        guard.children = next.steps;
+                        first.steps.push(guard);
+                    }
+                }
             }
         } else {
             first.steps.extend(next.steps);
@@ -453,6 +457,7 @@ impl Builder<'_> {
         {
             participant = Participant {
                 declaration: None,
+                column: None,
                 id: "java:unresolved-overflow".into(),
                 label: "Unresolved calls".into(),
                 kind: "boundary".into(),
@@ -501,7 +506,7 @@ fn unresolved_participant(n: Node<'_>, file: &SourceFile) -> Participant {
     } else {
         ("unresolvedCallee", "unknown")
     };
-    Participant { declaration: None, id: format!("java:source:{kind}:{}", hex::encode(Sha256::digest(expression.as_bytes()))), label: bounded(expression), kind: kind.into(),
+    Participant { declaration: None, column: None, id: format!("java:source:{kind}:{}", hex::encode(Sha256::digest(expression.as_bytes()))), label: bounded(expression), kind: kind.into(),
         identification: "Source spelling only; types, overloads and virtual dispatch unresolved. Visual group, not runtime object identity or a claimed return type.".into() }
 }
 pub(crate) fn build(
@@ -560,7 +565,7 @@ pub(crate) fn build(
         }
     }
     let mut b = Builder { file, seed, calls, count: 0, visits: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
-        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
+        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, column: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Java types, overloads, virtual dispatch, annotations/Lombok, reflection, generated methods and implicit initialization are not resolved. Calls/operations may throw; implicit exception paths are not expanded.".into()], hidden_steps: 0, truncated: false, truncated_by: vec![],
     }};
     let f = if remaining == 0 {
