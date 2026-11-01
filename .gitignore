@@ -11,7 +11,8 @@ __pycache__/
 /target/
 # tools/verify's tests lane builds with CARGO_TARGET_DIR=<target>-test-support.
 /target-test-support/
-/.trellis/
+/.trellis/*
+!/.trellis/rules.toml
 /.factory-sandboxes/
 .factory/
 /.pre-git-archive/

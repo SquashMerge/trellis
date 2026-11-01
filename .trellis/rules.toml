@@ -1,0 +1,75 @@
+version = 1
+
+# Source-reviewed #163 candidate. Add only positively witnessed exceptions.
+# Lower order is higher. Same-layer families do not require allowed peers.
+[layer_policy]
+peers = "forbid"
+shared_outbound = "forbid"
+
+[layers.web]
+order = 1
+paths = ["web/**"]
+
+[layers.entry]
+order = 2
+paths = [
+  "src/main.rs", "src/auth.rs", "src/http.rs", "src/http/**",
+  "src/daemon/**", "src/mcp/**",
+]
+
+[layers.query]
+order = 3
+paths = [
+  "src/navigation.rs", "src/classes.rs", "src/class_diagram.rs",
+  "src/behavior.rs", "src/behavior_bindings.rs", "src/behavior_java.rs",
+  "src/behavior_js.rs", "src/behavior_python.rs", "src/behavior_rust.rs",
+  "src/dependencies.rs", "src/dependency_links.rs", "src/dependency_rust.rs",
+  "src/dependency_rust_symbols.rs", "src/file_tree.rs", 
+  "src/git_status.rs", "src/metrics.rs", "src/references.rs", "src/references/**",
+  "src/rules.rs", "src/rust_sources.rs", "src/search_embed/**",
+  "src/search_model.rs", "src/search_rank.rs",
+  "src/architecture_details.rs", "src/behavior_incidental.rs", "src/classes/**",
+  "src/graph_query.rs", "src/rules/**", "src/rules_edit.rs", "src/behavior_columns.rs",
+]
+
+[layers.indexing]
+order = 4
+paths = [
+  "src/indexer.rs", "src/indexer_java.rs", "src/indexer_python.rs", "src/indexer_rust.rs",
+  "src/index_coordinator.rs", "src/index_coordinator/**", "src/capture.rs", "src/watch.rs",
+  "src/native_evidence.rs", "src/native_capture.rs",
+  "src/scip_admission.rs", "src/semantic_evidence.rs", "src/semantic_import.rs",
+  "src/search_capture.rs", "src/search_card.rs",
+  "src/native_rust_macros_tests.rs", "src/extractor_inputs_tests.rs", "src/indexer_projection_vectors_tests.rs",
+  "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/skipped_source.rs", "src/skipped_config.rs", "src/semantic_batch.rs", "src/semantic_batch/**",
+  "src/semantic_import/**",
+]
+
+[layers.storage]
+order = 5
+paths = ["src/store.rs", "src/store/**", "src/search_vectors.rs"]
+
+[layers.shared]
+shared = true
+paths = [
+  "src/model.rs", "src/testing.rs", "src/native_ids.rs", "src/scip_raw.rs", "src/files_view.rs", "src/parallel.rs", "src/build_info.rs", "src/search_lexical.rs",
+  "src/lib.rs", "src/scip_raw/**", "src/test_alloc.rs", "src/syntax_bounds.rs",
+]
+
+# Coarse developer-tool boundary; does not infer internal tooling architecture.
+[layers.tooling]
+display = "hidden"
+order = 1
+paths = [
+  "tools/*.py", "tools/verify-env.mjs", "src/bin/**", "src/native_navigation_fixture.rs", "tools/release/**",
+  "tools/semantic-contract/**", "tools/extraction/**", "tools/selection/**",
+  "tools/metrics-oracle/**", "tools/metrics-bench/**", "tools/semantic-search/**",
+  "tools/synthetic-cohorts/generate.mjs", "tools/synthetic-cohorts/test/**",
+  "docs/semantic-evidence/check-policy.mjs", "docs/semantic-evidence/id-test-vectors/**",
+  "build.rs", "build/**", "examples/**",
+]
+
+# Captured sample programs are inputs, not Trellis runtime implementations.
+[layers.fixture-inputs]
+order = 0
+paths = ["tests/fixtures/**", "tools/synthetic-cohorts/templates/**"]
