@@ -69,7 +69,13 @@ fn original_document_tuple(
         )
         .optional()?;
     tuple
-        .map(|tuple| read_semantic_tuple(tx, original, Some(tuple), None, true))
+        .map(|tuple| {
+            let mut snapshot = read_semantic_tuple(tx, original, Some(tuple), None, true)?;
+            if let [coverage] = snapshot.coverage.as_mut_slice() {
+                coverage.reasons = read_coverage_reasons(tx, tuple)?;
+            }
+            Ok(snapshot)
+        })
         .transpose()
 }
 
