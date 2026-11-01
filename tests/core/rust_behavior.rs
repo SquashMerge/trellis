@@ -933,3 +933,31 @@ fn confirmed_internal_targets_are_not_replaced_by_source_hints() {
     assert_ne!(target.kind, "internal");
     assert!(measured.steps[0].resolution.is_none() && measured.steps[0].target.is_none());
 }
+
+#[test]
+fn a_callable_inside_a_measured_macro_has_its_behaviour_at_real_lines() {
+    let source = include_str!("../fixtures/rust/macro_callables.rs");
+    let (_graph, view) = fixture(source, "countdown");
+    assert!(
+        !view
+            .warnings
+            .iter()
+            .any(|w| w.contains("does not match cached syntax")),
+        "{:?}",
+        view.warnings
+    );
+    assert_eq!(calls(&view.steps), ["countdown"], "{:?}", view.steps);
+    let call = flatten(&view.steps)
+        .into_iter()
+        .find(|s| s.kind == "call")
+        .unwrap();
+    let start = source.find("countdown(n - 1)").unwrap();
+    assert_eq!(call.range.start_byte, start);
+    let line = source[..start].matches('\n').count() + 1;
+    let column = start - source[..start].rfind('\n').unwrap();
+    assert_eq!(
+        (call.range.start_line, call.range.start_column),
+        (line, column)
+    );
+    assert_eq!(call.range.end_line, line);
+}

@@ -2213,11 +2213,12 @@ mod reservation_tests {
         let entry = sizes::map_entries::<(usize, usize), ()>(1).unwrap();
         let budget = LiveBudget::new(BatchLimits::PRODUCTION.unit_expansion_bytes);
         let mut operation = budget.reserve(0).unwrap();
-        let sites = super::super::super::source_role_sites_reserved("java", source, &mut |bytes| {
-            operation.grow(bytes()?)
-        })
-        .unwrap();
-        let expected = super::super::super::source_role_sites("java", source).unwrap();
+        let sites =
+            super::super::super::source_role_sites_reserved("java", source, None, &mut |bytes| {
+                operation.grow(bytes()?)
+            })
+            .unwrap();
+        let expected = super::super::super::source_role_sites("java", source, None).unwrap();
         assert_eq!(sites.types, expected.types);
         assert_eq!(sites.imports, expected.imports);
         assert!(!sites.types.is_empty());
@@ -2240,7 +2241,7 @@ mod reservation_tests {
         let denied = LiveBudget::new(limit);
         let error = (|| -> Result<RoleSites> {
             let mut operation = denied.reserve(0)?;
-            super::super::super::source_role_sites_reserved("java", source, &mut |bytes| {
+            super::super::super::source_role_sites_reserved("java", source, None, &mut |bytes| {
                 operation.grow(bytes()?)
             })
         })()

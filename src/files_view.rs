@@ -58,7 +58,13 @@ pub(crate) struct OutlineSyntax {
 
 /// `None` when the language has no such facts or the cached file cannot be parsed within the
 /// Files budget; callers then list no binding as callable and leave impl blocks unnamed.
-pub(crate) fn outline_syntax(file: &SourceFile) -> Option<OutlineSyntax> {
+/// `impl_blocks` are the native `impl` declarations asked about. One measured inside a macro has
+/// syntax only in that macro's expansion (#551), so it alone is looked up there, within the
+/// same budget; running out leaves those blocks unnamed.
+pub(crate) fn outline_syntax(
+    file: &SourceFile,
+    impl_blocks: &[(usize, usize)],
+) -> Option<OutlineSyntax> {
     let language: tree_sitter::Language = match file.language.as_str() {
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
@@ -83,11 +89,46 @@ pub(crate) fn outline_syntax(file: &SourceFile) -> Option<OutlineSyntax> {
         None,
         Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
     )?;
-    let text = file.text.as_bytes();
     let mut found = OutlineSyntax::default();
-    let mut cursor = tree.walk();
+    let in_budget = || started.elapsed() < FILE_TIME_LIMIT;
+    collect_outline(
+        tree.root_node(),
+        file.text.as_bytes(),
+        &mut found,
+        &in_budget,
+    )?;
+    if file.language == "rust" {
+        let mut expansions = crate::native_rust_macros::Expansions::new(&file.text)
+            .with_deadline(started + FILE_TIME_LIMIT);
+        for &(start, end) in impl_blocks {
+            if !in_budget() {
+                break;
+            }
+            if found.impl_targets.contains_key(&(start, end)) {
+                continue;
+            }
+            let block = expansions
+                .root_for(tree.root_node(), start, end)
+                .descendant_for_byte_range(start, end)
+                .filter(|node| node.start_byte() == start && node.end_byte() == end);
+            if let Some(name) = block.and_then(|node| impl_target(node, file.text.as_bytes())) {
+                found.impl_targets.insert((start, end), name);
+            }
+        }
+    }
+    Some(found)
+}
+
+/// Add the outline facts under `root`. `None` once `in_budget` fails.
+fn collect_outline(
+    root: tree_sitter::Node<'_>,
+    text: &[u8],
+    found: &mut OutlineSyntax,
+    in_budget: &impl Fn() -> bool,
+) -> Option<()> {
+    let mut cursor = root.walk();
     loop {
-        if started.elapsed() >= FILE_TIME_LIMIT {
+        if !in_budget() {
             return None;
         }
         let node = cursor.node();
@@ -109,24 +150,32 @@ pub(crate) fn outline_syntax(file: &SourceFile) -> Option<OutlineSyntax> {
         }) {
             found.callable_initializers.insert(range);
         }
-        if node.kind() == "impl_item"
-            && let Some(name) = node.child_by_field_name("type").and_then(type_name)
-            && let Ok(name) = name.utf8_text(text)
-        {
-            found.impl_targets.insert(range, name.to_owned());
+        if let Some(name) = impl_target(node, text) {
+            found.impl_targets.insert(range, name);
         }
-        if cursor.goto_first_child() || cursor.goto_next_sibling() {
+        if cursor.goto_first_child() {
             continue;
         }
         loop {
-            if !cursor.goto_parent() {
-                return Some(found);
+            if cursor.node() == root {
+                return Some(());
             }
             if cursor.goto_next_sibling() {
                 break;
             }
+            if !cursor.goto_parent() {
+                return Some(());
+            }
         }
     }
+}
+/// The type an `impl` block implements, by its last path segment.
+fn impl_target(node: tree_sitter::Node<'_>, text: &[u8]) -> Option<String> {
+    if node.kind() != "impl_item" {
+        return None;
+    }
+    let name = type_name(node.child_by_field_name("type")?)?;
+    Some(name.utf8_text(text).ok()?.to_owned())
 }
 /// The identifier naming a Rust type: `Foo`, `a::Foo`, `Foo<T>`, `&Foo`, `&mut a::Foo<T>`.
 fn type_name(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
@@ -416,8 +465,12 @@ fn snippet(text: &str, start: usize, end: usize) -> String {
 mod outline_syntax_tests {
     use super::*;
 
+    fn outline_syntax_of(file: &SourceFile) -> Option<OutlineSyntax> {
+        outline_syntax(file, &[])
+    }
+
     fn syntax(language: &str, text: &str) -> Option<OutlineSyntax> {
-        outline_syntax(&SourceFile {
+        outline_syntax_of(&SourceFile {
             path: "fixture".into(),
             hash: String::new(),
             language: language.into(),
@@ -466,6 +519,25 @@ mod outline_syntax_tests {
             .into_values()
             .collect();
         assert_eq!(targets, ["Budget", "Remote", "Holder"]);
+    }
+
+    #[test]
+    fn rust_impl_blocks_inside_measured_macros_name_their_type() {
+        let text = include_str!("../tests/fixtures/rust/macro_callables.rs");
+        let start = text.find("impl Meter").unwrap();
+        let end = start + text[start..].find("\n        }\n").unwrap() + "\n        }".len();
+        let file = SourceFile {
+            path: "fixture.rs".into(),
+            hash: String::new(),
+            language: "rust".into(),
+            text: text.into(),
+        };
+        let targets: Vec<_> = outline_syntax(&file, &[(start, end)])
+            .expect("parsed in budget")
+            .impl_targets
+            .into_values()
+            .collect();
+        assert_eq!(targets, ["Meter"]);
     }
 }
 

@@ -1623,6 +1623,34 @@ fn elected_daemon_exits_after_its_test_owner_process_ends() {
 }
 
 #[test]
+fn metrics_cli_scores_callables_inside_measured_macros() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "macrocli");
+    fs::write(
+        root.join("macros.rs"),
+        include_str!("../fixtures/rust/macro_callables.rs"),
+    )
+    .unwrap();
+    run(&home, "index", &root);
+    let response = cli(&home)
+        .args(["metrics", "--json", "--workspace"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        response.status.success(),
+        "{}",
+        String::from_utf8_lossy(&response.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&response.stdout).unwrap();
+    let files = envelope["payload"]["files"].as_array().unwrap();
+    assert!(files.iter().any(|file| file["path"] == "macros.rs"));
+}
+
+#[test]
 fn metrics_cli_reports_pinned_envelope_and_typed_selectors() {
     let temp = short_temp();
     let home = temp.path().join("home");

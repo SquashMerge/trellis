@@ -1487,3 +1487,106 @@ fn workbench_exclusion_does_not_skip_corrupt_vendor_validation() {
     assert!(store.recovery_pending_for_tests());
     response.finish(()).unwrap();
 }
+
+fn macro_rows(source: &str) -> Vec<trellis::store::MetricsDeclarationRow> {
+    let (_state, _root, store, _pin) = fixture_with_sources(&[("src/lib.rs", source)]);
+    let response = store.evidence_response().unwrap();
+    let payload = response
+        .metrics_at(
+            &MetricsOptions {
+                scope: "file".into(),
+                language: Some("rust".into()),
+                path: Some("src/lib.rs".into()),
+                source_set_id: Some(
+                    response
+                        .metrics_at(&MetricsOptions::default(), &mut || Ok(()))
+                        .unwrap()
+                        .files[0]
+                        .source_set_id
+                        .clone(),
+                ),
+                ..MetricsOptions::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    payload.declarations
+}
+
+#[test]
+fn callables_inside_measured_macros_are_scored_at_their_exact_ranges() {
+    let source = include_str!("../fixtures/rust/macro_callables.rs");
+    let rows = macro_rows(source);
+    let row = |text: &str| {
+        let start = source.find(text).unwrap_or_else(|| panic!("{text}"));
+        rows.iter()
+            .find(|row| row.range.start == start && row.range.end == start + text.len())
+            .unwrap_or_else(|| panic!("no row for {text}"))
+    };
+    // Closures in `ensure!`, `format!` and `vec!`, and one nested in `format!` in `assert_eq!`.
+    for text in [
+        "|v| *v != 0",
+        "|v| v + 1",
+        "|v| **v > 1",
+        "|x: &usize| x + 1",
+    ] {
+        assert_eq!(row(text).metrics["loc"], 1, "{text}");
+        assert_eq!(row(text).metrics["cyclomatic"], 1, "{text}");
+        assert!(
+            row(text).metrics["halstead"]["N2"].as_u64().unwrap() > 0,
+            "{text}"
+        );
+    }
+    // Body facts come from the expansion, and a nested closure stays out of its parent.
+    let branching = row("|v| {\n        if positive(*v) { true } else { *v == 0 }\n    }");
+    assert_eq!(branching.metrics["cyclomatic"], 2);
+    assert_eq!(branching.metrics["loc"], 3);
+    assert_eq!(branching.metrics["fanOut"], 1);
+    assert_eq!(branching.metrics["maxNesting"], 2);
+    let outer = row("|r| format!(\"{}\", (|x: &usize| x + 1)(r))");
+    assert_eq!(outer.metrics["halstead"]["N2"], 3, "{}", outer.metrics);
+    // A named function in a macro counts direct recursion, as it would outside one.
+    let countdown = row(
+        "fn countdown(n: u32) -> u32 {\n            if n == 0 { 0 } else { countdown(n - 1) }\n        }",
+    );
+    assert_eq!(countdown.metrics["parameters"], 1);
+    assert_eq!(countdown.metrics["cognitive"], 3);
+    let reading = row("fn reading(&self) -> u32 {\n                self.reading\n            }");
+    assert_eq!(reading.metrics["sloc"], 3);
+}
+
+#[test]
+fn a_closure_scores_the_same_inside_a_macro_and_outside_one() {
+    let closure = "|x: &u32| {\n        if *x > 1 { *x + 1 } else { 0 }\n    }";
+    let source = format!(
+        "fn both(values: &[u32]) {{\n    values.iter().map({closure}).count();\n    assert!(values.iter().map({closure}).count() > 0);\n}}\n"
+    );
+    let rows = macro_rows(&source);
+    let start = source.find(closure).unwrap();
+    let second = source.rfind(closure).unwrap();
+    let scored = |at: usize| rows.iter().find(|row| row.range.start == at).unwrap();
+    assert_ne!(start, second);
+    assert_eq!(scored(start).metrics, scored(second).metrics);
+}
+
+#[test]
+fn callables_outside_macros_score_the_same_beside_macro_callables() {
+    let source = include_str!("../fixtures/rust/macro_callables.rs");
+    let outside = &source[source.find("pub fn outside").unwrap()..];
+    let positive =
+        &source[source.find("fn positive").unwrap()..source.find("pub fn checked").unwrap()];
+    let isolated = format!("{positive}{outside}");
+    let alone = macro_rows(&isolated);
+    let beside = macro_rows(source);
+    let same_text = |row: &trellis::store::MetricsDeclarationRow| {
+        let text = &isolated[row.range.start..row.range.end];
+        beside
+            .iter()
+            .find(|other| &source[other.range.start..other.range.end] == text)
+            .unwrap_or_else(|| panic!("{text}"))
+    };
+    assert_eq!(alone.len(), 3);
+    for row in &alone {
+        assert_eq!(row.metrics, same_text(row).metrics);
+    }
+}

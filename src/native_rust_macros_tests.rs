@@ -484,3 +484,137 @@ fn escaped_format_braces_keep_the_capture_gap() {
     );
     assert_eq!(artifact.coverage[0].state, "partial");
 }
+
+/// Every eligible declaration needs a search card, so a named item in a measured macro must get
+/// one, or the document cannot be published (#551). The macro's contents stay out of the cards
+/// around it.
+#[test]
+fn items_in_measured_macros_get_their_own_search_cards() {
+    let text = "struct Holder;\nimpl Holder {\n    fn outer() {\n        assert!({\n            \
+                /// Inner docs.\n            fn inner(n: Local) -> u32 {\n                \
+                let _ = \"inner text\";\n                format!(\"{}\", { fn deepest() {} 1 });\n                \
+                1\n            }\n            true\n        }, \"outer message\");\n    }\n}\n";
+    let expanded = measure(&rust("src/a.rs", text), true);
+    let card = |name: &str| {
+        let declaration = expanded
+            .declarations
+            .iter()
+            .find(|d| d.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("{name}"));
+        expanded
+            .search_cards
+            .iter()
+            .find(|card| card.syntax_id == declaration.syntax_id)
+            .unwrap_or_else(|| panic!("{name}: {:?}", expanded.search_cards))
+    };
+    let inner = card("inner");
+    assert!(
+        inner.card.text.contains("Inner docs."),
+        "{}",
+        inner.card.text
+    );
+    assert!(
+        inner.card.text.contains("inner text"),
+        "{}",
+        inner.card.text
+    );
+    assert!(inner.card.text.contains("Local"), "{}", inner.card.text);
+    assert!(
+        inner
+            .ancestors
+            .iter()
+            .any(|a| a.name.as_deref() == Some("outer"))
+    );
+    card("deepest");
+    let outer = card("outer");
+    let opaque = measure(&rust("src/a.rs", text), false);
+    let plain = opaque
+        .search_cards
+        .iter()
+        .find(|c| c.syntax_id == outer.syntax_id)
+        .expect("the same declaration without expansion");
+    assert_eq!(outer.facts, plain.facts);
+    assert_eq!(
+        expanded.search_cards.len(),
+        4,
+        "{:?}",
+        expanded.search_cards
+    );
+}
+
+/// Items in a macro are not members of a module around it, and format strings are not charged
+/// to the card walk's visit bound: measurement never visits them, so a document it accepted
+/// must not fail there (Decision 0019).
+#[test]
+fn macro_contents_reach_no_outer_card_and_cannot_fail_the_card_walk() {
+    let text = "mod holder {\n    fn member() {}\n    assert!({ fn inner() {} true });\n}\n";
+    let file = rust("src/a.rs", text);
+    let cards = |artifact: &Artifact, name: &str| {
+        let declaration = artifact
+            .declarations
+            .iter()
+            .find(|d| d.name.as_deref() == Some(name))
+            .unwrap();
+        let id = &declaration.syntax_id;
+        let card = artifact.search_cards.iter().find(|c| &c.syntax_id == id);
+        card.unwrap().facts.members.clone()
+    };
+    let expanded = measure(&file, true);
+    assert_eq!(expanded.capability_reports[0].macro_expansions.len(), 1);
+    assert_eq!(cards(&expanded, "holder"), ["member"]);
+
+    let literal = "\\nx".repeat(180_000);
+    let call = format!("    assert!(x, \"{literal}\");\n");
+    let large = format!("fn f(x: bool) {{\n{call}{call}{call}}}\n");
+    let file = rust("src/large.rs", &large);
+    assert_eq!(
+        measure(&file, true).capability_reports[0]
+            .macro_expansions
+            .len(),
+        3
+    );
+}
+
+/// A long macro path is outside the allowlist, whatever its length, and never overflows.
+#[test]
+fn a_very_long_macro_path_stays_an_opaque_gap() {
+    let path = "a::".repeat(650_000);
+    let file = rust("src/path.rs", &format!("fn f() {{ {path}assert!(1); }}\n"));
+    let artifact = measure(&file, true);
+    assert!(artifact.capability_reports[0].macro_expansions.is_empty());
+    assert_eq!(gaps(&artifact).len(), 1);
+}
+
+/// Readers expand exactly what measurement expanded: a macro it refused at its depth bound is
+/// never parsed, whether outermost or nested in a measured one.
+#[test]
+fn expansions_follow_the_measured_set_not_their_own_decisions() {
+    use crate::native_rust_macros::{Expansions, MeasuredMacros};
+    let expanded = |text: &str| {
+        let artifact = measure(&rust("src/a.rs", text), true);
+        let tree = crate::native_rust_macros::plain_tree_for_tests(text);
+        let mut expansions = Expansions::new(text);
+        let report = &artifact.capability_reports[0];
+        expansions.expand_measured(tree.root_node(), &MeasuredMacros::of(report));
+        let starts: Vec<_> = expansions
+            .arguments()
+            .map(|node| text[..node.start_byte()].matches("assert!").count())
+            .collect();
+        (starts, gaps(&artifact).len())
+    };
+    // One measured macro; the 400-deep chain beside it stays opaque.
+    let chain = format!("assert!({}true{});", "dbg!(".repeat(400), ")".repeat(400));
+    let text = format!("fn f() {{ {chain} assert!(a()); }}\n");
+    assert_eq!(expanded(&text), (vec![2], 1));
+    // A chain nested in a measured macro is left at the level measurement stopped.
+    let nested = format!(
+        "fn f() {{ {}g(){}; }}\n",
+        "assert!(".repeat(100),
+        ")".repeat(100)
+    );
+    let (starts, gap_count) = expanded(&nested);
+    assert_eq!(gap_count, 1);
+    let measured = starts.len();
+    assert!((2..100).contains(&measured), "{measured}");
+    assert_eq!(starts, (1..=measured).collect::<Vec<_>>());
+}

@@ -3347,3 +3347,49 @@ mod batch_admission {
         );
     }
 }
+
+fn joined_roles(source: &str, at: usize, length: usize, roles: i32) -> Vec<semantic::Role> {
+    let occurrence = (at, at + length, "external pkg Measured#", roles);
+    let (_root, native, sources, inventory) =
+        admitted_case("rust", source, vec![occurrence], vec![]);
+    let output = join_inventory(&inventory, &native, &sources, 1).unwrap();
+    let reference = output.references.iter().find(|r| r.range.start == at);
+    reference
+        .unwrap_or_else(|| panic!("no reference"))
+        .roles
+        .clone()
+}
+
+/// Measured macro contents have role sites at their document spans (#551).
+#[test]
+fn explicit_types_and_imports_inside_measured_macros_keep_their_roles() {
+    let source = "struct Item; struct Total;\nfn f(items: &[Item]) {\n    assert!(items.iter().all(|v: &Item| {\n        \
+                  use std::fmt::Debug;\n        let total: Total = Total;\n        \
+                  format!(\"{}\", (|w: Item| 1)(Item)).len() > 0\n    }));\n}\n";
+    let last = |name: &str| source.rfind(name).unwrap();
+    let closure = source.find("|v: &Item").unwrap() + "|v: &".len();
+    assert_eq!(joined_roles(source, closure, 4, 8), [semantic::Role::Type]);
+    let local = source.find("total: Total").unwrap() + "total: ".len();
+    assert_eq!(joined_roles(source, local, 5, 8), [semantic::Role::Type]);
+    let nested = source.find("|w: Item").unwrap() + "|w: ".len();
+    assert_eq!(joined_roles(source, nested, 4, 8), [semantic::Role::Type]);
+    assert!(joined_roles(source, last("Debug"), 5, 2).contains(&semantic::Role::Import));
+}
+
+/// A macro measurement left opaque must not use up the expansion budget of a later measured
+/// macro: its type would join as a plain read, which is a wrong role, not an omission.
+#[test]
+fn a_macro_measurement_refused_cannot_starve_a_later_measured_macro_of_its_roles() {
+    // Compiles as is. Built here because a file this deep fails the Architecture of a checkout
+    // holding it, under the reference walk's own depth bound.
+    let source = format!(
+        "#![recursion_limit=\"2048\"]\nstruct LaterType; fn f() {{ let value = LaterType; \
+         assert!({}true{}); assert!({{ let x: LaterType = value; true }}, \"{}\"); }}{}",
+        "dbg!(".repeat(400),
+        ")".repeat(400),
+        "x".repeat(5000),
+        "",
+    );
+    let at = source.rfind("LaterType").unwrap();
+    assert_eq!(joined_roles(&source, at, 9, 8), [semantic::Role::Type]);
+}

@@ -1060,6 +1060,18 @@ fn base_texts(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
         .filter_map(|n| source.get(n.byte_range()).map(str::to_owned))
         .collect()
 }
+fn has_bases(node: tree_sitter::Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "class_declaration"
+            | "class_definition"
+            | "interface_declaration"
+            | "impl_item"
+            | "trait_item"
+            | "enum_declaration"
+            | "record_declaration"
+    )
+}
 fn parse_bases(
     doc: &crate::references::DocumentInput,
     check: &mut (impl FnMut() -> Result<()> + Send),
@@ -1112,21 +1124,13 @@ fn parse_bases(
             !node.is_error() && !node.is_missing(),
             "invalid_source_syntax"
         );
-        if matches!(
-            node.kind(),
-            "class_declaration"
-                | "class_definition"
-                | "interface_declaration"
-                | "impl_item"
-                | "trait_item"
-                | "enum_declaration"
-                | "record_declaration"
-        ) {
+        if has_bases(node) {
             types.insert((node.start_byte(), node.end_byte()), node);
         }
         let mut cursor = node.walk();
         stack.extend(node.children(&mut cursor).map(|n| (n, depth + 1)));
     }
+    let mut expansions = crate::native_rust_macros::Expansions::new(source);
     let mut result = BTreeMap::new();
     for d in &doc.declarations {
         check()?;
@@ -1140,7 +1144,17 @@ fn parse_bases(
             );
             continue;
         }
-        let node = types.get(&(d.range.start, d.range.end)).copied();
+        let mut node = types.get(&(d.range.start, d.range.end)).copied();
+        if node.is_none() && doc.key.language == "rust" {
+            // An `impl` measured inside a macro has syntax only in that macro's expansion
+            // (#551). Only measured macros are reached, so none of it can exceed a bound here.
+            node = expansions
+                .root_for(tree.root_node(), d.range.start, d.range.end)
+                .descendant_for_byte_range(d.range.start, d.range.end)
+                .filter(|n| {
+                    has_bases(*n) && n.start_byte() == d.range.start && n.end_byte() == d.range.end
+                });
+        }
         let mut bases = Bases::default();
         if let Some(n) = node {
             match doc.key.language.as_str() {

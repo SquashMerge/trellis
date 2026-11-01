@@ -819,7 +819,10 @@ pub fn build(
     let tree = parser
         .parse(&file.text, None)
         .context("Rust parse unavailable")?;
-    let mut node = tree.root_node();
+    let mut expansions = crate::native_rust_macros::Expansions::new(&file.text);
+    // A callable measured inside a macro has syntax only in that macro's expansion (#551).
+    let mut node =
+        expansions.root_for(tree.root_node(), seed.range.start_byte, seed.range.end_byte);
     // Locate the exact indexed function, not a nested body or an approximate span.
     loop {
         if node.start_byte() == seed.range.start_byte

@@ -52,7 +52,7 @@ async fn fixture_with_startup_hook(
     ProvisionedBrowser,
     String,
 ) {
-    fixture_with_identity(startup_hook, wait_ready, parser_fixture, false, false).await
+    fixture_with_identity(startup_hook, wait_ready, parser_fixture, false, false, &[]).await
 }
 async fn fixture_with_identity(
     startup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -60,6 +60,7 @@ async fn fixture_with_identity(
     parser_fixture: bool,
     git: bool,
     role_fixture: bool,
+    extra_sources: &[(&str, &str)],
 ) -> (
     tempfile::TempDir,
     Arc<trellis::daemon::registry::CheckoutRuntime>,
@@ -105,6 +106,11 @@ async fn fixture_with_identity(
             "function check() { return 1; }\n",
         )
         .unwrap();
+    }
+    for (path, source) in extra_sources {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
     }
     if parser_fixture {
         let mut source = String::from("function parseMany() {\n");
@@ -173,9 +179,37 @@ async fn fixture_with_identity(
     (base, runtime, browser, key)
 }
 #[tokio::test]
+async fn metrics_succeed_for_callables_inside_measured_macros() {
+    let (_base, _runtime, browser, key) = fixture_with_identity(
+        None,
+        true,
+        false,
+        false,
+        false,
+        &[(
+            "src/macros.rs",
+            include_str!("../fixtures/rust/macro_callables.rs"),
+        )],
+    )
+    .await;
+    let app = browser.router();
+    let (status, body) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let source = body["payload"]["files"][0]["sourceSetId"].as_str().unwrap();
+    let (status, body) = request(
+        app,
+        &key,
+        &format!("?scope=file&sourceSetId={source}&language=rust&path=src/macros.rs"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Eight closures and five named functions, the ones in macros included.
+    assert_eq!(body["payload"]["files"][0]["declarationCount"], 13);
+}
+#[tokio::test]
 async fn selected_metrics_roles_share_one_pin_and_filter_every_projection() {
     let (_base, _runtime, browser, key) =
-        fixture_with_identity(None, true, false, false, true).await;
+        fixture_with_identity(None, true, false, false, true, &[]).await;
     let app = browser.router();
     let (status, omitted) = request(app.clone(), &key, "").await;
     assert_eq!(status, StatusCode::OK, "{omitted}");
@@ -305,7 +339,7 @@ async fn selected_metrics_roles_share_one_pin_and_filter_every_projection() {
 #[tokio::test]
 async fn selected_metrics_file_metadata_preserves_zero_area_and_no_callable_roles() {
     let (_base, _runtime, browser, key) =
-        fixture_with_identity(None, true, false, false, true).await;
+        fixture_with_identity(None, true, false, false, true, &[]).await;
     let app = browser.router();
     let (status, response) = request(app.clone(), &key, "").await;
     assert_eq!(status, StatusCode::OK, "{response}");
@@ -353,7 +387,7 @@ async fn selected_metrics_file_metadata_preserves_zero_area_and_no_callable_role
 async fn selected_metrics_top_cognitive_validation_and_git_identity() {
     for git in [false, true] {
         let (_base, _runtime, browser, key) =
-            fixture_with_identity(None, true, false, git, false).await;
+            fixture_with_identity(None, true, false, git, false, &[]).await;
         let app = browser.clone().router();
         let (status, ordinary) = request(app.clone(), &key, "").await;
         assert_eq!(status, StatusCode::OK, "{ordinary}");

@@ -30,6 +30,9 @@ pub fn render_card(declaration: &Declaration, captured: &CapturedCard) -> Search
     })
 }
 
+/// Measured Rust macros by invocation byte range.
+pub(crate) type MeasuredMacros = BTreeMap<(usize, usize), crate::native_rust_macros::Expansion>;
+
 #[derive(Default)]
 struct Facts {
     doc: String,
@@ -45,6 +48,10 @@ struct Collector<'a> {
     file: &'a SourceFile,
     declarations: &'a [Declaration],
     nodes: &'a BTreeMap<usize, String>,
+    macros: &'a MeasuredMacros,
+    /// The ancestor stack's height at the innermost macro being walked (Decision 0019): what
+    /// lies at or below it is outside that macro, and takes no facts from it.
+    macro_floor: usize,
     indices: BTreeMap<&'a str, usize>,
     facts: BTreeMap<usize, Facts>,
     owners: BTreeMap<String, Option<usize>>,
@@ -52,7 +59,7 @@ struct Collector<'a> {
     visits: usize,
 }
 
-/// This walks the same tree after native calls and declarations have been measured.
+/// This walks the same trees after native calls and declarations have been measured.
 /// No parser, filesystem access, display key or evidence serialization is involved.
 pub(crate) fn capture(
     root: Node<'_>,
@@ -60,11 +67,14 @@ pub(crate) fn capture(
     declarations: &[Declaration],
     calls: &[Call],
     nodes: &BTreeMap<usize, String>,
+    macros: &MeasuredMacros,
 ) -> Result<Vec<CapturedCard>> {
     let mut collector = Collector {
         file,
         declarations,
         nodes,
+        macros,
+        macro_floor: 0,
         indices: declarations
             .iter()
             .enumerate()
@@ -282,6 +292,32 @@ fn attached_doc(node: Node<'_>, file: &SourceFile) -> String {
 }
 
 impl Collector<'_> {
+    /// Every eligible declaration needs a card, including one measured inside a macro. This
+    /// walk gives a macro's contents to declarations inside it only; a call measured in a
+    /// macro still reaches its owner's card, through the owner's calls. Measurement bounded
+    /// these nodes, and they include format strings it never visits, so they are not charged
+    /// to the visit bound: expansion never fails a document (Decision 0019).
+    fn walk_macro(
+        &mut self,
+        node: Node<'_>,
+        stack: &mut Vec<(usize, Ancestor)>,
+        depth: usize,
+    ) -> Result<()> {
+        let Some(arguments) = self
+            .macros
+            .get(&(node.start_byte(), node.end_byte()))
+            .and_then(|expansion| expansion.arguments())
+        else {
+            return Ok(());
+        };
+        let floor = std::mem::replace(&mut self.macro_floor, stack.len());
+        let visits = self.visits;
+        let walked = self.walk(arguments, stack, None, depth + 1, false);
+        self.macro_floor = floor;
+        self.visits = visits;
+        walked
+    }
+
     fn walk(
         &mut self,
         node: Node<'_>,
@@ -296,7 +332,7 @@ impl Collector<'_> {
         );
         self.visits += 1;
         if opaque(&self.file.language, node) {
-            return Ok(());
+            return self.walk_macro(node, stack, depth);
         }
         let declaration = self
             .nodes
@@ -308,7 +344,8 @@ impl Collector<'_> {
         }
         if let Some(index) = declaration {
             let d = &self.declarations[index];
-            if let Some((parent, _)) = stack.last()
+            if stack.len() > self.macro_floor
+                && let Some((parent, _)) = stack.last()
                 && search_card::is_container(&self.declarations[*parent].kind)
                 && self.declarations[index].kind != "parameter"
                 && let Some(name) = &d.name

@@ -313,7 +313,13 @@ impl<'a> JoinStore for MemoryJoinStore<'a> {
             .sources
             .get(document)
             .context("missing role-site source")?;
-        source_role_sites(document.language.as_str(), source)
+        let report = self
+            .measured
+            .native
+            .capability_reports
+            .iter()
+            .find(|report| &report.document == document);
+        source_role_sites(document.language.as_str(), source, report)
     }
 
     fn charge(&self, _units: usize) -> Result<()> {

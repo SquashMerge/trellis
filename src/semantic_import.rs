@@ -2847,24 +2847,31 @@ fn reserve_role_span(
     Ok(())
 }
 
-fn source_role_sites(language: &str, source: &[u8]) -> Result<RoleSites> {
-    source_role_sites_reserved(language, source, &mut |_| Ok(()))
+fn source_role_sites(
+    language: &str,
+    source: &[u8],
+    report: Option<&native::CapabilityReport>,
+) -> Result<RoleSites> {
+    source_role_sites_reserved(language, source, report, &mut |_| Ok(()))
 }
 
 fn source_role_sites_reserved(
     language: &str,
     source: &[u8],
+    report: Option<&native::CapabilityReport>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<RoleSites> {
-    Ok(source_role_sites_parsed(language, source, reserve)?.0)
+    Ok(source_role_sites_parsed(language, source, report, reserve)?.0)
 }
 
 /// The role sites of `source`, and the syntax tree they were read from (`None` for a language
 /// without role sites). Each supported language's tree is the one its direct type bases are
-/// read from too.
+/// read from too. `report` is the document's capability report, whose measured macros hold sites
+/// of their own.
 fn source_role_sites_parsed(
     language: &str,
     source: &[u8],
+    report: Option<&native::CapabilityReport>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<(RoleSites, Option<tree_sitter::Tree>)> {
     reserve(&mut || Ok(std::mem::size_of::<RoleSites>() as u64))?;
@@ -2881,7 +2888,7 @@ fn source_role_sites_parsed(
         .parse(source, None)
         .context("semantic role source parser failed")?;
     let mut sites = RoleSites::default();
-    walk_named_reverse(tree.root_node(), &mut |node| {
+    let mut visit = |node: tree_sitter::Node<'_>| {
         let kind = node.kind();
         let type_field = match language {
             "java"
@@ -3006,7 +3013,20 @@ fn source_role_sites_parsed(
             }
         }
         Ok(true)
-    })?;
+    };
+    walk_named_reverse(tree.root_node(), &mut visit)?;
+    if let Some(report) = report.filter(|report| !report.macro_expansions.is_empty())
+        && let Ok(text) = std::str::from_utf8(source)
+    {
+        // Measured macro contents have syntax only in their expansions (#551). A site missing
+        // here is not a conservative omission: its occurrence would join as a plain read.
+        use crate::native_rust_macros::{Expansions, MeasuredMacros};
+        let mut expansions = Expansions::new(text);
+        expansions.expand_measured(tree.root_node(), &MeasuredMacros::of(report));
+        for arguments in expansions.arguments() {
+            walk_named_reverse(arguments, &mut visit)?;
+        }
+    }
     Ok((sites, Some(tree)))
 }
 

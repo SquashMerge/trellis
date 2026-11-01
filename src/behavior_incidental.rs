@@ -157,6 +157,7 @@ pub(crate) fn trivial_accessors(file: &SourceFile, nodes: &[Symbol]) -> BTreeSet
         }
     }
     let none = BTreeSet::new();
+    let mut expansions = crate::native_rust_macros::Expansions::new(&file.text);
     for symbol in nodes
         .iter()
         .filter(|node| matches!(node.kind, SymbolKind::Function | SymbolKind::Method))
@@ -166,9 +167,19 @@ pub(crate) fn trivial_accessors(file: &SourceFile, nodes: &[Symbol]) -> BTreeSet
             .as_deref()
             .and_then(|parent| fields.get(parent))
             .unwrap_or(&none);
+        // A method measured inside a Rust macro has syntax only in its expansion (#551).
+        let root = if file.language == "rust" {
+            expansions.root_for(
+                tree.root_node(),
+                symbol.range.start_byte,
+                symbol.range.end_byte,
+            )
+        } else {
+            tree.root_node()
+        };
         if accessor_body(
             file,
-            tree.root_node(),
+            root,
             symbol.range.start_byte,
             symbol.range.end_byte,
             fields,
@@ -359,6 +370,27 @@ mod tests {
             .unwrap();
         let tree = parser.parse(class, None).unwrap();
         accessor_body(&file, tree.root_node(), start, end, &["x"].into())
+    }
+
+    #[test]
+    fn an_accessor_inside_a_measured_macro_is_read_from_its_expansion() {
+        let text = include_str!("../tests/fixtures/rust/macro_callables.rs");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fixture.rs"), text).unwrap();
+        let graph = crate::indexer::index_workspace(
+            &crate::indexer::IndexOptions::new(dir.path().to_owned()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let accessors = super::trivial_accessors(&graph.files[0], &graph.nodes);
+        let names: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| accessors.contains(&node.id))
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(names, ["reading"]);
     }
 
     #[test]

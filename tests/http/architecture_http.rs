@@ -40,10 +40,21 @@ async fn fixture() -> (
     ProvisionedBrowser,
     String,
 ) {
-    fixture_with_roles(false).await
+    fixture_with_sources(false, &[]).await
 }
 async fn fixture_with_roles(
     role_fixture: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<trellis::daemon::registry::CheckoutRuntime>,
+    ProvisionedBrowser,
+    String,
+) {
+    fixture_with_sources(role_fixture, &[]).await
+}
+async fn fixture_with_sources(
+    role_fixture: bool,
+    extra_sources: &[(&str, &str)],
 ) -> (
     tempfile::TempDir,
     Arc<trellis::daemon::registry::CheckoutRuntime>,
@@ -61,6 +72,11 @@ async fn fixture_with_roles(
     )
     .unwrap();
     fs::write(root.join("empty.js"), "// no callable\n").unwrap();
+    for (path, source) in extra_sources {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
     fs::create_dir(root.join("zero")).unwrap();
     fs::write(root.join("zero/empty.js"), "// zero-callable directory\n").unwrap();
     if role_fixture {
@@ -209,6 +225,32 @@ async fn architecture_route_pin_aggregate_setup_and_located_diagnostics() {
         assert!(!invalid["error"][field].is_null(), "{field}: {invalid}");
     }
     assert!(invalid.get("payload").is_none());
+}
+#[tokio::test]
+async fn architecture_succeeds_for_callables_inside_measured_macros() {
+    let (base, _runtime, browser, key) = fixture_with_sources(
+        false,
+        &[(
+            "src/macros.rs",
+            include_str!("../fixtures/rust/macro_callables.rs"),
+        )],
+    )
+    .await;
+    write_rules(
+        &base,
+        "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js','deep/**','zero/**']",
+    );
+    let (status, body) = request(browser.router(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let modules = body["payload"]["modules"].as_array().unwrap();
+    let measured = modules
+        .iter()
+        .find(|module| module["identity"]["path"] == "src/macros.rs")
+        .unwrap_or_else(|| panic!("{body}"));
+    assert!(
+        measured["declarationCount"].as_u64().unwrap() >= 13,
+        "{measured}"
+    );
 }
 #[tokio::test]
 async fn architecture_role_filters_metrics_without_changing_reference_evidence() {
