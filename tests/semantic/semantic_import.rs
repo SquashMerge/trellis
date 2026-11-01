@@ -754,7 +754,7 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
     // defers to the measured native kind (#473): its constructor (`Widget#<constructor>().`)
     // and method (`Widget#run().`) symbols bind their exact native declarations, so
     // `new Widget(3)` is constructor and the member call `w.run()` resolves with dispatch
-    // unknown.
+    // dynamic (owner ruling 2026-10-31, #557): SCIP names the prototype's declaration.
     let resolved = semantic::Resolution::Resolved;
     let bound = [
         (
@@ -771,7 +771,7 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
         ),
         (
             issue444_span("run", "()", 0),
-            (resolved, semantic::Dispatch::Unknown),
+            (resolved, semantic::Dispatch::Dynamic),
         ),
         (
             issue444_span("register", "(plain)", 0),
@@ -871,7 +871,7 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
 /// both. Plain and imported calls of free functions stay direct in every case.
 #[test]
 fn real_scip_typescript_explicit_symbol_kind_is_still_checked() {
-    use semantic::Dispatch::{Constructor, Direct, Unknown};
+    use semantic::Dispatch::{Constructor, Direct, Dynamic, Unknown};
     use semantic::Resolution::{Resolved, Unresolved};
     let calls = |kind: i32| {
         let (_root, native, sources, inventory) = issue444_case_with_kinds(&[
@@ -912,7 +912,7 @@ fn real_scip_typescript_explicit_symbol_kind_is_still_checked() {
             ("plain", Resolved, Direct),
             ("helper", Resolved, Direct),
             ("Widget", Resolved, Constructor),
-            ("run", Resolved, Unknown),
+            ("run", Resolved, Dynamic),
             ("register", Resolved, Direct),
         ]
     );
@@ -937,9 +937,17 @@ fn rust_method_named_constructor_still_rejects_constructor_kind() {
     let symbol = "rust-analyzer cargo c 0.1.0 S#constructor().";
     let definition = source.find("constructor").unwrap();
     let call = source.rfind("constructor").unwrap();
-    for (kind, resolution) in [
-        (9, semantic::Resolution::Unresolved),
-        (26, semantic::Resolution::Resolved),
+    for (kind, resolution, dispatch) in [
+        (
+            9,
+            semantic::Resolution::Unresolved,
+            semantic::Dispatch::Unknown,
+        ),
+        (
+            26,
+            semantic::Resolution::Resolved,
+            semantic::Dispatch::Direct,
+        ),
     ] {
         let (_root, native, sources, inventory) = admitted_case(
             "rust",
@@ -954,7 +962,7 @@ fn rust_method_named_constructor_still_rejects_constructor_kind() {
         assert_eq!(output.call_bindings.len(), 1);
         let binding = &output.call_bindings[0];
         assert_eq!(binding.resolution, resolution, "explicit kind {kind}");
-        assert_eq!(binding.dispatch, semantic::Dispatch::Unknown);
+        assert_eq!(binding.dispatch, dispatch);
     }
 }
 
@@ -1010,11 +1018,11 @@ fn constructor_call_to_class_is_constructor_dispatch() {
     }
 }
 
-/// Owner ruling 2026-10-30 (#470) for Rust: identifier, generic and path calls of a free
-/// function are direct; method-call syntax, and a path call of an associated function, stay
-/// unknown (trait and inherent dispatch are #14).
+/// Owner rulings 2026-10-30 (#470) and 2026-10-31 (#557) for Rust: identifier, generic and
+/// path calls of a free function are direct, and so are method-call syntax and a path call
+/// that bind an inherent method or associated function.
 #[test]
-fn rust_path_and_plain_calls_of_free_functions_are_direct() {
+fn rust_path_plain_and_inherent_calls_are_direct() {
     let source = "mod m { pub fn f() {} }\nstruct S;\nimpl S { fn g(&self) {} fn h() {} }\n\
         fn f2() {}\nfn f3<T>() {}\n\
         fn k(s: S) { m::f(); f2(); crate::m::f(); s.g(); S::h(); f3::<u8>(); }\n";
@@ -1030,8 +1038,8 @@ fn rust_path_and_plain_calls_of_free_functions_are_direct() {
         (at("{ m::f(", 5), 1, f, semantic::Dispatch::Direct),
         (at("; f2(", 2), 2, f2, semantic::Dispatch::Direct),
         (at("crate::m::f(", 10), 1, f, semantic::Dispatch::Direct),
-        (at("s.g(", 2), 1, g, semantic::Dispatch::Unknown),
-        (at("S::h(", 3), 1, h, semantic::Dispatch::Unknown),
+        (at("s.g(", 2), 1, g, semantic::Dispatch::Direct),
+        (at("S::h(", 3), 1, h, semantic::Dispatch::Direct),
         (at("f3::<", 0), 2, f3, semantic::Dispatch::Direct),
     ];
     let mut occurrences = vec![
@@ -1054,7 +1062,7 @@ fn rust_path_and_plain_calls_of_free_functions_are_direct() {
             (f2, 17, vec![]),
             (f3, 17, vec![]),
             (g, 26, vec![]),
-            (h, 26, vec![]),
+            (h, 80, vec![]),
         ],
     );
     let output = join_inventory(&inventory, &native, &sources, 1).unwrap();
@@ -1071,6 +1079,210 @@ fn rust_path_and_plain_calls_of_free_functions_are_direct() {
             "{start}"
         );
         assert_eq!(binding.dispatch, dispatch, "{start}");
+    }
+}
+
+/// Owner ruling 2026-10-31 (#557): the method's immediate parent decides. An inherent `impl`
+/// method is direct through `self.m()`, `x.m()`, `Type::f()` and an allowlisted macro's
+/// arguments; a `trait` block method is dynamic, and an `impl Trait for Type` method, which
+/// the owner has not ruled on, stays unknown. rust-analyzer states `Method` for a method,
+/// `StaticMethod` for an associated function and `TraitMethod` for a bodiless trait method.
+#[test]
+fn rust_method_dispatch_follows_the_measured_parent() {
+    use semantic::Dispatch::{Direct, Dynamic, Unknown};
+    let source = "trait T { fn req(&self); fn dflt(&self) {} }
+struct S;
+        impl S { fn a(&self) { self.b(); } fn b(&self) {} fn c() {} }
+        impl T for S { fn req(&self) {} }
+        fn k(s: S, d: &dyn T) { s.a(); S::c(); assert!(s.a() == ()); d.req(); T::req(d);         d.dflt(); s.req(); <S as T>::req(&s); }
+";
+    let at = |needle: &str, inner: usize| source.find(needle).unwrap() + inner;
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (req, dflt, a, b, c, impl_req) = (
+        symbol("T#req()."),
+        symbol("T#dflt()."),
+        symbol("impl#[S]a()."),
+        symbol("impl#[S]b()."),
+        symbol("impl#[S]c()."),
+        symbol("impl#[S][T]req()."),
+    );
+    let uses = [
+        (at("self.b(", 5), &b, Direct),
+        (at("s.a();", 2), &a, Direct),
+        (at("S::c(", 3), &c, Direct),
+        (at("!(s.a(", 4), &a, Direct),
+        (at("d.req(", 2), &req, Dynamic),
+        (at("T::req(", 3), &req, Dynamic),
+        (at("d.dflt(", 2), &dflt, Dynamic),
+        (at("s.req(", 2), &impl_req, Unknown),
+        (at("<S as T>::req(", 10), &impl_req, Unknown),
+    ];
+    let width = |symbol: &String| {
+        symbol
+            .trim_end_matches("().")
+            .rsplit([']', '#'])
+            .next()
+            .unwrap()
+            .len()
+    };
+    let mut occurrences = vec![
+        (
+            at("fn req(&self);", 3),
+            at("fn req(&self);", 6),
+            req.as_str(),
+            1,
+        ),
+        (at("fn dflt", 3), at("fn dflt", 7), dflt.as_str(), 1),
+        (at("fn a(", 3), at("fn a(", 4), a.as_str(), 1),
+        (at("fn b(", 3), at("fn b(", 4), b.as_str(), 1),
+        (at("fn c(", 3), at("fn c(", 4), c.as_str(), 1),
+        (
+            at("fn req(&self) {", 3),
+            at("fn req(&self) {", 6),
+            impl_req.as_str(),
+            1,
+        ),
+    ];
+    occurrences.extend(
+        uses.iter()
+            .map(|(start, symbol, _)| (*start, start + width(symbol), symbol.as_str(), 0)),
+    );
+    let (_root, native, sources, inventory) = admitted_case(
+        "rust",
+        source,
+        occurrences,
+        vec![
+            (req.as_str(), 70, vec![]),
+            (dflt.as_str(), 26, vec![]),
+            (a.as_str(), 26, vec![]),
+            (b.as_str(), 26, vec![]),
+            (c.as_str(), 80, vec![]),
+            (impl_req.as_str(), 26, vec![]),
+        ],
+    );
+    let bases: Vec<_> = native
+        .declarations
+        .iter()
+        .filter(|d| d.kind == "implementation")
+        .map(|d| d.header.bases.clone())
+        .collect();
+    assert_eq!(bases, [vec![], vec!["T".to_owned()]]);
+    let output = join_inventory(&inventory, &native, &sources, 1).unwrap();
+    assert_eq!(output.call_bindings.len(), uses.len());
+    for (start, _, dispatch) in uses {
+        let binding = output
+            .call_bindings
+            .iter()
+            .find(|b| b.join.anchor.range.start == start)
+            .unwrap_or_else(|| panic!("binding at {start}"));
+        assert_eq!(
+            (binding.resolution, binding.dispatch),
+            (semantic::Resolution::Resolved, dispatch),
+            "{}",
+            &source[start..start + 3]
+        );
+    }
+}
+
+/// #557: settlement ambiguity clears a join-time inherent `direct`, as it does a free
+/// function's (#470), and a member call with no internal target stays unknown.
+#[test]
+fn ambiguous_and_external_inherent_calls_stay_unknown() {
+    let source = "struct S;
+impl S { fn a(&self) {} fn b(&self) {} }
+        fn k(s: S) { s.a(); s.b(); }
+";
+    let at = |needle: &str, inner: usize| source.find(needle).unwrap() + inner;
+    let (a, b, std) = (
+        "rust-analyzer cargo c 0.1.0 impl#[S]a().",
+        "rust-analyzer cargo c 0.1.0 impl#[S]b().",
+        "rust-analyzer cargo std 1.98.1 vec/impl#[Vec]b().",
+    );
+    let use_a = at("s.a(", 2);
+    let use_b = at("s.b(", 2);
+    let (_root, native, sources, inventory) = admitted_case(
+        "rust",
+        source,
+        vec![
+            (at("fn a(", 3), at("fn a(", 4), a, 1),
+            (at("fn b(", 3), at("fn b(", 4), b, 1),
+            (use_a, use_a + 1, a, 0),
+            (use_a, use_a + 1, b, 0),
+            (use_b, use_b + 1, std, 0),
+        ],
+        vec![(a, 26, vec![]), (b, 26, vec![])],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 1).unwrap();
+    let at_use = |start: usize| {
+        output
+            .call_bindings
+            .iter()
+            .filter(move |b| b.join.anchor.range.start == start)
+    };
+    assert!(at_use(use_a).count() == 2);
+    assert!(at_use(use_a).all(|b| {
+        b.resolution == semantic::Resolution::Ambiguous && b.dispatch == semantic::Dispatch::Unknown
+    }));
+    assert!(at_use(use_b).all(|b| {
+        b.resolution == semantic::Resolution::External && b.dispatch == semantic::Dispatch::Unknown
+    }));
+}
+
+/// Owner ruling 2026-10-31 (#557): a Java `static`, `private` or `final` method has one body
+/// and is direct, measured from `Header.modifiers`; any other method is dynamic.
+#[test]
+fn java_fixed_methods_are_direct_and_other_methods_dynamic() {
+    use semantic::Dispatch::{Direct, Dynamic};
+    let source = "class A {
+  static void s() {}
+  private void p() {}
+  final void f() {}
+          void v() {}
+  void k(A a) { s(); A.s(); p(); this.p(); a.f(); v(); a.v(); }
+}
+";
+    let at = |needle: &str, inner: usize| source.find(needle).unwrap() + inner;
+    let symbol = |name: &str| format!("semanticdb maven . . A#{name}().");
+    let (s, p, f, v) = (symbol("s"), symbol("p"), symbol("f"), symbol("v"));
+    let uses = [
+        (at("{ s();", 2), &s, Direct),
+        (at("A.s(", 2), &s, Direct),
+        (at("; p();", 2), &p, Direct),
+        (at("this.p(", 5), &p, Direct),
+        (at("a.f(", 2), &f, Direct),
+        (at("; v();", 2), &v, Dynamic),
+        (at("a.v(", 2), &v, Dynamic),
+    ];
+    let mut occurrences = vec![
+        (at("void s", 5), at("void s", 6), s.as_str(), 1),
+        (at("void p", 5), at("void p", 6), p.as_str(), 1),
+        (at("void f", 5), at("void f", 6), f.as_str(), 1),
+        (at("void v", 5), at("void v", 6), v.as_str(), 1),
+    ];
+    occurrences.extend(
+        uses.iter()
+            .map(|(start, symbol, _)| (*start, start + 1, symbol.as_str(), 0)),
+    );
+    let (_root, native, sources, inventory) = admitted_case(
+        "java",
+        source,
+        occurrences,
+        vec![
+            (s.as_str(), 80, vec![]),
+            (p.as_str(), 26, vec![]),
+            (f.as_str(), 26, vec![]),
+            (v.as_str(), 26, vec![]),
+        ],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert_eq!(output.call_bindings.len(), uses.len());
+    for (start, _, dispatch) in uses {
+        let binding = output
+            .call_bindings
+            .iter()
+            .find(|b| b.join.anchor.range.start == start)
+            .unwrap_or_else(|| panic!("binding at {start}"));
+        assert_eq!(binding.dispatch, dispatch, "{}", &source[start..start + 3]);
     }
 }
 

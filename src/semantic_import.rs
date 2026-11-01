@@ -1272,8 +1272,9 @@ struct MeasuredOccurrence {
 }
 
 /// How a call's exact bound target declaration can be called, measured from its native
-/// declaration kind alone (owner ruling 2026-10-30, #470). Only JavaScript and Rust are
-/// classified; every other declaration is `Other`.
+/// declaration (owner rulings 2026-10-30, #470, and 2026-10-31, #557). Python and a Rust
+/// `impl Trait for Type` method are not classified; they, like every other declaration, are
+/// `Other`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum TargetCallable {
     #[default]
@@ -1283,10 +1284,17 @@ pub(super) enum TargetCallable {
     FreeFunction = 1,
     /// A JavaScript class, or its `constructor` method.
     Constructor = 2,
+    /// One fixed body: a Rust method of an inherent `impl`, or a Java `static`, `private` or
+    /// `final` method.
+    FixedMethod = 3,
+    /// A declaration, not the runtime body: a Rust `trait` method, a JavaScript method other
+    /// than `constructor`, or any other Java method.
+    DynamicMethod = 4,
 }
 
 impl TargetCallable {
-    fn of(declaration: &native::Declaration) -> Self {
+    /// `parent` is the immediate parent declaration of a Rust `implementation` method.
+    fn of(declaration: &native::Declaration, parent: Option<&native::Declaration>) -> Self {
         match (
             declaration.document.language.as_str(),
             declaration.kind.as_str(),
@@ -1296,7 +1304,59 @@ impl TargetCallable {
             ("javascript", "method") if declaration.name.as_deref() == Some("constructor") => {
                 Self::Constructor
             }
+            ("javascript", "method") => Self::DynamicMethod,
+            // The only native `type` that holds a method is a trait.
+            ("rust", "method")
+                if declaration
+                    .ancestors
+                    .last()
+                    .is_some_and(|parent| parent.kind == "type") =>
+            {
+                Self::DynamicMethod
+            }
+            // `impl Type` measures no trait base; `impl Trait for Type` stays unclassified.
+            ("rust", "method")
+                if parent.is_some_and(|parent| {
+                    parent.kind == "implementation" && parent.header.bases.is_empty()
+                }) =>
+            {
+                Self::FixedMethod
+            }
+            ("java", "method")
+                if declaration.header.modifiers.iter().any(|modifier| {
+                    matches!(modifier.as_str(), "static" | "private" | "final")
+                }) =>
+            {
+                Self::FixedMethod
+            }
+            ("java", "method") => Self::DynamicMethod,
             _ => Self::Other,
+        }
+    }
+
+    /// The immediate parent a Rust method's classification reads, which is only its
+    /// `implementation`: a method's measured ancestors name the parent's identity input.
+    fn parent<'s, S: JoinStore>(
+        store: &'s S,
+        declaration: &native::Declaration,
+    ) -> Result<Option<std::borrow::Cow<'s, native::Declaration>>> {
+        let document = &declaration.document;
+        match declaration.ancestors.split_last() {
+            Some((parent, ancestors))
+                if document.language == "rust"
+                    && declaration.kind == "method"
+                    && parent.kind == "implementation" =>
+            {
+                let id = native_ids::syntax_id(&serde_json::json!({
+                    "sourceSet": store.source_set_id(),
+                    "path": document.path,
+                    "language": document.language,
+                    "ancestors": ancestors,
+                    "declaration": parent,
+                }))?;
+                store.declaration_of(document, &id)
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1305,6 +1365,8 @@ impl TargetCallable {
             0 => Self::Other,
             1 => Self::FreeFunction,
             2 => Self::Constructor,
+            3 => Self::FixedMethod,
+            4 => Self::DynamicMethod,
             _ => anyhow::bail!("corrupt staged target callable"),
         })
     }
@@ -1321,7 +1383,9 @@ enum CallShape {
     Path,
     /// A JavaScript `new` expression whose constructor is an identifier or dotted name.
     New,
-    /// Member or method-call syntax, a compound callee, or anything not proved above.
+    /// The callee token follows a `.`: `x.m()`, `self.m()`, `a?.b()`, Java `this.m()`.
+    Member,
+    /// A compound callee, a call without a measured callee token, or anything not proved above.
     Other,
 }
 
@@ -1350,6 +1414,7 @@ fn call_shape(language: &str, call: &native::Call, source: &[u8]) -> CallShape {
             {
                 CallShape::New
             }
+            _ if member_prefix(prefix) => CallShape::Member,
             _ => CallShape::Other,
         },
         // A path callee's native token is its `scoped_identifier` name, so the prefix is path
@@ -1365,23 +1430,36 @@ fn call_shape(language: &str, call: &native::Call, source: &[u8]) -> CallShape {
         {
             CallShape::Path
         }
+        "rust" | "java" if member_prefix(prefix) => CallShape::Member,
         _ => CallShape::Other,
     }
 }
 
-/// A call binding's dispatch (owner ruling 2026-10-30, #470), from the measured native call
-/// shape and the exact bound target's declaration kind only: a plain JavaScript call, or a
-/// plain or path Rust call, to a free function is `direct`; a JavaScript `new` of a class or
-/// its constructor is `constructor`; everything else, member calls included, stays `unknown`.
+/// A call whose callee token directly follows a `.`. The receiver before it can be any
+/// expression; only the separator is read.
+fn member_prefix(prefix: &[u8]) -> bool {
+    prefix.trim_ascii_end().ends_with(b".")
+}
+
+/// A call binding's dispatch (owner rulings 2026-10-30, #470, and 2026-10-31, #557), from the
+/// measured native call shape and the exact bound target's native declaration only: a plain
+/// JavaScript call, or a plain or path Rust call, to a free function is `direct`, and so is a
+/// Rust member or path call to an inherent method and a Java plain or member call to a
+/// `static`, `private` or `final` method; a JavaScript `new` of a class or its constructor is
+/// `constructor`; a Rust trait method, a JavaScript member call to a method and any other Java
+/// method call is `dynamic`; everything else stays `unknown`.
 fn call_dispatch(language: &str, shape: CallShape, callable: TargetCallable) -> semantic::Dispatch {
+    use CallShape::{Member, New, Path, Plain};
+    use TargetCallable::{Constructor, DynamicMethod, FixedMethod, FreeFunction};
     match (language, shape, callable) {
-        ("javascript", CallShape::Plain, TargetCallable::FreeFunction)
-        | ("rust", CallShape::Plain | CallShape::Path, TargetCallable::FreeFunction) => {
-            semantic::Dispatch::Direct
-        }
-        ("javascript", CallShape::New, TargetCallable::Constructor) => {
-            semantic::Dispatch::Constructor
-        }
+        ("javascript", Plain, FreeFunction)
+        | ("rust", Plain | Path, FreeFunction)
+        | ("rust", Member | Path, FixedMethod)
+        | ("java", Plain | Member, FixedMethod) => semantic::Dispatch::Direct,
+        ("javascript", New, Constructor) => semantic::Dispatch::Constructor,
+        ("javascript", Member, DynamicMethod)
+        | ("rust", Member | Path, DynamicMethod)
+        | ("java", Plain | Member, DynamicMethod) => semantic::Dispatch::Dynamic,
         _ => semantic::Dispatch::Unknown,
     }
 }
@@ -1394,7 +1472,17 @@ pub(super) fn settled_dispatch(
     joined_target: Option<&semantic::Target>,
     settled: &semantic::CallBinding,
 ) -> semantic::Dispatch {
-    match (joined_target, &settled.declared_target) {
+    if resolves_to(joined_target, settled) {
+        joined
+    } else {
+        semantic::Dispatch::Unknown
+    }
+}
+
+/// Whether the settled row still resolves, with a verified target, to `joined_target`.
+fn resolves_to(joined_target: Option<&semantic::Target>, settled: &semantic::CallBinding) -> bool {
+    matches!(
+        (joined_target, &settled.declared_target),
         (
             Some(semantic::Target::Internal {
                 syntax_id: a,
@@ -1409,29 +1497,44 @@ pub(super) fn settled_dispatch(
         ) if settled.resolution == semantic::Resolution::Resolved
             && settled.stale_target == Some(false)
             && a == b
-            && x == y =>
-        {
-            joined
-        }
-        _ => semantic::Dispatch::Unknown,
-    }
+            && x == y
+    )
 }
 
 /// A rejoined call's dispatch: the classification of whichever join, destination first then
 /// captured, was made against the settled target. A rejoin can settle a call on a captured
 /// target retargeted to the destination (its syntax ID verified unchanged) that the
 /// destination join alone did not resolve; the call's document bytes are unchanged, so the
-/// captured shape and target kind still hold.
+/// captured shape and target kind still hold. A method's `direct` is the exception: the facts
+/// behind it, its `impl`'s bases and its modifiers, are outside its syntax ID, so it does not
+/// survive without a destination classification (#557). `target_is_method` reads the
+/// destination's declaration of the settled target.
 pub(super) fn rejoined_dispatch(
-    joins: [Option<(semantic::Dispatch, Option<&semantic::Target>)>; 2],
+    destination: Option<(semantic::Dispatch, Option<&semantic::Target>)>,
+    captured: Option<(semantic::Dispatch, Option<&semantic::Target>)>,
     settled: &semantic::CallBinding,
-) -> semantic::Dispatch {
-    joins
-        .into_iter()
-        .flatten()
-        .map(|(dispatch, target)| settled_dispatch(dispatch, target, settled))
-        .find(|dispatch| *dispatch != semantic::Dispatch::Unknown)
-        .unwrap_or(semantic::Dispatch::Unknown)
+    target_is_method: impl FnOnce(&str, &native::DocumentKey) -> Result<bool>,
+) -> Result<semantic::Dispatch> {
+    if let Some((dispatch, target)) = destination
+        && resolves_to(target, settled)
+    {
+        return Ok(dispatch);
+    }
+    let Some((dispatch, target)) = captured.filter(|(_, target)| resolves_to(*target, settled))
+    else {
+        return Ok(semantic::Dispatch::Unknown);
+    };
+    if dispatch == semantic::Dispatch::Direct
+        && let Some(semantic::Target::Internal {
+            syntax_id,
+            document,
+            ..
+        }) = target
+        && target_is_method(syntax_id, document)?
+    {
+        return Ok(semantic::Dispatch::Unknown);
+    }
+    Ok(dispatch)
 }
 
 fn measure_occurrence<S: JoinStore>(
@@ -1462,7 +1565,8 @@ fn measure_occurrence<S: JoinStore>(
         let candidate = store
             .declaration_of(doc, &binding.candidate_ids[0])?
             .context("missing exact native declaration")?;
-        callable = TargetCallable::of(&candidate);
+        let parent = TargetCallable::parent(store, &candidate)?;
+        callable = TargetCallable::of(&candidate, parent.as_deref());
         // A stated SCIP kind must agree with the measured native kind. An unspecified kind
         // (`0`, as scip-typescript 0.4.0 emits for every symbol) states nothing to conflict,
         // so it defers to the measured native kind of this exact, authenticated target (#473).
@@ -1479,7 +1583,9 @@ fn measure_occurrence<S: JoinStore>(
                 {
                     matches!(kind, 9 | 26)
                 }
-                "method" => kind == 26,
+                // rust-analyzer 1.98.1 states `TraitMethod` for a bodiless trait method and
+                // `StaticMethod` for an associated function without `self` (#557).
+                "method" => matches!(kind, 26 | 70 | 80),
                 _ => true,
             });
         if compatible {
@@ -3317,6 +3423,16 @@ fn reuse_captured_source_associations(
     facts
         .call_bindings
         .retain(|row| is_reused(&row.join.anchor.document));
+    // A reused row is no destination classification of a target outside the reused documents:
+    // the rejoin takes the captured one under its own rule, as a full rejoin would (#557).
+    for row in &mut facts.call_bindings {
+        if matches!(
+            &row.declared_target,
+            Some(semantic::Target::Internal { document, .. }) if !is_reused(document)
+        ) {
+            row.declared_target = None;
+        }
+    }
     facts.type_relationships.retain(|row| {
         proof_documents
             .get(row.provenance_id.as_str())
@@ -4286,6 +4402,18 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     }
     let references_by_id: BTreeMap<_, _> =
         references.iter().map(|row| (row.id.clone(), row)).collect();
+    let target_is_method = |syntax_id: &str, document: &native::DocumentKey| {
+        Ok(match target_projection {
+            Some(projection) => projection
+                .get(&(document.clone(), syntax_id.to_owned()))
+                .is_some_and(|declaration| declaration.kind == "method"),
+            None => r2
+                .declarations_by_id(syntax_id)
+                .iter()
+                .any(|d| d.document == *document && d.kind == "method"),
+        })
+    };
+    let mut rejoin_failure = None;
     calls.retain_mut(|call| {
         let Some(reference) = accepted_reference_ids
             .get(&call.provenance_id)
@@ -4303,9 +4431,15 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             .get(&call.provenance_id)
             .map(|(dispatch, target)| (*dispatch, target.as_ref()));
         let original = captured_dispatch.get(call.provenance_id.as_str()).copied();
-        call.dispatch = rejoined_dispatch([destination, original], call);
+        match rejoined_dispatch(destination, original, call, target_is_method) {
+            Ok(dispatch) => call.dispatch = dispatch,
+            Err(error) => rejoin_failure = Some(error),
+        }
         true
     });
+    if let Some(error) = rejoin_failure {
+        return Err(error);
+    }
     let eligible_proofs: BTreeSet<_> = filtered
         .claims
         .iter()

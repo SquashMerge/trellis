@@ -1077,6 +1077,7 @@ pub(crate) struct WitnessedDocument {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TargetDeclaration {
+    pub kind: String,
     pub syntax_id: String,
     pub document: native::DocumentKey,
     pub name: String,
