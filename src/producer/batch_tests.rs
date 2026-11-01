@@ -22,8 +22,8 @@ fn artifact(project_root: &str, paths: &[&str]) -> Vec<u8> {
     index.write_to_bytes().unwrap()
 }
 
-/// The owner-configured artifact copy enforces the same cap at its exact boundary. Sparse
-/// sources keep the test cheap; only the copy under the run directory is real.
+/// The owner-configured artifact copy enforces the same cap at its exact boundary. The source
+/// is sparse, but each case writes and hashes a full cap's worth of copy.
 #[test]
 fn copy_artifact_keeps_the_production_cap_at_its_boundary() {
     let cap = BatchLimits::PRODUCTION.artifact_bytes;

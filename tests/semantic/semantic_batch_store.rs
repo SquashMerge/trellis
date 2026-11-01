@@ -612,7 +612,7 @@ fn production_artifact_cap_refuses_one_byte_over_256_mib() {
     assert!(world.stage_dirs().is_empty());
     // At the cap the descriptor passes and only the actual bytes disagree with it.
     let error = expect_err(world.admit(&declare(cap)));
-    assert_ne!(detail(&error), "artifact bytes", "{error:#}");
+    assert_eq!(detail(&error), "artifact length", "{error:#}");
     assert!(world.stage_dirs().is_empty());
 }
 
