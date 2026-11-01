@@ -317,6 +317,19 @@ impl IndexJobCoordinator {
             mut cutoff,
         } = admission;
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
+        // A separate-process fixture orders one repair of a corrupt head against its reads.
+        #[cfg(all(feature = "test-support", unix))]
+        if !self.store.is_ready_disposition()
+            && let Some(path) = std::env::var_os("TRELLIS_TEST_LIVE_RECOVERY_SOCKET")
+        {
+            use std::os::unix::net::UnixListener;
+            let path = std::path::PathBuf::from(path);
+            if !path.exists() {
+                let listener = UnixListener::bind(&path)?;
+                std::fs::write(path.with_extension("ready"), [])?;
+                let (_stream, _) = listener.accept()?;
+            }
+        }
         let mut phase_start = std::time::Instant::now();
         let report = |name: &str, elapsed: std::time::Duration| {
             progress(IndexProgress {
