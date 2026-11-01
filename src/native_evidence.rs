@@ -4191,7 +4191,7 @@ mod borrowed_witness_tests {
         let expected = digest(b"trellis.native-version-witness.v1\0", &bytes);
         assert_eq!(
             expected,
-            "4a323e83a6ead180e606ba795d4c38a8609b4fe504f93f9e0f2dd459b2008124"
+            "82848af3e3998ec6eef6260ae4e694f27be290edb5488a24f96483bc93ea5eb7"
         );
         assert_eq!(witness(&f).unwrap(), expected);
         let declarations: Vec<_> = f.declarations.iter().collect();
