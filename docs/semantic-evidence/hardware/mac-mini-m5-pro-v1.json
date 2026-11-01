@@ -57,6 +57,17 @@
       "runtime": "trellis.native.syntax@native-v10 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
     },
     {
+      "name": "trellis-native-v13-javascript-test-support",
+      "status": "recorded",
+      "version": "native-v13",
+      "installedAtCapture": true,
+      "capturedOn": "2026-11-01",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; fix/563-one-file-partial from main 3d109bb2; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:ad5cf3093f15759ede50c5f1922e21d1b139d527482e2aba0638f7ef6e6ee195",
+      "executableHash": "ad5cf3093f15759ede50c5f1922e21d1b139d527482e2aba0638f7ef6e6ee195",
+      "runtime": "trellis.native.syntax@native-v13 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
+    },
+    {
       "name": "trellis-native-v12-javascript-test-support",
       "status": "recorded",
       "version": "native-v12",
