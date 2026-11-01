@@ -146,7 +146,15 @@ fn selected_case(change_b: &str) {
     fs::create_dir(&root).unwrap();
     fs::create_dir(root.join("src")).unwrap();
     fs::write(root.join(".gitignore"), ".trellis-semantic-batch*/\n").unwrap();
-    let a = "function run(){ target(); }\n";
+    let fused_alias = matches!(
+        change_b,
+        "oracle_fork_fused_target_lost" | "oracle_fork_fused_beside_lost_target"
+    );
+    let a = if fused_alias {
+        "function run(){ target(); }\nconst alias = target;\n"
+    } else {
+        "function run(){ target(); }\n"
+    };
     let b = "function target(){ return 1; }\n";
     fs::write(root.join("src/A.js"), a).unwrap();
     fs::write(root.join("src/B.js"), b).unwrap();
@@ -156,6 +164,7 @@ fn selected_case(change_b: &str) {
             | "oracle_two_producers"
             | "oracle_fork_two_producers"
             | "oracle_fork_healthy_two_producers"
+            | "oracle_fork_staggered_producers"
     ) {
         fs::write(root.join("src/C.py"), "def helper(): return 1\n").unwrap();
     }
@@ -279,13 +288,30 @@ fn selected_case(change_b: &str) {
             document.symbols.clear();
         }
     }
+    if fused_alias {
+        // Two claims of one reference site, on a span that is no call: the second proof fuses
+        // into the first one's row.
+        let symbols: &[&str] = if change_b == "oracle_fork_fused_target_lost" {
+            &["pkg target.", "external pkg other."]
+        } else {
+            // This row stands on no absent target: only the call in `run` loses its own.
+            &["external pkg one.", "external pkg other."]
+        };
+        for symbol in symbols {
+            let mut claim = scip::types::Occurrence::new();
+            claim.range = vec![1, 14, 20];
+            claim.symbol = (*symbol).into();
+            claim.symbol_roles = 0;
+            binary.documents[0].occurrences.push(claim);
+        }
+    }
     let exclusion_reason = match change_b {
         "partial_empty_covered" => Some("notRequested"),
-        "partial_not_requested" => Some("notRequested"),
+        "partial_not_requested" | "oracle_fork_not_requested" => Some("notRequested"),
         "partial_unsupported"
         | "oracle_partial_unsupported"
         | "oracle_fork_partial_unsupported" => Some("unsupported"),
-        "partial_failed" | "caller_failed" => Some("failed"),
+        "partial_failed" | "caller_failed" | "oracle_fork_failed_exclusion" => Some("failed"),
         _ => None,
     };
     let partial = exclusion_reason.is_some();
@@ -334,7 +360,13 @@ fn selected_case(change_b: &str) {
             | "oracle_two_producers"
             | "oracle_fork_two_producers"
             | "oracle_fork_healthy_two_producers"
+            | "oracle_fork_staggered_producers"
     ) {
+        if change_b == "oracle_fork_staggered_producers" {
+            // The next batch captures bytes this one holds as stale.
+            fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
+            run(&home, &["index", "--workspace", root_string]);
+        }
         let mut python_binary = scip::types::Index::new();
         let mut doc = scip::types::Document::new();
         doc.relative_path = "src/C.py".into();
@@ -821,7 +853,19 @@ fn selected_case(change_b: &str) {
             fs::write(root.join("src/B.js"), "function target(){ return 4; }\n").unwrap()
         }
         "oracle_deleted_a" => fs::remove_file(root.join("src/A.js")).unwrap(),
-        "oracle_deleted_b" => fs::remove_file(root.join("src/B.js")).unwrap(),
+        "oracle_deleted_b" | "oracle_fused_target_lost" | "oracle_fused_beside_lost_target" => {
+            fs::remove_file(root.join("src/B.js")).unwrap()
+        }
+        "oracle_not_requested" | "oracle_failed_exclusion" | "oracle_staggered_producers" => {
+            fs::write(root.join("src/D.js"), "function extra(){ return 2; }\n").unwrap()
+        }
+        // Only the capture stat changes: the same bytes, a newer modification time.
+        "oracle_touched_b" => fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("src/B.js"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap(),
         "oracle_moved_a" => fs::rename(root.join("src/A.js"), root.join("src/D.js")).unwrap(),
         "oracle_moved_b" => fs::rename(root.join("src/B.js"), root.join("src/D.js")).unwrap(),
         "oracle_ambiguous_b" => fs::write(
@@ -1215,9 +1259,8 @@ fn selected_case(change_b: &str) {
             | "oracle_fork_changed_a"
             | "oracle_fork_ambiguous_b"
             | "oracle_fork_partial_unsupported"
-            | "oracle_fork_successive_local" => (1, 0),
-            "oracle_fork_healthy_two_producers" => (2, 0),
-            "oracle_fork_missing_b"
+            | "oracle_fork_successive_local"
+            | "oracle_fork_missing_b"
             | "oracle_fork_deleted_a"
             | "oracle_fork_deleted_b"
             | "oracle_fork_moved_a"
@@ -1227,10 +1270,16 @@ fn selected_case(change_b: &str) {
             | "oracle_fork_unmatched_both"
             | "oracle_fork_duplicate_call_claims"
             | "oracle_fork_contradictory_calls"
-            | "oracle_fork_two_producers"
+            | "oracle_fork_raw_replacement"
+            | "oracle_fork_not_requested"
+            | "oracle_fork_failed_exclusion"
+            | "oracle_fork_touched_b"
+            | "oracle_fork_fused_beside_lost_target" => (1, 0),
+            "oracle_fork_healthy_two_producers" | "oracle_fork_staggered_producers" => (2, 0),
+            "oracle_fork_two_producers"
             | "oracle_fork_missing_raw_key"
             | "oracle_fork_synthetic"
-            | "oracle_fork_raw_replacement" => (0, 1),
+            | "oracle_fork_fused_target_lost" => (0, 1),
             "oracle_fork_context" => (0, 0),
             _ => panic!("missing branch expectation for {change_b}"),
         };
@@ -1258,13 +1307,51 @@ fn selected_case(change_b: &str) {
                 Some((true, trellis::semantic_evidence::CoverageState::Failed))
             );
         }
-        if change_b == "oracle_fork_restored_b" {
-            assert!(
-                reasons
+        if change_b == "oracle_fork_fused_target_lost" {
+            assert_eq!(reasons, &[json!("fused_reference_target_lost")], "{work}");
+        }
+        if matches!(
+            change_b,
+            "oracle_fork_not_requested" | "oracle_fork_failed_exclusion"
+        ) {
+            let state_of = |path: &str| {
+                snapshot
+                    .coverage
                     .iter()
-                    .any(|reason| reason == "restored_document_requires_measurement"),
-                "restoration must request measured rejoin, not fail its source: {work}"
+                    .find(|row| row.document_path == path)
+                    .map(|row| row.state)
+                    .unwrap()
+            };
+            assert_eq!(
+                state_of("src/A.js"),
+                trellis::semantic_evidence::CoverageState::Complete
             );
+            assert_eq!(
+                state_of("src/B.js"),
+                if change_b == "oracle_fork_not_requested" {
+                    trellis::semantic_evidence::CoverageState::NotRequested
+                } else {
+                    trellis::semantic_evidence::CoverageState::Failed
+                }
+            );
+            assert!(
+                snapshot
+                    .provenance
+                    .iter()
+                    .all(|proof| proof.document.path != "src/B.js"),
+                "an excluded document holds no facts: {snapshot:?}"
+            );
+        }
+        if change_b == "oracle_fork_touched_b" {
+            assert!(
+                snapshot
+                    .provenance
+                    .iter()
+                    .any(|proof| proof.document.path == "src/B.js" && proof.derived_from.is_some()),
+                "a touched document keeps its raw-linked proofs: {snapshot:?}"
+            );
+        }
+        if change_b == "oracle_fork_restored_b" {
             assert!(
                 snapshot
                     .coverage
@@ -1284,7 +1371,11 @@ fn selected_case(change_b: &str) {
         }
         if witnessed > 0 {
             assert_eq!(work["destinationIndexBuilds"], 1, "{change_b}: {work}");
-            assert_eq!(work["destinationDocumentRows"], 1, "{change_b}: {work}");
+            // Only a changed document is measured: a restored or touched one reuses its version.
+            assert!(
+                work["destinationDocumentRows"].as_u64().unwrap() <= 2,
+                "{change_b}: {work}"
+            );
             assert_eq!(
                 work["destinationJoinsOnReusedDocuments"], 0,
                 "{change_b}: {work}"
@@ -1773,6 +1864,7 @@ fn selected_case(change_b: &str) {
             "two_producers"
                 | "oracle_two_producers"
                 | "oracle_fork_two_producers"
+                | "oracle_fork_staggered_producers"
                 | "oracle_fork_healthy_two_producers"
         ) {
             2
@@ -2249,6 +2341,9 @@ fn forked_seeded_local_matches_forced_full_oracle() {
         "oracle_fork_contradictory_calls",
         "oracle_fork_partial_unsupported",
         "oracle_fork_two_producers",
+        "oracle_fork_failed_exclusion",
+        "oracle_fork_fused_target_lost",
+        "oracle_fork_fused_beside_lost_target",
     ] {
         eprintln!("forked oracle scenario: {scenario}");
         selected_case(scenario);
@@ -2265,6 +2360,20 @@ fn restored_captured_document_matches_forced_full_without_in_process_oracle() {
     selected_case("oracle_fork_restored_b");
 }
 
+/// #567: a document the artifact does not cover, in the artifact's own language, must not send
+/// an edit elsewhere to FULL.
+#[test]
+fn edit_beside_a_not_requested_document_takes_the_fast_path() {
+    selected_case("oracle_fork_not_requested");
+}
+
+/// #567: a touched file changes the capture stat, so the head cannot stand, but no document
+/// changed: a new daemon's reconciliation publishes on the fast path.
+#[test]
+fn stat_only_change_after_restart_takes_the_fast_path() {
+    selected_case("oracle_fork_touched_b");
+}
+
 #[test]
 fn synthetic_batch_native_edit_records_synthetic_producer_fallback() {
     selected_case("oracle_fork_synthetic");
@@ -2273,6 +2382,13 @@ fn synthetic_batch_native_edit_records_synthetic_producer_fallback() {
 #[test]
 fn two_healthy_producers_share_one_incremental_destination() {
     selected_case("oracle_fork_healthy_two_producers");
+}
+
+/// #567: batches of two languages, imported at different revisions, each reuse only what they
+/// captured: a document stale for one must not fail the other's witness.
+#[test]
+fn producers_imported_at_different_revisions_each_take_the_fast_path() {
+    selected_case("oracle_fork_staggered_producers");
 }
 
 #[test]

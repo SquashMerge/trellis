@@ -514,7 +514,7 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
         IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone()).unwrap();
     let error = drift
         .run(&options, &cancel, |p| {
-            if p.phase == "parse" {
+            if p.phase == "timing:capture" {
                 fs::write(
                     root.join("main.js"),
                     "function changed() {}

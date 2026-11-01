@@ -32,6 +32,28 @@ fn selected_capture_and_reconcile_use_the_revision_index() {
     }
 }
 
+/// Raw cleanup reaches a proof only through a capture no selection names, so a step over
+/// retained batches reads none of their proofs (#567).
+#[test]
+fn raw_proof_release_starts_from_unselected_captures() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(CACHE_SCHEMA_V33).unwrap();
+    let plan: Vec<String> = db
+        .prepare(&format!("EXPLAIN QUERY PLAN {RAW_PROOF_RELEASE_SQL}"))
+        .unwrap()
+        .query_map([], |row| row.get(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let position = |prefix: &str| plan.iter().position(|step| step.starts_with(prefix));
+    assert!(position("SCAN c").is_some(), "{plan:?}");
+    assert!(position("SCAN p").is_none(), "{plan:?}");
+    assert!(
+        position("SEARCH s").unwrap() < position("SEARCH p").unwrap(),
+        "the selection check must come before any proof is read: {plan:?}"
+    );
+}
+
 #[test]
 fn incomplete_current_schema_is_rejected() {
     let db = Connection::open_in_memory().unwrap();

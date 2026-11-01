@@ -39,6 +39,8 @@ pub struct OccSpec {
     pub enclosing: Vec<i32>,
     pub symbol: String,
     pub roles: i32,
+    /// Carry `range` in the typed oneof rather than the legacy field.
+    pub typed: bool,
 }
 
 /// One document an artifact covers. Without `occurrences` the document gets a single
@@ -72,6 +74,20 @@ impl DocSpec {
             enclosing: enclosing.to_vec(),
             symbol: symbol.into(),
             roles,
+            typed: false,
+        });
+        self
+    }
+
+    /// An occurrence whose `range` of three or four values travels as `SingleLineRange` or
+    /// `MultiLineRange`.
+    pub fn typed_occurrence(mut self, range: &[i32], symbol: &str, roles: i32) -> Self {
+        self.occurrences.push(OccSpec {
+            range: range.to_vec(),
+            enclosing: vec![],
+            symbol: symbol.into(),
+            roles,
+            typed: true,
         });
         self
     }
@@ -340,7 +356,31 @@ impl BatchFixture {
             }
             for occ in &spec.occurrences {
                 let mut occurrence = scip::types::Occurrence::new();
-                occurrence.range = occ.range.clone();
+                if occ.typed {
+                    use scip::types::{MultiLineRange, SingleLineRange, occurrence::Typed_range};
+                    occurrence.typed_range = Some(match *occ.range.as_slice() {
+                        [line, start_character, end_character] => {
+                            Typed_range::SingleLineRange(SingleLineRange {
+                                line,
+                                start_character,
+                                end_character,
+                                ..Default::default()
+                            })
+                        }
+                        [start_line, start_character, end_line, end_character] => {
+                            Typed_range::MultiLineRange(MultiLineRange {
+                                start_line,
+                                start_character,
+                                end_line,
+                                end_character,
+                                ..Default::default()
+                            })
+                        }
+                        _ => panic!("a typed range has three or four values"),
+                    });
+                } else {
+                    occurrence.range = occ.range.clone();
+                }
                 occurrence.enclosing_range = occ.enclosing.clone();
                 occurrence.symbol = occ.symbol.clone();
                 occurrence.symbol_roles = occ.roles;
