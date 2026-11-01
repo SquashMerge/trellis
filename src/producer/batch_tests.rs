@@ -4,6 +4,7 @@ use super::{ProducerName, TrustProfile};
 use crate::semantic_batch::descriptor::{
     Generation, GenerationComponent, GenerationOrigin, GenerationTrust,
 };
+use crate::semantic_batch::limits::BatchLimits;
 use protobuf::Message;
 
 const ID: &str = "0123456789abcdef0123456789abcdef";
@@ -19,6 +20,36 @@ fn artifact(project_root: &str, paths: &[&str]) -> Vec<u8> {
         index.documents.push(document);
     }
     index.write_to_bytes().unwrap()
+}
+
+/// The owner-configured artifact copy enforces the same cap at its exact boundary. The source
+/// is sparse, but each case writes and hashes a full cap's worth of copy.
+#[test]
+fn copy_artifact_keeps_the_production_cap_at_its_boundary() {
+    let cap = BatchLimits::PRODUCTION.artifact_bytes;
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("index.scip");
+    std::fs::File::create(&source)
+        .unwrap()
+        .set_len(cap + 1)
+        .unwrap();
+    let over = temp.path().join("over");
+    std::fs::create_dir(&over).unwrap();
+    assert_eq!(
+        batch::copy_artifact(&source, &over)
+            .unwrap_err()
+            .to_string(),
+        "limit_exceeded: artifact bytes"
+    );
+    std::fs::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_len(cap)
+        .unwrap();
+    let within = temp.path().join("within");
+    std::fs::create_dir(&within).unwrap();
+    assert_eq!(batch::copy_artifact(&source, &within).unwrap().1, cap);
 }
 
 #[test]
@@ -50,7 +81,7 @@ fn artifact_scan_is_bounded() {
     let many: Vec<String> = (0..100_001).map(|n| format!("d{n}")).collect();
     let many: Vec<&str> = many.iter().map(String::as_str).collect();
     assert!(code(&artifact("", &many)).starts_with("producer_output_invalid: artifact documents"));
-    let oversized = vec![0_u8; (64 << 20) + 1];
+    let oversized = vec![0_u8; BatchLimits::PRODUCTION.artifact_bytes as usize + 1];
     assert_eq!(code(&oversized), "limit_exceeded: producer artifact bytes");
     // A document without a path and a non-UTF-8 root are not artifacts Trellis can describe.
     let mut document = scip::types::Document::new();

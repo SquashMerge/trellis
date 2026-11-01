@@ -38,7 +38,7 @@ fn production_limits_match_approved_policy() {
     assert_eq!(pages, 1_024);
     assert_eq!(total_page_bytes, 64 * MIB);
     assert_eq!(artifacts, 64);
-    assert_eq!(artifact_bytes, 64 * MIB);
+    assert_eq!(artifact_bytes, 256 * MIB);
     assert_eq!(total_artifact_bytes, 512 * MIB);
     assert_eq!(candidates, 4_000_000);
     assert_eq!(wire_fields, 64_000_000);

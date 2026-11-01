@@ -87,7 +87,7 @@ pub(super) fn decode_whole_index_oracle(
     flag: &CancelFlag,
 ) -> Result<CapturedScipInventory, ScipCaptureError> {
     cancelled(flag)?;
-    if input.artifact_bytes.len() > 64 * 1024 * 1024 {
+    if input.artifact_bytes.len() as u64 > BatchLimits::PRODUCTION.artifact_bytes {
         return Err(limit("artifact bytes"));
     }
     if sha(input.artifact_bytes) != input.artifact_hash {

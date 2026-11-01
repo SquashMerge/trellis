@@ -8245,7 +8245,8 @@ fn attest_selected_batch_fast(
             )
         })
         .collect();
-    if capture.binary_bytes.len() > 64 * 1024 * 1024
+    if capture.binary_bytes.len() as u64
+        > crate::semantic_batch::limits::BatchLimits::PRODUCTION.artifact_bytes
         || descriptor.format_version != FORMAT_VERSION
         || descriptor.decoder_version != crate::scip_raw::DECODER_VERSION
         || raw.decoder_version != crate::scip_raw::DECODER_VERSION
