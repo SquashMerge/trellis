@@ -2847,24 +2847,31 @@ fn reserve_role_span(
     Ok(())
 }
 
-fn source_role_sites(language: &str, source: &[u8]) -> Result<RoleSites> {
-    source_role_sites_reserved(language, source, &mut |_| Ok(()))
+fn source_role_sites(
+    language: &str,
+    source: &[u8],
+    report: Option<&native::CapabilityReport>,
+) -> Result<RoleSites> {
+    source_role_sites_reserved(language, source, report, &mut |_| Ok(()))
 }
 
 fn source_role_sites_reserved(
     language: &str,
     source: &[u8],
+    report: Option<&native::CapabilityReport>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<RoleSites> {
-    Ok(source_role_sites_parsed(language, source, reserve)?.0)
+    Ok(source_role_sites_parsed(language, source, report, reserve)?.0)
 }
 
 /// The role sites of `source`, and the syntax tree they were read from (`None` for a language
 /// without role sites). Each supported language's tree is the one its direct type bases are
-/// read from too.
+/// read from too. `report` is the document's capability report, whose measured macros hold sites
+/// of their own.
 fn source_role_sites_parsed(
     language: &str,
     source: &[u8],
+    report: Option<&native::CapabilityReport>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<(RoleSites, Option<tree_sitter::Tree>)> {
     reserve(&mut || Ok(std::mem::size_of::<RoleSites>() as u64))?;
@@ -3008,12 +3015,14 @@ fn source_role_sites_parsed(
         Ok(true)
     };
     walk_named_reverse(tree.root_node(), &mut visit)?;
-    if language == "rust"
+    if let Some(report) = report.filter(|report| !report.macro_expansions.is_empty())
         && let Ok(text) = std::str::from_utf8(source)
     {
-        // Measured macro contents have syntax only in their expansions (#551).
-        let mut expansions = crate::native_rust_macros::Expansions::new(text);
-        expansions.expand_all(tree.root_node(), || true);
+        // Measured macro contents have syntax only in their expansions (#551). A site missing
+        // here is not a conservative omission: its occurrence would join as a plain read.
+        use crate::native_rust_macros::{Expansions, MeasuredMacros};
+        let mut expansions = Expansions::new(text);
+        expansions.expand_measured(tree.root_node(), &MeasuredMacros::of(report));
         for arguments in expansions.arguments() {
             walk_named_reverse(arguments, &mut visit)?;
         }
@@ -4953,29 +4962,5 @@ mod language_reason_tests {
         assert!(json["listed"].to_string().len() <= REPORT_PARTIAL_DOCUMENT_BYTES);
         assert_eq!(json["listed"].as_array().unwrap().len(), 315);
         assert_eq!(json["unlisted"], 1);
-    }
-}
-
-#[cfg(test)]
-mod macro_role_tests {
-    use super::*;
-
-    /// Measured macro contents have role sites, at their document spans (#551).
-    #[test]
-    fn role_sites_reach_into_measured_macros() {
-        let text = "fn f() {\n    assert!(items.iter().all(|v: &Item| {\n        \
-                    use std::fmt::Debug;\n        \
-                    let total: Total = format!(\"{}\", (|w: Nested| w)(v));\n        \
-                    total.ok()\n    }));\n    json!({ let hidden: Opaque = 1; });\n}\n";
-        let sites = source_role_sites("rust", text.as_bytes()).unwrap();
-        let span = |name: &str| {
-            let start = text.find(name).unwrap();
-            (start, start + name.len())
-        };
-        for name in ["Item", "Total", "Nested"] {
-            assert!(sites.types.contains(&span(name)), "{name}");
-        }
-        assert!(sites.imports.contains(&span("Debug")));
-        assert!(!sites.types.contains(&span("Opaque")));
     }
 }

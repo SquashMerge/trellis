@@ -22057,8 +22057,17 @@ impl Store {
                 .get(&symbol.id)
                 .is_some_and(|(kind, _)| kind == "variable" || kind == "implementation")
         }) {
+            let impl_blocks: Vec<_> = page
+                .iter()
+                .filter(|symbol| {
+                    metadata
+                        .get(&symbol.id)
+                        .is_some_and(|(kind, _)| kind == "implementation")
+                })
+                .map(|symbol| (symbol.range.start_byte, symbol.range.end_byte))
+                .collect();
             self.selected_source_row_for(tx, path, &selected)?
-                .and_then(|file| crate::files_view::outline_syntax(&file))
+                .and_then(|file| crate::files_view::outline_syntax(&file, &impl_blocks))
         } else {
             None
         };

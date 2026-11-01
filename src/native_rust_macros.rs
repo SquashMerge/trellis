@@ -7,9 +7,13 @@
 //! the original document, through tree-sitter included ranges. A fixed wrapper occupies bytes
 //! `0..prefix.len()` and one byte after the token tree, so every measured node's byte range is
 //! already a range of the original document. Anything that does not parse cleanly stays opaque.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
+use std::time::Instant;
 
-use tree_sitter::{Node, Parser, Point, Range as TsRange, Tree};
+use tree_sitter::{Node, ParseOptions, ParseState, Parser, Point, Range as TsRange, Tree};
+
+use crate::native_evidence::{CapabilityReport, Range};
 
 /// Where an allowlisted macro's format string sits, if it takes one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +113,7 @@ pub(crate) fn parse(
     start: usize,
     end: usize,
     position: Position<'_>,
+    deadline: Option<Instant>,
 ) -> Option<Tree> {
     let (prefix, open, close): (&[u8], &[u8], &[u8]) = match form {
         MacroForm::Arguments { .. } => (ARGUMENTS_PREFIX, b"(", b")"),
@@ -154,7 +159,20 @@ pub(crate) fn parse(
             &[]
         }
     };
-    parser.parse_with_options(&mut chunk, None, None)
+    let mut progress = |_: &ParseState| {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let options = ParseOptions::new().progress_callback(&mut progress);
+    let tree = parser.parse_with_options(&mut chunk, None, Some(options));
+    if tree.is_none() {
+        // A stopped parse would otherwise resume on this parser's next one.
+        parser.reset();
+    }
+    tree
 }
 
 /// The re-parsed argument list or array, exactly at the token tree's range, from an
@@ -204,18 +222,38 @@ impl Expansion {
 /// An allowlisted macro's form and token tree range.
 type TokenTreeSite = (MacroForm, (usize, usize));
 
-/// The re-parses of a document's allowlisted macros, for readers that start from the plain
-/// tree, where a token tree has no expression nodes. Each macro is parsed once, in measurement's
-/// order and under its byte budget, through [`parse`] and [`arguments`], so a reader sees what
-/// measurement saw at the same byte offsets. Node positions are real document positions too.
-/// [`Self::root_for`] reaches only macros on the way to a measured declaration; a macro
-/// [`Self::expand_all`] reaches may have stayed opaque to measurement, so what it yields must
-/// add facts, never bounds that can fail.
+/// The macros one document's measurement expanded, as its capability report records them: the
+/// outermost measured invocations, and every macro left a gap at its whole invocation. A
+/// macro nested in a measured one was measured unless it is such a gap. Reading this set, not
+/// re-deciding it, keeps a reader in step with measurement's bounds.
+pub(crate) struct MeasuredMacros<'r> {
+    outermost: &'r [Range],
+    opaque: BTreeSet<(usize, usize)>,
+}
+
+impl<'r> MeasuredMacros<'r> {
+    pub(crate) fn of(report: &'r CapabilityReport) -> Self {
+        let gaps = report.families.iter().flat_map(|family| &family.gaps);
+        Self {
+            outermost: &report.macro_expansions,
+            opaque: gaps.map(|gap| (gap.range.start, gap.range.end)).collect(),
+        }
+    }
+}
+
+/// The re-parses of a document's measured macros, for readers that start from the plain tree,
+/// where a token tree has no expression nodes. Each macro is parsed once, through [`parse`] and
+/// [`arguments`], so a reader sees what measurement saw at the same byte offsets. Node positions
+/// are real document positions too. Only measured macros are ever parsed: [`Self::root_for`]
+/// reaches those on the way to a measured declaration and [`Self::expand_measured`] takes them
+/// from the report. So measurement's byte budget covers them all, and a macro it refused
+/// cannot use up what a measured one needs.
 pub(crate) struct Expansions<'s> {
     text: &'s str,
     parser: Option<Parser>,
     line_starts: Vec<usize>,
     bytes: usize,
+    deadline: Option<Instant>,
     /// By token tree range. `None` for a macro that does not expand.
     parsed: BTreeMap<(usize, usize), Option<Expansion>>,
 }
@@ -227,8 +265,15 @@ impl<'s> Expansions<'s> {
             parser: None,
             line_starts: Vec::new(),
             bytes: 0,
+            deadline: None,
             parsed: BTreeMap::new(),
         }
+    }
+
+    /// Stop parsing at `deadline`; a macro it interrupts does not expand.
+    pub(crate) fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 
     /// The root of the tree holding `start..end`: the innermost expansion on the way to it, or
@@ -258,30 +303,24 @@ impl<'s> Expansions<'s> {
             .map_or(plain, |expansion| expansion.tree.root_node())
     }
 
-    /// Expand every allowlisted macro under `plain`, nested ones included. Stops once
-    /// `proceed` says so, and returns whether it finished.
-    pub(crate) fn expand_all(
-        &mut self,
-        plain: Node<'_>,
-        mut proceed: impl FnMut() -> bool,
-    ) -> bool {
-        // A stack in reverse document order: outermost macros in order, each before its nested.
+    /// Expand exactly the macros measurement expanded, nested ones included.
+    pub(crate) fn expand_measured(&mut self, plain: Node<'_>, measured: &MeasuredMacros<'_>) {
         let mut pending = Vec::new();
-        allowlisted_macros(plain, self.text, &mut pending);
-        pending.reverse();
+        for span in measured.outermost {
+            let site = plain
+                .descendant_for_byte_range(span.start, span.end)
+                .filter(|node| node.kind() == "macro_invocation")
+                .filter(|node| node.start_byte() == span.start && node.end_byte() == span.end)
+                .and_then(|node| allowlisted(node, self.text));
+            pending.extend(site);
+        }
         while let Some((form, key)) = pending.pop() {
-            if !proceed() {
-                return false;
-            }
             if self.expand(form, key)
                 && let Some(arguments) = self.expansion(key).and_then(Expansion::arguments)
             {
-                let nested = pending.len();
-                allowlisted_macros(arguments, self.text, &mut pending);
-                pending[nested..].reverse();
+                nested_measured(arguments, self.text, &measured.opaque, &mut pending);
             }
         }
-        true
     }
 
     /// The argument list or array of each macro expanded so far.
@@ -331,7 +370,8 @@ impl<'s> Expansions<'s> {
             let row = lines.partition_point(|&line| line <= byte) - 1;
             Point::new(row, byte - lines[row])
         };
-        let tree = parse(parser, self.text.as_bytes(), form, start, end, &position)?;
+        let text = self.text.as_bytes();
+        let tree = parse(parser, text, form, start, end, &position, self.deadline)?;
         let expansion = Expansion::new(tree, form, start, end);
         expansion.arguments().is_some().then_some(expansion)
     }
@@ -361,15 +401,20 @@ fn enclosing_macro(root: Node<'_>, text: &str, start: usize, end: usize) -> Opti
     }
 }
 
-/// The allowlisted macros under `root`, outermost only: a nested one has no syntax here, and
-/// turns up in its parent's expansion. A cursor walk, so nesting cannot exhaust the stack.
-fn allowlisted_macros(root: Node<'_>, text: &str, out: &mut Vec<TokenTreeSite>) {
+/// The measured macros directly under `root`: one nested deeper has no syntax here, and turns
+/// up in its parent's expansion. A cursor walk, so nesting cannot exhaust the stack.
+fn nested_measured(
+    root: Node<'_>,
+    text: &str,
+    opaque: &BTreeSet<(usize, usize)>,
+    out: &mut Vec<TokenTreeSite>,
+) {
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
         let invocation = node.kind() == "macro_invocation";
-        if invocation && let Some(site) = allowlisted(node, text) {
-            out.push(site);
+        if invocation && !opaque.contains(&(node.start_byte(), node.end_byte())) {
+            out.extend(allowlisted(node, text));
         }
         if !invocation && cursor.goto_first_child() {
             continue;
@@ -518,6 +563,15 @@ fn placeholder_names_argument(placeholder: &str) -> bool {
             .last()
             .is_some_and(identifier_start)
     })
+}
+
+#[cfg(test)]
+pub(crate) fn plain_tree_for_tests(text: &str) -> Tree {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .unwrap();
+    parser.parse(text, None).unwrap()
 }
 
 #[cfg(test)]

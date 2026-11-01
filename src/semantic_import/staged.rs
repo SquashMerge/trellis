@@ -1199,7 +1199,11 @@ impl<'a> JoinStore for StagedSide<'a> {
         #[cfg(feature = "test-support")]
         super::note_parsed_role_site_document(document);
         let group = self.require_group(document)?;
-        source_role_sites(document.language.as_str(), group.text.as_bytes())
+        source_role_sites(
+            document.language.as_str(),
+            group.text.as_bytes(),
+            group.native.capability_reports.first(),
+        )
     }
 
     fn role_sites_reserved(
@@ -1213,6 +1217,7 @@ impl<'a> JoinStore for StagedSide<'a> {
         let (sites, tree) = super::source_role_sites_parsed(
             document.language.as_str(),
             group.text.as_bytes(),
+            group.native.capability_reports.first(),
             &mut |bytes| operation.grow(bytes()?),
         )?;
         if let Some(local) = &self.local_claims {

@@ -584,3 +584,37 @@ fn a_very_long_macro_path_stays_an_opaque_gap() {
     assert!(artifact.capability_reports[0].macro_expansions.is_empty());
     assert_eq!(gaps(&artifact).len(), 1);
 }
+
+/// Readers expand exactly what measurement expanded: a macro it refused at its depth bound is
+/// never parsed, whether outermost or nested in a measured one.
+#[test]
+fn expansions_follow_the_measured_set_not_their_own_decisions() {
+    use crate::native_rust_macros::{Expansions, MeasuredMacros};
+    let expanded = |text: &str| {
+        let artifact = measure(&rust("src/a.rs", text), true);
+        let tree = crate::native_rust_macros::plain_tree_for_tests(text);
+        let mut expansions = Expansions::new(text);
+        let report = &artifact.capability_reports[0];
+        expansions.expand_measured(tree.root_node(), &MeasuredMacros::of(report));
+        let starts: Vec<_> = expansions
+            .arguments()
+            .map(|node| text[..node.start_byte()].matches("assert!").count())
+            .collect();
+        (starts, gaps(&artifact).len())
+    };
+    // One measured macro; the 400-deep chain beside it stays opaque.
+    let chain = format!("assert!({}true{});", "dbg!(".repeat(400), ")".repeat(400));
+    let text = format!("fn f() {{ {chain} assert!(a()); }}\n");
+    assert_eq!(expanded(&text), (vec![2], 1));
+    // A chain nested in a measured macro is left at the level measurement stopped.
+    let nested = format!(
+        "fn f() {{ {}g(){}; }}\n",
+        "assert!(".repeat(100),
+        ")".repeat(100)
+    );
+    let (starts, gap_count) = expanded(&nested);
+    assert_eq!(gap_count, 1);
+    let measured = starts.len();
+    assert!((2..100).contains(&measured), "{measured}");
+    assert_eq!(starts, (1..=measured).collect::<Vec<_>>());
+}
