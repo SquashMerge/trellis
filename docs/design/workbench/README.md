@@ -95,98 +95,92 @@ There are two app modes and one shared diagram set:
 
 ## Current UI vs. this design (gap list)
 
-Reviewed in the running app at `localhost:8877` on 2026-10-31 (`cbb32684`, index revision `acb51f94:6`) at 1440×900. Each finding was checked against the daemon's API responses and the Trellis MCP tools after a daemon restart. The owner rulings below win where they differ.
+Re-dogfooded on 2026-10-31 (second pass) at `944417ad` (index revision `57cfcbba:6`), 1440×900, in the browser, against the daemon's API responses and through the Trellis MCP tools. The owner rulings below win where they differ.
 
-**Shipped since 2026-10-29.** These were the earlier simplification and fix items:
+**Shipped since the first 2026-10-31 review (`cbb32684`):**
 
-- **Start:** the checkout is selected automatically and the app lands on Architecture. The header is a status chip ("Fresh · rev …") instead of the false "Index failed".
-- **Layout:**
-  - the left rail is only the file tree, with a whole-tree filter
-  - one-row toolbars, with an Options popover and an ⓘ
-- **Architecture:**
-  - the full layer stack, entry layer included, with Shared beside it
-  - inspector chips: 24 deviations · 275 unassigned · 0 exceptions
-  - the "% of sites mapped" coverage note and a compact legend
-  - the payload went from 35 MB to 844 KB
-- **Tabs and Files:**
-  - the Libraries tab is removed, with "Open in library" in context
-  - the Sequence start list
-  - "Open full" opens Sequence
-  - the selected source range is raised with a lavender bar
-  - references in the inspector ("References to witness · ≥50")
-- **MCP:** `rules_check` works, paged at 25 of 259.
+- **Semantic evidence in Sequence.**
+  - Participants come from rust-analyzer: `coordinate` has 10 participants, up from 1.
+  - Standard-library calls are hidden behind a "Show N incidental calls" toggle (64 for `coordinate`).
+- **Semantic evidence in Architecture.**
+  - 15,259 of 50,561 reference sites now map to a module (30%, up from 9%).
+  - Deviations went from 24 to 35 as more code became visible.
+  - MCP `rules_check` now counts `semanticBinding` evidence.
+- **Tooling.** Out of the layer stack, grey in the treemap, and out of the Sequence start list. The start list is application code only.
+- **Architecture text.** Coverage appears once (in the legend); names wrap instead of truncating.
+- **Files.** The outline shows types and callables, with members under an expanded type. The inspector caveat is behind an ⓘ. Source-margin labels no longer include IDs.
+- **Treemap.** The "Refresh treemap" and "All indexed files" buttons are gone.
+- **Load.** `/dependencies` no longer loads at startup; status is polled through a small `/status/head`.
+- **MCP.**
+  - `workspace_describe` and the other tools report a per-language `semantic` block (rust-analyzer, scip-typescript).
+  - `find_symbols` dropped its "syntaxOnly" warning.
+  - Pages are capped at 24 KB (`pageBytes`).
+- **Classes for Rust.** The tab now covers Rust (`src/classes/rust.rs`).
 
 Items are ordered by impact.
 
+### A. Blockers
 
-**Corrections after review (2026-10-31, Prime's review of PR #521; accepted by the owner):**
+1. **The landing view times out.**
+   - `GET …/architecture` takes 17–20 s; the client gives up at 15 s and shows "Request timed out. No automatic retry was made."
+   - The second attempt loaded, probably from a warm cache.
+   - Metrics went from 2.3 s to 8.9 s.
+   - MCP `rules_check` on `src/store.rs` fails with `deadline_exceeded` (5 s) twice in a row.
+   - The cost arrived with the semantic join.
+   - **Fix:** compute the architecture and metrics summaries once per index revision and serve them from a cache. Don't just raise the client timeout.
+2. **`call_graph` never gets past the root.**
+   - `Store::navigation_at → navigation_in` binds `resolution: resolved`, `join.status: exact`, yet the edge returns `to: null`, `visit: boundary`, `boundaryReason: dispatch`. The binding's `dispatch` is `unknown`.
+   - A direct inherent-method call has no dynamic dispatch, so depth 2 returns only the root node.
+   - **Fix:** treat exact bindings to inherent functions and methods as static and expand them. Keep the dispatch boundary for trait-object and generic receivers.
 
-- **Item 1 (Sequence):** `/sequence` already enriched exact semantic targets. The single lifeline came from the Rust syntax adapter's depth bound, which cut `coordinate`'s loop, and `semantic: unavailable` is display metadata, not enrichment status. Fixed in #531.
-- **Item 7 (Classes):** Rust became a supported Classes language with #506, so Classes showing on this repo is correct. The real defect is that `tools/*.py` alone counted. Fixed in #530.
-- **Item 12 (MCP):** the `syntax` tier labels describe each native answer (for example, `find_symbols` returns native declarations). The gap is that per-language semantic availability wasn't reported. Addressed in #534.
+### B. Sequence and Classes
 
-### A. Data: use the semantic evidence that's already imported
+3. **Large sequences are unreadable.**
+   - `coordinate` renders at 4680×14269px, scaled to 25% (12px text shows as about 3px).
+   - Each callee method gets its own lifeline (`receive`, `decode`, `start_final_check`, `phase_hook`, …), where the design uses one per type or module.
+   - Repeated `?` frames ("only if the preceding path continues normally") add height.
+   - **Fix:** group lifelines by type or module, collapse `?` continuation frames into a marker on the call, and open at 100% with scrolling (plus a fit toggle) instead of fit-to-width.
+4. **Empty sequences after hiding.** `witness` has only two std calls, so with them hidden the diagram is a single box. When every step is incidental, show them, or say "Only standard-library calls (2)" with the toggle.
+5. **Rust class boxes are empty.**
+   - `WatcherHealth` shows "3 fields · 7 methods" with empty compartments and "No proven class relationships".
+   - rust-analyzer has the types, e.g. `witness() -> WatcherWitness`.
+   - **Fix:** render the members, and draw return-type and field-type associations from the semantic bindings.
+   - The Classes tab also appears a moment after the other tabs (after the `classes?limit=1` probe), so decide the tab set before the first render.
 
-1. **Sequence ignores the semantic bindings.**
-   - MCP `outgoing_calls` now resolves calls through rust-analyzer: `Store::navigation_at → navigation_in` is `resolution: resolved`, `evidenceTier: semantic`.
-   - But the `/sequence` response still marks the seed `semantic: unavailable` and returns the seed as its only participant.
-   - `coordinate` (`src/mcp/mod.rs`, 571 lines) renders as one lifeline with 32 steps. 18 of them are std/core/alloc calls (`Arc::new`, `clone`, `into`), and the view says "0 incidental steps hidden".
-   - **Fix:** build participants from the resolved bindings, and hide standard-library calls by default as incidental, with a count and a toggle.
-2. **Architecture references ignore the semantic bindings.**
-   - Coverage is still 9%: 3,737 of 40,481 reference sites mapped to a module.
-   - `rules_check` still lists the limitation "Calls and type relationships have no admitted bindings".
-   - **Fix:** feed resolved call and type bindings into references and rules. Arrows and deviation counts stop being "≥" lower bounds where coverage is complete.
+### C. Architecture
 
-### B. Architecture
+6. **Arrows cross the boxes.**
+   - Arrow count tags ("↑≥150 · 32% mapped", "↑≥1 · 26% mapped") sit on the borders between bands.
+   - The red upward arrows from storage run diagonally through module boxes (`metrics`, "+19 more").
+   - **Fix:** route the upward arrows in a right-hand channel, as the mockup does, with their tags on the channel.
+7. **New modules are unassigned.**
+   - Unassigned grew from 275 to 283.
+   - `.trellis/rules.toml` doesn't cover `src/producer/**`, `src/architecture_details.rs`, `src/behavior_incidental.rs`, `src/classes/rust.rs`, `src/graph_query.rs`, `src/lib.rs` or `src/native_rust_macros.rs`.
+   - **Fix:** assign them to layers (a rules PR).
 
-3. **Tooling reads as the top layer.**
-   - `tooling` (order 1, a peer of `web`) sits at the top of the stack, so `tools/` looks like part of the UI.
-   - It's developer tooling, not runtime architecture.
-   - **Fix:** treat it like `fixture-inputs`: beside the stack or hidden by default (see open questions).
-4. **Labels collide and truncate.**
-   - Arrow-count tags overlap the band header chips: in the query band, "≥65" sits over "→shared ≥7".
-   - "↑≥1 · 7% mapped" runs into the indexing header.
-   - The "1 hidden layer" tag floats over the bottom of the drawing.
-   - Band titles and chips are cut off ("1 · tooling · 115 files …", "Shared · shar…", "architecture-…", "dependency_…"), because the drawing is 715px wide in a 912px area.
-   - **Fix:** route the count tags beside the arrows, wrap or widen labels, and make the hidden-layer note part of the layout.
-5. **Repeated text.**
-   - The coverage sentence appears twice in the view (above the drawing and under the legend) and again in the inspector.
-   - Two lines of counts and bands remain above the drawing.
-   - **Fix:** keep the coverage sentence once, next to the arrows or in the inspector, and move the counts into the ⓘ.
+### D. Files and Treemap
 
-### C. Tabs, Sequence and Files
+8. **Outline names are cut to ~5 characters** ("relev…", "certa…", "read_…"), because the "function L170" suffix takes the width. Use a kind icon, put the line number on hover, and let names take the row.
+9. **Treemap is still mostly orange.** The default `max` aggregation puts most files in the top fixed band (#395). Consider `mean` as the treemap default; keep the fixed bands.
 
-6. **The Sequence start list is mostly dev scripts.** Three of the five most complex methods are `tools/semantic-contract` scripts. Limit the list to application layers, excluding tooling and fixtures, or group it by layer.
-7. **Classes shows for a Rust app.** The tab appears because `tools/*.py` counts as production Python. Base the rule on application-layer code, not on any production file.
-8. **The file tree lists every member.** The `watch.rs` outline shows fields, parameters and impl blocks (`epoch` field, `bits` parameter, `<impl>`). Show types and callables; show members when the type is expanded.
-9. **The inspector is still verbose and clips.** Under "Sequence · measured", a nine-line caveat paragraph remains; move it to the ⓘ. The mini-sequence still clips at the right edge ("External boundary – lo…").
+### E. MCP
 
-### D. Treemap and load
-
-10. **Treemap controls.**
-    - "Refresh treemap" and "All indexed files" are still buttons; Architecture dropped its equivalents.
-    - With the fixed bands (#395), most of the area is in the top orange band.
-    - Consider defaulting to a metric or aggregation that separates files (e.g. `mean`), and keep the ramp fixed.
-11. **Startup load.**
-    - Architecture takes 4.6 s and metrics 2.3 s.
-    - `/status` (61 KB) is fetched four times in the first few seconds.
-    - `/dependencies` (264 KB) loads at startup although nothing shows it until "Open in library".
-    - **Fix:** load dependencies on demand, poll a small status digest, and cache architecture and metrics per revision.
-
-### E. MCP (separate issue)
-
-12. **The reported evidence level contradicts the results.** `workspace_describe` reports "syntax" as the evidence level for every language, and `find_symbols` warns "syntaxOnly", while rust-analyzer and scip-typescript data is fresh and `outgoing_calls` returns semantic, resolved bindings. Agents will under-trust the results. Report the evidence level per language from the imported evidence.
-13. **`rules_check` pages are at the size limit.** A 25-instance page is 63 KB against the 64 KB response cap. Lower the default page size or trim the evidence per instance.
+10. **The top-level evidence label still says "syntax".** `evidenceTier` is `syntax` for every language (and on each symbol), even where the new `semantic` block reports a fresh producer. Agents read the top-level field first. Report the best available evidence level per language and per symbol.
+11. **`rules_check` ignores `paths` for `unassigned`.** A check scoped to `src/watch.rs` returned 59 unrelated unassigned files (`tests/*.cjs`, `src/producer/*`). Scope the list to the requested paths.
 
 ## Suggested slices (each its own issue)
 
-**Already in the running app (2026-10-31).** These were the original slices 1–6 plus the 2026-10-29 slices 1–5:
+**Already in the running app (2026-10-31, second pass).** These were the original slices 1–6, the 2026-10-29 slices 1–5, and most of the first 2026-10-31 slices:
 
 - the brand restyle and Connect
 - the simplified shell, Architecture and Treemap with metrics, and Files
-- the Architecture payload
-- tabs: no Libraries; the Sequence start list
-- the Files and Inspector fixes
+- the Architecture payload, and tabs without Libraries
+- semantic bindings in Sequence and Architecture
+- application layers only
+- the Architecture text pass
+- Files and Inspector
+- the Treemap buttons
+- MCP per-language semantic reporting
 
 Confirm that `DESIGN.md` and `docs/design-refresh-contract.md` were amended along with the restyle.
 
@@ -194,18 +188,19 @@ Item numbers in brackets refer to the gap list above.
 
 ### Next
 
-1. **Semantic bindings in Sequence** [1].
-   - Participants come from resolved calls.
-   - Standard-library calls are hidden as incidental, with a count and a toggle.
-2. **Semantic bindings in Architecture** [2]. References and rules use resolved call and type bindings, with coverage reported per edge.
-3. **Application layers only** [3, 6, 7].
-   - Tooling sits beside the stack or is hidden.
-   - The Sequence start list and the Classes rule consider application layers only.
-4. **Architecture layout** [4, 5]. No collisions or truncation; one coverage sentence; counts behind the ⓘ.
-5. **Files and Inspector** [8, 9]. Types and callables in the tree; caveats behind the ⓘ; the mini-sequence fits.
-6. **Treemap and load** [10, 11]. Remove the orphan buttons; lazy-load dependencies; poll a status digest; cache per revision.
-7. **MCP consistency** [12, 13]. Report the evidence level per language from the imported evidence; size `rules_check` pages under the cap.
-8. **Remaining diagram views.** C4, and Pele parity for Class. No ERD.
+1. **Architecture and metrics per revision** [1].
+   - Compute once per index revision and serve from a cache.
+   - The landing view loads within the client timeout; MCP `rules_check` meets its deadline.
+2. **Static calls expand in `call_graph`** [2]. Exact bindings to inherent functions and methods expand; trait and generic dispatch stays a boundary.
+3. **Readable sequences** [3, 4].
+   - Lifelines per type or module; `?` frames collapsed.
+   - Opens at 100% with scrolling.
+   - An all-incidental sequence still shows something.
+4. **Rust class diagrams** [5]. Members and type associations from the semantic bindings; the tab set is decided before the first render.
+5. **Architecture arrows and rules** [6, 7]. Upward arrows in a side channel; new modules assigned in `.trellis/rules.toml`.
+6. **Files outline and Treemap default** [8, 9].
+7. **MCP consistency** [10, 11]. Top-level evidence level per language and symbol; `rules_check` unassigned list scoped to `paths`.
+8. **Remaining diagram views.** C4. No ERD.
 
 ### Gated (don't build until the prerequisite lands)
 
@@ -222,7 +217,7 @@ Item numbers in brackets refer to the gap list above.
 
 - ~~**Libraries tab:** keep it as a tab (2026-10-24 ruling), or reach it from external calls and references only (gap item 7)?~~ Settled 2026-10-29: **remove the tab**; reach the catalog in context ("open in library" from a call or reference into an external package). Built in #450.
 
-- **Tooling layer:** draw `tooling` beside the stack (like Shared, but marked as dev tooling), or hide it by default like `fixture-inputs`? Either way, it leaves the Sequence start list and the Classes rule (gap items 3, 6, 7).
+- **Tooling layer:** draw `tooling` beside the stack, or hide it by default like `fixture-inputs`? *As built in `944417ad`: hidden from the stack, grey in the treemap, and out of the Sequence start list.* Confirm, or ask for the beside-the-stack variant.
 
 ## Owner rulings on the packet (2026-10-24)
 
