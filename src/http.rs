@@ -37,6 +37,7 @@ use subtle::ConstantTimeEq;
 pub(crate) mod architecture;
 mod config;
 mod worker;
+pub use architecture::ArchitectureBuilding;
 pub use config::BrowserConfig;
 pub use worker::{AdmissionLease, RetireOutcome, RuntimePhase};
 use worker::{RuntimeState, STARTUP_BACKOFF_FIRST};
