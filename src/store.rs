@@ -6305,6 +6305,16 @@ macro_rules! revision_release_holds {
     };
 }
 
+/// Up to 64 stored proofs of a capture no selection names and no proof derives from. Captures
+/// come first: a scan over every stored proof, each checked against every provenance row, held
+/// one release step for tens of minutes once several large batches were retained (#567).
+const RAW_PROOF_RELEASE_SQL: &str = "SELECT p.rowid FROM semantic_raw_captures c
+    CROSS JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id
+    WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=c.batch_id)
+    AND NOT EXISTS(SELECT 1 FROM semantic_provenance v
+        WHERE v.capture_id=p.capture_id AND v.derived_from_provenance_id=p.proof_id)
+    LIMIT 64";
+
 fn semantic_pin_key(pin: IndexPin) -> String {
     format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
 }
@@ -9799,7 +9809,10 @@ fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
                 return Ok(true);
             }
         }
-        let proofs = db.execute("DELETE FROM semantic_raw_proofs WHERE rowid IN (SELECT p.rowid FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE NOT EXISTS(SELECT 1 FROM semantic_provenance v WHERE v.capture_id=p.capture_id AND v.derived_from_provenance_id=p.proof_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=c.batch_id) LIMIT 64)",[])?;
+        let proofs = db.execute(
+            &format!("DELETE FROM semantic_raw_proofs WHERE rowid IN ({RAW_PROOF_RELEASE_SQL})"),
+            [],
+        )?;
         let captures = db.execute("DELETE FROM semantic_raw_captures WHERE capture_id IN (SELECT c.capture_id FROM semantic_raw_captures c WHERE NOT EXISTS(SELECT 1 FROM semantic_raw_proofs p WHERE p.capture_id=c.capture_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=c.batch_id) LIMIT 64)",[])?;
         let exclusions = db.execute("DELETE FROM semantic_raw_exclusions WHERE rowid IN (SELECT e.rowid FROM semantic_raw_exclusions e WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=e.batch_id) LIMIT 64)",[])?;
         let batches = db.execute("DELETE FROM semantic_raw_batches WHERE batch_id IN (SELECT b.batch_id FROM semantic_raw_batches b WHERE NOT EXISTS(SELECT 1 FROM semantic_raw_captures c WHERE c.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_raw_exclusions e WHERE e.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=b.batch_id) LIMIT 64)",[])?;
