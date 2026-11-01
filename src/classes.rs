@@ -41,6 +41,11 @@ pub struct Catalog {
     pub relations: Vec<ClassRelation>,
     pub warnings: Vec<String>,
     pub truncated: bool,
+    /// Documents whose class rows were cut to fit (#564). They are stored as not class
+    /// complete, which keeps this past the bounded warnings: a later publication composes them
+    /// again.
+    #[serde(skip)]
+    pub fitted: BTreeSet<String>,
 }
 /// One value controls extraction and workspace composition, including test-sized caps.
 #[derive(Debug, Clone, Copy)]
@@ -583,8 +588,7 @@ impl std::io::Write for EncodedBytes {
     }
 }
 
-/// Marks a revision whose class rows were cut to fit, so later publications recompose them.
-pub(crate) const BUDGET_WARNING: &str = "class rows exceed the per-file evidence budget";
+const BUDGET_WARNING: &str = "class rows exceed the per-file evidence budget";
 
 /// What a class row is charged beside its text columns and payload: the projection's two
 /// hashes with their keys, and the stored ID.
@@ -661,6 +665,7 @@ impl Catalog {
         self.relations = relations;
         for path in &omitted {
             self.truncated = true;
+            self.fitted.insert(path.clone());
             self.add_warning(
                 &format!("{path}: {BUDGET_WARNING}; some omitted"),
                 Limits::default().text,

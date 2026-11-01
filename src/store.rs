@@ -5194,6 +5194,7 @@ fn stream_document_classes(
             .collect(),
         warnings: Vec::new(),
         truncated: catalog.truncated,
+        ..Default::default()
     }
 }
 
@@ -5287,9 +5288,6 @@ pub(crate) struct LocalPrepared {
     prior_coverage: BTreeMap<String, crate::native_evidence::Coverage>,
     prior_summaries: BTreeMap<String, crate::classes::FileSummary>,
     prior_class_complete: BTreeMap<String, bool>,
-    /// The prior revision's class rows were cut to fit their budgets. Rows it keeps stay cut,
-    /// so its warning and flag are recomposed too.
-    prior_class_fit: bool,
     old_stats: IndexStats,
     old_diagnostics: Vec<Diagnostic>,
     old_changed_counts: (usize, usize, usize),
@@ -5301,12 +5299,10 @@ impl LocalPrepared {
     /// without comparing its recomposed rows.
     fn recomposes_rust(&self) -> bool {
         let rust = |path: &String| path.ends_with(".rs");
-        self.prior_class_fit
-            || self
-                .changed_paths
-                .iter()
-                .chain(&self.removed_paths)
-                .any(rust)
+        self.changed_paths
+            .iter()
+            .chain(&self.removed_paths)
+            .any(rust)
             || self.prior_class_complete.iter().any(|(path, complete)| {
                 rust(path) && !complete && !self.changed_paths.contains(path)
             })
@@ -10500,7 +10496,8 @@ fn write_native(
                 coverage.state,
                 coverage.diagnostic,
                 ordinal as i64,
-                class_complete || !crate::classes::supports_language(&file.language),
+                (class_complete && !classes.fitted.contains(&file.path))
+                    || !crate::classes::supports_language(&file.language),
             ],
         )?;
         for (kind, roles) in [
@@ -17435,12 +17432,8 @@ impl Store {
                 "SELECT m.stats,m.diagnostics
                  FROM index_metadata m JOIN native_revisions r ON r.id=?1 WHERE m.singleton=1",
                 [&selected.key],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            let prior_class_fit = class_metadata(db, &selected)?
-                .0
-                .iter()
-                .any(|warning| warning.contains(crate::classes::BUDGET_WARNING));
             Ok(Some(LocalPrepared {changed_paths,removed_paths,native,prior_pin:selected.pin,
-                prior_ids,prior_coverage,prior_summaries,prior_class_complete,prior_class_fit,
+                prior_ids,prior_coverage,prior_summaries,prior_class_complete,
                 old_stats:serde_json::from_str(&stats).context(SelectedIntegrity("incompatible_index: stored JSON decode failed".into()))?,old_diagnostics:serde_json::from_str(&diagnostics).context(SelectedIntegrity("incompatible_index: stored JSON decode failed".into()))?,
                 old_changed_counts}))
         })
@@ -18454,6 +18447,7 @@ impl Store {
                     relations: Vec::new(),
                     warnings: metadata.warnings,
                     truncated: metadata.truncated,
+                    ..Default::default()
                 };
                 for extraction in extractions.values() {
                     check_cancel(cancel)?;

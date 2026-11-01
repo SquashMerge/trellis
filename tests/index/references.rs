@@ -6459,6 +6459,78 @@ fn a_rust_module_with_a_syntax_error_proves_no_name_absent_for_its_importers() {
 }
 
 #[test]
+fn a_module_a_broken_file_may_own_has_no_proved_crate() {
+    let files = |main: &'static str| {
+        [
+            ("src/lib.rs", "mod x; mod y;\n"),
+            ("src/x.rs", "fn run() { crate::y::f(); }\n"),
+            ("src/y.rs", "pub fn f() {}\n"),
+            ("src/main.rs", main),
+        ]
+    };
+    let control = "mod x; mod y { pub fn f() {} } fn main() {}\n";
+    assert!(!has(&outcome(&files(control)).0, "src/x.rs", "src/y.rs"));
+    for broken in [
+        "(mod x; mod y { pub fn f() {} } fn main() {}\n",
+        "mod (x; mod y { pub fn f() {} } fn main() {}\n",
+        "mod ; mod y { pub fn f() {} } fn main() {}\n",
+    ] {
+        let edges = outcome(&files(broken)).0;
+        assert!(!has(&edges, "src/x.rs", "src/y.rs"), "{broken}: {edges:?}");
+    }
+    // Everything below a possibly owned module has the same unknown owner.
+    let edges = outcome(&[
+        ("src/lib.rs", "mod x; mod y;\n"),
+        ("src/x.rs", "mod z;\n"),
+        ("src/x/z.rs", "fn run() { crate::y::f(); }\n"),
+        ("src/y.rs", "pub fn f() {}\n"),
+        ("src/main.rs", "(mod x; fn main() {}\n"),
+    ])
+    .0;
+    assert!(!has(&edges, "src/x/z.rs", "src/y.rs"), "{edges:?}");
+}
+
+#[test]
+fn a_broken_binary_that_declares_no_module_leaves_the_library_proved() {
+    let edges = outcome(&[
+        ("src/lib.rs", "mod x; mod y;\n"),
+        ("src/x.rs", "fn run() { crate::y::f(); }\n"),
+        ("src/y.rs", "pub fn f() {}\n"),
+        ("src/main.rs", "fn main() { (\n"),
+    ])
+    .0;
+    assert!(has(&edges, "src/x.rs", "src/y.rs"), "{edges:?}");
+}
+
+#[test]
+fn a_java_package_of_unknown_place_never_falls_back_to_the_standard_library() {
+    let files = |hidden: &'static str, user: &'static str| {
+        [("Hidden.java", hidden), ("app/Use.java", user)]
+    };
+    for user in [
+        "package app; import javax.swing.Local; class Use {}\n",
+        "package app; import javax.swing.*; class Use {}\n",
+    ] {
+        let control = files("package javax.swing; public class Local {}\n", user);
+        assert!(
+            outcome(&control).1 == 0 || has(&outcome(&control).0, "app/Use.java", "Hidden.java")
+        );
+        for broken in [
+            "package ; public class Local {}\n",
+            "@Foo( pakage javax.swing;\npublic class Local {}\n",
+            "import pakage javax.swing;\npublic class Local {}\n",
+        ] {
+            let (edges, unresolved) = outcome(&files(broken, user));
+            assert!(unresolved >= 1, "{broken}: {user}: {edges:?}");
+            assert!(
+                edges.iter().all(|(from, _)| from != "app/Use.java"),
+                "{edges:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_rust_path_into_a_broken_module_stays_unknown() {
     let files = |q: &'static str| {
         [
@@ -6767,7 +6839,7 @@ fn a_source_cut_anywhere_or_missing_a_token_never_fails_a_view() {
 #[test]
 fn breaking_any_file_at_any_byte_only_loses_edges() {
     const STRIDE: usize = 3;
-    let checkouts: [&[(&str, &str)]; 4] = [
+    let checkouts: [&[(&str, &str)]; 5] = [
         &[
             ("src/lib.rs", "mod p; mod q; mod user;\n"),
             (
@@ -6778,6 +6850,15 @@ fn breaking_any_file_at_any_byte_only_loses_edges() {
             (
                 "src/user.rs",
                 "use crate::p::*;\nuse crate::q::*;\nuse crate::q as foo;\nfn run() { foo::f(); g(); h(); }\n",
+            ),
+        ],
+        &[
+            ("src/lib.rs", "mod x; mod y;\n"),
+            ("src/x.rs", "fn run() { crate::y::f(); }\n"),
+            ("src/y.rs", "pub fn f() {}\n"),
+            (
+                "src/main.rs",
+                "mod x; mod y { pub fn f() {} } fn main() {}\n",
             ),
         ],
         &[

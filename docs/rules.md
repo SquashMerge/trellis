@@ -518,12 +518,14 @@ status.
 A parser error can hide or misplace anything in its file, so a broken file proves less than
 an over-deep one:
 
-- In Rust, every scope of the file is opaque, and an explicit name there is unknown too.
+- In Rust, every scope of the file is opaque, and an explicit name there is unknown too. A
+  file below it that its text names, but its tree doesn't declare, could have it as a second
+  owner, so that file and everything below it have no proved crate.
 - In JavaScript and Python, the file counts as dynamic: its exports are unknown.
 - In Java, no type root or explicit import of the file is proved, and neither is any type of
   its package, nor any name another file's type root could lose to a type hidden there. A
   broken package declaration, or a broken file with none that still spells `package`, leaves
-  the file's package unknown, which does the same for every package of its source set.
+  the file's package unknown, which does the same for every package of its source set. That includes standard library fallbacks.
   A misspelled declaration inside the body of a broken file's first type can't be told from
   ordinary recovered text, so that file stays in the unnamed package.
 - A selector's `extends` or `implements` on a type in the file is unknown, not false.

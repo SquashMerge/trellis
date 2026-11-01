@@ -378,11 +378,15 @@ impl Catalog {
             return Ok(SiteResolution::unknown("java_type_path_unsupported"));
         };
         charge(path.len(), work, check)?;
+        // A file of unknown package can be in this one, so neither it nor a fallback is proved.
+        if self.unplaced.contains(source_set) {
+            return Ok(SiteResolution::unknown("java_type_identity_ambiguous"));
+        }
         if let Some(package) = self
             .packages
             .get(&(source_set.to_owned(), package_path.to_vec()))
         {
-            if package.partial || self.unplaced.contains(source_set) {
+            if package.partial {
                 return Ok(SiteResolution::unknown("java_type_identity_ambiguous"));
             }
             if let Some(bucket) = package.exports.get(name) {
@@ -435,6 +439,9 @@ impl Catalog {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<SiteResolution> {
         charge(path.len(), work, check)?;
+        if self.unplaced.contains(source_set) {
+            return Ok(SiteResolution::unknown("java_wildcard_name_ambiguous"));
+        }
         let Some(package) = self.packages.get(&(source_set.to_owned(), path.to_vec())) else {
             if self.type_prefix(source_set, path, work, check)? {
                 return Ok(SiteResolution::unknown("java_member_type_unsupported"));
@@ -446,7 +453,7 @@ impl Catalog {
             }
             return Ok(SiteResolution::unknown("java_package_mapping_unavailable"));
         };
-        if package.partial || self.unplaced.contains(source_set) {
+        if package.partial {
             return Ok(SiteResolution::unknown("java_wildcard_name_ambiguous"));
         }
         let same_package = self
