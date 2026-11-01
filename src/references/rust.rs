@@ -369,9 +369,11 @@ impl Catalog {
                 }
             }
         }
+        let mut visited = BTreeSet::new();
         while let Some(scope) = pending.pop() {
             self.step(check)?;
-            if self.ambiguous.insert(scope) {
+            if visited.insert(scope) {
+                self.ambiguous.insert(scope);
                 pending.extend(
                     edges
                         .iter()

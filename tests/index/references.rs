@@ -6491,6 +6491,27 @@ fn a_module_a_broken_file_may_own_has_no_proved_crate() {
 }
 
 #[test]
+fn a_module_already_ambiguous_still_passes_a_lost_owner_to_what_lies_below_it() {
+    // `src/mod.rs` makes x ambiguous before the broken main.rs is considered.
+    let files = |main: &'static str| {
+        [
+            ("src/lib.rs", "mod x; pub fn f() {}\n"),
+            ("src/mod.rs", "mod x;\n"),
+            ("src/x.rs", "mod z;\n"),
+            ("src/x/z.rs", "fn run() { crate::f(); }\n"),
+            ("src/main.rs", main),
+        ]
+    };
+    assert!(
+        outcome(&files("mod x; pub fn f() {} fn main() {}\n"))
+            .0
+            .is_empty()
+    );
+    let edges = outcome(&files("(mod x; pub fn f() {} fn main() {}\n")).0;
+    assert!(!has(&edges, "src/x/z.rs", "src/lib.rs"), "{edges:?}");
+}
+
+#[test]
 fn a_broken_binary_that_declares_no_module_leaves_the_library_proved() {
     let edges = outcome(&[
         ("src/lib.rs", "mod x; mod y;\n"),
