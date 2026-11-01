@@ -99,39 +99,51 @@ Re-dogfooded on 2026-10-31 (second pass) at `944417ad` (index revision `57cfcbba
 
 **Shipped since the first 2026-10-31 review (`cbb32684`):**
 
-- **Semantic evidence in Sequence.**
-  - Participants come from rust-analyzer: `coordinate` has 10 participants, up from 1.
-  - Standard-library calls are hidden behind a "Show N incidental calls" toggle (64 for `coordinate`).
+- **Sequence participants and incidental calls.** Sequence already enriched exact semantic targets before this pass (#521's correction).
+  - Fresh rust-analyzer call bindings select measured declaration participants: `coordinate` has 10 participants, up from 1.
+  - External calls (the standard library and other packages), logging calls and trivial accessors are hidden behind a "Show N incidental calls" toggle. N counts incidental steps, operands included, so it isn't necessarily that many calls (64 for `coordinate`).
 - **Semantic evidence in Architecture.**
   - 15,259 of 50,561 reference sites now map to a module (30%, up from 9%).
   - Deviations went from 24 to 35 as more code became visible.
   - MCP `rules_check` now counts `semanticBinding` evidence.
-- **Tooling.** Out of the layer stack, grey in the treemap, and out of the Sequence start list. The start list is application code only.
+- **Tooling.** With tooling in a `display = "hidden"` layer, as in this checkout's local rules: out of the layer stack until the hidden-layer toggle reveals it, grey in the treemap, and out of the Sequence start list. The start list is application code only.
 - **Architecture text.** Coverage appears once (in the legend); names wrap instead of truncating.
 - **Files.** The outline shows types and callables, with members under an expanded type. The inspector caveat is behind an ⓘ. Source-margin labels no longer include IDs.
 - **Treemap.** The "Refresh treemap" and "All indexed files" buttons are gone.
-- **Load.** `/dependencies` no longer loads at startup; status is polled through a small `/status/head`.
+- **Load.** `/dependencies` no longer loads at startup; it loads on the first in-context library action. Pinned reads check the head through a small `/status/head` response; checkout selection and refresh still read full `/status`.
 - **MCP.**
-  - `workspace_describe` and the other tools report a per-language `semantic` block (rust-analyzer, scip-typescript).
-  - `find_symbols` dropped its "syntaxOnly" warning.
-  - Pages are capped at 24 KB (`pageBytes`).
-- **Classes for Rust.** The tab now covers Rust (`src/classes/rust.rs`).
+  - `workspace_describe` `languages` and the find, search and incoming `scopeCoverage` report a per-language `semantic` block (rust-analyzer, scip-typescript).
+  - `find_symbols` omits its `syntaxOnly` warning when every language in the answer has fresh selected semantic evidence. The warning stays otherwise.
+  - Pages target 24 KiB (`pageBytes` = 24,576 bytes). That isn't a hard cap: a lone larger item still gets its own page under the unchanged 65,536-byte response cap.
+
+**Retained, not new:** Rust support in the Classes tab (`src/classes/rust.rs`) predates the first review (#452, #506).
 
 Items are ordered by impact.
+
+**Corrections after review (2026-10-31, Prime's review of PR #561):**
+
+- **Shipped list:** Sequence's semantic enrichment and Rust Classes predate this pass, and the toggle, `syntaxOnly`, `pageBytes` and `/status/head` bullets were too broad. Reworded above.
+- **Item 1 (load):** the timings stand, but the cause isn't profiled. Direct metrics doesn't run the Architecture semantic join, and a source-score memo already exists.
+- **Item 2 (`call_graph`):** the boundary is the ratified #470 rule, and free-function calls already expand. The owner has since ruled on #557 to amend it.
+- **Item 5 (Classes):** members exist and start collapsed. Proven associations are a new evidence feature, not edges waiting to be drawn.
+- **Item 7 (rules):** resolved in the owner's local, untracked `.trellis/rules.toml`.
+- **Item 10 (MCP):** the `syntax` tier describes the native answer by contract (#528). The `semantic` block reports availability beside it.
+- **Item 11 (`rules_check`):** the full-snapshot `unassigned` catalog is contract behaviour, not an ignored filter. Whether to change it is an open question on #559.
+- **Tooling:** hiding it was already settled by the #524 ruling (`docs/rules.md`).
 
 ### A. Blockers
 
 1. **The landing view times out.**
    - `GET …/architecture` takes 17–20 s; the client gives up at 15 s and shows "Request timed out. No automatic retry was made."
-   - The second attempt loaded, probably from a warm cache.
+   - The second attempt loaded. Whether a warm cache explains that wasn't measured.
    - Metrics went from 2.3 s to 8.9 s.
    - MCP `rules_check` on `src/store.rs` fails with `deadline_exceeded` (5 s) twice in a row.
-   - The cost arrived with the semantic join.
-   - **Fix:** compute the architecture and metrics summaries once per index revision and serve them from a cache. Don't just raise the client timeout.
-2. **`call_graph` never gets past the root.**
+   - The cause isn't profiled yet. The semantic join is a hypothesis for Architecture and `rules_check`, which share it; direct metrics doesn't run it.
+   - **Proposed (#556):** compute the architecture and metrics summaries once per index revision and serve them from a cache. Don't just raise the client timeout. This goes beyond the existing source-score memo, has to respect live rules-file changes and request options, and has to be measured separately for MCP `rules_check`.
+2. **`call_graph` stops at this seed's method calls.**
    - `Store::navigation_at → navigation_in` binds `resolution: resolved`, `join.status: exact`, yet the edge returns `to: null`, `visit: boundary`, `boundaryReason: dispatch`. The binding's `dispatch` is `unknown`.
-   - A direct inherent-method call has no dynamic dispatch, so depth 2 returns only the root node.
-   - **Fix:** treat exact bindings to inherent functions and methods as static and expand them. Keep the dispatch boundary for trait-object and generic receivers.
+   - That's the ratified #470 rule: an exact binding doesn't prove dispatch, and member calls and Rust method targets stay `unknown`. So depth 2 returns only the root node here. Fresh exact bindings to free functions already expand.
+   - **Approved amendment, in progress (#557, owner ruling 2026-10-31):** a fresh exact binding to a fixed body is direct and expands: Rust inherent methods, and Java static, private and final methods. Rust trait methods and JS and Java instance methods stay dynamic; the edge shows the trait, interface or prototype declaration as its target, marked dynamic, rather than a target-less boundary, with no fan-out to implementations. `impl Trait for Type` is measured on this repo first.
 
 ### B. Sequence and Classes
 
@@ -141,10 +153,11 @@ Items are ordered by impact.
    - Repeated `?` frames ("only if the preceding path continues normally") add height.
    - **Fix:** group lifelines by type or module, collapse `?` continuation frames into a marker on the call, and open at 100% with scrolling (plus a fit toggle) instead of fit-to-width.
 4. **Empty sequences after hiding.** `witness` has only two std calls, so with them hidden the diagram is a single box. When every step is incidental, show them, or say "Only standard-library calls (2)" with the toggle.
-5. **Rust class boxes are empty.**
+5. **Rust class boxes open empty.**
    - `WatcherHealth` shows "3 fields · 7 methods" with empty compartments and "No proven class relationships".
-   - rust-analyzer has the types, e.g. `witness() -> WatcherWitness`.
-   - **Fix:** render the members, and draw return-type and field-type associations from the semantic bindings.
+   - The members are there, collapsed by default: **Show members** in the class's action menu renders them.
+   - "No proven class relationships" is deliberate. Field and signature types, e.g. `witness() -> WatcherWitness`, are kept as syntax hints, and a producer knowing a return type doesn't by itself establish an association edge.
+   - **Proposed:** show members by default. Separately, add proven return-type and field-type associations, a new evidence feature that needs its own contract path.
    - The Classes tab also appears a moment after the other tabs (after the `classes?limit=1` probe), so decide the tab set before the first render.
 
 ### C. Architecture
@@ -153,10 +166,10 @@ Items are ordered by impact.
    - Arrow count tags ("↑≥150 · 32% mapped", "↑≥1 · 26% mapped") sit on the borders between bands.
    - The red upward arrows from storage run diagonally through module boxes (`metrics`, "+19 more").
    - **Fix:** route the upward arrows in a right-hand channel, as the mockup does, with their tags on the channel.
-7. **New modules are unassigned.**
-   - Unassigned grew from 275 to 283.
-   - `.trellis/rules.toml` doesn't cover `src/producer/**`, `src/architecture_details.rs`, `src/behavior_incidental.rs`, `src/classes/rust.rs`, `src/graph_query.rs`, `src/lib.rs` or `src/native_rust_macros.rs`.
-   - **Fix:** assign them to layers (a rules PR).
+7. **New modules were unassigned (resolved locally).**
+   - Unassigned grew from 275 to 283 in this pass.
+   - `.trellis/rules.toml` didn't cover `src/producer/**`, `src/architecture_details.rs`, `src/behavior_incidental.rs`, `src/classes/rust.rs`, `src/graph_query.rs`, `src/lib.rs` or `src/native_rust_macros.rs`.
+   - **Resolved:** the owner has since assigned them in the local `.trellis/rules.toml`, which isn't tracked. No rules PR is pending.
 
 ### D. Files and Treemap
 
@@ -165,8 +178,8 @@ Items are ordered by impact.
 
 ### E. MCP
 
-10. **The top-level evidence label still says "syntax".** `evidenceTier` is `syntax` for every language (and on each symbol), even where the new `semantic` block reports a fresh producer. Agents read the top-level field first. Report the best available evidence level per language and per symbol.
-11. **`rules_check` ignores `paths` for `unassigned`.** A check scoped to `src/watch.rs` returned 59 unrelated unassigned files (`tests/*.cjs`, `src/producer/*`). Scope the list to the requested paths.
+10. **The top-level evidence label still says "syntax".** `evidenceTier` is `syntax` for every language (and on each symbol), even where the new `semantic` block reports a fresh producer. That's by contract (#528): the tier describes the native answer, and `semantic` reports what's available beside it. Agents read the top-level field first, so the distinction may need clarifying.
+11. **`rules_check` keeps the full `unassigned` catalog under `paths`.** A check scoped to `src/watch.rs` returned 59 unrelated unassigned files (`tests/*.cjs`, `src/producer/*`). That's the current contract: `paths` scopes source evaluation, while the informational `unassigned` catalog uses the full snapshot. Scoping the list to the requested paths would be a contract change, an open owner question on #559.
 
 ## Suggested slices (each its own issue)
 
@@ -188,18 +201,18 @@ Item numbers in brackets refer to the gap list above.
 
 ### Next
 
-1. **Architecture and metrics per revision** [1].
-   - Compute once per index revision and serve from a cache.
-   - The landing view loads within the client timeout; MCP `rules_check` meets its deadline.
-2. **Static calls expand in `call_graph`** [2]. Exact bindings to inherent functions and methods expand; trait and generic dispatch stays a boundary.
+1. **Architecture and metrics per revision** [1]. Proposed in #556.
+   - Profile first. Compute once per index revision and serve from a cache, beyond the existing source-score memo, respecting rules-file changes and request options.
+   - The landing view loads within the client timeout; MCP `rules_check` meets its deadline. Measure each separately.
+2. **Static calls expand in `call_graph`** [2]. Approved amendment to #470, in progress (#557): fresh exact bindings to fixed bodies (Rust inherent methods; Java static, private and final methods) expand; dynamic calls show the trait, interface or prototype declaration as their target.
 3. **Readable sequences** [3, 4].
    - Lifelines per type or module; `?` frames collapsed.
    - Opens at 100% with scrolling.
    - An all-incidental sequence still shows something.
-4. **Rust class diagrams** [5]. Members and type associations from the semantic bindings; the tab set is decided before the first render.
-5. **Architecture arrows and rules** [6, 7]. Upward arrows in a side channel; new modules assigned in `.trellis/rules.toml`.
+4. **Rust class diagrams** [5]. Members shown by default; the tab set is decided before the first render. Proven type associations are a separate evidence feature.
+5. **Architecture arrows** [6]. Upward arrows in a side channel.
 6. **Files outline and Treemap default** [8, 9].
-7. **MCP consistency** [10, 11]. Top-level evidence level per language and symbol; `rules_check` unassigned list scoped to `paths`.
+7. **MCP clarity** [10, 11]. Clarify that the `syntax` tier describes the native answer, beside the per-language `semantic` block. Scoping the `rules_check` unassigned catalog to `paths` is a contract change, only if the owner approves it on #559.
 8. **Remaining diagram views.** C4. No ERD.
 
 ### Gated (don't build until the prerequisite lands)
@@ -217,7 +230,9 @@ Item numbers in brackets refer to the gap list above.
 
 - ~~**Libraries tab:** keep it as a tab (2026-10-24 ruling), or reach it from external calls and references only (gap item 7)?~~ Settled 2026-10-29: **remove the tab**; reach the catalog in context ("open in library" from a call or reference into an external package). Built in #450.
 
-- **Tooling layer:** draw `tooling` beside the stack, or hide it by default like `fixture-inputs`? *As built in `944417ad`: hidden from the stack, grey in the treemap, and out of the Sequence start list.* Confirm, or ask for the beside-the-stack variant.
+- ~~**Tooling layer:** draw `tooling` beside the stack, or hide it by default like `fixture-inputs`?~~ Settled 2026-10-31 (#524, `docs/rules.md`): **hidden**. The layer carries `display = "hidden"` and waits behind the hidden-layer toggle, so the default view depends on that authored setting. *As built in `944417ad`: hidden from the stack, grey in the treemap, and out of the Sequence start list.*
+
+- **`rules_check` unassigned catalog:** keep the full-snapshot `unassigned` list under `paths` (current contract), or scope it? Open on #559.
 
 ## Owner rulings on the packet (2026-10-24)
 
