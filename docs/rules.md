@@ -524,6 +524,8 @@ an over-deep one:
   its package, nor any name another file's type root could lose to a type hidden there. A
   broken package declaration, or a broken file with none that still spells `package`, leaves
   the file's package unknown, which does the same for every package of its source set.
+  A misspelled declaration inside the body of a broken file's first type can't be told from
+  ordinary recovered text, so that file stays in the unnamed package.
 - A selector's `extends` or `implements` on a type in the file is unknown, not false.
 
 Sites that survive in the recovered tree keep the resolution their language gives them: an
