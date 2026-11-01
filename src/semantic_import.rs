@@ -4877,6 +4877,9 @@ pub(crate) struct WitnessedRejoin<'a> {
     pub basis: &'a BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
     /// The document's original associations when it is reused; `None` when it changed.
     pub reused: Option<JoinedFacts>,
+    /// Every document this producer reuses: a call's target in one of them is still a
+    /// destination classification.
+    pub reusable: &'a BTreeSet<native::DocumentKey>,
     /// The native gap counts its admission recorded.
     pub gaps: [u64; 4],
     pub current_targets: &'a BTreeMap<(native::DocumentKey, String), semantic::TargetDeclaration>,
@@ -4907,6 +4910,7 @@ pub(crate) fn rejoin_document_with_witness(
         producer,
         basis,
         reused,
+        reusable,
         gaps,
         current_targets,
         destination,
@@ -4914,16 +4918,16 @@ pub(crate) fn rejoin_document_with_witness(
     } = rejoin;
     let is_reused = reused.is_some();
     let captured = reused.unwrap_or_default();
-    let reusable = BTreeSet::from_iter(is_reused.then(|| document.clone()));
     let raw_index = ProofIdentityIndex::new(inventory)?;
     let mut filtered = inventory.clone();
     if !is_reused {
         filtered.claims.clear();
     }
     let filtered_index = ProofIdentityIndex::new(&filtered)?;
+    // `captured` holds this document's rows only, so `reusable` decides just their targets.
     let joined = reuse_captured_source_associations(
         &captured,
-        &reusable,
+        reusable,
         inventory,
         &destination_native.revision.source_set_id,
         &destination_native.revision.id,
