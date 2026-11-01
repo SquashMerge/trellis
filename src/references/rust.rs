@@ -468,7 +468,7 @@ impl Catalog {
                 let public = visibility(doc, child).is_some();
                 let restricted = visibility(doc, child).is_some_and(|v| v != "pub");
                 if let Some(argument) = child.child_by_field_name("argument") {
-                    let imports = imports(
+                    let (imports, cut) = imports(
                         doc,
                         argument,
                         public,
@@ -477,6 +477,8 @@ impl Catalog {
                         check,
                     )?;
                     self.scopes[scope].imports.extend(imports);
+                    // A skipped import could bind any name, so nothing here is proved absent.
+                    self.scopes[scope].opaque |= cut;
                 }
                 continue;
             }
@@ -606,6 +608,7 @@ impl Catalog {
             self.step(check)?;
             depth += 1;
             if depth > DEPTH {
+                self.scopes[scope].opaque = true;
                 break;
             }
             if node.kind() == "mod_item" || node.kind() == "source_file" {
@@ -1573,13 +1576,15 @@ fn imports(
     uncertain: bool,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<Vec<Import>> {
+) -> Result<(Vec<Import>, bool)> {
     let mut pending = vec![(root, Vec::<String>::new(), 0usize)];
     let mut result = Vec::new();
+    let mut cut = false;
     while let Some((node, prefix, depth)) = pending.pop() {
         owner_step(work, check)?;
         // Each nesting level clones the prefix, so a deep list is bounded here too.
         if depth > DEPTH {
+            cut = true;
             continue;
         }
         let combine = |value: &str| -> Vec<String> {
@@ -1642,7 +1647,7 @@ fn imports(
             }
         }
     }
-    Ok(result)
+    Ok((result, cut))
 }
 
 pub(super) fn extract(
@@ -1658,7 +1663,7 @@ pub(super) fn extract(
         }
         if node.kind() == "use_declaration" {
             if let Some(argument) = node.child_by_field_name("argument") {
-                for import in imports(doc, argument, false, false, work, check)? {
+                for import in imports(doc, argument, false, false, work, check)?.0 {
                     ensure!(result.len() < SITES, "bounded_work: reference site count");
                     result.push(RawSite {
                         start: import.start,

@@ -6286,3 +6286,150 @@ fn a_rust_use_list_past_the_walk_bounds_names_its_file() {
         .data;
     assert_eq!(data["partialFiles"][0]["path"], "deep.rs");
 }
+
+/// Production edges and unresolved sites, for comparing a shallow and a deep spelling.
+fn outcome(files: &[(&str, &str)]) -> (Vec<(String, String)>, usize) {
+    let input = snapshot(files);
+    let data = references::project(&input, &[], 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let mut edges: Vec<_> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| {
+            (
+                edge["source"]["path"].as_str().unwrap().to_owned(),
+                edge["target"]["path"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    edges.sort();
+    (edges, data["unresolved"].as_array().unwrap().len())
+}
+
+#[test]
+fn a_rust_import_past_the_bound_never_lets_a_wildcard_win() {
+    let target = |depth: usize| {
+        let consumer = format!(
+            "use crate::p::*; use {}crate::q as foo{}; fn run() {{ foo::f(); }}\n",
+            "{".repeat(depth),
+            "}".repeat(depth)
+        );
+        outcome(&[
+            ("src/lib.rs", "mod p; mod q; mod consumer;\n"),
+            ("src/p.rs", "pub mod foo { pub fn f() {} }\n"),
+            ("src/q.rs", "pub fn f() {}\n"),
+            ("src/consumer.rs", consumer.as_str()),
+        ])
+        .0
+    };
+    let wrong = ("src/consumer.rs".to_owned(), "src/p.rs".to_owned());
+    let right = ("src/consumer.rs".to_owned(), "src/q.rs".to_owned());
+    assert!(target(2).contains(&right));
+    assert!(!target(2).contains(&wrong));
+    assert!(!target(130).contains(&wrong), "{:?}", target(130));
+}
+
+#[test]
+fn a_java_import_past_the_bound_keeps_the_type_root_unknown() {
+    let edges = |depth: usize| {
+        let package = "a.".repeat(depth);
+        let path = format!("{}Outer.java", package.replace('.', "/"));
+        let outer = format!(
+            "package {};\npublic class Outer {{ public static class pkg {{ public static class Target {{}} }} }}\n",
+            package.trim_end_matches('.')
+        );
+        let consumer =
+            format!("import static {package}Outer.pkg;\nclass Use {{ pkg.Target value; }}\n");
+        outcome(&[
+            (path.as_str(), outer.as_str()),
+            ("pkg/Target.java", "package pkg;\npublic class Target {}\n"),
+            ("Use.java", consumer.as_str()),
+        ])
+        .0
+    };
+    let wrong = ("Use.java".to_owned(), "pkg/Target.java".to_owned());
+    assert!(!edges(2).contains(&wrong));
+    assert!(!edges(140).contains(&wrong), "{:?}", edges(140));
+}
+
+#[test]
+fn a_java_package_past_the_bound_leaves_its_own_names_unknown() {
+    let deep = format!(
+        "package {};\nclass Use {{ pkg.Target value; }}\nclass pkg {{ static class Target {{}} }}\n",
+        ["a"; 140].join(".")
+    );
+    let (edges, _) = outcome(&[
+        ("pkg/Target.java", "package pkg;\npublic class Target {}\n"),
+        ("Use.java", deep.as_str()),
+    ]);
+    assert!(
+        edges.iter().all(|(_, target)| target != "pkg/Target.java"),
+        "{edges:?}"
+    );
+}
+
+#[test]
+fn a_binding_past_the_bound_never_lets_a_star_export_win() {
+    // A deep explicit export shadows the star's name, as a shallow one does.
+    let target = |depth: usize| {
+        let barrel = format!(
+            "export * from './p.js';\nexport const {}name{} = [];\n",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        outcome(&[
+            ("barrel.js", barrel.as_str()),
+            ("p.js", "export const name = 1;\n"),
+            ("use.js", "import { name } from './barrel.js';\nname;\n"),
+        ])
+    };
+    let wrong = ("barrel.js".to_owned(), "p.js".to_owned());
+    assert_eq!(target(2).0.contains(&wrong), target(130).0.contains(&wrong));
+
+    let target = |depth: usize| {
+        let module = format!(
+            "from p import *\n{}name{} = 1\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        outcome(&[
+            ("a.py", module.as_str()),
+            ("p.py", "name = 1\n"),
+            ("use.py", "from a import name\n"),
+        ])
+    };
+    let shallow = target(2);
+    let deep = target(130);
+    assert!(
+        !deep
+            .0
+            .iter()
+            .any(|(source, target)| source == "use.py" && target == "p.py")
+            || shallow
+                .0
+                .iter()
+                .any(|(source, target)| source == "use.py" && target == "p.py"),
+        "{shallow:?} {deep:?}"
+    );
+
+    // A Python import nested past the bound shadows a star the same way.
+    let target = |depth: usize| {
+        let nest: String = (0..depth)
+            .map(|level| format!("{}if x:\n", " ".repeat(level)))
+            .collect();
+        let module = format!(
+            "from p import *\n{nest}{}from q import name\n",
+            " ".repeat(depth)
+        );
+        outcome(&[
+            ("a.py", module.as_str()),
+            ("p.py", "name = 1\n"),
+            ("q.py", "name = 2\n"),
+            ("use.py", "from a import name\n"),
+        ])
+    };
+    let wrong = ("use.py".to_owned(), "p.py".to_owned());
+    assert!(!target(130).0.contains(&wrong), "{:?}", target(130));
+}

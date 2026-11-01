@@ -505,8 +505,8 @@ PartialFile = {sourceSetId,language,path,reason:"depth_limit"|"visit_limit",
 
 `range` is the first skipped subtree, and `subtrees` counts subtrees skipped over the depth
 bound. References and declarations inside them are missing, so absence there proves
-nothing, and what a partial file exports stays unknown wherever a proof would need the
-skipped syntax. The field is empty when every document was read whole, and a `limitations` entry
+nothing, and a partial file's names stay unknown wherever a proof would need the skipped
+syntax: a skipped import or declaration never proves a competing binding absent. The field is empty when every document was read whole, and a `limitations` entry
 appears when it isn't. A partial file alone doesn't change the exit status.
 
 Reference work has one request-wide allowance of
