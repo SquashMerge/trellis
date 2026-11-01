@@ -8,6 +8,7 @@ use crate::semantic_evidence as sem;
 use crate::semantic_import::{
     WitnessScope, WitnessedRejoin, empty_publication, manifest_hash,
     original_document_associations, rejoin_document_with_witness, required_original_targets,
+    stored_occurrence_endpoints,
 };
 
 /// What one selected producer's witnessed rejoin stands on.
@@ -210,10 +211,16 @@ fn document_witness(
 fn shares_a_span(
     tx: &Connection,
     capture_id: i64,
+    position_encoding: sem::PositionEncoding,
     dropped: &BTreeSet<String>,
     fused: &BTreeSet<String>,
 ) -> Result<bool> {
-    let range = |proof: &String| -> Result<serde_json::Value> {
+    let encoding = match position_encoding {
+        sem::PositionEncoding::Utf8 => 1,
+        sem::PositionEncoding::Utf16 => 2,
+        sem::PositionEncoding::UnicodeScalar => 3,
+    };
+    let span = |proof: &String| {
         let bytes: Vec<u8> = tx
             .prepare_cached(
                 "SELECT canonical_bytes FROM semantic_raw_proofs
@@ -223,11 +230,11 @@ fn shares_a_span(
         let envelope: serde_json::Value = serde_json::from_slice(&bytes).context(
             SelectedIntegrity("incompatible_index: corrupt raw envelope".into()),
         )?;
-        Ok(envelope["raw"]["range"].clone())
+        stored_occurrence_endpoints(&envelope, encoding)
     };
-    let fused = fused.iter().map(range).collect::<Result<Vec<_>>>()?;
+    let fused = fused.iter().map(span).collect::<Result<BTreeSet<_>>>()?;
     for proof in dropped {
-        if fused.contains(&range(proof)?) {
+        if fused.contains(&span(proof)?) {
             return Ok(true);
         }
     }
@@ -535,7 +542,13 @@ pub(super) fn publish_with_witness(
             return witness_unavailable("fused_reference_target_lost");
         };
         if !rejoined.dropped.is_empty()
-            && shares_a_span(tx, capture.capture_id, &rejoined.dropped, &rejoined.fused)?
+            && shares_a_span(
+                tx,
+                capture.capture_id,
+                producer.position_encoding,
+                &rejoined.dropped,
+                &rejoined.fused,
+            )?
         {
             return witness_unavailable("fused_reference_target_lost");
         }

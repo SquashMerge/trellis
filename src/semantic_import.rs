@@ -588,8 +588,8 @@ pub(crate) fn compose_join(
     })
 }
 
-type Position = (i32, i32);
-type Endpoints = (Position, Position);
+pub(crate) type Position = (i32, i32);
+pub(crate) type Endpoints = (Position, Position);
 type CoordinateMap = BTreeMap<Position, usize>;
 
 fn occurrence_endpoints(claim: &CapturedClaim, admitted_encoding: u8) -> Result<(u8, Endpoints)> {
@@ -662,6 +662,25 @@ fn range_endpoints(
         )
     };
     Ok((encoding, endpoints))
+}
+
+/// The normalized endpoints of a stored occurrence's canonical envelope. One span has several
+/// valid wire shapes, each kept verbatim in the envelope, so spans are compared only as these.
+pub(crate) fn stored_occurrence_endpoints(
+    envelope: &serde_json::Value,
+    admitted_encoding: u8,
+) -> Result<Endpoints> {
+    let position_encoding = u8::try_from(
+        envelope["positionEncoding"]
+            .as_u64()
+            .context("raw position encoding")?,
+    )?;
+    let (_, endpoints) = range_endpoints(
+        &envelope["raw"]["range"],
+        position_encoding,
+        admitted_encoding,
+    )?;
+    Ok(endpoints)
 }
 
 /// Recognize the pinned producers' raw file/module markers, not a measured name anchor.

@@ -4376,10 +4376,20 @@ fn the_import_revision_outlasts_the_grace_while_its_batch_is_selected() {
 /// its declaration binding: the row's proof is still fused. Whether that claim or the other one
 /// owns the row follows the proof IDs, so several spellings cover both orders.
 fn fused_definition(world: &World, spelling: usize) -> (DocSpec, DocSpec) {
+    fused_definition_with(world, spelling, |doc, target| {
+        doc.occurrence(&[0, 9, 12], &[], target, 0)
+    })
+}
+
+/// `fused_definition`, with the claim that shares the definition's span built by `shape`.
+fn fused_definition_with(
+    world: &World,
+    spelling: usize,
+    shape: fn(DocSpec, &str) -> DocSpec,
+) -> (DocSpec, DocSpec) {
     let target = format!("pkg target{spelling}.");
-    let a = DocSpec::new("src/A.js")
-        .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
-        .occurrence(&[0, 9, 12], &[], &target, 0)
+    let a = DocSpec::new("src/A.js").occurrence(&[0, 9, 12], &[], "pkg run.", 1);
+    let a = shape(a, &target)
         .occurrence(&[0, 16, 22], &[0, 16, 24], &target, 0)
         .symbol("pkg run.", 17, &[]);
     let b = DocSpec::new("src/B.js")
@@ -4415,9 +4425,23 @@ fn a_fused_definition_stays_on_the_fast_path_and_matches_full() {
 /// named. The row cannot say what survives, so FULL decides, and the oracle confirms the result.
 #[test]
 fn a_target_lost_under_a_fused_definition_takes_full() {
+    a_lost_target_takes_full(|doc, target| doc.occurrence(&[0, 9, 12], &[], target, 0));
+}
+
+/// One span has several valid wire shapes, each kept verbatim in its raw proof: two claims of
+/// one span must be recognized as such whichever shapes they arrived in.
+#[test]
+fn a_target_lost_under_a_fused_row_takes_full_across_equivalent_range_shapes() {
+    a_lost_target_takes_full(|doc, target| doc.occurrence(&[0, 9, 0, 12], &[], target, 0));
+    a_lost_target_takes_full(|doc, target| doc.typed_occurrence(&[0, 9, 12], target, 0));
+    a_lost_target_takes_full(|doc, target| doc.typed_occurrence(&[0, 9, 0, 12], target, 0));
+}
+
+/// The FULL oracle checks each published result; the spellings cover both proof owners.
+fn a_lost_target_takes_full(shape: fn(DocSpec, &str) -> DocSpec) {
     for spelling in 0..6 {
         let world = definitions_world();
-        let (a, b) = fused_definition(&world, spelling);
+        let (a, b) = fused_definition_with(&world, spelling, shape);
         let mut fixture = world.fixture().reference("scip-typescript");
         fixture.artifact("javascript", vec![a, b]);
         let descriptor = world.write(&fixture);
