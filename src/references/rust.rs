@@ -129,6 +129,8 @@ struct Scope {
     explicit: BTreeMap<Name, Vec<Binding>>,
     imports: Vec<Import>,
     opaque: bool,
+    /// Something past the walk bounds was skipped here, so even an explicit name can collide.
+    cut: bool,
 }
 struct ModuleEdge {
     scope: usize,
@@ -372,6 +374,7 @@ impl Catalog {
             explicit: BTreeMap::new(),
             imports: Vec::new(),
             opaque: false,
+            cut: false,
         });
         Ok(id)
     }
@@ -390,6 +393,7 @@ impl Catalog {
         // A skipped item could bind any name here, as an unknown attribute could.
         if depth > DEPTH {
             self.scopes[scope].opaque = true;
+            self.scopes[scope].cut = true;
             return Ok(());
         }
         let document = self.scopes[scope].document;
@@ -479,6 +483,7 @@ impl Catalog {
                     self.scopes[scope].imports.extend(imports);
                     // A skipped import could bind any name, so nothing here is proved absent.
                     self.scopes[scope].opaque |= cut;
+                    self.scopes[scope].cut |= cut;
                 }
                 continue;
             }
@@ -609,6 +614,7 @@ impl Catalog {
             depth += 1;
             if depth > DEPTH {
                 self.scopes[scope].opaque = true;
+                self.scopes[scope].cut = true;
                 break;
             }
             if node.kind() == "mod_item" || node.kind() == "source_file" {
@@ -655,6 +661,7 @@ impl Catalog {
         // A skipped item could bind any name here, as an unknown attribute could.
         if depth > DEPTH {
             self.scopes[scope].opaque = true;
+            self.scopes[scope].cut = true;
             return Ok(());
         }
         let mut cursor = node.walk();
@@ -841,7 +848,7 @@ impl Catalog {
         }
         if self.scopes[scope].opaque {
             for namespace in [TYPE, VALUE] {
-                if !explicit_namespaces.contains(&namespace) {
+                if self.scopes[scope].cut || !explicit_namespaces.contains(&namespace) {
                     result
                         .names
                         .entry((namespace, name.to_owned()))
@@ -1711,6 +1718,7 @@ mod cache_tests {
             explicit: BTreeMap::new(),
             imports: Vec::new(),
             opaque: false,
+            cut: false,
         }
     }
 

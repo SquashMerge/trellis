@@ -6433,3 +6433,39 @@ fn a_binding_past_the_bound_never_lets_a_star_export_win() {
     let wrong = ("use.py".to_owned(), "p.py".to_owned());
     assert!(!target(130).0.contains(&wrong), "{:?}", target(130));
 }
+
+#[test]
+fn a_rust_import_past_the_bound_leaves_an_explicit_duplicate_unknown() {
+    let run = |depth: usize| {
+        let consumer = format!(
+            "use crate::p as foo;\nuse {}crate::q as foo{};\npub fn run() {{ foo::f(); }}\n",
+            "{".repeat(depth),
+            "}".repeat(depth)
+        );
+        let input = snapshot(&[
+            ("src/lib.rs", "pub mod p; pub mod q; pub mod consumer;\n"),
+            ("src/p.rs", "pub fn f() {}\n"),
+            ("src/q.rs", "pub fn f() {}\n"),
+            ("src/consumer.rs", consumer.as_str()),
+        ]);
+        let data = references::project(&input, &[], 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        let proved = data["production"].as_array().unwrap().iter().any(|edge| {
+            edge["target"]["path"] == "src/p.rs"
+                && edge["sites"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|site| site["spelling"] == "foo::f")
+        });
+        let unknown = data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["site"]["spelling"] == "foo::f");
+        (proved, unknown)
+    };
+    assert_eq!(run(2), (false, true));
+    assert_eq!(run(130), (false, true));
+}
