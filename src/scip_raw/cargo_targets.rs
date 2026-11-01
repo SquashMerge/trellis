@@ -121,9 +121,14 @@ impl CargoTargetsBuilder {
         if self.is_empty() {
             return;
         }
+        // A source Trellis didn't read (#576) could declare any module: its placeholder names
+        // none, so it is as uncertain as one that can't be parsed.
+        let unread = std::str::from_utf8(source)
+            .is_ok_and(|text| crate::skipped_source::skipped("rust", text).is_some());
+        let modules = (!unread).then(|| module_refs(source)).flatten();
         self.files.insert(
             path.to_owned(),
-            module_refs(source).unwrap_or(FileModules {
+            modules.unwrap_or(FileModules {
                 refs: vec![],
                 uncertain: true,
             }),
@@ -666,6 +671,28 @@ mod tests {
     }
 
     const PACKAGE: &str = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+
+    /// #576 review: a crate root Trellis didn't read could still own a module, so a module the
+    /// readable control shares between two targets never gets the other one as its owner.
+    #[test]
+    fn an_unread_crate_root_leaves_its_possible_modules_without_a_target() {
+        use crate::skipped_source::{Skip, placeholder};
+        let files = |lib: &str| {
+            targets(
+                &[("Cargo.toml", PACKAGE)],
+                &[
+                    ("src/lib.rs", lib),
+                    ("src/main.rs", "mod shared; fn main() {}\n"),
+                    ("src/shared.rs", "pub fn f() {}\n"),
+                ],
+            )
+        };
+        assert_eq!(of(&files("mod shared;\n"), "src/shared.rs"), None);
+        for skip in [Skip::Oversized, Skip::NotUtf8] {
+            let unread = files(&placeholder("rust", skip));
+            assert_eq!(of(&unread, "src/shared.rs"), None, "{skip:?}");
+        }
+    }
 
     #[test]
     fn conventional_layout_assigns_each_target_its_module_tree() {

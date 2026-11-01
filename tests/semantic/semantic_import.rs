@@ -150,6 +150,68 @@ fn an_artifact_naming_a_skipped_source_admits_it_without_claims() {
     }
 }
 
+/// #576 review: a document of an unread source is still validated against the closed SCIP
+/// domains: an unknown position encoding, symbol role or symbol kind there rejects the whole
+/// artifact, as it does for a readable one.
+#[test]
+fn an_unread_document_still_rejects_unknown_enums() {
+    use protobuf::EnumOrUnknown;
+    let text = "function f(){g();}\n";
+    type Edit = fn(&mut scip::types::Document);
+    let edits: [(&str, Edit); 3] = [
+        ("position encoding", |d| {
+            d.position_encoding = EnumOrUnknown::from_i32(999)
+        }),
+        ("symbol roles", |d| d.occurrences[0].symbol_roles = 1 << 20),
+        ("symbol kind", |d| {
+            d.symbols[0].kind = EnumOrUnknown::from_i32(99_999)
+        }),
+    ];
+    for (name, edit) in edits {
+        for (bytes, cap) in [
+            (text.as_bytes().to_vec(), 2 * 1024 * 1024),
+            (format!("{text}//{}\n", "x".repeat(600)).into_bytes(), 256),
+            ([text.as_bytes(), b"// caf\xe9\n"].concat(), 2 * 1024 * 1024),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let physical = fs::canonicalize(root.path()).unwrap();
+            fs::create_dir(physical.join("src")).unwrap();
+            fs::write(physical.join("src/A.js"), &bytes).unwrap();
+            fs::write(physical.join("src/B.js"), "function g(){}\n").unwrap();
+            let mut options = IndexOptions::new(physical.clone());
+            options.max_file_bytes = cap;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+            let artifact =
+                crate::semantic_batch_support::edit_scip(&hex::decode(WIRE).unwrap(), |index| {
+                    let mut readable = index.documents[0].clone();
+                    readable.relative_path = "src/B.js".into();
+                    readable.symbols.clear();
+                    readable.occurrences.truncate(1);
+                    readable.occurrences[0].range = vec![0, 9, 10];
+                    edit(&mut index.documents[0]);
+                    index.documents.push(readable);
+                });
+            let (descriptor, pages) = testing::single_artifact_batch(
+                &capture,
+                "scip-typescript",
+                "javascript",
+                &artifact,
+            )
+            .unwrap();
+            let pages: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+            let admitted = testing::admit_in_memory_from_capture(
+                &capture,
+                &descriptor,
+                &pages,
+                &[&artifact],
+                &cancel,
+            );
+            assert!(admitted.is_err(), "{name}, cap {cap}: {admitted:?}");
+        }
+    }
+}
+
 /// #576 review: a symbol whose only definition is in a skipped source is absent from the
 /// artifact's claims, but that proves nothing: its uses stay unresolved, never external. The
 /// readable control resolves them into the file.
