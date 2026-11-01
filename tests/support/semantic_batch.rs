@@ -255,7 +255,10 @@ impl BatchFixture {
             name: producer.into(),
             version: entry["version"].as_str().unwrap().into(),
             identity_kind: "executable",
-            executable_hash: entry["executableHash"].as_str().unwrap().into(),
+            // The pin of the host's target, which a profile row alone doesn't name.
+            executable_hash: trellis::scip_admission::pinned_producer_by_id(producer)
+                .unwrap()
+                .executable_hash,
             position_encoding: match entry["positionEncoding"].as_str().unwrap() {
                 "utf8" => 1,
                 "utf16" => 2,

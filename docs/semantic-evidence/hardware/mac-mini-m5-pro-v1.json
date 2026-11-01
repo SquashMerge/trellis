@@ -123,6 +123,20 @@
       "installMethod": "rustup component add rust-analyzer (stable-aarch64-apple-darwin)",
       "artifactDigest": "sha256:78082ea1a96a008751767bd35f43738b5d4565cbef06ee5b31ad742a316133b5",
       "executableHash": "78082ea1a96a008751767bd35f43738b5d4565cbef06ee5b31ad742a316133b5",
+      "targetPins": [
+        {
+          "target": "aarch64-apple-darwin",
+          "executableHash": "78082ea1a96a008751767bd35f43738b5d4565cbef06ee5b31ad742a316133b5"
+        },
+        {
+          "target": "aarch64-unknown-linux-gnu",
+          "executableHash": "a0c3f11a153e5d5f12a6de6ceabd2def60c2793293e901a4a045946050456e2f"
+        },
+        {
+          "target": "x86_64-unknown-linux-gnu",
+          "executableHash": "25da0296e9aa8e538e6ee36675f48b0cd3896c5d1764a3a71a0e2438757f5640"
+        }
+      ],
       "runtime": "Rust 1.98.1 toolchain",
       "positionEncoding": "utf8"
     }

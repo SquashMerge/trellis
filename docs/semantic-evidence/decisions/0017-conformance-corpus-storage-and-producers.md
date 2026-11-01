@@ -104,3 +104,22 @@ The alias declarations are deliberately narrow: JavaScript identifier-to-identif
 Amendment 1's alias floor remains required for JavaScript and Rust, exempt for Java and Python. A counted alias still needs an authenticated semantic reference at the exact measured alias name, roles `definition` and `alias`, and the original declaration as target. The 40-reference and callable-value-negative floors remain unchanged; no fabricated facts or native roles fill them.
 
 **Floor certification deferred (owner ruling, 2026-10-24).** #299 does not certify the per-language 40-reference, 20-callable-value-negative or four imports/aliases scenario floors. Real SCIP facts must first be joined to native-v9 candidates in #88/#89; certification belongs to corpus issues #27–#30 afterward. These required totals are unchanged. [Owner ruling](https://github.com/SquashMerge/trellis/pull/299#issuecomment-6385469679).
+
+## Amendment 6 (2026-10-31): one rust-analyzer pin per target
+
+- **Status:** owner ruling, 2026-10-31, [#548](https://github.com/SquashMerge/trellis/issues/548).
+- **Amends:** decision item 5, and Amendment 2's closed hardware profile shape.
+
+Item 5 pinned one rust-analyzer hash, the `aarch64-apple-darwin` binary, so `trellis producer status`, `plan` and `run` refused a correct 1.98.1 install on the Linux targets 0.1 ships for.
+
+1. **Per-target pins.** rust-analyzer is pinned by one hash for each of `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`. They are recorded in `targetPins` on its `semanticProducers[]` entry, an optional list of `{target, executableHash}` with unique targets. The entry's `executableHash` stays the reference host's value, and the `aarch64-apple-darwin` pin equals it. Fixture pins and the toolkit keep reading `executableHash`.
+2. **Selection.** Trellis selects the pin of the host's target. The strict hash check is unchanged. A target with no pin is refused as `producer_unavailable: no rust-analyzer pin for target <target>`. The descriptor of a run records the selected hash, so `Producer.executableHash` names the bytes that ran. `trellis producer pickup` still checks the artifact's tool name and version, not a binary; on a target with no pin it records the reference host's value. Admission accepts only the host target's hash, or that reference value on a target with no pin, so a descriptor written on another target is refused with `producer profile pin`.
+3. **Source of the hashes.** Each hash is the SHA-256 of `rust-analyzer-preview/bin/rust-analyzer` in the official `rust-analyzer-1.98.1-<target>.tar.xz` component from `static.rust-lang.org`, the file `rustup component add rust-analyzer` installs. Each tarball was checked against its published `.sha256` and the `xz_hash` of `channel-rust-1.98.1.toml`. The `aarch64-apple-darwin` result equals the existing pin and the binary of a rustup-installed toolchain. The Linux hashes come from the distribution only: those binaries were not run, and no Linux host has exercised the pins.
+
+| Target | `rust-analyzer` binary SHA-256 | Component `.tar.xz` SHA-256 |
+|---|---|---|
+| `aarch64-apple-darwin` | `78082ea1a96a008751767bd35f43738b5d4565cbef06ee5b31ad742a316133b5` | `e79c1c2f2cef01e3f6044e9e9e46b9963ac7c664f681d935ef900fb33828af9a` |
+| `x86_64-unknown-linux-gnu` | `25da0296e9aa8e538e6ee36675f48b0cd3896c5d1764a3a71a0e2438757f5640` | `19beefa939b986be0086a36a24c540801ce849ee74f39ee933b60f947b0d4431` |
+| `aarch64-unknown-linux-gnu` | `a0c3f11a153e5d5f12a6de6ceabd2def60c2793293e901a4a045946050456e2f` | `a0fd960a9ab36193ae9ba4310e5f780f6ca38fa86160fae739be4ac541b6d10c` |
+
+A rust-analyzer re-pin now records every target. `scip-java`'s launcher hash stays a known limitation, to verify during the release candidate.
