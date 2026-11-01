@@ -1342,6 +1342,9 @@ pub struct MetricsPayload {
     pub directories: Vec<MetricsDirectoryRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_cognitive: Option<Vec<MetricsTopCognitiveRow>>,
+    /// Selected files whose syntax exceeds the traversal bounds (#554); absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub partial_files: Vec<crate::syntax_bounds::PartialFile>,
 }
 
 /// One coherent native read snapshot retained until its owned result passes T03.
@@ -1669,6 +1672,7 @@ impl EvidenceResponse {
         let evaluated =
             crate::rules::evaluate_with_layers(config, &snapshot, &references, &[], check)?;
         payload["evidenceTier"] = references.data["evidenceTier"].clone();
+        payload["partialFiles"] = references.data["partialFiles"].clone();
         let references_coverage = &references.coverage;
         let rules = evaluated.data;
         let assignments = evaluated.layers;
@@ -2413,6 +2417,7 @@ impl EvidenceResponse {
             store.run_metrics_document_hook(&key.path, MetricsDocumentStage::Done);
             outcome
         };
+        let mut partial_files = Vec::new();
         let mut accept = |key: &DocumentKey,
                           outcome: Option<
             std::result::Result<MetricsComputedDocument, MetricsDocumentFailure>,
@@ -2435,6 +2440,7 @@ impl EvidenceResponse {
                     return progress.result(Err(anyhow::anyhow!("cancelled")));
                 }
             };
+            partial_files.extend(computed.gap().map(|gap| gap.file(key)));
             let mut rows = computed.commit(
                 &mut self
                     .store
@@ -2802,6 +2808,7 @@ impl EvidenceResponse {
             files,
             directories: directory_rows,
             top_cognitive,
+            partial_files,
         })
     }
     pub(crate) fn report_index_failure(&self, error: anyhow::Error) -> anyhow::Error {

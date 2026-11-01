@@ -95,6 +95,8 @@ struct Unit {
     blockers: BTreeMap<String, Blockers>,
     on_demand: BTreeMap<String, Bucket>,
     static_unknown: bool,
+    /// An import or the package declaration exceeds the path bound, so its binding is unknown.
+    cut: bool,
 }
 pub(super) struct Catalog {
     packages: BTreeMap<PackageKey, Package>,
@@ -219,7 +221,11 @@ impl Catalog {
                         owner_step(work, check)?;
                         unit.imports
                             .insert((child.start_byte(), child.end_byte()), import);
+                    } else {
+                        unit.cut = true;
                     }
+                } else if child.kind() == "package_declaration" {
+                    unit.cut |= declaration_path(doc, child, work, check)?.is_none();
                 } else if type_declaration(child)
                     && let Some(name) = child.child_by_field_name("name")
                 {
@@ -228,6 +234,8 @@ impl Catalog {
                 }
             }
             scan_blockers(doc, root, &mut unit, work, check)?;
+            // Syntax past the bounds can hold a shadow or a binding, so no type root is proved.
+            unit.static_unknown |= unit.cut || crate::syntax_bounds::scan(root, check)?.is_some();
             for blockers in unit.blockers.values_mut() {
                 blockers.finish(work, check)?;
             }
@@ -296,13 +304,15 @@ impl Catalog {
                     check,
                 );
             }
-            if import.path.last().is_some_and(|name| {
-                unit.static_explicit.contains(name)
-                    || unit
-                        .explicit
-                        .get(name)
-                        .is_some_and(|bindings| bindings.len() > 1)
-            }) {
+            if unit.cut
+                || import.path.last().is_some_and(|name| {
+                    unit.static_explicit.contains(name)
+                        || unit
+                            .explicit
+                            .get(name)
+                            .is_some_and(|bindings| bindings.len() > 1)
+                })
+            {
                 return Ok(SiteResolution::unknown("java_explicit_type_ambiguous"));
             }
             return self.named(source_set, &import.path, external_packages, work, check);
@@ -575,7 +585,9 @@ fn path(
     let mut pending = vec![(node, 0)];
     while let Some((node, depth)) = pending.pop() {
         owner_step(work, check)?;
-        ensure!(depth <= DEPTH, "bounded_work: reference AST");
+        if depth > DEPTH {
+            return Ok(None);
+        }
         match node.kind() {
             "identifier" | "type_identifier" => {
                 owner_step(work, check)?;

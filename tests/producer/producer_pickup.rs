@@ -13,7 +13,7 @@ use std::{
     process::{Command, Output, Stdio},
     time::Duration,
 };
-use tempfile::Builder;
+use tempfile::{Builder, TempDir};
 
 use crate::support;
 use support::{
@@ -517,39 +517,115 @@ fn pickup_reimports_unchanged_artifact_after_rebuild() {
     assert!(!marker.exists());
 }
 
-/// V7 without a restart: a live corruption recovery in the same daemon drops the semantic
-/// selection while the artifact and its stat stay unchanged. The stat check's retry asks
-/// whether the `done` evidence is still selected and re-imports the bytes.
-#[test]
-fn pickup_reimports_unchanged_artifact_after_live_recovery() {
-    let world = configured(&intervals(
-        json!({"debounceMs": 100, "stableMs": 100, "checkMs": 100}),
-    ));
-    let Configured {
-        checkout,
-        first,
-        marker,
-        ..
-    } = &world;
-    let pid = fs::read_to_string(checkout.home.join("daemon.pid")).unwrap();
+/// Holds the daemon's next repair of a corrupt head before it can publish, so a test can
+/// order that repair against a read. The stat check and a read can each detect the corruption.
+struct RecoveryGate {
+    _dir: TempDir,
+    socket: PathBuf,
+}
 
-    // Corrupt the published head under the running daemon; a read finds it and an explicit
-    // index request recovers in the same runtime.
+impl RecoveryGate {
+    fn new() -> Self {
+        let dir = Builder::new()
+            .prefix("recovery-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("recovery.sock");
+        Self { _dir: dir, socket }
+    }
+
+    /// A configured checkout whose stat check runs every 100 ms.
+    fn configured(&self) -> Configured {
+        let mut env = intervals(json!({"debounceMs": 100, "stableMs": 100, "checkMs": 100}));
+        env.push((
+            "TRELLIS_TEST_LIVE_RECOVERY_SOCKET".into(),
+            self.socket.display().to_string(),
+        ));
+        configured(&env)
+    }
+
+    /// Wait for the recovery to reach the gate, then let it publish.
+    fn release(&self) {
+        let ready = self.socket.with_extension("ready");
+        trellis::testing::wait_until("the live recovery to reach its gate", || ready.exists());
+        drop(UnixStream::connect(&self.socket).unwrap());
+    }
+}
+
+/// The published pin, as a read reports it.
+fn head(checkout: &Checkout) -> Value {
+    let db = rusqlite::Connection::open_with_flags(
+        index_db(checkout),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let (generation, revision): (String, i64) = db
+        .query_row(
+            "SELECT index_generation,index_revision FROM index_metadata",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    json!({"indexGeneration": generation, "indexRevision": revision})
+}
+
+/// Corrupt the published head under the running daemon, returning the corrupted pin.
+fn corrupt_head(checkout: &Checkout) -> Value {
+    let pin = head(checkout);
     let db = rusqlite::Connection::open(index_db(checkout)).unwrap();
     db.execute("UPDATE index_metadata SET stats='not-json'", [])
         .unwrap();
-    drop(db);
-    let read = checkout
+    pin
+}
+
+fn read_symbols(checkout: &Checkout) -> Output {
+    checkout
         .cli()
         .args(["symbols", "--search", "a", "--workspace"])
         .arg(&checkout.root)
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+/// V7's outcome: the same daemon re-imported the same bytes without running a producer.
+fn assert_reimported(world: &Configured, pid: &str) {
+    let imported = wait_last(
+        &world.checkout,
+        "the recovered index to re-import",
+        |last| last["requestId"] != world.first["requestId"] && last["state"] == "done",
+    );
+    assert_eq!(imported["sha256"], world.first["sha256"]);
+    assert_eq!(
+        fs::read_to_string(world.checkout.home.join("daemon.pid")).unwrap(),
+        pid,
+        "the daemon restarted"
+    );
+    assert!(!world.marker.exists());
+}
+
+/// V7 without a restart: a live corruption recovery in the same daemon drops the semantic
+/// selection while the artifact and its stat stay unchanged. The stat check's retry asks
+/// whether the `done` evidence is still selected and re-imports the bytes.
+///
+/// Read first: while the repair is held, a read of the corrupt head is refused, whichever of
+/// the read and the stat check detected the corruption.
+#[test]
+fn pickup_reimports_unchanged_artifact_after_live_recovery() {
+    let gate = RecoveryGate::new();
+    let world = gate.configured();
+    let checkout = &world.checkout;
+    let pid = fs::read_to_string(checkout.home.join("daemon.pid")).unwrap();
+
+    corrupt_head(checkout);
+    let read = read_symbols(checkout);
     let stderr = String::from_utf8_lossy(&read.stderr);
     assert!(
         !read.status.success() && stderr.contains("incompatible_index"),
-        "the corrupt head was served: {stderr}"
+        "the corrupt head was served: {} {stderr}",
+        String::from_utf8_lossy(&read.stdout)
     );
+    gate.release();
+
     let index = checkout
         .cli()
         .args(["index", "--workspace"])
@@ -561,15 +637,40 @@ fn pickup_reimports_unchanged_artifact_after_live_recovery() {
         "{}",
         String::from_utf8_lossy(&index.stderr)
     );
+    assert_reimported(&world, &pid);
+}
 
-    let imported = wait_last(checkout, "the recovered index to re-import", |last| {
-        last["requestId"] != first["requestId"] && last["state"] == "done"
+/// Repair first: with no read and no index request, the stat check alone detects the corrupt
+/// head and the daemon recovers. A later read then succeeds, on the repaired head and not on
+/// the corrupted pin.
+#[test]
+fn stat_check_repairs_a_corrupt_head_before_any_read() {
+    let gate = RecoveryGate::new();
+    let world = gate.configured();
+    let checkout = &world.checkout;
+    let pid = fs::read_to_string(checkout.home.join("daemon.pid")).unwrap();
+
+    let corrupted = corrupt_head(checkout);
+    gate.release();
+
+    // Until the repair is ready a read gets a typed refusal, never the corrupted pin.
+    let mut revision = Value::Null;
+    trellis::testing::wait_until("a read to succeed on the repaired head", || {
+        let read = read_symbols(checkout);
+        if !read.status.success() {
+            let stderr = String::from_utf8_lossy(&read.stderr);
+            assert!(
+                ["incompatible_index", "storage_busy", "rebuild_in_progress"]
+                    .iter()
+                    .any(|code| stderr.contains(code)),
+                "{stderr}"
+            );
+            return false;
+        }
+        let reply: Value = serde_json::from_slice(&read.stdout).unwrap();
+        revision = reply["data"]["revision"].clone();
+        true
     });
-    assert_eq!(imported["sha256"], first["sha256"]);
-    assert_eq!(
-        fs::read_to_string(checkout.home.join("daemon.pid")).unwrap(),
-        pid,
-        "the daemon restarted"
-    );
-    assert!(!marker.exists());
+    assert_ne!(revision, corrupted);
+    assert_reimported(&world, &pid);
 }

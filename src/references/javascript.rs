@@ -1166,10 +1166,9 @@ fn pattern_names(
     while let Some((node, depth)) = pending.pop() {
         check()?;
         visits += 1;
-        ensure!(
-            visits <= VISITS && depth <= DEPTH,
-            "bounded_work: reference AST"
-        );
+        if visits > VISITS || depth > DEPTH {
+            continue;
+        }
         if matches!(
             node.kind(),
             "identifier" | "shorthand_property_identifier_pattern"
@@ -1442,6 +1441,8 @@ fn body_hazards(
             "comment" | "string" | "string_fragment"
         ))
     })?;
+    // A hazard past the walk bounds went unseen, so the file proves nothing about its exports.
+    hazards.dynamic |= crate::syntax_bounds::scan(root, check)?.is_some();
     Ok(hazards)
 }
 pub(super) fn extract(

@@ -10931,6 +10931,11 @@ async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_i
         .collect();
     files[0].1 = "import './module_399.js'; import './module_399.js'; import 'external';\n".into();
     files[1].1 = "import('external');\n".repeat(300);
+    files[2].1 = format!(
+        "export const deep = {}{};\n",
+        "[".repeat(400),
+        "]".repeat(400)
+    );
     let borrowed: Vec<_> = files
         .iter()
         .map(|(p, t)| (p.as_str(), t.as_str()))
@@ -10980,6 +10985,10 @@ async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_i
         json!({"scannedDocuments":1,"mappedSites":2,"unresolvedSites":1,"semanticSites":0})
     );
     assert_eq!(envelope["truncated"], false);
+    // #554: the over-deep file is named, however the request is scoped.
+    assert_eq!(data["partialFiles"].as_array().unwrap().len(), 1);
+    assert_eq!(data["partialFiles"][0]["path"], "module_002.js");
+    assert_eq!(data["partialFiles"][0]["reason"], "depth_limit");
     let empty = ask(
         2,
         json!({"schemaVersion":1,"expectedBasis":basis,"paths":["absent.js"],"limit":1}),
