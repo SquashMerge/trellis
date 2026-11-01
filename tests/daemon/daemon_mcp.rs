@@ -427,6 +427,157 @@ fn concurrent_clients_share_single_socket_and_survive_bad_private_frame() {
 }
 
 #[test]
+fn daemon_refuses_missing_or_different_mcp_identity_before_marker_attachment() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let socket = socket_ready(home.path());
+    for identity in [None, Some(json!("old-catalog"))] {
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+            .unwrap();
+        let mut payload = json!({"workspace":root,"device":0,"inode":0,"relay":true});
+        if let Some(identity) = identity {
+            payload["mcpIdentity"] = identity;
+        }
+        protocol::write_frame(
+            &mut stream,
+            &protocol::Request {
+                id: 33,
+                operation: "mcp".into(),
+                payload,
+            },
+        )
+        .unwrap();
+        let reply: protocol::Reply = protocol::read_frame(&mut stream).unwrap();
+        assert_eq!(reply.id, 33);
+        assert!(
+            reply.payload["error"]
+                .as_str()
+                .unwrap()
+                .starts_with(protocol::MCP_RESTART_REQUIRED)
+        );
+        assert!(!root.join(".git/trellis/workspace-id").exists());
+    }
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+}
+
+#[test]
+fn replacement_daemon_with_changed_catalog_requires_mcp_restart() {
+    check_daemon_catalog_mismatch(false);
+}
+
+#[test]
+fn initial_daemon_with_changed_catalog_requires_mcp_restart() {
+    check_daemon_catalog_mismatch(true);
+}
+
+fn check_daemon_catalog_mismatch(initial: bool) {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let socket = socket_ready(home.path());
+    let mut peer = (!initial).then(|| Peer::start(home.path(), &root));
+    let metadata = json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}}});
+    if let Some(peer) = peer.as_mut() {
+        assert!(peer.ask(1, "tools/list", metadata.clone())["result"]["tools"].is_array());
+    }
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let mut dirs = vec![home.path().to_path_buf()];
+    let mut data = None;
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                data = path.parent().and_then(Path::parent).map(Path::to_path_buf);
+                break;
+            }
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    let owner =
+        trellis::daemon::SocketOwner::acquire(&trellis::daemon::SocketPaths::new(&data.unwrap()))
+            .unwrap()
+            .unwrap();
+    let listener = owner.listener().try_clone().unwrap();
+    let (release, released) = mpsc::sync_channel(1);
+    let fake = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+            .unwrap();
+        let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
+        assert_eq!(attach.payload["mcpIdentity"], protocol::mcp_identity());
+        protocol::write_frame(
+            &mut stream,
+            &protocol::Reply {
+                id: attach.id,
+                payload: json!({"result":true,"mcpIdentity":"changed-catalog"}),
+            },
+        )
+        .unwrap();
+        let mut line = String::new();
+        assert_eq!(
+            BufReader::new(stream).read_line(&mut line).unwrap(),
+            0,
+            "relay must not forward MCP traffic to an incompatible daemon"
+        );
+        listener.set_nonblocking(true).unwrap();
+        released
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "restart-required relay must not attach repeatedly"
+        );
+    });
+    let mut peer = peer.unwrap_or_else(|| Peer::start(home.path(), &root));
+    for id in [2, 3] {
+        let mut params = metadata.clone();
+        params["name"] = json!("trellis_workspace_describe");
+        params["arguments"] = json!({"schemaVersion":1});
+        let response = peer.ask(id, "tools/call", params);
+        assert_eq!(response["id"], id);
+        assert_eq!(
+            response["error"]["data"]["code"],
+            protocol::MCP_RESTART_REQUIRED
+        );
+        assert_eq!(response["error"]["data"]["retryable"], false);
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(response["error"]["message"], protocol::MCP_RESTART_MESSAGE);
+        assert!(response.get("result").is_none());
+    }
+    release.send(()).unwrap();
+    fake.join().unwrap();
+    assert!(socket.exists());
+}
+
+#[test]
 fn daemon_death_interrupts_session_and_next_launch_recovers() {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
@@ -447,7 +598,7 @@ fn daemon_death_interrupts_session_and_next_launch_recovers() {
         &protocol::Request {
             id: 33,
             operation: "mcp".into(),
-            payload: json!({"workspace":root,"device":0,"inode":0}),
+            payload: json!({"workspace":root,"device":0,"inode":0,"mcpIdentity":protocol::mcp_identity()}),
         },
     )
     .unwrap();
@@ -557,7 +708,7 @@ fn reconnect_handshake_skips_a_replaced_selection_and_keeps_launch_usable() {
             id: 1,
             operation: "mcp".into(),
             payload: json!({"workspace":launch.root,"device":launch.device,"inode":launch.inode,
-            "relay":true,"attachments":[remembered]}),
+            "relay":true,"mcpIdentity":protocol::mcp_identity(),"attachments":[remembered]}),
         },
     )
     .unwrap();
@@ -684,7 +835,7 @@ fn reconnect_skips_changed_membership_but_restores_another_selection() {
             id: 1,
             operation: "mcp".into(),
             payload: json!({"workspace":launch.root,"device":launch.device,"inode":launch.inode,
-            "relay":true,"attachments":[protocol::McpAttachment::from_identity(&changed_identity),
+            "relay":true,"mcpIdentity":protocol::mcp_identity(),"attachments":[protocol::McpAttachment::from_identity(&changed_identity),
                 protocol::McpAttachment::from_identity(&valid_identity)]}),
         },
     )
@@ -1371,7 +1522,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
             &mut socket,
             &protocol::Reply {
                 id: attach.id,
-                payload: json!({"result":true}),
+                payload: json!({"result":true,"mcpIdentity":protocol::mcp_identity()}),
             },
         )
         .unwrap();
@@ -1749,7 +1900,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
             &mut stream,
             &protocol::Reply {
                 id: attach.id,
-                payload: json!({"result":true}),
+                payload: json!({"result":true,"mcpIdentity":protocol::mcp_identity()}),
             },
         )
         .unwrap();

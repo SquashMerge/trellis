@@ -269,6 +269,7 @@ fn attach_mcp(
             "inode": workspace.inode,
             // Frames carry the relay's own ID (Decision 0009 §7).
             "relay": true,
+            "mcpIdentity": protocol::mcp_identity(),
             "attachments": attachments,
         }),
     };
@@ -283,8 +284,12 @@ fn attach_mcp(
         ));
     }
     if let Some(error) = reply.payload.get("error").and_then(|v| v.as_str()) {
+        if error.starts_with(protocol::MCP_RESTART_REQUIRED) {
+            return Err(io::Error::other(protocol::McpRestartRequired));
+        }
         return Err(io::Error::other(error.to_owned()));
     }
+    protocol::check_mcp_identity(reply.payload.get("mcpIdentity"))?;
     if reply.payload.get("result") != Some(&serde_json::Value::Bool(true)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -303,6 +308,12 @@ fn mcp_failure(
 ) -> serde_json::Value {
     use serde_json::json;
     let id = value.get("id").cloned().unwrap_or_default();
+    if code == protocol::MCP_RESTART_REQUIRED {
+        return json!({"jsonrpc":"2.0", "id":id, "error":{
+            "code":-32603, "message":protocol::MCP_RESTART_MESSAGE,
+            "data":{"code":protocol::MCP_RESTART_REQUIRED, "retryable":false}
+        }});
+    }
     if matches!(code, "daemon_unavailable" | "selection_unavailable")
         && value.get("method").and_then(|v| v.as_str()) == Some("tools/call")
         && value
@@ -923,6 +934,7 @@ struct Relay<'a, W: std::io::Write> {
     stdout: W,
     daemon: Option<DaemonConnection>,
     generation: u64,
+    restart_required: bool,
     connect: Reconnect<'a>,
     attachments:
         std::collections::BTreeMap<std::path::PathBuf, crate::store::topology::WorkspaceIdentity>,
@@ -935,6 +947,15 @@ struct Relay<'a, W: std::io::Write> {
 }
 
 impl<W: std::io::Write> Relay<'_, W> {
+    fn connection_failure(&self, value: &serde_json::Value) -> serde_json::Value {
+        let code = if self.restart_required {
+            protocol::MCP_RESTART_REQUIRED
+        } else {
+            "daemon_unavailable"
+        };
+        mcp_failure(value, code, self.workspace)
+    }
+
     fn next_frame(&mut self) -> Option<(crate::mcp::wire::Frame, u64, Instant)> {
         self.held.take().or_else(|| self.receiver.try_recv().ok())
     }
@@ -986,6 +1007,9 @@ impl<W: std::io::Write> Relay<'_, W> {
     /// connection after a completed legacy handshake replays it first.
     fn send(&mut self, relay: u64, line: &[u8], legacy: bool) -> bool {
         use std::io::Write;
+        if self.restart_required {
+            return false;
+        }
         if self.daemon.is_none() {
             self.generation += 1;
             // A vanished selected root cannot silently attach its successor or
@@ -996,8 +1020,14 @@ impl<W: std::io::Write> Relay<'_, W> {
                 .filter(|identity| identity.verify_readonly().is_ok())
                 .map(protocol::McpAttachment::from_identity)
                 .collect();
-            let Ok(mut connection) = (self.connect)(self.generation, &attachments) else {
-                return false;
+            let mut connection = match (self.connect)(self.generation, &attachments) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    self.restart_required = error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<protocol::McpRestartRequired>());
+                    return false;
+                }
             };
             if let (Some(init), true) = (&self.legacy_init, legacy && self.legacy_ready) {
                 let mut setup = format!("{SETUP_RELAY_ID} ").into_bytes();
@@ -1193,7 +1223,7 @@ impl<W: std::io::Write> Relay<'_, W> {
                 },
             );
         } else {
-            let response = mcp_failure(&value, "daemon_unavailable", self.workspace);
+            let response = self.connection_failure(&value);
             self.due_response(value, response, deadline);
         }
         Ok(())
@@ -1287,7 +1317,7 @@ impl<W: std::io::Write> Relay<'_, W> {
                         request.due = true;
                         let deadline = request.call.then_some(request.deadline);
                         let value = request.value.clone();
-                        let response = mcp_failure(&value, "daemon_unavailable", self.workspace);
+                        let response = self.connection_failure(&value);
                         let due = self.due_for(
                             &value,
                             DueOutcome::Response(response),
@@ -1324,7 +1354,7 @@ impl<W: std::io::Write> Relay<'_, W> {
                 if let Some(lost) = self.daemon.take() {
                     let _ = lost.stream.shutdown(std::net::Shutdown::Both);
                 }
-                let response = mcp_failure(&value, "daemon_unavailable", self.workspace);
+                let response = self.connection_failure(&value);
                 self.due_for(&value, DueOutcome::Response(response), None, Some(relay))
             };
             self.due.push_back(due);
@@ -1493,7 +1523,17 @@ pub fn relay_stdio(
             Ok(DaemonConnection { stream, generation })
         }
     };
-    let first = open(Ok(stream), 0, &[])?;
+    let (first, restart_required) = match open(Ok(stream), 0, &[]) {
+        Ok(first) => (Some(first), false),
+        Err(error)
+            if error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<protocol::McpRestartRequired>()) =>
+        {
+            (None, true)
+        }
+        Err(error) => return Err(error),
+    };
     let mut relay = Relay {
         workspace,
         receiver: &receiver,
@@ -1504,8 +1544,9 @@ pub fn relay_stdio(
         mode: crate::mcp::session::Mode::Unselected,
         eof: false,
         stdout: io::stdout().lock(),
-        daemon: Some(first),
+        daemon: first,
         generation: 0,
+        restart_required,
         connect: Box::new(move |generation, attachments| {
             open(reconnect(), generation, attachments)
         }),
@@ -1658,7 +1699,7 @@ mod stdin_fence_tests {
 #[cfg(test)]
 mod reply_gate_tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct Fixture {
@@ -1706,6 +1747,7 @@ mod reply_gate_tests {
                 stdout: Vec::new(),
                 daemon: None,
                 generation: 0,
+                restart_required: false,
                 connect: Box::new(|_, _| Err(io::Error::other("no daemon in this fixture"))),
                 attachments: Default::default(),
                 legacy_init: None,
@@ -1808,6 +1850,97 @@ mod reply_gate_tests {
             }
             assert!(Instant::now() < deadline, "the relay never settled");
             thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn mismatched_daemon_requires_restart_without_forwarding_or_repeated_attach() {
+        let fixture = Fixture::new();
+        let mut relay = fixture.relay_on(&fixture.frames);
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = attempts.clone();
+        relay.connect = Box::new(move |_, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other(protocol::McpRestartRequired))
+        });
+        for id in [1, 2] {
+            let value = json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1},
+                "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities":{}}}});
+            relay
+                .handle(
+                    crate::mcp::wire::Frame::Line(serde_json::to_vec(&value).unwrap()),
+                    Instant::now(),
+                )
+                .unwrap();
+            let fence = relay.fence().unwrap();
+            relay.decide(fence).unwrap();
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(relay.forwarded.is_empty());
+        let responses: Vec<Value> = std::str::from_utf8(&relay.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 2);
+        for response in responses {
+            assert_eq!(
+                response["error"]["data"]["code"],
+                protocol::MCP_RESTART_REQUIRED
+            );
+            assert_eq!(response["error"]["data"]["retryable"], false);
+            assert!(response.get("result").is_none());
+        }
+    }
+
+    #[test]
+    fn attach_rejects_missing_or_changed_daemon_identity_before_mcp_frames() {
+        for identity in [
+            None,
+            Some(json!("different")),
+            Some(json!(protocol::mcp_identity())),
+        ] {
+            let fixture = Fixture::new();
+            let (client, mut daemon) = UnixStream::pair().unwrap();
+            let expected = identity
+                .as_ref()
+                .is_some_and(|value| value == protocol::mcp_identity());
+            let (release, released) = std::sync::mpsc::sync_channel(1);
+            let server = std::thread::spawn(move || {
+                let request: Request = protocol::read_frame(&mut daemon).unwrap();
+                assert_eq!(request.payload["mcpIdentity"], protocol::mcp_identity());
+                let mut payload = json!({"result":true});
+                if let Some(identity) = identity {
+                    payload["mcpIdentity"] = identity;
+                }
+                protocol::write_frame(
+                    &mut daemon,
+                    &Reply {
+                        id: request.id,
+                        payload,
+                    },
+                )
+                .unwrap();
+                released
+                    .recv_timeout(crate::testing::HANG_BACKSTOP)
+                    .unwrap();
+            });
+            let result = attach_mcp(client, &fixture.workspace, &[]);
+            if expected {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .get_ref()
+                        .unwrap()
+                        .is::<protocol::McpRestartRequired>()
+                );
+            }
+            release.send(()).unwrap();
+            server.join().unwrap();
         }
     }
 

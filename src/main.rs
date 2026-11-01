@@ -1509,6 +1509,7 @@ fn dispatch_connection(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let result = (|| -> Result<mcp::OpenedWorkspace> {
+            protocol::check_mcp_identity(request.payload.get("mcpIdentity"))?;
             let root: PathBuf = serde_json::from_value(
                 request
                     .payload
@@ -1587,7 +1588,9 @@ fn dispatch_connection(
         let reply = protocol::Reply {
             id: request.id,
             payload: match &result {
-                Ok(_) => serde_json::json!({"result": true}),
+                Ok(_) => {
+                    serde_json::json!({"result": true, "mcpIdentity": protocol::mcp_identity()})
+                }
                 Err(error) => serde_json::json!({"error": format!("{error:#}")}),
             },
         };
