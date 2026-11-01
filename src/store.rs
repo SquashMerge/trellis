@@ -6292,6 +6292,27 @@ struct SelectedNativeInput {
     captured: Result<CapturedNativeInput>,
 }
 
+/// What keeps a superseded revision past the grace: a selected batch's captured pin, and the
+/// revision that took the import of a batch the head still selects, whose admitted tuples every
+/// witnessed rejoin reuses (#567).
+macro_rules! revision_release_holds {
+    () => {
+        "AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s
+            WHERE s.captured_pin=native_revision_supersessions.revision_id)
+         AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s
+            WHERE s.revision_id=native_revision_supersessions.revision_id
+            AND EXISTS(SELECT 1 FROM semantic_revision_raw_selections head
+                JOIN index_metadata m ON m.singleton=1
+                WHERE head.batch_id=s.batch_id
+                AND head.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision)
+            AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections earlier
+                JOIN native_revisions r ON r.id=earlier.revision_id
+                JOIN native_revisions self ON self.id=s.revision_id
+                WHERE earlier.batch_id=s.batch_id
+                AND r.published_index_revision<self.published_index_revision))"
+    };
+}
+
 fn semantic_pin_key(pin: IndexPin) -> String {
     format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
 }
@@ -19525,11 +19546,12 @@ impl Store {
                 .optional()?;
             let due = if retention_clock_plausible(origin, now, elapsed) {
                 db.query_row(
-                    "SELECT revision_id FROM native_revision_supersessions
-                    WHERE state='retained' AND superseded_at<=?1
-                    AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.captured_pin=native_revision_supersessions.revision_id)
-                    AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.revision_id=native_revision_supersessions.revision_id AND EXISTS(SELECT 1 FROM semantic_revision_raw_selections head JOIN index_metadata m ON m.singleton=1 WHERE head.batch_id=s.batch_id AND head.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections earlier JOIN native_revisions r ON r.id=earlier.revision_id JOIN native_revisions self ON self.id=s.revision_id WHERE earlier.batch_id=s.batch_id AND r.published_index_revision<self.published_index_revision))
-                    ORDER BY superseded_at,revision_id LIMIT 1",
+                    concat!(
+                        "SELECT revision_id FROM native_revision_supersessions
+                        WHERE state='retained' AND superseded_at<=?1 ",
+                        revision_release_holds!(),
+                        " ORDER BY superseded_at,revision_id LIMIT 1"
+                    ),
                     [now.saturating_sub(900)],
                     |r| r.get::<_, String>(0),
                 )
@@ -19602,10 +19624,11 @@ impl Store {
             )?;
             if state == "retained" {
                 let changed = tx.execute(
-                    "UPDATE native_revision_supersessions SET state='pending'
-                    WHERE revision_id=?1 AND state='retained' AND superseded_at<=?2
-                    AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.captured_pin=native_revision_supersessions.revision_id)
-                    AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.revision_id=native_revision_supersessions.revision_id AND EXISTS(SELECT 1 FROM semantic_revision_raw_selections head JOIN index_metadata m ON m.singleton=1 WHERE head.batch_id=s.batch_id AND head.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections earlier JOIN native_revisions r ON r.id=earlier.revision_id JOIN native_revisions self ON self.id=s.revision_id WHERE earlier.batch_id=s.batch_id AND r.published_index_revision<self.published_index_revision))",
+                    concat!(
+                        "UPDATE native_revision_supersessions SET state='pending'
+                        WHERE revision_id=?1 AND state='retained' AND superseded_at<=?2 ",
+                        revision_release_holds!()
+                    ),
                     params![selected, now.saturating_sub(900)],
                 )?;
                 ensure!(changed == 1, "revision conflict: due revision changed");

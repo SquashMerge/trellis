@@ -3178,16 +3178,16 @@ pub(crate) fn original_document_associations(
         unclaimed.insert((derived.provenance_id.as_str(), row.evidence_kind));
     }
     let mut facts = JoinedFacts::default();
-    let mut claimed = |id: &str, raw: &str| {
-        if let Some(kind) = kinds.get(id) {
-            unclaimed.retain(|entry: &(&str, semantic::EvidenceKind)| *entry != (raw, *kind));
+    let mut claimed = |id: &str| {
+        if let (Some(raw), Some(kind)) = (by_provenance.get(id), kinds.get(id)) {
+            unclaimed.remove(&(*raw, *kind));
         }
     };
     for row in &snapshot.symbols {
         if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
-            claimed(&row.provenance_id, raw);
+            claimed(&row.provenance_id);
             facts.symbols.push(value);
         }
     }
@@ -3195,7 +3195,7 @@ pub(crate) fn original_document_associations(
         if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
-            claimed(&row.provenance_id, raw);
+            claimed(&row.provenance_id);
             facts.declaration_bindings.push(value);
         }
     }
@@ -3206,7 +3206,7 @@ pub(crate) fn original_document_associations(
             }
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
-            claimed(&row.provenance_id, raw);
+            claimed(&row.provenance_id);
             facts
                 .reference_claims
                 .insert((*raw).to_owned(), value.clone());
@@ -3236,7 +3236,7 @@ pub(crate) fn original_document_associations(
             }
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
-            claimed(&row.provenance_id, raw);
+            claimed(&row.provenance_id);
             facts.call_bindings.push(value);
         }
     }
@@ -3244,7 +3244,7 @@ pub(crate) fn original_document_associations(
         if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
             let mut value = row.clone();
             value.provenance_id = (*raw).to_owned();
-            claimed(&row.provenance_id, raw);
+            claimed(&row.provenance_id);
             facts.type_relationships.push(value);
         }
     }

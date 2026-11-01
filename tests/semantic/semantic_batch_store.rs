@@ -4437,6 +4437,12 @@ fn a_target_lost_under_a_fused_definition_takes_full() {
             .store
             .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
             .unwrap();
+        let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
+        assert_eq!(
+            work["fallbackReasons"],
+            json!(["fused_reference_target_lost"]),
+            "{spelling}: {work}"
+        );
     }
 }
 
