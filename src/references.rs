@@ -235,6 +235,22 @@ pub fn project_with_workers(
         .map(|(projection, _)| projection)
 }
 
+#[cfg(feature = "test-support")]
+static TEST_SITE_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(SITES);
+
+/// Lower the site budget, so a test's small revision can exceed it.
+#[cfg(feature = "test-support")]
+pub fn set_site_limit_for_tests(limit: usize) {
+    TEST_SITE_LIMIT.store(limit, std::sync::atomic::Ordering::Release);
+}
+
+fn site_limit() -> usize {
+    #[cfg(feature = "test-support")]
+    return TEST_SITE_LIMIT.load(std::sync::atomic::Ordering::Acquire);
+    #[cfg(not(feature = "test-support"))]
+    SITES
+}
+
 /// The most sites a reference read may sample per edge.
 pub const MAX_SAMPLE_LIMIT: usize = 50;
 
@@ -569,7 +585,10 @@ fn resolve(
                     (None, None) => continue,
                 };
                 site_count += 1;
-                ensure!(site_count <= SITES, "bounded_work: reference site count");
+                ensure!(
+                    site_count <= site_limit(),
+                    "bounded_work: reference site count"
+                );
                 let role = site.role;
                 let test = role == Some("test");
                 let bound = site.mapping == "semantic";

@@ -148,9 +148,14 @@ its own transaction. A build keeps no source text, syntax trees or semantic rows
 per-source reference rows (up to 50 sampled sites per edge), rule rows, metric rows and each
 finished summary, so a checkout holds one result, bounded by the existing reference and rule
 budgets. A checkout keeps at most two: the head's, and the one it replaced or an older retained
-revision a page is showing. Those budgets cover the whole revision: a path-scoped read of a
-repository over them fails `bounded_work` with the whole-revision read. Every read projects
-from the result:
+revision a page is showing. Every read projects from the result.
+
+A build resolves references and prepares declaration rules for the whole revision, under the
+existing budgets; layer-edge and exception work is charged per read, on the references that
+read selects. A revision over those budgets fails `bounded_work` for the summary, details and
+unscoped reads. A path-scoped MCP or CLI read then computes just its own paths on the request,
+under the budgets of that scope and its usual deadline.
+
 
 | Read | While the build runs |
 | --- | --- |

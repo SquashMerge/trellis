@@ -1,6 +1,6 @@
 #![cfg(feature = "test-support")]
 //! #556: one background Architecture build per revision and rules file, served to every read.
-use super::architecture_http::{RULES, fixture, request, write_rules};
+use super::architecture_http::{RULES, fixture, fixture_with_sources, request, write_rules};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -141,7 +141,6 @@ async fn a_read_during_the_build_answers_building_with_progress_then_the_result(
 #[tokio::test]
 async fn concurrent_readers_wait_for_one_build() {
     let (base, runtime, browser, key) = fixture().await;
-    write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
     let app = browser.clone().router();
     // The build starts only once every reader is waiting on the owner.
@@ -166,6 +165,8 @@ async fn concurrent_readers_wait_for_one_build() {
             _ => {}
         }
     }));
+    // Rules after the hook, so no build can start before it.
+    write_rules(&base, RULES);
     let (a, b, c) = tokio::join!(
         request(app.clone(), &key, ""),
         request(app.clone(), &key, ""),
@@ -543,4 +544,59 @@ async fn a_waiting_read_holds_nothing_and_ends_on_cancellation() {
     .await
     .unwrap();
     hold.release();
+}
+
+/// Owner ruling on #571: a revision over a whole-revision budget stays refused as a whole, and
+/// a narrow read computes its own scope under the budgets of that scope.
+#[tokio::test]
+async fn an_over_budget_revision_still_answers_a_narrow_read() {
+    // Every import is a reference site; the revision has more than the lowered budget.
+    let wide = (0..12)
+        .map(|i| format!("import {{ v as v{i} }} from './p.js';\n"))
+        .collect::<String>();
+    let (base, runtime, browser, key) = fixture_with_sources(
+        false,
+        &[
+            ("p.js", "export function v() {}\n"),
+            ("narrow.js", "import { v } from './p.js';\nv();\n"),
+            ("wide.js", &wide),
+        ],
+    )
+    .await;
+    trellis::references::set_site_limit_for_tests(5);
+    write_rules(&base, RULES);
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (status, whole) = request(browser.clone().router(), &key, "").await;
+    assert!(!status.is_success(), "{status} {whole}");
+
+    let tool = runtime.clone();
+    let (references, rules, unscoped) = tokio::task::spawn_blocking(move || {
+        let read = |kind: &str, arguments: Value| {
+            tool.await_architecture_tool(
+                kind,
+                &arguments,
+                trellis::testing::HANG_BACKSTOP,
+                &mut || Ok(()),
+            );
+            let (response, _) = tool.evidence_response().unwrap();
+            tool.architecture_tool(&response, kind, &arguments, &mut || Ok(()))
+        };
+        (
+            read("references", json!({"paths":["narrow.js"]})).unwrap(),
+            read("check", json!({"paths":["narrow.js"]})).unwrap(),
+            read("check", json!({})).unwrap_err(),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(references["counts"]["scannedDocuments"], 1);
+    assert_eq!(references["production"][0]["source"]["path"], "narrow.js");
+    assert_eq!(rules["rulesVersion"], "rules:v2");
+    assert_eq!(rules["instances"][0]["target"]["path"], "narrow.js");
+    assert!(
+        unscoped.to_string().starts_with("bounded_work"),
+        "{unscoped:#}"
+    );
+    // The failure is kept: the narrow reads asked for no further build.
+    assert_eq!(scheduler.architecture_builds_for_tests(), 1);
 }

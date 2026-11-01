@@ -1351,6 +1351,14 @@ pub struct MetricsPayload {
     pub partial_files: Vec<crate::syntax_bounds::PartialFile>,
 }
 
+/// How one architecture operation evaluates rules over its references.
+type EvaluateRules<'a> = dyn FnMut(
+        &crate::rules::Config,
+        &crate::references::Projection,
+        &mut (dyn FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value>
+    + 'a;
+
 /// One coherent native read snapshot retained until its owned result passes T03.
 pub struct EvidenceResponse {
     store: Store,
@@ -1706,12 +1714,75 @@ impl EvidenceResponse {
         core: &ArchitectureCore,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<serde_json::Value> {
-        let ArchitectureArguments {
-            paths,
-            sample_limit,
-            ..
-        } = parsed;
-        let references = core.references(paths, *sample_limit, check)?;
+        let references = core.references(&parsed.paths, parsed.sample_limit, check)?;
+        let mut evaluate =
+            |config: &crate::rules::Config,
+             references: &crate::references::Projection,
+             check: &mut (dyn FnMut() -> Result<()> + Send)| {
+                let mut check = || check();
+                Ok(crate::rules::evaluate_prepared(
+                    config,
+                    core.rules(config)?,
+                    references,
+                    &parsed.paths,
+                    &mut check,
+                )?
+                .data)
+            };
+        Self::architecture_payload(
+            kind,
+            arguments,
+            config,
+            references,
+            core.pin,
+            &mut evaluate,
+            check,
+        )
+    }
+
+    /// One path-scoped operation computed from its own scope, under the budgets of that
+    /// scope. For a revision too large for a core.
+    pub(crate) fn architecture_response_scoped(
+        &self,
+        kind: &str,
+        arguments: &serde_json::Value,
+        parsed: &ArchitectureArguments,
+        config: Option<&crate::rules::Config>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
+        let snapshot = self
+            .architecture_snapshot(parsed.pin, check)
+            .map_err(|error| self.store.report_index_failure(error))?;
+        let references =
+            crate::references::project(&snapshot, &parsed.paths, parsed.sample_limit, check)?;
+        let mut evaluate =
+            |config: &crate::rules::Config,
+             references: &crate::references::Projection,
+             check: &mut (dyn FnMut() -> Result<()> + Send)| {
+                let mut check = || check();
+                crate::rules::evaluate(config, &snapshot, references, &parsed.paths, &mut check)
+            };
+        Self::architecture_payload(
+            kind,
+            arguments,
+            config,
+            references,
+            snapshot.pin,
+            &mut evaluate,
+            check,
+        )
+    }
+
+    /// One operation's answer from its references and its way of evaluating the rules.
+    fn architecture_payload(
+        kind: &str,
+        arguments: &serde_json::Value,
+        config: Option<&crate::rules::Config>,
+        references: crate::references::Projection,
+        pin: IndexPin,
+        evaluate: &mut EvaluateRules<'_>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
         let mut payload = match kind {
             "references" => references.data,
             "prompt" => serde_json::json!({
@@ -1721,14 +1792,7 @@ impl EvidenceResponse {
             }),
             "check" | "explain" => {
                 let config = config.expect("checked rules presence");
-                let result = crate::rules::evaluate_prepared(
-                    config,
-                    core.rules(config)?,
-                    &references,
-                    paths,
-                    check,
-                )?
-                .data;
+                let result = evaluate(config, &references, &mut *check)?;
                 if kind == "explain" {
                     crate::rules::explain(
                         result,
@@ -1745,8 +1809,8 @@ impl EvidenceResponse {
             }
             _ => unreachable!(),
         };
-        payload["indexGeneration"] = serde_json::json!(core.pin.index_generation.to_string());
-        payload["indexRevision"] = serde_json::json!(core.pin.index_revision);
+        payload["indexGeneration"] = serde_json::json!(pin.index_generation.to_string());
+        payload["indexRevision"] = serde_json::json!(pin.index_revision);
         check()?;
         Ok(payload)
     }

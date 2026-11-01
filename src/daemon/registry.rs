@@ -2723,8 +2723,31 @@ impl CheckoutRuntime {
             metrics: false,
             compute_older_pin: true,
         };
-        let core = self.architecture_core_for_read(response, pin, config.as_ref(), needs, check)?;
-        response.architecture_response_at(kind, arguments, &parsed, config.as_ref(), &core, check)
+        let answer = self
+            .architecture_core_for_read(response, pin, config.as_ref(), needs, check)
+            .and_then(|core| {
+                response.architecture_response_at(
+                    kind,
+                    arguments,
+                    &parsed,
+                    config.as_ref(),
+                    &core,
+                    check,
+                )
+            });
+        match answer {
+            // The revision is over a whole-revision budget. A narrow read may not be.
+            Err(error) if parsed.scoped() && error.to_string().starts_with("bounded_work") => {
+                response.architecture_response_scoped(
+                    kind,
+                    arguments,
+                    &parsed,
+                    config.as_ref(),
+                    check,
+                )
+            }
+            answer => answer,
+        }
     }
 
     /// One paged Architecture detail read, bounded like the summary.

@@ -52,7 +52,7 @@ async fn fixture_with_roles(
 ) {
     fixture_with_sources(role_fixture, &[]).await
 }
-async fn fixture_with_sources(
+pub(super) async fn fixture_with_sources(
     role_fixture: bool,
     extra_sources: &[(&str, &str)],
 ) -> (

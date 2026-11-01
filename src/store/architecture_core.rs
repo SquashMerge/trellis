@@ -29,6 +29,9 @@ impl ArchitectureArguments {
     pub(crate) fn pin(&self) -> Option<IndexPin> {
         self.pin
     }
+    pub(crate) fn scoped(&self) -> bool {
+        !self.paths.is_empty()
+    }
 }
 
 /// How far one core build has got.
