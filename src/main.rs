@@ -351,6 +351,8 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 }
 
 const CLI_READ_WAIT: Duration = Duration::from_secs(5);
+/// A rules check or references read can wait for the revision's architecture core (#556).
+const CLI_ARCHITECTURE_WAIT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1661,7 +1663,15 @@ fn dispatch_connection(
     } else {
         metrics_work
     };
-    let request_deadline = Instant::now() + if metrics { metrics_work } else { CLI_READ_WAIT };
+    let architecture = matches!(request.operation.as_str(), "rules_check" | "references");
+    let request_deadline = Instant::now()
+        + if metrics {
+            metrics_work
+        } else if architecture {
+            CLI_ARCHITECTURE_WAIT
+        } else {
+            CLI_READ_WAIT
+        };
     let read_scope = matches!(
         request.operation.as_str(),
         "status"
@@ -1811,7 +1821,6 @@ fn dispatch_connection(
                     .context("invalid_argument: semanticProducerId must be a string")?,
                 }),
                 "rules_check" | "references" => (|| {
-                    let (response, catching_up) = checkout.evidence_response()?;
                     let kind = if request.operation == "references" {
                         "references"
                     } else {
@@ -1821,7 +1830,14 @@ fn dispatch_connection(
                         ensure!(Instant::now() < request_deadline, "deadline_exceeded");
                         Ok(())
                     };
-                    let result = response.architecture_response(kind, args, &mut check);
+                    // The owner finishes the first read after a publication; leave time to
+                    // answer. This wait comes before read admission.
+                    let wait = request_deadline
+                        .saturating_duration_since(Instant::now())
+                        .saturating_sub(Duration::from_secs(1));
+                    checkout.await_architecture_tool(kind, args, wait, &mut check);
+                    let (response, catching_up) = checkout.evidence_response()?;
+                    let result = checkout.architecture_tool(&response, kind, args, &mut check);
                     match result {
                         Ok(payload) => {
                             check()?;
