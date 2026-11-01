@@ -258,8 +258,11 @@ test("a method whose every step is hidden says so and shows them on request",{ti
 // #558: a large diagram opens at its own size in the real panel; Fit is explicit and undoes.
 const longSource=`fn measured() {\n${Array.from({length:40},(_,i)=>`    if a_condition_with_a_name_long_enough_to_be_wider_than_the_narrow_panel_${i}() { return; }\n`).join("")}}\n`;
 test("a large sequence scrolls at readable size until Fit is asked for",{timeout:240000},async()=>published(longSource,async({page})=>{
+ await page.setViewportSize({width:1900,height:700});
+ const fit=page.locator("#sequence-fit");
+ await page.waitForFunction(()=>document.querySelector("#sequence-fit").hidden);
  await page.setViewportSize({width:800,height:700});
- const fit=page.locator("#sequence-fit");await fit.waitFor();
+ await fit.waitFor();
  const measure=()=>page.locator("#sequence-diagram").evaluate(box=>{const svg=box.querySelector("svg"),scale=svg.getScreenCTM().a;
   return {scale,smallest:Math.min(...[...svg.querySelectorAll("text")].filter(t=>t.textContent.trim()).map(t=>parseFloat(getComputedStyle(t).fontSize)*scale)),width:svg.getBoundingClientRect().width,clientWidth:box.clientWidth,clientHeight:box.clientHeight,scrollHeight:box.scrollHeight};});
  const opened=await measure();

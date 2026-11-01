@@ -224,14 +224,19 @@ and #542's "any other guard is unchanged".
   `column.id`:
   - Rust: the `impl` type (`impl Trait for Foo` is `Foo`), else the trait, struct or enum,
     else the module (the file stem, or the directory of a `mod.rs`, plus inline modules).
-    An `impl` block whose type has no name (`impl Tr for [u8]`) is its module's.
+    An `impl` block whose type has no name (`impl Tr for [u8]`) or is its own type parameter
+    (`impl<A> Tr for A`) is its module's. A self type by a path that does not start at
+    `crate`, `self` or `super` keeps its path (`fmt::Error`).
   - JavaScript, Java and Python: the class, else the file (Python: the module).
   - A closure or nested function is in the column of whatever encloses it; an anonymous
     class defers outward.
   - A Rust type's `impl` blocks join across files when the snapshot declares at most one
     type of that name. With several, nothing says which an `impl` implements, so its blocks
-    stay apart by file and inline module: two types are never conflated.
-  - Two columns that read the same are told apart by path in `column.label`.
+    stay apart by file and inline module: two declared types are never conflated. Types
+    are not resolved here, so an imported foreign type with a local type's bare name
+    (`use other::Error; impl Tr for Error`) reads as the local one.
+  - Two columns that read the same are told apart in `column.label`: by path, and by line
+    within one file.
   - A syntax hint has no `column` and stays its own lane; a syntax-only view is unchanged.
 - **Identity.** A column is a display grouping that proves nothing about receivers. `target`,
   `lane`, `participants[].declaration` and the inspector keep the exact method. Each exact
@@ -259,6 +264,9 @@ and #542's "any other guard is unchanged".
   external call into Rust's `std`, `core` or `alloc` by its `externalPackage`, "Only external
   calls" when all are external, and "Only incidental calls" otherwise. The full view offers
   "Show them", the same request as Show all.
+- **JavaScript source hints.** As in the other adapters, the last syntax lane is reserved:
+  excess hints share the unknown-operations lane and stay measured calls, so a view with
+  many hints is neither truncated nor loses its arrows once enrichment resolves them.
 
 The browser draws an expanded step's arrows and notes from its `lane`, shows the tier and
 reason in the sequence status line, and offers a "Show/Hide N incidental calls" toggle

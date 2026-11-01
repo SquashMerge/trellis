@@ -95,6 +95,30 @@ test("a coordinate-shaped diagram draws one lane per type with the method on eac
   assert.match(await label.getAttribute("aria-label"), /lexical_spelling_0/);
 });
 
+test("a call within one column draws a self arrow, as do a callee's own calls", async () => {
+  const view = coordinateView({types:1, methods:3, steps:6});
+  const seedColumn = view.participants[0].column, [, first, second] = view.participants;
+  first.column = second.column = seedColumn;
+  const call = view.steps.find(step => step.target === first.id);
+  call.target = first.id;
+  call.children = [{...structuredClone(call), id:`${call.id}>inner`, callId:"callid:inner", target:second.id, lane:first.id, children:[]}];
+  view.steps = [call];
+  const result = await render(view);
+  assert.equal(result.status, "rendered", result.reason);
+  assert.equal(await page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").count(), 1);
+  assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(), [`[001] ${first.declaration.name}`, `[002] ${second.declaration.name}`]);
+  assert.equal(await page.locator("#sequence-diagram .pele-message").count(), 2);
+  assert.equal(await page.locator("#sequence-diagram .pele-message").nth(1).getAttribute("data-trellis-target-id"), second.id);
+});
+
+test("Python's break draws in Pele", async () => {
+  const view = coordinateView({steps:3});
+  view.steps = [{...structuredClone(view.steps[0]), id:"exit:0", kind:"exit", label:"break", callId:null, target:undefined, callEvidence:undefined}];
+  const result = await render(view);
+  assert.equal(result.status, "rendered", result.reason);
+  assert.match(await page.locator('#sequence-diagram .pele-note[data-trellis-step-id="exit:0"]').textContent(), /break/);
+});
+
 test("the 21st method of a type costs no lane; the 21st type still does", async () => {
   const many = coordinateView({types:1, methods:30, steps:60});
   assert.equal((await render(many)).status, "rendered");
@@ -179,6 +203,8 @@ test("the empty state names what is hidden", async () => {
   assert.equal(await summary({steps:[hidden("external", "std"), hidden("external", "core")], hiddenSteps:2}), "Only standard-library calls (2 hidden).");
   assert.equal(await summary({steps:[hidden("external", "std"), hidden("external", "serde")], hiddenSteps:2}), "Only external calls (2 hidden).");
   assert.equal(await summary({steps:[hidden("external", "std"), hidden("logging")], hiddenSteps:2}), "Only incidental calls (2 hidden).");
+  const npm = hidden("external", "core"); npm.callEvidence.externalPackage.manager = "npm";
+  assert.equal(await summary({steps:[npm], hiddenSteps:1}), "Only external calls (1 hidden).", "only Cargo's std is Rust's");
   assert.equal(await summary({steps:[hidden("external", "std"), {...hidden("external", "std"), hidden:false}], hiddenSteps:1}), "", "a shown step draws the diagram");
   assert.equal(await summary({steps:[], hiddenSteps:0}), "", "no steps at all has its own message");
   await page.evaluate(() => {

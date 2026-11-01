@@ -585,3 +585,21 @@ fn definition_header_shortcuts_are_bounded() {
     );
     assert!(!flatten(&view.steps).iter().any(|s| s.kind == "definition"));
 }
+
+/// #558: a `break` draws an `exit` step, which folds no guard; many sequential guards after
+/// a drawn `return` spend no depth.
+#[test]
+fn guards_fold_only_after_a_drawn_return_and_spend_no_depth() {
+    let (_, view) = fixture(
+        "def run(xs):\n    for x in xs:\n        if x:\n            break\n        after()\n",
+        "run",
+    );
+    assert!(flatten(&view.steps).iter().all(|s| s.folded.is_empty()));
+    let ifs: String = (0..40)
+        .map(|n| format!("    if x{n}:\n        return\n"))
+        .collect();
+    let source = format!("def run():\n{ifs}    a(b(c()))\n");
+    let (_, view) = fixture(&source, "run");
+    assert_eq!(calls(&view.steps), ["c", "b", "a"]);
+    assert!(!view.truncated, "{:?}", view.warnings);
+}

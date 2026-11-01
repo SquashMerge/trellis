@@ -336,3 +336,18 @@ fn exhausted_argument_visit_budget_never_implies_enclosing_invocation() {
     assert!(calls(&view.steps).is_empty(), "{:?}", view.steps);
     assert!(!view.warnings.iter().any(|w| w.contains("unreachable")));
 }
+
+/// #558: only a drawn `return` or `throw` folds a guard; many sequential guards spend no depth.
+#[test]
+fn guards_fold_only_after_a_drawn_exit_and_spend_no_depth() {
+    let (_, view) = fixture(
+        "class Fixture { void run() { for (int i : xs()) { if (i > 0) break; } after(); } }",
+        "run",
+    );
+    assert!(flatten(&view.steps).iter().all(|s| s.folded.is_empty()));
+    let ifs: String = (0..40).map(|n| format!("if (x{n}) return; ")).collect();
+    let source = format!("class Fixture {{ void run() {{ {ifs} a(b(c())); }} }}");
+    let (_, view) = fixture(&source, "run");
+    assert_eq!(calls(&view.steps), ["c", "b", "a"]);
+    assert!(!view.truncated, "{:?}", view.warnings);
+}

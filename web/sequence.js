@@ -54,11 +54,12 @@ function sequenceBasisLabel(evidence) {
   return `basis ${basis.producerId}${typeof basis.producerVersion === "string" ? " " + basis.producerVersion : ""}`;
 }
 // A call that may return early carries its folded `?` and guards (#542); a chain group
-// shows it when one of its calls does. A branch carries the guard after it (#558): its own
-// frame shows how the path ends. Server fields, never inferred from labels.
+// shows it when one of its calls does. An `if` or `match` carries the guard after it (#558):
+// its own frame shows how the path ends. Server fields, never inferred from labels.
 function sequenceEarlyReturn(step) {
   const folded = item => Array.isArray(item?.folded) && item.folded.length > 0;
-  if (step?.kind === "branch" && folded(step)) return " · may exit early";
+  // A branch keeps its folded steps when the depth bound redraws it as a boundary: no call ID.
+  if (folded(step) && !step.callId) return " · may exit early";
   return folded(step) || step?.kind === "group" && (step.children || []).some(folded) ? " · may return early" : "";
 }
 function sequenceEntry(step) {
@@ -120,7 +121,7 @@ const compactLabels = new Map([
   ["await: suspension/resumption boundary, timing unknown", "await · timing unknown"],
   ["iteration target write: implicit setters/unpacking unresolved", "iteration write · setters/unpacking unresolved"]
 ]);
-const analysisKinds = new Set(["effect", "return", "throw", "await", "note", "boundary", "definition"]);
+const analysisKinds = new Set(["effect", "return", "throw", "exit", "await", "note", "boundary", "definition"]);
 function compactAnalysis(step) {
   const label = step.label || step.kind;
   if (compactLabels.has(label)) return compactLabels.get(label);
@@ -160,7 +161,10 @@ function sequenceEmptySummary(view) {
   const walk = items => { for (const step of items) { if (step.incidental) hidden.push(step); walk(step.children || []); walk(step.alternate || []); } };
   walk(steps);
   const external = step => step.incidental === "external";
-  const standard = step => external(step) && STANDARD_LIBRARIES.has(step.callEvidence?.externalPackage?.name);
+  const standard = step => {
+    const pkg = step.callEvidence?.externalPackage;
+    return external(step) && pkg?.manager === "cargo" && STANDARD_LIBRARIES.has(pkg.name);
+  };
   const kind = hidden.length && hidden.every(standard) ? "standard-library" : hidden.length && hidden.every(external) ? "external" : "incidental";
   return `Only ${kind} calls (${view.hiddenSteps} hidden).`;
 }

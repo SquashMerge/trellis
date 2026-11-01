@@ -179,6 +179,8 @@ fn impl_target(node: tree_sitter::Node<'_>, text: &[u8]) -> Option<String> {
 }
 /// The type one `impl` block implements (#558), from its header alone: an `impl` can be most
 /// of a very large file. A header with a brace of its own does not parse, and names nothing.
+/// Nor does a blanket `impl<A: X> Y for A`: `A` is no type. A path that does not start at this
+/// crate keeps its path (`fmt::Error`), so it never reads as a local type of that last name.
 pub(crate) fn impl_block_target(block: &str) -> Option<String> {
     let header = format!("{}{{}}", &block[..block.find('{')?]);
     let mut parser = tree_sitter::Parser::new();
@@ -194,7 +196,29 @@ pub(crate) fn impl_block_target(block: &str) -> Option<String> {
     let item = root
         .named_children(&mut cursor)
         .find(|node| node.kind() == "impl_item")?;
-    impl_target(item, header.as_bytes())
+    let text = header.as_bytes();
+    let name = type_name(item.child_by_field_name("type")?)?;
+    let scope = name
+        .parent()
+        .filter(|parent| parent.kind() == "scoped_type_identifier");
+    if let Some(scoped) = scope {
+        let path = scoped.child_by_field_name("path")?.utf8_text(text).ok()?;
+        let root = path.split("::").next().unwrap_or(path);
+        if !matches!(root, "crate" | "self" | "super") {
+            return Some(scoped.utf8_text(text).ok()?.to_owned());
+        }
+    } else if let Some(parameters) = item.child_by_field_name("type_parameters") {
+        let name = name.utf8_text(text).ok()?;
+        let mut cursor = parameters.walk();
+        if parameters.named_children(&mut cursor).any(|node| {
+            let own = node.child_by_field_name("name");
+            let own = own.or_else(|| node.child_by_field_name("left"));
+            own.unwrap_or(node).utf8_text(text).ok() == Some(name)
+        }) {
+            return None;
+        }
+    }
+    Some(name.utf8_text(text).ok()?.to_owned())
 }
 /// The identifier naming a Rust type: `Foo`, `a::Foo`, `Foo<T>`, `&Foo`, `&mut a::Foo<T>`.
 fn type_name(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {

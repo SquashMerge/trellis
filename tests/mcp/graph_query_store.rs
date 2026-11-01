@@ -1297,8 +1297,9 @@ fn sequence_source_hints_do_not_consume_resolved_lane_budget() {
     assert!(
         sequence_steps(&view.steps)
             .iter()
-            .all(|step| step.target.is_some())
+            .all(|step| step.target.is_some() && step.kind == "call")
     );
+    assert!(!view.truncated, "{:?}", view.warnings);
 }
 
 #[test]

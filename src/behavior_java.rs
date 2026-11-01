@@ -130,23 +130,22 @@ impl Builder<'_> {
             }
             if f.exits && i + 1 < nodes.len() {
                 // Do not draw the suffix after a return/throw alternative as unconditional.
+                let Some(guard) = self.step(nodes[i + 1], "branch", CONTINUES_LABEL) else {
+                    break;
+                };
+                // After a branch that draws its exit the suffix stays at this level (#558).
+                let Some(mut guard) = fold_guard(&mut out.steps, guard) else {
+                    continue;
+                };
                 if depth >= MAX_DEPTH {
                     self.limit();
                     break;
                 }
-                if let Some(guard) = self.step(nodes[i + 1], "branch", CONTINUES_LABEL) {
-                    let rest = self.block(&nodes[i + 1..], depth + 1);
-                    out.continues = rest.continues;
-                    out.exits |= rest.exits;
-                    // After a branch that draws its exit the suffix stays here (#558).
-                    match fold_guard(&mut out.steps, guard) {
-                        None => out.steps.extend(rest.steps),
-                        Some(mut guard) => {
-                            guard.children = rest.steps;
-                            out.steps.push(guard);
-                        }
-                    }
-                }
+                let rest = self.block(&nodes[i + 1..], depth + 1);
+                guard.children = rest.steps;
+                out.continues = rest.continues;
+                out.exits |= rest.exits;
+                out.steps.push(guard);
                 break;
             }
         }

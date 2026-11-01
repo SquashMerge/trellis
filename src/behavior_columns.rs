@@ -125,23 +125,36 @@ pub(crate) fn fits(participants: &[Participant], column: &SequenceColumn) -> boo
 }
 
 /// Tells apart two columns that would read the same (two `index.js`, or a type name that
-/// stayed apart), by the path of each column's first participant.
+/// stayed apart), by the path of each column's first participant, and by its line when the
+/// two share a file.
 pub(crate) fn disambiguate(participants: &mut [Participant]) {
-    let mut paths: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut first: BTreeMap<String, BTreeMap<String, &Symbol>> = BTreeMap::new();
     for participant in participants.iter() {
         if let (Some(column), Some(symbol)) = (&participant.column, &participant.declaration) {
-            paths
+            first
                 .entry(column.label.clone())
                 .or_default()
                 .entry(column.id.clone())
-                .or_insert_with(|| symbol.path.clone());
+                .or_insert(symbol);
+        }
+    }
+    let mut names = BTreeMap::new();
+    for (label, ids) in first.iter().filter(|(_, ids)| ids.len() > 1) {
+        for (id, symbol) in ids {
+            let shared = ids.values().filter(|s| s.path == symbol.path).count() > 1;
+            let name = if shared {
+                format!("{label} ({}:{})", symbol.path, symbol.range.start_line)
+            } else {
+                format!("{label} ({})", symbol.path)
+            };
+            names.insert(id.clone(), name);
         }
     }
     for participant in participants {
         if let Some(column) = &mut participant.column
-            && let Some(ids) = paths.get(&column.label).filter(|ids| ids.len() > 1)
+            && let Some(name) = names.get(&column.id)
         {
-            column.label = format!("{} ({})", column.label, ids[&column.id]);
+            column.label.clone_from(name);
         }
     }
 }
@@ -194,7 +207,7 @@ mod tests {
     #[test]
     fn a_rust_method_belongs_to_its_impl_type_even_for_a_trait_or_a_closure() {
         let path = "src/store/graph_read.rs";
-        let text = "impl<T> Display for a::Store<T> where T: Copy { fn open() {} }";
+        let text = "impl<T> Display for crate::a::Store<T> where T: Copy { fn open() {} }";
         let mut block = symbol(
             "impl",
             "<implementation@0>",
@@ -225,30 +238,57 @@ mod tests {
     }
 
     #[test]
-    fn a_rust_impl_of_a_type_that_has_no_name_falls_back_to_its_module() {
+    fn a_rust_impl_of_no_nameable_type_falls_back_to_its_module() {
         let path = "src/store/graph_read.rs";
-        let text = "impl Tr for [u8] { fn open() {} }";
-        let mut block = symbol(
-            "impl",
-            "<implementation@0>",
-            SymbolKind::Class,
-            Some("file"),
-            0,
+        for text in [
+            "impl Tr for [u8] { fn open() {} }",
+            "impl<A: X> Tr for A { fn open() {} }",
+            "impl<A> Tr for &A { fn open() {} }",
+            "impl<A: X> Tr for Box<A> where A: Y { fn open() {} }",
+        ] {
+            let mut block = symbol(
+                "impl",
+                "<implementation@0>",
+                SymbolKind::Class,
+                Some("file"),
+                0,
+            );
+            block.range.end_byte = text.len();
+            let columns = DocumentColumns {
+                language: "rust".into(),
+                nodes: nodes(vec![
+                    symbol("file", path, SymbolKind::Module, None, 0),
+                    block,
+                    symbol("m", "open", SymbolKind::Method, Some("impl"), 11),
+                ]),
+                text: text.into(),
+            };
+            let expected = if text.contains("Box") {
+                "Box"
+            } else {
+                "graph_read"
+            };
+            let label = match columns.owner(&columns.nodes["m"]) {
+                Owner::Column(column) => column.label,
+                Owner::RustType { name, .. } => name,
+            };
+            assert_eq!(label, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_foreign_path_keeps_its_path_and_a_crate_path_reads_as_its_type() {
+        let target = crate::files_view::impl_block_target;
+        assert_eq!(
+            target("impl Tr for fmt::Error {").as_deref(),
+            Some("fmt::Error")
         );
-        block.range.end_byte = text.len();
-        let columns = DocumentColumns {
-            language: "rust".into(),
-            nodes: nodes(vec![
-                symbol("file", path, SymbolKind::Module, None, 0),
-                block,
-                symbol("m", "open", SymbolKind::Method, Some("impl"), 11),
-            ]),
-            text: text.into(),
-        };
-        let Owner::Column(column) = columns.owner(&columns.nodes["m"]) else {
-            panic!("a module column")
-        };
-        assert_eq!(column.label, "graph_read");
+        assert_eq!(
+            target("impl Tr for &other::a::E<T> {").as_deref(),
+            Some("other::a::E")
+        );
+        assert_eq!(target("impl Tr for crate::a::E {").as_deref(), Some("E"));
+        assert_eq!(target("impl super::Tr for self::E {").as_deref(), Some("E"));
     }
 
     #[test]
@@ -363,5 +403,18 @@ mod tests {
                 "Store"
             ]
         );
+    }
+
+    #[test]
+    fn same_named_columns_of_one_file_are_told_apart_by_line() {
+        let mut one = participant("a", "1", "S", "a.rs");
+        let mut two = participant("b", "2", "S", "a.rs");
+        one.declaration.as_mut().unwrap().range.start_line = 3;
+        two.declaration.as_mut().unwrap().range.start_line = 9;
+        let mut participants = vec![one, two];
+        disambiguate(&mut participants);
+        let label = |at: usize| participants[at].column.as_ref().unwrap().label.as_str();
+        assert_eq!(label(0), "S (a.rs:3)");
+        assert_eq!(label(1), "S (a.rs:9)");
     }
 }
