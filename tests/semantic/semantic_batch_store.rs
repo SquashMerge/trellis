@@ -4372,6 +4372,268 @@ fn the_import_revision_outlasts_the_grace_while_its_batch_is_selected() {
     assert_eq!(tuples(&world), 0);
 }
 
+/// A new batch over the same documents, then one local edit of `src/C.js`.
+fn edit_and_import(world: &World, ordinal: usize, counts: &Path) -> IndexPin {
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let descriptor = world.write(&fixture);
+    let imported = world.publish(&descriptor).unwrap().0;
+    local_edit(
+        world,
+        "src/C.js",
+        &format!("function other(){{ return {ordinal}; }}\n"),
+        counts,
+    );
+    imported
+}
+
+fn revision_state(world: &World, pin: IndexPin) -> String {
+    world
+        .db()
+        .query_row(
+            "SELECT state FROM native_revision_supersessions WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                pin.index_generation, pin.index_revision
+            )],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn unreleased_revisions(world: &World) -> i64 {
+    world.count(
+        "SELECT COUNT(*) FROM native_revisions r
+         LEFT JOIN native_revision_supersessions s ON s.revision_id=r.id
+         WHERE COALESCE(s.state,'head')<>'released'",
+    )
+}
+
+/// Owner ruling 2026-11-01: holds are rooted at the head, so what survives the grace does not
+/// grow with the number of imports, and the next edit still stands on its admitted tuples.
+#[test]
+fn sequential_imports_leave_no_chain_of_held_revisions() {
+    let world = definitions_world();
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    world.republish();
+    let mut clock = 1_000;
+    let mut bounds = Vec::new();
+    for imports in 1..=5 {
+        clock += 10;
+        world
+            .store
+            .set_retention_clock_for_tests(clock, (clock - 1_000) as u64);
+        edit_and_import(&world, imports, &counts);
+        clock += 1_000;
+        world
+            .store
+            .set_retention_clock_for_tests(clock, (clock - 1_000) as u64);
+        run_maintenance(&world);
+        bounds.push((
+            unreleased_revisions(&world),
+            world.count("SELECT COUNT(*) FROM semantic_raw_batches"),
+        ));
+    }
+    // The head, its batch's capture and import; the capture still selects the batch before.
+    assert_eq!(bounds[4], bounds[2], "{bounds:?}");
+    assert_eq!(bounds[4], bounds[3], "{bounds:?}");
+    assert!(bounds[4].0 <= 3 && bounds[4].1 <= 2, "{bounds:?}");
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1") };
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 9; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+}
+
+/// A revision in its grace outlives the capture its selection names: it reads its own stored
+/// basis and proofs, never the captured manifest. Past its grace its pin stops resolving.
+#[test]
+fn a_revision_in_its_grace_reads_after_its_capture_is_released() {
+    let world = definitions_world();
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let capture = world.store.index_baseline().unwrap();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let descriptor = world.write(&fixture);
+    world.publish(&descriptor).unwrap();
+    world.store.set_retention_clock_for_tests(1_001, 1);
+    local_edit(&world, "src/C.js", "function other(){ }\n", &counts);
+    let in_grace = world.store.index_baseline().unwrap();
+    world.store.set_retention_clock_for_tests(1_900, 900);
+    local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 2; }\n",
+        &counts,
+    );
+    world.store.set_retention_clock_for_tests(1_901, 901);
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let replacement = world.write(&fixture);
+    world.publish(&replacement).unwrap();
+
+    let semantic = world.store.semantic_at(in_grace).unwrap();
+    let raw = world.store.selected_raw_inputs_at(in_grace).unwrap();
+    let source = world.store.source_at("src/C.js", Some(in_grace)).unwrap();
+    assert_eq!(raw.len(), 1);
+    assert_ne!(raw[0].captured_pin, world.store.index_baseline().unwrap());
+    world.store.set_retention_clock_for_tests(1_950, 950);
+    run_maintenance(&world);
+    assert_eq!(revision_state(&world, capture), "released");
+
+    assert_eq!(world.store.semantic_at(in_grace).unwrap(), semantic);
+    assert_eq!(
+        world.store.source_at("src/C.js", Some(in_grace)).unwrap(),
+        source
+    );
+    let proof = semantic
+        .provenance
+        .iter()
+        .find_map(|row| row.derived_from.as_ref())
+        .unwrap();
+    assert!(
+        world
+            .store
+            .semantic_raw_proof_at(
+                &raw[0].producer_id,
+                &raw[0].captures[0].artifact_hash,
+                &raw[0].source_set_id,
+                &raw[0].captured_revision,
+                &proof.provenance_id,
+            )
+            .unwrap()
+            .is_some(),
+        "the batch a retained revision selects keeps its proofs"
+    );
+
+    world.store.set_retention_clock_for_tests(2_802, 1_802);
+    run_maintenance(&world);
+    assert_eq!(revision_state(&world, in_grace), "released");
+    let error = world.store.semantic_at(in_grace).unwrap_err();
+    assert!(format!("{error:#}").starts_with("pin_expired"), "{error:#}");
+}
+
+/// Two producers imported at different revisions keep each one's capture and import.
+#[test]
+fn each_head_selected_batch_keeps_its_capture_and_import_past_the_grace() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+                ("src/C.py", "def helper(): return 1\n"),
+            ],
+        )
+    });
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+    }
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let javascript = world.write(&fixture);
+    world.publish(&javascript).unwrap();
+    world.store.set_retention_clock_for_tests(1_001, 1);
+    local_edit(&world, "src/D.js", "function later(){ }\n", &counts);
+    world.store.set_retention_clock_for_tests(1_002, 2);
+    let mut fixture = world.fixture().reference("scip-python");
+    fixture.artifact("python", vec![DocSpec::new("src/C.py")]);
+    let python = world.write(&fixture);
+    world.publish(&python).unwrap();
+    world.store.set_retention_clock_for_tests(2_003, 1_003);
+    local_edit(
+        &world,
+        "src/D.js",
+        "function later(){ return 1; }\n",
+        &counts,
+    );
+    world.store.set_retention_clock_for_tests(3_904, 2_904);
+    run_maintenance(&world);
+    assert_eq!(
+        world.count(
+            "SELECT COUNT(DISTINCT s.producer_id) FROM semantic_revision_raw_selections s
+             JOIN index_metadata m ON m.singleton=1
+             WHERE s.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision"
+        ),
+        2
+    );
+    let work = local_edit(
+        &world,
+        "src/D.js",
+        "function later(){ return 2; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 2, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+}
+
+/// A release the daemon stops midway resumes after a publication, and takes only what the head
+/// no longer holds.
+#[test]
+fn an_interrupted_release_resumes_without_touching_what_the_head_holds() {
+    let world = definitions_world();
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    world.republish();
+    edit_and_import(&world, 1, &counts);
+    world.store.set_retention_clock_for_tests(1_010, 10);
+    edit_and_import(&world, 2, &counts);
+    world.store.set_retention_clock_for_tests(2_020, 1_020);
+    {
+        let leader = world.store.publication_for_tests().unwrap();
+        let permit = world.store.maintenance_try_enter().unwrap();
+        let probe = world.store.open_maintenance_queue_probe().unwrap();
+        world
+            .store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap();
+    }
+    assert!(world.count("SELECT COUNT(*) FROM native_revision_release_debt") <= 1);
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 3; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    world.store.set_retention_clock_for_tests(3_030, 2_030);
+    run_maintenance(&world);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM native_revision_release_debt"),
+        0
+    );
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 4; }\n",
+        &counts,
+    );
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+}
+
 /// A definition's claim can lose its reference row to another claim at its span while it keeps
 /// its declaration binding: the row's proof is still fused. Whether that claim or the other one
 /// owns the row follows the proof IDs, so several spellings cover both orders.

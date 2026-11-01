@@ -6299,13 +6299,17 @@ struct SelectedNativeInput {
     captured: Result<CapturedNativeInput>,
 }
 
-/// What keeps a superseded revision past the grace: a selected batch's captured pin, and the
-/// revision that took the import of a batch the head still selects, whose admitted tuples every
-/// witnessed rejoin reuses (#567).
+/// What keeps a superseded revision past the grace, rooted at the head (owner ruling
+/// 2026-11-01): the captured pin of a batch the head selects, and the revision that took that
+/// batch's import, whose admitted tuples every witnessed rejoin reuses. A selection on any other
+/// revision holds nothing, so sequential imports leave no chain. Raw cleanup stays scoped to
+/// every remaining selection, so a revision in its grace keeps its own evidence.
 macro_rules! revision_release_holds {
     () => {
         "AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s
-            WHERE s.captured_pin=native_revision_supersessions.revision_id)
+            JOIN index_metadata m ON m.singleton=1
+            WHERE s.captured_pin=native_revision_supersessions.revision_id
+            AND s.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision)
          AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s
             WHERE s.revision_id=native_revision_supersessions.revision_id
             AND EXISTS(SELECT 1 FROM semantic_revision_raw_selections head
