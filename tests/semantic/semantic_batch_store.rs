@@ -1,6 +1,8 @@
 #![cfg(feature = "test-support")]
 use crate::semantic_batch_support;
 
+#[path = "proptest_multi_original.rs"]
+mod proptest_multi_original;
 #[path = "proptest_retention.rs"]
 mod proptest_retention;
 
