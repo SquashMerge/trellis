@@ -164,6 +164,8 @@ pub struct SearchIndexStatus {
 pub struct SearchAvailability {
     pub backend: Option<Backend>,
     pub unavailable_reason: Option<SearchUnavailableReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<crate::search_config::SearchConfiguration>,
 }
 
 const MODEL_AVAILABLE_OR_UNTRIED: u8 = 0;
@@ -175,6 +177,7 @@ pub struct SearchModelStatus {
     backend: Backend,
     ready: Arc<AtomicBool>,
     model_unavailable: Arc<AtomicU8>,
+    configuration: Option<crate::search_config::SearchConfiguration>,
 }
 
 impl SearchModelStatus {
@@ -186,6 +189,7 @@ impl SearchModelStatus {
         SearchAvailability {
             backend: Some(self.backend),
             unavailable_reason: self.unavailable_reason(),
+            configuration: self.configuration.clone(),
         }
     }
 
@@ -283,6 +287,7 @@ impl SearchModel {
                 backend,
                 ready: Arc::new(AtomicBool::new(false)),
                 model_unavailable: Arc::new(AtomicU8::new(unavailable)),
+                configuration: None,
             },
         })
     }
@@ -298,6 +303,14 @@ impl SearchModel {
             .model_unavailable
             .store(MODEL_AVAILABLE_OR_UNTRIED, Ordering::Release);
         Ok(model)
+    }
+
+    pub(crate) fn with_configuration(
+        mut self,
+        configuration: crate::search_config::SearchConfiguration,
+    ) -> Self {
+        self.status.configuration = Some(configuration);
+        self
     }
 
     pub fn backend(&self) -> Backend {

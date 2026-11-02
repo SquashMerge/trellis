@@ -2922,6 +2922,15 @@ async fn selected_status_head_is_the_bounded_digest_of_the_same_status() {
     for key in keys {
         assert_eq!(head[key], full[key], "{key}: {head} differs from status");
     }
+    // Factory-only registries have no startup configuration, but full status
+    // still carries the same search availability as CLI/workspace describe.
+    assert_eq!(
+        full.get("searchIndex"),
+        Some(&serde_json::json!({
+            "backend": null,
+            "unavailableReason": null
+        }))
+    );
     // Fixed fields only: statistics and diagnostics, which grow with the checkout, stay on status.
     assert!(full.get("stats").is_some() && full.get("diagnostics").is_some());
     let digest = serde_json::to_vec(&head).unwrap().len();
