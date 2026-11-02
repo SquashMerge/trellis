@@ -6,6 +6,42 @@ use std::time::Instant;
 
 pub const MAX_FRAME: usize = 1024 * 1024;
 
+pub const MCP_RESTART_REQUIRED: &str = "mcp_restart_required";
+pub const MCP_RESTART_MESSAGE: &str =
+    "Trellis MCP protocol changed; restart the MCP server to use the installed binary.";
+
+/// Private MCP compatibility, independent of build diagnostics and index identity.
+/// Bump the domain revision for incompatible relay changes outside the catalog.
+pub fn mcp_identity() -> &'static str {
+    static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"trellis-mcp-relay-v1\0");
+        hash.update(
+            serde_json::to_vec(&crate::mcp::catalog::entries()).expect("static MCP catalog"),
+        );
+        hex::encode(hash.finalize())
+    })
+}
+
+pub fn check_mcp_identity(value: Option<&serde_json::Value>) -> io::Result<()> {
+    if value.and_then(serde_json::Value::as_str) == Some(mcp_identity()) {
+        Ok(())
+    } else {
+        Err(io::Error::other(McpRestartRequired))
+    }
+}
+
+#[derive(Debug)]
+pub struct McpRestartRequired;
+impl std::fmt::Display for McpRestartRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{MCP_RESTART_REQUIRED}: {MCP_RESTART_MESSAGE}")
+    }
+}
+impl std::error::Error for McpRestartRequired {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Request {
     pub id: u64,

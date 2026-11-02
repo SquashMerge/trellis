@@ -22,9 +22,18 @@ Legacy mode starts with MCP `initialize` carrying `protocolVersion`, `capabiliti
 | Invalid JSON-RPC shape, batches, oversized input, lifecycle violation | `-32600` |
 | Unknown method | `-32601` |
 | Invalid protocol parameters, missing modern metadata, supplied list cursor, unknown tool | `-32602` |
-| Unexpected internal protocol failure | `-32603` |
+| Internal protocol failure or incompatible MCP relay/daemon identity | `-32603` |
 | Valid non-tool stdio request refused because the connection already has 16 outstanding non-call requests (Decision 0009) | `-32000` Server error; original ID and bounded `error.data.code:"too_many_requests"` |
 | Unsupported modern revision | `-32022` |
+
+Before forwarding MCP traffic, the relay and daemon compare a private protocol
+identity on every socket attachment, including replacement daemons. The identity
+binds the complete tool catalog and relay protocol revision; it is independent of
+build diagnostics and index identity. Missing or different identities refuse the
+attachment before workspace attachment or tool execution. The relay returns a
+JSON-RPC error (not a tool result) with `error.data.code:"mcp_restart_required"`,
+`error.data.retryable:false`, and an instruction to restart the MCP server. That
+relay stops reconnecting after a mismatch. Tool output schemas are unchanged.
 
 For `-32022`, include required JSON-RPC `error.data:{supported:["2026-07-28","2025-11-25"],requested:<requested-version>}` so the client can negotiate; the requested value is the unsupported revision received. `-32021` is reserved for genuinely required missing client capability (none here); `-32020` HeaderMismatch does not apply to stdio. Bad **application** arguments to a known tool instead return the typed error envelope. Oversized wire input is discarded through its line delimiter and receives bounded `-32600`; malformed parsing has `-32700` precedence when no valid request was obtained.
 
