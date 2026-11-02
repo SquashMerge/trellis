@@ -4056,6 +4056,8 @@ async fn architecture_cli_waits_for_startup_reconciliation_after_typed_admission
         String::from_utf8_lossy(&indexed.stderr)
     );
     let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    let initial_identity = trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid"))
+        .expect("initial fixture daemon identity");
     daemon.stop_attested().unwrap();
     let dbpath = real_index_db(&home);
     let use_lock = dbpath.parent().unwrap().with_extension("lock");
@@ -4076,6 +4078,7 @@ async fn architecture_cli_waits_for_startup_reconciliation_after_typed_admission
     let wait_listener = tokio::net::UnixListener::bind(&wait_path).unwrap();
     let stdout_path = temp.path().join("references.stdout");
     let stderr_path = temp.path().join("references.stderr");
+    let replacement = FixtureDaemon::new(&home);
     let mut read = command(&root, &home, "references");
     read.env("TRELLIS_TEST_DAEMON_STARTUP_SOCKET", &startup_path)
         .env("TRELLIS_TEST_CLI_READ_WAIT_SOCKET", &wait_path)
@@ -4130,4 +4133,17 @@ async fn architecture_cli_waits_for_startup_reconciliation_after_typed_admission
         references["payload"]["production"][0]["target"]["path"],
         "src/high.rs"
     );
+    let successor = trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid"))
+        .expect("replacement fixture daemon identity");
+    assert!(
+        successor.matches(),
+        "replacement daemon exited before cleanup"
+    );
+    assert_ne!(
+        serde_json::to_value(initial_identity).unwrap(),
+        serde_json::to_value(successor).unwrap(),
+        "references must have elected a replacement daemon",
+    );
+    drop(replacement);
+    trellis::testing::wait_until("replacement daemon cleanup", || !successor.matches());
 }
