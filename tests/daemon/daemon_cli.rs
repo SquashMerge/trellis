@@ -214,7 +214,10 @@ fn daemon_cleanup_uses_its_recorded_identity_across_restarts() {
         let mut daemon = detached(command);
         trellis::testing::wait_until("fixture daemon socket", || {
             assert!(daemon.0.try_wait().unwrap().is_none());
-            std::os::unix::net::UnixStream::connect(&socket).is_ok()
+            fs::read_to_string(&marker).ok().as_deref() == Some(&daemon.0.id().to_string())
+                && trellis::testing::daemon_marker_identity(&marker)
+                    .is_some_and(|identity| identity.matches())
+                && std::os::unix::net::UnixStream::connect(&socket).is_ok()
         });
         daemon
     };
