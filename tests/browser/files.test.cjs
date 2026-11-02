@@ -284,8 +284,8 @@ test("Files Open full opens Sequence over a last-used Treemap; the mini fits, th
   // Source-margin actions name the declaration, never its opaque ID.
   const action = page.locator(`.source-diagram-action[data-symbol-id="${method.symbol.id}"]`);
   await action.waitFor({state:"attached"});
-  assert.equal(await action.getAttribute("aria-label"), "Sequence for measured · syntax");
-  assert.equal(await action.getAttribute("title"), "Sequence · syntax · measured");
+  assert.equal(await action.getAttribute("aria-label"), "Sequence for measured · measured declaration");
+  assert.equal(await action.getAttribute("title"), "Sequence · measured declaration · measured");
   for (const label of await page.locator(".source-diagram-action").evaluateAll(nodes => nodes.flatMap(node => [node.getAttribute("aria-label"), node.title]))) {
     assert.doesNotMatch(label, /sid:|:v1:/, label);
   }
