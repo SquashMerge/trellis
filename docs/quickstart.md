@@ -147,7 +147,7 @@ The top bar switches between **Diagrams** and **Files**.
 
 - **Architecture** draws your layers and the references between them, with arrows that break your rules in red. It needs a [rules file](#6-architecture-rules). Without one, it tells you so.
 - **Treemap** shows folders and files sized by lines. Color shows a complexity metric that you choose, or production versus test.
-- **Sequence** shows what a method does, step by step: calls, branches and returns. Pick a method from **Most complex methods** or from the file tree. These are static possible paths, not a runtime trace. **Show N incidental calls** reveals the calls hidden by default.
+- **Sequence** shows what a method does, step by step: calls, branches and returns. Pick a method from **Most complex methods** or from the file tree. These are static possible paths, not a runtime trace. **Show all steps** restores admitted detail and incidental calls; **Show calls** returns to the calls-first view.
 - **Classes** finds a class and shows its declared fields and methods.
 
 **Files** is a file tree with a read-only source view. It shows the indexed version of a file, and uncommitted changes against `HEAD` when you have them.

@@ -64,7 +64,7 @@ To keep diagrams readable, some calls are hidden as *incidental*:
 - **Logging:** calls that look like logging by their name, such as `logger.info(...)`, `console.log(...)` and Rust `info!`. This is a naming rule, not proof that the call has no effects, and it also hides your own wrapper with such a name.
 - **Trivial accessors:** calls with a verified target whose body only returns or sets a field. These need semantic evidence.
 
-A call that may return early always stays visible. **Show N incidental calls** reveals what's hidden. A single call can count as several steps there, because its arguments are hidden with it.
+A call that may return early always stays visible. **Show all steps** restores admitted detail and incidental calls; **Show calls** returns to the calls-first view. This does not recover calls omitted by backend limits.
 
 Diagrams are also bounded: long methods stop at a step limit, with a warning that says so.
 
