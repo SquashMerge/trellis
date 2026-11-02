@@ -1081,6 +1081,15 @@ test("Architecture unassigned files match rules_check without counting external 
     assert.equal(files.length, mcp.unassignedFileCount, "the full native inventory agrees with the checkout-wide rules count");
     assert.ok(files.includes("src/only.rs"), "test-only files still belong to the file inventory");
     assert.ok(files.includes("src/isolated.rs"), "files without references still belong to the file inventory");
+    assert.ok(files.includes("src/latin.rs"), "a module-only file without references still belongs to the file inventory");
+    assert.ok(dto.partialFiles.some(file => file.path === "src/latin.rs" && file.reason === "not_utf8"));
+    const partialModule = dto.modules.find(module => module.identity.path === "src/latin.rs");
+    assert.equal(partialModule.declarationCount, 0);
+    assert.equal(typeof partialModule.revisionId, "string");
+    assert.equal(typeof partialModule.contentHash, "string");
+    assert.equal(typeof partialModule.provenanceId, "string");
+    assert.ok(checked.unassigned.some(identity => identityKey(identity) === identityKey(partialModule.identity)));
+    assert.ok(dto.edges.every(edge => edge.pairs.every(pair => pair.source.path !== "src/latin.rs" && pair.target.path !== "src/latin.rs")), "the partial module invents no reference edges");
     assert.equal(await page.locator("#architecture-unassigned").textContent(), `${checked.unassignedFileCount} unassigned files`);
     await page.locator("#architecture-unassigned").click();
     assert.deepEqual(await page.locator("#architecture-review-list .architecture-rule-row").evaluateAll(rows => rows.map(row => row.dataset.source).sort()), files);
@@ -1091,7 +1100,7 @@ test("Architecture unassigned files match rules_check without counting external 
   await page.setViewportSize({width:390, height:844});
   await noOverflow(page);
   await capture(page, "architecture-unassigned-mobile");
-}, new Map([...libraryFiles, ["src/isolated.rs", "// No references or declarations.\n"]]), sources, {git:true}));
+}, new Map([...libraryFiles, ["src/isolated.rs", "// No references or declarations.\n"], ["src/latin.rs", Buffer.from([0xff])]]), sources, {git:true}));
 
 test("Architecture opens an external package reference in the library catalog, without a Libraries tab", {timeout:240000}, async () => published(rules, async selected => {
   const {page, paths, server, requests} = selected;
