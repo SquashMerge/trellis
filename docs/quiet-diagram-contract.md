@@ -4,15 +4,23 @@ Simplify verbose sequence labels and large class views with repeated paths and m
 Simplify defaults, not evidence. Frontend-only; DO NOT edit native extraction, API, cache/schema,
 providers or inspected repositories. Preserve snapshots/tokens/views/notes/budgets.
 
-Sequence owner: web/sequence.js web/style.css tests/sequence-ui.test.cjs ONLY.
-- Compact effect/return/definition/protocol boundary labels; no full RHS/return source by default.
-  Keep every original step/call ID/range/order and conditional scope. No hiding calls/unsupported boundaries.
+Sequence display (#594): web/sequence.js shares the display projection with web/sequence-pele.js.
+- Calls-first is the default. Hide standalone writes, bindings, returns and deferred-definition
+  leaves until Show all steps. Keep admitted measured calls/collapsed entry previews in order,
+  enclosing branch/alternative/loop/try scope, concise unknown/protocol boundaries and early-exit
+  context. Hiding a return's value text must not make a later call appear unconditional.
+  Keep every original step/call ID/range in the DTO; selection receives the original object.
 - Known generated continuation guard (exact label, no alternate) can use a quiet labelled guard rail
   rather than full alt box. It must remain visibly conditional; not an ordinary unconditional suffix.
   Other branches/loops/try keep structured frames. No merging/removing guards or alternatives.
-- Non-call notes should be quiet rows/small indicators rather than full-width boxed paragraphs.
-  Uncertainty remains visible in concise labels. Full original labels in aria/title/inspector and
-  Show all steps restores full labels/frame presentation. Call lanes/collapsed entry previews unchanged.
+- Retained context uses quiet rows/small indicators rather than full-width boxed paragraphs.
+  Uncertainty remains visible in concise labels. Full original labels remain in aria/title/inspector;
+  Show all steps restores admitted non-call rows and full labels/frame presentation, using the same
+  setting as incidental-call disclosure. Call lanes/collapsed entry previews stay unchanged.
+- A zero-call view says non-call behavior may be hidden and offers Show all steps; it never says
+  the method does nothing. Unknown markers and truncation warnings remain visible. This display
+  projection cannot recover calls omitted by server limits: visible 200, seed 150/callee reserve 50,
+  work/depth/participant bounds are unchanged.
 - Synthetic regression example (not an observed run): call prepare_handler -> write -> nested-definition boundary ->
   continuation guard with PipelineStep/Pipeline calls and return. Assert all IDs/ordering, immutable DTO, guards,
   callback original fullstep, keyboard and full-detail restoration. Existing grouping tests stay valid.

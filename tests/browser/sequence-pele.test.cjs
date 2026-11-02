@@ -509,3 +509,40 @@ test("currently pinned synchronous Pele failure visibly falls back to complete l
  assert.equal(result.started,true);assert.match(result.reason,/Pele renderer failed/);
  assertVisibleFallback(result,steps(view.steps).map(step=>step.id),view.steps[0].label);
 });
+
+test("calls-first keeps conditional and unknown context, exact selection and admitted detail in both renderers", async () => {
+ const view=fixture("rust"),template=view.steps[0];
+ const leaf=(id,kind,label=id,extra={})=>({...structuredClone(template),id,kind,label,callId:null,target:undefined,callEvidence:undefined,children:[],alternate:[],hidden:false,...extra});
+ const call=id=>leaf(id,"call",id,{callId:id});
+ view.steps=[call("prepare"),leaf("write","effect","write: state = ready"),leaf("definition","definition","define callback · body deferred"),
+  leaf("nested","boundary","Nested callable boundary: body does not execute at definition; captures are not expanded."),
+  leaf("condition","branch","if ready",{children:[call("ready"),leaf("return","return","return result")],alternate:[call("fallback"),leaf("write-alt","effect","write: fallback")]}),
+  leaf("loop","loop","loop_expression: possible iterations, not unrolled; exit/termination unknown",{children:[call("repeat"),leaf("write-loop","effect","write: iteration")]}),
+  leaf("unknown","boundary","Unsupported complex control: possible behavior remains unknown; body not expanded."),
+  leaf("continuation","branch","only if the preceding path continues normally",{children:[call("finish")]}),leaf("last-return","return","return final_value")];
+ const result=await page.evaluate(async view=>{
+  const walk=roots=>roots.flatMap(step=>[step,...walk(step.children),...walk(step.alternate)]),original=walk(view.steps),before=JSON.stringify(view);
+  const freeze=value=>{if(value&&typeof value==="object"){Object.freeze(value);Object.values(value).forEach(freeze);}return value;};freeze(view);
+  const container=document.querySelector("#sequence-diagram"),results=[];
+  for(const renderer of [TrellisSequence,TrellisPeleSequence]) {
+   const selected=[],options={onSelect:step=>selected.push(step)},expanded=new Set();
+   const outcome=await renderer.render(container,view,null,expanded,options);
+   if(outcome&&outcome.status!=="rendered")throw Error(outcome.reason);
+   const selector=renderer===TrellisSequence?"[data-source-step-id]":".pele-note[data-trellis-step-id],.pele-edge-label[data-trellis-step-id]";
+   const nodes=[...container.querySelectorAll(selector)],ids=nodes.map(node=>node.dataset.sourceStepId||node.dataset.trellisStepId);
+   for(const node of nodes)node.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
+   const exact=selected.every((step,i)=>step===original.find(original=>original.id===ids[i]));
+   const unknown=container.textContent.includes("behavior unknown"),exit=container.textContent.includes("may exit early");
+   await renderer.render(container,view,null,expanded,{...options,showDetails:true});
+   const restored=[...container.querySelectorAll(selector)].map(node=>node.dataset.sourceStepId||node.dataset.trellisStepId);
+   results.push({ids,exact,unknown,exit,restored,fullWrite:container.textContent.includes("write: state = ready"),unchanged:JSON.stringify(view)===before});
+  }
+  return {results,original:original.map(step=>step.id)};
+ },view);
+ assert.equal(result.original.length,16);
+ for(const rendered of result.results) {
+  assert.deepEqual(rendered.ids,["prepare","condition","ready","fallback","loop","repeat","unknown","continuation","finish"]);
+  assert.ok(rendered.exact);assert.ok(rendered.unknown);assert.ok(rendered.exit);assert.ok(rendered.fullWrite);assert.ok(rendered.unchanged);
+  assert.deepEqual(rendered.restored,result.original);
+ }
+});
