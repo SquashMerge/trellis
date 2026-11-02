@@ -186,9 +186,8 @@ impl FixtureDaemon {
     }
 
     fn stop_attested(&self) -> Result<(), &'static str> {
-        if self.1.replace(true) {
-            return Ok(());
-        }
+        // Explicit calls may retire a restarted fixture. Drop must not discover one.
+        self.1.set(true);
         let marker = self.0.join("auto-daemon.pid");
         let raw = fs::read_to_string(&marker).map_err(|_| "pid_marker_missing")?;
         let pid = raw.parse::<u32>().map_err(|_| "pid_marker_invalid")?;
@@ -246,7 +245,9 @@ impl FixtureDaemon {
 }
 impl Drop for FixtureDaemon {
     fn drop(&mut self) {
-        let _ = self.stop_attested();
+        if !self.1.get() {
+            let _ = self.stop_attested();
+        }
     }
 }
 

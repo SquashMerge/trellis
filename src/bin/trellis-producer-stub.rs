@@ -15,6 +15,10 @@
 //!
 //! `--sleep-forever` is the descendant mode used by `tree`.
 
+#[path = "../producer/process_info.rs"]
+#[allow(dead_code)]
+mod process_info;
+
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -92,10 +96,8 @@ fn main() {
     if let Some(pidfile) = mode["tree"].as_str() {
         let exe = std::env::current_exe().expect("current_exe");
         let mut pids = vec![std::process::id()];
-        let mut identities = vec![
-            trellis::testing::ProcessIdentity::capture(std::process::id() as libc::pid_t)
-                .expect("own identity"),
-        ];
+        let identity = |pid: u32| json!({"pid": pid, "start_time": process_info::start_time(pid as libc::pid_t).expect("process identity")});
+        let mut identities = vec![identity(std::process::id())];
         for _ in 0..2 {
             // The descendants outlive this process on purpose.
             #[allow(clippy::zombie_processes)]
@@ -104,10 +106,7 @@ fn main() {
                 .spawn()
                 .expect("descendant");
             pids.push(child.id());
-            identities.push(
-                trellis::testing::ProcessIdentity::capture(child.id() as libc::pid_t)
-                    .expect("descendant identity"),
-            );
+            identities.push(identity(child.id()));
         }
         fs::write(
             Path::new(pidfile).with_extension("identity.json"),
