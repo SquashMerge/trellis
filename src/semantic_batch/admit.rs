@@ -12,7 +12,10 @@ use super::{
     staging::{Stage, StageBudget, StageClaimSink, artifact_file, lookup_assigned},
 };
 use crate::{
-    index_coordinator::{CopiedInput, copy_semantic_input_to_stage, open_semantic_input},
+    index_coordinator::{
+        CopiedInput, copy_semantic_input_to_stage, copy_stream_to_stage,
+        open_frozen_semantic_input, open_semantic_input,
+    },
     model::{CancelFlag, IndexPin},
     native_evidence as native,
     scip_admission::{PinnedProducer, admission, file_uri, order},
@@ -28,6 +31,233 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::Ordering,
 };
+
+/// Remember genuine reader errors that the decoder's wire-format API cannot carry. EOF
+/// synthesized by `read_exact` remains a malformed/truncated artifact, not an I/O fault.
+struct TrackedRead<R> {
+    inner: R,
+    fault: std::rc::Rc<std::cell::RefCell<Option<std::io::Error>>>,
+}
+
+#[cfg(all(test, feature = "test-support"))]
+thread_local! {
+    static FAIL_DECODE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PREFLIGHT_FAULT: std::cell::Cell<Option<(&'static str, &'static str)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) fn fail_preflight_at(point: &'static str, kind: &'static str) {
+    PREFLIGHT_FAULT.with(|fault| fault.set(Some((point, kind))));
+}
+
+fn preflight_fault(point: &str) -> Result<()> {
+    #[cfg(all(test, feature = "test-support"))]
+    if let Some(kind) = PREFLIGHT_FAULT.with(|fault| {
+        let current = fault.get();
+        if current.is_some_and(|(selected, _)| selected == point) {
+            fault.set(None);
+            current.map(|(_, kind)| kind)
+        } else {
+            None
+        }
+    }) {
+        return Err(match kind {
+            "corrupt" => rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                None,
+            )
+            .into(),
+            "corrupt-wrapped" => anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                None,
+            ))
+            .context("producer_failed: native read"),
+            "conversion" => {
+                rusqlite::Error::InvalidColumnType(0, "test".into(), rusqlite::types::Type::Real)
+                    .into()
+            }
+            "busy" => rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )
+            .into(),
+            "native" => {
+                crate::store::SelectedIntegrity("incompatible_index: injected native fault".into())
+                    .into()
+            }
+            _ => unreachable!(),
+        });
+    }
+    let _ = point;
+    Ok(())
+}
+
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) fn fail_next_decode_read() {
+    FAIL_DECODE_READ.with(|flag| flag.set(true));
+}
+
+impl<R: Read> Read for TrackedRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(all(test, feature = "test-support"))]
+        let result = if FAIL_DECODE_READ.with(|flag| flag.replace(false)) {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            self.inner.read(buf)
+        };
+        #[cfg(not(all(test, feature = "test-support")))]
+        let result = self.inner.read(buf);
+        match result {
+            Err(error) if error.kind() != std::io::ErrorKind::Interrupted => {
+                let returned = std::io::Error::new(error.kind(), error.to_string());
+                *self.fault.borrow_mut() = Some(error);
+                Err(returned)
+            }
+            other => other,
+        }
+    }
+}
+
+/// Observable boundaries of a frozen producer batch. Decode events surround the production
+/// streaming decoder itself, not the shallow producer scan or the preceding stage copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrozenPhase {
+    FrozenBatch,
+    SnapshotRead,
+    SnapshotWrite,
+    ShallowScan,
+    BatchPages,
+    Durability,
+    /// The pre-decode source-disposition pass.
+    CoveragePass,
+    ArtifactPass,
+    FullDecode,
+    /// The post-decode check that every covered source was actually emitted.
+    CoverageClosure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FrozenEvent {
+    Begin(FrozenPhase),
+    /// Snapshot read/write counts bytes, batch pages counts inventory documents, and the
+    /// shallow scan counts checked steps. Other phases do not currently emit progress.
+    Progress(FrozenPhase, u64),
+    BeforeSync(FrozenSync),
+    End(FrozenPhase, Result<(), String>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrozenSync {
+    SnapshotFile,
+    PageFile,
+    DescriptorFile,
+    BatchDirectory,
+    GenerationDirectory,
+    AncestorDirectory(usize),
+}
+
+pub(crate) fn observed<T>(
+    observer: &dyn Fn(FrozenEvent),
+    phase: FrozenPhase,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    observer(FrozenEvent::Begin(phase));
+    let result = operation();
+    let status = result.as_ref().map(|_| ()).map_err(|error| {
+        if let Some(typed) = preserved_error(error) {
+            typed
+        } else if let Some(error) = error.downcast_ref::<ScipCaptureError>() {
+            match error {
+                ScipCaptureError::Cancelled => "cancelled".to_owned(),
+                ScipCaptureError::LimitExceeded(detail) => format!("limit_exceeded: {detail}"),
+                _ => format!("producer_output_invalid: {}", error.detail()),
+            }
+        } else {
+            let message = error.to_string();
+            if crate::store::transient_storage_contention(error) {
+                format!("storage_busy: {message}")
+            } else {
+                format!("producer_failed: {message}")
+            }
+        }
+    });
+    observer(FrozenEvent::End(phase, status));
+    result
+}
+
+pub(crate) fn preserved_error(error: &anyhow::Error) -> Option<String> {
+    let preferred = error.chain().find_map(|cause| {
+        let message = cause.to_string();
+        let class = message.split(':').next().unwrap_or("");
+        [
+            "root_changed",
+            "storage_busy",
+            "cancelled",
+            "limit_exceeded",
+        ]
+        .contains(&class)
+        .then_some(message)
+    });
+    if preferred.is_some() {
+        return preferred;
+    }
+    if let Some(error) = error.downcast_ref::<ScipCaptureError>() {
+        match error {
+            ScipCaptureError::Cancelled => return Some("cancelled".to_owned()),
+            ScipCaptureError::LimitExceeded(detail) => {
+                return Some(format!("limit_exceeded: {detail}"));
+            }
+            _ => {}
+        }
+    }
+    error.chain().find_map(|cause| {
+        let message = cause.to_string();
+        let class = message.split(':').next().unwrap_or("");
+        [
+            "producer_output_invalid",
+            "producer_output_missing",
+            "producer_failed",
+            "invalid_request",
+            "stale_basis",
+            "capture_unavailable",
+            "index_not_ready",
+            "store_unavailable",
+            "producer_state_corrupt",
+            "incompatible_index",
+            "recovery_required",
+        ]
+        .contains(&class)
+        .then_some(message)
+    })
+}
+
+/// Used only after a live native-reader boundary has classified the error. A stage failure
+/// must never be passed here: it may contain the same SQLite codes as live-index corruption.
+pub(crate) fn native_read_error(error: anyhow::Error) -> anyhow::Error {
+    if preferred_native_error(&error).is_some()
+        || crate::store::transient_storage_contention(&error)
+    {
+        return error;
+    }
+    if Store::is_index_recovery_failure(&error) {
+        return error.context("recovery_required: retained native index corruption");
+    }
+    error
+}
+
+fn preferred_native_error(error: &anyhow::Error) -> Option<String> {
+    preserved_error(error).filter(|message| {
+        [
+            "root_changed",
+            "storage_busy",
+            "cancelled",
+            "limit_exceeded",
+            "incompatible_index",
+            "recovery_required",
+        ]
+        .contains(&message.split(':').next().unwrap_or(""))
+    })
+}
 
 /// Who owns the stage: the claimed request and its claim incarnation.
 #[derive(Debug, Clone, Copy)]
@@ -181,6 +411,7 @@ impl Passes<'_> {
                     cargo.add_document(&row.relative_path, &bytes);
                 }
                 hasher.push(&row.language, &row.relative_path, &row.content_hash);
+                preflight_fault("stage-source")?;
                 conn.prepare_cached(
                     "INSERT INTO sources(ord, language, path, content_hash, byte_length) VALUES(?1,?2,?3,?4,?5)",
                 )?
@@ -286,6 +517,7 @@ impl Passes<'_> {
 
     /// Copies each artifact into the stage, authenticates the copy against the descriptor,
     /// then decodes the staged copy into `claims`.
+    #[cfg(feature = "test-support")]
     pub fn artifact_pass(
         &self,
         stage_dir: &Path,
@@ -294,6 +526,28 @@ impl Passes<'_> {
         native: &mut dyn NativeSource,
         cargo_targets: &scip_raw::CargoTargets,
         counters: &mut BatchCounters,
+    ) -> Result<()> {
+        self.artifact_pass_observed(
+            stage_dir,
+            conn,
+            inputs,
+            native,
+            cargo_targets,
+            counters,
+            &|_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn artifact_pass_observed(
+        &self,
+        stage_dir: &Path,
+        conn: &Connection,
+        inputs: &mut dyn BatchInputs,
+        native: &mut dyn NativeSource,
+        cargo_targets: &scip_raw::CargoTargets,
+        counters: &mut BatchCounters,
+        observer: &dyn Fn(FrozenEvent),
     ) -> Result<()> {
         let descriptor = self.descriptor;
         for entry in &descriptor.artifacts {
@@ -315,24 +569,45 @@ impl Passes<'_> {
             if copied.sha256 != entry.sha256 {
                 return Err(admission("artifact digest").into());
             }
-            self.decode(entry, &dest, conn, native, cargo_targets, counters)?;
+            observed(observer, FrozenPhase::FullDecode, || {
+                self.decode(entry, &dest, conn, native, cargo_targets, counters)
+            })?;
             #[cfg(all(feature = "test-support", unix))]
             if entry.ordinal == 0 {
                 pause_after_first_artifact()?;
             }
         }
-        let unseen: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM coverage c WHERE c.artifact IS NOT NULL \
-             AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.source_ord=c.source_ord)",
-            [],
-            |r| r.get(0),
-        )?;
-        if unseen != 0 {
-            return Err(
-                ScipCaptureError::InvalidArtifact("missing artifact document".into()).into(),
-            );
+        // Exercise the actual closure query with a missing staged document, using the stage's
+        // own connection rather than opening a second handle on its live SQLite file.
+        #[cfg(all(test, feature = "test-support"))]
+        if PREFLIGHT_FAULT.with(|fault| {
+            if fault.get() == Some(("stage-closure", "remove-document")) {
+                fault.set(None);
+                true
+            } else {
+                false
+            }
+        }) {
+            let removed = conn.execute(
+                "DELETE FROM documents WHERE source_ord=(SELECT MIN(source_ord) FROM documents)",
+                [],
+            )?;
+            anyhow::ensure!(removed == 1, "test fixture missing decoded document");
         }
-        Ok(())
+        observed(observer, FrozenPhase::CoverageClosure, || {
+            let unseen: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM coverage c WHERE c.artifact IS NOT NULL \
+                 AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.source_ord=c.source_ord)",
+                [],
+                |r| r.get(0),
+            )?;
+            if unseen != 0 {
+                return Err(
+                    ScipCaptureError::InvalidArtifact("missing artifact document".into()).into(),
+                );
+            }
+            Ok(())
+        })
     }
 
     fn decode(
@@ -345,6 +620,7 @@ impl Passes<'_> {
         counters: &mut BatchCounters,
     ) -> Result<()> {
         let descriptor = self.descriptor;
+        preflight_fault("stage-artifact")?;
         let assigned: i64 = conn.query_row(
             "SELECT COUNT(*) FROM coverage WHERE artifact=?1",
             [entry.ordinal],
@@ -408,8 +684,13 @@ impl Passes<'_> {
             }
         };
         let file = std::fs::File::open(staged).context("staged artifact")?;
+        let read_fault = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let reader = TrackedRead {
+            inner: file,
+            fault: read_fault.clone(),
+        };
         let decoded = decode_streaming(
-            file,
+            reader,
             entry.byte_length,
             &context,
             &mut resolve,
@@ -419,7 +700,11 @@ impl Passes<'_> {
             self.cancel,
         );
         if let Err(error) = decoded {
-            return Err(sink.take_fault().or(fault).unwrap_or_else(|| error.into()));
+            return Err(sink
+                .take_fault()
+                .or(fault)
+                .or_else(|| read_fault.borrow_mut().take().map(anyhow::Error::new))
+                .unwrap_or_else(|| error.into()));
         }
         sink.finish()?;
         Ok(())
@@ -447,11 +732,32 @@ fn pause_after_first_artifact() -> Result<()> {
 /// File-backed pages and artifacts, opened with the no-follow rules under the workspace root.
 pub(crate) struct FileInputs<'a> {
     pub root: &'a Path,
+    pub frozen_store: Option<&'a Store>,
+}
+
+fn frozen_input_error(store: &Store, error: anyhow::Error) -> anyhow::Error {
+    if let Err(root) = store.verify_root()
+        && (root.to_string() == "root_changed" || root.to_string().starts_with("root_changed:"))
+    {
+        let message = root.to_string();
+        return error.context(if message == "root_changed" {
+            "root_changed: captured root lost".to_owned()
+        } else {
+            message
+        });
+    }
+    error
 }
 
 impl BatchInputs for FileInputs<'_> {
     fn page(&mut self, entry: &PageEntry) -> Result<Vec<u8>> {
-        let (file, len) = open_semantic_input(self.root, &self.root.join(&entry.relative_path))?;
+        let path = self.root.join(&entry.relative_path);
+        let (file, len) = if let Some(store) = self.frozen_store {
+            open_frozen_semantic_input(self.root, &path)
+                .map_err(|error| frozen_input_error(store, error))?
+        } else {
+            open_semantic_input(self.root, &path)?
+        };
         if len != entry.byte_length {
             return Err(admission("page length").into());
         }
@@ -467,6 +773,21 @@ impl BatchInputs for FileInputs<'_> {
         limits: &BatchLimits,
         progress: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<CopiedInput> {
+        if let Some(store) = self.frozen_store {
+            let (file, len) =
+                open_frozen_semantic_input(self.root, &self.root.join(&entry.relative_path))
+                    .map_err(|error| frozen_input_error(store, error))?;
+            if len > limits.artifact_bytes {
+                return Err(ScipCaptureError::LimitExceeded("artifact bytes".into()).into());
+            }
+            return copy_stream_to_stage(
+                file,
+                dest,
+                limits.artifact_bytes,
+                super::limits::IO_BUFFER_BYTES as usize,
+                progress,
+            );
+        }
         copy_semantic_input_to_stage(
             self.root,
             &self.root.join(&entry.relative_path),
@@ -481,18 +802,48 @@ impl BatchInputs for FileInputs<'_> {
 pub(crate) struct ReaderSource<'r, 'a> {
     pub reader: &'r NativeReader<'a>,
     pub stream: Option<InventoryStream<'r>>,
+    /// Only failures from the retained index cross `with_native_reader`'s recovery boundary.
+    native_fault: Option<anyhow::Error>,
+}
+
+impl ReaderSource<'_, '_> {
+    fn capture<T>(&mut self, result: Result<T>) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let message = preferred_native_error(&error).unwrap_or_else(|| {
+                    if crate::store::transient_storage_contention(&error) {
+                        "storage_busy: native source read".to_owned()
+                    } else if Store::is_index_recovery_failure(&error) {
+                        "recovery_required: retained native index corruption".to_owned()
+                    } else {
+                        "native reader failed".to_owned()
+                    }
+                });
+                self.native_fault = Some(error);
+                Err(anyhow::anyhow!(message))
+            }
+        }
+    }
 }
 
 impl NativeSource for ReaderSource<'_, '_> {
     fn next_inventory(&mut self) -> Result<Option<native::Document>> {
-        match self.stream.as_mut() {
+        let result = preflight_fault("native-source").and_then(|()| match self.stream.as_mut() {
             Some(stream) => stream.next_document(),
             None => Ok(None),
-        }
+        });
+        self.capture(result)
     }
 
     fn source_bytes(&mut self, document: &native::Document) -> Result<Vec<u8>> {
-        self.reader.source_bytes(document)
+        let point = if self.stream.is_some() {
+            "native-source-bytes"
+        } else {
+            "native-artifact"
+        };
+        let result = preflight_fault(point).and_then(|()| self.reader.source_bytes(document));
+        self.capture(result)
     }
 }
 
@@ -553,11 +904,46 @@ pub fn stage_batch(
     counters: &mut BatchCounters,
     cancel: &CancelFlag,
 ) -> Result<AdmittedBatch> {
+    stage_batch_in(
+        store,
+        input,
+        owner,
+        descriptor_path,
+        descriptor_sha256,
+        limits,
+        counters,
+        cancel,
+        None,
+        &|_| {},
+    )
+}
+
+/// Preflight uses a private parent owned by the producer operation, outside the index startup
+/// sweep. All admission passes and resource accounting are otherwise the same as the worker's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stage_batch_in(
+    store: &Store,
+    input: &StageInput,
+    owner: StageOwner<'_>,
+    descriptor_path: &Path,
+    descriptor_sha256: &str,
+    limits: &BatchLimits,
+    counters: &mut BatchCounters,
+    cancel: &CancelFlag,
+    stage_parent: Option<&Path>,
+    observer: &dyn Fn(FrozenEvent),
+) -> Result<AdmittedBatch> {
     #[cfg(feature = "test-support")]
     super::testing::reset_whole_snapshot_reads();
     check_cancel(cancel)?;
     let root = input.input_root.as_path();
-    let (file, len) = open_semantic_input(root, descriptor_path)?;
+    let frozen = stage_parent.is_some();
+    let (file, len) = if frozen {
+        open_frozen_semantic_input(root, descriptor_path)
+            .map_err(|error| frozen_input_error(store, error))?
+    } else {
+        open_semantic_input(root, descriptor_path)?
+    };
     if len > limits.descriptor_bytes {
         return Err(ScipCaptureError::LimitExceeded("descriptor bytes".into()).into());
     }
@@ -569,25 +955,56 @@ pub fn stage_batch(
     let captured: IndexPin = store
         .retained_native_pin_for(&descriptor.source_revision, &descriptor.source_set.id)
         .map_err(|error| {
-            if error.to_string().contains("capture_unavailable") {
+            if error.to_string().contains("capture_unavailable")
+                && matches!(
+                    error.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::QueryReturnedNoRows)
+                )
+            {
                 anyhow::anyhow!("capture_unavailable: captured revision not retained")
             } else {
-                error
+                native_read_error(error)
             }
         })?;
-    store.with_native_reader(captured, |reader| {
-        let header = reader.header()?;
-        Ok(descriptor.bind_header(&input.project_roots, &header.source_set, &header.revision)?)
-    })?;
+    store
+        .with_native_reader(captured, |reader| {
+            let header = reader.header()?;
+            Ok(descriptor.bind_header(
+                &input.project_roots,
+                &header.source_set,
+                &header.revision,
+            )?)
+        })
+        .map_err(native_read_error)?;
     descriptor.check_pages(limits)?;
     descriptor.check_artifacts(limits)?;
-    descriptor.check_paths(root)?;
-    let native_config = store.retained_native_components_at(captured)?.1;
+    if frozen {
+        descriptor
+            .check_frozen_paths(root)
+            .map_err(|error| frozen_input_error(store, error))?;
+    } else {
+        descriptor.check_paths(root)?;
+    }
+    let native_config = store
+        .retained_native_components_at(captured)
+        .map_err(native_read_error)?
+        .1;
     let module_roots = scip_raw::ModuleRoots::from_native_config(&native_config);
-    let mut stage = Stage::create(
-        &store.semantic_stage_parent()?,
+    let index_dir = store.semantic_stage_parent()?;
+    let mut stage = Stage::create_in(
+        stage_parent.unwrap_or(&index_dir),
+        &index_dir,
         owner.request_id,
         owner.incarnation,
+        if stage_parent.is_some() {
+            descriptor
+                .totals
+                .artifact_bytes
+                .saturating_add(descriptor.totals.page_bytes)
+                .saturating_add(bytes.len() as u64)
+        } else {
+            0
+        },
     )?;
     let passes = Passes {
         descriptor: &descriptor,
@@ -598,31 +1015,55 @@ pub fn stage_batch(
         module_roots: &module_roots,
         native_config: &native_config,
     };
-    let mut inputs = FileInputs { root };
+    let mut inputs = FileInputs {
+        root,
+        frozen_store: frozen.then_some(store),
+    };
     passes.begin(stage.conn()?, &bytes, descriptor_sha256)?;
-    let cargo_targets = store.with_native_reader(captured, |reader| {
-        let mut native = ReaderSource {
-            reader,
-            stream: Some(reader.inventory()?),
-        };
-        passes.source_pass(stage.conn()?, &mut inputs, &mut native, counters)
+    let conn = stage.conn()?;
+    let cargo_targets = store
+        .with_native_reader(captured, |reader| {
+            let mut native = ReaderSource {
+                reader,
+                stream: Some(reader.inventory()?),
+                native_fault: None,
+            };
+            let result = passes.source_pass(conn, &mut inputs, &mut native, counters);
+            match native.native_fault.take() {
+                Some(error) => Err(error),
+                None => Ok(result),
+            }
+        })
+        .map_err(native_read_error)??;
+    observed(observer, FrozenPhase::CoveragePass, || {
+        passes.coverage_pass(stage.conn()?, &mut inputs, counters)
     })?;
-    passes.coverage_pass(stage.conn()?, &mut inputs, counters)?;
     let dir = stage.dir().to_owned();
-    store.with_native_reader(captured, |reader| {
-        let mut native = ReaderSource {
-            reader,
-            stream: None,
-        };
-        passes.artifact_pass(
-            &dir,
-            stage.conn()?,
-            &mut inputs,
-            &mut native,
-            &cargo_targets,
-            counters,
-        )
-    })?;
+    let conn = stage.conn()?;
+    store
+        .with_native_reader(captured, |reader| {
+            let mut native = ReaderSource {
+                reader,
+                stream: None,
+                native_fault: None,
+            };
+            let result = observed(observer, FrozenPhase::ArtifactPass, || {
+                passes.artifact_pass_observed(
+                    &dir,
+                    conn,
+                    &mut inputs,
+                    &mut native,
+                    &cargo_targets,
+                    counters,
+                    observer,
+                )
+            });
+            match native.native_fault.take() {
+                Some(error) => Err(error),
+                None => Ok(result),
+            }
+        })
+        .map_err(native_read_error)??;
     Ok(AdmittedBatch::new(
         stage,
         descriptor,

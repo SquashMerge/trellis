@@ -14,13 +14,11 @@ use std::{
     io::Write,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Terminal run records kept per root key.
 pub const RETAINED_RUNS: usize = 10;
-/// How long the sweep waits for a killed group to empty.
-const SWEEP_KILL_WAIT: Duration = Duration::from_secs(10);
 /// Directories that exist only while the producer phase is running.
 const PHASE_DIRS: [&str; 7] = [
     "worktree",
@@ -173,6 +171,12 @@ fn ensure_private(path: &Path) -> Result<()> {
 }
 
 fn remove_tree(path: &Path) -> Result<()> {
+    #[cfg(all(test, feature = "test-support"))]
+    if path.file_name().is_some_and(|name| name == "worktree")
+        && FAIL_STRIP.with(|flag| flag.replace(false))
+    {
+        return Err(std::io::Error::other("injected strip failure").into());
+    }
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
         Ok(_) => fs::remove_file(path),
@@ -189,7 +193,37 @@ fn remove_tree(path: &Path) -> Result<()> {
     .with_context(|| format!("remove {}", path.display()))
 }
 
+#[cfg(all(test, feature = "test-support"))]
+thread_local! {
+    static FAIL_TERMINAL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_STATE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_STRIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, feature = "test-support"))]
+pub(super) fn fail_terminal_after_rename() {
+    FAIL_TERMINAL_AFTER_RENAME.with(|flag| flag.set(true));
+}
+
+#[cfg(all(test, feature = "test-support"))]
+pub(super) fn fail_state_sync(fail: bool) {
+    FAIL_STATE_SYNC.with(|flag| flag.set(fail));
+}
+
+#[cfg(all(test, feature = "test-support"))]
+pub(super) fn fail_next_strip() {
+    FAIL_STRIP.with(|flag| flag.set(true));
+}
+
 /// Temporary file, fsync, rename, directory fsync.
+fn sync_state_file(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(all(test, feature = "test-support"))]
+    if FAIL_STATE_SYNC.with(|flag| flag.get()) {
+        return Err(std::io::Error::other("injected state sync failure"));
+    }
+    file.sync_all()
+}
+
 fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let stage = dir.join(format!(".{name}.tmp-{}", std::process::id()));
     let result = (|| -> Result<()> {
@@ -201,9 +235,18 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&stage)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        sync_state_file(&file)?;
         fs::rename(&stage, dir.join(name))?;
-        fs::File::open(dir)?.sync_all()?;
+        #[cfg(all(test, feature = "test-support"))]
+        if name == "run.json"
+            && FAIL_TERMINAL_AFTER_RENAME.with(|flag| flag.get())
+            && serde_json::from_slice::<RunRecord>(bytes)
+                .is_ok_and(|record| record.state.is_terminal())
+        {
+            FAIL_TERMINAL_AFTER_RENAME.with(|flag| flag.set(false));
+            return Err(std::io::Error::other("injected failure after terminal rename").into());
+        }
+        sync_state_file(&fs::File::open(dir)?)?;
         Ok(())
     })();
     if result.is_err() {
@@ -386,20 +429,92 @@ impl StateDir {
         remove_tree(&self.path.join("pickup.json"))
     }
 
+    fn write_recovery_unknown(&self, record: &mut RunRecord) -> Result<()> {
+        record.error_code = Some("termination_unestablished".to_owned());
+        self.write_run_record(record)
+            .context("store_unavailable: write recovery status")
+    }
+
+    /// When the pending-input set is unavailable, publish uncertainty without
+    /// removing anything. Try every readable abandoned record even if one write fails.
+    pub fn note_recovery_unknown(&self, this_daemon: &DaemonIdentity) -> Result<()> {
+        self.note_recovery_unknown_owned(this_daemon, false)
+    }
+
+    pub(super) fn note_recovery_unknown_owned(
+        &self,
+        this_daemon: &DaemonIdentity,
+        recover_current: bool,
+    ) -> Result<()> {
+        let mut first_error = None;
+        for (_, result) in self.scan_runs()? {
+            match result {
+                Ok(Some(mut record))
+                    if !record.state.is_terminal()
+                        && (recover_current || record.daemon != *this_daemon)
+                        && !(record.daemon == *this_daemon
+                            && record.state == RunState::Importing
+                            && record.request_id.is_some()) =>
+                {
+                    if let Err(error) = self.write_recovery_unknown(&mut record) {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+                _ => {}
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Recover from a crashed daemon. `keep` holds the generation directories
     /// named by queued or running generated import requests.
     ///
-    /// A non-terminal run owned by another daemon is stripped and then marked
-    /// `failed/abandoned`; its group is killed only when the
-    /// recorded leader is still the process that started it. A run directory
-    /// whose record fails its closed parse is removed; one that cannot be read
-    /// for another reason is left and reported. A pickup
+    /// A non-terminal run owned by another daemon first records termination
+    /// as unestablished, then is stripped and marked `failed/abandoned`. Recorded numeric
+    /// identities cannot establish group ownership atomically and are not
+    /// signalled. A run directory whose record fails its closed parse is
+    /// removed; one that cannot be read for another reason is left and reported. A pickup
     /// directory that no request names is removed. The inputs an abandoned run
     /// kept are stripped by the first sweep after its request settles.
     pub fn sweep(
         &self,
         this_daemon: &DaemonIdentity,
         keep: &BTreeSet<PathBuf>,
+    ) -> Result<SweepReport> {
+        self.sweep_owned(this_daemon, keep, false)
+    }
+
+    /// `recover_current` is allowed only at the producer owner's pre-run
+    /// transition, when that owner proves no prior run is active.
+    pub(super) fn sweep_owned(
+        &self,
+        this_daemon: &DaemonIdentity,
+        keep: &BTreeSet<PathBuf>,
+        recover_current: bool,
+    ) -> Result<SweepReport> {
+        self.sweep_inner(this_daemon, keep, recover_current)
+            .map_err(|error| {
+                if error.to_string().starts_with("store_unavailable:")
+                    || error.to_string().starts_with("storage_busy:")
+                {
+                    error
+                } else {
+                    error.context("store_unavailable: producer recovery cleanup")
+                }
+            })
+    }
+
+    fn sweep_inner(
+        &self,
+        this_daemon: &DaemonIdentity,
+        keep: &BTreeSet<PathBuf>,
+        recover_current: bool,
     ) -> Result<SweepReport> {
         let kept = |dir: &Path| kept(keep, dir);
         let mut report = SweepReport::default();
@@ -435,21 +550,24 @@ impl StateDir {
                 }
                 continue;
             }
-            if record.daemon == *this_daemon {
+            if !recover_current && record.daemon == *this_daemon {
                 continue;
             }
-            if let Some(process) = record.process
-                && leader_matches(&process)
+            if record.daemon == *this_daemon
+                && record.state == RunState::Importing
+                && record.request_id.is_some()
             {
-                unsafe { libc::killpg(process.pgid, libc::SIGKILL) };
-                let deadline = std::time::Instant::now() + SWEEP_KILL_WAIT;
-                while process_info::group_exists(process.pgid)
-                    && std::time::Instant::now() < deadline
-                {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                report.killed_groups.push(process.pgid);
+                // The accepted FIFO request remains the owner of this import.
+                continue;
             }
+            // A PID and start time cannot prove ownership at the instant of a
+            // group signal. Even an absent identity does not prove that no
+            // child was spawned before its identity was recorded.
+            // Publish the uncertainty first, so a fallible strip cannot leave
+            // an abandoned process apparently running without qualification.
+            // Rewrite on retry too: a previous rename may have succeeded while
+            // its directory fsync failed, leaving durability unconfirmed.
+            self.write_recovery_unknown(&mut record)?;
             // Strip first, then publish the terminal record, so a terminal record means the
             // sweep is done with the directory. A crash between the two leaves a stripped
             // directory under a non-terminal record, which the next sweep abandons again.
@@ -460,9 +578,9 @@ impl StateDir {
             }
             record.state = RunState::Failed;
             record.outcome = Some("abandoned".to_owned());
-            record.error_code = Some("abandoned".to_owned());
             record.finished_at = Some(now_millis());
-            self.write_run_record(&record)?;
+            self.write_run_record(&record)
+                .context("store_unavailable: write recovery status")?;
             report.abandoned_runs.push(run_id);
         }
         self.prune_runs(keep)?;
@@ -485,11 +603,4 @@ impl StateDir {
 /// Whether `dir`, spelled as given or canonicalized, is in `keep`.
 fn kept(keep: &BTreeSet<PathBuf>, dir: &Path) -> bool {
     keep.contains(dir) || fs::canonicalize(dir).is_ok_and(|real| keep.contains(&real))
-}
-
-/// The recorded group leader is alive and is still the process that started
-/// the run, so signalling its group cannot hit a reused process.
-fn leader_matches(process: &ProcessIdentity) -> bool {
-    process_info::start_time(process.pgid) == Some(process.leader_start_time)
-        && unsafe { libc::getpgid(process.pgid) } == process.pgid
 }

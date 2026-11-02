@@ -354,10 +354,10 @@ fn run_times_out_and_reports() {
     assert_eq!(reply["errorCode"], "timed_out");
     assert!(stderr(&output).contains("timed_out"), "{}", stderr(&output));
     assert!(reply["diagnostics"]["durationMs"].as_u64().unwrap() >= 1000);
-    assert_eq!(reply["diagnostics"]["groupSurvived"], false);
+    assert_eq!(reply["diagnostics"]["groupSurvived"], Value::Null);
     let record = world.record(reply["runId"].as_str().unwrap());
     assert_eq!(record["outcome"], "timed_out");
-    assert_eq!(record["diagnostics"]["groupSurvived"], false);
+    assert_eq!(record["diagnostics"]["groupSurvived"], Value::Null);
     assert_descendants_gone(&pids);
 }
 

@@ -128,6 +128,7 @@ pub struct StageBudget {
     baseline: u64,
     staging_bytes: u64,
     disk_growth_bytes: u64,
+    additional_growth: u64,
 }
 
 impl StageBudget {
@@ -136,8 +137,11 @@ impl StageBudget {
         if staged > self.staging_bytes {
             return Err(ScipCaptureError::LimitExceeded("staging bytes".into()));
         }
-        let live = index_files_bytes(&self.index_dir).saturating_add(staged);
-        if live.saturating_sub(self.baseline) > self.disk_growth_bytes {
+        let growth = index_files_bytes(&self.index_dir)
+            .saturating_add(staged)
+            .saturating_add(self.additional_growth)
+            .saturating_sub(self.baseline);
+        if growth > self.disk_growth_bytes {
             return Err(ScipCaptureError::LimitExceeded(
                 "operation disk growth".into(),
             ));
@@ -151,6 +155,7 @@ pub struct Stage {
     dir: PathBuf,
     index_dir: PathBuf,
     baseline: u64,
+    additional_growth: u64,
     conn: Option<Connection>,
 }
 
@@ -166,13 +171,25 @@ fn open_connection(path: &Path) -> Result<Connection> {
 impl Stage {
     /// Creates the stage directory under `index_dir` and `stage.db` with its full schema.
     pub fn create(index_dir: &Path, request_id: &str, incarnation: &str) -> Result<Self> {
-        let dir = index_dir.join(stage_dir_name(request_id, incarnation)?);
+        Self::create_in(index_dir, index_dir, request_id, incarnation, 0)
+    }
+
+    /// Creates a stage outside the startup sweep's directory while accounting for the same index.
+    pub(crate) fn create_in(
+        parent: &Path,
+        index_dir: &Path,
+        request_id: &str,
+        incarnation: &str,
+        additional_growth: u64,
+    ) -> Result<Self> {
+        let dir = parent.join(stage_dir_name(request_id, incarnation)?);
         let baseline = index_files_bytes(index_dir);
         std::fs::create_dir(&dir).context("stage directory")?;
         let mut stage = Stage {
             dir,
             index_dir: index_dir.to_owned(),
             baseline,
+            additional_growth,
             conn: None,
         };
         let conn = open_connection(&stage.db_path())?;
@@ -221,6 +238,7 @@ impl Stage {
             baseline: self.baseline,
             staging_bytes: limits.staging_bytes,
             disk_growth_bytes: limits.disk_growth_bytes,
+            additional_growth: self.additional_growth,
         }
     }
 }

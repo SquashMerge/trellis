@@ -1924,8 +1924,9 @@ impl CheckoutRuntime {
         let _lease = resources.scheduler.admission_lease()?;
         resources.store.verify_root()?;
         let stub = crate::producer::profiles::Stub::from_env();
-        let mut status = crate::producer::plan::status(&resources.store, &request, stub.as_ref())?;
-        status["activeRun"] = self.producer.status();
+        let mut status =
+            self.producer
+                .producer_status(&resources.store, &request, stub.as_ref())?;
         if let Some(producers) = status["producers"].as_array_mut() {
             for producer in producers {
                 let name = producer["name"].as_str().unwrap_or_default().to_owned();

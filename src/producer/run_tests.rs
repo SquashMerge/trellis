@@ -70,7 +70,7 @@ fn startup_sweep_keeps_directories_named_by_queued_generated_imports() {
     ] {
         let dir = store.producer_generation_dir(origin, id).unwrap();
         fs::write(dir.join("batch/descriptor.json"), b"{}").unwrap();
-        store
+        let row = store
             .enqueue_generated_semantic_import(
                 &workspace,
                 &GeneratedImportOptions {
@@ -82,11 +82,16 @@ fn startup_sweep_keeps_directories_named_by_queued_generated_imports() {
                 },
             )
             .unwrap();
+        if origin == GenerationOrigin::TrellisRun {
+            let mut record = state.read_run_record(id).unwrap().unwrap();
+            record.request_id = Some(row.id);
+            state.write_run_record(&record).unwrap();
+        }
     }
     assert_eq!(store.pending_generation_ids().unwrap().len(), 2);
     assert_eq!(store.pending_generation_dirs().unwrap().len(), 2);
 
-    let report = sweep_state(&store, false).expect("sweep ran");
+    let report = sweep_state(&store, false).unwrap().expect("sweep ran");
     assert_eq!(report.abandoned_runs.len(), 2);
     assert_eq!(report.removed_pickups.len(), 1);
     assert_eq!(report.removed_pickups[0], other_pickup);
@@ -102,6 +107,9 @@ fn startup_sweep_keeps_directories_named_by_queued_generated_imports() {
     for id in [&queued_run, &other_run] {
         let record = state.read_run_record(id).unwrap().unwrap();
         assert_eq!(record.outcome.as_deref(), Some("abandoned"));
+        if id == &queued_run {
+            assert!(record.request_id.is_some());
+        }
     }
 }
 

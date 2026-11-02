@@ -22,6 +22,8 @@ mod batch_tests;
 #[cfg(test)]
 mod detect_tests;
 #[cfg(test)]
+mod exec_tests;
+#[cfg(test)]
 mod pickup_tests;
 #[cfg(test)]
 mod pickup_watch_tests;
@@ -97,8 +99,8 @@ pub enum TrustProfile {
     Trusted,
 }
 
-/// A producer's process group, recorded with the leader's start time so a
-/// later sweep never signals a reused process ID.
+/// A producer's recorded process group and leader start time. This is
+/// diagnostic information, not authority to signal a process group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProcessIdentity {
@@ -115,20 +117,87 @@ pub struct ExitReport {
     pub signal_name: Option<String>,
 }
 
+/// Completed measurements, or an explicit unknown termination without invented metrics.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Diagnostics {
+    Complete(CompleteDiagnostics),
+    Unknown(UnknownDiagnostics),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminationFailure {
+    Observation,
+    Signal,
+    Reap,
+    Timeout,
+    Unwind,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminationStatus {
+    #[default]
+    Unknown,
+}
+
+/// A required field whose value can explicitly be null. Without a custom
+/// deserializer serde treats a missing `Option` field as `None` as well.
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnknownDiagnostics {
+    pub termination: TerminationStatus,
+    pub failure: TerminationFailure,
+    #[serde(deserialize_with = "required_nullable")]
+    pub group_survived: Option<bool>,
+}
+
 /// Crash and bound diagnostics of one producer process group (AC5e).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Diagnostics {
+pub struct CompleteDiagnostics {
     pub exit: ExitReport,
+    /// The group termination state is not inferred from the leader's exit.
+    #[serde(default)]
+    pub termination: TerminationStatus,
     pub duration_ms: u64,
     pub peak_rss_bytes: u64,
     /// The memory bound is sampled, never an address-space limit.
     pub memory_enforcement: String,
-    pub artifact_bytes: u64,
+    /// Measured size; None means the artifact was absent or its size was unavailable.
+    #[serde(deserialize_with = "required_nullable")]
+    pub artifact_bytes: Option<u64>,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
     pub stdout_tail: String,
     pub stderr_tail: String,
+    /// Whether observed output exceeded the log cap; false is inconclusive for
+    /// a stream that did not reach EOF.
     pub truncated: bool,
-    pub group_survived: bool,
+    /// True only when EOF was observed. False means byte counts and tails are
+    /// partial observations; None represents an older record without a status.
+    #[serde(default)]
+    pub stdout_complete: Option<bool>,
+    #[serde(default)]
+    pub stderr_complete: Option<bool>,
+    /// `None` means that group survival could not be established safely.
+    #[serde(deserialize_with = "required_nullable")]
+    pub group_survived: Option<bool>,
+}
+
+impl CompleteDiagnostics {
+    /// Integration contract: unknown group termination requires a validated,
+    /// producer-independent artifact snapshot before import may be enqueued.
+    pub fn requires_validated_snapshot(&self) -> bool {
+        matches!(self.termination, TerminationStatus::Unknown)
+    }
 }

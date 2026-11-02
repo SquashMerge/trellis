@@ -143,7 +143,7 @@ fn timeout_terminates_group() {
     };
     let outcome = run(&spec, &limits);
     assert_eq!(outcome.ending, Ending::TimedOut);
-    assert!(!outcome.diagnostics.group_survived);
+    assert_eq!(outcome.diagnostics.group_survived, None);
     assert!(outcome.diagnostics.exit.signal_name.is_some());
     wait_all_gone(&pids(&pidfile));
     reaper.disarm();
@@ -162,7 +162,7 @@ fn memory_limit_terminates_group() {
     assert_eq!(LimitKind::Memory.reason(), "producer memory");
     assert!(outcome.diagnostics.peak_rss_bytes > 64 * 1024 * 1024);
     assert_eq!(outcome.diagnostics.memory_enforcement, "sampled");
-    assert!(!outcome.diagnostics.group_survived);
+    assert_eq!(outcome.diagnostics.group_survived, None);
     assert!(!trellis::testing::process_running(outcome.process.pgid));
 }
 
@@ -179,7 +179,7 @@ fn artifact_cap_terminates_group() {
         outcome.ending,
         Ending::LimitExceeded(LimitKind::ArtifactBytes)
     );
-    assert!(outcome.diagnostics.artifact_bytes > 1024);
+    assert!(outcome.diagnostics.artifact_bytes.unwrap() > 1024);
     assert!(!trellis::testing::process_running(outcome.process.pgid));
 }
 
@@ -234,7 +234,7 @@ fn crash_reports_signal_and_stderr_tail() {
         outcome.diagnostics.stderr_tail,
         "stub stderr line 0\nstub stderr line 1\nstub stderr line 2\n"
     );
-    assert!(!outcome.diagnostics.group_survived);
+    assert_eq!(outcome.diagnostics.group_survived, None);
 }
 
 #[test]
@@ -292,7 +292,7 @@ fn normal_exit_reaps_lingering_descendants() {
     let outcome = run(&spec, &fast());
     assert_eq!(outcome.ending, Ending::Exited);
     assert_eq!(outcome.diagnostics.exit.code, Some(0));
-    assert!(!outcome.diagnostics.group_survived);
+    assert_eq!(outcome.diagnostics.group_survived, None);
     let all = pids(&pidfile);
     assert_eq!(all.len(), 3);
     wait_all_gone(&all);

@@ -467,19 +467,30 @@ impl Descriptor {
 
     /// Check 6: every named file is under the root with no symlink component.
     pub fn check_paths(&self, root: &Path) -> Result<()> {
-        let paths = self
-            .pages
+        for relative in self.role_paths() {
+            validate_selected_role(root, &root.join(relative))?;
+        }
+        Ok(())
+    }
+
+    /// The same rules for freshly frozen inputs, retaining operational metadata failures.
+    pub(crate) fn check_frozen_paths(&self, root: &Path) -> anyhow::Result<()> {
+        for relative in self.role_paths() {
+            crate::scip_admission::validate_selected_role_with_io(root, &root.join(relative))
+                .map_err(crate::scip_admission::frozen_role_error)?;
+        }
+        Ok(())
+    }
+
+    fn role_paths(&self) -> impl Iterator<Item = &str> {
+        self.pages
             .iter()
             .map(|page| page.relative_path.as_str())
             .chain(
                 self.artifacts
                     .iter()
                     .map(|artifact| artifact.relative_path.as_str()),
-            );
-        for relative in paths {
-            validate_selected_role(root, &root.join(relative))?;
-        }
-        Ok(())
+            )
     }
 }
 

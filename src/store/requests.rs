@@ -8,7 +8,7 @@ use crate::{
     semantic_batch::descriptor::GenerationOrigin,
     store::topology::{UseGuard, WriterSession},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
@@ -1385,7 +1385,10 @@ impl Store {
         )?;
         let mut pending = Vec::new();
         for row in rows {
-            if let Ok(SemanticImportJob::Generated(options)) = row?.semantic_job() {
+            if let SemanticImportJob::Generated(options) = row?
+                .semantic_job()
+                .context("incompatible_queue: pending semantic request options")?
+            {
                 pending.push((options.origin, options.generation_id));
             }
         }

@@ -384,18 +384,35 @@ fn availability(result: &Result<Resolution, detect::Unavailable>) -> Value {
     }
 }
 
-fn last_run(record: &RunRecord) -> Value {
+fn last_run(record: &RunRecord, pending: bool, active: Option<Option<&str>>) -> Value {
+    let unowned = is_unowned(record, active);
     json!({
         "runId": record.run_id,
         "trustProfile": record.trust_profile,
-        "state": record.state,
+        "state": if unowned { json!("unknown") } else { json!(record.state) },
+        "recordedState": if pending { None } else { Some(record.state) },
         "outcome": record.outcome,
         "errorCode": record.error_code,
         "planSha256": record.plan_sha256,
         "sourceRevision": record.source_revision,
         "createdAt": record.created_at,
         "finishedAt": record.finished_at,
+        "diagnostics": record.diagnostics,
+        "recoveryTermination": recovery_termination(record, active),
+        "terminalRecordPending": pending.then_some(true),
     })
+}
+
+fn is_unowned(record: &RunRecord, active: Option<Option<&str>>) -> bool {
+    !record.state.is_terminal()
+        && !(record.state == super::state::RunState::Importing && record.request_id.is_some())
+        && active.is_some_and(|id| id != Some(record.run_id.as_str()))
+}
+
+fn recovery_termination(record: &RunRecord, active: Option<Option<&str>>) -> Option<&'static str> {
+    (!record.state.is_terminal()
+        && (record.daemon != super::state::DaemonIdentity::current() || is_unowned(record, active)))
+    .then_some("unknown")
 }
 
 /// `restricted` or `trusted` when the newest run of the producer imported
@@ -413,6 +430,16 @@ fn mode(last: Option<&RunRecord>) -> Value {
 /// producer, and one run's record when `runId` is given. `activeRun` and `pickup` are
 /// filled by their owners.
 pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Result<Value> {
+    status_with_pending(store, request, stub, None, None)
+}
+
+pub(super) fn status_with_pending(
+    store: &Store,
+    request: &StatusRequest,
+    stub: Option<&Stub>,
+    pending: Option<&RunRecord>,
+    active: Option<Option<&str>>,
+) -> Result<Value> {
     let declared = Declared::new(&request.environment)?;
     let head = match store.index_baseline() {
         Ok(pin) => {
@@ -428,10 +455,15 @@ pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Re
         Err(error) => return Err(error),
     };
     let (roots, identity) = store.state_topology();
-    let runs = match StateDir::existing(roots, identity)? {
+    let mut runs = match StateDir::existing(roots, identity)? {
         Some(state) => state.runs()?,
         None => Vec::new(),
     };
+    if let Some(pending) = pending {
+        runs.retain(|record| record.run_id != pending.run_id);
+        runs.push(pending.clone());
+        runs.sort_by(|a, b| (b.created_at, &b.run_id).cmp(&(a.created_at, &a.run_id)));
+    }
     let producers: Vec<Value> = Target::all(stub.is_some())
         .into_iter()
         .map(|target| {
@@ -464,7 +496,7 @@ pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Re
                     "trusted": trust(TrustProfile::Trusted),
                 },
                 "mode": mode(last),
-                "lastRun": last.map(last_run),
+                "lastRun": last.map(|record| last_run(record, pending.is_some_and(|pending| pending.run_id == record.run_id), active)),
                 "pickup": null,
             })
         })
@@ -476,12 +508,26 @@ pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Re
         "producers": producers,
     });
     if let Some(run_id) = &request.run_id {
-        let record = match StateDir::existing(roots, identity)? {
-            Some(state) => state.read_run_record(run_id)?,
-            None => None,
+        let record = if let Some(pending) = pending.filter(|pending| pending.run_id == *run_id) {
+            Some(pending.clone())
+        } else {
+            match StateDir::existing(roots, identity)? {
+                Some(state) => state.read_run_record(run_id)?,
+                None => None,
+            }
         };
         let record = record.ok_or_else(|| anyhow::anyhow!("{}: run", super::NOT_FOUND))?;
+        let recovery = recovery_termination(&record, active);
+        let unowned = is_unowned(&record, active);
+        let recorded_state = record.state;
         reply["run"] = serde_json::to_value(record)?;
+        if unowned {
+            reply["run"]["state"] = json!("unknown");
+        }
+        let pending_record = pending.is_some_and(|pending| pending.run_id == *run_id);
+        reply["run"]["recordedState"] = json!((!pending_record).then_some(recorded_state));
+        reply["run"]["recoveryTermination"] = json!(recovery);
+        reply["run"]["terminalRecordPending"] = json!(pending_record.then_some(true));
     }
     Ok(reply)
 }

@@ -296,12 +296,45 @@ fn pickup_config_round_trips_and_clears() {
     assert!(error.to_string().starts_with("producer_state_corrupt"));
 }
 
-/// A shell that leads its own group and sleeps, standing in for a producer
-/// orphaned by a crashed daemon.
-fn orphan_group() -> Child {
-    let mut command = Command::new("/bin/sh");
+/// A single owned process, standing in for a producer orphaned by a daemon.
+/// No other code waits for it: until `try_wait` reaps it, its PID cannot be reused.
+struct OwnedProcess {
+    child: Child,
+    reaped: bool,
+}
+
+impl OwnedProcess {
+    fn is_running(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                self.reaped = true;
+                false
+            }
+            Err(error) => {
+                // ECHILD means we no longer own a waitable PID; for other
+                // errors the drop guard still cleans up the unreaped child.
+                self.reaped = error.raw_os_error() == Some(libc::ECHILD);
+                panic!("check owned child: {error}");
+            }
+        }
+    }
+}
+
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // Child::kill targets only our unreaped child, including on panic.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn orphan_process() -> OwnedProcess {
+    let mut command = Command::new("/bin/sleep");
     command
-        .args(["-c", "sleep 60 & wait"])
+        .arg("300")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -314,13 +347,16 @@ fn orphan_group() -> Child {
             }
         });
     }
-    command.spawn().unwrap()
+    OwnedProcess {
+        child: command.spawn().unwrap(),
+        reaped: false,
+    }
 }
 
-fn abandoned_run(state: &StateDir, n: u32, child: &Child, start_offset: u64) {
+fn abandoned_run(state: &StateDir, n: u32, child: &OwnedProcess, start_offset: u64) {
     state.create_run_dir(&run_id(n)).unwrap();
     let mut running = record(n, RunState::Running, other_daemon());
-    let pgid = child.id() as i32;
+    let pgid = child.child.id() as i32;
     running.process = Some(ProcessIdentity {
         pgid,
         leader_start_time: process_info::start_time(pgid).unwrap() + start_offset,
@@ -329,45 +365,209 @@ fn abandoned_run(state: &StateDir, n: u32, child: &Child, start_offset: u64) {
     populate(&state.run_dir(&run_id(n)).unwrap(), &["worktree", "out"]);
 }
 
-fn kill_group(mut child: Child) {
-    unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
-    let _ = child.wait();
-}
-
 #[test]
-fn sweep_kills_abandoned_group_with_matching_identity() {
+fn recovery_never_signals_a_matching_recorded_identity() {
     let fixture = fixture();
     let state = state(&fixture);
-    let mut child = orphan_group();
+    let mut child = orphan_process();
     abandoned_run(&state, 1, &child, 0);
-    let pid = child.id() as i32;
-    // The real orphan's parent is gone and init reaps it; reap here so the
-    // killed leader does not linger as a zombie group member.
-    let reaper = std::thread::spawn(move || child.wait().unwrap());
-    let report = state
-        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
-        .unwrap();
-    assert_eq!(report.killed_groups, [pid]);
-    // The sweep's SIGKILL ended the leader.
-    let status = reaper.join().unwrap();
-    assert_eq!(
-        std::os::unix::process::ExitStatusExt::signal(&status),
-        Some(libc::SIGKILL)
-    );
+    let result = state.sweep(&DaemonIdentity::current(), &BTreeSet::new());
+    let running = child.is_running();
+    let report = result.unwrap();
+    assert!(running, "recovery must not signal the owned group");
+    assert!(report.killed_groups.is_empty());
     let after = state.read_run_record(&run_id(1)).unwrap().unwrap();
     assert_eq!(after.state, RunState::Failed);
     assert_eq!(after.outcome.as_deref(), Some("abandoned"));
+    assert_eq!(
+        after.error_code.as_deref(),
+        Some("termination_unestablished")
+    );
     assert!(after.finished_at.is_some());
     let dir = state.run_dir(&run_id(1)).unwrap();
     assert!(!dir.join("worktree").exists());
     assert!(!dir.join("out").exists());
+    // The --run status response serializes this same record, while lastRun
+    // copies this errorCode directly from it.
+    let visible = serde_json::to_value(&after).unwrap();
+    assert_eq!(visible["errorCode"], "termination_unestablished");
+}
+
+#[test]
+fn recovery_reports_unknown_for_missing_and_unreadable_process_identities() {
+    let fixture = fixture();
+    let state = state(&fixture);
+    for n in [1, 2] {
+        state.create_run_dir(&run_id(n)).unwrap();
+        let mut running = record(n, RunState::Running, other_daemon());
+        if n == 2 {
+            // This out-of-range PID has no readable process identity.
+            running.process = Some(ProcessIdentity {
+                pgid: i32::MAX,
+                leader_start_time: 1,
+            });
+            assert_eq!(process_info::start_time(i32::MAX), None);
+        }
+        state.write_run_record(&running).unwrap();
+    }
+    let report = state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap();
+    assert!(report.killed_groups.is_empty());
+    for n in [1, 2] {
+        let after = state.read_run_record(&run_id(n)).unwrap().unwrap();
+        assert_eq!(after.state, RunState::Failed);
+        assert_eq!(after.outcome.as_deref(), Some("abandoned"));
+        assert_eq!(
+            after.error_code.as_deref(),
+            Some("termination_unestablished")
+        );
+    }
+}
+
+#[test]
+fn recovery_leaves_existing_abandoned_terminal_record_unchanged() {
+    let fixture = fixture();
+    let state = state(&fixture);
+    let dir = state.create_run_dir(&run_id(1)).unwrap();
+    let mut old = record(1, RunState::Failed, other_daemon());
+    old.outcome = Some("abandoned".into());
+    old.error_code = Some("abandoned".into());
+    state.write_run_record(&old).unwrap();
+    populate(&dir, &["out", "batch"]);
+    state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap();
+    assert_eq!(state.read_run_record(&run_id(1)).unwrap(), Some(old));
+    assert!(!dir.join("out").exists() && !dir.join("batch").exists());
+}
+
+#[test]
+fn recovery_status_exposes_termination_unestablished() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("work");
+    fs::create_dir(&workspace).unwrap();
+    let workspace = fs::canonicalize(workspace).unwrap();
+    fs::write(workspace.join("example.js"), "function example() {}\n").unwrap();
+    let store =
+        crate::store::Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = crate::indexer::index_workspace_bundle(
+        &crate::indexer::IndexOptions::new(workspace.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.writer().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    let (roots, identity) = store.state_topology();
+    let state = StateDir::open(roots, identity).unwrap();
+    let dir = state.create_run_dir(&run_id(1)).unwrap();
+    state
+        .write_run_record(&record(1, RunState::Running, other_daemon()))
+        .unwrap();
+    let request = super::plan::StatusRequest {
+        version: 1,
+        run_id: Some(run_id(1)),
+        environment: super::detect::Environment {
+            home: workspace.to_str().unwrap().to_owned(),
+            ..Default::default()
+        },
+    };
+    let stage = dir.join(format!(".run.json.tmp-{}", std::process::id()));
+    fs::create_dir(&stage).unwrap();
+    let error = super::run::sweep_state(&store, false).unwrap_err();
+    assert!(
+        error.to_string().starts_with("store_unavailable:"),
+        "{error:#}"
+    );
+    let scheduler = crate::http::new(
+        store.clone(),
+        crate::indexer::IndexOptions::new(workspace.clone()),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:1".parse().unwrap(),
+    )
+    .unwrap();
+    scheduler.force_root_transition_tick_for_tests().unwrap();
+    assert!(store.index_baseline().is_ok());
+    assert!(dir.join("run.json").exists());
+    assert_eq!(
+        state
+            .read_run_record(&run_id(1))
+            .unwrap()
+            .unwrap()
+            .error_code,
+        None
+    );
+    let status = super::plan::status(&store, &request, None).unwrap();
+    assert_eq!(status["run"]["recoveryTermination"], "unknown");
+    assert_eq!(status["run"]["errorCode"], serde_json::Value::Null);
+    let last = status["producers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "scip-typescript")
+        .unwrap();
+    assert_eq!(last["lastRun"]["recoveryTermination"], "unknown");
+    assert_eq!(last["lastRun"]["errorCode"], serde_json::Value::Null);
+    fs::remove_dir(stage).unwrap();
+    if unsafe { libc::geteuid() } != 0 {
+        let locked = dir.join("worktree/locked");
+        populate(&locked, &["inner"]);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = state.sweep(&DaemonIdentity::current(), &BTreeSet::new());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        let status = super::plan::status(&store, &request, None).unwrap();
+        assert_eq!(status["run"]["state"], "running");
+        assert_eq!(status["run"]["errorCode"], "termination_unestablished");
+        let last_run = status["producers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|producer| producer["name"] == "scip-typescript")
+            .unwrap();
+        assert_eq!(last_run["lastRun"]["state"], "running");
+        assert_eq!(
+            last_run["lastRun"]["errorCode"],
+            "termination_unestablished"
+        );
+    }
+    state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap();
+    let status = super::plan::status(&store, &request, None).unwrap();
+    assert_eq!(status["run"]["outcome"], "abandoned");
+    assert_eq!(status["run"]["errorCode"], "termination_unestablished");
+    let last_run = status["producers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|producer| producer["name"] == "scip-typescript")
+        .unwrap();
+    assert_eq!(last_run["lastRun"]["outcome"], "abandoned");
+    assert_eq!(
+        last_run["lastRun"]["errorCode"],
+        "termination_unestablished"
+    );
 }
 
 #[test]
 fn sweep_ignores_mismatched_start_time() {
     let fixture = fixture();
     let state = state(&fixture);
-    let child = orphan_group();
+    let mut child = orphan_process();
     abandoned_run(&state, 1, &child, 1);
     // A run this daemon owns is left alone as well.
     state.create_run_dir(&run_id(2)).unwrap();
@@ -380,21 +580,29 @@ fn sweep_ignores_mismatched_start_time() {
     assert!(report.killed_groups.is_empty());
     assert_eq!(report.abandoned_runs, [run_id(1)]);
     assert!(
-        process_info::group_exists(child.id() as i32),
+        child.is_running(),
         "a process whose start time differs is never signalled"
     );
     assert_eq!(
         state.read_run_record(&run_id(2)).unwrap().unwrap().state,
         RunState::Running
     );
-    kill_group(child);
+    assert_eq!(
+        state
+            .read_run_record(&run_id(1))
+            .unwrap()
+            .unwrap()
+            .error_code
+            .as_deref(),
+        Some("termination_unestablished")
+    );
 }
 
 #[test]
 fn sweep_keeps_dirs_in_keep_set() {
     let fixture = fixture();
     let state = state(&fixture);
-    let child = orphan_group();
+    let child = orphan_process();
     abandoned_run(&state, 1, &child, 1);
     populate(&state.run_dir(&run_id(1)).unwrap(), &["batch"]);
     let keep = BTreeSet::from([fs::canonicalize(state.run_dir(&run_id(1)).unwrap()).unwrap()]);
@@ -407,7 +615,16 @@ fn sweep_keeps_dirs_in_keep_set() {
         state.read_run_record(&run_id(1)).unwrap().unwrap().state,
         RunState::Failed
     );
-    kill_group(child);
+    assert_eq!(
+        state
+            .read_run_record(&run_id(1))
+            .unwrap()
+            .unwrap()
+            .error_code
+            .as_deref(),
+        Some("termination_unestablished")
+    );
+    drop(child);
 
     // Once no request names the directory, the next sweep strips what was kept.
     let report = state
@@ -531,10 +748,19 @@ fn sweep_publishes_the_abandoned_record_only_after_the_strip() {
         swept.is_err(),
         "the strip must fail on the locked directory"
     );
+    let error = swept.unwrap_err();
+    assert!(
+        error.to_string().starts_with("store_unavailable:"),
+        "{error:#}"
+    );
+    assert!(error.downcast_ref::<std::io::Error>().is_some());
+    let after_failure = state.read_run_record(&run_id(1)).unwrap().unwrap();
+    assert_eq!(after_failure.state, RunState::Importing);
+    assert_eq!(after_failure.outcome, None);
     assert_eq!(
-        state.read_run_record(&run_id(1)).unwrap().unwrap().state,
-        RunState::Importing,
-        "no terminal record before the directory is stripped"
+        after_failure.error_code.as_deref(),
+        Some("termination_unestablished"),
+        "termination uncertainty must be visible even when stripping fails"
     );
 
     // The crash shape: stripped contents under a non-terminal record.
@@ -547,9 +773,272 @@ fn sweep_publishes_the_abandoned_record_only_after_the_strip() {
     let after = state.read_run_record(&run_id(1)).unwrap().unwrap();
     assert_eq!(after.state, RunState::Failed);
     assert_eq!(after.outcome.as_deref(), Some("abandoned"));
+    assert_eq!(
+        after.error_code.as_deref(),
+        Some("termination_unestablished")
+    );
     let names: Vec<_> = fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(names, ["run.json"]);
+}
+
+#[test]
+fn sweep_reports_typed_failure_if_unknown_cannot_be_published() {
+    let fixture = fixture();
+    let state = state(&fixture);
+    let dir = state.create_run_dir(&run_id(1)).unwrap();
+    let original = record(1, RunState::Running, other_daemon());
+    state.write_run_record(&original).unwrap();
+    populate(&dir, &["worktree", "out", "batch"]);
+    // A directory at the atomic-write staging path deterministically makes
+    // opening the staged record fail, even when tests run as root.
+    let stage = dir.join(format!(".run.json.tmp-{}", std::process::id()));
+    fs::create_dir(&stage).unwrap();
+    let error = state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap_err();
+    assert!(
+        error.to_string().starts_with("store_unavailable:"),
+        "{error:#}"
+    );
+    assert!(error.downcast_ref::<std::io::Error>().is_some());
+    assert_eq!(state.read_run_record(&run_id(1)).unwrap(), Some(original));
+    assert!(dir.join("worktree/file").exists());
+    assert!(dir.join("out/file").exists());
+    assert!(dir.join("batch/file").exists());
+    fs::remove_dir(stage).unwrap();
+}
+
+#[test]
+fn unknown_status_without_keep_set_is_best_effort_for_each_run() {
+    let fixture = fixture();
+    let state = state(&fixture);
+    for n in [1, 2] {
+        let dir = state.create_run_dir(&run_id(n)).unwrap();
+        state
+            .write_run_record(&record(n, RunState::Running, other_daemon()))
+            .unwrap();
+        populate(&dir, &["worktree"]);
+    }
+    let first_dir = state.run_dir(&run_id(1)).unwrap();
+    let stage = first_dir.join(format!(".run.json.tmp-{}", std::process::id()));
+    fs::create_dir(&stage).unwrap();
+    let error = state
+        .note_recovery_unknown(&DaemonIdentity::current())
+        .unwrap_err();
+    assert!(error.to_string().starts_with("store_unavailable:"));
+    let first = state.read_run_record(&run_id(1)).unwrap().unwrap();
+    let second = state.read_run_record(&run_id(2)).unwrap().unwrap();
+    assert_eq!(first.error_code, None);
+    assert_eq!(
+        second.error_code.as_deref(),
+        Some("termination_unestablished")
+    );
+    assert_eq!(second.state, RunState::Running);
+    assert!(first_dir.join("worktree/file").exists());
+    assert!(
+        state
+            .run_dir(&run_id(2))
+            .unwrap()
+            .join("worktree/file")
+            .exists()
+    );
+    fs::remove_dir(stage).unwrap();
+}
+
+#[test]
+fn failed_strip_retries_without_changing_queued_import() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("work");
+    fs::create_dir(&workspace).unwrap();
+    let workspace = fs::canonicalize(workspace).unwrap();
+    let store =
+        crate::store::Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+    let (roots, identity) = store.state_topology();
+    let state = StateDir::open(roots, identity).unwrap();
+    let id = run_id(1);
+    let dir = state.create_run_dir(&id).unwrap();
+    populate(&dir, &["worktree/locked/inner", "out", "batch"]);
+    let descriptor = dir.join("batch/descriptor.json");
+    fs::write(&descriptor, b"{}").unwrap();
+    let descriptor = fs::canonicalize(descriptor).unwrap();
+    let request = store
+        .enqueue_generated_semantic_import(
+            &workspace,
+            &crate::store::requests::GeneratedImportOptions {
+                version: 2,
+                descriptor: descriptor.to_str().unwrap().into(),
+                descriptor_sha256: "0".repeat(64),
+                origin: crate::semantic_batch::descriptor::GenerationOrigin::TrellisRun,
+                generation_id: id.clone(),
+            },
+        )
+        .unwrap();
+    let mut importing = record(1, RunState::Importing, other_daemon());
+    importing.request_id = Some(request.id.clone());
+    state.write_run_record(&importing).unwrap();
+    let keep = store.pending_generation_dirs().unwrap();
+    let locked = dir.join("worktree/locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+    let first = state.sweep(&DaemonIdentity::current(), &keep);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(first.is_err());
+    let failed = state.read_run_record(&id).unwrap().unwrap();
+    assert_eq!(failed.state, RunState::Importing);
+    assert_eq!(
+        failed.error_code.as_deref(),
+        Some("termination_unestablished")
+    );
+    assert_eq!(failed.request_id.as_deref(), Some(request.id.as_str()));
+    assert_eq!(
+        store.request_by_id(&request.id).unwrap().unwrap().state,
+        "queued"
+    );
+    assert_eq!(store.pending_generation_ids().unwrap().len(), 1);
+    assert_eq!(fs::read(&descriptor).unwrap(), b"{}");
+    assert_eq!(fs::read(dir.join("out/file")).unwrap(), b"x");
+
+    let report = state.sweep(&DaemonIdentity::current(), &keep).unwrap();
+    assert_eq!(report.abandoned_runs.as_slice(), std::slice::from_ref(&id));
+    let after = state.read_run_record(&id).unwrap().unwrap();
+    assert_eq!(after.state, RunState::Failed);
+    assert_eq!(after.request_id.as_deref(), Some(request.id.as_str()));
+    assert_eq!(
+        after.error_code.as_deref(),
+        Some("termination_unestablished")
+    );
+    assert_eq!(
+        store.request_by_id(&request.id).unwrap().unwrap().state,
+        "queued"
+    );
+    assert_eq!(store.pending_generation_ids().unwrap().len(), 1);
+    assert_eq!(fs::read(&descriptor).unwrap(), b"{}");
+    assert_eq!(fs::read(dir.join("out/file")).unwrap(), b"x");
+    assert!(
+        state
+            .sweep(&DaemonIdentity::current(), &keep)
+            .unwrap()
+            .abandoned_runs
+            .is_empty()
+    );
+    assert_eq!(store.pending_generation_ids().unwrap().len(), 1);
+}
+
+#[test]
+fn unresolved_pending_generation_defers_cleanup_and_retry_preserves_inputs() {
+    use crate::semantic_batch::descriptor::GenerationOrigin;
+    use crate::store::requests::GeneratedImportOptions;
+
+    for origin in [GenerationOrigin::TrellisRun, GenerationOrigin::OwnerPickup] {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("work");
+        fs::create_dir(&workspace).unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let store =
+            crate::store::Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+        let (roots, identity) = store.state_topology();
+        let state = StateDir::open(roots, identity).unwrap();
+        let id = run_id(1);
+        let dir = match origin {
+            GenerationOrigin::TrellisRun => state.create_run_dir(&id).unwrap(),
+            GenerationOrigin::OwnerPickup => state.create_pickup_dir(&id).unwrap(),
+        };
+        populate(&dir, &["batch"]);
+        let descriptor = dir.join("batch/descriptor.json");
+        fs::write(&descriptor, b"{}").unwrap();
+        let descriptor = fs::canonicalize(descriptor).unwrap();
+        let request = store
+            .enqueue_generated_semantic_import(
+                &workspace,
+                &GeneratedImportOptions {
+                    version: 2,
+                    descriptor: descriptor.to_str().unwrap().into(),
+                    descriptor_sha256: "0".repeat(64),
+                    origin,
+                    generation_id: id.clone(),
+                },
+            )
+            .unwrap();
+        let other = state.create_run_dir(&run_id(2)).unwrap();
+        state
+            .write_run_record(&record(2, RunState::Running, other_daemon()))
+            .unwrap();
+        populate(&other, &["worktree"]);
+
+        // Simulate an ordinary lookup race: the pending generation disappears
+        // during resolution and reappears before the next recovery attempt.
+        let held = dir.with_extension("held");
+        fs::rename(&dir, &held).unwrap();
+        let failed = store.pending_generation_dirs();
+        let deferred = super::run::sweep_state(&store, false);
+        fs::rename(&held, &dir).unwrap();
+        let error =
+            failed.expect_err("a missing pending generation must not yield a partial keep set");
+        assert!(error.to_string().starts_with("store_unavailable:"));
+        assert!(deferred.is_err());
+        let observed = state.read_run_record(&run_id(2)).unwrap().unwrap();
+        assert_eq!(observed.state, RunState::Running);
+        assert_eq!(
+            observed.error_code.as_deref(),
+            Some("termination_unestablished")
+        );
+        assert!(other.join("worktree/file").exists());
+        assert_eq!(fs::read(dir.join("batch/file")).unwrap(), b"x");
+        assert_eq!(
+            store.request_by_id(&request.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(store.pending_generation_ids().unwrap().len(), 1);
+
+        let report = super::run::sweep_state(&store, false)
+            .unwrap()
+            .expect("retry succeeds");
+        assert_eq!(report.abandoned_runs, [run_id(2)]);
+        assert_eq!(
+            state.read_run_record(&run_id(2)).unwrap().unwrap().state,
+            RunState::Failed
+        );
+        assert_eq!(fs::read(dir.join("batch/file")).unwrap(), b"x");
+        assert_eq!(
+            store.request_by_id(&request.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(store.pending_generation_ids().unwrap().len(), 1);
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unreadable_pending_semantic_options_defer_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("work");
+    fs::create_dir(&workspace).unwrap();
+    let workspace = fs::canonicalize(workspace).unwrap();
+    let store =
+        crate::store::Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+    let (roots, identity) = store.state_topology();
+    let state = StateDir::open(roots, identity).unwrap();
+    let dir = state.create_run_dir(&run_id(1)).unwrap();
+    state
+        .write_run_record(&record(1, RunState::Running, other_daemon()))
+        .unwrap();
+    populate(&dir, &["worktree"]);
+    store
+        .enqueue_semantic_options_json_for_tests(&workspace, &serde_json::json!({"version": 99}))
+        .unwrap();
+    let error = store.pending_generation_dirs().unwrap_err();
+    assert!(error.to_string().starts_with("incompatible_queue:"));
+    assert!(super::run::sweep_state(&store, false).is_err());
+    let after = state.read_run_record(&run_id(1)).unwrap().unwrap();
+    assert_eq!(after.state, RunState::Running);
+    assert_eq!(
+        after.error_code.as_deref(),
+        Some("termination_unestablished")
+    );
+    assert!(dir.join("worktree/file").exists());
 }

@@ -292,31 +292,91 @@ pub(crate) fn path(s: &str) -> bool {
         && !s.contains(['\\', '\0'])
         && s.split('/').all(|p| !p.is_empty() && p != "." && p != "..")
 }
+
+#[cfg(all(test, feature = "test-support"))]
+thread_local! {
+    static ROLE_IO_FAULT: std::cell::Cell<Option<(&'static str, &'static str, i32)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) fn fail_role_io(point: &'static str, name: &'static str, errno: i32) {
+    ROLE_IO_FAULT.with(|slot| slot.set(Some((point, name, errno))));
+}
+
+pub(crate) fn role_io_fault(point: &str, path: &Path) -> std::io::Result<()> {
+    #[cfg(all(test, feature = "test-support"))]
+    if let Some(errno) = ROLE_IO_FAULT.with(|slot| {
+        let fault = slot.get();
+        if fault.is_some_and(|(p, name, _)| {
+            p == point && path.file_name().is_some_and(|file| file == name)
+        }) {
+            slot.set(None);
+            fault.map(|(_, _, errno)| errno)
+        } else {
+            None
+        }
+    }) {
+        return Err(std::io::Error::from_raw_os_error(errno));
+    }
+    let _ = (point, path);
+    Ok(())
+}
+
 pub(crate) fn validate_selected_role(root: &Path, p: &Path) -> Result<String, ScipCaptureError> {
+    validate_selected_role_with_io(root, p).map_err(|error| {
+        error
+            .downcast::<ScipCaptureError>()
+            .unwrap_or_else(|_| admission("selected role absent"))
+    })
+}
+
+/// The same role rules, retaining operational metadata errors for Trellis-owned inputs.
+pub(crate) fn validate_selected_role_with_io(root: &Path, p: &Path) -> anyhow::Result<String> {
     if !p.is_absolute() {
-        return Err(admission("selected role is not absolute"));
+        return Err(admission("selected role is not absolute").into());
     }
     relative(root, p)
 }
-fn relative(root: &Path, p: &Path) -> Result<String, ScipCaptureError> {
+fn relative(root: &Path, p: &Path) -> anyhow::Result<String> {
     let r = p
         .strip_prefix(root)
         .map_err(|_| admission("role outside root"))?
         .to_str()
         .ok_or_else(|| admission("non-UTF8 role"))?;
     if !path(r) {
-        return Err(admission("invalid role path"));
+        return Err(admission("invalid role path").into());
     }
     let mut current = root.to_owned();
     for component in r.split('/') {
         current.push(component);
-        let metadata =
-            std::fs::symlink_metadata(&current).map_err(|_| admission("selected role absent"))?;
+        let metadata = role_io_fault("metadata", &current)
+            .and_then(|()| std::fs::symlink_metadata(&current))
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ENOTDIR)
+                {
+                    anyhow::Error::new(admission("selected role absent"))
+                } else {
+                    anyhow::Error::new(error)
+                }
+            })?;
         if metadata.file_type().is_symlink() {
-            return Err(admission("symlinked selected role"));
+            return Err(admission("symlinked selected role").into());
         }
     }
     Ok(r.into())
+}
+
+pub(crate) fn frozen_role_error(error: anyhow::Error) -> anyhow::Error {
+    let Some(io) = error.downcast_ref::<std::io::Error>() else {
+        return error;
+    };
+    let busy = matches!(io.raw_os_error(), Some(libc::EBUSY) | Some(libc::EAGAIN));
+    error.context(if busy {
+        "storage_busy: frozen semantic input I/O"
+    } else {
+        "producer_failed: frozen semantic input I/O"
+    })
 }
 pub(crate) fn file_uri(root: &Path) -> Result<String, ScipCaptureError> {
     let s = root

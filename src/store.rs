@@ -14200,6 +14200,13 @@ impl Store {
     pub(crate) fn is_rebuild_failure(error: &anyhow::Error) -> bool {
         recovery_class(error) == RecoveryClass::Rebuild
     }
+    /// Whether a failure reported by a live-index read requires rebuilding or recreating it.
+    pub(crate) fn is_index_recovery_failure(error: &anyhow::Error) -> bool {
+        matches!(
+            recovery_class(error),
+            RecoveryClass::Rebuild | RecoveryClass::RecreatePending
+        )
+    }
     fn note_index_failure(&self, error: &anyhow::Error) -> RecoveryClass {
         let class = recovery_class(error);
         match class {
@@ -15036,9 +15043,10 @@ impl Store {
     ) -> Result<std::collections::BTreeSet<std::path::PathBuf>> {
         let mut dirs = std::collections::BTreeSet::new();
         for (origin, id) in self.pending_generation_ids()? {
-            if let Ok(dir) = self.producer_generation_dir(origin, &id) {
-                dirs.insert(dir);
-            }
+            dirs.insert(
+                self.producer_generation_dir(origin, &id)
+                    .context("store_unavailable: resolve pending generated input")?,
+            );
         }
         Ok(dirs)
     }

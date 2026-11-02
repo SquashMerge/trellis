@@ -1555,31 +1555,92 @@ pub(crate) fn open_semantic_input(
     open_semantic_input_before_open(root, path, || {})
 }
 
+/// Opens a freshly frozen Trellis-owned input without misclassifying operational I/O faults.
+pub(crate) fn open_frozen_semantic_input(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(std::fs::File, u64)> {
+    open_semantic_input_mode(root, path, || {}, true)
+}
+
 fn open_semantic_input_before_open(
     root: &std::path::Path,
     path: &std::path::Path,
     before_open: impl FnOnce(),
 ) -> Result<(std::fs::File, u64)> {
-    crate::scip_admission::validate_selected_role(root, path)
-        .map_err(|error| anyhow::anyhow!("invalid_request: {}", error.detail()))?;
-    let metadata = std::fs::symlink_metadata(path)?;
+    open_semantic_input_mode(root, path, before_open, false)
+}
+
+fn open_semantic_input_mode(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    before_open: impl FnOnce(),
+    frozen: bool,
+) -> Result<(std::fs::File, u64)> {
+    if frozen {
+        crate::scip_admission::validate_selected_role_with_io(root, path).map_err(|error| {
+            if let Some(invalid) = error.downcast_ref::<crate::scip_raw::ScipCaptureError>() {
+                anyhow::anyhow!("invalid_request: {}", invalid.detail())
+            } else {
+                crate::scip_admission::frozen_role_error(error)
+            }
+        })?;
+    } else {
+        crate::scip_admission::validate_selected_role(root, path)
+            .map_err(|error| anyhow::anyhow!("invalid_request: {}", error.detail()))?;
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        if frozen {
+            frozen_open_error(error)
+        } else {
+            error.into()
+        }
+    })?;
     ensure!(
         metadata.is_file(),
         "invalid_request: semantic input must be a regular file"
     );
     before_open();
     use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| anyhow::anyhow!("invalid_request: semantic input open: {error}"))?;
-    let opened = file.metadata()?;
+    let file = crate::scip_admission::role_io_fault("open", path)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+        })
+        .map_err(|error| {
+            if frozen {
+                frozen_open_error(error)
+            } else {
+                anyhow::anyhow!("invalid_request: semantic input open: {error}")
+            }
+        })?;
+    let opened = file.metadata().map_err(|error| {
+        if frozen {
+            crate::scip_admission::frozen_role_error(error.into())
+        } else {
+            error.into()
+        }
+    })?;
     ensure!(
         opened.is_file(),
         "invalid_request: semantic input must be a regular file"
     );
     Ok((file, opened.len()))
+}
+
+fn frozen_open_error(error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::NotFound
+        || matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTDIR) | Some(libc::ELOOP)
+        )
+    {
+        anyhow::Error::new(error).context("invalid_request: semantic input open")
+    } else {
+        crate::scip_admission::frozen_role_error(error.into())
+    }
 }
 
 /// Digest and length of an input copied by `copy_semantic_input_to_stage`.
@@ -2161,7 +2222,10 @@ fn sweep_abandoned_semantic_stages(store: &Store) {
     }
     // Producer runs and pickup directories a crashed daemon left, except those a queued or
     // running generated import still names (D2). Nothing is importing yet at this point.
-    crate::producer::run::sweep_state(store, false);
+    if let Err(error) = crate::producer::run::sweep_state(store, false) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "producer recovery deferred: {error:#}");
+    }
 }
 
 #[cfg(test)]

@@ -61,6 +61,63 @@ fn stage_names_are_validated() {
 }
 
 #[test]
+fn stage_growth_retains_old_index_shrink_semantics() {
+    let parent = tempfile::tempdir().unwrap();
+    let index = parent.path().join("index.db");
+    let file = std::fs::File::create(&index).unwrap();
+    file.set_len(4 << 20).unwrap();
+    drop(file);
+    let stage = Stage::create(parent.path(), "request", "shrink").unwrap();
+    assert!(stage.bytes() < 4 << 20);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(index)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let limits = BatchLimits {
+        disk_growth_bytes: 0,
+        ..BatchLimits::PRODUCTION
+    };
+    stage.budget(&limits).check().unwrap();
+}
+
+#[test]
+fn frozen_growth_is_charged_before_subtracting_the_index_baseline() {
+    let parent = tempfile::tempdir().unwrap();
+    let index = parent.path().join("index.db");
+    std::fs::File::create(&index)
+        .unwrap()
+        .set_len(4 << 20)
+        .unwrap();
+    let probe = Stage::create(parent.path(), "request", "probe").unwrap();
+    let stage_bytes = probe.bytes();
+    drop(probe);
+    let exact = (4 << 20) - stage_bytes;
+    let within =
+        Stage::create_in(parent.path(), parent.path(), "request", "within", exact).unwrap();
+    let over =
+        Stage::create_in(parent.path(), parent.path(), "request", "over", exact + 1).unwrap();
+    assert_eq!(within.bytes(), stage_bytes);
+    assert_eq!(over.bytes(), stage_bytes);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(index)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let limits = BatchLimits {
+        disk_growth_bytes: 0,
+        ..BatchLimits::PRODUCTION
+    };
+    within.budget(&limits).check().unwrap();
+    assert_eq!(
+        over.budget(&limits).check().unwrap_err(),
+        ScipCaptureError::LimitExceeded("operation disk growth".into())
+    );
+}
+
+#[test]
 fn stage_cleanup_removes_only_its_own_directory() {
     let parent = tempfile::tempdir().unwrap();
     let other = parent.path().join("semantic-stage-other-run");
