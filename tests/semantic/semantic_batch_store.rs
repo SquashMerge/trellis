@@ -8337,6 +8337,78 @@ fn over_symbol_cap_document_is_excluded_and_proves_no_absence() {
     }
 }
 
+/// #634: relationship targets defined only in a document excluded over the symbol cap are
+/// never made external: `Child extends Base` and `Child#f` overriding `Base#f` publish no
+/// external target, in both join paths. Uncapped, both relationships target `Base`'s file.
+#[test]
+fn relationship_targets_in_an_excluded_document_are_never_external() {
+    use trellis::semantic_evidence::Target;
+    let child = "class Child extends Base { void f() {} }";
+    let base = "class Base { void f() {} void g() {} }";
+    let world = world(|root| {
+        fs::write(root.join("A.java"), child).unwrap();
+        fs::write(root.join("B.java"), base).unwrap();
+    });
+    let child_doc = DocSpec::new("A.java");
+    let child_doc = occ_at(child_doc, child, ("Child", 0), None, "pkg Child#", 1);
+    let child_doc = occ_at(child_doc, child, ("Base", 0), None, "pkg Base#", 8);
+    let child_doc = occ_at(child_doc, child, ("f", 0), None, "pkg Child#f().", 1)
+        .symbol("pkg Child#", 7, &["pkg Base#"])
+        .symbol("pkg Child#f().", 26, &["pkg Base#f()."]);
+    let base_doc = occ_at(
+        DocSpec::new("B.java"),
+        base,
+        ("Base", 0),
+        None,
+        "pkg Base#",
+        1,
+    );
+    let base_doc = occ_at(base_doc, base, ("f", 0), None, "pkg Base#f().", 1);
+    let base_doc = occ_at(base_doc, base, ("g", 0), None, "pkg Base#g().", 1)
+        .symbol("pkg Base#", 7, &[])
+        .symbol("pkg Base#f().", 26, &[])
+        .symbol("pkg Base#g().", 26, &[]);
+    let descriptor = one_artifact_per_language(&world, vec![("java", vec![child_doc, base_doc])]);
+    let capped_limits = BatchLimits {
+        document_symbols: 2,
+        ..BatchLimits::PRODUCTION
+    };
+    for (limits, capped) in [(BatchLimits::PRODUCTION, false), (capped_limits, true)] {
+        let case = if capped { "capped" } else { "uncapped" };
+        let (mut admitted, _, _) = world
+            .join_with(&descriptor, &limits, DestinationMutations::default())
+            .unwrap();
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        let memory = world
+            .memory_rejoin_with(&descriptor, DestinationMutations::default(), &limits)
+            .unwrap()
+            .publication;
+        assert_same_publication(&staged, &memory, case);
+        let external = staged
+            .type_relationships
+            .iter()
+            .filter(|r| matches!(r.target, Target::External { .. }))
+            .count();
+        assert_eq!(external, 0, "{case}: {:?}", staged.type_relationships);
+        let into_base = staged
+            .type_relationships
+            .iter()
+            .filter(|r| {
+                matches!(&r.target, Target::Internal { document, .. } if document.path == "B.java")
+            })
+            .count();
+        if capped {
+            assert_eq!(
+                coverage_of(&staged, "B.java").diagnostic.as_deref(),
+                Some("document_cap_exceeded")
+            );
+            assert_eq!(into_base, 0, "{case}");
+        } else {
+            assert_eq!(into_base, 2, "{case}: {:?}", staged.type_relationships);
+        }
+    }
+}
+
 /// A Rust document with an attribute, a macro invocation hiding a definition and an ordinary
 /// call: seven occurrences, four of them definitions.
 const GAPS_RS: &str = "#[derive(Debug)]\npub struct Point;\n\nmy_macro! { fn hidden() {} }\n\npub fn run() { helper(); }\npub fn helper() {}\n";
