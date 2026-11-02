@@ -30,6 +30,7 @@ fn abandoned_record(id: &str) -> RunRecord {
         created_at: 1,
         finished_at: None,
         diagnostics: None,
+        group_status: None,
     }
 }
 

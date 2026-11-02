@@ -22,6 +22,8 @@ mod batch_tests;
 #[cfg(test)]
 mod detect_tests;
 #[cfg(test)]
+mod exec_tests;
+#[cfg(test)]
 mod pickup_tests;
 #[cfg(test)]
 mod pickup_watch_tests;
@@ -130,5 +132,22 @@ pub struct Diagnostics {
     pub stdout_tail: String,
     pub stderr_tail: String,
     pub truncated: bool,
-    pub group_survived: bool,
+    pub group_status: GroupStatus,
+}
+
+/// What Trellis established about the producer's process group when it stopped
+/// owning it (#624). `empty` and `survived` are proven while the group ID was
+/// still held; anything that cannot be proven is `unknown`, never assumed empty.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GroupStatus {
+    /// Every member was signalled and only the unreaped leader was left.
+    Empty,
+    /// A member was still in the group after the kill wait.
+    Survived,
+    /// Termination was not established: the final signal was refused (macOS
+    /// refuses a group whose only member is the unreaped leader), the group
+    /// could not be listed, or ownership was never provable (crash recovery).
+    #[default]
+    Unknown,
 }

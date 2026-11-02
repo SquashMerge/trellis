@@ -2,7 +2,7 @@ use super::process_info;
 use super::state::{
     DaemonIdentity, PickupConfig, PickupEntry, RETAINED_RUNS, RunRecord, RunState, StateDir,
 };
-use super::{ProcessIdentity, TrustProfile};
+use super::{GroupStatus, ProcessIdentity, TrustProfile};
 use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
 use std::{
     collections::BTreeSet,
@@ -67,6 +67,7 @@ fn record(n: u32, state: RunState, daemon: DaemonIdentity) -> RunRecord {
         created_at: u64::from(n),
         finished_at: None,
         diagnostics: None,
+        group_status: None,
     }
 }
 
@@ -334,42 +335,80 @@ fn kill_group(mut child: Child) {
     let _ = child.wait();
 }
 
+/// Owner ruling 2026-11-02 (#624): recovery has only a recorded PID and start time, which
+/// cannot atomically prove the group is still the run's, so it never signals it. Even a
+/// leader that still has the recorded start time is left running; termination is
+/// unestablished and membership unknown.
 #[test]
-fn sweep_kills_abandoned_group_with_matching_identity() {
+fn sweep_never_signals_a_recorded_group_and_reports_it_unknown() {
     let fixture = fixture();
     let state = state(&fixture);
-    let mut child = orphan_group();
-    abandoned_run(&state, 1, &child, 0);
-    let pid = child.id() as i32;
-    // The real orphan's parent is gone and init reaps it; reap here so the
-    // killed leader does not linger as a zombie group member.
-    let reaper = std::thread::spawn(move || child.wait().unwrap());
-    let report = state
-        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
-        .unwrap();
-    assert_eq!(report.killed_groups, [pid]);
-    // The sweep's SIGKILL ended the leader.
-    let status = reaper.join().unwrap();
-    assert_eq!(
-        std::os::unix::process::ExitStatusExt::signal(&status),
-        Some(libc::SIGKILL)
-    );
-    let after = state.read_run_record(&run_id(1)).unwrap().unwrap();
-    assert_eq!(after.state, RunState::Failed);
-    assert_eq!(after.outcome.as_deref(), Some("abandoned"));
-    assert!(after.finished_at.is_some());
-    let dir = state.run_dir(&run_id(1)).unwrap();
-    assert!(!dir.join("worktree").exists());
-    assert!(!dir.join("out").exists());
+    for (n, offset) in [(1, 0), (2, 1)] {
+        let child = orphan_group();
+        abandoned_run(&state, n, &child, offset);
+        let pid = child.id() as i32;
+        let report = state
+            .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(report.unestablished_groups, [pid]);
+        assert_eq!(report.abandoned_runs, [run_id(n)]);
+        assert!(
+            process_info::group_exists(pid),
+            "recovery never signals a recorded group"
+        );
+        let after = state.read_run_record(&run_id(n)).unwrap().unwrap();
+        assert_eq!(after.state, RunState::Failed);
+        assert_eq!(after.outcome.as_deref(), Some("abandoned"));
+        assert_eq!(
+            after.error_code.as_deref(),
+            Some("abandoned: producer termination unestablished")
+        );
+        assert_eq!(after.group_status, Some(GroupStatus::Unknown));
+        assert!(after.finished_at.is_some());
+        let dir = state.run_dir(&run_id(n)).unwrap();
+        assert!(!dir.join("worktree").exists());
+        assert!(!dir.join("out").exists());
+        kill_group(child);
+    }
 }
 
+/// A recorded group ID with no process at all is proven gone, so the run is plainly
+/// abandoned with an empty group; one whose producer phase had ended keeps what its owner
+/// established.
 #[test]
-fn sweep_ignores_mismatched_start_time() {
+fn sweep_records_a_vanished_group_empty_and_keeps_an_established_status() {
     let fixture = fixture();
     let state = state(&fixture);
     let child = orphan_group();
-    abandoned_run(&state, 1, &child, 1);
-    // A run this daemon owns is left alone as well.
+    abandoned_run(&state, 1, &child, 0);
+    kill_group(child);
+    state.create_run_dir(&run_id(2)).unwrap();
+    let mut importing = record(2, RunState::Importing, other_daemon());
+    importing.process = Some(ProcessIdentity {
+        pgid: i32::MAX,
+        leader_start_time: 1,
+    });
+    importing.group_status = Some(GroupStatus::Unknown);
+    state.write_run_record(&importing).unwrap();
+    let report = state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap();
+    assert_eq!(report.unestablished_groups, [i32::MAX]);
+    let vanished = state.read_run_record(&run_id(1)).unwrap().unwrap();
+    assert_eq!(vanished.error_code.as_deref(), Some("abandoned"));
+    assert_eq!(vanished.group_status, Some(GroupStatus::Empty));
+    let established = state.read_run_record(&run_id(2)).unwrap().unwrap();
+    assert_eq!(established.group_status, Some(GroupStatus::Unknown));
+    assert_eq!(
+        established.error_code.as_deref(),
+        Some("abandoned: producer termination unestablished")
+    );
+}
+
+#[test]
+fn sweep_ignores_runs_this_daemon_owns() {
+    let fixture = fixture();
+    let state = state(&fixture);
     state.create_run_dir(&run_id(2)).unwrap();
     state
         .write_run_record(&record(2, RunState::Running, DaemonIdentity::current()))
@@ -377,31 +416,28 @@ fn sweep_ignores_mismatched_start_time() {
     let report = state
         .sweep(&DaemonIdentity::current(), &BTreeSet::new())
         .unwrap();
-    assert!(report.killed_groups.is_empty());
-    assert_eq!(report.abandoned_runs, [run_id(1)]);
-    assert!(
-        process_info::group_exists(child.id() as i32),
-        "a process whose start time differs is never signalled"
-    );
+    assert!(report.abandoned_runs.is_empty());
     assert_eq!(
         state.read_run_record(&run_id(2)).unwrap().unwrap().state,
         RunState::Running
     );
-    kill_group(child);
 }
 
+/// The inputs of a queued import, the frozen snapshot included, survive an abandoned run
+/// whose group is unknown (owner ruling 2026-11-02).
 #[test]
 fn sweep_keeps_dirs_in_keep_set() {
     let fixture = fixture();
     let state = state(&fixture);
     let child = orphan_group();
     abandoned_run(&state, 1, &child, 1);
-    populate(&state.run_dir(&run_id(1)).unwrap(), &["batch"]);
+    populate(&state.run_dir(&run_id(1)).unwrap(), &["batch", "snapshot"]);
     let keep = BTreeSet::from([fs::canonicalize(state.run_dir(&run_id(1)).unwrap()).unwrap()]);
     state.sweep(&DaemonIdentity::current(), &keep).unwrap();
     let dir = state.run_dir(&run_id(1)).unwrap();
     assert!(dir.join("out/file").exists());
     assert!(dir.join("batch/file").exists());
+    assert!(dir.join("snapshot/file").exists());
     assert!(!dir.join("worktree").exists(), "phase directories still go");
     assert_eq!(
         state.read_run_record(&run_id(1)).unwrap().unwrap().state,
@@ -416,6 +452,7 @@ fn sweep_keeps_dirs_in_keep_set() {
     assert!(report.abandoned_runs.is_empty());
     assert!(dir.join("run.json").exists());
     assert!(!dir.join("out").exists() && !dir.join("batch").exists());
+    assert!(!dir.join("snapshot").exists());
 }
 
 #[test]

@@ -712,3 +712,94 @@ fn pickup_reaches_only_allowed_producer_modules() {
         }
     }
 }
+
+/// The leader's owner in `src/producer/exec.rs`, the only file that may name these.
+const LEADER_OWNER: &str = "src/producer/exec.rs";
+
+/// What in one production file could reap a child it did not spawn or change how SIGCHLD
+/// reaps (#624). The producer's leader is held unreaped, which pins its group ID, through the
+/// last group signal; that holds only while nothing else in the process reaps it. Waiting for
+/// one's own child by PID (`Child::wait`, `waitpid(pid, ..)`) stays allowed.
+fn reaper_findings(file: &str, text: &str) -> Vec<String> {
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut found = Vec::new();
+    for pattern in [
+        "waitpid(-1",
+        "waitpid(0,",
+        "libc::wait(",
+        "wait3(",
+        "wait4(",
+        "P_ALL",
+        "P_PGID",
+        "SignalKind::child",
+    ] {
+        if compact.contains(pattern) {
+            found.push(pattern.to_owned());
+        }
+    }
+    for word in ["SIGCHLD", "SA_NOCLDWAIT", "waitid"] {
+        if file != LEADER_OWNER && whole_words(text, word) > 0 {
+            found.push(word.to_owned());
+        }
+    }
+    // The owner only reads the SIGCHLD disposition, never sets it.
+    let reads = compact
+        .matches("sigaction(libc::SIGCHLD,std::ptr::null(),")
+        .count();
+    if compact.matches("sigaction(").count() != reads || compact.contains("signal(libc::SIGCHLD") {
+        found.push("SIGCHLD disposition change".to_owned());
+    }
+    found
+}
+
+#[test]
+fn reaper_scan_sees_what_it_must() {
+    for (file, source) in [
+        ("src/a.rs", "unsafe { libc::waitpid( -1, &mut s, 0) };"),
+        ("src/a.rs", "unsafe { libc::waitpid(0, &mut s, 0) };"),
+        ("src/a.rs", "unsafe { libc::wait(&mut s) };"),
+        ("src/a.rs", "signal(SignalKind::child())"),
+        ("src/a.rs", "libc::waitid(libc::P_PID, pid, &mut i, 0)"),
+        ("src/a.rs", "let s = libc::SIGCHLD;"),
+        (LEADER_OWNER, "libc::waitid(libc::P_ALL, 0, &mut i, 0)"),
+        (LEADER_OWNER, "libc::sigaction(libc::SIGCHLD, &new, null)"),
+        (LEADER_OWNER, "libc::signal(libc::SIGCHLD, libc::SIG_IGN)"),
+    ] {
+        let text = unshield(&without_test_items(&lex(source, false)));
+        assert!(!reaper_findings(file, &text).is_empty(), "{file}: {source}");
+    }
+    for (file, source) in [
+        (
+            "src/a.rs",
+            "child.wait(); unsafe { libc::waitpid(pid, &mut s, libc::WNOHANG) };",
+        ),
+        (
+            LEADER_OWNER,
+            "libc::waitid(libc::P_PID, pid, &mut i, 0); \
+             libc::sigaction(libc::SIGCHLD, std::ptr::null(), &raw mut a)",
+        ),
+    ] {
+        let text = unshield(&without_test_items(&lex(source, false)));
+        assert_eq!(
+            reaper_findings(file, &text),
+            Vec::<String>::new(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn no_production_code_reaps_children_it_did_not_spawn() {
+    let mut found = Vec::new();
+    for (file, text) in production(|_| true, false) {
+        for finding in reaper_findings(&file, &text) {
+            found.push(format!("{file}: {finding}"));
+        }
+    }
+    assert!(found.is_empty(), "{found:?}");
+    let owner = production(|f| f == LEADER_OWNER, false);
+    assert!(
+        owner[0].1.contains("WNOWAIT"),
+        "the leader's exit is observed without reaping it"
+    );
+}
