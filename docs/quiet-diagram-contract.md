@@ -8,7 +8,10 @@ Sequence display (#594): web/sequence.js shares the display projection with web/
 - Calls-first is the default. Hide standalone writes, bindings, returns and deferred-definition
   leaves until Show all steps. Keep admitted measured calls/collapsed entry previews in order,
   enclosing branch/alternative/loop/try scope, concise unknown/protocol boundaries and early-exit
-  context. Hiding a return's value text must not make a later call appear unconditional.
+  context. Retain extractor-labelled uncertainty even in non-boundary rows: Python setter/iteration
+  effects, Python/Java/Rust unresolved loop protocols/transfers and JavaScript unknown exception paths.
+  Ordinary writes/bindings and call-free controls without explicit uncertainty stay behind Show all.
+  Hiding a return's value text must not make a later call appear unconditional.
   Keep every original step/call ID/range in the DTO; selection receives the original object.
 - Known generated continuation guard (exact label, no alternate) can use a quiet labelled guard rail
   rather than full alt box. It must remain visibly conditional; not an ordinary unconditional suffix.

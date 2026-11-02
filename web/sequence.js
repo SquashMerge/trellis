@@ -87,6 +87,7 @@ const compactLabels = new Map([
   ["for_expression: possible iterations, not unrolled; exit/termination unknown", "for · possible iterations"],
   ["while_expression: possible iterations, not unrolled; exit/termination unknown", "while · possible iterations"],
   ["loop_expression: possible iterations, not unrolled; exit/termination unknown", "loop · termination unknown"],
+  ["possible iterations, not unrolled; protocol and termination unresolved", "loop · protocol / termination unresolved"],
   ["Definition boundary: decorators/defaults/annotations and binding effects not expanded; callable body does not execute here.", "definition · effects not expanded"],
   ["Class definition boundary: bases, decorators, metaclass and class-body execution not expanded; method bodies do not execute here.", "class definition · effects not expanded"],
   ["Nested callable boundary: body does not execute at definition; captures are not expanded.", "nested callable · captures not expanded"],
@@ -168,6 +169,20 @@ const deferredSequenceBoundaries = new Set([
   "Nested callable boundary: body does not execute at definition; captures are not expanded.",
   "Lambda boundary: body does not execute at definition; captures are not expanded."
 ]);
+function sequenceUncertainty(step) {
+  if (step.kind === "effect") return step.label === "iteration target write: implicit setters/unpacking unresolved" ||
+    step.label?.startsWith("write: ") && step.label.endsWith(" (implicit setters/unpacking unresolved)");
+  if (step.kind === "try") return step.label === "try; exception behavior unknown";
+  if (step.kind !== "loop") return false;
+  return [
+    "possible iterations, not unrolled; protocol and termination unresolved",
+    "enhanced for: possible iterations; iterable evaluated once; implicit iterator/array protocol not expanded",
+    "loop: possible iterations, not unrolled; termination and transfers unknown",
+    "for_expression: possible iterations, not unrolled; exit/termination unknown",
+    "while_expression: possible iterations, not unrolled; exit/termination unknown",
+    "loop_expression: possible iterations, not unrolled; exit/termination unknown"
+  ].includes(step.label);
+}
 function sequenceDisplay(view, options = {}) {
   const visible = new Set(), exits = new Set();
   const visit = steps => {
@@ -177,7 +192,8 @@ function sequenceDisplay(view, options = {}) {
       const children = visit(step.children), alternate = visit(step.alternate);
       const transfer = ["return", "throw", "exit"].includes(step.kind) || children.transfers || alternate.transfers;
       const structural = ["branch", "loop", "try"].includes(step.kind);
-      const context = step.kind === "await" || step.kind === "boundary" && !deferredSequenceBoundaries.has(step.label);
+      const context = step.kind === "await" || sequenceUncertainty(step) ||
+        step.kind === "boundary" && !deferredSequenceBoundaries.has(step.label);
       const show = options.showDetails || step.kind === "call" || !!step.callId || context ||
         children.shows || alternate.shows || structural && transfer;
       if (show) visible.add(step);

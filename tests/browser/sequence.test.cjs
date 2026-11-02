@@ -442,3 +442,63 @@ test("published app visibly falls back for malformed target evidence, depth, Mer
    }
  }
 }));
+
+const pythonUncertaintySource = `def measured(obj):
+    local = prepare()
+    obj.value = prepare()
+    return local
+
+def protocol_loop(items):
+    for item in items:
+        pass
+`;
+test("published Python setter and call-free loop retain concise uncertainty in both renderers", {timeout:240000}, async () => published(pythonUncertaintySource, async ({page,dto,pin,server,paths}) => {
+ const setter=dto.steps.find(step=>step.kind==="effect"&&step.label.endsWith(" (implicit setters/unpacking unresolved)"));
+ assert.ok(setter,"Python extractor must emit the unresolved setter effect");
+ assert.ok(dto.steps.some(step=>step.kind==="effect"&&step.label==="bind name: local"));
+ const seed=await H.seedId(server,paths.token,"protocol_loop");
+ const response=await H.api(server.base,paths.token,"POST",H.scoped(server.rootKey,"sequence"),{seed,expectedRevision:pin,showAll:false});
+ assert.equal(response.status,200,JSON.stringify(response.data));
+ const loopView=response.data,loop=loopView.steps.find(step=>step.kind==="loop");
+ assert.equal(loop.label,"possible iterations, not unrolled; protocol and termination unresolved");
+ const check=async view=>page.evaluate(async view=>{
+  const walk=roots=>roots.flatMap(step=>[step,...walk(step.children||[]),...walk(step.alternate||[])]),originals=walk(view.steps),before=JSON.stringify(view);
+  const freeze=value=>{if(value&&typeof value==="object"){Object.freeze(value);Object.values(value).forEach(freeze);}return value;};freeze(view);
+  const results=[];
+  for(const renderer of [TrellisSequence,TrellisPeleSequence]) {
+   const container=document.createElement("div");document.body.append(container);
+   const selected=[],options={onSelect:step=>selected.push(step)};
+   const result=await renderer.render(container,view,null,new Set(),options);
+   if(renderer===TrellisPeleSequence&&result.status!=="rendered")throw Error(result.reason);
+   const selector=renderer===TrellisSequence?"[data-source-step-id]":".pele-note[data-trellis-step-id],.pele-edge-label[data-trellis-step-id]";
+   const rows=[...container.querySelectorAll(selector)],ids=rows.map(row=>row.dataset.sourceStepId||row.dataset.trellisStepId),compact=rows.map(row=>{
+    const copy=row.cloneNode(true);copy.querySelectorAll("title").forEach(title=>title.remove());return copy.textContent;
+   }).join(" ");
+   for(const row of rows)row.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
+   const exact=selected.length===ids.length&&selected.every((step,i)=>step===originals.find(original=>original.id===ids[i]));
+   await renderer.render(container,view,null,new Set(),{...options,showDetails:true});
+   const restored=[...container.querySelectorAll(selector)].map(row=>row.dataset.sourceStepId||row.dataset.trellisStepId);
+   results.push({ids,compact,exact,restored,unchanged:JSON.stringify(view)===before});container.remove();
+  }
+  return {results,originals:originals.map(step=>step.id),summary:TrellisSequence.emptySummary(view)};
+ },view);
+ const measured=await check(dto);
+ for(const rendered of measured.results) {
+  assert.ok(rendered.ids.includes(setter.id));assert.match(rendered.compact,/write · setters\/unpacking unresolved/);
+  assert.doesNotMatch(rendered.compact,/obj\.value = prepare|bind local|return local/);
+  assert.deepEqual(rendered.ids,dto.steps.filter(step=>step.kind==="call"||step===setter).map(step=>step.id));
+  assert.ok(rendered.exact&&rendered.unchanged);assert.deepEqual(rendered.restored,measured.originals);
+ }
+ assert.equal(measured.summary,"");
+ const protocol=await check(loopView);
+ for(const rendered of protocol.results) {
+  assert.ok(rendered.ids.includes(loop.id));assert.match(rendered.compact,/protocol.*termination unresolved/);
+  assert.match(rendered.compact,/iteration write · setters\/unpacking unresolved/);
+  assert.ok(rendered.exact&&rendered.unchanged);assert.deepEqual(rendered.restored,protocol.originals);
+ }
+ assert.match(protocol.summary,/No measured calls.*Non-call behavior may be hidden/);
+ await page.locator(".method-pick").filter({hasText:"protocol_loop"}).click();
+ await page.locator("#sequence-diagram .sequence-empty").waitFor();
+ assert.match(await page.locator("#sequence-diagram").textContent(),/protocol.*termination unresolved/);
+ assert.ok(await page.locator("#sequence-diagram svg").count());
+}, "flow.py"));

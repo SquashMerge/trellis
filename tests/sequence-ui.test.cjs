@@ -998,3 +998,24 @@ test("calls-first hides deferred callables but keeps unexpanded initialization e
   d.render({showDetails:true});
   assert.deepEqual(d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]),steps.map(step=>step.id));
 });
+
+test("calls-first preserves extractor-labelled uncertainty outside boundaries only", () => {
+  const make=(id,kind,label)=>({id,kind,label,path:"main.py",range,children:[],alternate:[],hidden:false});
+  const ordinary=[make("bind","effect","bind name: unknown"),make("write","effect","write: unknown = unresolved"),make("ordinary-loop","loop","for_statement: possible iterations, not unrolled")];
+  const uncertain=[
+    make("setter","effect","write: obj.value = prepare() (implicit setters/unpacking unresolved)"),
+    make("iteration","effect","iteration target write: implicit setters/unpacking unresolved"),
+    make("python-loop","loop","possible iterations, not unrolled; protocol and termination unresolved"),
+    make("java-iter","loop","enhanced for: possible iterations; iterable evaluated once; implicit iterator/array protocol not expanded"),
+    make("java-loop","loop","loop: possible iterations, not unrolled; termination and transfers unknown"),
+    ...["for_expression","while_expression","loop_expression"].map(kind=>make(kind,"loop",`${kind}: possible iterations, not unrolled; exit/termination unknown`)),
+    make("js-try","try","try; exception behavior unknown")
+  ];
+  const view=freeze({...viewWith([...ordinary,...uncertain]),revision:{indexGeneration:"pin",indexRevision:1}}),before=JSON.stringify(view),d=diagram(view);
+  const ids=()=>d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]);
+  assert.deepEqual(ids(),uncertain.map(step=>step.id));
+  assert.deepEqual(Array.from(peleProjector().project(view).rows,row=>row.id),uncertain.map(step=>step.id));
+  assert.equal(rowLabel(d.row("setter")),"write · setters/unpacking unresolved");
+  d.render({showDetails:true});assert.deepEqual(ids(),view.steps.map(step=>step.id));
+  assert.equal(JSON.stringify(view),before);
+});
