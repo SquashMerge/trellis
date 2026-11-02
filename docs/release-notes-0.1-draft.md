@@ -90,9 +90,10 @@ explicit trust settings.
   ([#602](https://github.com/SquashMerge/trellis/pull/602),
   [#601](https://github.com/SquashMerge/trellis/pull/601),
   [#590](https://github.com/SquashMerge/trellis/pull/590))
-- Local edit publication avoids repeated semantic statement preparation and
-  unnecessary publication notifications. Edit latency remains open work; these
-  changes do not establish a performance qualification pass.
+- Local edit publication retains prepared semantic statements and promptly reports
+  the existing rebuild-in-progress state when semantic writes block readers.
+  Edit latency remains open work; these changes do not establish a performance
+  qualification pass.
   ([#627](https://github.com/SquashMerge/trellis/pull/627))
 - Shutdown ordering and fixture process cleanup have regression coverage. The MCP
   contract suite checks every advertised tool against real Rust and JavaScript
