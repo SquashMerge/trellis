@@ -7969,6 +7969,128 @@ fn witnessed_local_rejoin_keeps_a_method_direct_in_an_unchanged_document() {
     );
 }
 
+/// A first spill during semantic rejoin must be visible before that rejoin finishes.
+#[test]
+fn witnessed_semantic_spill_marks_readers_before_commit() {
+    use std::sync::atomic::Ordering;
+    use trellis::store::{RebuildInProgress, SemanticPublicationStage};
+
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+                ("src/c.rs", "fn other() { }\n"),
+            ],
+        );
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g) = (symbol("r()."), symbol("impl#[S]f()."), symbol("g()."));
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 15, 16], &[], &f, 0)
+                .occurrence(&[0, 20, 21], &[], &g, 0)
+                .symbol(&r, 17, &[]),
+            DocSpec::new("src/b.rs")
+                .occurrence(&[1, 12, 13], &[], &f, 1)
+                .occurrence(&[2, 3, 4], &[], &g, 1)
+                .symbol(&f, 26, &[])
+                .symbol(&g, 17, &[]),
+            DocSpec::new("src/c.rs"),
+        ],
+    );
+    drop(world.publish(&world.write(&fixture)).unwrap());
+    let counts = world._state.path().join("spill-work-counts.json");
+    // SAFETY: nextest runs each test in its own process.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+    }
+    let spill_count = |db: &rusqlite::Connection| {
+        let (mut current, mut highwater) = (0, 0);
+        // SAFETY: live writer connection and valid local out-pointers.
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                db.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_SPILL,
+                &mut current,
+                &mut highwater,
+                0,
+            )
+        };
+        assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+        current
+    };
+    for rollback in [false, true] {
+        let prior = world.store.status().unwrap().revision;
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_hook = observed.clone();
+        let reading = world.store.clone();
+        let cancel = world.cancel.clone();
+        world
+            .store
+            .set_semantic_publication_observer_for_tests(move |stage, db| {
+                if stage == SemanticPublicationStage::BeforeSemantic {
+                    assert_eq!(spill_count(db), 0, "native work must not spill");
+                    db.pragma_update(None, "cache_size", -64).unwrap();
+                } else if !observed_hook.swap(true, Ordering::AcqRel) {
+                    assert!(spill_count(db) > 0, "semantic work must actually spill");
+                    let error = reading.status().unwrap_err();
+                    assert!(
+                        error.chain().any(|cause| cause.is::<RebuildInProgress>()),
+                        "semantic spill was not marked before commit: {error:#}"
+                    );
+                    let error = reading.source_at("src/a.rs", Some(prior)).unwrap_err();
+                    assert!(
+                        error.chain().any(|cause| cause.is::<RebuildInProgress>()),
+                        "{error:#}"
+                    );
+                    if rollback {
+                        cancel.store(true, Ordering::Release);
+                    }
+                }
+            });
+        write_files(
+            &world.root,
+            &[(
+                "src/c.rs",
+                if rollback {
+                    "fn other() { let _ = 2; }\n"
+                } else {
+                    "fn other() { let _ = 1; }\n"
+                },
+            )],
+        );
+        let options = IndexOptions::new(world.root.clone());
+        let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+        let leader = world.store.publication_for_tests().unwrap();
+        let result =
+            world
+                .store
+                .publish_local_for_tests(&options, &capture, &leader, &world.cancel);
+        assert!(observed.load(Ordering::Acquire));
+        world.cancel.store(false, Ordering::Release);
+        let expected = if rollback {
+            assert!(result.is_err());
+            prior
+        } else {
+            result.unwrap()
+        };
+        assert_eq!(world.store.status().unwrap().revision, expected);
+        let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
+        if !rollback {
+            assert_eq!(work["witnessedRejoins"], 1, "{work}");
+        }
+    }
+}
+
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the
 /// per-document cap shrunk below src/lib.rs's 36 occurrences: the document is admitted partial
 /// with the typed reason, keeps exactly its definitions, and both join paths agree.
