@@ -7314,6 +7314,23 @@ forbid = [{{ calls = "helper" }}]
                                 let reply = mcp.success(name, args);
                                 let items = reply["data"][field].as_array().unwrap();
                                 assert!(!items.is_empty(), "{name}: {reply}");
+                                for proof in ["coverage", "provenance", "semanticBases"] {
+                                    assert_eq!(
+                                        reply["data"].get(proof).is_none(),
+                                        compact,
+                                        "{name}: compact={compact}: {proof}"
+                                    );
+                                }
+                                for item in items {
+                                    for proof in ["binding", "semanticBasisRef"] {
+                                        if compact {
+                                            assert!(
+                                                item.get(proof).is_none(),
+                                                "{name}: {proof}: {item}"
+                                            );
+                                        }
+                                    }
+                                }
                                 if limit.is_some() {
                                     assert_eq!(items.len(), 1);
                                 } else {
@@ -7419,6 +7436,29 @@ forbid = [{{ calls = "helper" }}]
                             .collect()
                     };
                     for scoped in [false, true] {
+                        let assert_rule_scope = |reply: &Value| {
+                            if name != "trellis_rules_check" || !scoped {
+                                return;
+                            }
+                            for field in ["instances", "testOnly"] {
+                                assert!(
+                                    reply["data"][field]
+                                        .as_array()
+                                        .unwrap()
+                                        .iter()
+                                        .all(|item| item["target"]["path"] == path),
+                                    "{reply}"
+                                );
+                            }
+                            assert!(
+                                reply["data"]["unassigned"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .all(|item| item["path"] == path),
+                                "{reply}"
+                            );
+                        };
                         if scoped && name == "trellis_rules_explain" {
                             continue;
                         }
@@ -7439,6 +7479,15 @@ forbid = [{{ calls = "helper" }}]
                             args["target"] = instance["target"].clone();
                         }
                         let full = mcp.success(name, args.clone());
+                        assert_rule_scope(&full);
+                        if name == "trellis_rules_check" && language == "javascript" {
+                            let has_library = full["data"]["unassigned"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|item| item["path"] == "src/lib.js");
+                            assert_eq!(has_library, !scoped, "{full}");
+                        }
                         if name == "trellis_references" {
                             // References are module edges: the Rust fixture's bound calls
                             // stay in one module and therefore do not create reference edges.
@@ -7497,6 +7546,7 @@ forbid = [{{ calls = "helper" }}]
                         let mut sampled = args.clone();
                         sampled["limit"] = json!(1);
                         let sample = mcp.success(name, sampled);
+                        assert_rule_scope(&sample);
                         if name == "trellis_references" {
                             for field in ["production", "tests"] {
                                 for edge in sample["data"][field].as_array().unwrap() {
@@ -7513,6 +7563,7 @@ forbid = [{{ calls = "helper" }}]
                         let mut terminal = args.clone();
                         terminal["offset"] = json!(whole.len());
                         let end = mcp.success(name, terminal);
+                        assert_rule_scope(&end);
                         assert!(flatten(&end).is_empty());
                         assert!(end["data"]["page"]["nextOffset"].is_null());
                         for limit in [None, Some(1)] {
@@ -7522,6 +7573,7 @@ forbid = [{{ calls = "helper" }}]
                                 continuation["limit"] = json!(limit);
                             }
                             let page = mcp.success(name, continuation);
+                            assert_rule_scope(&page);
                             let tail = flatten(&page);
                             assert_eq!(tail.is_empty(), whole.len() == 1);
                             assert_eq!(page["data"]["page"]["offset"], 1);
