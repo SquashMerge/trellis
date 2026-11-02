@@ -1053,11 +1053,7 @@ fn two_document_case(change_b: &str) {
             assert_eq!(state_of("src/B.js"), "failed");
         }
     }
-    if let Ok(pid) = fs::read_to_string(home.join("daemon.pid"))
-        && let Ok(pid) = pid.parse::<i32>()
-    {
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-    }
+    let _ = trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM);
 }
 
 #[test]
@@ -1430,11 +1426,7 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
             .state,
         trellis::semantic_evidence::CoverageState::Failed
     );
-    if let Ok(pid) = fs::read_to_string(home.join("daemon.pid"))
-        && let Ok(pid) = pid.parse::<i32>()
-    {
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-    }
+    let _ = trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM);
 }
 
 #[test]
@@ -2112,11 +2104,7 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                 );
                 assert!(selected.type_relationships.iter().all(|r| !matches!(&r.target,trellis::semantic_evidence::Target::External{symbol} if symbol.symbol.contains("Object#toString"))),"implicit Object endpoint must not be inferred");
             }
-            if let Ok(pid) = fs::read_to_string(home.join("daemon.pid"))
-                && let Ok(pid) = pid.parse::<i32>()
-            {
-                unsafe { libc::kill(pid, libc::SIGTERM) };
-            }
+            let _ = trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM);
             eprintln!(
                 "SEMANTIC_VARIANT_END language={language} variant={variant} elapsed={:?}",
                 variant_started.elapsed()

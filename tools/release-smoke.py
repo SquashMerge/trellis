@@ -107,28 +107,69 @@ def run(binary, source, output):
                         except subprocess.TimeoutExpired:
                             child.kill()
                             child.wait()
-                # start_daemon creates a detached session; a process group
-                # cannot own a replacement. Match only this smoke's binary.
-                def replacements():
-                    processes = subprocess.check_output(["ps", "-axo", "pid=,args="], text=True)
-                    return [int(line.strip().split(None, 1)[0]) for line in processes.splitlines()
-                            if len(line.strip().split(None, 1)) == 2
-                            and line.strip().split(None, 1)[1] == binary + " daemon"]
-                for pid in replacements():
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                deadline = time.monotonic() + 10
-                while replacements():
-                    if time.monotonic() >= deadline:
-                        for pid in replacements():
-                            try:
-                                os.kill(pid, signal.SIGKILL)
-                            except ProcessLookupError:
-                                pass
-                        raise RuntimeError("detached smoke daemon did not stop after SIGTERM")
-                    time.sleep(0.05)
+                try:
+                    replacements_stopped = stop_replacements(home, binary)
+                except BaseException:
+                    output.unlink(missing_ok=True)
+                    raise
+                if replacements_stopped:
+                    # A replacement means this smoke lost its owned daemon.
+                    output.unlink(missing_ok=True)
+                    raise RuntimeError("unexpected detached replacement invalidated smoke")
+
+
+def stop_replacements(home, binary):
+    """Only this smoke's private HOME and exact executable may be stopped.
+
+    ps lstart has second resolution; this and the immediate scope recheck
+    narrow the race but cannot make numeric signaling atomic.
+    """
+    home_token = re.compile(r"(?:^| )HOME=" + re.escape(str(home))
+                            + r"(?= [A-Za-z_][A-Za-z0-9_]*=|$)")
+
+    def candidates(pid=None):
+        args = ["ps", "eww", *(["-A"] if pid is None else ["-p", str(pid)]),
+                "-o", "pid=,lstart=,stat=,command="]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        if result.returncode != 0 and not (pid is not None and result.returncode == 1):
+            raise RuntimeError("cannot inspect smoke replacements: " + result.stderr)
+        found = {}
+        for line in result.stdout.splitlines():
+            fields = line.strip().split(None, 7)
+            if len(fields) != 8:
+                continue
+            raw_pid, *start, state, command = fields
+            if (int(raw_pid) > 0 and not state.startswith("Z")
+                    and command.startswith(binary + " daemon ") and home_token.search(command)):
+                found[int(raw_pid)] = " ".join(start)
+        return found
+
+    remaining = candidates()
+    found = bool(remaining)
+
+    def matching(pid):
+        return candidates(pid).get(pid) == remaining[pid]
+
+    def send(pid, sig):
+        if matching(pid):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+
+    for pid in remaining:
+        send(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 10
+    while remaining:
+        remaining = {pid: start for pid, start in remaining.items() if matching(pid)}
+        if not remaining:
+            break
+        if time.monotonic() >= deadline:
+            for pid in remaining:
+                send(pid, signal.SIGKILL)
+            raise RuntimeError("detached smoke daemon did not stop after SIGTERM")
+        time.sleep(0.05)
+    return found
 
 
 if __name__ == "__main__":

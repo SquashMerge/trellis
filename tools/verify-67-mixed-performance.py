@@ -84,6 +84,10 @@ def maxrss_bytes(usage):
 
 def reap_with_rusage(proc, grace=20):
     """Terminate and reap `proc` with wait4 so its resource usage is kept."""
+    # Readiness poll may already have reaped it. Its PID is no longer ours,
+    # and wait4 usage is unavailable; never signal the cached numeric PID.
+    if proc.returncode is not None:
+        return {"maxRssBytes": None}
     usage = None
     status = None
     killed = False
@@ -179,45 +183,52 @@ def stop_home_processes(home, binary):
     def candidates(pid=None):
         args = ["/bin/ps", "eww"]
         args += ["-p", str(pid)] if pid is not None else ["-A"]
-        args += ["-o", "pid=", "-o", "stat=", "-o", "command="]
+        args += ["-o", "pid=", "-o", "lstart=", "-o", "stat=", "-o", "command="]
         result = subprocess.run(args, capture_output=True, text=True, timeout=10)
         require(result.returncode == 0 or (pid is not None and result.returncode == 1),
                 f"cannot enumerate private HOME daemon processes (ps exit {result.returncode}): {result.stderr.strip()}")
-        found = set()
+        found = {}
         for line in result.stdout.splitlines():
-            fields = line.strip().split(None, 2)
-            if len(fields) != 3:
+            fields = line.strip().split(None, 7)
+            if len(fields) != 8:
                 continue
-            raw_pid, state, command_line = fields
+            raw_pid, *start_fields, state, command_line = fields
+            start = " ".join(start_fields)
             if (not state.startswith("Z") and command_line.startswith(str(binary) + " ")
                     and home_token.search(command_line)):
-                found.add(int(raw_pid))
+                if int(raw_pid) > 0:
+                    found[int(raw_pid)] = start
         return found
+
+    # lstart is second-resolution, not atomic ownership. Private HOME/binary
+    # rechecks also apply; same-second reuse and a check/signal window remain.
+    def still_matches(pid):
+        return candidates(pid).get(pid) == remaining[pid]
 
     remaining = candidates()
     if not remaining:
         return
     record("unexpected_home_processes", pids=sorted(remaining), home=str(home), attempt_valid=False)
     for pid in remaining:
-        if candidates(pid):
+        if still_matches(pid):
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
     deadline = time.monotonic() + 20
     while remaining and time.monotonic() < deadline:
-        remaining = {pid for pid in remaining if candidates(pid)}
+        remaining = {pid: start for pid, start in remaining.items() if still_matches(pid)}
         if remaining:
             time.sleep(.05)
     for pid in remaining:
-        if candidates(pid):
+        if still_matches(pid):
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
     deadline = time.monotonic() + 10
     while remaining and time.monotonic() < deadline:
-        remaining = {pid for pid in remaining if candidates(pid)}
+        remaining = {pid: start for pid, start in remaining.items() if still_matches(pid)}
         if remaining:
             time.sleep(.05)
     require(not remaining and election_free(home), "private HOME processes did not exit/release election")
