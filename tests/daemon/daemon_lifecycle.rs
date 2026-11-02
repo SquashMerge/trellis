@@ -296,6 +296,31 @@ async fn lost_active_index_wakes_cli_index_waiter_without_recreating_queue() {
     );
 }
 
+#[test]
+fn serve_connections_hold_only_the_daemon_until_the_last_disconnect() {
+    let (_base, id, mut registry, now) = fixture();
+    registry.attach_launch(7, &id).unwrap();
+    registry.retain_serve(1);
+    registry.retain_serve(2);
+    registry.disconnect_at(7, now);
+    let later = now + DAEMON_IDLE_DELAY + Duration::from_secs(1);
+    let tick = registry.advance(later).unwrap();
+    assert!(!tick.exit);
+    assert_eq!(tick.released, vec![id.root_key.clone()]);
+    assert_eq!(registry.idle_exit_deadline(), None);
+    registry.disconnect_at(1, later);
+    assert!(!registry.advance(later + DAEMON_IDLE_DELAY).unwrap().exit);
+    assert_eq!(registry.idle_exit_deadline(), None);
+    registry.disconnect_at(2, later);
+    let due = later + DAEMON_IDLE_DELAY;
+    assert_eq!(registry.idle_exit_deadline(), Some(due));
+    // A repeated disconnect cannot extend grace or remove another session.
+    registry.disconnect_at(1, due);
+    registry.disconnect_at(2, due);
+    assert_eq!(registry.idle_exit_deadline(), Some(due));
+    assert!(registry.advance(due).unwrap().exit);
+}
+
 #[tokio::test]
 async fn lifecycle_driver_exits_when_startup_deadline_is_due() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::starting_at(
