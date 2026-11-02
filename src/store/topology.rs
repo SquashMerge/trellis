@@ -1176,6 +1176,41 @@ fn lower_hex(text: &str, length: usize) -> bool {
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
+
+// Retire inspection witnesses before releasing the verified use lock. The
+// retirement itself serializes with SQLite open/close and defers borrowed or
+// live witnesses; if the lock identity was lost, conservatively retain them.
+struct GcInspectionWitnesses<'a> {
+    guard: &'a UseGuard,
+    paths: Vec<PathBuf>,
+    suspended: Vec<PathBuf>,
+}
+impl Drop for GcInspectionWitnesses<'_> {
+    fn drop(&mut self) {
+        if self
+            .paths
+            .first()
+            .and_then(|path| path.parent())
+            .is_some_and(|dir| {
+                self.guard
+                    .verify_exclusive_path(&dir.with_extension("lock"))
+                    .is_ok()
+            })
+        {
+            drop(super::SqliteWitnessRetirement(std::mem::take(
+                &mut self.paths,
+            )));
+        } else if !self.suspended.is_empty() {
+            // No verified use guard: restore prior requests without closing
+            // descriptors or disturbing requests inserted during inspection.
+            let mut registry = super::sqlite_witnesses()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            registry.retired.extend(self.suspended.drain(..));
+        }
+    }
+}
+
 fn readonly_index_db(path: &Path) -> Result<super::ProtectedSqliteConnection> {
     use rusqlite::OpenFlags;
     let file = super::retained_sqlite_file(path, false, false, false)?;
@@ -1315,6 +1350,31 @@ fn gc_remove_candidate(
     writer: &WriterGuard,
     hook: &mut dyn FnMut(GcStage) -> Result<()>,
 ) -> Result<bool> {
+    if guard
+        .verify_exclusive_path(&dir.with_extension("lock"))
+        .is_err()
+    {
+        return Ok(false);
+    }
+    let paths = vec![dir.join("index.db"), dir.join("requests.db")];
+    let suspended = {
+        // A prior skipped inspection may have deferred retirement for a
+        // borrower. This exclusive inspection needs its witnesses through the
+        // unlink preflight, so defer that retirement until this scope exits.
+        let mut registry = super::sqlite_witnesses()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        paths
+            .iter()
+            .filter(|path| registry.retired.remove(*path))
+            .cloned()
+            .collect()
+    };
+    let witnesses = GcInspectionWitnesses {
+        guard: &guard,
+        paths,
+        suspended,
+    };
     let producer_state = cache.join("producers").join(key);
     let admit = (|| -> Result<Vec<(PathBuf, (u64, u64))>> {
         guard.verify_exclusive_path(&dir.with_extension("lock"))?;
@@ -1462,6 +1522,7 @@ fn gc_remove_candidate(
     // Still under the candidate's exclusive use lock.
     remove_producer_state(&producer_state)?;
     // Lock path is the final name removed, after the directory is gone.
+    drop(witnesses);
     guard.remove_last()?;
     Ok(true)
 }
@@ -1670,6 +1731,11 @@ impl TopologyRoots {
                     Err(e) if e.is::<StorageBusy>() => ("busy", "use_lock_busy"),
                     Err(_) => ("unknown", "unsafe_use_lock"),
                     Ok(guard) => {
+                        let _witnesses = GcInspectionWitnesses {
+                            guard: &guard,
+                            paths: vec![entry.path().join("index.db")],
+                            suspended: Vec::new(),
+                        };
                         let result = inspect_index(&entry.path(), &name, now_secs)
                             .unwrap_or(("unknown", "metadata_unreadable"));
                         if guard.verify().is_err() {
@@ -2121,6 +2187,446 @@ mod gc_schema_race_tests {
 #[cfg(test)]
 mod gc_final_witness_tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn has_witness(path: &Path) -> bool {
+        crate::store::sqlite_witnesses()
+            .lock()
+            .unwrap()
+            .by_path
+            .contains_key(path)
+    }
+
+    #[test]
+    fn automatic_gc_retries_after_borrowed_witness_is_released() {
+        for old_schema in [false, true] {
+            let state = tempfile::tempdir().unwrap();
+            let candidate_root = tempfile::tempdir().unwrap();
+            let current_root = tempfile::tempdir().unwrap();
+            let candidate =
+                crate::store::Store::open_for_tests(state.path(), candidate_root.path()).unwrap();
+            if !old_schema {
+                candidate
+                    .enqueue_request(
+                        &crate::indexer::IndexOptions::new(candidate_root.path().to_owned()),
+                        None,
+                    )
+                    .unwrap();
+            }
+            let roots = candidate.roots.clone();
+            let identity = candidate.identity.verified_clone().unwrap();
+            let index = roots.index_db(&identity);
+            let queue = roots.requests_db(&identity);
+            candidate.retire_checkout_sqlite_witnesses();
+            drop(candidate);
+            if old_schema {
+                let db = rusqlite::Connection::open(&index).unwrap();
+                db.pragma_update(None, "user_version", 1).unwrap();
+            }
+            let current =
+                crate::store::Store::open_for_tests(state.path(), current_root.path()).unwrap();
+            let writer = roots
+                .writer(Arc::new(current.identity.verified_clone().unwrap()))
+                .unwrap();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 31 * 86_400;
+            let borrowed_path = if old_schema { &index } else { &queue };
+            let before = fs::read(&index).unwrap();
+            let queue_before = (!old_schema).then(|| fs::read(&queue).unwrap());
+            let lock_inode = fs::metadata(roots.index_use_lock(&identity)).unwrap().ino();
+            let mut borrower = None;
+            let mut hits = 0;
+            let removed = roots
+                .automatic_gc_at_with_hook(&current.identity, &writer, now, &mut |stage| {
+                    if stage == GcStage::BeforeCandidateUnlink {
+                        hits += 1;
+                        borrower = Some(crate::store::retained_sqlite_file(
+                            borrowed_path,
+                            false,
+                            false,
+                            false,
+                        )?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!((removed, hits), (0, 1));
+            assert_eq!(fs::read(&index).unwrap(), before);
+            if let Some(bytes) = &queue_before {
+                assert_eq!(&fs::read(&queue).unwrap(), bytes);
+            }
+            assert_eq!(
+                fs::metadata(roots.index_use_lock(&identity)).unwrap().ino(),
+                lock_inode
+            );
+            {
+                let registry = crate::store::sqlite_witnesses().lock().unwrap();
+                assert!(registry.by_path.contains_key(borrowed_path));
+                assert!(registry.retired.contains(borrowed_path));
+                assert!(
+                    registry
+                        .live
+                        .keys()
+                        .all(|(path, _, _)| path != borrowed_path)
+                );
+            }
+            drop(borrower);
+            assert!(has_witness(borrowed_path));
+            let mut retry_hit = 0;
+            let removed = roots
+                .automatic_gc_at_with_hook(&current.identity, &writer, now + 86_400, &mut |stage| {
+                    if stage == GcStage::BeforeCandidateUnlink {
+                        retry_hit += 1;
+                        assert!(has_witness(&index));
+                        if !old_schema {
+                            assert!(has_witness(&queue));
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                (removed, retry_hit),
+                (1, 1),
+                "retry failed for old_schema={old_schema}"
+            );
+            assert!(!index.exists() && !queue.exists());
+            assert!(!has_witness(&index) && !has_witness(&queue));
+            assert!(!roots.index_use_lock(&identity).exists());
+            drop(writer);
+            current.retire_checkout_sqlite_witnesses();
+            drop(current);
+        }
+    }
+
+    #[test]
+    fn gc_lost_guard_restores_suspended_retirement_without_closing_witnesses() {
+        use std::os::fd::AsRawFd;
+
+        let state = tempfile::tempdir().unwrap();
+        let candidate_root = tempfile::tempdir().unwrap();
+        let current_root = tempfile::tempdir().unwrap();
+        let candidate =
+            crate::store::Store::open_for_tests(state.path(), candidate_root.path()).unwrap();
+        candidate
+            .enqueue_request(
+                &crate::indexer::IndexOptions::new(candidate_root.path().to_owned()),
+                None,
+            )
+            .unwrap();
+        let roots = candidate.roots.clone();
+        let identity = candidate.identity.verified_clone().unwrap();
+        let index = roots.index_db(&identity);
+        let queue = roots.requests_db(&identity);
+        let lock = roots.index_use_lock(&identity);
+        let moved_lock = lock.with_extension("fault-injection");
+        candidate.retire_checkout_sqlite_witnesses();
+        drop(candidate);
+        let current =
+            crate::store::Store::open_for_tests(state.path(), current_root.path()).unwrap();
+        let writer = roots
+            .writer(Arc::new(current.identity.verified_clone().unwrap()))
+            .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 31 * 86_400;
+        let mut borrower = None;
+        let mut hits = 0;
+        assert_eq!(
+            roots
+                .automatic_gc_at_with_hook(&current.identity, &writer, now, &mut |stage| {
+                    if stage == GcStage::BeforeCandidateUnlink {
+                        hits += 1;
+                        borrower = Some(crate::store::retained_sqlite_file(
+                            &index, false, false, false,
+                        )?);
+                    }
+                    Ok(())
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(hits, 1);
+        drop(borrower);
+        {
+            let registry = crate::store::sqlite_witnesses().lock().unwrap();
+            assert!(registry.retired.contains(&index));
+            assert!(!registry.retired.contains(&queue));
+        }
+        let mut descriptors = None;
+        let error = roots
+            .automatic_gc_at_with_hook(&current.identity, &writer, now + 86_400, &mut |stage| {
+                if stage == GcStage::BeforeCandidateUnlink {
+                    let mut registry = crate::store::sqlite_witnesses().lock().unwrap();
+                    assert!(!registry.retired.contains(&index));
+                    descriptors = Some((
+                        registry.by_path[&index][0].as_raw_fd(),
+                        registry.by_path[&queue][0].as_raw_fd(),
+                    ));
+                    // A later retirement request must survive restoration too.
+                    registry.retired.insert(queue.clone());
+                    drop(registry);
+                    fs::rename(&lock, &moved_lock)?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        let (index_fd, queue_fd) = descriptors.expect("fault hook reached");
+        {
+            let registry = crate::store::sqlite_witnesses().lock().unwrap();
+            assert!(
+                registry.retired.contains(&index),
+                "prior retirement request was lost"
+            );
+            assert!(
+                registry.retired.contains(&queue),
+                "later retirement request was lost"
+            );
+            assert_eq!(registry.by_path[&index][0].as_raw_fd(), index_fd);
+            assert_eq!(registry.by_path[&queue][0].as_raw_fd(), queue_fd);
+            assert!(unsafe { libc::fcntl(index_fd, libc::F_GETFD) } >= 0);
+            assert!(unsafe { libc::fcntl(queue_fd, libc::F_GETFD) } >= 0);
+        }
+        fs::rename(&moved_lock, &lock).unwrap();
+        let guard = UseGuard::acquire_existing(&lock, true, true).unwrap();
+        for path in [&index, &queue] {
+            drop(
+                crate::store::protected_sqlite_open(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .unwrap(),
+            );
+            assert!(!has_witness(path));
+        }
+        drop(guard);
+        drop(writer);
+        current.retire_checkout_sqlite_witnesses();
+        drop(current);
+    }
+
+    #[test]
+    fn report_failure_retires_witness_opened_before_sidecar_check() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_for_tests(state.path(), root.path()).unwrap();
+        let roots = store.roots.clone();
+        let path = roots.index_db(&store.identity);
+        store.retire_checkout_sqlite_witnesses();
+        drop(store);
+        assert!(!has_witness(&path));
+        let sidecar = path.with_file_name("index.db-journal");
+        fs::write(&sidecar, b"journal").unwrap();
+        let report = roots.gc_report_at(1_800_000_000).unwrap();
+        assert_eq!(report.derived.len(), 1);
+        assert_eq!(
+            (report.derived[0].status, report.derived[0].reason),
+            ("unknown", "metadata_unreadable")
+        );
+        assert!(!has_witness(&path));
+        assert_eq!(fs::read(sidecar).unwrap(), b"journal");
+    }
+
+    #[test]
+    fn automatic_gc_retires_witness_when_recent_candidate_is_skipped() {
+        let state = tempfile::tempdir().unwrap();
+        let candidate_root = tempfile::tempdir().unwrap();
+        let current_root = tempfile::tempdir().unwrap();
+        let candidate =
+            crate::store::Store::open_for_tests(state.path(), candidate_root.path()).unwrap();
+        let roots = candidate.roots.clone();
+        let path = roots.index_db(&candidate.identity);
+        candidate.retire_checkout_sqlite_witnesses();
+        drop(candidate);
+        assert!(!has_witness(&path));
+        let current =
+            crate::store::Store::open_for_tests(state.path(), current_root.path()).unwrap();
+        let writer = roots
+            .writer(Arc::new(current.identity.verified_clone().unwrap()))
+            .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(
+            roots
+                .automatic_gc_at(&current.identity, &writer, now)
+                .unwrap(),
+            0
+        );
+        assert!(path.exists());
+        assert!(!has_witness(&path));
+        drop(writer);
+        current.retire_checkout_sqlite_witnesses();
+        drop(current);
+    }
+
+    #[test]
+    fn automatic_gc_error_retires_index_and_queue_witnesses() {
+        let state = tempfile::tempdir().unwrap();
+        let candidate_root = tempfile::tempdir().unwrap();
+        let current_root = tempfile::tempdir().unwrap();
+        let candidate =
+            crate::store::Store::open_for_tests(state.path(), candidate_root.path()).unwrap();
+        candidate
+            .enqueue_request(
+                &crate::indexer::IndexOptions::new(candidate_root.path().to_owned()),
+                None,
+            )
+            .unwrap();
+        let roots = candidate.roots.clone();
+        let index = roots.index_db(&candidate.identity);
+        let queue = candidate.request_db_path();
+        let candidate_identity = candidate.identity.verified_clone().unwrap();
+        candidate.retire_checkout_sqlite_witnesses();
+        drop(candidate);
+        assert!(!has_witness(&index) && !has_witness(&queue));
+        let current =
+            crate::store::Store::open_for_tests(state.path(), current_root.path()).unwrap();
+        let writer = roots
+            .writer(Arc::new(current.identity.verified_clone().unwrap()))
+            .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 31 * 86_400;
+        let error = roots
+            .automatic_gc_at_with_hook(&current.identity, &writer, now, &mut |stage| {
+                if stage == GcStage::BeforeCandidateUnlink {
+                    anyhow::bail!("injected pre-unlink error");
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("injected pre-unlink error"));
+        assert!(index.exists() && queue.exists());
+        assert!(!has_witness(&index) && !has_witness(&queue));
+        let queue_before = fs::read(&queue).unwrap();
+        let mut hit = 0;
+        let error = roots
+            .automatic_gc_at_with_hook(&current.identity, &writer, now + 86_400, &mut |stage| {
+                if stage == GcStage::AfterFirstDbUnlink {
+                    hit += 1;
+                    assert!(!index.exists());
+                    assert!(queue.exists());
+                    anyhow::bail!("injected partial deletion");
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(hit, 1);
+        assert!(error.to_string().contains("injected partial deletion"));
+        assert!(!index.exists());
+        assert_eq!(fs::read(&queue).unwrap(), queue_before);
+        assert!(roots.index_use_lock(&candidate_identity).exists());
+        assert!(!has_witness(&index) && !has_witness(&queue));
+        drop(writer);
+        current.retire_checkout_sqlite_witnesses();
+        drop(current);
+    }
+
+    #[test]
+    fn inspection_retirement_defers_for_live_connection_and_borrower() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_for_tests(state.path(), root.path()).unwrap();
+        let path = store.roots.index_db(&store.identity);
+        let guard =
+            UseGuard::acquire_existing(&store.roots.index_use_lock(&store.identity), true, true)
+                .unwrap();
+        let db = crate::store::protected_sqlite_open(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        db.execute_batch(
+            "BEGIN IMMEDIATE; UPDATE index_metadata SET last_opened_at=last_opened_at",
+        )
+        .unwrap();
+        drop(GcInspectionWitnesses {
+            guard: &guard,
+            paths: vec![path.clone()],
+            suspended: Vec::new(),
+        });
+        assert!(has_witness(&path));
+        let contender = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::live_sqlite_witness_tests::sqlite_lock_contender_child",
+                "--nocapture",
+            ])
+            .env("TRELLIS_LIVE_SQLITE_LOCK_CHILD", &path)
+            .env("TRELLIS_LIVE_SQLITE_LOCK_TABLE", "index")
+            .output()
+            .unwrap();
+        assert!(
+            contender.status.success(),
+            "contender acquired writer lock: {contender:?}"
+        );
+        let stdout = String::from_utf8_lossy(&contender.stdout);
+        assert!(
+            stdout.contains("running 1 test"),
+            "contender did not run: {stdout}"
+        );
+        assert!(
+            stdout.contains("store::live_sqlite_witness_tests::sqlite_lock_contender_child ... ok"),
+            "contender did not complete: {stdout}"
+        );
+        db.execute_batch("COMMIT").unwrap();
+        drop(db);
+        assert!(!has_witness(&path));
+
+        let borrower = crate::store::retained_sqlite_file(&path, false, false, false).unwrap();
+        drop(GcInspectionWitnesses {
+            guard: &guard,
+            paths: vec![path.clone()],
+            suspended: Vec::new(),
+        });
+        assert!(has_witness(&path));
+        assert!(borrower.metadata().is_ok());
+        drop(borrower);
+        // A bare Arc drop does not signal retirement; a later retirement does.
+        assert!(has_witness(&path));
+        drop(GcInspectionWitnesses {
+            guard: &guard,
+            paths: vec![path.clone()],
+            suspended: Vec::new(),
+        });
+        assert!(!has_witness(&path));
+    }
+
+    #[test]
+    fn inspection_retirement_keeps_witness_if_use_lock_identity_is_lost() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_for_tests(state.path(), root.path()).unwrap();
+        let path = store.roots.index_db(&store.identity);
+        let lock = store.roots.index_use_lock(&store.identity);
+        let guard = UseGuard::acquire_existing(&lock, true, true).unwrap();
+        let moved = lock.with_extension("moved");
+        fs::rename(&lock, &moved).unwrap();
+        drop(GcInspectionWitnesses {
+            guard: &guard,
+            paths: vec![path.clone()],
+            suspended: Vec::new(),
+        });
+        assert!(has_witness(&path));
+        fs::rename(&moved, &lock).unwrap();
+        drop(GcInspectionWitnesses {
+            guard: &guard,
+            paths: vec![path.clone()],
+            suspended: Vec::new(),
+        });
+        assert!(!has_witness(&path));
+    }
 
     #[test]
     fn borrowed_and_live_sqlite_witnesses_skip_at_final_unlink_without_close() {
@@ -2197,7 +2703,6 @@ mod gc_final_witness_tests {
             0,
             "live SQLite connection must skip, not delete"
         );
-        assert_eq!(fs::read(&path).unwrap(), before);
         let db = live.as_ref().unwrap();
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
@@ -2205,6 +2710,7 @@ mod gc_final_witness_tests {
             i64::from(crate::store::DATABASE_SCHEMA_VERSION)
         );
         drop(live);
+        assert_eq!(fs::read(&path).unwrap(), before);
         assert!(roots.index_use_lock(&candidate).exists());
     }
 }

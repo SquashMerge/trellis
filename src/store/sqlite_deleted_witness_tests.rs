@@ -58,6 +58,113 @@ fn idle_retirement_defers_sqlite_witness_until_last_managed_connection_closes() 
 }
 
 #[test]
+fn gc_report_releases_witnesses_for_inactive_checkouts() {
+    const CHILD: &str = "TRELLIS_GC_REPORT_WITNESS_CHILD";
+    const TEST: &str =
+        "store::sqlite_deleted_witness_tests::gc_report_releases_witnesses_for_inactive_checkouts";
+    if std::env::var_os(CHILD).is_none() {
+        let outcome = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            outcome.status.success(),
+            "child output:\n{}\n{}",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        return;
+    }
+
+    let state = tempfile::tempdir().unwrap();
+    let workspaces = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let roots = topology::TopologyRoots::isolated_for_tests(
+        state.path().join("cache"),
+        state.path().join("data"),
+    );
+    let mut candidates = Vec::new();
+    for workspace in &workspaces {
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let path = roots.index_db(&store.identity);
+        let key = store.identity.root_key.clone();
+        store.retire_checkout_sqlite_witnesses();
+        drop(store);
+        let metadata = std::fs::metadata(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        candidates.push((key, path, (metadata.dev(), metadata.ino()), bytes));
+    }
+    assert_ne!(candidates[0].2, candidates[1].2);
+
+    // Examine only our own paths, including live registrations and exact inodes.
+    let snapshot = || {
+        let registry = sqlite_witnesses().lock().unwrap();
+        candidates
+            .iter()
+            .map(|(_, path, _, _)| {
+                let inodes = registry
+                    .by_path
+                    .get(path)
+                    .into_iter()
+                    .flatten()
+                    .map(|file| {
+                        let metadata = file.metadata().unwrap();
+                        (metadata.dev(), metadata.ino())
+                    })
+                    .collect::<Vec<_>>();
+                let live = registry
+                    .live
+                    .iter()
+                    .filter(|((name, _, _), _)| name == path)
+                    .map(|(_, count)| count)
+                    .sum::<usize>();
+                (path.clone(), inodes, live)
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = snapshot();
+    assert!(
+        before
+            .iter()
+            .all(|(_, inodes, live)| inodes.is_empty() && *live == 0),
+        "setup retirement: {before:?}"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 31 * 86_400;
+    let report = || {
+        let derived = roots.gc_report_at(now).unwrap().derived;
+        assert_eq!(derived.len(), candidates.len());
+        for (key, path, inode, bytes) in &candidates {
+            let entry = derived.iter().find(|entry| &entry.root_key == key).unwrap();
+            assert_eq!((entry.status, entry.reason), ("eligible", "age_30_days"));
+            let metadata = std::fs::metadata(path).unwrap();
+            assert_eq!((metadata.dev(), metadata.ino()), *inode);
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+    };
+    report();
+    let first = snapshot();
+    report();
+    let second = snapshot();
+    for (i, (_, inodes, live)) in second.iter().enumerate() {
+        assert_eq!(*live, 0);
+        assert!(
+            inodes.len() <= first[i].1.len(),
+            "same inode grew: {first:?} -> {second:?}"
+        );
+        assert!(inodes.len() <= 1 && inodes.iter().all(|inode| *inode == candidates[i].2));
+    }
+    eprintln!("report witness trace: before={before:?}, first={first:?}, second={second:?}");
+    assert!(
+        second.iter().all(|(_, inodes, _)| inodes.is_empty()),
+        "quiescent GC reports retained candidate witnesses: {second:?}"
+    );
+}
+
+#[test]
 fn exclusive_release_closes_only_deleted_index_after_all_sqlite_connections() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
