@@ -1749,9 +1749,15 @@ async fn serve_shutdown(signal: i32, kill_daemon: bool) {
     let mut daemon_command = cli(&home);
     let mut owner = (signal == 0).then(|| Owned(Command::new("sleep").arg("120").spawn().unwrap()));
     daemon_command.arg("daemon");
-    if let Some(owner) = &owner {
-        daemon_command.env(trellis::testing::OWNER_PID_ENV, owner.0.id().to_string());
-    }
+    let owner_observed = owner.as_ref().map(|owner| {
+        let path = temp.path().join("owner-gone.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        daemon_command
+            .env(trellis::testing::OWNER_PID_ENV, owner.0.id().to_string())
+            .env("TRELLIS_TEST_DAEMON_OWNER_GONE_SOCKET", path);
+        listener
+    });
     let mut daemon = detached(daemon_command);
     let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while UnixStream::connect(&socket).is_err() {
@@ -1814,6 +1820,14 @@ async fn serve_shutdown(signal: i32, kill_daemon: bool) {
     if let Some(owner) = &mut owner {
         owner.0.kill().unwrap();
         owner.0.wait().unwrap();
+        let mut observation = None;
+        trellis::testing::wait_until("daemon observing owner exit", || {
+            observation = owner_observed.as_ref().unwrap().accept().ok();
+            observation.is_some()
+        });
+        // Accept proves the daemon reached the owner-gone branch. The hook
+        // reports that transition only; it never waits for this test.
+        drop(observation.unwrap());
     } else {
         assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
     }
