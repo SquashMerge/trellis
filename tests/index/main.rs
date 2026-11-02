@@ -17,6 +17,7 @@ mod native_id_vectors;
 mod native_search_capture;
 mod native_store;
 mod native_whitespace;
+mod proptest_absence;
 mod python_indexer;
 mod references;
 mod rust_indexer;

@@ -64,6 +64,7 @@ sha2 = "0.11"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+proptest = "1"
 
 # Debug-profile speed for the verify suite. Only codegen optimization changes:
 # debug assertions, overflow checks and debuginfo keep their dev defaults.
