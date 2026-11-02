@@ -328,12 +328,18 @@ async fn a_page_on_an_older_revision_gets_it_from_the_owner() {
     assert_eq!(missing["payload"]["state"], "missing_rules", "{status}");
     let older = head(&missing["payload"]);
     let root = base.path().join("checkout");
-    std::fs::write(root.join("added.js"), "function added() {}\n").unwrap();
+    runtime.hold_worker_step_for_tests(|| {
+        std::fs::write(root.join("added.js"), "function added() {}\n").unwrap();
+        // Capture the root directory change before publishing; rules stay absent.
+        std::fs::create_dir(root.join(".trellis")).unwrap();
+    });
     let indexing = runtime.clone();
-    tokio::task::spawn_blocking(move || indexing.cli_index(&IndexOptions::new(root)))
-        .await
-        .unwrap()
-        .unwrap();
+    let indexed_root = root.clone();
+    let publication =
+        tokio::task::spawn_blocking(move || indexing.cli_index(&IndexOptions::new(indexed_root)))
+            .await
+            .unwrap()
+            .unwrap();
     write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
     let (status, read) = request(app.clone(), &key, &older).await;
@@ -344,10 +350,25 @@ async fn a_page_on_an_older_revision_gets_it_from_the_owner() {
         missing["payload"]["indexRevision"]
     );
     assert_eq!(scheduler.architecture_builds_for_tests(), 2);
+    // An unchanged inventory must retain the head that the owner already built.
+    let indexing = runtime.clone();
+    let unchanged =
+        tokio::task::spawn_blocking(move || indexing.cli_index(&IndexOptions::new(root)))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        unchanged["publishedRevision"],
+        publication["publishedRevision"]
+    );
     // Both stay served, without another build.
     let (status, current) = request(app.clone(), &key, "").await;
     assert_eq!(status, StatusCode::OK, "{current}");
     assert_eq!(current["payload"]["modules"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        head(&current["payload"]),
+        head(&publication["publishedRevision"])
+    );
     let (status, again) = request(app, &key, &older).await;
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(scheduler.architecture_builds_for_tests(), 2);
