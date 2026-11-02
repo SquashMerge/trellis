@@ -160,7 +160,7 @@ test("native SVG preserves nested branch loop try, safe labels, unknown lifeline
   const attempt=all.find(n=>n.attrs?.["data-kind"]==="try");
   assert.ok(descendants(attempt).some(n=>n.attrs?.["data-step-id"]==="cleanup"));
   assert.ok(all.some(n=>n.tagName==="svg")); assert.equal(all.filter(n=>n.attrs?.class==="sequence-arrow").length,0);
-  assert.ok(all.some(n=>n.attrs?.["data-presentation"]==="quiet-note"));
+  assert.ok(!all.some(n=>n.attrs?.["data-step-id"]==="write"), "standalone writes wait for Show all");
   assert.ok(all.every(n=>!["script","img"].includes(n.tagName)));
   assert.doesNotMatch(text(h.get("sequence-diagram")), /hidden-log/);
   assert.doesNotMatch(text(h.get("sequence-diagram")), /Unknown target/);
@@ -1786,4 +1786,47 @@ test("architecture and metrics reads are cached per revision, shared in flight a
   await assert.rejects(failed, /busy/);
   h.context.fetch = async request => { if (!request.startsWith("/api/status")) reads.push(request); return response({payload:{...h.run("status.revision")}}); };
   const count = reads.length; await h.run("revisionRead(pathB)"); assert.equal(reads.length, count + 1, "a failed read is not cached");
+});
+
+test("calls-first detail shortcut restores non-call rows and shares Options state", async () => {
+  const h=harness(), requests=[];
+  const write={id:"write",kind:"effect",label:"write: state = ready",path:"src/a.js",range:{startLine:2,endLine:2},children:[],alternate:[],hidden:false};
+  const unknown={...write,id:"unknown",kind:"boundary",label:"Unsupported complex control: possible behavior remains unknown; body not expanded."};
+  const dto={...view("root"),steps:[write,unknown]};
+  h.context.fetch=async(path,options)=>{requests.push(JSON.parse(options.body));return response(dto);};
+  await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
+  const rows=()=>descendants(h.get("sequence-diagram")).filter(n=>n.attrs?.["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]);
+  assert.deepEqual(rows(),["unknown"]);
+  assert.match(text(h.get("sequence-diagram")),/No measured calls.*non-call behavior/i);
+  assert.equal(h.get("sequence-incidental").hidden,false);
+  assert.equal(h.get("sequence-incidental").textContent,"Show all steps");
+  assert.equal(h.get("sequence-incidental").attrs["aria-pressed"],"false");
+  h.run("const originalLoadSequence=loadSequence; loadSequence=(...args)=>window.detailLoad=originalLoadSequence(...args)");
+  h.get("sequence-diagram").children[0].children[0].listeners.click();
+  await h.run("window.detailLoad");
+  assert.equal(h.get("all-steps").checked,true);
+  assert.equal(h.get("sequence-incidental").textContent,"Show calls");
+  assert.deepEqual(rows(),["write","unknown"]);
+  assert.equal(h.get("sequence-diagram").children.some(n=>n.attrs?.class==="sequence-empty"),false);
+  h.get("sequence-incidental").listeners.click();
+  await h.run("window.detailLoad");
+  assert.equal(h.get("all-steps").checked,false);
+  assert.deepEqual(rows(),["unknown"]);
+  assert.deepEqual(requests.map(request=>request.showAll),[false,true,false]);
+});
+
+test("Files zero-call preview keeps uncertainty and opens full admitted detail explicitly", async () => {
+  const h=harness();
+  const unknown={id:"unknown",kind:"boundary",label:"Unsupported complex control: possible behavior remains unknown; body not expanded.",path:"src/a.js",range:{startLine:2,endLine:2},children:[],alternate:[],hidden:false};
+  h.context.dto={...view("root"),steps:[unknown],truncated:true,warnings:["Sequence step limit reached."]};
+  h.run("filesMini=dto; filesSymbol=dto.seed; fitFilesMini=()=>{}; navigateDiagram=(...args)=>window.opened=args");
+  await h.run("renderFilesMini(()=>true)");
+  assert.match(text(h.get("files-mini-sequence")),/No measured calls.*behavior unknown/);
+  assert.match(text(h.get("files-mini-notes")),/Sequence step limit reached.*Truncated by sequence limits/);
+  h.get("files-mini-sequence").children[0].children[0].listeners.click();
+  const opened=h.run("window.opened");
+  assert.equal(opened[0],h.context.dto.seed);
+  assert.equal(opened[1],h.context.dto.revision);
+  assert.equal(opened[2],"sequence");
+  assert.equal(opened[4],true,"Show all requests incidental calls as well as non-call detail");
 });

@@ -252,8 +252,13 @@ and #542's "any other guard is unchanged".
 - **Arrow labels.** In both renderers the compact diagram labels an arrow with its row number
   and the target declaration's name, not the call's source spelling. Rows and frame headers
   use the compact labels, at most 72 characters; a collapsed chain whose entry call draws no
-  arrow keeps its entry call ID and may run longer. Options → Show all steps keeps the
-  exact DTO text.
+  arrow keeps its entry call ID and may run longer. The #594 calls-first display projects both
+  renderers from original DTO objects: standalone writes/bindings, return text and deferred-definition
+  leaves stay hidden by default. Admitted measured calls, enclosing branch/alternative/loop/try
+  frames, unknown/protocol boundaries and concise early-exit context remain visible. No call list
+  replaces conditional scope. Options → Show all steps restores admitted non-call rows and exact
+  DTO text, using the same setting that reveals incidental calls. This does not change backend
+  visible 200/seed 150/callee reserve 50, work/depth/participant bounds or recover clipped calls.
 - **Size.** Each method opens at its own size (no text under 12 px) and the panel scrolls.
   "Fit to width", offered only while the diagram is wider than the panel, shrinks it on
   request, for that method and its redraws. The Files preview keeps fitting its column.
@@ -271,14 +276,16 @@ and #542's "any other guard is unchanged".
   diagram. It says "Only standard-library calls (N hidden)." when every hidden step is an
   external call into Rust's `std`, `core` or `alloc` by its `externalPackage`, "Only external
   calls" when all are external, and "Only incidental calls" otherwise. The full view offers
-  "Show them", the same request as Show all.
+  "Show all steps", the same request as Options → Show all steps. A view with no admitted
+  measured calls instead says that non-call behavior may be hidden, never that the method has
+  no behavior. Any retained unknown/control markers and truncation warning stay visible.
 - **JavaScript source hints.** As in the other adapters, the last syntax lane is reserved:
   excess hints share the unknown-operations lane and stay measured calls, so a view with
   many hints is neither truncated nor loses its arrows once enrichment resolves them.
 
 The browser draws an expanded step's arrows and notes from its `lane`, shows the tier and
-reason in the sequence status line, and offers a "Show/Hide N incidental calls" toggle
-(the same `showAll` request as Options → Show all steps).
+reason in the sequence status line, and offers a "Show all steps" / "Show calls" shortcut
+(the same `showAll` setting as Options → Show all steps, not a separate incidental toggle).
 
 Typed integrity, busy and pin failures abort the entire response, never returning a
 partially enriched view. Lanes/arrows prove static declaration targets only: no runtime
@@ -310,8 +317,8 @@ Loops are fragments not unrolled. Return/throw terminate sameblock; remainingcod
 withwarning, never shownexecutingafterreturn. Exceptionpaths notassertedwhenunknown.
 Unsupportedcomplexcontrol => source-linked boundary/warning; never quietlyfabricatebehavior. Evidence is
 static possible paths, NOT observed runtime order. Bounds max200steps/20participants/depth24 failsofttruncated
-warning; sourcequotes/labels bounded. Default showAll=false collapses only confidentlyincidental logging;
-retain validations,writes,external/unresolvedeffects,branchtests,returns/throws. Hidden counts+Showall control.
+warning; sourcequotes/labels bounded. The current calls-first display and incidental-call rules above
+supersede the original detail default; all admitted evidence stays available through Show all steps.
 This is deterministic heuristic selectivity, NOT claimed semantic consequentialness. Source-links mandatory.
 
 JS adapter src/behavior_js.rs builds the neutral DTO from cached SourceFile, selectedSymbol, measuredcalls.

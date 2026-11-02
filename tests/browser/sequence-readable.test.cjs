@@ -111,10 +111,12 @@ test("a call within one column draws a self arrow, as do a callee's own calls", 
   assert.equal(await page.locator("#sequence-diagram .pele-message").nth(1).getAttribute("data-trellis-target-id"), second.id);
 });
 
-test("Python's break draws in Pele", async () => {
+test("Python's break is available through Show all in Pele", async () => {
   const view = coordinateView({steps:3});
   view.steps = [{...structuredClone(view.steps[0]), id:"exit:0", kind:"exit", label:"break", callId:null, target:undefined, callEvidence:undefined}];
-  const result = await render(view);
+  assert.equal((await render(view)).status, "rendered");
+  assert.equal(await page.locator('#sequence-diagram .pele-note[data-trellis-step-id="exit:0"]').count(), 0);
+  const result = await render(view, {showDetails:true});
   assert.equal(result.status, "rendered", result.reason);
   assert.match(await page.locator('#sequence-diagram .pele-note[data-trellis-step-id="exit:0"]').textContent(), /break/);
 });
@@ -257,13 +259,13 @@ test("the empty state names what is hidden", async () => {
   const npm = hidden("external", "core"); npm.callEvidence.externalPackage.manager = "npm";
   assert.equal(await summary({steps:[npm], hiddenSteps:1}), "Only external calls (1 hidden).", "only Cargo's std is Rust's");
   assert.equal(await summary({steps:[hidden("external", "std"), {...hidden("external", "std"), hidden:false}], hiddenSteps:1}), "", "a shown step draws the diagram");
-  assert.equal(await summary({steps:[], hiddenSteps:0}), "", "no steps at all has its own message");
+  assert.match(await summary({steps:[], hiddenSteps:0}), /No measured calls.*does not mean no behavior/);
   await page.evaluate(() => {
     window.shown = 0;
     TrellisSequence.renderEmpty(document.getElementById("sequence-diagram"), "Only standard-library calls (2 hidden).", () => window.shown++);
   });
   assert.equal(await page.locator("#sequence-diagram svg").count(), 0, "no lone box");
-  assert.equal(await page.locator("#sequence-diagram .sequence-empty").textContent(), "Only standard-library calls (2 hidden). Show them");
+  assert.equal(await page.locator("#sequence-diagram .sequence-empty").textContent(), "Only standard-library calls (2 hidden). Show all steps");
   await page.locator("#sequence-diagram .sequence-empty button").click();
   assert.equal(await page.evaluate(() => window.shown), 1);
 });
