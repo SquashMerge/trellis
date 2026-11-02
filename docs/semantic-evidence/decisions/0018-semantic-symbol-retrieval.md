@@ -309,7 +309,7 @@ exactly `modelsDir`, `model` and `backend`, each one of `default`, `config_file`
 query-pinned coverage, a verified model identity or code evidence. Production daemons
 publish them; standalone registries and injected models without configuration knowledge
 omit the object. Query `SearchIndexStatus` is unchanged. The additive describe contract
-uses `toolVersion:5`; its exact closed wire schema is owned by the
+uses `toolVersion:6`; its exact closed wire schema is owned by the
 [MCP contract](../../mcp-readonly-pilot-contract.md#amendment-594-user-model-configuration-diagnostics).
 
 ## Retrieval is not evidence
