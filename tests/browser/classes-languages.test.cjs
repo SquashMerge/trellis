@@ -178,7 +178,8 @@ test("published Rust types merge impl methods across files and render through Pe
     await page.waitForFunction(seed => !!document.querySelector(`#classes-diagram .pele-node[data-trellis-class-id="${seed}"]`), account.symbol.id, {timeout:15000});
     const balance = account.methods[0];
     await page.locator(`.pele-member[data-trellis-symbol-id="${balance.symbolId}"]`).click();
-    await page.waitForFunction(() => /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""), null, {timeout:15000});
+    await page.locator("#sequence-diagram .sequence-empty").waitFor();
+    assert.match(await page.locator("#sequence-diagram .sequence-empty").textContent(), /No measured calls.*Non-call behavior may be hidden/);
     const sequence = requests.filter(row => row.url.pathname.endsWith("/sequence")).at(-1);
     assert.equal(sequence.body.seed, balance.symbolId);
     assert.deepEqual(sequence.body.expectedRevision, pin);

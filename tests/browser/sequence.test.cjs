@@ -73,7 +73,7 @@ test("method source Sequence uses the clicked declaration, not the left-tree sel
  const response = await responsePromise, selected = await response.json();
  assert.equal(response.status(), 200, JSON.stringify(selected));
  assert.equal(selected.seed.id, helperId); assert.equal(selected.seed.name, "first"); assert.deepEqual(selected.revision, pin);
- await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), helperId);
+ await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-diagram .sequence-empty")?.textContent.includes("No measured calls"), helperId);
  await page.goBack();
  await page.waitForFunction(text => document.querySelector("#source")?.textContent === text && !document.querySelector("#workspace-source-panel")?.hidden, before);
  assert.deepEqual(await page.locator("#source .highlight .line-number").allTextContents(), highlighted);
@@ -111,7 +111,7 @@ test("published source roves one tabbable declaration action and invokes exact s
  await page.keyboard.press("Enter");
  const response = await responsePromise, selected = await response.json();
  assert.equal(response.status(), 200, JSON.stringify(selected));assert.equal(selected.seed.id, exactId);assert.deepEqual(selected.revision, pin);
- await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), exactId);
+ await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-diagram .sequence-empty")?.textContent.includes("No measured calls"), exactId);
  await page.goBack();
  await page.waitForFunction(({id,text}) => document.activeElement?.dataset.symbolId === id && document.querySelector("#source")?.textContent === text, {id:exactId,text:before});
  assert.equal(await sourcePane.getAttribute("data-navigation-line"), "2");assert.equal(await tabbable.count(), 1);
@@ -133,10 +133,12 @@ test("published JavaScript nested try/handler/exit retains order and original so
  assert.ok(steps.some(s=>s.label.includes("catch: only if")),"handler remains distinct");
  assert.ok(steps.some(s=>s.label.includes("finally: on both")),"cleanup remains distinct");
  assert.ok(steps.some(s=>s.kind==="throw"));assert.ok(steps.some(s=>s.kind==="return"));
- const visible=steps.filter(s=>!s.hidden);
+ const visible=steps.filter(s=>!s.hidden && !["return","throw","exit","effect","definition"].includes(s.kind));
  const notes=await page.locator(".pele-note[data-trellis-step-id]").evaluateAll(ns=>ns.map(n=>({id:n.dataset.trellisStepId,text:n.textContent,callId:n.dataset.trellisCallId})));
  assert.deepEqual(notes.map(n=>n.id),visible.map(s=>s.id),"note order follows original control/alternate/handler order");
- for(const kind of ["try","throw","return"]){const step=visible.find(s=>s.kind===kind);assert.ok(step,kind);assert.ok(notes.find(n=>n.id===step.id)?.text.includes(kind));}
+ const attempt=visible.find(s=>s.kind==="try");assert.ok(attempt);
+ assert.match(notes.find(n=>n.id===attempt.id).text,/may exit early/);
+ for(const step of steps.filter(s=>["throw","return"].includes(s.kind))) assert.ok(!notes.some(note=>note.id===step.id),"exit leaves wait for full detail");
  const handler=visible.find(s=>s.label.includes("catch: only if"));assert.ok(handler);
  const target=page.locator(`.pele-note[data-trellis-step-id="${handler.id}"]`);await target.focus();await page.keyboard.press("Enter");
  assert.equal(await target.getAttribute("aria-pressed"),"true");assert.match(await page.locator("#call-inspector").innerText(),/catch: only if/);
@@ -152,6 +154,9 @@ test("published JavaScript nested try/handler/exit retains order and original so
  await page.waitForFunction(()=>document.querySelector("#sequence-state")?.textContent?.includes("Pele rendered")&&document.querySelector("#sequence-state")?.textContent?.includes("0 incidental steps hidden"));
  assert.ok(serverRequests.some(body=>body.showAll===true&&body.expectedRevision.indexGeneration===pin.indexGeneration&&body.expectedRevision.indexRevision===pin.indexRevision));
  assert.ok((await page.locator(".pele-note[data-trellis-step-id]").allTextContents()).some(text=>text.includes("console.log")));
+ for(const step of steps.filter(s=>["throw","return"].includes(s.kind))) {
+  assert.match(await page.locator(`.pele-note[data-trellis-step-id="${step.id}"]`).textContent(),new RegExp(step.kind));
+ }
  // The same published view remains navigable with a narrow scroll canvas and
  // keyboard-visible focus. No library-injected controls or inline CSS.
  await page.setViewportSize({width:540,height:780});
@@ -235,7 +240,7 @@ test("logging macro hides under the incidental toggle with its reason",{timeout:
  assert.equal(work.label,"work");assert.equal(dto.incidentalSteps,1);assert.equal(dto.hiddenSteps,1);
  assert.equal(await page.locator(`#sequence-diagram .pele-note[data-trellis-step-id="${logging.id}"]`).count(),0);
  const toggle=page.locator("#sequence-incidental");
- assert.equal(await toggle.textContent(),"Show 1 incidental call");
+ assert.equal(await toggle.textContent(),"Show all steps");
  await toggle.click();
  const note=page.locator(`#sequence-diagram .pele-note[data-trellis-step-id="${logging.id}"]`);
  await note.waitFor();await note.click();
@@ -246,7 +251,7 @@ test("logging macro hides under the incidental toggle with its reason",{timeout:
 test("a method whose every step is hidden says so and shows them on request",{timeout:240000},async()=>published("fn measured() {\n    work();\n}\nfn quiet() {\n    log::info!(\"x\");\n}\n",async({page})=>{
  await page.locator(".method-pick").filter({hasText:"quiet"}).first().click();
  const empty=page.locator("#sequence-diagram .sequence-empty");await empty.waitFor();
- assert.equal(await empty.textContent(),"Only incidental calls (1 hidden). Show them");
+ assert.equal(await empty.textContent(),"Only incidental calls (1 hidden). Show all steps");
  assert.equal(await page.locator("#sequence-diagram svg").count(),0);
  assert.doesNotMatch(await page.locator("#sequence-state").innerText(),/Pele/);
  assert.equal(await page.locator("#sequence-fit").isVisible(),false);
@@ -437,3 +442,63 @@ test("published app visibly falls back for malformed target evidence, depth, Mer
    }
  }
 }));
+
+const pythonUncertaintySource = `def measured(obj):
+    local = prepare()
+    obj.value = prepare()
+    return local
+
+def protocol_loop(items):
+    for item in items:
+        pass
+`;
+test("published Python setter and call-free loop retain concise uncertainty in both renderers", {timeout:240000}, async () => published(pythonUncertaintySource, async ({page,dto,pin,server,paths}) => {
+ const setter=dto.steps.find(step=>step.kind==="effect"&&step.label.endsWith(" (implicit setters/unpacking unresolved)"));
+ assert.ok(setter,"Python extractor must emit the unresolved setter effect");
+ assert.ok(dto.steps.some(step=>step.kind==="effect"&&step.label==="bind name: local"));
+ const seed=await H.seedId(server,paths.token,"protocol_loop");
+ const response=await H.api(server.base,paths.token,"POST",H.scoped(server.rootKey,"sequence"),{seed,expectedRevision:pin,showAll:false});
+ assert.equal(response.status,200,JSON.stringify(response.data));
+ const loopView=response.data,loop=loopView.steps.find(step=>step.kind==="loop");
+ assert.equal(loop.label,"possible iterations, not unrolled; protocol and termination unresolved");
+ const check=async view=>page.evaluate(async view=>{
+  const walk=roots=>roots.flatMap(step=>[step,...walk(step.children||[]),...walk(step.alternate||[])]),originals=walk(view.steps),before=JSON.stringify(view);
+  const freeze=value=>{if(value&&typeof value==="object"){Object.freeze(value);Object.values(value).forEach(freeze);}return value;};freeze(view);
+  const results=[];
+  for(const renderer of [TrellisSequence,TrellisPeleSequence]) {
+   const container=document.createElement("div");document.body.append(container);
+   const selected=[],options={onSelect:step=>selected.push(step)};
+   const result=await renderer.render(container,view,null,new Set(),options);
+   if(renderer===TrellisPeleSequence&&result.status!=="rendered")throw Error(result.reason);
+   const selector=renderer===TrellisSequence?"[data-source-step-id]":".pele-note[data-trellis-step-id],.pele-edge-label[data-trellis-step-id]";
+   const rows=[...container.querySelectorAll(selector)],ids=rows.map(row=>row.dataset.sourceStepId||row.dataset.trellisStepId),compact=rows.map(row=>{
+    const copy=row.cloneNode(true);copy.querySelectorAll("title").forEach(title=>title.remove());return copy.textContent;
+   }).join(" ");
+   for(const row of rows)row.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
+   const exact=selected.length===ids.length&&selected.every((step,i)=>step===originals.find(original=>original.id===ids[i]));
+   await renderer.render(container,view,null,new Set(),{...options,showDetails:true});
+   const restored=[...container.querySelectorAll(selector)].map(row=>row.dataset.sourceStepId||row.dataset.trellisStepId);
+   results.push({ids,compact,exact,restored,unchanged:JSON.stringify(view)===before});container.remove();
+  }
+  return {results,originals:originals.map(step=>step.id),summary:TrellisSequence.emptySummary(view)};
+ },view);
+ const measured=await check(dto);
+ for(const rendered of measured.results) {
+  assert.ok(rendered.ids.includes(setter.id));assert.match(rendered.compact,/write · setters\/unpacking unresolved/);
+  assert.doesNotMatch(rendered.compact,/obj\.value = prepare|bind local|return local/);
+  assert.deepEqual(rendered.ids,dto.steps.filter(step=>step.kind==="call"||step===setter).map(step=>step.id));
+  assert.ok(rendered.exact&&rendered.unchanged);assert.deepEqual(rendered.restored,measured.originals);
+ }
+ assert.equal(measured.summary,"");
+ const protocol=await check(loopView);
+ for(const rendered of protocol.results) {
+  assert.ok(rendered.ids.includes(loop.id));assert.match(rendered.compact,/protocol.*termination unresolved/);
+  assert.match(rendered.compact,/iteration write · setters\/unpacking unresolved/);
+  assert.ok(rendered.exact&&rendered.unchanged);assert.deepEqual(rendered.restored,protocol.originals);
+ }
+ assert.match(protocol.summary,/No measured calls.*Non-call behavior may be hidden/);
+ await page.locator(".method-pick").filter({hasText:"protocol_loop"}).click();
+ await page.locator("#sequence-diagram .sequence-empty").waitFor();
+ assert.match(await page.locator("#sequence-diagram").textContent(),/protocol.*termination unresolved/);
+ assert.ok(await page.locator("#sequence-diagram svg").count());
+}, "flow.py"));

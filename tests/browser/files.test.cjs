@@ -235,11 +235,15 @@ test("published Files outlines types and callables with members under an expande
   assert.equal(await page.evaluate(() => globalThis.snippetExecuted), undefined);
   const view = await read(selected, "sequence", {seed:method.symbol.id, expectedRevision:pin, showAll:false});
   await page.waitForFunction(() => document.querySelector("#files-open-full")?.disabled === false);
-  const visible = flatten(view.steps).filter(step => !step.hidden);
+  const visible = flatten(view.steps).filter(step => !step.hidden && step.kind !== "return");
+  assert.deepEqual(visible.map(step=>step.kind), ["branch","call"], "the measured conditional call keeps its source order");
   assert.deepEqual(await page.locator("#files-mini-sequence [data-trellis-step-id]").evaluateAll(rows => rows.map(row => row.dataset.trellisStepId)), visible.map(step => step.id));
   await page.locator("#files-open-full").click();
   await page.waitForFunction(() => !document.body.classList.contains("files-section") && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
   assert.deepEqual(await page.locator("#sequence-diagram [data-trellis-step-id]").evaluateAll(rows => rows.map(row => row.dataset.trellisStepId)), visible.map(step => step.id));
+  await page.locator("#sequence-incidental").click();
+  await page.waitForFunction(() => document.querySelector("#sequence-incidental")?.getAttribute("aria-pressed") === "true" && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+  assert.deepEqual(await page.locator("#sequence-diagram [data-trellis-step-id]").evaluateAll(rows => rows.map(row => row.dataset.trellisStepId)), flatten(view.steps).map(step=>step.id), "Show all restores original returns and exact order");
   assert.ok(requests.filter(row => row.url.pathname.endsWith("/sequence")).every(row => row.body.seed === method.symbol.id && JSON.stringify(row.body.expectedRevision) === JSON.stringify(pin)));
   await enterFiles(selected);
   const first = matches.items[0];
@@ -284,8 +288,8 @@ test("Files Open full opens Sequence over a last-used Treemap; the mini fits, th
   // Source-margin actions name the declaration, never its opaque ID.
   const action = page.locator(`.source-diagram-action[data-symbol-id="${method.symbol.id}"]`);
   await action.waitFor({state:"attached"});
-  assert.equal(await action.getAttribute("aria-label"), "Sequence for measured · syntax");
-  assert.equal(await action.getAttribute("title"), "Sequence · syntax · measured");
+  assert.equal(await action.getAttribute("aria-label"), "Sequence for measured · measured declaration");
+  assert.equal(await action.getAttribute("title"), "Sequence · measured declaration · measured");
   for (const label of await page.locator(".source-diagram-action").evaluateAll(nodes => nodes.flatMap(node => [node.getAttribute("aria-label"), node.title]))) {
     assert.doesNotMatch(label, /sid:|:v1:/, label);
   }
@@ -344,7 +348,7 @@ test("Files Open full opens Sequence over a last-used Treemap; the mini fits, th
 
 // #526 and #514: the preview's caveats sit behind its ⓘ; the drawing scales to the inspector
 // and, when its scaled text would be under 9 px, says "Too large to preview · Open full".
-test("Files mini-sequence keeps caveats behind ⓘ, fits the inspector and floors unreadable text", {timeout:240000}, async () => published({}, async selected => {
+test("Files mini-sequence keeps caveats behind ⓘ, fits the inspector and floors unreadable text", {timeout:240000}, async () => published({sourceText:source.replace("return value + count;", "return increment(value);")}, async selected => {
   const {page, pin} = selected;
   await enterFiles(selected); await openFile(selected, "Watcher.java");
   const method = (await outline(selected, "Watcher.java")).items.find(item => item.symbol.name === "measured");
@@ -389,7 +393,7 @@ test("Files mini-sequence keeps caveats behind ⓘ, fits the inspector and floor
     return box.x < view.x - 0.5 || box.y < view.y - 0.5 || box.x + box.width > view.x + view.width + 0.5 || box.y + box.height > view.y + view.height + 0.5;
   });
   assert.equal(clipped, false, "no label runs past the drawing's box");
-  // A simple return-only callable across ordinary column widths: whenever it is drawn, every label
+  // A simple measured-call callable across ordinary column widths: whenever it is drawn, every label
   // is at least 9 px on screen, measured from geometry (screen box over user box), not the estimate.
   const rendered = () => page.locator("#files-mini-sequence").evaluate(node => {
     const drawnNow = node.offsetParent !== null, svg = node.querySelector("svg");
@@ -699,7 +703,7 @@ test("explicit More source actions admits page two and Back restores its action 
   const selectedResponse = await sequence, dto = await selectedResponse.json();
   assert.equal(selectedResponse.status(), 200, JSON.stringify(dto));
   assert.equal(dto.seed.id, target.symbol.id); assert.deepEqual(dto.revision, pin);
-  await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), target.symbol.id);
+  await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-diagram .sequence-empty")?.textContent.includes("No measured calls"), target.symbol.id);
   await page.goBack();
   await page.waitForFunction(({id, line, scroll}) => {
     const panel = document.querySelector("#workspace-source-panel");

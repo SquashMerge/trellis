@@ -758,7 +758,7 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str, home: &P
                     count("selected"),
                     count("complete") + count("partial") + count("failed")
                 );
-                assert!(row["evidenceTier"] == "syntax");
+                assert!(row["nativeCoverageTier"] == "syntax");
                 // #528: no import, so no language reports selected semantic evidence.
                 assert_eq!(
                     row["semantic"],
@@ -855,7 +855,7 @@ fn golden_settled_failure(id: &Value, root: &Value, code: &str, basis: Value) ->
 /// Find's four scope rows for a checkout with no native documents (#156).
 fn empty_scope_coverage() -> Value {
     let row = |language: &str| {
-        json!({"language":language,"evidenceTier":"syntax","coverage":{
+        json!({"language":language,"nativeCoverageTier":"syntax","coverage":{
             "selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
             "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
                 "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
@@ -6846,7 +6846,7 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     // scope is reported as per-language tuple counts from the same snapshot.
     assert_eq!(data["data"]["coverage"], json!([]));
     let row = |language: &str, counts: [u64; 5]| {
-        json!({"language":language,"evidenceTier":"syntax","coverage":{
+        json!({"language":language,"nativeCoverageTier":"syntax","coverage":{
             "selected":counts[0],"complete":counts[1],"partial":counts[2],
             "failed":counts[3],"unselected":counts[4]},
             "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
