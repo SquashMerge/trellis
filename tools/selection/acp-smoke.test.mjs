@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { safeEnv, OPTIONS, denyPermission, redactedDiagnostic, reportedUsd, killGroup, permissionDecision, selectModel, errorEvidence, parseLimits, toolAudit, toolResponseAudit, sdkErrorCategory, buildPrompt } from './acp-smoke.mjs';
+import { safeEnv, OPTIONS, denyPermission, redactedDiagnostic, reportedUsd, groupIdentity, killGroup, permissionDecision, selectModel, errorEvidence, parseLimits, toolAudit, toolResponseAudit, sdkErrorCategory, buildPrompt } from './acp-smoke.mjs';
 import { selectionTools, readPacket, providerPacket, LOCAL_PACKET_LIMIT, PROVIDER_PACKET_LIMIT } from './selection-mcp.mjs';
 const HERE=path.dirname(fileURLToPath(import.meta.url));
 const packet={schemaVersion:1,questionId:'dry',question:'What happens?',candidates:[{id:'c001',source:'untrusted'},{id:'c002',source:'data'}]};
@@ -66,8 +66,34 @@ test('cleanup terminates an owned process group without an inference process',as
  const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',env:safeEnv()});
  await once(child,'spawn');
  const exited=once(child,'exit');
- await killGroup(child);await exited;
+ const result=await killGroup(child,groupIdentity(child.pid));await exited;
+ assert.equal(result.complete,true);
  assert.throws(()=>process.kill(-child.pid,0),{code:'ESRCH'});
+});
+
+test('group cleanup fails closed on leader identity loss before TERM or escalation',async()=>{
+ const child={pid:123,exitCode:null,signalCode:null};
+ for(const initial of [null,'changed']) {
+  const calls=[];
+  const result=await killGroup(child,'recorded',{observe:()=>initial,signal:(...args)=>calls.push(args)});
+  assert.equal(result.complete,false);assert.deepEqual(calls,[[-123,0]]);
+ }
+ for(const changed of ['changed',null]) {
+  let reads=0;const calls=[];
+  const result=await killGroup(child,'recorded',{observe:()=>++reads===1?'recorded':changed,
+   signal:(...args)=>calls.push(args),pause:async()=>{}});
+  assert.equal(result.complete,false);assert.deepEqual(calls,[[-123,'SIGTERM'],[-123,0]]);
+ }
+ const calls=[];
+ const result=await killGroup({...child,exitCode:0},'recorded',{observe:()=>assert.fail('already reaped'),
+  signal:(pid,name)=>{calls.push([pid,name]);throw Object.assign(new Error(),{code:'ESRCH'});}});
+ assert.equal(result.complete,true);assert.deepEqual(calls,[[-123,0]]);
+});
+test('group escalation signals only while the original leader still matches',async()=>{
+ const calls=[];
+ const result=await killGroup({pid:123,exitCode:null,signalCode:null},'recorded',{
+  observe:()=> 'recorded',signal:(...args)=>calls.push(args),pause:async()=>{}});
+ assert.equal(result.complete,true);assert.deepEqual(calls,[[-123,'SIGTERM'],[-123,'SIGKILL']]);
 });
 
 test('only exact experiment tools with validated arguments receive allow_once',()=>{

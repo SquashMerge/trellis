@@ -38,6 +38,78 @@ pub fn owned(mut command: std::process::Command) -> std::process::Command {
     command
 }
 
+/// A fixture process recorded before its PID can become stale. The start time
+/// distinguishes an exited fixture from a later process assigned the same PID.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProcessIdentity {
+    pid: libc::pid_t,
+    start_time: u64,
+}
+
+impl ProcessIdentity {
+    pub fn capture(pid: libc::pid_t) -> Option<Self> {
+        (pid > 1).then_some(())?;
+        let start_time = crate::producer::process_info::start_time(pid)?;
+        Some(Self { pid, start_time })
+    }
+
+    pub fn matches(&self) -> bool {
+        self.pid > 1 && crate::producer::process_info::start_time(self.pid) == Some(self.start_time)
+    }
+
+    /// Recheck immediately before signaling. This is an identity check, not an
+    /// atomic OS process handle; direct children should retain their Child owner.
+    pub fn signal(&self, signal: libc::c_int) -> std::io::Result<bool> {
+        if !self.matches() {
+            return Ok(false);
+        }
+        if unsafe { libc::kill(self.pid, signal) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
+}
+
+fn identity_path(marker: &std::path::Path) -> std::path::PathBuf {
+    marker.with_extension("identity.json")
+}
+
+/// Called by the elected test daemon itself, before it announces readiness.
+pub fn write_daemon_marker(marker: &std::path::Path) -> std::io::Result<()> {
+    let identity = ProcessIdentity::capture(std::process::id() as libc::pid_t)
+        .ok_or_else(|| std::io::Error::other("cannot capture fixture daemon identity"))?;
+    std::fs::write(identity_path(marker), serde_json::to_vec(&identity)?)?;
+    std::fs::write(marker, identity.pid.to_string())
+}
+
+/// Read the elected daemon's self-recorded identity, agreeing with its PID marker.
+pub fn daemon_marker_identity(marker: &std::path::Path) -> Option<ProcessIdentity> {
+    let pid = std::fs::read_to_string(marker)
+        .ok()?
+        .parse::<libc::pid_t>()
+        .ok()?;
+    let identity: ProcessIdentity =
+        serde_json::from_slice(&std::fs::read(identity_path(marker)).ok()?).ok()?;
+    (identity.pid == pid).then_some(identity)
+}
+
+/// Signal only the process whose self-recorded identity agrees with this marker.
+/// Missing, malformed and stale markers are not permission to signal a PID.
+pub fn signal_daemon_marker(
+    marker: &std::path::Path,
+    signal: libc::c_int,
+) -> std::io::Result<bool> {
+    match daemon_marker_identity(marker) {
+        Some(identity) => identity.signal(signal),
+        None => Ok(false),
+    }
+}
+
 /// Whether `pid` is still running. A process that has exited but not yet been
 /// reaped by its parent (a zombie) is not running.
 pub fn process_running(pid: libc::pid_t) -> bool {
@@ -75,6 +147,82 @@ fn zombie(pid: libc::pid_t) -> bool {
 mod tests {
     use super::owned;
     use std::{ffi::OsStr, process::Command};
+
+    struct Sleeper(std::process::Child);
+    impl Sleeper {
+        fn start() -> Self {
+            Self(Command::new("sleep").arg("120").spawn().unwrap())
+        }
+    }
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn recorded_identity_rejects_stale_and_special_pids() {
+        let mut child = Sleeper::start();
+        let identity = super::ProcessIdentity::capture(child.0.id() as libc::pid_t).unwrap();
+        let stale = super::ProcessIdentity {
+            start_time: identity.start_time + 1,
+            ..identity
+        };
+        assert!(!stale.signal(libc::SIGTERM).unwrap());
+        assert!(child.0.try_wait().unwrap().is_none());
+        for pid in [0, -1, 1] {
+            let invalid = super::ProcessIdentity { pid, ..identity };
+            assert!(!invalid.signal(libc::SIGTERM).unwrap());
+        }
+        assert!(identity.signal(libc::SIGTERM).unwrap());
+        child.0.wait().unwrap();
+        assert!(!identity.signal(libc::SIGTERM).unwrap());
+    }
+
+    #[test]
+    fn daemon_marker_requires_matching_self_recorded_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("daemon.pid");
+        let mut original = Sleeper::start();
+        let mut unrelated = Sleeper::start();
+        let identity = super::ProcessIdentity::capture(original.0.id() as libc::pid_t).unwrap();
+        std::fs::write(
+            super::identity_path(&marker),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+        for value in [
+            unrelated.0.id().to_string(),
+            "0".into(),
+            "-1".into(),
+            "invalid".into(),
+        ] {
+            std::fs::write(&marker, value).unwrap();
+            assert!(!super::signal_daemon_marker(&marker, libc::SIGTERM).unwrap());
+        }
+        assert!(unrelated.0.try_wait().unwrap().is_none());
+        std::fs::write(&marker, original.0.id().to_string()).unwrap();
+        assert!(super::signal_daemon_marker(&marker, libc::SIGTERM).unwrap());
+        original.0.wait().unwrap();
+        assert!(!super::signal_daemon_marker(&marker, libc::SIGTERM).unwrap());
+        std::fs::write(&marker, unrelated.0.id().to_string()).unwrap();
+        assert!(!super::signal_daemon_marker(&marker, libc::SIGKILL).unwrap());
+        std::fs::remove_file(super::identity_path(&marker)).unwrap();
+        assert!(!super::signal_daemon_marker(&marker, libc::SIGTERM).unwrap());
+        assert!(unrelated.0.try_wait().unwrap().is_none());
+        std::fs::write(super::identity_path(&marker), b"not json").unwrap();
+        assert!(!super::signal_daemon_marker(&marker, libc::SIGTERM).unwrap());
+        let identity = super::ProcessIdentity::capture(unrelated.0.id() as libc::pid_t).unwrap();
+        std::fs::write(
+            super::identity_path(&marker),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+        assert!(super::signal_daemon_marker(&marker, libc::SIGKILL).unwrap());
+        unrelated.0.wait().unwrap();
+        assert!(!super::signal_daemon_marker(&marker, libc::SIGKILL).unwrap());
+    }
 
     #[test]
     fn owned_clears_user_configuration_but_preserves_fixture_environment() {
