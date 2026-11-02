@@ -1416,6 +1416,34 @@ async fn run_daemon() -> Result<()> {
     checkouts.set_search_fill(search_fill);
     checkouts.set_search_service(search.clone());
     let registry = Arc::new(tokio::sync::Mutex::new(checkouts));
+    // A private fixture socket moves the existing virtual lifecycle clock;
+    // no production delay or daemon protocol is changed.
+    #[cfg(feature = "test-support")]
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_CLOCK_SOCKET") {
+        let registry = registry.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            use std::io::{Read, Write};
+            let mut hook = std::os::unix::net::UnixStream::connect(path)?;
+            hook.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))?;
+            let mut now = Instant::now();
+            let mut command = [0];
+            while hook.read_exact(&mut command).is_ok() {
+                if command == *b"T" {
+                    now += registry::DAEMON_IDLE_DELAY + Duration::from_secs(1);
+                }
+                let exit = runtime
+                    .block_on(async {
+                        let mut registry = registry.lock().await;
+                        registry.set_clock_override_for_tests(now);
+                        registry.advance(now).map(|tick| tick.exit)
+                    })
+                    .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+                hook.write_all(&[u8::from(exit)])?;
+            }
+            Ok(())
+        });
+    }
     #[cfg(feature = "test-support")]
     if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STARTUP_SOCKET") {
         registry
@@ -1547,6 +1575,31 @@ mod serve_option_transport_tests {
         assert!(message.contains("serve control read failed: fixture connection reset"));
     }
 
+    #[tokio::test]
+    async fn serve_registration_releases_on_handler_error_and_disconnect() {
+        for failed in [false, true] {
+            let registry = Arc::new(tokio::sync::Mutex::new(registry::CheckoutRegistry::new()));
+            let shared = registry.clone();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                let handler = || -> Result<()> {
+                    let _registration = ServeRegistration::new(shared.clone(), runtime.clone(), 1);
+                    assert!(
+                        runtime
+                            .block_on(async { shared.lock().await.idle_exit_deadline() })
+                            .is_none()
+                    );
+                    ensure!(!failed, "fixture registration or reply failure");
+                    Ok(())
+                };
+                assert_eq!(handler().is_err(), failed);
+            })
+            .await
+            .unwrap();
+            assert!(registry.lock().await.idle_exit_deadline().is_some());
+        }
+    }
+
     #[test]
     fn daemon_receipt_keeps_omitted_and_explicit_default_distinct() {
         let options = serde_json::to_value(registry::BrowserOptions::default()).unwrap();
@@ -1558,6 +1611,43 @@ mod serve_option_transport_tests {
         assert_eq!(explicit.0["maxFileBytes"], 2_097_152);
         assert!(explicit.0.get("scip").is_none());
         assert!(explicit.0.get("manifest").is_none());
+    }
+}
+
+/// Scoped to one blocking control handler, including registration/reply errors.
+struct ServeRegistration {
+    registry: Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+    runtime: tokio::runtime::Handle,
+    session: u64,
+}
+
+impl ServeRegistration {
+    fn new(
+        registry: Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+        runtime: tokio::runtime::Handle,
+        session: u64,
+    ) -> Self {
+        runtime.block_on(async { registry.lock().await.retain_serve(session) });
+        Self {
+            registry,
+            runtime,
+            session,
+        }
+    }
+}
+
+impl Drop for ServeRegistration {
+    fn drop(&mut self) {
+        self.runtime.block_on(async {
+            self.registry.lock().await.disconnect(self.session);
+        });
+        #[cfg(feature = "test-support")]
+        if let Some(path) = std::env::var_os("TRELLIS_TEST_SERVE_RELEASE_SOCKET") {
+            use std::io::Write;
+            if let Ok(mut hook) = std::os::unix::net::UnixStream::connect(path) {
+                let _ = hook.write_all(b"R");
+            }
+        }
     }
 }
 
@@ -1752,6 +1842,8 @@ fn dispatch_connection(
         return write_daemon_reply(&mut stream, &reply);
     }
     let serve = request.operation == "serve";
+    let _serve_registration =
+        serve.then(|| ServeRegistration::new(registry.clone(), runtime.clone(), session));
     // One deadline for the whole CLI read (#142): activation contention, the
     // wait for startup reconciliation and every SQLite busy wait share it, so
     // they cannot stack. When it passes the read fails typed.
@@ -2184,6 +2276,7 @@ fn dispatch_connection(
     {
         std::thread::sleep(delay);
     }
+    let serve_registered = serve && result.is_ok();
     let expired_success = metrics && result.is_ok() && Instant::now() >= request_deadline;
     let reply = protocol::Reply {
         id: request.id,
@@ -2210,9 +2303,9 @@ fn dispatch_connection(
     } else {
         write_daemon_reply(&mut stream, &reply)?;
     }
-    if serve {
-        // This control connection only observes the daemon process lifetime:
-        // it ends when the client closes it or the daemon stops, signalled by
+    if serve_registered {
+        // The scoped registration holds the daemon alive until this control
+        // connection closes or the daemon stops, signalled by
         // the shutdown channel instead of a polled flag (#138 item 21).
         let closer = stream.try_clone()?;
         let mut shutdown = browser_shutdown.subscribe();

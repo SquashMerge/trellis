@@ -62,7 +62,7 @@ trellis serve --token-file ~/.trellis-private/token
 - `--workspace PATH` serves a checkout other than the current one.
 - `--bind 127.0.0.1:9000` uses another port. Only loopback addresses are accepted.
 
-**Stopping.** `serve` is a thin client of a per-user background process, `trellis daemon`, which does the work. Ctrl-C ends `serve`, but the daemon keeps running and the web app keeps working. Running the same `serve` command again attaches to it.
+**Stopping.** `serve` is a thin client of a per-user background process, `trellis daemon`, which does the work. Ctrl-C ends `serve`, but the daemon keeps running and the web app keeps working. Running the same `serve` command again attaches to it. While `serve` runs, its control connection keeps the daemon alive even without an open browser. After the last `serve` stops, the daemon may exit after its ordinary 30-minute idle grace if no other clients or work remain.
 
 To stop everything, or before you change the port or token file, stop the daemon. Otherwise `serve` fails with `serve bind conflicts with running listener` or `serve token file conflicts with running listener`.
 
