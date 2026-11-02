@@ -758,11 +758,84 @@
                 "model_not_configured",
                 "model_load_failed"
               ]
+            },
+            "configuration": {
+              "$ref": "#/$defs/SearchConfiguration"
             }
           },
           "required": [
             "backend",
             "unavailableReason"
+          ]
+        },
+        "SearchConfiguration": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "configFile": {
+              "type": "string"
+            },
+            "modelsDir": {
+              "type": "string"
+            },
+            "modelName": {
+              "type": "string"
+            },
+            "modelRevision": {
+              "type": "string"
+            },
+            "modelPath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "backend": {
+              "enum": [
+                "auto",
+                "cpu",
+                "metal"
+              ]
+            },
+            "sources": {
+              "$ref": "#/$defs/SearchConfigurationSources"
+            }
+          },
+          "required": [
+            "configFile",
+            "modelsDir",
+            "modelName",
+            "modelRevision",
+            "modelPath",
+            "backend",
+            "sources"
+          ]
+        },
+        "SearchConfigurationSources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "modelsDir": {
+              "$ref": "#/$defs/SearchConfigurationSource"
+            },
+            "model": {
+              "$ref": "#/$defs/SearchConfigurationSource"
+            },
+            "backend": {
+              "$ref": "#/$defs/SearchConfigurationSource"
+            }
+          },
+          "required": [
+            "modelsDir",
+            "model",
+            "backend"
+          ]
+        },
+        "SearchConfigurationSource": {
+          "enum": [
+            "default",
+            "config_file",
+            "environment"
           ]
         }
       },
@@ -825,7 +898,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 4
+                  "const": 5
                 },
                 "watcherDegraded": {
                   "type": "boolean"

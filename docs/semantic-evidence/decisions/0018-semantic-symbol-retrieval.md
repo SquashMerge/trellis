@@ -274,6 +274,44 @@ A standalone registry without a search service has null backend and reason. This
 the earlier null-only model-unavailability wording; no evidence semantics or release-build
 Metal defaults change.
 
+## User model configuration (owner-directed #594 first slice)
+
+User setup no longer requires a shell environment variable. On macOS and Linux the daemon
+reads `~/.config/trellis/config.toml` once at startup; XDG configuration variables do not
+relocate this file. The optional root keys are `models_dir` (an absolute directory) and
+`backend` (`auto`, `cpu` or `metal`). An optional `[model]` table supplies `name` and
+`revision` together, restricted to Trellis's existing reviewed supported pin. Missing values
+use the topology data root's `models` directory, the reviewed model and automatic backend.
+Managed snapshots live at `<modelsDir>/<modelName>/<modelRevision>`; model data is not
+stored in the configuration directory. Changing configuration requires daemon restart.
+Invalid, unsupported or unreadable configuration fails startup even with environment
+overrides; defaults are not written to disk.
+
+`TRELLIS_SEARCH_MODEL` and `TRELLIS_SEARCH_BACKEND` remain field-wise development
+and evaluation overrides, with precedence over user-file values and defaults. An empty
+model-path override explicitly disables model use. A missing managed snapshot is not an
+implicit request to fetch it. Startup, status, MCP describe and search never download.
+Installation is explicit, uses the same reviewed revision and nine filename/SHA-256 pins,
+and verifies a complete snapshot before publishing it for use. Installation does not write
+configuration or restart the daemon; the default snapshot is resolved at the next manual
+daemon start. It neither runs upstream
+custom code nor changes model/cache identity, storage schema, caps or ranking constants.
+Missing/failed model loading keeps the existing lexical fallback and unavailable reasons.
+
+Workspace describe and CLI status extend daemon-wide `searchIndex` with optional
+`configuration:{configFile,modelsDir,modelName,modelRevision,modelPath,backend,sources}`.
+Every field is required when the object is present. Paths, name and revision are strings;
+`modelPath` alone is nullable, for explicit disable. A missing snapshot still reports the
+resolved managed path. Configuration `backend` is the preference (`auto`, `cpu`, `metal`),
+not the actually selected sibling `searchIndex.backend`. The closed `sources` object has
+exactly `modelsDir`, `model` and `backend`, each one of `default`, `config_file`,
+`environment`, naming the winning source. These are startup diagnostics, not readiness,
+query-pinned coverage, a verified model identity or code evidence. Production daemons
+publish them; standalone registries and injected models without configuration knowledge
+omit the object. Query `SearchIndexStatus` is unchanged. The additive describe contract
+uses `toolVersion:5`; its exact closed wire schema is owned by the
+[MCP contract](../../mcp-readonly-pilot-contract.md#amendment-594-user-model-configuration-diagnostics).
+
 ## Retrieval is not evidence
 
 A hit’s syntax Evidence proves only the measured declaration, not relevance. There is no

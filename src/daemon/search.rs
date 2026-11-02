@@ -1,7 +1,6 @@
 //! Daemon-wide local model and vector-cache ownership, independent of checkouts.
 use std::{
     collections::VecDeque,
-    path::PathBuf,
     sync::{
         Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -201,17 +200,17 @@ pub struct SearchService {
 
 impl SearchService {
     pub fn from_environment(roots: TopologyRoots) -> Result<Self> {
-        let path = std::env::var_os("TRELLIS_SEARCH_MODEL").map(PathBuf::from);
-        let backend =
-            std::env::var("TRELLIS_SEARCH_BACKEND")
-                .map(Some)
-                .or_else(|error| match error {
-                    std::env::VarError::NotPresent => Ok(None),
-                    std::env::VarError::NotUnicode(_) => Err(EmbedError::InvalidInput(
-                        "TRELLIS_SEARCH_BACKEND must be UTF-8".into(),
-                    )),
-                })?;
-        Self::new(roots, SearchConfig::from_values(path, backend.as_deref())?)
+        Self::from_resolved(roots.clone(), crate::search_config::resolve(&roots)?)
+    }
+
+    pub fn from_resolved(
+        roots: TopologyRoots,
+        resolved: crate::search_config::ResolvedSearchConfig,
+    ) -> Result<Self> {
+        let config = resolved.runtime_config()?;
+        let configured = config.model_path().is_some();
+        let model = SearchModel::new(config)?.with_configuration(resolved.diagnostics);
+        Self::from_model(roots, model, configured)
     }
 
     pub fn new(roots: TopologyRoots, config: SearchConfig) -> Result<Self> {

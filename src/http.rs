@@ -5133,6 +5133,7 @@ async fn provisioned_core_answer(
                 return Err(invalid());
             }
             let head = matches!(route, BrowserCoreRoute::StatusHead);
+            let search = runtime.search_availability();
             let runtime = runtime.clone();
             let (status, catching_up) = tokio::task::spawn_blocking(move || {
                 let (response, catching_up) = runtime.evidence_response()?;
@@ -5162,7 +5163,21 @@ async fn provisioned_core_answer(
                 }))
                 .into_response()
             } else {
-                Json(status).into_response()
+                let mut body = serde_json::to_value(status).map_err(|_| {
+                    ApiError(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "Operation failed",
+                    )
+                })?;
+                body["searchIndex"] = serde_json::to_value(search).map_err(|_| {
+                    ApiError(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "Operation failed",
+                    )
+                })?;
+                Json(body).into_response()
             };
             Ok((body, catching_up))
         }
