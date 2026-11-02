@@ -438,7 +438,7 @@ fn spawn_sites_are_closed_inventory() {
 }
 
 #[test]
-fn no_download_clients_in_src() {
+fn download_clients_are_confined_to_explicit_model_management() {
     for (file, text) in production(|_| true, false) {
         for client in [
             "ureq",
@@ -454,15 +454,27 @@ fn no_download_clients_in_src() {
                 "{file} uses the HTTP/TCP client {client}"
             );
         }
-        // reqwest is only a URL parser, in one place.
+        // Only the explicit model installer may download (#594). All other
+        // source keeps the existing URL-parser-only exception.
         for (at, _) in text.match_indices("reqwest") {
             let rest = &text[at..];
             assert!(
-                file == "src/mcp/session.rs" && rest.starts_with("reqwest::Url::parse("),
-                "{file} uses reqwest beyond URL parsing"
+                file == "src/model_management.rs"
+                    || (file == "src/mcp/session.rs" && rest.starts_with("reqwest::Url::parse(")),
+                "{file} uses reqwest outside explicit model management or URL parsing"
             );
         }
     }
+    let management_references: Vec<_> = production(|_| true, false)
+        .into_iter()
+        .filter(|(_, text)| whole_words(text, "model_management") > 0)
+        .map(|(file, _)| file)
+        .collect();
+    assert_eq!(
+        management_references,
+        ["src/lib.rs", "src/main.rs"],
+        "model management is exposed by the library and called only by the explicit CLI"
+    );
     // Install commands are spelled in string literals, so scan those.
     for (file, text) in production(|_| true, true) {
         for literal in string_literals(&text) {

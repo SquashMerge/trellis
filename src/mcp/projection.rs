@@ -170,7 +170,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 4);
+        assert_eq!(ready["data"]["toolVersion"], 5);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
