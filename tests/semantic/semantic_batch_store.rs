@@ -1,6 +1,9 @@
 #![cfg(feature = "test-support")]
 use crate::semantic_batch_support;
 
+#[path = "proptest_retention.rs"]
+mod proptest_retention;
+
 use protobuf::Message;
 use semantic_batch_support::{
     BatchFixture, DocSpec, edit_descriptor, edit_page, long_path_workspace, uniform_workspace,
