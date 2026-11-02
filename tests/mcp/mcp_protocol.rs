@@ -1,5 +1,7 @@
 #![cfg(feature = "test-support")]
 //! Executable stdio contract checks. Requests wait for replies; no timing-dependent queue hooks.
+#[path = "architecture_race_properties.rs"]
+mod architecture_race_properties;
 use serde_json::{Value, json};
 use std::{
     fs,
