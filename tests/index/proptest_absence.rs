@@ -14,15 +14,21 @@ use trellis::{
 /// A snapshot as a store read builds it.
 fn snapshot(files: &[(String, Vec<u8>)], max_file_bytes: u64) -> Snapshot {
     let root = tempfile::tempdir().unwrap();
+    snapshot_at(root.path(), files, max_file_bytes)
+}
+
+fn snapshot_at(
+    root: &std::path::Path,
+    files: &[(String, Vec<u8>)],
+    max_file_bytes: u64,
+) -> Snapshot {
     for (path, bytes) in files {
-        let path = root.path().join(path);
+        let path = root.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
     }
-    let identity =
-        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
-            .unwrap();
-    let mut options = IndexOptions::new(root.path().to_owned());
+    let identity = trellis::store::topology::WorkspaceIdentity::discover(Some(root), root).unwrap();
+    let mut options = IndexOptions::new(root.to_owned());
     options.max_file_bytes = max_file_bytes;
     let (graph, native) = index_workspace_with_native(
         &options,
@@ -97,8 +103,19 @@ fn snapshot(files: &[(String, Vec<u8>)], max_file_bytes: u64) -> Snapshot {
     }
 }
 
-fn project_with(files: &[(String, Vec<u8>)], only: &[String], cap: u64) -> Value {
-    references::project(&snapshot(files, cap), only, 20, &mut || Ok(()))
+pub(super) fn project_with(files: &[(String, Vec<u8>)], only: &[String], cap: u64) -> Value {
+    references::project(&snapshot(files, cap), only, 50, &mut || Ok(()))
+        .unwrap()
+        .data
+}
+
+pub(super) fn project_at(
+    root: &std::path::Path,
+    files: &[(String, Vec<u8>)],
+    only: &[String],
+    cap: u64,
+) -> Value {
+    references::project(&snapshot_at(root, files, cap), only, 50, &mut || Ok(()))
         .unwrap()
         .data
 }
@@ -120,7 +137,7 @@ fn resolved(data: &Value) -> BTreeSet<(String, String)> {
 
 /// Compare individual sites on unchanged source files, not just aggregated module pairs.
 /// Sites in the altered file have different text and cannot be compared by byte range.
-fn resolved_sites(
+pub(super) fn resolved_sites(
     data: &Value,
     changed: &str,
 ) -> BTreeSet<(String, String, String, u64, u64, String)> {

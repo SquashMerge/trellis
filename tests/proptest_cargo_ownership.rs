@@ -356,6 +356,24 @@ fn shared_module_witness() {
 }
 
 #[test]
+fn unread_path_module_cannot_prove_nested_package_ownership() {
+    for skip in 0..UNREAD.len() {
+        // Package p0 reaches a workspace-shared source through #[path]. Before it is
+        // skipped, package p1's b.rs has a single known owner. The unread source could
+        // contain another #[path] to b.rs, so that ownership is no longer provable.
+        let degraded = graph(4, vec![0; 13], [true, false], skip);
+        let mut healthy = degraded.clone();
+        healthy.files.get_mut("shared/x.rs").unwrap().unread = None;
+        let before = render(&healthy).finish();
+        let after = render(&degraded).finish();
+        assert_eq!(before.target_of("p1/src/b.rs"), Some(&healthy.targets[2].1));
+        assert_eq!(after.target_of("p1/src/b.rs"), None);
+        check(&healthy).unwrap();
+        check(&degraded).unwrap();
+    }
+}
+
+#[test]
 fn scenario_controls_are_non_vacuous() {
     for scenario in 0..=9 {
         if scenario == 6 {
