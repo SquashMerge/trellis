@@ -21,6 +21,8 @@ test.before(async () => {
   server = createServer((req, res) => {
     res.setHeader("Content-Security-Policy", policy);
     if (req.url === "/pin.js") { res.setHeader("Content-Type", "text/javascript; charset=utf-8"); res.end(pin); return; }
+    const font = req.url.match(/^\/fonts\/(inter-variable|manrope-variable|jetbrains-mono-latin)\.woff2$/);
+    if (font) { res.setHeader("Content-Type", "font/woff2"); res.end(readFileSync(join(ROOT, "web", req.url))); return; }
     const file = files[req.url];
     if (file) { res.setHeader("Content-Type", file.endsWith("css") ? "text/css; charset=utf-8" : "text/javascript; charset=utf-8"); res.end(readFileSync(join(ROOT, file))); return; }
     if (req.url === "/") { res.setHeader("Content-Type", "text/html"); res.end(html); return; }
@@ -81,6 +83,59 @@ test("Pele draws each measured class with native IDs mapped back to Trellis clas
   assert.equal(await page.locator("#classes-diagram svg [style]").count() + await page.locator("#classes-diagram svg[style]").count(), 0);
   assert.deepEqual(cspErrors(), []);
 });
+
+// One ordinary declaration: the long field type must not determine whether its
+// text escapes the box. The controller loads local product fonts before layout.
+const longType = "java.util.Map<java.lang.String, java.util.List<com.example.catalog.model.ProductDescriptor>>";
+for (const renderer of ["pele", "cards"]) for (const width of [1100, 380]) {
+  test(`long field type stays inside ${renderer} at ${width}px with original keyboard actions`, async () => {
+    await page.setViewportSize({width, height: 800});
+    if (renderer === "cards") await page.evaluate(() => { window.savedPele = window.pele; window.pele = undefined; });
+    const dto = diagram([node("Typed", "Catalog", {fields: [{name: "items", typeHint: longType, path: "src/Typed.java", range}],
+      methods: [{name: "run", symbolId: "Typed#run", typeHint: "void", path: "src/Typed.java", range}]})]);
+    try {
+      await open(dto);
+      assert.match(await state(), renderer === "pele" ? /Pele rendered/ : /Pele fell back: Pele asset unavailable/);
+      assert.ok(await page.evaluate(() => document.fonts.check('14px "JetBrains Mono"') && document.fonts.check('14px "Inter"')), "layout waits for final local fonts");
+      const geometry = await page.evaluate(renderer => {
+        const inside = (text, box) => text.x >= box.x - .5 && text.x + text.width <= box.x + box.width + .5 &&
+          text.y >= box.y - .5 && text.y + text.height <= box.y + box.height + .5;
+        let contained;
+        if (renderer === "pele") {
+          const group = document.querySelector(".pele-node"), box = group.querySelector(":scope > rect").getBBox();
+          contained = [...group.querySelectorAll("text")].map(text => ({text: text.textContent, width: text.getBBox().width, classWidth: box.width, inside: inside(text.getBBox(), box)}));
+        } else {
+          const card = document.querySelector(".classes-node").getBoundingClientRect();
+          contained = [...document.querySelectorAll(".classes-member")].map(row => {
+            const ranges = [...row.children].flatMap(child => {
+              const range = document.createRange(); range.selectNodeContents(child);
+              return [...range.getClientRects()];
+            });
+            return {text: row.textContent, inside: ranges.every(box => box.left >= card.left && box.right <= card.right && box.top >= card.top && box.bottom <= card.bottom)};
+          });
+        }
+        return {contained, documentWidth: document.documentElement.scrollWidth, viewport: innerWidth};
+      }, renderer);
+      assert.ok(geometry.contained.every(row => row.inside), JSON.stringify(geometry));
+      assert.ok(geometry.documentWidth <= geometry.viewport, JSON.stringify(geometry));
+      const field = renderer === "pele" ? page.locator('.pele-member[data-trellis-member-kind="field"]') : page.locator(".classes-member-type").first();
+      assert.ok((await field.getAttribute("aria-label")).includes(longType), "complete type remains accessible");
+      await field.focus(); await page.keyboard.press("Enter");
+      assert.deepEqual(await page.evaluate(() => window.harness.navigations), [{classId: "Typed", memberName: "items", startByte: 10, endByte: 200, memberPath: "src/Typed.java"}]);
+      const method = renderer === "pele" ? page.locator('.pele-member[data-trellis-symbol-id="Typed#run"]') : page.getByRole("button", {name: "Show sequence for run(): void", exact: true});
+      await method.focus(); await page.keyboard.press("Enter");
+      assert.deepEqual(await page.evaluate(() => window.harness.methods.map(m => [m.id, m.parent, m.range])), [["Typed#run", "Typed", range]]);
+      assert.deepEqual(await page.evaluate(() => window.harness.dto), dto, "DTO typeHint, IDs and pin stay unchanged");
+      assert.equal(await page.evaluate(() => window.harness.reads.length), 0, "display and selection do not read source");
+      assert.deepEqual(cspErrors(), []);
+    } finally {
+      if (renderer === "cards") await page.evaluate(() => { window.pele = window.savedPele; delete window.savedPele; });
+      await page.setViewportSize({width: 1280, height: 720});
+      // Drain resize/scroll delivery before the next test opens a keyboard menu.
+      await page.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done))));
+    }
+  });
+}
 
 test("repository text is shown literally through encoded labels and never becomes Mermaid or markup", async () => {
   const hostile = 'Evil<T> & "q" {x} </text><script>window.pwned=1</script>';
