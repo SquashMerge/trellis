@@ -50,7 +50,7 @@ function harness({navigation = false} = {}) {
   document.querySelector=selector=>document.body.querySelector(selector);
   document.getElementById=id=>{if(!elements.has(id)){const item=element(id);elements.set(id,item);document.body.append(item);}return elements.get(id);};
   const window = {innerWidth:390,innerHeight:600,addEventListener(type,fn){(winListeners[type] ||= []).push(fn);}};
-  vm.runInNewContext(pinSource + "\n" + source,{window,document,URLSearchParams,console});
+  vm.runInNewContext(pinSource + "\n" + source,{window,document,URLSearchParams,console,getComputedStyle:()=>({getPropertyValue:token=>token==="--mono"?"monospace":"sans-serif"})});
   window.TrellisClasses.init({...(navigation ? {navigateMember:(...args)=>navigate(...args)} : {}),request:(url,options)=>{calls.push({url,options});return request(url,options);},readSource:(step,rev)=>reads.push({step,revision:rev}),selectMethod:symbol=>methods.push(symbol),currentRevision:()=>revision,currentSession:()=>session,onChange:()=>changes.push(true),onStale:message=>stale.push(message)});
   return {controller:window.TrellisClasses,document,window,calls,reads,methods,changes,navigations,stale,get:document.getElementById,
     setNavigate(fn){navigate=fn;},setRequest(fn){request=fn;},setRevision(value){revision=value;},setSession(value){session=value;},
@@ -68,6 +68,21 @@ async function related(h, from, ids) {
  await h.button(chooser,"Add selected classes").fire("click");
 }
 async function allReturned(h) { await h.button(h.document.body,"Show all returned classes").fire("click"); }
+
+
+for (const outcome of ["loaded", "failed", "reset"]) test(`local font readiness is guarded before class publication: ${outcome}`, async () => {
+ const h=harness(),font=deferred(),started=deferred(),loads=[];
+ h.document.fonts={load:spec=>{loads.push(spec);started.resolve();return font.promise;}};
+ h.setRequest(async()=>diagram(["A"]));
+ const opening=h.controller.open({seed:"A"});await started.promise;
+ assert.equal(h.card("A"),undefined,"no layout is published using temporary font metrics");
+ assert.deepEqual(loads,["14px monospace","14px sans-serif"]);
+ if(outcome==="reset")h.controller.reset();
+ if(outcome==="failed")font.reject(new Error("local font unavailable"));else font.resolve([]);
+ await opening;
+ assert.equal(!!h.card("A"),outcome!=="reset");
+ assert.equal(h.calls.length,1);assert.equal(h.reads.length,0);
+});
 
 test("init is inert; global search and file open only read catalog/diagram",async()=>{
  const h=harness();assert.equal(h.calls.length,0);
