@@ -62,7 +62,7 @@ test("the eleven-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 5);
+  assert.equal(describe.toolVersion.const, 6);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
@@ -109,6 +109,30 @@ test("describe configuration is optional, closed, and separate from query readin
     declarations: 1, embedded: 0, lexical: "complete", unavailableReason: "model_not_configured" };
   assert.ok(validateReadiness(readiness), JSON.stringify(validateReadiness.errors));
   assert.equal(validateReadiness({ ...readiness, configuration }), false);
+});
+
+test("native coverage labels do not claim the selected semantic tier", () => {
+  for (const tool of tools) {
+    const schema = tool.outputSchema;
+    if (!schema.$defs?.LanguageStatus) continue;
+    const validate = ajv.compile({ $schema: schema.$schema, $defs: schema.$defs,
+      $ref: "#/$defs/LanguageStatus" });
+    const coverage = { selected: 2, complete: 1, partial: 1, failed: 0, unselected: 0 };
+    const semantic = { available: true, producerId: "rust-analyzer", freshness: "fresh",
+      coverage, note: null };
+    if (tool.name === "trellis_workspace_describe") semantic.partialReasons = null;
+    const status = { language: "rust", nativeCoverageTier: "syntax", coverage, semantic };
+    assert.ok(validate(status), `${tool.name}: ${JSON.stringify(validate.errors)}`);
+    assert.equal(validate({ ...status, nativeCoverageTier: "semantic" }), false, tool.name);
+    const { nativeCoverageTier, ...legacy } = status;
+    assert.equal(validate({ ...legacy, evidenceTier: "syntax" }), false, tool.name);
+    assert.equal(validate({ ...status, evidenceTier: "syntax" }), false, tool.name);
+  }
+  // The field rename must not rewrite item-level evidence semantics.
+  assert.deepEqual(tools[1].outputSchema.$defs.Symbol.properties.evidenceTier,
+    { const: "syntax" });
+  assert.deepEqual(tools[4].outputSchema.$defs.CallItem.properties.evidenceTier.enum,
+    ["syntax", "semantic"]);
 });
 
 test("search accepts only its closed public input", () => {
