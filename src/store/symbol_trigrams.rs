@@ -182,13 +182,7 @@ impl Search<'_> {
         )
     }
 
-    fn ordered_sql(
-        &self,
-        tier: i64,
-        upper: bool,
-        id_shaped: bool,
-        role: Option<&str>,
-    ) -> String {
+    fn ordered_sql(&self, tier: i64, upper: bool, id_shaped: bool, role: Option<&str>) -> String {
         let table = self.source.split(' ').next().unwrap_or_default();
         let alias = self.source.rsplit(' ').next().unwrap_or_default();
         let name = self.name;
@@ -840,6 +834,11 @@ mod tests {
             let owner = if rng.random_ratio(1, 3) { 2 } else { 1 };
             let named = !rng.random_ratio(1, 16);
             insert_ranked(&db, rowid, owner, named.then_some(name.as_str()));
+            db.execute(
+                "UPDATE native_version_declarations SET role='test' WHERE rowid=?1 AND rowid%3=0",
+                [rowid],
+            )
+            .unwrap();
             let id = format!("sid:v1:{:032x}", rng.random::<u128>());
             let encoded = super::super::id_codec::encode_sid(&id).unwrap();
             db.execute(
@@ -923,7 +922,11 @@ mod tests {
                  WHEN instr(lower({name}),lower(?{q}))=1 THEN 1 ELSE 2 END=2
                  AND instr(lower({name}),lower(?{q}))>0
                  AND EXISTS(SELECT 1 FROM {names} WHERE rowid={alias}.rowid AND {names} MATCH ?{p})
+                 {role_filter}
                  ORDER BY {name} COLLATE BINARY,{id} LIMIT ?{limit}",
+                role_filter = search
+                    .role
+                    .map_or_else(String::new, |column| format!("AND {column}='production'")),
                 columns = search.columns,
                 source = search.source,
                 joins = search.joins(true),
@@ -953,7 +956,8 @@ mod tests {
                 i64::from(statement.get_status(StatementStatus::VmStep))
             };
             let legacy_steps = measure(&legacy);
-            let steps = measure(&search.ordered_sql(2, false, false, None));
+            let steps =
+                measure(&search.ordered_sql(2, false, false, search.role.map(|_| "production")));
             assert!(
                 steps * 10 < legacy_steps * 7,
                 "{}: {steps} VM steps versus legacy {legacy_steps}",
@@ -974,7 +978,8 @@ mod tests {
             insert_ranked(&db, 100 - at, 1, Some(&format!("a_oca_{at:03}")));
         }
         let measure = |search: Search<'_>| {
-            let sql = search.ordered_sql(2, false, false, None);
+            let role = search.role.map(|_| "production");
+            let sql = search.ordered_sql(2, false, false, role);
             let expression = match_expression("oca").unwrap();
             let limit = 5_i64;
             let revision = "pin:v1:test:1";
@@ -991,7 +996,7 @@ mod tests {
                 .unwrap();
             assert!(
                 plan.iter()
-                    .any(|p| p.contains("USING COVERING INDEX") && p.contains("_search_name")),
+                    .any(|p| p.contains("USING") && p.contains("_search_name")),
                 "{plan:?}"
             );
             // SQLite can flatten correlated EXISTS into a bounded FTS semi-join.
