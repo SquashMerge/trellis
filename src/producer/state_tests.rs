@@ -344,7 +344,7 @@ fn sweep_never_signals_a_recorded_group_and_reports_it_unknown() {
     let fixture = fixture();
     let state = state(&fixture);
     for (n, offset) in [(1, 0), (2, 1)] {
-        let child = orphan_group();
+        let mut child = orphan_group();
         abandoned_run(&state, n, &child, offset);
         let pid = child.id() as i32;
         let report = state
@@ -352,8 +352,10 @@ fn sweep_never_signals_a_recorded_group_and_reports_it_unknown() {
             .unwrap();
         assert_eq!(report.unestablished_groups, [pid]);
         assert_eq!(report.abandoned_runs, [run_id(n)]);
+        // The leader is this test's child: a signalled leader would have exited (and a
+        // zombie still counts as a group member, so a group probe could not tell).
         assert!(
-            process_info::group_exists(pid),
+            child.try_wait().unwrap().is_none(),
             "recovery never signals a recorded group"
         );
         let after = state.read_run_record(&run_id(n)).unwrap().unwrap();

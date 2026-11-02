@@ -745,6 +745,10 @@ fn unknown_group_refuses_a_snapshot_that_fails_full_admission_before_enqueue() {
     assert_eq!(world.stub_entry()["lastRun"]["groupStatus"], "unknown");
     assert!(only_record_remains(&world.runs_dir().join(run_id)));
     assert_eq!(index_revision(&world), before);
+    assert!(
+        stage_residue(&world).is_empty(),
+        "the failed preflight's stage is gone"
+    );
 }
 
 /// A full decode alone is not enough: a document the artifact names but that is not in the
@@ -761,6 +765,46 @@ fn unknown_group_refuses_a_snapshot_with_an_unlisted_document() {
     let reply = reply(&world.run(&[]));
     assert_eq!(reply["outcome"], "producer_output_invalid", "{reply}");
     assert_eq!(reply["import"], Value::Null);
+}
+
+/// Whether a semantic stage directory (an import's or a preflight's) is left in the index
+/// directory.
+fn stage_residue(world: &World) -> Vec<String> {
+    entries(world.index_db().parent().unwrap())
+        .into_iter()
+        .filter(|name| name.starts_with("semantic-stage-"))
+        .collect()
+}
+
+/// A cancel that lands while the snapshot preflight runs ends the run `cancelled` with
+/// nothing queued and no stage left behind.
+#[test]
+fn cancel_during_the_snapshot_preflight_queues_nothing() {
+    let world = World::with_env(
+        &[("TRELLIS_TEST_PRODUCER_PREFLIGHT_SOCKET", "preflight.sock")],
+        &[("TRELLIS_TEST_PRODUCER_GROUP_UNKNOWN", "1")],
+    );
+    world.emitting();
+    let before = index_revision(&world);
+    let child = world.spawn_run(&[]);
+    world.wait_hook("preflight.sock");
+    let active = world.active_run();
+    assert_eq!(active["state"], "writingBatch");
+    assert_eq!(active["groupStatus"], "unknown");
+    let output = world.producer("cancel", &["--run", active["runId"].as_str().unwrap()]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    world.release_hook("preflight.sock");
+
+    let output = child.wait_with_output().unwrap();
+    let reply = reply(&output);
+    assert_eq!(reply["state"], "cancelled", "{reply}");
+    assert_eq!(reply["import"], Value::Null);
+    assert_eq!(
+        world.record(reply["runId"].as_str().unwrap())["requestId"],
+        Value::Null
+    );
+    assert!(stage_residue(&world).is_empty());
+    assert_eq!(index_revision(&world), before);
 }
 
 /// The group was not proven empty, so a process left in it may rewrite `out/index.scip`
@@ -799,6 +843,7 @@ fn unknown_group_imports_the_frozen_snapshot_despite_a_later_rewrite() {
     assert_eq!(record["diagnostics"]["groupStatus"], "unknown");
     assert_eq!(world.stub_entry()["lastRun"]["groupStatus"], "unknown");
     assert!(only_record_remains(&dir));
+    assert!(stage_residue(&world).is_empty());
 }
 
 fn entries(dir: &Path) -> Vec<String> {

@@ -426,6 +426,7 @@ impl Run<'_> {
     /// digest, its full decode and the closure that every covered document was decoded. The
     /// stage is discarded; nothing is published.
     fn preflight(&self, written: &batch::WrittenBatch) -> Result<()> {
+        test_hook("TRELLIS_TEST_PRODUCER_PREFLIGHT_SOCKET");
         let store = self.ctx.store;
         let input = StageInput::generated(
             Path::new(store.workspace_root()),
