@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import closing
@@ -181,11 +182,23 @@ class Campaign(unittest.TestCase):
             (root / "idx/semantic-stage-req1-inc1/rows").write_bytes(b"x" * 70)
             (root / "idx/stage-1/rows").write_bytes(b"x" * 888)
             (root / "idx/other").write_bytes(b"x" * 999)
-            sampler = GATE.StorageSampler(root, interval=0.01).start()
-            (root / "idx/index.db-wal").write_bytes(b"x" * 500)
-            time.sleep(0.05)
-            (root / "idx/index.db-wal").write_bytes(b"x")
-            peak = sampler.stop()
+            sampled_high_water = threading.Event()
+            sampler = GATE.StorageSampler(root, interval=0.01)
+            sample = sampler.sample
+
+            def observed_sample():
+                sample()
+                if sampler.sqlite_peak == 610 and sampler.stage_peak == 70:
+                    sampled_high_water.set()
+
+            sampler.sample = observed_sample
+            sampler.start()
+            try:
+                (root / "idx/index.db-wal").write_bytes(b"x" * 500)
+                self.assertTrue(sampled_high_water.wait(5), "sampler did not observe the high water")
+                (root / "idx/index.db-wal").write_bytes(b"x")
+            finally:
+                peak = sampler.stop()
             self.assertEqual(peak["total"], 610)
             self.assertEqual(sampler.stage_peak, 70)
             self.assertEqual(peak["method"], "poll 50 ms plus final stat")
