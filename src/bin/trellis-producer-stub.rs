@@ -92,6 +92,10 @@ fn main() {
     if let Some(pidfile) = mode["tree"].as_str() {
         let exe = std::env::current_exe().expect("current_exe");
         let mut pids = vec![std::process::id()];
+        let mut identities = vec![
+            trellis::testing::ProcessIdentity::capture(std::process::id() as libc::pid_t)
+                .expect("own identity"),
+        ];
         for _ in 0..2 {
             // The descendants outlive this process on purpose.
             #[allow(clippy::zombie_processes)]
@@ -100,7 +104,16 @@ fn main() {
                 .spawn()
                 .expect("descendant");
             pids.push(child.id());
+            identities.push(
+                trellis::testing::ProcessIdentity::capture(child.id() as libc::pid_t)
+                    .expect("descendant identity"),
+            );
         }
+        fs::write(
+            Path::new(pidfile).with_extension("identity.json"),
+            serde_json::to_vec(&identities).expect("encode process identities"),
+        )
+        .expect("identity file");
         let text: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
         fs::write(pidfile, text).expect("pidfile");
     }

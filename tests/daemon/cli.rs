@@ -179,13 +179,16 @@ fn connected_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
 }
 
 /// Test-scope guard for only the daemon elected under this disposable HOME.
-struct FixtureDaemon(std::path::PathBuf);
+struct FixtureDaemon(std::path::PathBuf, std::cell::Cell<bool>);
 impl FixtureDaemon {
     fn new(home: &std::path::Path) -> Self {
-        Self(home.to_path_buf())
+        Self(home.to_path_buf(), std::cell::Cell::new(false))
     }
 
     fn stop_attested(&self) -> Result<(), &'static str> {
+        if self.1.replace(true) {
+            return Ok(());
+        }
         let marker = self.0.join("auto-daemon.pid");
         let raw = fs::read_to_string(&marker).map_err(|_| "pid_marker_missing")?;
         let pid = raw.parse::<u32>().map_err(|_| "pid_marker_invalid")?;
@@ -225,11 +228,7 @@ impl FixtureDaemon {
         {
             return Err("daemon_command_mismatch");
         }
-        let sent = Command::new("/bin/kill")
-            .args(["-TERM", &pid.to_string()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+        let sent = trellis::testing::signal_daemon_marker(&marker, libc::SIGTERM).unwrap_or(false);
         if !sent {
             return Err("daemon_kill_failed");
         }
@@ -3576,13 +3575,7 @@ fn daemon_publication_is_independent_of_cli_output_file() {
     struct ElectedDaemon(std::path::PathBuf);
     impl Drop for ElectedDaemon {
         fn drop(&mut self) {
-            if let Ok(pid) = fs::read_to_string(&self.0)
-                && let Ok(pid) = pid.parse::<u32>()
-                && pid <= i32::MAX as u32
-            {
-                // The elected daemon writes this marker under the private fixture.
-                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            }
+            let _ = trellis::testing::signal_daemon_marker(&self.0, libc::SIGTERM);
         }
     }
     let _daemon = ElectedDaemon(daemon_pid.clone());

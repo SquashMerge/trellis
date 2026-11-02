@@ -53,6 +53,7 @@ fn succeeded(output: &Output) -> Value {
 
 /// One checkout with its published native revision, a running daemon and an open store.
 struct World {
+    daemon: std::cell::Cell<Option<trellis::testing::ProcessIdentity>>,
     _temp: TempDir,
     home: PathBuf,
     root: PathBuf,
@@ -92,6 +93,9 @@ impl World {
         let index_db = roots.index_db(&identity);
         let store = Store::open(roots, identity).unwrap();
         Self {
+            daemon: std::cell::Cell::new(trellis::testing::daemon_marker_identity(
+                &home.join("daemon.pid"),
+            )),
             _temp: temp,
             home,
             root,
@@ -195,7 +199,13 @@ impl World {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert!(
+            self.daemon
+                .take()
+                .expect("fixture daemon identity")
+                .signal(libc::SIGTERM)
+                .unwrap()
+        );
         trellis::testing::wait_until("daemon exit", || !trellis::testing::process_running(pid));
         wait_for_daemon_election_free(&self.home);
     }
@@ -203,10 +213,8 @@ impl World {
 
 impl Drop for World {
     fn drop(&mut self) {
-        if let Ok(pid) = fs::read_to_string(self.home.join("daemon.pid"))
-            && let Ok(pid) = pid.parse::<i32>()
-        {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+        if let Some(identity) = self.daemon.take() {
+            let _ = identity.signal(libc::SIGTERM);
         }
     }
 }
@@ -1272,7 +1280,14 @@ fn cancellation_during_staging_publishes_nothing_and_request_completes_after_res
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    assert!(
+        world
+            .daemon
+            .take()
+            .expect("fixture daemon identity")
+            .signal(libc::SIGTERM)
+            .unwrap()
+    );
     trellis::testing::wait_until("daemon exit", || !trellis::testing::process_running(pid));
     let _ = child.wait();
     assert_eq!(world.head(), prior);
@@ -1308,7 +1323,14 @@ fn kill_daemon(world: &World) {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    assert!(
+        world
+            .daemon
+            .take()
+            .expect("fixture daemon identity")
+            .signal(libc::SIGKILL)
+            .unwrap()
+    );
     trellis::testing::wait_until("daemon death", || !trellis::testing::process_running(pid));
 }
 
@@ -1319,12 +1341,16 @@ fn restart_and_index(world: &World, env: &[(&str, &Path)]) -> Value {
     for (key, value) in env {
         command.env(key, value);
     }
-    succeeded(
+    let result = succeeded(
         &command
             .args(["index", "--workspace", world.root.to_str().unwrap()])
             .output()
             .unwrap(),
-    )
+    );
+    world.daemon.set(trellis::testing::daemon_marker_identity(
+        &world.home.join("daemon.pid"),
+    ));
+    result
 }
 
 #[test]

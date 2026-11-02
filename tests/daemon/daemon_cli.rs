@@ -197,14 +197,38 @@ impl AutoDaemonGuard {
 }
 impl Drop for AutoDaemonGuard {
     fn drop(&mut self) {
-        if let Ok(pid) = fs::read_to_string(&self.0)
-            && let Ok(pid) = pid.parse::<u32>()
-            && pid <= i32::MAX as u32
-        {
-            // The private test HOME and PID marker are created by this fixture.
-            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        }
+        let _ = trellis::testing::signal_daemon_marker(&self.0, libc::SIGTERM);
     }
+}
+
+#[test]
+fn daemon_cleanup_uses_its_recorded_identity_across_restarts() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let marker = home.join("auto-daemon.pid");
+    let socket = fixture_socket_paths(&home).socket;
+    let start = || {
+        let mut command = cli(&home);
+        command.arg("daemon");
+        let mut daemon = detached(command);
+        trellis::testing::wait_until("fixture daemon socket", || {
+            assert!(daemon.0.try_wait().unwrap().is_none());
+            std::os::unix::net::UnixStream::connect(&socket).is_ok()
+        });
+        daemon
+    };
+    let mut first = start();
+    let original = trellis::testing::daemon_marker_identity(&marker).unwrap();
+    assert!(trellis::testing::signal_daemon_marker(&marker, libc::SIGTERM).unwrap());
+    first.0.wait().unwrap();
+    assert!(!original.signal(libc::SIGTERM).unwrap());
+    let mut successor = start();
+    assert!(!original.signal(libc::SIGTERM).unwrap());
+    assert!(successor.0.try_wait().unwrap().is_none());
+    assert!(trellis::testing::signal_daemon_marker(&marker, libc::SIGKILL).unwrap());
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(successor.0.wait().unwrap().signal(), Some(libc::SIGKILL));
 }
 
 struct Owned(Child);
