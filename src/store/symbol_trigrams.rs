@@ -425,6 +425,10 @@ thread_local! {
     static ORDERED_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+#[path = "find_order_tests.rs"]
+mod find_order_tests;
+
 /// How many ID scans this thread has run, so a test can see the shortcut.
 #[cfg(test)]
 pub(crate) fn id_scans() -> usize {
