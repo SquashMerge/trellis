@@ -148,7 +148,7 @@ function sequenceHash(id, revision) {
   const query = new URLSearchParams({sid:id, rootKey:selectedRootKey, indexGeneration:revision.indexGeneration, indexRevision:String(revision.indexRevision)});
   return `#sequence?${query}`;
 }
-async function navigateDiagram(symbol, revision, kind = "sequence", admitted = null) {
+async function navigateDiagram(symbol, revision, kind = "sequence", admitted = null, showAll = false) {
   IndexPin.copy(revision);
   if (!IndexPin.equal(revision, status?.revision) || !token || !selectedRootKey) throw new Error("Source navigation is stale. Refresh the indexed view.");
   const context = navigationContext(), ticket = ++navigationSerial;
@@ -159,12 +159,12 @@ async function navigateDiagram(symbol, revision, kind = "sequence", admitted = n
   else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id && IndexPin.equal(diagramSequence.revision, revision)) {
     rememberNavigation({kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked}, true, sequenceHash(selectedMethod.id, revision));
   } else if (!window.location?.hash) rememberNavigation({kind:"unavailable"}, true, "");
-  rememberNavigation({kind, symbol, admitted, showAll:false}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
+  rememberNavigation({kind, symbol, admitted, showAll}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
   window.TrellisClasses?.reset();
   clearSource(); diagramSequence = null;
   await setSection("diagrams", kind === "class" ? "classes" : "sequence");
   if (!current()) return;
-  $("all-steps").checked = false;
+  $("all-steps").checked = showAll;
   if (kind === "class") return openClasses({seed:symbol.id});
   return selectMethod(symbol, admitted, current);
 }
@@ -1210,11 +1210,12 @@ async function renderFilesMini(current) {
   const readSource = step => { if (current()) return openFilesLocation(step, revision); };
   const options = {showDetails:false, isCurrent:current, onOpenTarget:sequenceTargetAction(data, current)};
   options.onUnsupported = reason => { if (current()) { window.TrellisSequence.render(container, data, readSource, expanded, options); $("files-mini-state").textContent += ` · Pele fell back: ${reason}`; } };
-  const empty = window.TrellisSequence.emptySummary(data);
-  const outcome = empty ? {status:"empty"} : window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
+  const empty = window.TrellisSequence.emptySummary(data, options);
+  const onlyEmpty = empty && !window.TrellisSequence.display(data, options).visible.size;
+  const outcome = onlyEmpty ? {status:"empty"} : window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
   if (!current() || outcome.status === "stale") return;
-  if (outcome.status === "empty") window.TrellisSequence.renderEmpty(container, empty);
-  else if (outcome.status !== "rendered") window.TrellisSequence.render(container, data, readSource, expanded, options);
+  if (outcome.status !== "rendered" && outcome.status !== "empty") window.TrellisSequence.render(container, data, readSource, expanded, options);
+  if (empty) window.TrellisSequence.renderEmpty(container, empty, () => { if (current()) void perform(() => navigateDiagram(data.seed, revision, "sequence", null, true)); }, !onlyEmpty);
   // One short status line; the sequence's caveats and diagnostics live behind the ⓘ (#526).
   const notes = [...(data.warnings || [])];
   if (data.truncated) notes.push("Truncated by sequence limits; Open full shows the same bounded steps.");
@@ -1541,15 +1542,15 @@ async function selectMethod(symbol, admitted = null, callerCurrent = null) {
   await loadSequence(admitted, false, callerCurrent);
   if (callerCurrent() && selectedMethod === symbol && window.matchMedia?.("(max-width: 900px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
 }
-// Calls bound to the standard library or another external package are incidental (#522):
-// hidden unless Show all is on. The count comes from the server; this only flips Show all.
+// One reversible detail setting controls non-call rows and incidental calls (#594).
+// This visible shortcut and Options → Show all steps always flip the same setting.
 function renderIncidentalToggle(data) {
   const button = $("sequence-incidental");
   if (!button) return;
   const count = Number.isSafeInteger(data?.incidentalSteps) ? data.incidentalSteps : 0, showing = !!$("all-steps").checked;
-  button.hidden = !count;
-  button.textContent = `${showing ? "Hide" : "Show"} ${count} incidental ${count === 1 ? "call" : "calls"}`;
-  button.title = "Calls bound to the standard library or another external package, logging calls (a naming rule) and trivial accessors";
+  button.hidden = false;
+  button.textContent = showing ? "Show calls" : "Show all steps";
+  button.title = `Calls-first keeps conditional and unknown context. Show all restores admitted non-call steps and ${count} incidental ${count === 1 ? "call" : "calls"}; sequence limits still apply.`;
   button.setAttribute("aria-pressed", String(showing));
 }
 // The method Fit was asked for: a redraw of it keeps Fit, another opens at its own size (#558).
@@ -1593,17 +1594,18 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     };
     const diagram = $("sequence-diagram");
     const expanded = new Set();
-    // Every step hidden draws no diagram: one box would say nothing happens (#558).
-    const empty = window.TrellisSequence.emptySummary(data);
-    const outcome = empty ? {status:"empty"} : window.TrellisPeleSequence
+    // No calls is not no behavior. Keep any unknown/control markers beside this guidance.
+    const empty = window.TrellisSequence.emptySummary(data, options);
+    const onlyEmpty = empty && !window.TrellisSequence.display(data, options).visible.size;
+    const outcome = onlyEmpty ? {status:"empty"} : window.TrellisPeleSequence
       ? await window.TrellisPeleSequence.render(diagram, data, readSource, expanded, options)
       : {status:"unsupported", reason:"Pele asset unavailable"};
     if (!current() || !IndexPin.equal(status?.revision, revision)) return;
     if (outcome.status === "stale") return;
-    if (outcome.status === "empty") window.TrellisSequence.renderEmpty(diagram, empty, () => { $("all-steps").checked = true; void loadSequence(); });
-    else if (outcome.status !== "rendered") {
+    if (outcome.status !== "rendered" && outcome.status !== "empty") {
       window.TrellisSequence.render(diagram, data, readSource, expanded, options);
     }
+    if (empty) window.TrellisSequence.renderEmpty(diagram, empty, () => { if (options.isCurrent()) { $("all-steps").checked = true; void loadSequence(); } }, !onlyEmpty);
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
     renderIncidentalToggle(data);
     $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;

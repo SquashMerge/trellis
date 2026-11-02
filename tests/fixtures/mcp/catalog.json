@@ -173,7 +173,7 @@
               ],
               "type": "object"
             },
-            "evidenceTier": {
+            "nativeCoverageTier": {
               "const": "syntax"
             },
             "language": {
@@ -323,7 +323,7 @@
           },
           "required": [
             "language",
-            "evidenceTier",
+            "nativeCoverageTier",
             "coverage",
             "semantic"
           ],
@@ -898,7 +898,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 5
+                  "const": 6
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1954,7 +1954,7 @@
               ],
               "type": "object"
             },
-            "evidenceTier": {
+            "nativeCoverageTier": {
               "const": "syntax"
             },
             "language": {
@@ -2035,7 +2035,7 @@
           },
           "required": [
             "language",
-            "evidenceTier",
+            "nativeCoverageTier",
             "coverage",
             "semantic"
           ],
@@ -3214,7 +3214,7 @@
               ],
               "type": "object"
             },
-            "evidenceTier": {
+            "nativeCoverageTier": {
               "const": "syntax"
             },
             "language": {
@@ -3295,7 +3295,7 @@
           },
           "required": [
             "language",
-            "evidenceTier",
+            "nativeCoverageTier",
             "coverage",
             "semantic"
           ],
@@ -5066,7 +5066,7 @@
               ],
               "type": "object"
             },
-            "evidenceTier": {
+            "nativeCoverageTier": {
               "const": "syntax"
             },
             "language": {
@@ -5147,7 +5147,7 @@
           },
           "required": [
             "language",
-            "evidenceTier",
+            "nativeCoverageTier",
             "coverage",
             "semantic"
           ],
@@ -6938,7 +6938,7 @@
               ],
               "type": "object"
             },
-            "evidenceTier": {
+            "nativeCoverageTier": {
               "const": "syntax"
             },
             "language": {
@@ -7019,7 +7019,7 @@
           },
           "required": [
             "language",
-            "evidenceTier",
+            "nativeCoverageTier",
             "coverage",
             "semantic"
           ],
@@ -8470,7 +8470,7 @@
             "language": {
               "$ref": "#/$defs/Language"
             },
-            "evidenceTier": {
+            "nativeCoverageTier": {
               "const": "syntax"
             },
             "coverage": {
@@ -8576,7 +8576,7 @@
           },
           "required": [
             "language",
-            "evidenceTier",
+            "nativeCoverageTier",
             "coverage",
             "semantic"
           ],
@@ -12056,7 +12056,7 @@
               ],
               "type": "object"
             },
-            "evidenceTier": {
+            "nativeCoverageTier": {
               "const": "syntax"
             },
             "language": {
@@ -12137,7 +12137,7 @@
           },
           "required": [
             "language",
-            "evidenceTier",
+            "nativeCoverageTier",
             "coverage",
             "semantic"
           ],

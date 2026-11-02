@@ -129,7 +129,7 @@ for (const mode of ["sole", "constructor", "zero", "multiple", "unresolved", "am
       if (mode === "external") {
         const empty = page.locator("#sequence-diagram .sequence-empty");
         await empty.waitFor();
-        assert.equal(await empty.textContent(), "Only external calls (2 hidden). Show them");
+        assert.equal(await empty.textContent(), "Only external calls (2 hidden). Show all steps");
       } else {
         await page.locator("#sequence-diagram svg.pele").waitFor();
         assert.match(await page.locator("#sequence-state").textContent(), /Pele rendered/);
@@ -226,13 +226,13 @@ for (const mode of ["sole", "constructor", "zero", "multiple", "unresolved", "am
             assert.ok(calls.every(call => call.hidden));
             assert.equal(await page.locator("#sequence-diagram [data-trellis-call-id]").count(), 0);
             const toggle = page.locator("#sequence-incidental");
-            assert.equal(await toggle.textContent(), "Show 2 incidental calls");
+            assert.equal(await toggle.textContent(), "Show all steps");
             assert.equal(await toggle.getAttribute("aria-pressed"), "false");
             await toggle.click();
-            await page.waitForFunction(() => document.querySelector("#sequence-incidental")?.textContent === "Hide 2 incidental calls" && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
+            await page.waitForFunction(() => document.querySelector("#sequence-incidental")?.textContent === "Show calls" && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
             assert.equal(await page.locator("#all-steps").isChecked(), true);
             assert.equal(await toggle.getAttribute("aria-pressed"), "true");
-          } else assert.equal(await page.locator("#sequence-incidental").isHidden(), true);
+          } else assert.equal(await page.locator("#sequence-incidental").textContent(), "Show all steps");
           const visible = await page.locator("#sequence-diagram").innerText();
           const label = {missing:/missing|unavailable|no semantic/i, stale:/stale/i, dispatch:/dispatch/i, external:/external/i, ambiguous:/ambiguous/i, unresolved:/unresolved|unbound/i}[mode];
           assert.match(visible, label);
@@ -336,7 +336,7 @@ test("sequence draws resolved participants, expands direct callees and hides std
     // Std calls are hidden until the toggle shows them.
     for (const id of [fixture.calls[0], fixture.calleeCalls[1]]) assert.equal(await page.locator(`#sequence-diagram [data-trellis-call-id="${id}"]`).count(), 0);
     const toggle = page.locator("#sequence-incidental");
-    assert.equal(await toggle.textContent(), "Show 2 incidental calls");
+    assert.equal(await toggle.textContent(), "Show all steps");
     await page.screenshot({path: process.env.TRELLIS_522_SHOTS ? `${process.env.TRELLIS_522_SHOTS}/fixture-expanded.png` : join(paths.temp, "shot.png")});
     // The inspector keeps the evidence and its captured basis.
     await page.locator(`#sequence-diagram .pele-edge-label[data-trellis-call-id="${fixture.calleeCalls[0]}"]`).click();
@@ -344,7 +344,7 @@ test("sequence draws resolved participants, expands direct callees and hides std
     assert.match(await page.locator("#inspector-evidence").textContent(), /^Resolved declaration · direct · fresh · /);
     assert.match(await page.locator("#inspector-detail").textContent(), /"semanticBasis"/);
     await toggle.click();
-    await page.waitForFunction(() => document.querySelector("#sequence-incidental")?.textContent === "Hide 2 incidental calls" && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
+    await page.waitForFunction(() => document.querySelector("#sequence-incidental")?.textContent === "Show calls" && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
     for (const id of [fixture.calls[0], fixture.calleeCalls[1]]) assert.ok(await page.locator(`#sequence-diagram [data-trellis-call-id="${id}"]`).count() > 0, id);
     assert.match(await page.locator("#sequence-state").textContent(), / · 0 incidental steps hidden/);
     // The SVG fallback draws the same lanes: the arrow to `inner` starts on the callee lane.

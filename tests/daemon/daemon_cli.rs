@@ -548,8 +548,8 @@ fn serve_request_preserves_explicit_default_file_cap_presence() {
         }
         let stderr = bounded_fixture_stderr(&stderr_path);
         assert!(
-            stderr.contains("Trellis:"),
-            "serve did not receive fake acknowledgement: {stderr}; {}",
+            stderr.contains("daemon_unavailable"),
+            "serve did not report the fake daemon's closed connection: {stderr}; {}",
             fixture_daemon_diagnostic(&home, &fixture_socket_paths(&home).socket)
         );
         options.push(
@@ -1548,8 +1548,194 @@ fn concurrent_cold_cli_indexes_share_one_daemon_and_keep_fifo_results() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn serve_without_browser_keeps_daemon_past_idle_delay_then_releases_it() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "serve-lease");
+    let clock_path = temp.path().join("clock.sock");
+    let clock_listener = UnixListener::bind(&clock_path).unwrap();
+    clock_listener.set_nonblocking(true).unwrap();
+    let release_path = temp.path().join("release.sock");
+    let release_listener = UnixListener::bind(&release_path).unwrap();
+    release_listener.set_nonblocking(true).unwrap();
+    let mut daemon_command = cli(&home);
+    daemon_command
+        .arg("daemon")
+        .env("TRELLIS_TEST_DAEMON_CLOCK_SOCKET", &clock_path)
+        .env("TRELLIS_TEST_SERVE_RELEASE_SOCKET", &release_path);
+    let mut daemon = detached(daemon_command);
+    let mut accepted = None;
+    trellis::testing::wait_until("daemon clock hook connecting", || {
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        accepted = clock_listener.accept().ok();
+        accepted.is_some()
+    });
+    let (mut clock, _) = accepted.unwrap();
+    clock.set_nonblocking(false).unwrap();
+    clock
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let socket = fixture_socket_paths(&home).socket;
+    trellis::testing::wait_until("daemon listener ready", || {
+        UnixStream::connect(&socket).is_ok()
+    });
+    let (mut served, log) = detached_with_log(serve(
+        &home,
+        &root,
+        "127.0.0.1:0".parse().unwrap(),
+        &temp.path().join("token"),
+    ));
+    serve_banner_address(&mut served.0, &log, &home).await;
+    // No HTTP, browser lease, CLI or MCP client is present. Move virtual time
+    // past the unchanged 30-minute daemon delay, not a wall-clock sleep.
+    clock.write_all(b"T").unwrap();
+    let mut exit = [1];
+    clock.read_exact(&mut exit).unwrap();
+    assert_eq!(exit, [0], "live serve permitted daemon idle exit");
+    assert!(daemon.0.try_wait().unwrap().is_none());
+    assert!(served.0.try_wait().unwrap().is_none());
+    assert_eq!(
+        unsafe { libc::kill(served.0.id() as i32, libc::SIGTERM) },
+        0
+    );
+    let mut status = None;
+    trellis::testing::wait_until("serve releasing its control connection", || {
+        status = served.0.try_wait().unwrap();
+        status.is_some()
+    });
+    assert!(status.unwrap().success());
+    let mut released = None;
+    trellis::testing::wait_until("daemon publishing serve lease release", || {
+        released = release_listener.accept().ok();
+        released.is_some()
+    });
+    // The daemon connects only after removing its registration; acceptance
+    // therefore proves release without reading from an already-closed peer.
+    drop(released.unwrap());
+    // Release starts a fresh grace interval, not immediate idle expiry.
+    clock.write_all(b"P").unwrap();
+    clock.read_exact(&mut exit).unwrap();
+    assert_eq!(exit, [0], "daemon skipped post-serve idle grace");
+    // The next tick is beyond ordinary grace after release. It must now exit:
+    // this proves the serve registration did not leak after disconnect.
+    clock.write_all(b"T").unwrap();
+    clock.read_exact(&mut exit).unwrap();
+    assert_eq!(exit, [1], "serve registration leaked after disconnect");
+    drop(clock);
+    let mut status = None;
+    trellis::testing::wait_until("daemon exiting after ordinary idle grace", || {
+        status = daemon.0.try_wait().unwrap();
+        status.is_some()
+    });
+    assert!(status.unwrap().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_serve_registration_releases_daemon_lease() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use trellis::daemon::protocol;
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "failed-serve");
+    let clock_path = temp.path().join("clock.sock");
+    let listener = UnixListener::bind(&clock_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let release_path = temp.path().join("release.sock");
+    let releases = UnixListener::bind(&release_path).unwrap();
+    releases.set_nonblocking(true).unwrap();
+    let mut command = cli(&home);
+    command
+        .arg("daemon")
+        .env("TRELLIS_TEST_DAEMON_CLOCK_SOCKET", &clock_path)
+        .env("TRELLIS_TEST_SERVE_RELEASE_SOCKET", &release_path);
+    let mut daemon = detached(command);
+    let mut clock = None;
+    trellis::testing::wait_until("daemon clock hook", || {
+        clock = listener.accept().ok();
+        clock.is_some()
+    });
+    let (mut clock, _) = clock.unwrap();
+    clock.set_nonblocking(false).unwrap();
+    clock
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    // Establish the virtual epoch before registration and release, independent
+    // of how long fixture startup took on a loaded host.
+    clock.write_all(b"P").unwrap();
+    let mut exit = [1];
+    clock.read_exact(&mut exit).unwrap();
+    assert_eq!(exit, [0]);
+    let mut control = None;
+    trellis::testing::wait_until("daemon control socket", || {
+        control = UnixStream::connect(fixture_socket_paths(&home).socket).ok();
+        control.is_some()
+    });
+    let mut control = control.unwrap();
+    control
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    protocol::write_frame(
+        &mut control,
+        &protocol::Request {
+            id: 1,
+            operation: "serve".to_owned(),
+            // Valid workspace, invalid/missing registration options.
+            payload: serde_json::json!({"workspace": root}),
+        },
+    )
+    .unwrap();
+    let reply: protocol::Reply = protocol::read_frame(&mut control).unwrap();
+    assert!(reply.payload["error"].is_string());
+    let mut release = None;
+    trellis::testing::wait_until("failed registration releasing lease", || {
+        release = releases.accept().ok();
+        release.is_some()
+    });
+    // Keep the failed caller's socket open: a failed registration must not
+    // keep a daemon lease merely because its caller has not disconnected.
+    clock.write_all(b"T").unwrap();
+    let mut exit = [0];
+    clock.read_exact(&mut exit).unwrap();
+    assert_eq!(exit, [1]);
+    drop(clock);
+    trellis::testing::wait_until("idle daemon exiting after failed registration", || {
+        daemon.0.try_wait().unwrap().is_some()
+    });
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn serve_arms_sigterm_before_banner_to_control_wait() {
-    use std::os::unix::net::UnixStream;
+    serve_shutdown(libc::SIGTERM, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_arms_sigint_before_banner_to_control_wait() {
+    serve_shutdown(libc::SIGINT, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_fails_when_daemon_is_killed() {
+    serve_shutdown(libc::SIGKILL, true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_fails_even_when_daemon_exits_successfully() {
+    serve_shutdown(0, true).await;
+}
+
+#[cfg(unix)]
+async fn serve_shutdown(signal: i32, kill_daemon: bool) {
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     let temp = short_temp();
     let home = temp.path().join("home");
@@ -1561,7 +1747,11 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
     let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let socket = fixture_socket_paths(&home).socket;
     let mut daemon_command = cli(&home);
+    let mut owner = (signal == 0).then(|| Owned(Command::new("sleep").arg("120").spawn().unwrap()));
     daemon_command.arg("daemon");
+    if let Some(owner) = &owner {
+        daemon_command.env(trellis::testing::OWNER_PID_ENV, owner.0.id().to_string());
+    }
     let mut daemon = detached(daemon_command);
     let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while UnixStream::connect(&socket).is_err() {
@@ -1579,9 +1769,12 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
     }
     let original_pid = daemon.0.id();
     let log = temp.path().join("serve.log");
+    let hook_path = temp.path().join("banner.sock");
+    let hook = UnixListener::bind(&hook_path).unwrap();
+    hook.set_nonblocking(true).unwrap();
     let mut command = serve(&home, &root, address, &token);
     command
-        .env("TRELLIS_TEST_SERVE_AFTER_BANNER_PAUSE", "1")
+        .env("TRELLIS_TEST_SERVE_AFTER_BANNER_SOCKET", &hook_path)
         .stdout(Stdio::null())
         .stderr(Stdio::from(fs::File::create(&log).unwrap()));
     let mut served = Owned(command.spawn().unwrap());
@@ -1601,24 +1794,72 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
         assert!(Instant::now() < deadline, "serve banner not printed");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // The opt-in pause keeps the serve select unpolled. Without pre-arming
-    // SIGTERM, this signal terminates the process instead of closing control.
-    assert_eq!(
-        unsafe { libc::kill(served.0.id() as i32, libc::SIGTERM) },
-        0
-    );
+    // Wait for the explicit hook, then signal before the select is polled.
+    let mut arrived = None;
+    trellis::testing::wait_until("serve reaching the banner hook", || {
+        arrived = hook.accept().ok();
+        arrived.is_some()
+    });
+    let (mut release, _) = arrived.unwrap();
+    use std::io::{Read, Write};
+    release
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    release.read_exact(&mut [0]).unwrap();
+    let pid = if kill_daemon {
+        daemon.0.id()
+    } else {
+        served.0.id()
+    };
+    if let Some(owner) = &mut owner {
+        owner.0.kill().unwrap();
+        owner.0.wait().unwrap();
+    } else {
+        assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
+    }
+    if kill_daemon {
+        let mut daemon_status = None;
+        trellis::testing::wait_until("daemon exiting", || {
+            daemon_status = daemon.0.try_wait().unwrap();
+            daemon_status.is_some()
+        });
+        assert_eq!(daemon_status.unwrap().success(), signal == 0);
+    }
+    release.write_all(b"R").unwrap();
     let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let status = loop {
         if let Some(status) = served.0.try_wait().unwrap() {
             break status;
         }
-        assert!(Instant::now() < deadline, "serve did not exit on SIGTERM");
+        assert!(
+            Instant::now() < deadline,
+            "serve did not exit after shutdown"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
+    let logged = fs::read_to_string(&log).unwrap();
+    if kill_daemon {
+        assert!(!status.success(), "serve unexpectedly succeeded: {logged}");
+        assert!(logged.contains("daemon_unavailable"), "{logged}");
+        assert!(logged.contains("EOF"), "{logged}");
+        assert!(
+            logged.contains("daemon exit status unavailable"),
+            "{logged}"
+        );
+        return;
+    }
     assert!(
         status.success(),
-        "serve did not shut down gracefully: {status}; log: {}",
-        fs::read_to_string(&log).unwrap()
+        "serve did not shut down gracefully: {status}; log: {logged}"
+    );
+    let signal_name = if signal == libc::SIGTERM {
+        "SIGTERM"
+    } else {
+        "SIGINT"
+    };
+    assert!(
+        logged.contains(&format!("received {signal_name}")),
+        "{logged}"
     );
     assert_eq!(daemon.0.id(), original_pid);
     assert!(

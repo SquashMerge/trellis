@@ -6308,7 +6308,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
     // #528: describe and scopeCoverage report the imported JavaScript evidence beside the
     // native coverage, which keeps its syntax tier; other languages have no producer.
     let describe = mcp.call("trellis_workspace_describe", json!({"schemaVersion":1}));
-    assert_eq!(describe["data"]["toolVersion"], 5);
+    assert_eq!(describe["data"]["toolVersion"], 6);
     for (scope, rows) in [
         ("describe", &describe["data"]["languages"]),
         ("incoming", &incoming["data"]["scopeCoverage"]),
@@ -6316,7 +6316,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
         let rows = rows.as_array().unwrap();
         let javascript = &rows[3];
         assert_eq!(javascript["language"], "javascript", "{scope}");
-        assert_eq!(javascript["evidenceTier"], "syntax", "{scope}");
+        assert_eq!(javascript["nativeCoverageTier"], "syntax", "{scope}");
         assert_eq!(
             javascript["semantic"]["available"], true,
             "{scope}: {javascript}"

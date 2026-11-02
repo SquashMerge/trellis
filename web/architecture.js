@@ -120,6 +120,7 @@
       for (const limitation of references?.limitations || []) paragraph(target, limitation);
       const unassigned = view.modules.filter(module => module.layer === null);
       paragraph(target, view.state === "no_layers" ? "No layer graph or file assignment inventory is available until layers are configured." : `${unassigned.length} unassigned native file modules remain unknown.`);
+      if (view.state === "ready" && Number.isSafeInteger(view.rules?.unassignedCount)) paragraph(target, `${view.rules.unassignedCount} unassigned identities (native files and external packages) in the rule-check catalog.`);
       if (references?.externalPackages?.length) disclosure(target, "External packages and captured evidence", references.externalPackages);
       const choose = (label, action) => { const button = make("button", label); button.type = "button"; button.addEventListener("click", action); target.append(button); };
       const c = basis;
@@ -593,7 +594,7 @@
       get("architecture-review-panel").hidden = false; renderReview();
     }
     // Counted review chips head every Architecture inspection (#449); each opens its list.
-    // Counts come from the summary: rule-check counts, unassigned files, authored exceptions.
+    // File assignments count native modules; the rule-check catalog also includes external identities.
     function reviewChips(target) {
       const chips = make("div", undefined, "architecture-review-chips"), counts = view.rules?.counts;
       chips.setAttribute("role", "group"); chips.setAttribute("aria-label", "Review counts");
@@ -603,7 +604,10 @@
         button.addEventListener("click", () => { if (usable() && !editBusy) return open(); }); chips.append(button);
       };
       if (view.state === "ready" && Number.isSafeInteger(counts?.deviates)) chip("architecture-review", counts.deviates, counts.deviates === 1 ? "deviation" : "deviations", () => openReview("rules"), counts.deviates ? "error" : null);
-      if (view.state === "ready" && Number.isSafeInteger(view.rules?.unassignedCount)) chip("architecture-unassigned", view.rules.unassignedCount, "unassigned", () => openReview("unassigned"));
+      if (view.state === "ready") {
+        const unassigned = view.modules.filter(module => module.layer === null).length;
+        chip("architecture-unassigned", unassigned, unassigned === 1 ? "unassigned file" : "unassigned files", () => openReview("unassigned"));
+      }
       if (Number.isSafeInteger(view.exceptionCount)) chip("architecture-authored", view.exceptionCount, view.exceptionCount === 1 ? "exception" : "exceptions", showAuthored);
       target.append(chips);
     }
