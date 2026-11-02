@@ -59,7 +59,7 @@ fn counts(row: &[u64; 5]) -> Value {
 
 /// The four `LanguageStatus` rows, in #22 language order, from per-language native
 /// tuple counts [selected, complete, partial, failed, unselected] and each language's
-/// selected imported evidence (#528). `evidenceTier` and `coverage` keep describing the
+/// selected imported evidence (#528). `nativeCoverageTier` and `coverage` describe the
 /// native syntax tuples; `semantic` separately reports the selected producer, its
 /// freshness and its tuple counts, with `available` true when it is selected, fresh and
 /// covers at least one document. Partial coverage of either stays visible.
@@ -69,7 +69,7 @@ fn language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
         .zip(rows)
         .zip(tiers)
         .map(|((language, row), tier)| {
-            json!({"language":language,"evidenceTier":"syntax","coverage":counts(row),
+            json!({"language":language,"nativeCoverageTier":"syntax","coverage":counts(row),
             "semantic":{"available":tier.semantic(),"producerId":tier.producer_id,
                 "freshness":if tier.freshness.is_empty() {"unavailable"} else {tier.freshness},
                 "coverage":counts(&tier.counts),"note":tier.note}})
@@ -138,7 +138,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":5,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":6,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
@@ -170,7 +170,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 5);
+        assert_eq!(ready["data"]["toolVersion"], 6);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(ready["data"]["languages"].as_array().unwrap().len(), 4);
         // Without imported evidence every language is syntax, with no producer.
         for language in ready["data"]["languages"].as_array().unwrap() {
-            assert_eq!(language["evidenceTier"], "syntax");
+            assert_eq!(language["nativeCoverageTier"], "syntax");
             assert_eq!(language["semantic"]["available"], false);
             assert_eq!(language["semantic"]["producerId"], Value::Null);
             assert_eq!(language["semantic"]["freshness"], "unavailable");
@@ -300,8 +300,9 @@ mod tests {
             false,
         );
         let rust = &fresh["data"]["languages"][1];
-        // The native coverage row keeps its tier; the import is reported beside it.
-        assert_eq!(rust["evidenceTier"], "syntax");
+        // Native coverage is labelled separately from the selected semantic import.
+        assert_eq!(rust["nativeCoverageTier"], "syntax");
+        assert!(rust.get("evidenceTier").is_none());
         assert_eq!(
             rust["coverage"],
             json!({"selected":355,"complete":22,"partial":333,"failed":0,"unselected":0})
@@ -937,10 +938,10 @@ mod find_tests {
             assert_eq!(
                 data["scopeCoverage"],
                 json!([
-                    {"language":"java","evidenceTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
-                    {"language":"rust","evidenceTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
-                    {"language":"python","evidenceTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
-                    {"language":"javascript","evidenceTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}}
+                    {"language":"java","nativeCoverageTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
+                    {"language":"rust","nativeCoverageTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
+                    {"language":"python","nativeCoverageTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
+                    {"language":"javascript","nativeCoverageTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}}
                 ])
             );
             // Incomplete selected scope: partial, one aggregate warning first.
@@ -3403,7 +3404,7 @@ mod size_tests {
                 .all(|w| w["code"] != "syntaxOnly")
         );
         let rust = &page["data"]["scopeCoverage"][1];
-        assert_eq!(rust["evidenceTier"], "syntax");
+        assert_eq!(rust["nativeCoverageTier"], "syntax");
         assert_eq!(rust["coverage"]["partial"], 333);
         assert_eq!(rust["semantic"]["available"], true);
         assert_eq!(rust["semantic"]["coverage"]["partial"], 312);
