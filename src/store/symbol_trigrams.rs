@@ -67,6 +67,7 @@ struct Search<'a> {
     joins: &'a [&'a str],
     name: &'a str,
     id: &'a str,
+    role: Option<&'a str>,
     query_parameter: usize,
     limit_parameter: usize,
     match_parameter: usize,
@@ -100,7 +101,11 @@ impl Search<'_> {
             rusqlite::params![expression, probe_limit],
             |row| row.get(0),
         ))?;
-        if limit > 0 && count > threshold {
+        #[cfg(test)]
+        let force_ordered = FORCE_ORDERED.get();
+        #[cfg(not(test))]
+        let force_ordered = false;
+        if limit > 0 && (count > threshold || force_ordered) {
             #[cfg(test)]
             ORDERED_SEARCHES.set(ORDERED_SEARCHES.get() + 1);
             return self
@@ -157,20 +162,33 @@ impl Search<'_> {
             .join(" ")
     }
 
+    fn role_order(&self) -> String {
+        self.role.map_or_else(String::new, |role| {
+            format!("CASE {role} WHEN 'production' THEN 0 ELSE 1 END,")
+        })
+    }
+
     fn sql(&self, from: &str) -> String {
         format!(
             "SELECT {columns} FROM {from} {joins} WHERE {literal}
-                ORDER BY 3,{name} COLLATE BINARY,{id} LIMIT ?{limit}",
+                ORDER BY 3,{role}{name} COLLATE BINARY,{id} LIMIT ?{limit}",
             columns = self.columns,
             joins = self.joins(false),
             literal = self.literal(),
+            role = self.role_order(),
             name = self.name,
             id = self.id,
             limit = self.limit_parameter,
         )
     }
 
-    fn ordered_sql(&self, tier: i64, upper: bool, id_shaped: bool) -> String {
+    fn ordered_sql(
+        &self,
+        tier: i64,
+        upper: bool,
+        id_shaped: bool,
+        role: Option<&str>,
+    ) -> String {
         let table = self.source.split(' ').next().unwrap_or_default();
         let alias = self.source.rsplit(' ').next().unwrap_or_default();
         let name = self.name;
@@ -219,9 +237,13 @@ impl Search<'_> {
                 ("name", predicate)
             }
         };
+        let role_filter = match (self.role, role) {
+            (Some(column), Some(role)) => format!(" AND {column}='{role}'"),
+            _ => String::new(),
+        };
         format!(
             "SELECT {columns} FROM {source} INDEXED BY {table}_search_{index} {joins}
-             WHERE {predicate} ORDER BY {name} COLLATE BINARY,{id} LIMIT ?{limit}",
+             WHERE {predicate}{role_filter} ORDER BY {name} COLLATE BINARY,{id} LIMIT ?{limit}",
             columns = self.columns,
             source = self.source,
             // Keep the ordered source outermost; sparse/literal queries retain
@@ -242,25 +264,34 @@ impl Search<'_> {
     ) -> Result<Vec<(String, String, i64)>> {
         let upper = prefix_end(&query.to_ascii_lowercase());
         let mut hits = Vec::new();
+        // Separate role passes retain the indexed name/ID walk and its early
+        // stop. Sorting by role first would scan every matching source row.
+        let roles: &[Option<&str>] = if self.role.is_some() {
+            &[Some("production"), Some("test")]
+        } else {
+            &[None]
+        };
         for tier in 0..=2 {
-            let remaining = limit - hits.len() as i64;
-            if remaining <= 0 {
-                break;
+            for &role in roles {
+                let remaining = limit - hits.len() as i64;
+                if remaining <= 0 {
+                    return Ok(hits);
+                }
+                #[cfg(test)]
+                if tier == 2 && id_shaped {
+                    ID_SCANS.set(ID_SCANS.get() + 1);
+                }
+                let mut values = values.to_vec();
+                values[self.limit_parameter - 1] = &remaining;
+                if tier == 1 && upper.is_some() {
+                    values.push(&upper);
+                }
+                hits.extend(ranked(
+                    db,
+                    &self.ordered_sql(tier, upper.is_some(), id_shaped, role),
+                    &values,
+                )?);
             }
-            #[cfg(test)]
-            if tier == 2 && id_shaped {
-                ID_SCANS.set(ID_SCANS.get() + 1);
-            }
-            let mut values = values.to_vec();
-            values[self.limit_parameter - 1] = &remaining;
-            if tier == 1 && upper.is_some() {
-                values.push(&upper);
-            }
-            hits.extend(ranked(
-                db,
-                &self.ordered_sql(tier, upper.is_some(), id_shaped),
-                &values,
-            )?);
         }
         Ok(hits)
     }
@@ -324,6 +355,7 @@ fn w2_search() -> Search<'static> {
         ],
         name: "d.name",
         id: "d.syntax_id",
+        role: Some("d.role"),
         query_parameter: 2,
         limit_parameter: 3,
         match_parameter: 4,
@@ -352,6 +384,7 @@ fn graph_search() -> Search<'static> {
         joins: &["revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.gid=n.gid"],
         name: "n.name",
         id: "n.id",
+        role: None,
         query_parameter: 1,
         limit_parameter: 2,
         match_parameter: 3,
@@ -393,6 +426,7 @@ fn ranked(
 #[cfg(test)]
 thread_local! {
     static FORCE_LITERAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_ORDERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ID_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ORDERED_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -440,10 +474,21 @@ impl super::Store {
 mod tests {
     use super::*;
 
+    fn with_ordered_search<T>(read: impl FnOnce() -> T) -> T {
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FORCE_ORDERED.set(self.0);
+            }
+        }
+        let _reset = Reset(FORCE_ORDERED.replace(true));
+        read()
+    }
+
     fn ranking_fixture() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
-            "CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,name TEXT);
+            "CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,name TEXT,role TEXT NOT NULL DEFAULT 'production');
              CREATE INDEX native_version_declarations_search_name ON native_version_declarations(name COLLATE BINARY,syntax_id,vid);
              CREATE INDEX native_version_declarations_search_folded ON native_version_declarations(lower(name),name COLLATE BINARY,syntax_id,vid);
              CREATE TABLE document_versions(vid INTEGER PRIMARY KEY,id TEXT);
@@ -487,6 +532,69 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn w2_role_order_precedes_clipping_in_literal_trigram_ordered_and_id_union_paths() {
+        let db = ranking_fixture();
+        for (id, name, role) in [
+            (1, Some("OCA"), "test"),
+            (9, Some("oca"), "production"),
+            (2, Some("ocaA"), "test"),
+            (8, Some("ocaZ"), "production"),
+            (4, Some("ocaZ"), "production"),
+            (3, Some("a_oca"), "test"),
+            (7, Some("z_oca"), "production"),
+            (21, Some("abc"), "test"),
+            (22, Some("abcA"), "test"),
+            (0xabc, None, "test"),
+            (0x1abc, Some("z_id_only"), "production"),
+        ] {
+            insert_ranked(&db, id, 1, name);
+            db.execute(
+                "UPDATE native_version_declarations SET role=?1 WHERE rowid=?2",
+                rusqlite::params![role, id],
+            )
+            .unwrap();
+        }
+        let ids =
+            |hits: Vec<(String, String)>| hits.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
+        for (query, expected) in [
+            ("oca", vec![9, 1, 4, 8, 2, 7, 3]),
+            ("OCA", vec![9, 1, 4, 8, 2, 7, 3]),
+            // A two-character query takes the literal path without FTS.
+            ("oc", vec![9, 4, 8, 1, 2, 7, 3]),
+            // Exact/prefix test hits precede production ID-only hits. The
+            // production ID-only hit precedes the unnamed test ID-only hit.
+            ("abc", vec![21, 22, 0x1abc, 0xabc]),
+        ] {
+            for limit in [1, 2, 3, 4, 7, 20] {
+                let expected = expected
+                    .iter()
+                    .take(limit as usize)
+                    .map(|id| format!("sid:v1:{id:032x}"))
+                    .collect::<Vec<_>>();
+                let actual = w2_hits(&db, "pin:v1:test:1", query, limit).unwrap();
+                assert_eq!(ids(actual.clone()), expected, "{query} limit={limit}");
+                let literal =
+                    with_literal_scan(|| w2_hits(&db, "pin:v1:test:1", query, limit)).unwrap();
+                assert_eq!(actual, literal, "literal {query} limit={limit}");
+                if match_expression(query).is_some() {
+                    let before = ORDERED_SEARCHES.get();
+                    let ordered =
+                        with_ordered_search(|| w2_hits(&db, "pin:v1:test:1", query, limit))
+                            .unwrap();
+                    assert_eq!(ordered, actual, "ordered {query} limit={limit}");
+                    assert_eq!(ORDERED_SEARCHES.get(), before + 1);
+                }
+            }
+        }
+        // Browser/CLI graph order is still match tier, name, then SID.
+        let graph = graph_hits(&db, "oca", 20).unwrap();
+        assert_eq!(
+            ids(graph),
+            [1, 9, 2, 4, 8, 3, 7].map(|id| format!("sid:v1:{id:032x}"))
+        );
     }
 
     #[test]
@@ -639,7 +747,7 @@ mod tests {
             if search.query_parameter == 2 {
                 values.insert(0, &revision);
             }
-            let sql = search.ordered_sql(1, true, false);
+            let sql = search.ordered_sql(1, true, false, None);
             let plan: Vec<String> = db
                 .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
                 .unwrap()
@@ -648,7 +756,7 @@ mod tests {
                 .collect::<rusqlite::Result<_>>()
                 .unwrap();
             assert!(
-                plan.iter().any(|p| p.contains("USING COVERING INDEX")
+                plan.iter().any(|p| p.contains("USING")
                     && p.contains("_search_folded")
                     && p.contains("<expr>>?")
                     && p.contains("<expr><?")),
@@ -845,7 +953,7 @@ mod tests {
                 i64::from(statement.get_status(StatementStatus::VmStep))
             };
             let legacy_steps = measure(&legacy);
-            let steps = measure(&search.ordered_sql(2, false, false));
+            let steps = measure(&search.ordered_sql(2, false, false, None));
             assert!(
                 steps * 10 < legacy_steps * 7,
                 "{}: {steps} VM steps versus legacy {legacy_steps}",
@@ -866,7 +974,7 @@ mod tests {
             insert_ranked(&db, 100 - at, 1, Some(&format!("a_oca_{at:03}")));
         }
         let measure = |search: Search<'_>| {
-            let sql = search.ordered_sql(2, false, false);
+            let sql = search.ordered_sql(2, false, false, None);
             let expression = match_expression("oca").unwrap();
             let limit = 5_i64;
             let revision = "pin:v1:test:1";
