@@ -114,7 +114,19 @@
     try {
       const projection = project(nodes, options);
       if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
-      const raw = window.pele.render(projection.source, {fontSize:14, responsive:false, links:false, images:false}).svg;
+      // Pele measures class members with its proportional font by default,
+      // while the product renders them in mono. Measure every line in that mono
+      // font before layout. Annotations use sans, so reserve the wider measure.
+      const style = getComputedStyle(document.getElementById("classes-diagram"));
+      const fonts = [style.getPropertyValue("--mono").trim() || "monospace", style.getPropertyValue("--sans").trim() || "sans-serif"];
+      const canvas = document.createElement("canvas").getContext("2d");
+      const measurer = {width(text, size, flags) {
+        return Math.max(...fonts.map(font => {
+          canvas.font = `${flags & 2 ? "italic " : ""}${flags & 1 ? "bold " : ""}${size}px ${font}`;
+          return canvas.measureText(text).width;
+        }));
+      }};
+      const raw = window.pele.render(projection.source, {fontSize:14, measurer, responsive:false, links:false, images:false}).svg;
       const {root, controls} = validatedSvg(raw, projection);
       for (const {group, item, members} of controls) {
         group.setAttribute("data-trellis-class-id", item.node.id);
@@ -400,6 +412,13 @@
     const expansion = [...nextExpanded];
     try {
       const data = await api.request("/api/class-diagram", {method: "POST", body: {seed: nextSeed, expectedRevision: c.revision, expanded: expansion, includeHierarchy: false, includeUnmatched: false}});
+      if (ticket !== serial || searchTicket !== searchSerial || !valid(c)) return;
+      // Layout uses the final local product fonts, not their temporary fallbacks.
+      // A failed font load still permits the browser's measured fallback font.
+      if (document.fonts) {
+        const style = getComputedStyle(ui.diagram);
+        await Promise.all(["--mono", "--sans"].map(token => document.fonts.load(`14px ${style.getPropertyValue(token).trim()}`).catch(() => {})));
+      }
       if (ticket !== serial || searchTicket !== searchSerial || !valid(c)) return;
       if (!window.TrellisIndexPin.equal(data.revision, c.revision)) {
         reset(); api.onStale?.("Workspace revision changed. Open the class again.");
