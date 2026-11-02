@@ -3062,6 +3062,56 @@ mod enriched_read_tests {
     }
 
     #[test]
+    fn find_ranks_production_within_match_tiers_before_limit_and_lookahead() {
+        use crate::native_evidence::DeclarationRole::{Production, Test};
+
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        for (path, text) in [
+            (
+                "src/service.js",
+                "function navigation_at() {}\nfunction rankZ() {}\nfunction zcoreZ() {}\nfunction mixedTail() {}\n",
+            ),
+            (
+                "tests/fixture.js",
+                "function navigation_at() {}\nfunction rankA() {}\nfunction acoreA() {}\nfunction mixed() {}\n",
+            ),
+        ] {
+            let path = workspace.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (pin, _owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let read = store.evidence_response().unwrap();
+        for (query, expected_name, expected_role) in [
+            ("rank", "rankZ", Production),
+            ("core", "zcoreZ", Production),
+            ("NAVIGATION_AT", "navigation_at", Production),
+            // Exact test names still precede production prefixes.
+            ("mixed", "mixed", Test),
+        ] {
+            let found = read.mcp_find_with_lines(query, 1, Some(pin)).unwrap();
+            assert_eq!(found.symbols.len(), 1, "{query}");
+            assert!(found.has_more, "{query}: the second hit is lookahead");
+            let declaration = &found.symbols[0].symbol.declaration;
+            assert_eq!(declaration.name.as_deref(), Some(expected_name), "{query}");
+            assert_eq!(declaration.role, expected_role, "{query}");
+            let all = read.mcp_find_with_lines(query, 20, Some(pin)).unwrap();
+            assert_eq!(all.symbols.len(), 2, "{query}");
+            assert!(!all.has_more, "{query}");
+            assert_eq!(all.symbols[0].symbol.declaration, *declaration, "{query}");
+        }
+        read.finish(()).unwrap();
+    }
+
+    #[test]
     fn interleaved_find_hits_keep_rank_lines_and_document_versions() {
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
