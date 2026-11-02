@@ -5825,6 +5825,14 @@ struct McpSession {
 
 impl McpSession {
     fn start(world: &World, session: u64) -> Self {
+        Self::start_with_readiness(world, session, false)
+    }
+
+    fn start_settled(world: &World, session: u64) -> Self {
+        Self::start_with_readiness(world, session, true)
+    }
+
+    fn start_with_readiness(world: &World, session: u64, settled: bool) -> Self {
         use std::io::Write;
         use trellis::daemon::registry::CheckoutRegistry;
         let identity = WorkspaceIdentity::discover(Some(&world.root), &world.root)
@@ -5847,6 +5855,7 @@ impl McpSession {
                 .recv_timeout(trellis::testing::HANG_BACKSTOP)
                 .unwrap();
         }));
+        let runtime = registry.activate(&identity.root_key).unwrap();
         let registry = Arc::new(tokio::sync::Mutex::new(registry));
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
         client
@@ -5877,6 +5886,12 @@ impl McpSession {
             .unwrap();
         let reply = mcp.reply();
         assert_eq!(reply["result"]["isError"], false, "{reply}");
+        mcp.pairs.push(json!({"name":"trellis_workspace_describe",
+            "structuredContent":reply["result"]["structuredContent"]}));
+        if settled {
+            mcp.release.send(()).unwrap();
+            runtime.await_architecture_for_tests();
+        }
         mcp
     }
 
@@ -5907,8 +5922,44 @@ impl McpSession {
         let reply = self.reply();
         assert_eq!(reply["id"], self.next_id);
         let envelope = reply["result"]["structuredContent"].clone();
+        assert!(envelope.is_object(), "{name}: {reply}");
+        assert_eq!(
+            reply["result"]["isError"],
+            envelope.get("error").is_some(),
+            "{name}: {reply}"
+        );
         self.pairs
             .push(json!({"name":name,"structuredContent":envelope}));
+        envelope
+    }
+
+    fn catalog(&mut self) -> Value {
+        use std::io::Write;
+        self.next_id += 1;
+        let mut request = Self::request(self.next_id, "", json!({}));
+        request["method"] = json!("tools/list");
+        request["params"].as_object_mut().unwrap().remove("name");
+        request["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("arguments");
+        writeln!(self.client, "{request}").unwrap();
+        let reply = self.reply();
+        assert_eq!(reply["id"], self.next_id);
+        let catalog = reply["result"]["tools"].clone();
+        let expected: Value =
+            serde_json::from_str(include_str!("../fixtures/mcp/catalog.json")).unwrap();
+        assert_eq!(
+            catalog, expected,
+            "advertised catalog differs from validated schemas"
+        );
+        catalog
+    }
+
+    fn success(&mut self, name: &str, arguments: Value) -> Value {
+        let envelope = self.call(name, arguments);
+        assert!(envelope.get("error").is_none(), "{name}: {envelope}");
+        assert!(envelope["data"].is_object(), "{name}: {envelope}");
         envelope
     }
 
@@ -5925,6 +5976,9 @@ const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json', 'utf8
 for (const {name, structuredContent} of JSON.parse(readFileSync(0, 'utf8'))) {
     const validate = ajv.compile(catalog.find(tool => tool.name === name).outputSchema);
     if (!validate(structuredContent)) throw Error(`${name}: ${JSON.stringify(validate.errors)}`);
+    const missingVersion = {...structuredContent};
+    delete missingVersion.schemaVersion;
+    if (validate(missingVersion)) throw Error(`${name}: validator accepted missing schemaVersion`);
 }
 "#;
         let mut child = std::process::Command::new("node")
@@ -5935,13 +5989,17 @@ for (const {name, structuredContent} of JSON.parse(readFileSync(0, 'utf8'))) {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
+        let written = child
             .stdin
             .take()
             .unwrap()
-            .write_all(&serde_json::to_vec(&self.pairs).unwrap())
-            .unwrap();
+            .write_all(&serde_json::to_vec(&self.pairs).unwrap());
         let output = child.wait_with_output().unwrap();
+        assert!(
+            written.is_ok(),
+            "schema validator input: {written:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             output.status.success(),
             "structuredContent schema validation: {}",
@@ -7144,6 +7202,420 @@ fn witnessed_local_rejoin_preserves_real_partial_import_metadata() {
     );
 }
 
+/// #599: enumerate the live catalog, not a hand-picked subset of MCP tools. All responses
+/// (including bootstrap and argument failures) go through McpSession's catalog validator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_advertised_mcp_tool_matches_the_catalog_on_real_imports() {
+    for language in ["rust", "javascript"] {
+        let (world, caller, path, producer) = if language == "rust" {
+            (
+                partial_calls_mcp_world(),
+                "run",
+                "src/lib.rs",
+                "rust-analyzer".to_owned(),
+            )
+        } else {
+            let files = ["src/lib.js", "src/main.js"];
+            let (world, _) = real_fixture_world("issue444-javascript-calls", &files);
+            let (_, producer) = publish_real_fixture(&world, "issue444-javascript-calls", &files);
+            (world, "caller", "src/main.js", producer)
+        };
+        fs::create_dir_all(world.root.join(".trellis")).unwrap();
+        fs::write(
+            world.root.join(".trellis/rules.toml"),
+            format!(
+                r#"version = 1
+[roles.entry]
+select = {{ name = "{caller}", language = ["{language}"] }}
+[roles.helper]
+select = {{ name = "helper", language = ["{language}"] }}
+[[rules]]
+id = "entry-must-not-call-helper"
+for_each = "entry"
+forbid = [{{ calls = "helper" }}]
+"#
+            ),
+        )
+        .unwrap();
+        let ids = declaration_ids(&world);
+        let mut mcp = McpSession::start_settled(&world, 599);
+        let catalog = mcp.catalog();
+        // Startup may republish/rejoin. Use its settled head, and prove the real import
+        // survived rather than silently exercising a syntax-only replacement.
+        let published = world
+            .store
+            .semantic_at(world.store.index_baseline().unwrap())
+            .unwrap();
+        assert!(published.producers.iter().any(|p| p.id == producer));
+        assert!(published.call_bindings.iter().any(|b| b.call_id.is_some()));
+        let pin = world.store.index_baseline().unwrap();
+        let basis = json!({"indexGeneration":pin.index_generation.to_string(),
+            "indexRevision":pin.index_revision});
+        let pinned = |extra: Value| {
+            let mut args = json!({"schemaVersion":1,"expectedBasis":basis});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            args
+        };
+        for advertised in catalog.as_array().unwrap() {
+            let name = advertised["name"].as_str().unwrap();
+            match name {
+                "trellis_workspace_describe" => {
+                    let reply = mcp.success(name, json!({"schemaVersion":1}));
+                    assert_eq!(reply["evidenceBasis"], basis);
+                    let status = reply["data"]["languages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|status| status["language"] == language)
+                        .unwrap();
+                    assert_eq!(status["semantic"]["available"], true);
+                    assert_eq!(status["semantic"]["producerId"], producer);
+                    assert!(status["semantic"]["coverage"]["selected"].as_u64().unwrap() > 0);
+                    if language == "rust" {
+                        assert!(status["semantic"]["coverage"]["partial"].as_u64().unwrap() > 0);
+                        assert!(status["semantic"]["partialReasons"].is_object());
+                    }
+                }
+                "trellis_find_symbols" | "trellis_search_symbols" => {
+                    let field = if name == "trellis_find_symbols" {
+                        "symbols"
+                    } else {
+                        "hits"
+                    };
+                    let full = mcp.success(name, pinned(json!({"query":"helper"})));
+                    let small = mcp.success(name, pinned(json!({"query":"helper","limit":1})));
+                    let items = full["data"][field].as_array().unwrap();
+                    assert!(!items.is_empty(), "{name}: {full}");
+                    assert!(items.iter().any(|item| item["symbolId"] == ids["helper"]));
+                    assert_eq!(small["data"][field].as_array().unwrap(), &items[..1]);
+                }
+                "trellis_declaration" => {
+                    let reply = mcp.success(name, pinned(json!({"symbolId":ids[caller]})));
+                    assert_eq!(reply["data"]["declaration"]["syntaxId"], ids[caller]);
+                    assert_eq!(reply["data"]["declaration"]["name"], caller);
+                }
+                "trellis_outgoing_calls" | "trellis_incoming_calls" => {
+                    let incoming = name == "trellis_incoming_calls";
+                    let field = if incoming { "callers" } else { "calls" };
+                    let id = &ids[if incoming { "helper" } else { caller }];
+                    let mut expected = None;
+                    for explicit in [false, true] {
+                        for compact in [false, true] {
+                            for limit in [None, Some(1)] {
+                                let mut args = pinned(json!({"symbolId":id,"compact":compact}));
+                                if explicit {
+                                    args["semanticProducerId"] = json!(producer);
+                                }
+                                if let Some(limit) = limit {
+                                    args["limit"] = json!(limit);
+                                }
+                                let reply = mcp.success(name, args);
+                                let items = reply["data"][field].as_array().unwrap();
+                                assert!(!items.is_empty(), "{name}: {reply}");
+                                for proof in ["coverage", "provenance", "semanticBases"] {
+                                    assert_eq!(
+                                        reply["data"].get(proof).is_none(),
+                                        compact,
+                                        "{name}: compact={compact}: {proof}"
+                                    );
+                                }
+                                for item in items {
+                                    for proof in ["binding", "semanticBasisRef"] {
+                                        if compact {
+                                            assert!(
+                                                item.get(proof).is_none(),
+                                                "{name}: {proof}: {item}"
+                                            );
+                                        }
+                                    }
+                                }
+                                if limit.is_some() {
+                                    assert_eq!(items.len(), 1);
+                                } else {
+                                    let identities: Vec<_> = items
+                                        .iter()
+                                        .map(|item| {
+                                            json!([
+                                                item["callId"],
+                                                item["targetId"],
+                                                item["evidenceTier"]
+                                            ])
+                                        })
+                                        .collect();
+                                    if let Some(expected) = &expected {
+                                        assert_eq!(&identities, expected);
+                                    } else {
+                                        expected = Some(identities);
+                                    }
+                                    assert!(
+                                        items.iter().any(|item| item["evidenceTier"] == "semantic"),
+                                        "{name}: {reply}"
+                                    );
+                                    if !compact {
+                                        assert!(
+                                            items
+                                                .iter()
+                                                .any(|item| item["binding"]["resolution"]
+                                                    == "resolved"),
+                                            "{name}: {reply}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                "trellis_read_source" => {
+                    let source = fs::read_to_string(world.root.join(path)).unwrap();
+                    use sha2::Digest;
+                    let hash = hex::encode(sha2::Sha256::digest(source.as_bytes()));
+                    let reply = mcp.success(
+                        name,
+                        pinned(json!({"path":path,"startLine":1,
+                        "endLine":source.lines().count(),"expectedContentHash":hash})),
+                    );
+                    assert_eq!(reply["data"]["text"], source);
+                }
+                "trellis_call_graph" => {
+                    let mut full = None;
+                    for explicit in [false, true] {
+                        for max_calls in [None, Some(1)] {
+                            let mut args = pinned(json!({"symbolId":ids[caller]}));
+                            if explicit {
+                                args["semanticProducerId"] = json!(producer);
+                            }
+                            if let Some(cap) = max_calls {
+                                args["maxCalls"] = json!(cap);
+                            }
+                            let reply = mcp.success(name, args);
+                            let result = &reply["data"]["result"];
+                            let edges = result["edges"].as_array().unwrap();
+                            assert!(!edges.is_empty(), "{reply}");
+                            if max_calls.is_some() {
+                                assert_eq!(edges.len(), 1);
+                            } else {
+                                assert!(result["nodes"].as_array().unwrap().len() > 1);
+                                assert!(
+                                    edges
+                                        .iter()
+                                        .any(|edge| edge["binding"]["resolution"] == "resolved")
+                                );
+                                if let Some(full) = &full {
+                                    assert_eq!(edges, full);
+                                } else {
+                                    full = Some(edges.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                "trellis_references" | "trellis_rules_check" | "trellis_rules_explain" => {
+                    let fields: &[&str] = if name == "trellis_references" {
+                        &[
+                            "modules",
+                            "externalPackages",
+                            "production",
+                            "tests",
+                            "unresolved",
+                        ]
+                    } else {
+                        &["instances", "testOnly", "unassigned", "externalPackages"]
+                    };
+                    let flatten = |reply: &Value| -> Vec<Value> {
+                        fields
+                            .iter()
+                            .flat_map(|field| {
+                                reply["data"][*field]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(move |item| json!([field, item]))
+                            })
+                            .collect()
+                    };
+                    for scoped in [false, true] {
+                        let assert_rule_scope = |reply: &Value| {
+                            if name != "trellis_rules_check" || !scoped {
+                                return;
+                            }
+                            for field in ["instances", "testOnly"] {
+                                assert!(
+                                    reply["data"][field]
+                                        .as_array()
+                                        .unwrap()
+                                        .iter()
+                                        .all(|item| item["target"]["path"] == path),
+                                    "{reply}"
+                                );
+                            }
+                            assert!(
+                                reply["data"]["unassigned"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .all(|item| item["path"] == path),
+                                "{reply}"
+                            );
+                        };
+                        if scoped && name == "trellis_rules_explain" {
+                            continue;
+                        }
+                        let mut args = pinned(json!({}));
+                        if scoped {
+                            args["paths"] = json!([path]);
+                        }
+                        if name == "trellis_rules_explain" {
+                            // Use the exact identity from the checker, not an invented source set.
+                            let check = mcp.success("trellis_rules_check", pinned(json!({})));
+                            let instance = check["data"]["instances"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|item| item["rule"] == "entry-must-not-call-helper")
+                                .unwrap();
+                            args["rule"] = instance["rule"].clone();
+                            args["target"] = instance["target"].clone();
+                        }
+                        let full = mcp.success(name, args.clone());
+                        assert_rule_scope(&full);
+                        if name == "trellis_rules_check" && language == "javascript" {
+                            let has_library = full["data"]["unassigned"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|item| item["path"] == "src/lib.js");
+                            assert_eq!(has_library, !scoped, "{full}");
+                        }
+                        if name == "trellis_references" {
+                            // References are module edges: the Rust fixture's bound calls
+                            // stay in one module and therefore do not create reference edges.
+                            if language == "javascript" {
+                                assert!(
+                                    full["data"]["counts"]["semanticSites"].as_u64().unwrap() > 0,
+                                    "{full}"
+                                );
+                            }
+                            assert!(
+                                full["data"]["semanticProducers"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|p| p["language"] == language
+                                        && p["producerId"] == producer)
+                            );
+                            if scoped {
+                                assert_eq!(full["data"]["counts"]["scannedDocuments"], 1);
+                                for field in ["production", "tests"] {
+                                    assert!(
+                                        full["data"][field]
+                                            .as_array()
+                                            .unwrap()
+                                            .iter()
+                                            .all(|edge| edge["source"]["path"] == path)
+                                    );
+                                }
+                            }
+                            if language == "rust" {
+                                assert_eq!(full["data"]["modules"].as_array().unwrap().len(), 1);
+                                assert_eq!(full["data"]["modules"][0]["identity"]["path"], path);
+                                assert_eq!(full["data"]["production"], json!([]));
+                                assert_eq!(full["data"]["tests"], json!([]));
+                            }
+                        } else {
+                            let instance = full["data"]["instances"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|item| item["rule"] == "entry-must-not-call-helper")
+                                .unwrap();
+                            assert_eq!(instance["status"], "deviates", "{full}");
+                        }
+                        let whole = flatten(&full);
+                        assert!(!whole.is_empty(), "{name}: {full}");
+                        // The unchanged Rust fixture has only one reference module; its
+                        // positive offset is terminal. JS also covers a nonempty suffix.
+                        if language == "javascript" || name != "trellis_references" {
+                            assert!(whole.len() > 1);
+                        }
+                        assert_eq!(full["data"]["page"]["total"], whole.len());
+                        assert!(full["data"]["page"]["nextOffset"].is_null());
+                        // `limit` bounds evidence samples, NOT page size. Offset continues
+                        // the flattened arrays; normal fixtures fit a single byte-bounded page.
+                        let mut sampled = args.clone();
+                        sampled["limit"] = json!(1);
+                        let sample = mcp.success(name, sampled);
+                        assert_rule_scope(&sample);
+                        if name == "trellis_references" {
+                            for field in ["production", "tests"] {
+                                for edge in sample["data"][field].as_array().unwrap() {
+                                    assert!(edge["sites"].as_array().unwrap().len() <= 1);
+                                }
+                            }
+                        } else {
+                            let instances = sample["data"]["instances"].as_array().unwrap();
+                            assert!(!instances.is_empty());
+                            for instance in instances {
+                                assert!(instance["evidence"].as_array().unwrap().len() <= 1);
+                            }
+                        }
+                        let mut terminal = args.clone();
+                        terminal["offset"] = json!(whole.len());
+                        let end = mcp.success(name, terminal);
+                        assert_rule_scope(&end);
+                        assert!(flatten(&end).is_empty());
+                        assert!(end["data"]["page"]["nextOffset"].is_null());
+                        for limit in [None, Some(1)] {
+                            let mut continuation = args.clone();
+                            continuation["offset"] = json!(1);
+                            if let Some(limit) = limit {
+                                continuation["limit"] = json!(limit);
+                            }
+                            let page = mcp.success(name, continuation);
+                            assert_rule_scope(&page);
+                            let tail = flatten(&page);
+                            assert_eq!(tail.is_empty(), whole.len() == 1);
+                            assert_eq!(page["data"]["page"]["offset"], 1);
+                            assert_eq!(page["data"]["page"]["total"], whole.len());
+                            assert!(page["data"]["page"]["nextOffset"].is_null());
+                            if limit.is_none() {
+                                assert_eq!(tail, whole[1..]);
+                                assert!(!tail.contains(&whole[0]));
+                                assert_eq!([whole[..1].to_vec(), tail].concat(), whole);
+                            }
+                            if limit.is_some() {
+                                if name == "trellis_references" {
+                                    for field in ["production", "tests"] {
+                                        for edge in page["data"][field].as_array().unwrap() {
+                                            assert!(edge["sites"].as_array().unwrap().len() <= 1);
+                                        }
+                                    }
+                                } else {
+                                    for instance in page["data"]["instances"].as_array().unwrap() {
+                                        assert!(
+                                            instance["evidence"].as_array().unwrap().len() <= 1
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => panic!("advertised MCP tool has no real-import contract case: {name}"),
+            }
+            let failed = mcp.call(name, json!({"schemaVersion":1,"unexpected":true}));
+            assert_eq!(
+                failed["error"]["code"], "invalid_request",
+                "{name}: {failed}"
+            );
+            assert_eq!(failed["error"]["retryable"], false);
+            assert!(failed.get("data").is_none());
+        }
+        mcp.finish();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_partial_import_outgoing_calls_match_the_catalog() {
     partial_import_calls_mcp("trellis_outgoing_calls", 5951).await;
@@ -7495,6 +7967,128 @@ fn witnessed_local_rejoin_keeps_a_method_direct_in_an_unchanged_document() {
         ),
         [call("f"), call("g")]
     );
+}
+
+/// A first spill during semantic rejoin must be visible before that rejoin finishes.
+#[test]
+fn witnessed_semantic_spill_marks_readers_before_commit() {
+    use std::sync::atomic::Ordering;
+    use trellis::store::{RebuildInProgress, SemanticPublicationStage};
+
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+                ("src/c.rs", "fn other() { }\n"),
+            ],
+        );
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g) = (symbol("r()."), symbol("impl#[S]f()."), symbol("g()."));
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 15, 16], &[], &f, 0)
+                .occurrence(&[0, 20, 21], &[], &g, 0)
+                .symbol(&r, 17, &[]),
+            DocSpec::new("src/b.rs")
+                .occurrence(&[1, 12, 13], &[], &f, 1)
+                .occurrence(&[2, 3, 4], &[], &g, 1)
+                .symbol(&f, 26, &[])
+                .symbol(&g, 17, &[]),
+            DocSpec::new("src/c.rs"),
+        ],
+    );
+    drop(world.publish(&world.write(&fixture)).unwrap());
+    let counts = world._state.path().join("spill-work-counts.json");
+    // SAFETY: nextest runs each test in its own process.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+    }
+    let spill_count = |db: &rusqlite::Connection| {
+        let (mut current, mut highwater) = (0, 0);
+        // SAFETY: live writer connection and valid local out-pointers.
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                db.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_SPILL,
+                &mut current,
+                &mut highwater,
+                0,
+            )
+        };
+        assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+        current
+    };
+    for rollback in [false, true] {
+        let prior = world.store.status().unwrap().revision;
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_hook = observed.clone();
+        let reading = world.store.clone();
+        let cancel = world.cancel.clone();
+        world
+            .store
+            .set_semantic_publication_observer_for_tests(move |stage, db| {
+                if stage == SemanticPublicationStage::BeforeSemantic {
+                    assert_eq!(spill_count(db), 0, "native work must not spill");
+                    db.pragma_update(None, "cache_size", -64).unwrap();
+                } else if !observed_hook.swap(true, Ordering::AcqRel) {
+                    assert!(spill_count(db) > 0, "semantic work must actually spill");
+                    let error = reading.status().unwrap_err();
+                    assert!(
+                        error.chain().any(|cause| cause.is::<RebuildInProgress>()),
+                        "semantic spill was not marked before commit: {error:#}"
+                    );
+                    let error = reading.source_at("src/a.rs", Some(prior)).unwrap_err();
+                    assert!(
+                        error.chain().any(|cause| cause.is::<RebuildInProgress>()),
+                        "{error:#}"
+                    );
+                    if rollback {
+                        cancel.store(true, Ordering::Release);
+                    }
+                }
+            });
+        write_files(
+            &world.root,
+            &[(
+                "src/c.rs",
+                if rollback {
+                    "fn other() { let _ = 2; }\n"
+                } else {
+                    "fn other() { let _ = 1; }\n"
+                },
+            )],
+        );
+        let options = IndexOptions::new(world.root.clone());
+        let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+        let leader = world.store.publication_for_tests().unwrap();
+        let result =
+            world
+                .store
+                .publish_local_for_tests(&options, &capture, &leader, &world.cancel);
+        assert!(observed.load(Ordering::Acquire));
+        world.cancel.store(false, Ordering::Release);
+        let expected = if rollback {
+            assert!(result.is_err());
+            prior
+        } else {
+            result.unwrap()
+        };
+        assert_eq!(world.store.status().unwrap().revision, expected);
+        let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
+        if !rollback {
+            assert_eq!(work["witnessedRejoins"], 1, "{work}");
+        }
+    }
 }
 
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the

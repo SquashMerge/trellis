@@ -306,6 +306,7 @@ fn document_header(artifact: &Artifact) -> Artifact {
 /// oracle, `collected` receives every document's rows.
 pub(super) fn publish_with_witness(
     input: &WitnessedInput<'_>,
+    semantic_document_written: &mut impl FnMut(&Connection) -> Result<()>,
     #[cfg(feature = "test-support")] mut collected: Option<&mut sem::SemanticPublication>,
 ) -> Result<()> {
     use crate::native_ids;
@@ -573,6 +574,7 @@ pub(super) fn publish_with_witness(
             .document(&doc.key, &publication, witness.as_ref(), &targets, &lookup)
             .map_err(|error| witness_validation_failed(&error))?;
         write_import_coverage(tx, input.key, &publication)?;
+        semantic_document_written(tx)?;
         #[cfg(feature = "test-support")]
         if let Some(collected) = collected.as_deref_mut() {
             collected.coverage.extend(publication.coverage);
