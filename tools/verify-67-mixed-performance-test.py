@@ -31,12 +31,12 @@ class HomeProcessCleanup(unittest.TestCase):
         return subprocess.CompletedProcess([], code, output, error)
 
     def test_portable_snapshot_finds_only_live_private_home_binary(self):
-        matching = f"123 S {self.binary} daemon HOME={self.home} PATH=/bin\n"
+        matching = f"123 Mon Nov 2 10:00:00 2026 S {self.binary} daemon HOME={self.home} PATH=/bin\n"
         rows = matching + (
-            f"124 Z {self.binary} daemon HOME={self.home} PATH=/bin\n"
-            f"125 S {self.binary} daemon HOME=/tmp/other-home PATH=/bin\n"
-            f"126 S {self.binary} daemon HOME={self.home}-other PATH=/bin\n"
-            f"127 S /tmp/other-binary daemon HOME={self.home} PATH=/bin\n"
+            f"124 Mon Nov 2 10:00:00 2026 Z {self.binary} daemon HOME={self.home} PATH=/bin\n"
+            f"125 Mon Nov 2 10:00:00 2026 S {self.binary} daemon HOME=/tmp/other-home PATH=/bin\n"
+            f"126 Mon Nov 2 10:00:00 2026 S {self.binary} daemon HOME={self.home}-other PATH=/bin\n"
+            f"127 Mon Nov 2 10:00:00 2026 S /tmp/other-binary daemon HOME={self.home} PATH=/bin\n"
         )
         rechecks = []
 
@@ -61,6 +61,42 @@ class HomeProcessCleanup(unittest.TestCase):
         kill.assert_called_once_with(123, signal.SIGTERM)
         self.assertEqual(rechecks, [123, 123])
         election.assert_called_once_with(self.home)
+
+    def test_identity_change_or_disappearance_never_signals(self):
+        row = f"123 Mon Nov 2 10:00:00 2026 S {self.binary} daemon HOME={self.home} PATH=/bin\n"
+        for observed in (row.replace("10:00:00", "10:00:01"), ""):
+            with self.subTest(observed=observed), \
+                    patch.object(RUNNER.subprocess, "run", side_effect=[
+                        self.result(output=row), self.result(output=observed), self.result(output=observed)]), \
+                    patch.object(RUNNER.os, "kill") as kill, \
+                    patch.object(RUNNER, "record"), \
+                    patch.object(RUNNER, "election_free", return_value=True):
+                RUNNER.stop_home_processes(self.home, self.binary)
+            kill.assert_not_called()
+
+    def test_identity_changes_immediately_before_escalation(self):
+        row = f"123 Mon Nov 2 10:00:00 2026 S {self.binary} daemon HOME={self.home} PATH=/bin\n"
+        with patch.object(RUNNER.subprocess, "run", side_effect=[
+                self.result(output=row), self.result(output=row),
+                self.result(output=row.replace("10:00:00", "10:00:01")), self.result(code=1)]), \
+                patch.object(RUNNER.time, "monotonic", side_effect=[0,21,21,21]), \
+                patch.object(RUNNER.os, "kill") as kill, \
+                patch.object(RUNNER, "record"), \
+                patch.object(RUNNER, "election_free", return_value=True):
+            RUNNER.stop_home_processes(self.home, self.binary)
+        kill.assert_called_once_with(123,signal.SIGTERM)
+
+    def test_matching_identity_is_rechecked_before_kill(self):
+        row = f"123 Mon Nov 2 10:00:00 2026 S {self.binary} daemon HOME={self.home} PATH=/bin\n"
+        with patch.object(RUNNER.subprocess, "run", side_effect=[
+                self.result(output=row), self.result(output=row), self.result(output=row), self.result(code=1)]), \
+                patch.object(RUNNER.time, "monotonic", side_effect=[0,21,21,21]), \
+                patch.object(RUNNER.os, "kill") as kill, \
+                patch.object(RUNNER, "record"), \
+                patch.object(RUNNER, "election_free", return_value=True):
+            RUNNER.stop_home_processes(self.home, self.binary)
+        self.assertEqual([call.args for call in kill.call_args_list],
+                         [(123, signal.SIGTERM), (123, signal.SIGKILL)])
 
     def test_empty_global_snapshot_requires_success(self):
         for code in (0, 1):
@@ -91,6 +127,28 @@ class HomeProcessCleanup(unittest.TestCase):
             kill.assert_not_called()
 
 
+class ReleaseCleanup(unittest.TestCase):
+    def test_private_scope_and_escalation_identity_recheck(self):
+        spec = importlib.util.spec_from_file_location("release_smoke", Path(__file__).with_name("release-smoke.py"))
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        row = "123 Mon Nov 2 10:00:00 2026 S /tmp/private-trellis daemon HOME=/tmp/private-home PATH=/bin\n"
+        other = row.replace("HOME=/tmp/private-home", "HOME=/tmp/other-home")
+        result = lambda text: subprocess.CompletedProcess([],0,text,"")
+        with patch.object(smoke.subprocess,"run",side_effect=[result(row+other),result(row),result(row),
+                result(row.replace("10:00:00","10:00:01"))]), \
+                patch.object(smoke.os,"kill") as kill, \
+                patch.object(smoke.time,"monotonic",side_effect=[0,11]):
+            with self.assertRaisesRegex(RuntimeError,"did not stop"):
+                smoke.stop_replacements(Path("/tmp/private-home"),"/tmp/private-trellis")
+        kill.assert_called_once_with(123,signal.SIGTERM)
+        for changed in (row.replace("10:00:00","10:00:01"), ""):
+            with patch.object(smoke.subprocess,"run",side_effect=[result(row),result(changed),result(changed)]), \
+                    patch.object(smoke.os,"kill") as kill:
+                self.assertTrue(smoke.stop_replacements(Path("/tmp/private-home"),"/tmp/private-trellis"))
+            kill.assert_not_called()
+
+
 class Rusage(unittest.TestCase):
     def test_command_records_rusage_when_requested(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -110,12 +168,14 @@ class Rusage(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(RUNNER, "EVIDENCE", Path(tmp)), \
                 patch.object(RUNNER.os, "wait4", return_value=(4321, 0, usage)) as wait4, \
+                patch.object(RUNNER.os, "kill") as kill, \
                 patch.object(RUNNER, "stop_home_processes"), \
                 patch.object(RUNNER, "election_free", return_value=True), \
                 patch.object(RUNNER, "record"):
             daemon = RUNNER.Daemon(Path("/tmp/b"), Path("/tmp/h"), "t", record_rusage=True)
             daemon.proc = proc
             daemon.stop()
+        kill.assert_called_once_with(4321, signal.SIGTERM)
         wait4.assert_called_with(4321, RUNNER.os.WNOHANG)
         proc.poll.assert_not_called()
         proc.wait.assert_not_called()
@@ -123,6 +183,13 @@ class Rusage(unittest.TestCase):
         self.assertEqual(daemon.rusage, {"maxRssBytes": 2048 * factor})
         self.assertEqual(proc.returncode, 0)
 
+
+    def test_reap_with_rusage_never_signals_already_reaped_readiness_failure(self):
+        proc = Mock(pid=4321, returncode=1)
+        with patch.object(RUNNER.os, "kill") as kill, patch.object(RUNNER.os, "wait4") as wait4:
+            self.assertEqual(RUNNER.reap_with_rusage(proc), {"maxRssBytes": None})
+        kill.assert_not_called()
+        wait4.assert_not_called()
 
     def test_reap_with_rusage_keeps_usage_of_already_exited_child(self):
         proc = subprocess.Popen([sys.executable, "-c", "pass"])

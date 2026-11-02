@@ -396,6 +396,8 @@ pub struct Store {
     publication_before_commit_hook: Arc<TestOneShotHook>,
     #[cfg(feature = "test-support")]
     publication_before_semantic_hook: Arc<TestOneShotHook>,
+    #[cfg(feature = "test-support")]
+    semantic_publication_observer: Arc<Mutex<Option<SemanticPublicationObserver>>>,
     #[cfg(test)]
     test_stream_before_preflight_hook: Arc<Mutex<Option<TestStreamPreflightHook>>>,
     /// The publication page cache in KiB; only tests lower it.
@@ -635,6 +637,15 @@ enum PublishStage {
     AfterFile,
     BeforeCommit,
 }
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticPublicationStage {
+    BeforeSemantic,
+    AfterDocument,
+}
+#[cfg(feature = "test-support")]
+type SemanticPublicationObserver = Box<dyn FnMut(SemanticPublicationStage, &Connection) + Send>;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ActivationStage {
     BeforeRename,
@@ -6998,24 +7009,19 @@ fn semantic_target_read(
         }
     })
 }
+#[cfg(test)]
+thread_local! {
+    static SEMANTIC_CHILD_REPREPARES: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
 fn semantic_targets(
-    db: &Connection,
-    table: &str,
-    where_clause: &str,
+    stmt: &mut rusqlite::Statement<'_>,
+    start: usize,
     values: &[&dyn rusqlite::ToSql],
     source_set: &str,
 ) -> Result<Vec<crate::semantic_evidence::Target>> {
-    let mut stmt = db.prepare_cached(&format!(
-        "SELECT * FROM {table} WHERE {where_clause} ORDER BY ordinal"
-    ))?;
     let rows = stmt
         .query_map(values, |row| {
-            // Child target rows carry parent ID then ordinal; reference child has tuple,ref,ordinal.
-            let start = if table == "semantic_reference_candidates" {
-                3
-            } else {
-                2
-            };
             let target = semantic_target_read(row, start, source_set).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     start,
@@ -7026,6 +7032,10 @@ fn semantic_targets(
             Ok((row.get::<_, i64>(start - 1)?, target))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    #[cfg(test)]
+    SEMANTIC_CHILD_REPREPARES.with(|count| {
+        count.set(count.get() + stmt.reset_status(rusqlite::StatementStatus::RePrepare));
+    });
     let mut targets = Vec::new();
     for (ordinal, target) in rows {
         selected_ensure!(
@@ -7046,8 +7056,18 @@ fn semantic_ordered<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let raw = db
-        .prepare_cached(sql)?
+    let mut stmt = db.prepare_cached(sql)?;
+    semantic_ordered_rows(&mut stmt, values)
+}
+
+fn semantic_ordered_rows<T>(
+    stmt: &mut rusqlite::Statement<'_>,
+    values: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let raw = stmt
         .query_map(values, |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?
@@ -7096,13 +7116,10 @@ fn semantic_symbol_key_read(
     })
 }
 fn semantic_symbol_keys(
-    db: &Connection,
-    table: &str,
-    parent: &str,
+    stmt: &mut rusqlite::Statement<'_>,
     id: i64,
     source_set: &str,
 ) -> Result<Vec<crate::semantic_evidence::SymbolKey>> {
-    let mut stmt=db.prepare(&format!("SELECT ordinal,scheme,symbol,scope,document_language,document_path FROM {table} WHERE {parent}=?1 ORDER BY ordinal"))?;
     let rows = stmt
         .query_map([id], |row| {
             Ok((
@@ -7128,15 +7145,11 @@ fn semantic_symbol_keys(
     Ok(keys)
 }
 fn semantic_candidate_ids(
-    db: &Connection,
-    table: &str,
+    stmt: &mut rusqlite::Statement<'_>,
     parent: i64,
     kind: &str,
 ) -> Result<Vec<String>> {
-    let sql =
-        format!("SELECT ordinal,candidate_id FROM {table} WHERE binding_id=?1 ORDER BY ordinal");
-    let rows = db
-        .prepare(&sql)?
+    let rows = stmt
         .query_map([parent], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?
@@ -7299,6 +7312,9 @@ fn read_semantic_tuple_for_call(
         let rows=db.prepare("SELECT p.provenance_id,p.content_hash,p.evidence_kind,p.freshness,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id,p.capture_id,p.derived_from_record_kind,p.derived_from_fact_digest FROM semantic_provenance p JOIN semantic_basis b ON b.tuple_id=p.tuple_id AND b.basis_id=p.basis_id WHERE p.tuple_id=?1 AND (?5 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?5)) AND (?2 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_declaration_bindings WHERE tuple_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_id FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_id FROM semantic_type_relationships WHERE tuple_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.rowid")?.query_map(params![tuple, history_syntax.and_then(id_codec::encode_sid), language, path, call_id],|r|{
             Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,String>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,r.get::<_,String>(15)?,r.get::<_,i64>(16)?,r.get::<_,Option<i64>>(17)?,r.get::<_,Option<String>>(18)?,r.get::<_,Option<String>>(19)?))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut lookup_dependencies_stmt = db.prepare_cached(
+            "SELECT ordinal,lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 ORDER BY ordinal",
+        )?;
         for (
             id,
             content_hash,
@@ -7406,11 +7422,8 @@ fn read_semantic_tuple_for_call(
                     .into());
                 }
             };
-            let lookup_dependencies = semantic_ordered::<String>(
-                db,
-                "SELECT ordinal,lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 ORDER BY ordinal",
-                &[&basis_id],
-            )?;
+            let lookup_dependencies =
+                semantic_ordered_rows::<String>(&mut lookup_dependencies_stmt, &[&basis_id])?;
             result.provenance.push(sem::Provenance {
                 id,
                 producer_id: producer_id.clone(),
@@ -7584,6 +7597,10 @@ fn read_semantic_facts(
         return read_semantic_call_facts(db, tuple, document, result, selected_call);
     }
     let symbol_rows=db.prepare("SELECT symbol_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id FROM semantic_symbols WHERE tuple_id=?1 ORDER BY ordinal")?.query_map([tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    // Keep child statements alive across their fact loops: cache return clears bindings.
+    let mut symbol_targets = db.prepare_cached(
+        "SELECT * FROM semantic_symbol_targets WHERE symbol_id=?1 ORDER BY ordinal",
+    )?;
     for (
         ordinal,
         (id, stored, scheme, symbol, scope, language, path, display_name, provenance_id),
@@ -7596,17 +7613,17 @@ fn read_semantic_facts(
         result.symbols.push(sem::Symbol {
             key: semantic_symbol_key_read(scheme, symbol, scope, language, path, source_set)?,
             display_name,
-            declarations: semantic_targets(
-                db,
-                "semantic_symbol_targets",
-                "symbol_id=?1",
-                &[&id],
-                source_set,
-            )?,
+            declarations: semantic_targets(&mut symbol_targets, 2, &[&id], source_set)?,
             provenance_id,
         });
     }
     let binding_rows=db.prepare("SELECT binding_id,ordinal,syntax_id,provenance_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic FROM semantic_declaration_bindings WHERE tuple_id=?1 ORDER BY ordinal")?.query_map([tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<Vec<u8>>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,i64>(8)?,r.get::<_,i64>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,Option<String>>(12)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut declaration_symbols = db.prepare_cached(
+        "SELECT ordinal,scheme,symbol,scope,document_language,document_path FROM semantic_declaration_binding_symbols WHERE binding_id=?1 ORDER BY ordinal",
+    )?;
+    let mut declaration_candidates = db.prepare_cached(
+        "SELECT ordinal,candidate_id FROM semantic_declaration_join_candidates WHERE binding_id=?1 ORDER BY ordinal",
+    )?;
     for (
         ordinal,
         (
@@ -7638,13 +7655,7 @@ fn read_semantic_facts(
                     ))
                 })
                 .transpose()?,
-            symbols: semantic_symbol_keys(
-                db,
-                "semantic_declaration_binding_symbols",
-                "binding_id",
-                id,
-                source_set,
-            )?,
+            symbols: semantic_symbol_keys(&mut declaration_symbols, id, source_set)?,
             join: sem::Join {
                 anchor: sem::MeasuredAnchor {
                     document: crate::native_evidence::DocumentKey {
@@ -7666,8 +7677,7 @@ fn read_semantic_facts(
                 },
                 status: semantic_enum(status)?,
                 candidate_ids: semantic_candidate_ids(
-                    db,
-                    "semantic_declaration_join_candidates",
+                    &mut declaration_candidates,
                     id,
                     "declaration",
                 )?,
@@ -7701,6 +7711,12 @@ fn read_semantic_facts(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut reference_roles = db.prepare_cached(
+        "SELECT ordinal,role FROM semantic_reference_roles WHERE tuple_id=?1 AND reference_id=?2 ORDER BY ordinal",
+    )?;
+    let mut reference_candidates = db.prepare_cached(
+        "SELECT * FROM semantic_reference_candidates WHERE tuple_id=?1 AND reference_id=?2 ORDER BY ordinal",
+    )?;
     for (
         id,
         ordinal,
@@ -7715,18 +7731,9 @@ fn read_semantic_facts(
         provenance_id,
     ) in reference_rows
     {
-        let roles = semantic_ordered(
-            db,
-            "SELECT ordinal,role FROM semantic_reference_roles WHERE tuple_id=?1 AND reference_id=?2 ORDER BY ordinal",
-            &[&tuple, &id],
-        )?;
-        let candidates = semantic_targets(
-            db,
-            "semantic_reference_candidates",
-            "tuple_id=?1 AND reference_id=?2",
-            &[&tuple, &id],
-            source_set,
-        )?;
+        let roles = semantic_ordered_rows(&mut reference_roles, &[&tuple, &id])?;
+        let candidates =
+            semantic_targets(&mut reference_candidates, 3, &[&tuple, &id], source_set)?;
         result.references.push(sem::Reference {
             id: id_codec::decode_occ(&id).context(SelectedIntegrity(
                 "incompatible_index: corrupt semantic reference ID".into(),
@@ -7846,6 +7853,15 @@ fn read_semantic_call_facts(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut call_join_candidates = db.prepare_cached(
+        "SELECT ordinal,candidate_id FROM semantic_call_join_candidates WHERE binding_id=?1 ORDER BY ordinal",
+    )?;
+    let mut call_candidates = db.prepare_cached(
+        "SELECT * FROM semantic_call_candidates WHERE binding_id=?1 ORDER BY ordinal",
+    )?;
+    let mut possible_dispatch = db.prepare_cached(
+        "SELECT * FROM semantic_call_possible_dispatch WHERE binding_id=?1 ORDER BY ordinal",
+    )?;
     for (
         ordinal,
         (
@@ -7902,31 +7918,14 @@ fn read_semantic_call_facts(
                     kind: semantic_enum(kind)?,
                 },
                 status: semantic_enum(status)?,
-                candidate_ids: semantic_candidate_ids(
-                    db,
-                    "semantic_call_join_candidates",
-                    id,
-                    "call",
-                )?,
+                candidate_ids: semantic_candidate_ids(&mut call_join_candidates, id, "call")?,
                 diagnostic,
             },
             resolution: semantic_enum(resolution)?,
             declared_target,
-            candidates: semantic_targets(
-                db,
-                "semantic_call_candidates",
-                "binding_id=?1",
-                &[&id],
-                source_set,
-            )?,
+            candidates: semantic_targets(&mut call_candidates, 2, &[&id], source_set)?,
             dispatch: semantic_enum(dispatch)?,
-            possible_dispatch: semantic_targets(
-                db,
-                "semantic_call_possible_dispatch",
-                "binding_id=?1",
-                &[&id],
-                source_set,
-            )?,
+            possible_dispatch: semantic_targets(&mut possible_dispatch, 2, &[&id], source_set)?,
             possible_dispatch_complete,
             stale_target,
             provenance_id,
@@ -8954,6 +8953,7 @@ fn selected_native_rejoin(
     cancel: &CancelFlag,
     local_reuse: Option<&PreflightReuse>,
     prior_pin: Option<IndexPin>,
+    semantic_document_written: &mut impl FnMut(&Connection) -> Result<()>,
 ) -> Result<()> {
     if selected.iter().all(|input| input.lightweight) && !selected.is_empty() {
         tx.execute_batch("SAVEPOINT original_witness_rejoin")?;
@@ -8968,6 +8968,7 @@ fn selected_native_rejoin(
             local_reuse,
             prior_pin,
             false,
+            semantic_document_written,
         );
         match attempt {
             Ok(()) => {
@@ -9000,6 +9001,7 @@ fn selected_native_rejoin(
                     local_reuse,
                     prior_pin,
                     true,
+                    semantic_document_written,
                 );
             }
         }
@@ -9015,6 +9017,7 @@ fn selected_native_rejoin(
         local_reuse,
         prior_pin,
         false,
+        semantic_document_written,
     )
 }
 
@@ -9030,6 +9033,7 @@ fn selected_native_rejoin_once(
     local_reuse: Option<&PreflightReuse>,
     prior_pin: Option<IndexPin>,
     force_full_after_witness: bool,
+    semantic_document_written: &mut impl FnMut(&Connection) -> Result<()>,
 ) -> Result<()> {
     use crate::{native_ids, semantic_evidence as sem};
     let key = semantic_pin_key(pin);
@@ -9205,6 +9209,7 @@ fn selected_native_rejoin_once(
                         .map(|_| crate::semantic_import::empty_publication(&input.producer));
                     witness_rejoin::publish_with_witness(
                         &witnessed,
+                        semantic_document_written,
                         #[cfg(feature = "test-support")]
                         oracle_rows.as_mut(),
                     )?;
@@ -9547,6 +9552,7 @@ fn selected_native_rejoin_once(
         let mut no_requested = captured;
         no_requested.requested_producers.clear();
         write_import_semantic(tx, &key, &publication, &no_requested)?;
+        semantic_document_written(tx)?;
     }
     Ok(())
 }
@@ -13171,6 +13177,8 @@ impl Store {
             publication_before_commit_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(feature = "test-support")]
             publication_before_semantic_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(feature = "test-support")]
+            semantic_publication_observer: Arc::default(),
             #[cfg(test)]
             test_stream_before_preflight_hook: Arc::new(Mutex::new(None)),
             publication_cache_kib: Arc::new(std::sync::atomic::AtomicI64::new(
@@ -19043,6 +19051,22 @@ impl Store {
                     captured,
                 )?;
             }
+            #[cfg(feature = "test-support")]
+            let mut observer = self.semantic_publication_observer.lock().unwrap().take();
+            #[cfg(feature = "test-support")]
+            if let Some(observer) = observer.as_mut() {
+                observer(SemanticPublicationStage::BeforeSemantic, &tx);
+            }
+            let mut semantic_document_written = |db: &Connection| -> Result<()> {
+                if let Some(watch) = readers_blocked.as_mut() {
+                    watch.check(db);
+                }
+                #[cfg(feature = "test-support")]
+                if let Some(observer) = observer.as_mut() {
+                    observer(SemanticPublicationStage::AfterDocument, db);
+                }
+                Ok(())
+            };
             write_semantic(
                 &tx,
                 native,
@@ -19079,6 +19103,7 @@ impl Store {
                     cancel,
                     local.map(|_| &reuse),
                     old_pin.filter(|_| !rebaseline),
+                    &mut semantic_document_written,
                 )
                 .map_err(rejoin_storage_error)?;
                 if let Some(prior) = old_pin.filter(|pin| !rebaseline && pin.index_revision > 0) {
@@ -19846,6 +19871,15 @@ impl Store {
         hook: impl FnOnce() + Send + 'static,
     ) {
         self.publication_before_semantic_hook.set(hook);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_semantic_publication_observer_for_tests(
+        &self,
+        observer: impl FnMut(SemanticPublicationStage, &Connection) + Send + 'static,
+    ) {
+        *self.semantic_publication_observer.lock().unwrap() = Some(Box::new(observer));
     }
 
     /// Deterministic test barrier just before writer admission. Never use in production.
@@ -22880,5 +22914,7 @@ mod sqlite_deleted_witness_tests;
 mod catalog_summary_tests;
 #[cfg(test)]
 mod preflight_hash_reuse_tests;
+#[cfg(test)]
+mod semantic_statement_lifetime_tests;
 #[cfg(test)]
 mod unchanged_trust_tests;

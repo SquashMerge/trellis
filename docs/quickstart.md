@@ -389,6 +389,15 @@ Where you'll see this:
 
 `fresh` comes back when you've re-imported.
 
+## Dogfood an installed candidate
+
+For a release candidate or a real-repository MCP check, follow the
+[installed-binary smoke steps](releases.md#installed-binary-mcp-dogfood). The runner
+uses your installed binary and chosen checkout, checks every live catalog tool,
+and reports errors and missing capabilities without printing tokens. It needs
+this project's tooling checkout and Node dependencies; it is not bundled in the
+release archive.
+
 ## Next
 
 - [Known limitations](known-limitations.md)

@@ -88,6 +88,24 @@ if (process.env.TRELLIS_SEQUENCE_CLEANUP_CHILD === "1") {
       rmSync(paths.temp, {recursive:true,force:true,maxRetries:10,retryDelay:100});
     }
   });
+  test("detached cleanup rejects changed, gone and wrong-HOME identities before signals", async () => {
+    const home = "/tmp/sequence-identity-home";
+    const row = (start, selectedHome=home) => `123 ${start} S ${H.binary} daemon HOME=${selectedHome} PATH=/bin\n`;
+    const first = "Mon Nov 2 10:00:00 2026", changed = "Mon Nov 2 10:00:01 2026";
+    for (const observed of [row(changed), "", row(first, home+"-other")]) {
+      const calls = [];
+      await H.stopSuiteDaemons({homes:new Set([home]),
+        runCommand:async (_command,args) => ({stdout:args.includes("-A") ? row(first) : observed}),
+        signal:(...args)=>calls.push(args)});
+      assert.deepEqual(calls,[]);
+    }
+    let reads = 0;
+    const calls = [];
+    await assert.rejects(H.stopSuiteDaemons({homes:new Set([home]), grace:0,
+      runCommand:async () => ({stdout:++reads < 4 ? row(first) : row(changed)}),
+      signal:(...args)=>calls.push(args)}), /ignored SIGTERM/);
+    assert.deepEqual(calls,[[123,"SIGTERM"]],"identity changed immediately before escalation");
+  });
   for (const action of ["cleanup", "fail", "SIGTERM", "SIGINT"]) {
     test(`sequence harness cleans its detached daemon on ${action}`, {timeout:150000}, async () => {
       const child = fork(__filename, [], {env:{...process.env,TRELLIS_SEQUENCE_CLEANUP_CHILD:"1"}, stdio:["ignore","pipe","pipe","ipc"]});
@@ -115,8 +133,8 @@ if (process.env.TRELLIS_SEQUENCE_CLEANUP_CHILD === "1") {
       } finally {
         await Promise.all([H.stopDaemon({child:unrelated}), H.stopDaemon({child})]);
         if (owned) {
-          if (alive(owned.pid)) process.kill(owned.pid, "SIGTERM");
-          if (alive(owned.servePid)) process.kill(owned.servePid, "SIGTERM");
+          // The child suite owns cleanup. Never signal cached grandchild PIDs.
+          if (existsSync(owned.binary)) await H.stopSuiteDaemons({suiteBinary:owned.binary, homes:new Set([join(owned.temp,"home")])});
           rmSync(owned.temp, {recursive:true,force:true,maxRetries:10,retryDelay:100});
           rmSync(dirname(owned.binary), {recursive:true,force:true});
         }

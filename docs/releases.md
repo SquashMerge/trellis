@@ -99,6 +99,58 @@ or embedding code changes, re-run the full form-c CPU/Metal parity check in
 not a substitute for all 6,722 cards and 50 queries, and a missing model or
 reference corpus is not a successful parity run.
 
+### Installed-binary MCP dogfood
+
+The packaged-byte smoke above is not a real-repository MCP dogfood run. Before
+publication, clean-install the candidate archive as in the
+[quickstart](quickstart.md#1-install), then import Rust and JavaScript semantic
+evidence on the Trellis checkout using the
+[producer steps](quickstart.md#5-add-semantic-evidence) or the refresh scripts.
+Finish indexing and configure the optional search model before running the smoke.
+Use a callable symbol present in that checkout; `--query` defaults to `main`.
+
+The runner needs Node 22 or later and this tooling checkout's pinned MCP SDK and
+Ajv dependencies. From the Trellis tooling checkout:
+
+```sh
+npm ci --prefix tests/mcp --ignore-scripts
+./tools/mcp-smoke --binary /absolute/path/to/installed/trellis \
+  --workspace /absolute/path/to/trellis-checkout --query main > mcp-smoke.json
+```
+
+`--binary` is required: the runner never builds, installs, or substitutes a Cargo
+binary. It starts that executable's `mcp` command with the given checkout and your
+normal environment. An existing daemon may still be running older bytes. Before
+candidate qualification, explicitly stop your old daemon using the
+[quickstart stopping steps](quickstart.md#2-start-trellis-and-connect-the-web-app),
+then index/import with the candidate. The runner never stops a daemon, and leaves
+an auto-started daemon running. Its report does not attest the daemon's binary.
+
+The script discovers the live catalog, validates inputs and every returned
+`structuredContent` against its live JSON Schemas, and records per-call timings
+and result sizes. It discovers a real callable symbol, its source location, and a
+real rules instance for explanation. All advertised tools must be exercised;
+missing recipes, symbols or rules instances are failures, not skips. Rules
+pagination stops after finding an instance. This is a smoke, not exhaustive graph
+or source verification. Native partial coverage, rule deviations and `unknown`
+conformance are not by themselves tool errors.
+
+A nonzero exit blocks this qualification step: investigate every tool error
+(including `deadline_exceeded`), schema mismatch, missing/stale semantic evidence
+for the selected language, unavailable or incomplete search index, unready
+workspace or missing capability. Watcher degradation is reported separately.
+A lexical search response does not pass when its
+model is missing. Finish setup and rerun; do not mark a failed or partial run as
+qualified. The JSON report contains only fixed labels, codes, counts, sizes and
+timings, never tokens, source text, raw tool responses or subprocess stderr.
+
+Retain the report with the candidate archive checksum and tested checkout SHA.
+Also complete the [#150 eight-task MCP run](https://github.com/SquashMerge/trellis/issues/150)
+with no fallbacks and responses under the agent size limit, and the Claude Desktop
+UI review with no new P1 gaps. This script does not replace either human dogfood
+step or claim they passed. The release checklist is
+[#529](https://github.com/SquashMerge/trellis/issues/529).
+
 Release archives, SHA-256 checksums and provenance belong on GitHub Releases.
 Provenance records the tagged commit, target, compiled features, toolchain,
 locked inputs and archived bytes. Rebuildable source is not a claim of proven

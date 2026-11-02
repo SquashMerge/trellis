@@ -236,7 +236,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       semantic: [["node", "tools/semantic-contract/test/run.mjs"]],
       cohorts: [["node", "--test", "tools/synthetic-cohorts/test/cohorts.test.mjs"]],
       checks: [
-        ["node", "--test", "tests/mcp-catalog-sdk.test.mjs"],
+        ["node", "--test", "tests/mcp-catalog-sdk.test.mjs", "tests/mcp-smoke.test.mjs"],
         ["python3", "tools/stage3-watcher-runner-test.py"],
         ["python3", "tools/verify-67-mixed-performance-test.py"],
         ["python3", "tools/verify-40-query-performance-test.py"],
@@ -361,4 +361,32 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });
   }
+});
+
+test("verify cancellation rechecks recorded identities after descending, without PID fallback", () => {
+  const source = readFileSync(join(ROOT, "tools/verify"), "utf8");
+  const functions = source.slice(source.indexOf("process_identity()"), source.indexOf("# An early lane failure"));
+  const temp = mkdtempSync(join(tmpdir(), "trellis-verify-identity-"));
+  try {
+    const rootIdentity = "99 Mon Nov 2 10:00:00 2026 installer";
+    const childIdentity = "123 Mon Nov 2 10:00:00 2026 child";
+    writeFileSync(join(temp,"123"),rootIdentity+"\n");
+    writeFileSync(join(temp,"124"),childIdentity+"\n");
+    const script = `${functions}
+process_identity() { cat "$FIXTURE/$1" 2>/dev/null || true; }
+pgrep() {
+  if [ "$2" = 123 ]; then echo 124; fi
+  if [ "$2" = 124 ]; then
+    printf '%s\n' '99 Mon Nov 2 10:00:01 2026 replacement' > "$FIXTURE/123"
+  fi
+}
+kill() { printf '%s\n' "$*" >> "$FIXTURE/signals"; }
+stop_tree 123 '${rootIdentity}'
+stop_tree 125 ''
+stop_tree 124 'wrong identity'
+`;
+    const result = spawnSync("/bin/sh", ["-c",script], {encoding:"utf8", env:{...process.env,FIXTURE:temp}});
+    assert.equal(result.status,0,result.stderr);
+    assert.equal(readFileSync(join(temp,"signals"),"utf8"),"-TERM 124\n");
+  } finally { rmSync(temp,{recursive:true,force:true}); }
 });

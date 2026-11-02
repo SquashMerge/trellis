@@ -101,6 +101,15 @@ jobs:
         run: |
           cargo clippy --locked --all-targets --no-default-features --features metal -- -D warnings
           cargo nextest run --locked --all-targets --no-fail-fast --no-default-features --features test-support,metal
+      - name: Free Linux runner space before container build
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo 'Disk space before removing unused preinstalled SDKs'
+          df -h / "$GITHUB_WORKSPACE"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          echo 'Disk space after removing unused preinstalled SDKs'
+          df -h / "$GITHUB_WORKSPACE"
       - name: Build native glibc 2.31 candidate
         if: runner.os == 'Linux'
         shell: bash

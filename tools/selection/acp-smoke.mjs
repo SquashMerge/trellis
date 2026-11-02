@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import { performance } from 'node:perf_hooks';
 import { randomUUID } from 'node:crypto';
@@ -112,12 +112,31 @@ export function reportedUsd(updates) {
   const costs=updates.map(u=>u.cost).filter(c=>c?.currency==='USD' && Number.isFinite(c.amount) && c.amount>=0);
   return costs.length?Math.max(...costs.map(c=>c.amount)):null;
 }
-export async function killGroup(child) {
-  if(!child?.pid) return;
-  const kill=signal=>{try{process.kill(-child.pid,signal);}catch(e){if(e.code!=='ESRCH') throw e;}};
+// Keep the leader's launch observation, not a fresh identity sampled at cleanup.
+// lstart is second-resolution; the command/PGID recheck narrows (not closes)
+// the exit/reuse window and cannot distinguish same-second identical launches.
+export function groupIdentity(pid) {
+  if(!Number.isInteger(pid) || pid<=0) return null;
+  const result=spawnSync('ps',['ww','-p',String(pid),'-o','pgid=,lstart=,stat=,command='],{encoding:'utf8',timeout:10000});
+  if(result.status!==0) return null;
+  const row=result.stdout.trim().match(/^(\d+)\s+((?:\S+\s+){4}\S+)\s+(\S+)\s+(.*)$/);
+  if(!row || Number(row[1])!==pid || row[3].startsWith('Z')) return null;
+  return `${row[1]} ${row[2].replace(/\s+/g,' ')} ${row[4]}`;
+}
+export async function killGroup(child,identity,{observe=groupIdentity,signal=process.kill,
+  pause=ms=>new Promise(resolve=>setTimeout(resolve,ms))}={}) {
+  if(!child?.pid) return {complete:true};
+  if(!Number.isInteger(child.pid) || child.pid<=0) return {complete:false,reason:'invalid group leader PID; cleanup incomplete'};
+  const absent=()=>{try{signal(-child.pid,0);return false;}catch(e){if(e.code==='ESRCH') return true;throw e;}};
+  const matches=()=>identity && child.exitCode===null && child.signalCode===null && observe(child.pid)===identity;
+  const incomplete=()=>({complete:absent(),reason:'group leader exited or changed; cleanup incomplete if descendants remain'});
+  if(!matches()) return incomplete();
+  const kill=name=>{try{signal(-child.pid,name);}catch(e){if(e.code!=='ESRCH') throw e;}};
   kill('SIGTERM');
-  await new Promise(resolve=>setTimeout(resolve,300));
+  await pause(300);
+  if(!matches()) return incomplete();
   kill('SIGKILL');
+  return {complete:true};
 }
 export async function main(packetArg,outputArg,...flags) {
   const limits=parseLimits(flags), options={...OPTIONS,maxBudgetUsd:limits.sdkBudgetUsd};
@@ -134,7 +153,7 @@ export async function main(packetArg,outputArg,...flags) {
   const start=performance.now(), scratch=fs.mkdtempSync(path.join(os.tmpdir(),'selection-acp-'));
   const usageUpdates=[],permissionAudit=[],audit=toolAudit(),responseAudit=toolResponseAudit(),phaseTimingsMs={};
   let phaseStart=start;
-  const phase=next=>{const now=performance.now();phaseTimingsMs[stage]=(phaseTimingsMs[stage]??0)+Math.round(now-phaseStart);phaseStart=now;stage=next;}; let child,connection,sessionId,timer,authKind=null,authPlan=null,permissionsDenied=0,stage='launch',completed=false,diagnosticBytes=0;
+  const phase=next=>{const now=performance.now();phaseTimingsMs[stage]=(phaseTimingsMs[stage]??0)+Math.round(now-phaseStart);phaseStart=now;stage=next;}; let child,childIdentity,connection,sessionId,timer,authKind=null,authPlan=null,permissionsDenied=0,stage='launch',completed=false,diagnosticBytes=0;
   const record={schemaVersion:1,provider:'claude-acp',contextDelivery:limits.inlineContext?'inline':'mcp',reservationId:id,packetHash:digest(packet),providerPacketHash:digest(providerPacket(packet)),instructionsHash:digest(INSTRUCTIONS),graphHash:packet.graphHash,questionId:packet.questionId,requestedModel:OPTIONS.model,packetBytes:Buffer.byteLength(JSON.stringify(packet)),providerPacketBytes:Buffer.byteLength(JSON.stringify(providerPacket(packet))),limits:{reserveUsd:limits.reserveUsd,maxBudgetUsd:limits.sdkBudgetUsd,maxTurns:4,maxOutputTokens:4096,maxMcpOutputTokens:64000,timeoutMs:120000},costNote:'Provider-reported token-equivalent USD estimate, not actual subscription cash charge; unknown/failed cost retains the full reservation. Not an invoice guarantee.'};
   const log=fs.openSync(logFile,'wx',0o600);
   let rejectAbort;
@@ -143,6 +162,7 @@ export async function main(packetArg,outputArg,...flags) {
   process.once('SIGINT',abort);process.once('SIGTERM',abort);
   try {
     child=spawn(process.execPath,[adapter],{cwd:scratch,env:safeEnv(),stdio:['pipe','pipe','pipe'],detached:true});
+    childIdentity=groupIdentity(child.pid);
     child.on('error',()=>rejectAbort(new Error('Adapter launch failed')));
     child.stderr.on('data',chunk=>{if(diagnosticBytes<65536){const line=redactedDiagnostic(chunk.toString());fs.writeSync(log,line);diagnosticBytes+=line.length;}});
     let wireBytes=0;
@@ -207,7 +227,10 @@ export async function main(packetArg,outputArg,...flags) {
     phase('cleanup');
     clearTimeout(timer);process.removeListener('SIGINT',abort);process.removeListener('SIGTERM',abort);
     if(sessionId && !completed) connection?.agent.notify('session/cancel',{sessionId}).catch(()=>{});
-    connection?.close();await killGroup(child);fs.closeSync(log);
+    connection?.close();
+    record.cleanup=await killGroup(child,childIdentity);
+    if(!record.cleanup.complete) {record.status='failed';record.error=record.cleanup.reason;}
+    fs.closeSync(log);
     fs.rmSync(scratch,{recursive:true,force:true});
     phase('done');record.phaseTimingsMs=phaseTimingsMs;record.toolCallAudit=audit.snapshot();record.toolResponseAudit=responseAudit.snapshot();
     record.latencyMs=Math.round(performance.now()-start);record.permissionsDenied=permissionsDenied;record.permissionAudit=permissionAudit;
