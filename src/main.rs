@@ -1470,6 +1470,7 @@ async fn run_daemon() -> Result<()> {
     let browser = Arc::new(tokio::sync::Mutex::new(daemon::BrowserProvisioner::new()));
     let next_session = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
+    let mut connections = tokio::task::JoinSet::new();
     let idle = daemon::run_idle_lifecycle(registry.clone());
     tokio::pin!(idle);
     // A test-elected daemon ends with the test process that owns it (#130),
@@ -1484,6 +1485,10 @@ async fn run_daemon() -> Result<()> {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if !trellis::testing::process_running(pid) {
+                    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_OWNER_GONE_SOCKET") {
+                        let _observed = std::os::unix::net::UnixStream::connect(path)
+                            .expect("connect owner-exit observation fixture");
+                    }
                     return;
                 }
             }
@@ -1503,6 +1508,7 @@ async fn run_daemon() -> Result<()> {
         tokio::select! {
             result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break; }
             () = &mut owner_gone => break,
+            _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = async {
                 #[cfg(feature = "test-support")]
                 if let Some(errno) = injected_accept_errno {
@@ -1535,16 +1541,93 @@ async fn run_daemon() -> Result<()> {
                 let search = search.clone();
                 let id = next_session.fetch_add(1, Ordering::Relaxed);
                 let browser_shutdown = browser_shutdown.clone();
-                tokio::task::spawn_blocking(move || {
+                connections.spawn_blocking(move || {
                     let _ = dispatch_connection(stream, id, registry, browser, search, browser_shutdown, accepted_at);
                 });
             }
         }
     }
-    let _ = browser_shutdown.send(true);
+    stop_daemon_connections(&browser_shutdown, &mut connections).await;
     drop(listener);
     drop(owner);
     Ok(())
+}
+
+async fn stop_daemon_connections(
+    shutdown: &tokio::sync::watch::Sender<bool>,
+    connections: &mut tokio::task::JoinSet<()>,
+) {
+    shutdown.send_replace(true);
+    while connections.join_next().await.is_some() {}
+}
+
+#[cfg(test)]
+mod daemon_shutdown_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct ControlPeer(std::os::unix::net::UnixStream);
+    impl Drop for ControlPeer {
+        fn drop(&mut self) {
+            let _ = self.0.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_is_retained_for_a_late_serve_subscriber() {
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        drop(receiver);
+        let (control, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _peer = ControlPeer(peer);
+        let mut connections = tokio::task::JoinSet::new();
+        let (release, admitted) = std::sync::mpsc::channel();
+        let (observed, observation) = tokio::sync::oneshot::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let late_shutdown = shutdown.clone();
+        connections.spawn_blocking(move || {
+            admitted.recv().unwrap();
+            let stopped = late_shutdown.subscribe();
+            let retained = *stopped.borrow();
+            if retained {
+                wait_for_serve_disconnect(control, stopped, &runtime).unwrap();
+            }
+            let _ = observed.send(retained);
+        });
+        // This current-thread task runs only after shutdown publishes its value
+        // and yields while draining the accepted dispatch.
+        tokio::spawn(async move { release.send(()).unwrap() });
+        stop_daemon_connections(&shutdown, &mut connections).await;
+        assert!(
+            observation.await.unwrap(),
+            "daemon shutdown was lost before a serve control watcher subscribed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_finishes_the_serve_control_read_before_returning() {
+        let (control, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _peer = ControlPeer(peer);
+        let (shutdown, stopped) = tokio::sync::watch::channel(false);
+        let mut connections = tokio::task::JoinSet::new();
+        let completed = Arc::new(AtomicBool::new(false));
+        let finished = completed.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        connections.spawn_blocking(move || {
+            let _ = started.send(());
+            wait_for_serve_disconnect(control, stopped, &runtime).unwrap();
+            finished.store(true, Ordering::Release);
+        });
+        ready.await.unwrap();
+        stop_daemon_connections(&shutdown, &mut connections).await;
+        assert!(
+            completed.load(Ordering::Acquire),
+            "daemon shutdown returned before its serve control read finished"
+        );
+    }
 }
 
 fn checked_serve_options(raw: serde_json::Value) -> Result<registry::CheckoutOptions> {
@@ -2307,24 +2390,32 @@ fn dispatch_connection(
         // The scoped registration holds the daemon alive until this control
         // connection closes or the daemon stops, signalled by
         // the shutdown channel instead of a polled flag (#138 item 21).
-        let closer = stream.try_clone()?;
-        let mut shutdown = browser_shutdown.subscribe();
-        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
-        let watcher = runtime.spawn(async move {
-            tokio::select! {
-                _ = shutdown.wait_for(|stopped| *stopped) => {
-                    let _ = closer.shutdown(std::net::Shutdown::Both);
-                }
-                _ = closed_rx => {}
-            }
-        });
-        stream.set_read_timeout(None)?;
-        let mut one = [0u8; 1];
-        use std::io::Read;
-        while matches!(stream.read(&mut one), Ok(n) if n > 0) {}
-        let _ = closed_tx.send(());
-        let _ = runtime.block_on(watcher);
+        wait_for_serve_disconnect(stream, browser_shutdown.subscribe(), &runtime)?;
     }
+    Ok(())
+}
+
+fn wait_for_serve_disconnect(
+    mut stream: std::os::unix::net::UnixStream,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<()> {
+    let closer = stream.try_clone()?;
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+    let watcher = runtime.spawn(async move {
+        tokio::select! {
+            _ = shutdown.wait_for(|stopped| *stopped) => {
+                let _ = closer.shutdown(std::net::Shutdown::Both);
+            }
+            _ = closed_rx => {}
+        }
+    });
+    stream.set_read_timeout(None)?;
+    let mut one = [0u8; 1];
+    use std::io::Read;
+    while matches!(stream.read(&mut one), Ok(n) if n > 0) {}
+    let _ = closed_tx.send(());
+    let _ = runtime.block_on(watcher);
     Ok(())
 }
 
