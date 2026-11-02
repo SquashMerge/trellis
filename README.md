@@ -52,50 +52,66 @@ never trigger removal.
 ## Local semantic search
 
 `trellis_search_symbols` can combine lexical results with local voyage-4-nano embeddings.
-Weights are optional and must be downloaded explicitly. On macOS, build with Metal support
-for acceleration (the default build remains CPU-only):
+Weights are optional. Nothing downloads implicitly: only an explicit install command can
+fetch them. No separate Hugging Face CLI is needed:
 
 ```sh
-cargo install --path . --locked --features metal
-```
-
-For CPU-only installation, use `cargo install --path . --locked`. With Hugging Face's `hf`
-CLI installed separately, download the supported revision and all nine required files to
-an absolute directory outside your checkouts:
-
-```sh
-export TRELLIS_SEARCH_MODEL="$HOME/.local/share/trellis/models/voyage-4-nano/5fb34e870f49f19e79c94d5e118f5ee730133279"
-hf download voyageai/voyage-4-nano \
-  --revision 5fb34e870f49f19e79c94d5e118f5ee730133279 \
-  --local-dir "$TRELLIS_SEARCH_MODEL" \
-  1_Pooling/config.json config.json config_sentence_transformers.json \
-  model.safetensors modeling_qwen3_bidirectional.py modules.json \
-  sentence_bert_config.json tokenizer.json tokenizer_config.json
-export TRELLIS_SEARCH_BACKEND=auto
+trellis model install
+trellis model list
 trellis status --workspace /absolute/path/to/checkout
 ```
 
-This weights location is recommended, not automatically discovered. Trellis verifies the
-pinned files and never executes the downloaded Python file. `TRELLIS_SEARCH_BACKEND` accepts
-`auto` (Metal on a supported macOS Metal build, otherwise CPU), `cpu`, or `metal`. Explicit
-Metal selection never silently falls back to CPU.
+Install fetches the selected reviewed pin, verifies all nine files against pinned SHA-256
+hashes, then publishes the complete snapshot atomically. A valid existing snapshot is
+verified without fetching; an incomplete or invalid one is refused. Remove it explicitly
+before reinstalling:
 
-Set these variables in your shell startup file or editor/agent MCP launcher environment.
-There is no persistent model configuration file. The shared daemon inherits the environment
-of the first CLI or MCP process that auto-starts it; later callers' variables and a newly
-installed binary do not reconfigure an existing daemon. To change settings, stop clients,
-terminate the inspected `trellis daemon` PID with `kill -TERM <pid>`, then run the status
-command above from the configured environment before reconnecting clients. There is no
-CLI restart command. See the [model and daemon setup guide](docs/semantic-search-local-cache.md)
-for PID discovery and restart details.
+```sh
+trellis model remove voyageai/voyage-4-nano --revision 5fb34e870f49f19e79c94d5e118f5ee730133279
+trellis model install
+```
 
-Search, workspace describe and CLI status report `searchIndex.unavailableReason` as
-`model_not_configured` when the model variable was unset or empty, or `model_load_failed` when the
-configured files could not be verified or loaded. Both preserve lexical retrieval. Describe
-and CLI status expose only `{backend, unavailableReason}`, not search readiness or coverage.
-An untried/loading model or missing resident matrix still has a `null` reason; this is not
-proof of vector readiness. Search's existing `vector_budget_exceeded` reason is unchanged.
-See the [local model/cache guide](docs/semantic-search-local-cache.md) for readiness and cache behavior.
+The default model is `voyageai/voyage-4-nano` at revision
+`5fb34e870f49f19e79c94d5e118f5ee730133279`. Snapshots are shared across checkouts under
+`<modelsDir>/voyageai/voyage-4-nano/<revision>`. The default `modelsDir` is:
+
+- macOS: `~/Library/Application Support/dev.squashmerge.trellis/models`
+- Linux: `$XDG_DATA_HOME/trellis/models`, or `~/.local/share/trellis/models` when unset.
+
+Defaults work without a configuration file and are never written automatically. Optional
+user-wide overrides live at the literal path `~/.config/trellis/config.toml`:
+
+```toml
+models_dir = "/absolute/path/to/shared/models"
+backend = "auto"
+
+[model]
+name = "voyageai/voyage-4-nano"
+revision = "5fb34e870f49f19e79c94d5e118f5ee730133279"
+```
+
+All overrides are optional; `models_dir` must be absolute (no `~` expansion), and `backend`
+accepts `auto`, `cpu`, or `metal`. Invalid configuration fails clearly instead of falling
+back. Official macOS ARM64 releases include Metal; source builds need
+`cargo install --path . --locked --features metal` for acceleration. Explicit Metal never
+silently falls back to CPU. Trellis never executes downloaded Python.
+
+This persistent setup also works for Claude Desktop without model environment variables in
+its MCP launcher. `TRELLIS_SEARCH_MODEL` and `TRELLIS_SEARCH_BACKEND` remain development/test
+overrides: environment wins over file, then defaults; an empty model override disables it.
+
+**Settings are captured only at daemon startup.** Install/remove do not write configuration.
+Neither model commands nor configuration edits restart/reconfigure a running daemon. Follow the
+[manual restart guide](docs/semantic-search-local-cache.md#configuration-and-daemon-restart)
+before expecting changes. `model list` prints JSON for the next startup without fetching,
+loading weights or starting a daemon; its `filesPresent` is not hash verification.
+
+CLI status, workspace describe and browser diagnostics include the daemon's effective
+`searchIndex.configuration` and per-field sources, beside `backend` and `unavailableReason`.
+Missing managed files preserve lexical retrieval with `model_not_configured`; a failed
+verification/load reports `model_load_failed`. Configuration is not query readiness, and a
+null reason does not prove vector availability. See the
+[local model/cache guide](docs/semantic-search-local-cache.md) for details.
 
 ## What works
 

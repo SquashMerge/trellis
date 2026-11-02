@@ -170,6 +170,14 @@ pub(crate) fn supported_model_name() -> &'static str {
     SUPPORTED_MODEL.name
 }
 
+pub(crate) fn supported_model_revision() -> &'static str {
+    SUPPORTED_MODEL.revision
+}
+
+pub(crate) fn supported_model_files() -> &'static [(&'static str, &'static str)] {
+    SUPPORTED_MODEL.files
+}
+
 pub(crate) fn model_id_for_card_format(card_format: &str) -> String {
     crate::native_ids::digest(
         b"trellis.search-model.v1\0",

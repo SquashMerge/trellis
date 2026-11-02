@@ -354,7 +354,15 @@
     text("workspace-name", rootName(root) || "No workspace");
     text("workspace-meta", status ? `Revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision} · ${status.stats?.files ?? 0} files · ${"Syntax only · SCIP display metadata is not proof"}` : checkoutRoot ? "Index status unavailable" : "Connect to a local daemon");
     if (get("workspace-name")) get("workspace-name").title = root;
-
+    const search = status?.searchIndex, config = search?.configuration;
+    const reason = search?.unavailableReason;
+    const modelState = reason === "model_not_configured" ? "Lexical search only — model files are missing or disabled"
+      : reason === "model_load_failed" ? "Lexical search only — model could not load"
+      : "Search model configured; embedding readiness is reported per query";
+    text("search-model-status", config
+      ? `${modelState}. ${config.modelName}@${config.modelRevision} (${config.sources?.model}) · Looked in: ${config.modelPath || "disabled by environment"} · Models directory: ${config.modelsDir} (${config.sources?.modelsDir}) · Backend: ${config.backend} (${config.sources?.backend}) · Config: ${config.configFile}`
+      : "");
+    hide("search-model-status", !config);
   }
   function reset() {
     setSection("diagrams"); resetInspector(); showView("architecture"); closePopovers(); hide("source-dock", true); hide("dock-library", true); sourceReturnFocus = null;

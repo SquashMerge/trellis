@@ -11,6 +11,9 @@ use std::{
     time::Duration,
 };
 
+const REVIEWED_MODEL_NAME: &str = "voyageai/voyage-4-nano";
+const REVIEWED_MODEL_REVISION: &str = "5fb34e870f49f19e79c94d5e118f5ee730133279";
+
 fn emitted_document<'a>(data: &'a Value, item: &Value) -> &'a Value {
     let doc = item["doc"].as_u64().expect("emitted doc index") as usize;
     let documents = data["documents"].as_array().expect("document table");
@@ -685,7 +688,13 @@ for (const {name, structuredContent} of inputs) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
-fn expected_envelope(id: &Value, code: Option<&str>, label: &str, root: &Value) -> Value {
+fn expected_envelope(
+    id: &Value,
+    code: Option<&str>,
+    label: &str,
+    root: &Value,
+    home: &Path,
+) -> Value {
     let fixture = fixture();
     if let Some(code) = code {
         let spec = &fixture["expected"]["failures"][code];
@@ -701,16 +710,33 @@ fn expected_envelope(id: &Value, code: Option<&str>, label: &str, root: &Value) 
         let mut envelope = fixture["expected"]["describe"].clone();
         envelope["requestId"] = id.clone();
         envelope["data"]["workspaceLabel"] = json!(label);
-        envelope["data"]["searchIndex"] =
-            json!({"backend":"cpu","unavailableReason":"model_not_configured"});
+        let models_dir = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/dev.squashmerge.trellis/models")
+        } else {
+            home.join("data/trellis/models")
+        };
+        envelope["data"]["searchIndex"] = json!({
+            "backend":"cpu","unavailableReason":"model_not_configured",
+            "configuration":{
+                "configFile":home.join(".config/trellis/config.toml"),
+                "modelsDir":models_dir,
+                "modelName":REVIEWED_MODEL_NAME,
+                "modelRevision":REVIEWED_MODEL_REVISION,
+                "modelPath":models_dir
+                    .join(REVIEWED_MODEL_NAME)
+                    .join(REVIEWED_MODEL_REVISION),
+                "backend":"cpu",
+                "sources":{"modelsDir":"default","model":"default","backend":"environment"}
+            }
+        });
         envelope["workspace"] = root.clone();
         envelope["catchingUp"] = json!(true);
         envelope
     }
 }
-fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str) {
+fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str, home: &Path) {
     let root = &v["result"]["structuredContent"]["workspace"];
-    let mut envelope = expected_envelope(&v["id"], code, label, root);
+    let mut envelope = expected_envelope(&v["id"], code, label, root, home);
     if code.is_none() {
         let actual = &v["result"]["structuredContent"];
         let state = actual["data"]["indexState"].as_str().unwrap();
@@ -787,13 +813,14 @@ fn exact_tool_for_id(
     code: Option<&str>,
     modern: bool,
     label: &str,
+    home: &Path,
 ) {
     assert_eq!(&v["id"], expected_id, "outer JSON-RPC ID must echo sent ID");
     assert_eq!(
         &v["result"]["structuredContent"]["requestId"], expected_id,
         "typed requestId must echo sent ID"
     );
-    exact_tool(v, code, modern, label);
+    exact_tool(v, code, modern, label, home);
 }
 /// Exact post-H golden responses retain full structured evidence and a summary.
 fn exact_golden_settled(v: &Value, expected_id: &Value, modern: bool, envelope: Value) {
@@ -1041,7 +1068,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
                 !legacy,
             );
             if i == 0 {
-                exact_tool(&reply, None, !legacy, "checkout");
+                exact_tool(&reply, None, !legacy, "checkout", peer._home.path());
                 assert_eq!(
                     reply["result"]["structuredContent"]["data"]["workspaceLabel"],
                     "checkout"
@@ -2062,11 +2089,18 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                 let name = name.as_str().unwrap();
                 let bad = json!({"schemaVersion":1,"unknown":"rejected"});
                 let invalid = peer.ask(call(legacy, id.clone(), name, bad));
-                exact_tool_for_id(&invalid, &id, Some("invalid_request"), !legacy, "checkout");
+                exact_tool_for_id(
+                    &invalid,
+                    &id,
+                    Some("invalid_request"),
+                    !legacy,
+                    "checkout",
+                    peer._home.path(),
+                );
                 let args = fixture()["validArguments"][index].clone();
                 let accepted = peer.ask(call(legacy, id.clone(), name, args));
                 if index == 0 {
-                    exact_tool_for_id(&accepted, &id, None, !legacy, "checkout");
+                    exact_tool_for_id(&accepted, &id, None, !legacy, "checkout", peer._home.path());
                     if settled_pin.is_none() {
                         settled_pin = Some(await_settled_golden_h(&witness, &root_key).await);
                     }
@@ -2094,6 +2128,7 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                     Some("invalid_request"),
                     !legacy,
                     "checkout",
+                    peer._home.path(),
                 );
             }
         }
@@ -2131,6 +2166,7 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
             Some("range_too_large"),
             !legacy,
             "checkout",
+            peer._home.path(),
         );
         for fields in [
             json!({"name":"trellis_workspace_describe","arguments":{},"unexpected":0}),
@@ -2159,6 +2195,7 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
         Some("index_not_ready"),
         true,
         "checkout",
+        peer._home.path(),
     );
     assert!(peer.finish().0.success());
 }
@@ -2222,6 +2259,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         None,
         true,
         "ancestor",
+        explicit._home.path(),
     );
     let ancestor_marker = ancestor.join(".git/trellis/workspace-id");
     let first_marker = fs::read(&ancestor_marker).unwrap();
@@ -2238,6 +2276,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         None,
         true,
         "ancestor",
+        adopted._home.path(),
     );
     assert!(adopted.finish().0.success());
     assert_eq!(fs::read(&ancestor_marker).unwrap(), first_marker);
@@ -2252,6 +2291,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         None,
         true,
         "nearer",
+        implicit._home.path(),
     );
     let nearer_marker = fs::read(nearer.join(".git/trellis/workspace-id")).unwrap();
     assert_ne!(first_marker, nearer_marker);
@@ -2456,7 +2496,13 @@ fn unusable_index_sentinels_do_not_change_unavailable_projection_or_get_repaired
             name,
             fixture()["validArguments"][i].clone(),
         ));
-        exact_tool(&response, Some("index_not_ready"), true, "checkout");
+        exact_tool(
+            &response,
+            Some("index_not_ready"),
+            true,
+            "checkout",
+            peer._home.path(),
+        );
     }
     no_db_under_except(peer._home.path(), &sentinels);
     for index in sentinels {
@@ -2497,7 +2543,13 @@ fn golden_modern_legacy_transcripts() {
             "trellis_workspace_describe",
             json!({"schemaVersion":1}),
         ));
-        exact_tool(&response, None, mode == "modern", "checkout");
+        exact_tool(
+            &response,
+            None,
+            mode == "modern",
+            "checkout",
+            peer._home.path(),
+        );
         let response = peer.ask(call(
             mode == "legacy",
             json!("golden-evidence"),
@@ -2509,6 +2561,7 @@ fn golden_modern_legacy_transcripts() {
             Some("index_not_ready"),
             mode == "modern",
             "checkout",
+            peer._home.path(),
         );
         assert!(peer.finish().0.success());
     }
@@ -2546,7 +2599,13 @@ fn ordinary_cancellation_and_eof_without_private_race_hook() {
         peer.stdin.as_mut().unwrap().flush().unwrap();
         let mut reply = peer.reply();
         if reply["id"] == "cancel-me" {
-            exact_tool(&reply, Some("index_not_ready"), !legacy, "checkout");
+            exact_tool(
+                &reply,
+                Some("index_not_ready"),
+                !legacy,
+                "checkout",
+                peer._home.path(),
+            );
             reply = peer.reply();
         }
         assert_eq!(reply["id"], "after-cancel");
@@ -2655,7 +2714,7 @@ fn linked_git_worktrees_get_distinct_selected_markers() {
             "trellis_workspace_describe",
             json!({"schemaVersion":1}),
         ));
-        exact_tool_for_id(&result, &json!(1), None, true, label);
+        exact_tool_for_id(&result, &json!(1), None, true, label, peer._home.path());
         let marker = git.join("trellis/workspace-id");
         ids.push(fs::read(&marker).unwrap());
         assert!(
@@ -2670,7 +2729,7 @@ fn linked_git_worktrees_get_distinct_selected_markers() {
             "trellis_workspace_describe",
             json!({"schemaVersion":1}),
         ));
-        exact_tool_for_id(&result, &json!(2), None, true, label);
+        exact_tool_for_id(&result, &json!(2), None, true, label, reopened._home.path());
         assert!(reopened.finish().0.success());
         assert_eq!(
             fs::read(&marker).unwrap(),
@@ -12376,12 +12435,54 @@ async fn mcp_search_model_configuration_reasons_reach_describe_and_status() {
     use trellis::{
         daemon::search::SearchService, search_embed::EmbedError, search_model::SearchConfig,
     };
-    for configured in [false, true] {
+    for scenario in ["unconfigured", "load_failed", "managed_missing"] {
+        let configured = scenario == "load_failed";
+        let home = tempfile::tempdir().unwrap();
+        let config_file = home.path().join(".config/trellis/config.toml");
+        let models_dir = home.path().join("custom-models");
+        let mut expected_status = json!({
+            "backend":"cpu",
+            "unavailableReason":if configured { "model_load_failed" } else { "model_not_configured" }
+        });
+        if scenario == "managed_missing" {
+            fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+            fs::write(
+                &config_file,
+                format!(
+                    "models_dir = {:?}\nbackend = \"cpu\"\n[model]\nname = {:?}\nrevision = {:?}\n",
+                    models_dir.to_str().unwrap(),
+                    REVIEWED_MODEL_NAME,
+                    REVIEWED_MODEL_REVISION,
+                ),
+            )
+            .unwrap();
+            expected_status["configuration"] = json!({
+                "configFile":config_file,
+                "modelsDir":models_dir,
+                "modelName":REVIEWED_MODEL_NAME,
+                "modelRevision":REVIEWED_MODEL_REVISION,
+                "modelPath":models_dir
+                    .join(REVIEWED_MODEL_NAME)
+                    .join(REVIEWED_MODEL_REVISION),
+                "backend":"cpu",
+                "sources":{"modelsDir":"config_file","model":"config_file","backend":"config_file"}
+            });
+        }
         let (fixture, service, _) = SearchMcpFixture::with_optional_search(
             &[("a.js", "function orchard() {}\n")],
             false,
             |roots| {
-                Some(std::sync::Arc::new(
+                Some(std::sync::Arc::new(if scenario == "managed_missing" {
+                    let resolved = trellis::search_config::ResolvedSearchConfig::from_inputs(
+                        config_file.clone(),
+                        roots.data.join("models"),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    assert!(resolved.runtime_config().unwrap().model_path().is_none());
+                    SearchService::from_resolved(roots.clone(), resolved).unwrap()
+                } else {
                     SearchService::new(
                         roots.clone(),
                         SearchConfig::from_values(
@@ -12390,8 +12491,8 @@ async fn mcp_search_model_configuration_reasons_reach_describe_and_status() {
                         )
                         .unwrap(),
                     )
-                    .unwrap(),
-                ))
+                    .unwrap()
+                }))
             },
             false,
         )
@@ -12416,10 +12517,7 @@ async fn mcp_search_model_configuration_reasons_reach_describe_and_status() {
             .runtime(&fixture.identity.root_key)
             .unwrap();
         let cli_status = runtime.cli_status().unwrap();
-        assert_eq!(
-            cli_status["searchIndex"],
-            json!({"backend":"cpu","unavailableReason":reason})
-        );
+        assert_eq!(cli_status["searchIndex"], expected_status);
         let mut pairs = Vec::new();
         for legacy in [false, true] {
             let (mut client, mut reader, session) =
@@ -12438,6 +12536,11 @@ async fn mcp_search_model_configuration_reasons_reach_describe_and_status() {
                 "{reply}"
             );
             assert_eq!(envelope["data"]["hits"][0]["matchedBy"], json!(["lexical"]));
+            assert!(
+                envelope["data"]["searchIndex"]
+                    .get("configuration")
+                    .is_none()
+            );
             assert_eq!(envelope["data"]["searchIndex"]["embedded"], 0);
             assert!(envelope["data"]["searchIndex"]["modelId"].is_null());
             pairs.push(search_schema_pair(&reply));
@@ -12464,6 +12567,7 @@ async fn mcp_search_model_configuration_reasons_reach_describe_and_status() {
             session.join().unwrap().unwrap();
         }
         assert!(!fixture.vectors.exists());
+        assert!(!models_dir.exists());
         validate_structured_content(&pairs);
     }
 }
