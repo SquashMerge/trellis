@@ -1912,10 +1912,7 @@ impl EvidenceResponse {
             })
             .collect();
         let mut modules = Vec::new();
-        for module in references.data["modules"]
-            .as_array()
-            .context("store_unavailable: references modules")?
-        {
+        for module in &references.modules {
             check()?;
             let target = &module["identity"];
             let key = (

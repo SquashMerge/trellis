@@ -405,6 +405,14 @@ async fn one_file_past_the_evidence_budgets_is_a_coverage_gap_and_every_view_is_
         let payload = &body["payload"];
         assert_eq!(payload["partialFiles"][0]["path"], path, "{source:.40}");
         assert_eq!(payload["partialFiles"][0]["reason"], "evidence_budget");
+        assert!(
+            payload["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|module| { module["identity"]["path"] == path }),
+            "module-only files remain in the Architecture inventory: {path}"
+        );
         assert_eq!(payload["partialFiles"][0]["range"]["end"], source.len());
         assert_eq!(payload["references"]["partialFiles"][0]["path"], path);
         assert_eq!(payload["rules"]["partialFiles"][0]["path"], path);
@@ -456,6 +464,14 @@ async fn one_source_that_is_not_utf8_is_skipped_and_every_view_is_served() {
         let payload = &body["payload"];
         assert_eq!(payload["partialFiles"][0]["path"], path);
         assert_eq!(payload["partialFiles"][0]["reason"], "not_utf8");
+        assert!(
+            payload["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|module| { module["identity"]["path"] == path }),
+            "module-only files remain in the Architecture inventory: {path}"
+        );
         assert_eq!(payload["references"]["partialFiles"][0]["path"], path);
         assert_eq!(payload["rules"]["partialFiles"][0]["path"], path);
         assert!(
