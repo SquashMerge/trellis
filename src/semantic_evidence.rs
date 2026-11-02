@@ -47,8 +47,9 @@ record!(Coverage { producer_id: String, language: Language, source_set_id: Strin
 // Every reason a semantic import made one document's coverage `partial` (#520). The single
 // `Coverage.diagnostic` keeps only the reason of highest precedence; this keeps them all.
 // The four counts are the document's unsupported occurrences by the kind of native gap that
-// hid them. The flags are the per-document occurrence cap, a dependent fact omitted for an
-// unverified internal target, and a diagnostic the captured join reported.
+// hid them. The flags are a per-document cap (occurrences, #394, or another wire cap, #634),
+// a dependent fact omitted for an unverified internal target, and a diagnostic the captured
+// join reported.
 record!(CoverageReasons {
     macro_invocation: u64,
     attribute_item: u64,
@@ -1296,7 +1297,11 @@ fn validate_coverage_reasons(row: &Coverage, reasons: &CoverageReasons) -> Resul
     ensure!(
         match row.diagnostic.as_deref() {
             Some("unsupported_native_gap") => gaps > 0,
-            Some(crate::scip_raw::OCCURRENCE_CAP_EXCEEDED) => gaps == 0 && reasons.capped,
+            Some(
+                crate::scip_raw::OCCURRENCE_CAP_EXCEEDED | crate::scip_raw::DOCUMENT_CAP_EXCEEDED,
+            ) => {
+                gaps == 0 && reasons.capped
+            }
             Some("unmeasurable_internal_target") => gaps == 0 && !reasons.capped,
             _ => false,
         },

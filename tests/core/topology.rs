@@ -1115,16 +1115,16 @@ fn gc_classifies_current_schema_but_refuses_spoofed_shapes() {
     assert_eq!(inspect(), ("unknown", "recent_open"));
     // Any earlier schema is collectable whatever its layout, root or age (#253).
     for version in [
-        1, 7, 9, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+        1, 7, 9, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
     ] {
         db.pragma_update(None, "user_version", version).unwrap();
         assert_eq!(inspect(), ("eligible", "old_schema"), "v{version}");
     }
     db.pragma_update(None, "user_version", 0).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 35).unwrap();
+    db.pragma_update(None, "user_version", 36).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 34).unwrap();
+    db.pragma_update(None, "user_version", 35).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();

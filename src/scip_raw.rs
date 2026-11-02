@@ -270,7 +270,7 @@ pub struct CapturedScipInventory {
     pub source_manifest_hash: String,
     pub completion: Completion,
     pub exclusions: Vec<Exclusion>,
-    /// Documents the decoder admitted partially ([`OCCURRENCE_CAP_EXCEEDED`]).
+    /// Documents the decoder admitted under a per-document cap ([`DocumentCap`]).
     pub capped_documents: CappedDocuments,
     pub claims: Vec<CapturedClaim>,
 }
@@ -405,6 +405,12 @@ struct WireBudget<'a> {
     /// Occurrences of the `Document` units walked since the caller last reset it. The walk
     /// does not cap them: a document over `document_occurrences` is admitted partially.
     document_occurrences: u64,
+    /// The walk is inside a `Document` unit, where a per-document count cap excludes the
+    /// document instead of rejecting the artifact (#634).
+    in_document: bool,
+    /// The `Document` unit walked since the caller last reset it exceeds a per-document count
+    /// cap other than its occurrences ([`DOCUMENT_CAP_EXCEEDED`]).
+    document_cap_exceeded: bool,
     limits: &'a BatchLimits,
 }
 impl<'a> WireBudget<'a> {
@@ -414,7 +420,19 @@ impl<'a> WireBudget<'a> {
             relationships: 0,
             candidates: 0,
             document_occurrences: 0,
+            in_document: false,
+            document_cap_exceeded: false,
             limits,
+        }
+    }
+    /// A repeated field over its count: a per-document count cap inside a `Document` unit
+    /// marks the document excluded and the walk goes on; anything else rejects the artifact.
+    fn over_count(&mut self, per_document: bool, name: &str) -> Result<(), ScipCaptureError> {
+        if per_document && self.in_document {
+            self.document_cap_exceeded = true;
+            Ok(())
+        } else {
+            Err(limit(name))
         }
     }
 }
@@ -448,13 +466,20 @@ fn wire(
         let n = tag >> 3;
         let wt = (tag & 7) as u8;
         let (expected, kind, max) = field(node, n).ok_or_else(|| invalid("unknown field"))?;
-        let (max, max_name) = match (node, n) {
+        // A count over 1 is a per-document cap: inside a `Document` unit, exceeding it excludes
+        // that document (owner ruling 2026-11-02, #634). A singular field repeated, and every
+        // cap outside a document (metadata, external symbols), still reject the artifact.
+        let (max, max_name, per_document) = match (node, n) {
             // Bounded by the wire-field and unit budgets; over `document_occurrences` the
             // document is admitted partially (owner ruling 2026-10-28, #394).
-            (Node::Document, 2) => (u64::MAX, "document entries"),
-            (Node::Document, 3) => (budget.limits.document_symbols, "document entries"),
-            (Node::Signature, 2) => (budget.limits.signature_occurrences, "signature occurrences"),
-            _ => (max as u64, "repeated field"),
+            (Node::Document, 2) => (u64::MAX, "document entries", false),
+            (Node::Document, 3) => (budget.limits.document_symbols, "document entries", true),
+            (Node::Signature, 2) => (
+                budget.limits.signature_occurrences,
+                "signature occurrences",
+                true,
+            ),
+            _ => (max as u64, "repeated field", max > 1),
         };
         let max = usize::try_from(max).unwrap_or(usize::MAX);
         if wt != expected && !(matches!(kind, Wire::Packed) && wt == 2) {
@@ -498,7 +523,7 @@ fn wire(
             *count += 1;
         }
         if *count > max {
-            return Err(limit(max_name));
+            budget.over_count(per_document, max_name)?;
         }
         if wt == 0 {
             varint(b, &mut i)?;
@@ -515,8 +540,11 @@ fn wire(
                 varint(&b[..end], &mut k)?;
                 budget.fields += 1;
                 *count += 1;
-                if budget.fields > budget.limits.wire_fields || *count > max {
+                if budget.fields > budget.limits.wire_fields {
                     return Err(limit("packed values"));
+                }
+                if *count > max {
+                    budget.over_count(per_document, "packed values")?;
                 }
                 if budget.fields.is_multiple_of(1024) {
                     cancelled(flag)?;
@@ -779,9 +807,7 @@ fn occurrence(
             known(*tag)?;
         }
     }
-    if o.diagnostics.len() > 1000 {
-        return Err(limit("diagnostics"));
-    }
+    // `wire` bounds the diagnostics count before any parse (#634).
     if let Some(r) = &o.typed_range {
         match r {
             occurrence::Typed_range::SingleLineRange(v) => unknown(&v.special_fields)?,
@@ -870,10 +896,8 @@ fn symbol(
     unknown(&s.special_fields)?;
     let kind = known(s.kind)?;
     if let Some(sig) = s.signature_documentation.as_ref() {
+        // `wire` bounds the occurrence count before any parse (#634).
         signature_unknown(&sig.special_fields)?;
-        if sig.occurrences.len() > 10000 {
-            return Err(limit("signature occurrences"));
-        }
         let mut positions = Vec::with_capacity(sig.occurrences.len() * 4);
         for o in &sig.occurrences {
             *traversed += 1;
@@ -963,9 +987,8 @@ pub struct UnitDocument<'a> {
     pub path: &'a str,
     pub language: &'a str,
     pub wire_digest: &'a str,
-    /// The document has more occurrences than `document_occurrences`: it is admitted
-    /// partially, with only its definition occurrences ([`OCCURRENCE_CAP_EXCEEDED`]).
-    pub occurrence_cap_exceeded: bool,
+    /// The per-document cap the document was admitted under, if any.
+    pub cap: Option<DocumentCap>,
 }
 
 /// Coverage diagnostic of a document admitted partially because it has more occurrences than
@@ -975,8 +998,50 @@ pub struct UnitDocument<'a> {
 /// fully validated, so a malformed one rejects the artifact as before.
 pub const OCCURRENCE_CAP_EXCEEDED: &str = "occurrence_cap_exceeded";
 
-/// `(language, path)` of the documents admitted under [`OCCURRENCE_CAP_EXCEEDED`].
-pub type CappedDocuments = BTreeSet<(String, String)>;
+/// Coverage diagnostic of a document admitted with no claims because it exceeds another
+/// per-document wire cap: more symbols than `document_symbols`, a symbol with more signature
+/// occurrences than `signature_occurrences`, or any other repeated field of the document over
+/// its decoder table count (owner ruling 2026-11-02, #634). The document is still walked and
+/// every occurrence and symbol fully validated, one at a time, so a malformed one rejects the
+/// artifact as below the cap; the rest of the artifact imports. Aggregate caps still reject it.
+pub const DOCUMENT_CAP_EXCEEDED: &str = "document_cap_exceeded";
+
+/// The per-document cap a document was admitted under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DocumentCap {
+    /// [`OCCURRENCE_CAP_EXCEEDED`]: only definition occurrences are dropped.
+    Occurrences,
+    /// [`DOCUMENT_CAP_EXCEEDED`]: the document keeps no claim.
+    Document,
+}
+impl DocumentCap {
+    /// The coverage diagnostic of a document admitted under this cap.
+    pub fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Occurrences => OCCURRENCE_CAP_EXCEEDED,
+            Self::Document => DOCUMENT_CAP_EXCEEDED,
+        }
+    }
+    /// The stored `capped` value: 0 for none, 1 and 2 for these caps.
+    pub fn code(cap: Option<Self>) -> i64 {
+        match cap {
+            None => 0,
+            Some(Self::Occurrences) => 1,
+            Some(Self::Document) => 2,
+        }
+    }
+    /// The cap of a stored `capped` value.
+    pub fn from_code(code: i64) -> Option<Self> {
+        match code {
+            1 => Some(Self::Occurrences),
+            2 => Some(Self::Document),
+            _ => None,
+        }
+    }
+}
+
+/// `(language, path)` of the documents admitted under a per-document cap, with that cap.
+pub type CappedDocuments = BTreeMap<(String, String), DocumentCap>;
 /// One assigned document's authenticated source, returned by the caller's resolver.
 pub struct DocumentSource<'s> {
     pub language: String,
@@ -1010,7 +1075,7 @@ pub struct VecSink {
     capped: CappedDocuments,
 }
 impl VecSink {
-    /// The documents admitted under [`OCCURRENCE_CAP_EXCEEDED`] so far.
+    /// The documents admitted under a per-document cap so far.
     pub fn capped_documents(&self) -> &CappedDocuments {
         &self.capped
     }
@@ -1045,9 +1110,9 @@ impl ClaimSink for VecSink {
         if !self.paths.insert(doc.path.to_string()) {
             return Err(invalid("duplicate document path"));
         }
-        if doc.occurrence_cap_exceeded {
+        if let Some(cap) = doc.cap {
             self.capped
-                .insert((doc.language.to_owned(), doc.path.to_owned()));
+                .insert((doc.language.to_owned(), doc.path.to_owned()), cap);
         }
         Ok(())
     }
@@ -1200,8 +1265,10 @@ const CAPPED_POSITION_BATCH: usize = 1 << 16;
 
 /// Admits an over-cap `Document` unit partially, in place: validates every occurrence exactly
 /// as an admitted one is validated, then keeps every other field and only the definition
-/// occurrences (none if they alone exceed `cap`), in wire order. No occurrence becomes a claim
-/// here; the caller decodes the kept unit as usual.
+/// occurrences (none if they alone exceed the cap), in wire order. Under
+/// [`DocumentCap::Document`] it also validates every symbol, one at a time, and keeps no
+/// occurrence and no symbol. No occurrence becomes a claim here; the caller decodes the kept
+/// unit as usual.
 #[allow(clippy::too_many_arguments)]
 fn cap_document(
     bytes: &mut Vec<u8>,
@@ -1209,20 +1276,22 @@ fn cap_document(
     language: &str,
     path: &str,
     text: Option<&str>,
-    cap: u64,
+    cap: DocumentCap,
+    occurrence_cap: u64,
     traversed: &mut usize,
     cancel: &CancelFlag,
 ) -> Result<(), ScipCaptureError> {
+    let excluded = cap == DocumentCap::Document;
     let mut definitions = 0u64;
     let mut at = 0;
-    while at < bytes.len() {
+    while !excluded && at < bytes.len() {
         let (number, span, payload) = next_field(bytes, at)?;
         at = span.end;
         if number == 2 && occurrence_roles(&bytes[payload])? & 1 != 0 {
             definitions += 1;
         }
     }
-    let keep_definitions = definitions <= cap;
+    let keep_definitions = !excluded && definitions <= occurrence_cap;
     let mut positions = Vec::new();
     let mut unresolved_markers = Vec::new();
     let mut write = 0;
@@ -1248,6 +1317,15 @@ fn cap_document(
                 positions.clear();
             }
             keep_definitions && o.symbol_roles & 1 != 0
+        } else if number == 3 && excluded {
+            *traversed += 1;
+            if traversed.is_multiple_of(1024) {
+                cancelled(cancel)?;
+            }
+            let s = types::SymbolInformation::parse_from_bytes(&bytes[payload])
+                .map_err(|_| invalid("protobuf parse"))?;
+            symbol(&s, artifact.position_encoding, cancel, traversed, false)?;
+            false
         } else {
             true
         };
@@ -1370,6 +1448,8 @@ pub fn decode_streaming<'s, R: Read>(
             _ => Node::Symbol,
         };
         budget.document_occurrences = 0;
+        budget.in_document = number == 2;
+        budget.document_cap_exceeded = false;
         let walked = wire(&unit.bytes, node, 1, &mut budget, cancel);
         unit.counters.wire_fields = budget.fields;
         unit.counters.candidates = budget.candidates;
@@ -1396,8 +1476,14 @@ pub fn decode_streaming<'s, R: Read>(
             }
             _ => {
                 let wire_digest = sha(&unit.bytes);
-                let capped = budget.document_occurrences > limits.document_occurrences;
-                let (d, source) = if capped {
+                let cap = if budget.document_cap_exceeded {
+                    Some(DocumentCap::Document)
+                } else if budget.document_occurrences > limits.document_occurrences {
+                    Some(DocumentCap::Occurrences)
+                } else {
+                    None
+                };
+                let (d, source) = if let Some(cap) = cap {
                     let (path, language) = document_identity(&unit.bytes)?;
                     if !valid_path(&path) {
                         return Err(invalid("unlisted document"));
@@ -1417,6 +1503,7 @@ pub fn decode_streaming<'s, R: Read>(
                         &source.language,
                         &path,
                         text,
+                        cap,
                         limits.document_occurrences,
                         &mut traversed,
                         cancel,
@@ -1443,7 +1530,7 @@ pub fn decode_streaming<'s, R: Read>(
                     path: &d.relative_path,
                     language: &source.language,
                     wire_digest: &wire_digest,
-                    occurrence_cap_exceeded: capped && read,
+                    cap: cap.filter(|_| read),
                 })?;
                 if read && !d.text.is_empty() && d.text.as_bytes() != source.bytes.as_ref() {
                     return Err(invalid("document source binding"));
@@ -3164,7 +3251,10 @@ mod tests {
         let capped = decode_capped(&bytes, 4).unwrap();
         assert_eq!(
             capped.capped_documents,
-            BTreeSet::from([("javascript".to_owned(), "src/A.js".to_owned())])
+            BTreeMap::from([(
+                ("javascript".to_owned(), "src/A.js".to_owned()),
+                DocumentCap::Occurrences
+            )])
         );
         assert_eq!(
             kinds(&capped),
@@ -3211,5 +3301,287 @@ mod tests {
             );
             assert_eq!(decode_capped(&bytes, 4).unwrap_err(), under, "{case}");
         }
+    }
+
+    const A_SOURCE: &[u8] = b"function f(){g();}\n";
+    const B_SOURCE: &[u8] = b"function h(){}\n";
+    fn document_at(path: &str, fields: &[Vec<u8>]) -> Vec<u8> {
+        let mut doc = message(1, path.as_bytes());
+        doc.extend(message(4, b"javascript"));
+        doc.extend(fields.concat());
+        doc.extend([0x30, 1]);
+        message(2, &doc)
+    }
+    fn info(symbol: &str) -> Vec<u8> {
+        message(3, &[message(1, symbol.as_bytes()), vec![0x28, 17]].concat())
+    }
+    /// `src/A.js` as [`capped_artifact`] has it, then `src/B.js` with `b` and `extra` after it.
+    fn two_documents(b: &[Vec<u8>], extra: &[Vec<u8>]) -> Vec<u8> {
+        let a = document_at(
+            "src/A.js",
+            &[
+                occ([0, 9, 10], "A#", 1),
+                occ([0, 13, 14], "B#", 0),
+                occ([0, 0, 8], "B#", 1),
+                info("A#"),
+            ],
+        );
+        [a, document_at("src/B.js", b)]
+            .into_iter()
+            .chain(extra.iter().cloned())
+            .collect::<Vec<_>>()
+            .concat()
+    }
+    /// `src/B.js`: one definition and three symbols.
+    fn b_fields() -> Vec<Vec<u8>> {
+        vec![occ([0, 9, 10], "H#", 1), info("H#"), info("I#"), info("J#")]
+    }
+    fn decode_two(
+        bytes: &[u8],
+        limits: &BatchLimits,
+    ) -> Result<CapturedScipInventory, ScipCaptureError> {
+        let documents = [("src/A.js", A_SOURCE), ("src/B.js", B_SOURCE)]
+            .into_iter()
+            .map(|(path, source)| AuthenticatedScipDocument {
+                language: "javascript".into(),
+                relative_path: path.into(),
+                source_bytes: source,
+                content_hash: sha(source),
+            })
+            .collect();
+        decode_authenticated_with(
+            &vector_input(bytes, documents),
+            limits,
+            &Arc::new(AtomicBool::new(false)),
+        )
+    }
+    fn symbols_capped_at(cap: u64) -> BatchLimits {
+        BatchLimits {
+            document_symbols: cap,
+            ..BatchLimits::PRODUCTION
+        }
+    }
+    fn excluded_b() -> CappedDocuments {
+        BTreeMap::from([(
+            ("javascript".to_owned(), "src/B.js".to_owned()),
+            DocumentCap::Document,
+        )])
+    }
+    fn claims_of<'a>(inventory: &'a CapturedScipInventory, path: &str) -> Vec<&'a CapturedClaim> {
+        inventory
+            .claims
+            .iter()
+            .filter(|claim| claim.envelope.relative_path == path)
+            .collect()
+    }
+
+    /// Owner ruling 2026-11-02 (#634): a document over the per-document symbol cap no longer
+    /// refuses the artifact. It is admitted with no claims and reported under
+    /// `document_cap_exceeded`; every other document imports exactly as without it.
+    #[test]
+    fn over_symbol_cap_document_is_excluded_and_the_rest_imports() {
+        let bytes = two_documents(&b_fields(), &[]);
+        let full = decode_two(&bytes, &symbols_capped_at(3)).unwrap();
+        assert!(
+            full.capped_documents.is_empty(),
+            "at the cap is not over it"
+        );
+        assert_eq!(claims_of(&full, "src/B.js").len(), 4);
+        let excluded = decode_two(&bytes, &symbols_capped_at(2)).unwrap();
+        assert_eq!(excluded.capped_documents, excluded_b());
+        assert!(claims_of(&excluded, "src/B.js").is_empty());
+        assert_eq!(
+            claims_of(&excluded, "src/A.js"),
+            claims_of(&full, "src/A.js"),
+            "the other document's claims are unchanged"
+        );
+        assert_eq!(
+            DocumentCap::Document.diagnostic(),
+            DOCUMENT_CAP_EXCEEDED,
+            "the coverage diagnostic"
+        );
+        // Deterministic: the same bytes admit the same claims.
+        assert_eq!(
+            decode_two(&bytes, &symbols_capped_at(2)).unwrap().claims,
+            excluded.claims
+        );
+        // Over both caps, the document keeps nothing rather than its definitions.
+        let both = decode_two(
+            &bytes,
+            &BatchLimits {
+                document_occurrences: 0,
+                ..symbols_capped_at(2)
+            },
+        )
+        .unwrap();
+        assert_eq!(both.capped_documents, {
+            let mut capped = excluded_b();
+            capped.insert(
+                ("javascript".to_owned(), "src/A.js".to_owned()),
+                DocumentCap::Occurrences,
+            );
+            capped
+        });
+        assert!(claims_of(&both, "src/B.js").is_empty());
+    }
+
+    /// The other per-document counts of the decoder table exclude the document the same way:
+    /// a symbol's signature occurrences and an occurrence's diagnostics.
+    #[test]
+    fn other_per_document_wire_caps_exclude_the_document() {
+        let signature = message(
+            3,
+            &[
+                message(1, b"H#"),
+                message(
+                    7,
+                    &[
+                        message(5, b"ab"),
+                        message(2, &message(1, &[0, 0, 1])),
+                        message(2, &message(1, &[0, 1, 2])),
+                    ]
+                    .concat(),
+                ),
+            ]
+            .concat(),
+        );
+        let bytes = two_documents(&[occ([0, 9, 10], "H#", 1), signature], &[]);
+        let limits = BatchLimits {
+            signature_occurrences: 2,
+            ..BatchLimits::PRODUCTION
+        };
+        assert!(
+            decode_two(&bytes, &limits)
+                .unwrap()
+                .capped_documents
+                .is_empty()
+        );
+        let limits = BatchLimits {
+            signature_occurrences: 1,
+            ..BatchLimits::PRODUCTION
+        };
+        assert_eq!(
+            decode_two(&bytes, &limits).unwrap().capped_documents,
+            excluded_b()
+        );
+
+        let diagnostics = |count: usize| {
+            message(
+                2,
+                &[
+                    message(1, &[0, 9, 10]),
+                    message(2, b"H#"),
+                    vec![0x18, 1],
+                    message(6, b"").repeat(count),
+                ]
+                .concat(),
+            )
+        };
+        let at = decode_two(
+            &two_documents(&[diagnostics(1000)], &[]),
+            &BatchLimits::PRODUCTION,
+        );
+        assert!(at.unwrap().capped_documents.is_empty());
+        let over = decode_two(
+            &two_documents(&[diagnostics(1001)], &[]),
+            &BatchLimits::PRODUCTION,
+        )
+        .unwrap();
+        assert_eq!(over.capped_documents, excluded_b());
+        assert!(claims_of(&over, "src/B.js").is_empty());
+    }
+
+    /// An excluded document is still fully validated, one occurrence and symbol at a time, so a
+    /// malformed one rejects the artifact exactly as it does under the cap.
+    #[test]
+    fn excluded_document_still_validates_its_occurrences_and_symbols() {
+        for (case, bad) in [
+            ("range outside source", occ([3, 0, 1], "D#", 0)),
+            ("symbol roles", occ([0, 9, 10], "D#", 0x80)),
+            (
+                "unknown symbol kind",
+                message(3, &[message(1, b"K#"), vec![0x28, 0x7f]].concat()),
+            ),
+        ] {
+            let mut fields = b_fields();
+            fields.push(bad);
+            let bytes = two_documents(&fields, &[]);
+            let under = decode_two(&bytes, &symbols_capped_at(100)).unwrap_err();
+            assert!(
+                matches!(under, ScipCaptureError::InvalidArtifact(_)),
+                "{case}: {under:?}"
+            );
+            assert_eq!(
+                decode_two(&bytes, &symbols_capped_at(2)).unwrap_err(),
+                under,
+                "{case}"
+            );
+        }
+    }
+
+    /// Caps outside a document, aggregate caps and a repeated singular field still refuse the
+    /// whole artifact, and an excluded document's entries still count toward the aggregates.
+    #[test]
+    fn aggregate_and_index_level_caps_still_refuse_the_artifact() {
+        let external = message(3, &[message(1, b"ext#"), vec![0x28, 17]].concat());
+        let over = |limits: &BatchLimits, extra: &[Vec<u8>]| {
+            decode_two(&two_documents(&b_fields(), extra), limits).unwrap_err()
+        };
+        assert_eq!(
+            over(
+                &BatchLimits {
+                    external_symbols: 0,
+                    ..symbols_capped_at(2)
+                },
+                &[external]
+            ),
+            limit("index entries")
+        );
+        // An external symbol's signature occurrences are not a document's.
+        let signature = message(
+            3,
+            &[
+                message(1, b"ext#"),
+                message(
+                    7,
+                    &[
+                        message(5, b"ab"),
+                        message(2, &message(1, &[0, 0, 1])),
+                        message(2, &message(1, &[0, 1, 2])),
+                    ]
+                    .concat(),
+                ),
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            over(
+                &BatchLimits {
+                    signature_occurrences: 1,
+                    ..BatchLimits::PRODUCTION
+                },
+                &[signature]
+            ),
+            limit("signature occurrences")
+        );
+        // A: 4 entries; B: 4 entries, all dropped but still counted.
+        let candidates = |candidates| BatchLimits {
+            candidates,
+            ..symbols_capped_at(2)
+        };
+        assert!(decode_two(&two_documents(&b_fields(), &[]), &candidates(8)).is_ok());
+        assert_eq!(over(&candidates(7), &[]), limit("candidate facts"));
+        let fields = BatchLimits {
+            wire_fields: 20,
+            ..symbols_capped_at(2)
+        };
+        // The wire-field budget runs out inside a packed range.
+        assert_eq!(over(&fields, &[]), limit("packed values"));
+        let mut repeated = b_fields();
+        repeated.push(message(1, b"src/B.js"));
+        assert_eq!(
+            decode_two(&two_documents(&repeated, &[]), &symbols_capped_at(2)).unwrap_err(),
+            limit("repeated field")
+        );
     }
 }

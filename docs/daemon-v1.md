@@ -119,7 +119,8 @@ macroDefinition, other}`. `summary` is one line, present when any tuple is parti
 for macro invocation, attribute or macro definition gaps (`native gaps only` when some gap is of
 kind `other`). When the partial documents have other reasons,
 it lists each reason with its document count, such as
-`partial: 3 · native gaps 2, occurrence cap 1`.
+`partial: 3 · native gaps 2, document cap 1`, where `document cap` counts documents admitted
+under a per-document SCIP cap (occurrences, or another per-document wire cap; contract v1).
 
 The `trellis semantic import` report gives each language's `partialReasons` with the same
 document counts and `unsupportedOccurrences`. It also gives `listed`, the partial documents in

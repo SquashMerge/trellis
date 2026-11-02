@@ -475,9 +475,9 @@ pub(super) fn publish_with_witness(
             .collect::<Vec<_>>();
         let capped_documents = raw
             .capped_documents
-            .iter()
-            .filter(|(language, path)| *language == doc.key.language && *path == doc.key.path)
-            .cloned()
+            .get(&(doc.key.language.clone(), doc.key.path.clone()))
+            .map(|cap| ((doc.key.language.clone(), doc.key.path.clone()), *cap))
+            .into_iter()
             .collect();
         let claims = document_claims(tx, capture.capture_id, &capture.artifact_hash, &doc.key)?;
         let captured_doc = captured_documents.get(&doc.key).copied();

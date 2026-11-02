@@ -388,7 +388,7 @@ impl SemanticCoverageSummary {
         } else {
             [
                 ("native gaps", reasons.native_gaps),
-                ("occurrence cap", reasons.capped),
+                ("document cap", reasons.capped),
                 ("omitted dependents", reasons.omitted),
                 ("captured diagnostics", reasons.captured_diagnostics),
                 ("unrecorded", reasons.unrecorded),

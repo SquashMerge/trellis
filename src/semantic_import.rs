@@ -859,6 +859,9 @@ struct InventoryIndex<'a> {
     symbol_info: BTreeMap<(String, String, String), &'a CapturedClaim>,
     declared_symbols: BTreeSet<String>,
     information_symbols: BTreeSet<String>,
+    /// Languages with a document admitted with no claims under
+    /// `scip_raw::DOCUMENT_CAP_EXCEEDED` (#634).
+    excluded_languages: BTreeSet<String>,
 }
 
 impl<'a> InventoryIndex<'a> {
@@ -870,6 +873,12 @@ impl<'a> InventoryIndex<'a> {
             symbol_info: BTreeMap::new(),
             declared_symbols: BTreeSet::new(),
             information_symbols: BTreeSet::new(),
+            excluded_languages: inventory
+                .capped_documents
+                .iter()
+                .filter(|(_, cap)| **cap == crate::scip_raw::DocumentCap::Document)
+                .map(|((language, _), _)| language.clone())
+                .collect(),
         };
         for claim in &inventory.claims {
             #[cfg(test)]
@@ -1875,11 +1884,12 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
     let key = scoped_symbol_key(&scoped);
     let mut asserted = scoped_declaration_targets(store, index, &scoped, operation)?;
     // A symbol the artifact never declares nor describes is external, unless a source of this
-    // language wasn't read: the producer saw it, but its claims are dropped (#576).
+    // language wasn't read (#576) or was admitted over a per-document cap with no claims (#634):
+    // the producer saw it, but its claims are dropped.
     if asserted.is_empty()
         && key.scope == semantic::SymbolScope::Global
         && index.presence(&symbol, None)? == (false, false)
-        && !store.has_unread_source(&doc.language)?
+        && !store.has_unclaimed_source(&doc.language)?
     {
         store.reserve_operation(operation, || {
             staged::sizes::sum(&[
@@ -2528,7 +2538,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             if target_candidates.is_empty()
                 && !target_symbol.starts_with("local ")
                 && !index.is_information_symbol(target_symbol)?
-                && !store.has_unread_source(&doc.language)?
+                && !store.has_unclaimed_source(&doc.language)?
             {
                 store.reserve_operation(&mut operation, || {
                     staged::sizes::sum(&[
@@ -2675,11 +2685,12 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 }
                 let mut destination =
                     declaration_target(store, index, doc, target_symbol, &mut operation)?;
-                // A global symbol could be declared in a source that wasn't read (#576).
+                // A global symbol could be declared in a source that wasn't read (#576) or kept
+                // no claims over a per-document cap (#634).
                 if destination.is_none()
                     && target_method.is_none()
                     && (target_symbol.starts_with("local ")
-                        || !store.has_unread_source(&doc.language)?)
+                        || !store.has_unclaimed_source(&doc.language)?)
                 {
                     store.reserve_operation(&mut operation, || {
                         staged::sizes::sum(&[
@@ -4690,9 +4701,11 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         let requested = requested.contains(&doc.key);
         let failed = failed.contains(&doc.key);
         let excluded = exclusions.get(&(doc.key.language.as_str(), doc.key.path.as_str()));
-        let capped = inventory
+        let cap = inventory
             .capped_documents
-            .contains(&(doc.key.language.clone(), doc.key.path.clone()));
+            .get(&(doc.key.language.clone(), doc.key.path.clone()))
+            .copied();
+        let capped = cap.is_some();
         let reasons = semantic::CoverageReasons::new(
             unsupported_documents
                 .get(&doc.key)
@@ -4770,8 +4783,8 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
                 Some("excluded_by_producer".into())
             } else if reasons.native_gaps() > 0 {
                 Some("unsupported_native_gap".into())
-            } else if capped {
-                Some(crate::scip_raw::OCCURRENCE_CAP_EXCEEDED.into())
+            } else if let Some(cap) = cap {
+                Some(cap.diagnostic().into())
             } else if partial {
                 Some("unmeasurable_internal_target".into())
             } else {

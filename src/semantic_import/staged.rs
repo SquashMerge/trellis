@@ -1130,7 +1130,7 @@ impl ProofIdentities for StagedSide<'_> {
 }
 
 impl<'a> JoinStore for StagedSide<'a> {
-    fn has_unread_source(&self, language: &str) -> Result<bool> {
+    fn has_unclaimed_source(&self, language: &str) -> Result<bool> {
         let key = (self.rev, language.to_owned());
         if let Some(&unread) = self.ctx.unread.borrow().get(&key) {
             return Ok(unread);
@@ -1141,6 +1141,13 @@ impl<'a> JoinStore for StagedSide<'a> {
             self.ctx.conn,
             "SELECT 1 FROM nat_docs WHERE rev=?1 AND language=?2 AND content_hash IN (?3,?4) LIMIT 1",
             &[&self.rev, &language, &oversized, &not_utf8],
+        )? || exists(
+            self.ctx.conn,
+            "SELECT 1 FROM documents d JOIN sources s ON s.ord=d.source_ord WHERE d.capped=?1 AND s.language=?2 LIMIT 1",
+            &[
+                &crate::scip_raw::DocumentCap::code(Some(crate::scip_raw::DocumentCap::Document)),
+                &language,
+            ],
         )?;
         self.ctx.unread.borrow_mut().insert(key, unread);
         Ok(unread)
@@ -1496,8 +1503,8 @@ struct DocFlags {
     unsupported_claims: u64,
     /// Claims other than symbol information: the document's report denominator.
     claims: u64,
-    /// Admitted under `scip_raw::OCCURRENCE_CAP_EXCEEDED`.
-    capped: bool,
+    /// The per-document cap it was admitted under (`scip_raw::DocumentCap`).
+    capped: Option<crate::scip_raw::DocumentCap>,
     /// The unsupported claims by the kind of native gap that hid them (#520).
     gaps: [u64; 4],
 }
@@ -1947,7 +1954,7 @@ impl StagedJoin<'_> {
             Option<i64>,
             Option<i64>,
             Option<String>,
-            Option<bool>,
+            Option<i64>,
             [Option<i64>; 4],
         );
         let row: Option<Row> = self
@@ -1993,7 +2000,7 @@ impl StagedJoin<'_> {
                 unsupported: unsupported.unwrap_or_default(),
                 unsupported_claims: u64::try_from(unsupported_claims.unwrap_or_default())?,
                 claims: u64::try_from(claims.unwrap_or_default())?,
-                capped: capped.unwrap_or_default(),
+                capped: capped.and_then(crate::scip_raw::DocumentCap::from_code),
                 gaps,
             },
             excluded,
@@ -2079,7 +2086,7 @@ impl StagedJoin<'_> {
         } = flags;
         let reasons = semantic::CoverageReasons::new(
             flags.gaps,
-            flags.capped,
+            flags.capped.is_some(),
             outcome.omitted,
             outcome.diagnostics,
         );
@@ -2134,8 +2141,8 @@ impl StagedJoin<'_> {
                 Some("excluded_by_producer".into())
             } else if unsupported {
                 Some("unsupported_native_gap".into())
-            } else if flags.capped {
-                Some(crate::scip_raw::OCCURRENCE_CAP_EXCEEDED.into())
+            } else if let Some(cap) = flags.capped {
+                Some(cap.diagnostic().into())
             } else if partial {
                 Some("unmeasurable_internal_target".into())
             } else {
