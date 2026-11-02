@@ -43,9 +43,14 @@ source links, and contained diagram scrolling. No automatic indexing or inferenc
 Method lists retain all indexed functions/methods, including accessors and zero-call checks:
 there is no semantic method-importance classifier yet. The show-all method control is ready
 for retention hints, but the current backend does not hide methods without evidence.
-For sequence steps, only standalone `console.log` / `console.debug` wrappers are hidden by
-an explicitly labelled naming heuristic. Their argument effects and calls used in guards
-remain; Show all steps restores the wrappers. Other effects stay visible.
+Sequence diagrams show admitted calls first, with their branch/alternative/loop/try scope,
+concise unknown behavior and early-exit context. Standalone writes, bindings, return-value text
+and deferred nested definitions are available through Show all steps. The original DTO, measured
+call order and source identities do not change. A zero-call view does not mean no behavior.
+The same Show all steps setting reveals incidental calls (including explicitly labelled logging
+heuristics, external calls and trivial accessors) and restores full admitted step text.
+Frontend filtering cannot recover calls clipped by server limits. The visible 200-step bound,
+seed 150/callee reserve 50, work, depth and participant bounds and truncation warnings stay unchanged.
 
 Complex loop transfers, unsupported patterns and optional-chain operations may appear as
 source-linked boundaries rather than expanded behavior. These limits are explicit; the

@@ -87,6 +87,7 @@ const compactLabels = new Map([
   ["for_expression: possible iterations, not unrolled; exit/termination unknown", "for · possible iterations"],
   ["while_expression: possible iterations, not unrolled; exit/termination unknown", "while · possible iterations"],
   ["loop_expression: possible iterations, not unrolled; exit/termination unknown", "loop · termination unknown"],
+  ["possible iterations, not unrolled; protocol and termination unresolved", "loop · protocol / termination unresolved"],
   ["Definition boundary: decorators/defaults/annotations and binding effects not expanded; callable body does not execute here.", "definition · effects not expanded"],
   ["Class definition boundary: bases, decorators, metaclass and class-body execution not expanded; method bodies do not execute here.", "class definition · effects not expanded"],
   ["Nested callable boundary: body does not execute at definition; captures are not expanded.", "nested callable · captures not expanded"],
@@ -162,11 +163,57 @@ function sequenceColumn(participant) {
 // Rust's standard library crates, as a producer names their package. Other languages' producers
 // do not name one, so their external calls stay "external".
 const STANDARD_LIBRARIES = new Set(["std", "core", "alloc"]);
-// What to say when a view has steps and every one is hidden (#558), or "" when any shows.
+// Calls-first is a display projection of admitted evidence, never a new execution tree.
+// Membership keeps source controls and both adapters bound to the exact original objects.
+const deferredSequenceBoundaries = new Set([
+  "Nested callable boundary: body does not execute at definition; captures are not expanded.",
+  "Lambda boundary: body does not execute at definition; captures are not expanded."
+]);
+function sequenceUncertainty(step) {
+  if (step.kind === "effect") return step.label === "iteration target write: implicit setters/unpacking unresolved" ||
+    step.label?.startsWith("write: ") && step.label.endsWith(" (implicit setters/unpacking unresolved)");
+  if (step.kind === "try") return step.label === "try; exception behavior unknown";
+  if (step.kind !== "loop") return false;
+  return [
+    "possible iterations, not unrolled; protocol and termination unresolved",
+    "enhanced for: possible iterations; iterable evaluated once; implicit iterator/array protocol not expanded",
+    "loop: possible iterations, not unrolled; termination and transfers unknown",
+    "for_expression: possible iterations, not unrolled; exit/termination unknown",
+    "while_expression: possible iterations, not unrolled; exit/termination unknown",
+    "loop_expression: possible iterations, not unrolled; exit/termination unknown"
+  ].includes(step.label);
+}
+function sequenceDisplay(view, options = {}) {
+  const visible = new Set(), exits = new Set();
+  const visit = steps => {
+    let shows = false, transfers = false;
+    for (const step of steps || []) {
+      if (step.hidden) continue;
+      const children = visit(step.children), alternate = visit(step.alternate);
+      const transfer = ["return", "throw", "exit"].includes(step.kind) || children.transfers || alternate.transfers;
+      const structural = ["branch", "loop", "try"].includes(step.kind);
+      const context = step.kind === "await" || sequenceUncertainty(step) ||
+        step.kind === "boundary" && !deferredSequenceBoundaries.has(step.label);
+      const show = options.showDetails || step.kind === "call" || !!step.callId || context ||
+        children.shows || alternate.shows || structural && transfer;
+      if (show) visible.add(step);
+      if (structural && transfer) exits.add(step);
+      shows ||= show; transfers ||= transfer;
+    }
+    return {shows, transfers};
+  };
+  visit(view?.steps);
+  return {visible, earlyReturn:step => sequenceEarlyReturn(step) || (!options.showDetails && exits.has(step) ? " · may exit early" : "")};
+}
+// What to say when the admitted view has no displayed calls (#594).
 // Counts come from the server; the reasons are the steps' own.
-function sequenceEmptySummary(view) {
+function sequenceEmptySummary(view, options = {}) {
   const steps = view?.steps || [];
-  if (!steps.length || steps.some(step => !step.hidden)) return "";
+  if (options.showDetails) return "";
+  const display = sequenceDisplay(view, options);
+  if ([...display.visible].some(step => step.kind === "call" || step.callId)) return "";
+  if (steps.some(step => !step.hidden)) return "No measured calls in the admitted steps. Non-call behavior may be hidden; use Show all steps to inspect it.";
+  if (!steps.length) return "No measured calls in the admitted steps. This does not mean no behavior; inspect source or Show all steps.";
   const hidden = [];
   const walk = items => { for (const step of items) { if (step.incidental) hidden.push(step); walk(step.children || []); walk(step.alternate || []); } };
   walk(steps);
@@ -179,16 +226,16 @@ function sequenceEmptySummary(view) {
   return `Only ${kind} calls (${view.hiddenSteps} hidden).`;
 }
 // Replaces a diagram with its empty state. `onShow`, when given, is a real control.
-function renderSequenceEmpty(container, summary, onShow) {
+function renderSequenceEmpty(container, summary, onShow, preserveDiagram = false) {
   const note = document.createElement("p");
   note.className = "sequence-empty"; note.textContent = `${summary} `;
   if (onShow) {
     const show = document.createElement("button");
-    show.type = "button"; show.textContent = "Show them";
+    show.type = "button"; show.textContent = "Show all steps";
     show.addEventListener("click", onShow);
     note.append(show);
   }
-  container.replaceChildren(note);
+  if (preserveDiagram) container.prepend(note); else container.replaceChildren(note);
 }
 const sequenceRenders = new WeakMap();
 function beginSequenceRender(container) {
@@ -198,7 +245,7 @@ function beginSequenceRender(container) {
 function drawSequence(container, view, readSource, expandedGroups, options, selection) {
   const current = options.isCurrent, active = beginSequenceRender(container);
   options = {...options, isCurrent:() => active() && (!current || current())};
-  const groupControls = new Map(), rowControls = [];
+  const groupControls = new Map(), rowControls = [], displayProjection = sequenceDisplay(view, options);
   const ns = "http://www.w3.org/2000/svg";
   const make = (tag, attrs = {}, text) => {
     const n = document.createElementNS(ns, tag);
@@ -217,7 +264,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   let visibleDepth = 0;
   while (pending.length) {
     const {step, depth} = pending.pop();
-    if (step.hidden) continue;
+    if (!displayProjection.visible.has(step)) continue;
     visibleDepth = Math.max(visibleDepth, depth);
     if (step.kind === "group" && !expandedGroups.has(step.id)) {
       const entry = entryCall(step);
@@ -304,7 +351,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       (!options.isCurrent || options.isCurrent()) &&
       (typeof options.onSelect === "function" || typeof readSource === "function");
     const call = ["call", "boundary"].includes(evidence.kind) && evidence.callId, proof = call ? provenance(evidence) : null;
-    const fullLabel = tooltip(step) + sequenceEarlyReturn(step) + (evidence !== step ? ` · Entry preview only: ${tooltip(evidence)}` : "");
+    const fullLabel = tooltip(step) + displayProjection.earlyReturn(step) + (evidence !== step ? ` · Entry preview only: ${tooltip(evidence)}` : "");
     const control = make("g", {class:"sequence-source", "data-source-step-id":step.id,
       ...(interactive ? {role:"button", tabindex:0, "aria-label":`${options.onSelect ? "Inspect" : "Read source"}: ${fullLabel}`, "aria-pressed":String(selection.id === step.id)} : {})});
     // Compact controls remain individual, ordered fragments. No matching guard
@@ -323,7 +370,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     const tabWidth = operator ? Math.max(80, operator.length * 8 + 28) : 0;
     const labelX = operator ? x + tabWidth + 12 : x + 5;
     const capacity = Math.max(24, Math.floor((width-labelX-(proof && options.showDetails ? 145 : 35))/7.8));
-    const early = sequenceEarlyReturn(step);
+    const early = displayProjection.earlyReturn(step);
     const limit = Math.min(SEQUENCE_LABEL_LIMIT, capacity);
     if (!options.showDetails) label = shorten(label.replace(/\s+/g, " "), isControl ? Math.min(56, capacity - (operator ? 2 : 0)) : Math.max(12, limit - early.length));
     label += early;
@@ -377,7 +424,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   }
   function draw(steps, parent, depth) {
     for (const step of steps || []) {
-      if (step.hidden) continue;
+      if (!displayProjection.visible.has(step)) continue;
       const group = make("g", {"data-kind":step.kind, "data-step-id":step.id}); parent.append(group);
       if (step.kind === "group") {
         const start = y, x = 18 + depth * 10, expanded = expandedGroups.has(step.id);
@@ -452,4 +499,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty};

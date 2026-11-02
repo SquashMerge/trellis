@@ -180,11 +180,11 @@ test("compact control summaries preserve every guard, alternate and exit; Show a
   const selected = [], view = freeze(viewWith([guard])), before = JSON.stringify(view);
   const d = diagram(view, {onSelect:step=>selected.push(step)});
   const ids = () => d.nodes().filter(n=>n.attrs["data-step-id"]).map(n=>n.attrs["data-step-id"]);
-  assert.deepEqual(ids(), ["first-guard", "second-guard", "checked", "exit", "alternate"]);
+  assert.deepEqual(ids(), ["first-guard", "second-guard", "checked"]);
   assert.ok(visibleText(d.nodes()).includes("Compact labels · select for details"));
   const compactGuards = d.nodes().filter(n=>n.attrs.class === "sequence-control-label").flatMap(n=>n.children.filter(c=>c.tag === "tspan").map(c=>c.textContent));
   assert.equal(compactGuards.length, 2);
-  assert.ok(compactGuards.every(t=>t.startsWith("[") && t.endsWith("…]") && !t.includes("branch ·") && !t.includes("summary")));
+  assert.ok(compactGuards.every(t=>t.startsWith("[") && t.includes("…") && t.endsWith("may exit early]") && !t.includes("branch ·") && !t.includes("summary")));
   assert.ok(visibleText(d.nodes()).includes("else / alternate"));
   assert.ok(d.nodes().filter(n=>n.tag === "title" && n.textContent.includes(label)).length >= 2);
   d.row(inner.id).listeners.click(); assert.equal(selected[0], inner); assert.equal(selected[0].range.startLine, 5);
@@ -267,12 +267,12 @@ test("known guard prose becomes concise display text without merging nodes or lo
   const view = freeze(viewWith([guard1])), before = JSON.stringify(view), selected = [];
   const d = diagram(view, {onSelect:step=>selected.push(step)});
   const rowText = id => d.row(id).children.find(n=>n.tag === "text" && n.attrs.class !== "sequence-fragment-operator").children.filter(n=>n.tag === "tspan").map(n=>n.textContent).join(" ");
-  assert.equal(rowText("guard1"), "[if prior path continues]"); assert.equal(rowText("guard2"), "[if prior path continues]");
+  assert.equal(rowText("guard1"), "[if prior path continues] · may exit early"); assert.equal(rowText("guard2"), "[if prior path continues] · may exit early");
   assert.equal(d.nodes().filter(n=>n.attrs.class === "sequence-guard-rail").length, 2);
-  assert.equal(rowText("check"), "[success / early return]");
-  assert.equal(rowText("residual"), "early return");
-  assert.ok(!visibleText(d.nodes()).some(t=>/summary|branch ·|return ·|error/i.test(t)));
-  for (const step of [guard1, guard2, check, exit]) {
+  assert.equal(rowText("check"), "[success / early return · may exit early]");
+  assert.equal(d.row("residual"), undefined);
+  assert.ok(!visibleText(d.nodes()).some(t=>/summary|branch ·|return · (?!may exit early)|error/i.test(t)));
+  for (const step of [guard1, guard2, check]) {
     assert.ok(d.row(step.id).attrs["aria-label"].includes(step.label));
     assert.ok(d.row(step.id).children.some(n=>n.tag === "text" && n.children.some(n=>n.tag === "title" && n.textContent.includes(step.label))));
     const hit = d.row(step.id).children.find(n=>n.attrs.class === "sequence-row-hit");
@@ -400,23 +400,23 @@ test("quiet protocol and unsupported boundaries remain individual evidence contr
 });
 
 
-test("proven name bindings and deferred definitions stay explicit without invented guards", () => {
+test("proven name bindings and deferred definitions stay available in Show all without invented guards", () => {
   const binding = {id:"binding",kind:"effect",label:"bind name: agent",path:"factory.py",range};
   const definition = {id:"definition",kind:"definition",label:"define _executor · async body deferred",path:"factory.py",range};
   const steps = [call("make_agent"),binding,definition,call("Step"),call("Workflow"),{id:"return",kind:"return",label:"return Workflow(steps=[Step(executor=_executor)])",path:"factory.py",range}];
   const view = freeze(viewWith(steps)), before = JSON.stringify(view), selected = [];
   const d = diagram(view,{onSelect:step=>selected.push(step)});
-  assert.equal(rowLabel(d.row(binding.id)),"bind agent");
-  assert.equal(rowLabel(d.row(definition.id)),definition.label);
+  assert.equal(d.row(binding.id),undefined);
+  assert.equal(d.row(definition.id),undefined);
   assert.equal(d.nodes().filter(n=>n.attrs.class === "sequence-guard-rail" || n.attrs.class === "sequence-fragment").length,0);
   assert.equal(d.nodes().filter(n=>n.attrs["data-kind"] === "call").length,3);
+  assert.equal(d.sources.length,0);
+  d.render({showDetails:true,onSelect:step=>selected.push(step)});
   for(const step of [binding,definition]) {
     d.row(step.id).listeners.keydown({key:"Enter",preventDefault(){}});
     assert.equal(selected.at(-1),step);
     assert.ok(d.row(step.id).attrs["aria-label"].includes(step.label));
   }
-  assert.equal(d.sources.length,0);
-  d.render({showDetails:true,onSelect:step=>selected.push(step)});
   assert.equal(rowLabel(d.row(binding.id)),`effect · ${binding.label}`);
   assert.equal(rowLabel(d.row(definition.id)),`definition · ${definition.label}`);
   assert.equal(JSON.stringify(view),before);
@@ -934,4 +934,88 @@ test("collapsed chain retains the early-return marker in its compact row", () =>
   const text = d.nodes().filter(n => n.tag === "tspan").map(n => n.textContent).join(" ");
   assert.match(text, /calls collapsed \(entry preview\) · may return early/);
   assert.match(d.row("chain").attrs["aria-label"], /may return early/);
+});
+
+// Normal-size admitted source tree: the display must not rewrite this evidence.
+function callsFirstView() {
+  const leaf = (id, kind, label = id, extra = {}) => ({id, kind, label, path:"main.rs", range, children:[], alternate:[], hidden:false, ...extra});
+  const measured = id => leaf(id, "call", id, {callId:id});
+  return {...viewWith([
+    measured("prepare"), leaf("write", "effect", "write: state = ready"),
+    leaf("definition", "definition", "define callback · body deferred"),
+    leaf("nested", "boundary", "Nested callable boundary: body does not execute at definition; captures are not expanded."),
+    leaf("condition", "branch", "if ready", {children:[measured("ready"),leaf("return", "return", "return result")], alternate:[measured("fallback"),leaf("write-alt", "effect", "write: fallback")] }),
+    leaf("loop", "loop", "loop_expression: possible iterations, not unrolled; exit/termination unknown", {children:[measured("repeat"),leaf("write-loop", "effect", "write: iteration")] }),
+    leaf("unknown", "boundary", "Unsupported complex control: possible behavior remains unknown; body not expanded."),
+    leaf("continuation", "branch", "only if the preceding path continues normally", {children:[measured("finish")] }),
+    leaf("last-return", "return", "return final_value")
+  ]), revision:{indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1}};
+}
+test("calls-first shares original ordered calls, conditional/unknown context and reversible detail in both renderers", () => {
+  const view = freeze(callsFirstView()), before = JSON.stringify(view), selected = [];
+  const d = diagram(view, {onSelect:step=>selected.push(step)}), adapter = peleProjector();
+  const projection = adapter.project(view);
+  const retained = ["prepare","condition","ready","fallback","loop","repeat","unknown","continuation","finish"];
+  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]),retained);
+  assert.deepEqual(Array.from(projection.rows,row=>row.id),retained);
+  const originals = view.steps.flatMap(function walk(step) {return [step,...(step.children||[]).flatMap(walk),...(step.alternate||[]).flatMap(walk)];});
+  assert.equal(originals.length,16);
+  for (const row of projection.rows) {
+    const original = originals.find(step=>step.id===row.id);
+    assert.equal(row.step,original); assert.equal(row.range,original.range);
+    d.row(row.id).listeners.click(); assert.equal(selected.at(-1),original);
+  }
+  assert.match(rowLabel(d.row("condition")),/may exit early/);
+  assert.match(projection.rows.find(row=>row.id==="condition").display,/may exit early/);
+  assert.match(projection.source,/alt if ready/); assert.match(projection.source,/else alternate path/);
+  assert.match(projection.source,/loop loop/); assert.match(projection.source,/unknown/);
+  d.render({showDetails:true});
+  const all = adapter.project(view,new Set(),{showDetails:true});
+  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]),originals.map(step=>step.id));
+  assert.deepEqual(Array.from(all.rows,row=>row.id),originals.map(step=>step.id));
+  assert.match(rowLabel(d.row("write")),/write: state = ready/);
+  assert.equal(JSON.stringify(view),before);
+});
+test("calls-first zero-call summary never claims that a method has no behavior", () => {
+  const window = {};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window});
+  const view = viewWith([{id:"write",kind:"effect",label:"write state",children:[],alternate:[]}]);
+  assert.match(window.TrellisSequence.emptySummary(view),/No measured calls.*non-call behavior.*Show all steps/i);
+  assert.equal(window.TrellisSequence.emptySummary(view,{showDetails:true}),"");
+});
+
+test("calls-first hides deferred callables but keeps unexpanded initialization effects", () => {
+  const labels = [
+    "Nested callable boundary: body does not execute at definition; captures are not expanded.",
+    "Lambda boundary: body does not execute at definition; captures are not expanded.",
+    "Nested declaration boundary: bodies are not executed here; implicit initialization is not expanded.",
+    "Nested function/callback/class boundary: bodies are not executed here; class definition effects (base, computed keys, static initialization) are not expanded."
+  ];
+  const steps = labels.map((label,i)=>({id:`deferred-${i}`,kind:"boundary",label,path:"main.rs",range,children:[],alternate:[],hidden:false}));
+  const view = freeze(viewWith(steps)), d = diagram(view);
+  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]),["deferred-2","deferred-3"]);
+  assert.deepEqual(Array.from(peleProjector().project({...view,revision:{indexGeneration:"pin",indexRevision:1}}).rows,row=>row.id),["deferred-2","deferred-3"]);
+  d.render({showDetails:true});
+  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]),steps.map(step=>step.id));
+});
+
+test("calls-first preserves extractor-labelled uncertainty outside boundaries only", () => {
+  const make=(id,kind,label)=>({id,kind,label,path:"main.py",range,children:[],alternate:[],hidden:false});
+  const ordinary=[make("bind","effect","bind name: unknown"),make("write","effect","write: unknown = unresolved"),make("ordinary-loop","loop","for_statement: possible iterations, not unrolled")];
+  const uncertain=[
+    make("setter","effect","write: obj.value = prepare() (implicit setters/unpacking unresolved)"),
+    make("iteration","effect","iteration target write: implicit setters/unpacking unresolved"),
+    make("python-loop","loop","possible iterations, not unrolled; protocol and termination unresolved"),
+    make("java-iter","loop","enhanced for: possible iterations; iterable evaluated once; implicit iterator/array protocol not expanded"),
+    make("java-loop","loop","loop: possible iterations, not unrolled; termination and transfers unknown"),
+    ...["for_expression","while_expression","loop_expression"].map(kind=>make(kind,"loop",`${kind}: possible iterations, not unrolled; exit/termination unknown`)),
+    make("js-try","try","try; exception behavior unknown")
+  ];
+  const view=freeze({...viewWith([...ordinary,...uncertain]),revision:{indexGeneration:"pin",indexRevision:1}}),before=JSON.stringify(view),d=diagram(view);
+  const ids=()=>d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]);
+  assert.deepEqual(ids(),uncertain.map(step=>step.id));
+  assert.deepEqual(Array.from(peleProjector().project(view).rows,row=>row.id),uncertain.map(step=>step.id));
+  assert.equal(rowLabel(d.row("setter")),"write · setters/unpacking unresolved");
+  d.render({showDetails:true});assert.deepEqual(ids(),view.steps.map(step=>step.id));
+  assert.equal(JSON.stringify(view),before);
 });
