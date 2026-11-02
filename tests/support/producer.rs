@@ -226,7 +226,9 @@ pub fn stop_daemon(home: &Path) {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    assert!(
+        trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM).unwrap()
+    );
     trellis::testing::wait_until("daemon exit", || !trellis::testing::process_running(pid));
     let lock = trellis::daemon::SocketPaths::new(&data_dir(home)).lock;
     trellis::testing::wait_until("daemon election lock released", || {

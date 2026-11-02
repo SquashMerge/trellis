@@ -109,8 +109,10 @@ unknown`) and the longer prose live behind the ⓘ.
 The inspector opens on the counted review chips, **23 deviations · 156 unassigned ·
 0 exceptions**, and every Architecture inspection keeps them at its head. They open the
 review list (production deviations, which is what the first chip counts), the unassigned
-files and the authored exceptions. Deviations are `rules.counts.deviates`, unassigned is
-`rules.unassignedCount` and exceptions is `exceptionCount`. There is no refresh button: the
+files and the authored exceptions. Deviations are `rules.counts.deviates`, unassigned files
+are the full native module inventory with no assigned layer (including module-only files),
+and exceptions is `exceptionCount`. The evidence disclosure separately labels
+`rules.unassignedCount` as identities, including external packages. There is no refresh button: the
 view re-reads when a new revision is selected or the tab is opened again. A detail list
 that fails with `rules_conflict` offers **Reload Architecture**. On narrow screens the
 overview does not open the inspector drawer.

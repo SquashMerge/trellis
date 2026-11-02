@@ -44,6 +44,14 @@ Both are policy constants, to be tuned later without a format change.
   - The next client re-attaches it with a catch-up scan and publication.
 - **Daemon exit: 30 minutes** after the last client of any checkout disconnects, counting active browsers as above, and only with no queued or in-flight work anywhere.
 
+**Owner ruling, 2026-11-02 (#612):** A running `trellis serve` holds a daemon-level
+registration for the lifetime of its control connection. The daemon must not
+idle-exit while any such registration is live, even with no browser or other
+client. This does not attach a checkout or change checkout-release policy. When
+the last serve disconnects and no other clients remain, ordinary 30-minute daemon
+idle grace starts. Registration/reply failures and closed control connections
+release only their own registration.
+
 **Owner ruling, 2026-10-11 (#130):** “Anywhere” means checkouts activated by this daemon. Idle exit does not scan other index directories or their orphan queues. Unknown entries, unreadable queues and accepted rows in never-activated checkouts cannot veto exit. Those rows remain durable and recover on the next activation (Decision 0008 §3). The 15-minute release and 30-minute exit constants are unchanged.
 
 ## Consequences

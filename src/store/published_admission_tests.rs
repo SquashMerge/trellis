@@ -90,11 +90,42 @@ fn same_pin_commit_child() {
     assert_eq!(db.execute(CORRUPT_INVENTORY, []).unwrap(), 1);
 }
 
+fn wait_owned_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            // This owner has not reaped the child, so its PID cannot be reused.
+            let _ = child.kill();
+            child.wait().unwrap();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn owned_child_timeout_reaps_before_returning() {
+    let mut child = Command::new("sleep").arg("120").spawn().unwrap();
+    assert!(wait_owned_child(&mut child, Duration::ZERO).is_none());
+    assert!(child.try_wait().unwrap().is_some());
+    let mut exited = Command::new("true").spawn().unwrap();
+    let status = exited.wait().unwrap();
+    assert_eq!(wait_owned_child(&mut exited, Duration::ZERO), Some(status));
+}
+
 #[test]
 fn separate_process_same_pin_commit_invalidates_parent_admission() {
     let (state, root, store) = selected_read_once_tests::published_store(1);
     let pin = store.status().unwrap().revision;
-    let child = Command::new(std::env::current_exe().unwrap())
+    let stdout = tempfile::tempfile().unwrap();
+    let stderr = tempfile::tempfile().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "store::published_admission_tests::same_pin_commit_child",
@@ -102,26 +133,25 @@ fn separate_process_same_pin_commit_invalidates_parent_admission() {
         ])
         .env("TRELLIS_ADMISSION_TEST_STATE", state.path())
         .env("TRELLIS_ADMISSION_TEST_ROOT", root.path())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(stdout.try_clone().unwrap())
+        .stderr(stderr.try_clone().unwrap())
         .spawn()
         .unwrap();
-    let pid = child.id();
-    let (done_tx, done_rx) = mpsc::channel();
-    let waiter = thread::spawn(move || {
-        let _ = done_tx.send(child.wait_with_output());
-    });
-    let output = match done_rx.recv_timeout(HOOK_TIMEOUT) {
-        Ok(result) => result.unwrap(),
-        Err(error) => {
-            // Kill/reap the helper on a failed liveness backstop, never retry it.
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            waiter.join().unwrap();
-            panic!("same-pin writer did not finish: {error}");
-        }
-    };
-    waiter.join().unwrap();
-    assert!(output.status.success(), "child failed: {output:?}");
+    let status = wait_owned_child(&mut child, HOOK_TIMEOUT);
+    if !status.is_some_and(|status| status.success()) {
+        use std::io::{Read, Seek};
+        let read = |mut file: std::fs::File| {
+            file.rewind().unwrap();
+            let mut text = String::new();
+            file.read_to_string(&mut text).unwrap();
+            text
+        };
+        panic!(
+            "child failed or timed out: {status:?}; stdout: {}; stderr: {}",
+            read(stdout),
+            read(stderr)
+        );
+    }
     assert_eq!(
         ReadRevision::current(&store.cache_write().unwrap())
             .unwrap()

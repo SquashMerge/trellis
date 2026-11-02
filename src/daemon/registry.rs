@@ -462,6 +462,7 @@ pub struct CheckoutRegistry {
     search: Option<Arc<super::search::SearchService>>,
     runtimes: HashMap<String, Arc<CheckoutRuntime>>,
     idle_exit_at: Option<Instant>,
+    serve_sessions: HashSet<u64>,
     clock_override: Option<Instant>,
     /// Wakes the lifecycle owner: clients came or went, a runtime retired,
     /// accepted work drained or the last lease was released (Decision 0009 §5).
@@ -491,6 +492,7 @@ impl CheckoutRegistry {
             search: None,
             runtimes: HashMap::new(),
             idle_exit_at: Some(now + DAEMON_IDLE_DELAY),
+            serve_sessions: HashSet::new(),
             clock_override: None,
             lifecycle: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "test-support")]
@@ -1397,9 +1399,17 @@ impl CheckoutRegistry {
         Ok(identity)
     }
 
-    /// Called at MCP EOF/disconnect; an explicit worktree remains attached until then.
+    /// A live serve control connection keeps the daemon up without attaching
+    /// a checkout or extending its watcher lifetime.
+    pub fn retain_serve(&mut self, session: u64) {
+        self.serve_sessions.insert(session);
+        self.idle_exit_at = None;
+        self.lifecycle.notify_one();
+    }
+
+    /// Called at client EOF/disconnect; explicit worktrees remain attached until then.
     pub fn disconnect(&mut self, session: u64) {
-        self.disconnect_at(session, Instant::now());
+        self.disconnect_at(session, self.clock_override.unwrap_or_else(Instant::now));
     }
 
     pub fn disconnect_at(&mut self, session: u64, now: Instant) {
@@ -1407,7 +1417,7 @@ impl CheckoutRegistry {
         if let Some(expired_at) = expired_at {
             self.update_exit_deadline(expired_at);
         }
-        let mut disconnected = false;
+        let mut disconnected = self.serve_sessions.remove(&session);
         for entry in self.entries.values_mut() {
             if entry.sessions.remove(&session) {
                 disconnected = true;
@@ -1420,10 +1430,11 @@ impl CheckoutRegistry {
             return;
         }
         self.lifecycle.notify_one();
-        if self
-            .entries
-            .values()
-            .all(|entry| entry.sessions.is_empty() && entry.browser_until.is_none())
+        if self.serve_sessions.is_empty()
+            && self
+                .entries
+                .values()
+                .all(|entry| entry.sessions.is_empty() && entry.browser_until.is_none())
         {
             self.idle_exit_at = Some(now + DAEMON_IDLE_DELAY);
         } else {
@@ -1533,10 +1544,11 @@ impl CheckoutRegistry {
     }
 
     fn update_exit_deadline(&mut self, now: Instant) {
-        if self
-            .entries
-            .values()
-            .any(|entry| !entry.sessions.is_empty() || entry.browser_until.is_some())
+        if !self.serve_sessions.is_empty()
+            || self
+                .entries
+                .values()
+                .any(|entry| !entry.sessions.is_empty() || entry.browser_until.is_some())
         {
             self.idle_exit_at = None;
         } else if self.idle_exit_at.is_none() {
