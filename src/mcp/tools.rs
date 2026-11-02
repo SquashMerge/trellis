@@ -20,6 +20,9 @@ fn closed(o: &serde_json::Map<String, Value>, fields: &[&str], required: &[&str]
 fn string(v: Option<&Value>) -> Option<&str> {
     v?.as_str()
 }
+fn valid_lookup_key(value: Option<&Value>) -> bool {
+    string(value).is_some_and(|key| !key.is_empty())
+}
 fn valid_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36
@@ -131,11 +134,12 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             &[
                 "schemaVersion",
                 "query",
+                "lookupKey",
                 "limit",
                 "expectedBasis",
                 "workspace",
             ],
-            &["schemaVersion", "query"],
+            &["schemaVersion"],
         ),
         "trellis_search_symbols" => (
             &[
@@ -149,25 +153,33 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             &["schemaVersion", "query"],
         ),
         "trellis_declaration" => (
-            &["schemaVersion", "symbolId", "expectedBasis", "workspace"],
-            &["schemaVersion", "symbolId"],
+            &[
+                "schemaVersion",
+                "symbolId",
+                "lookupKey",
+                "expectedBasis",
+                "workspace",
+            ],
+            &["schemaVersion"],
         ),
         "trellis_outgoing_calls" | "trellis_incoming_calls" => (
             &[
                 "schemaVersion",
                 "symbolId",
+                "lookupKey",
                 "limit",
                 "semanticProducerId",
                 "compact",
                 "expectedBasis",
                 "workspace",
             ],
-            &["schemaVersion", "symbolId"],
+            &["schemaVersion"],
         ),
         "trellis_call_graph" => (
             &[
                 "schemaVersion",
                 "symbolId",
+                "lookupKey",
                 "semanticProducerId",
                 "depth",
                 "maxNodes",
@@ -177,7 +189,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "expectedBasis",
                 "workspace",
             ],
-            &["schemaVersion", "symbolId"],
+            &["schemaVersion"],
         ),
         _ => (
             &[
@@ -230,6 +242,12 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             }
             limit(o).and_then(|()| offset(o))
         }
+        "trellis_find_symbols" if o.contains_key("lookupKey") => {
+            if o.contains_key("query") || !valid_lookup_key(o.get("lookupKey")) {
+                return Err("invalid_request");
+            }
+            limit(o)
+        }
         "trellis_find_symbols" | "trellis_search_symbols" => {
             let q = string(o.get("query")).ok_or("invalid_request")?;
             let max_bytes = if name == "trellis_search_symbols" {
@@ -252,14 +270,20 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
         | "trellis_outgoing_calls"
         | "trellis_incoming_calls"
         | "trellis_call_graph" => {
-            let sid = string(o.get("symbolId")).ok_or("invalid_request")?;
-            if sid.len() > 8192
-                || sid.len() != 39
-                || !sid.starts_with("sid:v1:")
-                || !sid[7..]
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            {
+            if o.contains_key("symbolId") == o.contains_key("lookupKey") {
+                return Err("invalid_request");
+            }
+            if let Some(value) = o.get("symbolId") {
+                let sid = value.as_str().ok_or("invalid_request")?;
+                if sid.len() != 39
+                    || !sid.starts_with("sid:v1:")
+                    || !sid[7..]
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err("invalid_request");
+                }
+            } else if !valid_lookup_key(o.get("lookupKey")) {
                 return Err("invalid_request");
             }
             if name == "trellis_call_graph" {
@@ -344,9 +368,11 @@ pub fn call_graph_query(args: &Value) -> crate::graph_query::GraphQuery {
         })
     };
     crate::graph_query::GraphQuery {
-        root_syntax_id: args["symbolId"]
-            .as_str()
-            .expect("validated call graph root")
+        // A lookup-key root is resolved inside the admitted evidence response.
+        root_syntax_id: args
+            .get("symbolId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
             .to_owned(),
         semantic_producer_id: args
             .get("semanticProducerId")
@@ -478,73 +504,77 @@ pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
                 .expect("sanitized failure message")
         )
     } else {
-        let (count, items) = match name {
-            "trellis_workspace_describe" => (1, "workspace"),
-            "trellis_find_symbols" => (
-                envelope["data"]["symbols"]
-                    .as_array()
-                    .expect("find symbols")
-                    .len(),
-                "symbols",
-            ),
-            "trellis_search_symbols" => (
-                envelope["data"]["hits"]
-                    .as_array()
-                    .expect("search hits")
-                    .len(),
-                "hits",
-            ),
-            "trellis_declaration" => (1, "declaration"),
-            "trellis_references" => (
-                envelope["data"]["production"]
-                    .as_array()
-                    .expect("production edges")
-                    .len()
-                    + envelope["data"]["tests"]
+        let (count, items) = if let Some(candidates) = envelope["data"]["candidates"].as_array() {
+            (candidates.len(), "candidates")
+        } else {
+            match name {
+                "trellis_workspace_describe" => (1, "workspace"),
+                "trellis_find_symbols" => (
+                    envelope["data"]["symbols"]
                         .as_array()
-                        .expect("test edges")
+                        .expect("find symbols")
                         .len(),
-                "edges",
-            ),
-            "trellis_rules_check" | "trellis_rules_explain" => (
-                envelope["data"]["instances"]
-                    .as_array()
-                    .expect("rule instances")
-                    .len(),
-                "instances",
-            ),
-            "trellis_incoming_calls" => (
-                envelope["data"]["callers"]
-                    .as_array()
-                    .expect("incoming callers")
-                    .len(),
-                "calls",
-            ),
-            "trellis_outgoing_calls" => (
-                envelope["data"]["calls"]
-                    .as_array()
-                    .expect("outgoing calls")
-                    .len(),
-                "calls",
-            ),
-            "trellis_call_graph" => (
-                envelope["data"]["result"]["edges"]
-                    .as_array()
-                    .expect("call graph edges")
-                    .len(),
-                "edges",
-            ),
-            "trellis_read_source" => (
-                (envelope["data"]["endLine"]
-                    .as_u64()
-                    .expect("source end line")
-                    - envelope["data"]["startLine"]
+                    "symbols",
+                ),
+                "trellis_search_symbols" => (
+                    envelope["data"]["hits"]
+                        .as_array()
+                        .expect("search hits")
+                        .len(),
+                    "hits",
+                ),
+                "trellis_declaration" => (1, "declaration"),
+                "trellis_references" => (
+                    envelope["data"]["production"]
+                        .as_array()
+                        .expect("production edges")
+                        .len()
+                        + envelope["data"]["tests"]
+                            .as_array()
+                            .expect("test edges")
+                            .len(),
+                    "edges",
+                ),
+                "trellis_rules_check" | "trellis_rules_explain" => (
+                    envelope["data"]["instances"]
+                        .as_array()
+                        .expect("rule instances")
+                        .len(),
+                    "instances",
+                ),
+                "trellis_incoming_calls" => (
+                    envelope["data"]["callers"]
+                        .as_array()
+                        .expect("incoming callers")
+                        .len(),
+                    "calls",
+                ),
+                "trellis_outgoing_calls" => (
+                    envelope["data"]["calls"]
+                        .as_array()
+                        .expect("outgoing calls")
+                        .len(),
+                    "calls",
+                ),
+                "trellis_call_graph" => (
+                    envelope["data"]["result"]["edges"]
+                        .as_array()
+                        .expect("call graph edges")
+                        .len(),
+                    "edges",
+                ),
+                "trellis_read_source" => (
+                    (envelope["data"]["endLine"]
                         .as_u64()
-                        .expect("source start line")
-                    + 1) as usize,
-                "lines",
-            ),
-            _ => unreachable!("known tool name"),
+                        .expect("source end line")
+                        - envelope["data"]["startLine"]
+                            .as_u64()
+                            .expect("source start line")
+                        + 1) as usize,
+                    "lines",
+                ),
+                _ => unreachable!("known tool name"),
+            }
         };
         let truncation = if envelope["truncated"] == true {
             format!(
@@ -740,6 +770,59 @@ mod tests {
             assert_eq!(validate(n, Some(&v)), Ok(()));
         }
     }
+    #[test]
+    fn stable_lookup_selectors_are_exclusive_and_nonempty() {
+        for name in [
+            "trellis_find_symbols",
+            "trellis_declaration",
+            "trellis_outgoing_calls",
+            "trellis_incoming_calls",
+            "trellis_call_graph",
+        ] {
+            let other = if name == "trellis_find_symbols" {
+                "query"
+            } else {
+                "symbolId"
+            };
+            let mut args = json!({"schemaVersion":1,"lookupKey":"src/store.rs::Store::read"});
+            assert_eq!(validate(name, Some(&args)), Ok(()));
+            // No new per-field cap: only the existing transport request bound applies.
+            args["lookupKey"] = json!("x".repeat(9000));
+            assert_eq!(validate(name, Some(&args)), Ok(()));
+            for invalid in [json!(""), json!(null), json!(1), json!([])] {
+                args["lookupKey"] = invalid;
+                check(name, &args, "invalid_request");
+            }
+            args["lookupKey"] = json!("src/store.rs::Store::read");
+            args[other] = good(name)[other].clone();
+            check(name, &args, "invalid_request");
+            check(name, &json!({"schemaVersion":1}), "invalid_request");
+        }
+        check(
+            "trellis_search_symbols",
+            &json!({"schemaVersion":1,"lookupKey":"src/a.rs::a"}),
+            "invalid_request",
+        );
+    }
+
+    #[test]
+    fn candidate_summaries_precede_operation_fields() {
+        for name in [
+            "trellis_declaration",
+            "trellis_outgoing_calls",
+            "trellis_incoming_calls",
+            "trellis_call_graph",
+        ] {
+            let envelope = json!({"schemaVersion":1,"requestId":1,"data":{"lookupKey":"src/a.rs::a","candidates":[{},{}]},"truncated":false});
+            let summary = result(name, envelope, true);
+            assert_eq!(summary["isError"], false);
+            assert_eq!(
+                summary["content"][0]["text"],
+                format!("{name}: 2 candidates; full result in structuredContent.")
+            );
+        }
+    }
+
     #[test]
     fn find_and_inspect_boundaries() {
         let n = "trellis_find_symbols";
@@ -959,7 +1042,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":3,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":4,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});

@@ -239,3 +239,73 @@ fn incoming_reads_each_selected_source_once_for_repeated_callers() {
     }));
     assert_eq!(counts.source_reads, 2);
 }
+
+#[test]
+fn rust_lookup_keys_reuse_the_checked_source_for_sid_answers() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("store.rs"), "struct Store; impl Store { fn save(&self) {} fn caller(&self) { self.save(); self.save(); } }\n").unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.writer().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let target = native
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name.as_deref() == Some("save"))
+        .unwrap();
+    let (found, counts) = whole_request(|| {
+        store
+            .evidence_response()
+            .unwrap()
+            .mcp_find_with_lines("save", 20, Some(pin))
+            .unwrap()
+    });
+    assert_eq!(counts.source_reads, 1);
+    assert_eq!(
+        found.symbols[0].source.stable_lookup_key.as_deref(),
+        Some("store.rs::Store::save")
+    );
+    let (declaration, counts) = whole_request(|| {
+        store
+            .evidence_response()
+            .unwrap()
+            .mcp_declaration_with_lines(&target.syntax_id, Some(pin))
+            .unwrap()
+            .unwrap()
+    });
+    assert_eq!(counts.source_reads, 1);
+    assert_eq!(
+        declaration.source.stable_lookup_key.as_deref(),
+        Some("store.rs::Store::save")
+    );
+    let (incoming, counts) = whole_request(|| {
+        store
+            .evidence_response()
+            .unwrap()
+            .mcp_incoming_with_lines(&target.syntax_id, 20, Some(pin))
+            .unwrap()
+            .unwrap()
+    });
+    assert_eq!(incoming.calls.len(), 2);
+    assert_eq!(counts.source_reads, 1);
+    assert_eq!(
+        incoming.selected.source.stable_lookup_key.as_deref(),
+        Some("store.rs::Store::save")
+    );
+}
