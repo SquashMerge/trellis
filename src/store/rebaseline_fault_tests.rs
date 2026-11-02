@@ -819,6 +819,119 @@ fn exceptional_corrupt_recreate_refuses_busy_use_without_unlinking_index() {
 }
 
 #[test]
+fn old_native_producer_waits_for_automatic_reconciliation_without_corruption() {
+    let (state, work, store) = super::selected_read_once_tests::published_store(1);
+    let index = store.roots.index_db(&store.identity);
+    let roots = store.roots.clone();
+    let identity = topology::WorkspaceIdentity::discover_unattached(Some(work.path()), work.path())
+        .unwrap()
+        .attach_existing_marker_readonly()
+        .unwrap();
+    let original = store.status().unwrap().revision;
+    let options = IndexOptions::new(work.path().to_owned());
+    let request = store.enqueue_request(&options, None).unwrap();
+    {
+        let db = store.cache_write().unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        db.execute("UPDATE native_producers SET version='native-v12'", [])
+            .unwrap();
+    }
+    drop(store);
+    let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let error = recovering.evidence_response_daemon_local().err().unwrap();
+    assert!(error.is::<topology::IndexNotReady>(), "{error:#}");
+    let cold = Store::status_existing_readonly(roots, identity).unwrap_err();
+    assert!(cold.is::<topology::IndexNotReady>(), "{cold:#}");
+    let scheduler = crate::http::new(
+        recovering.clone(),
+        options,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    assert!(recovering.request_by_id(&request.id).unwrap().is_some());
+    let inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&index).unwrap());
+    scheduler.force_root_transition_tick_for_tests().unwrap();
+    let current = recovering.status().unwrap().revision;
+    assert_ne!(current.index_generation, original.index_generation);
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(&index).unwrap()),
+        inode
+    );
+    assert_eq!(
+        recovering
+            .request_by_id(&request.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "done"
+    );
+}
+
+#[test]
+fn old_schema_discovery_is_selectable_and_automatic_recovery_keeps_queue() {
+    let (state, work, store) = super::selected_read_once_tests::published_store(1);
+    let roots = store.roots.clone();
+    let identity = topology::WorkspaceIdentity::discover_unattached(Some(work.path()), work.path())
+        .unwrap()
+        .attach_existing_marker_readonly()
+        .unwrap();
+    let key = identity.root_key.clone();
+    let options = IndexOptions::new(work.path().to_owned());
+    let request = store.enqueue_request(&options, None).unwrap();
+    let index = roots.index_db(&identity);
+    {
+        let db = store.cache_write().unwrap();
+        db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION - 1)
+            .unwrap();
+    }
+    drop(store);
+    assert_eq!(
+        Store::browser_index_root_existing(&roots, &key).unwrap(),
+        fs::canonicalize(work.path()).unwrap().to_str().unwrap()
+    );
+    let cold = Store::status_existing_readonly(roots.clone(), identity).unwrap_err();
+    assert!(cold.is::<topology::IndexNotReady>(), "{cold:#}");
+    let mut registry = crate::daemon::registry::CheckoutRegistry::with_roots(roots);
+    let row = registry
+        .browser_checkouts_probe()
+        .check()
+        .into_iter()
+        .find(|row| row["rootKey"] == key)
+        .unwrap();
+    assert_eq!(row["state"], "available");
+    assert_eq!(row["indexError"], "index_not_ready");
+    assert!(row["revision"].is_null());
+    assert_eq!(
+        registry.browser_identity(&key).unwrap().root,
+        fs::canonicalize(work.path()).unwrap()
+    );
+    let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let scheduler = crate::http::new(
+        recovering.clone(),
+        options,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&index).unwrap());
+    scheduler.force_root_transition_tick_for_tests().unwrap();
+    assert!(recovering.status().is_ok());
+    assert_ne!(
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(&index).unwrap()),
+        inode
+    );
+    assert_eq!(
+        recovering
+            .request_by_id(&request.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "done"
+    );
+}
+
+#[test]
 fn obsolete_metadata_marker_recreates_new_file_and_preserves_requests() {
     assert_obsolete_index_recreates_and_preserves_requests(false);
 }

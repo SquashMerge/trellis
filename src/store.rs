@@ -444,9 +444,10 @@ impl std::fmt::Debug for Store {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryDisposition {
     Ready = 0,
-    Rebuild = 1,
-    RecreatePending = 2,
-    RootReplaced = 3,
+    UpgradePending = 1,
+    Rebuild = 2,
+    RecreatePending = 3,
+    RootReplaced = 4,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MetadataColumn {
@@ -594,6 +595,15 @@ impl std::fmt::Display for SelectedIntegrity {
     }
 }
 impl std::error::Error for SelectedIntegrity {}
+#[derive(Debug)]
+struct NativeProducerIncompatible;
+impl std::fmt::Display for NativeProducerIncompatible {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("index_not_ready: native producer upgrade requires reconciliation")
+    }
+}
+impl std::error::Error for NativeProducerIncompatible {}
+
 #[derive(Debug)]
 struct ControlIntegrity(String);
 impl std::fmt::Display for ControlIntegrity {
@@ -1340,6 +1350,9 @@ impl OptionalRecovery {
     }
     fn record(&self, error: anyhow::Error) {
         let disposition = match recovery_class(&error) {
+            RecoveryClass::Rebuild if error.is::<NativeProducerIncompatible>() => {
+                RecoveryDisposition::UpgradePending
+            }
             RecoveryClass::Rebuild => RecoveryDisposition::Rebuild,
             RecoveryClass::RecreatePending => RecoveryDisposition::RecreatePending,
             RecoveryClass::Hard => return,
@@ -4537,7 +4550,8 @@ fn recovery_class(error: &anyhow::Error) -> RecoveryClass {
     if error.downcast_ref::<ObsoleteIndexFormat>().is_some() {
         return RecoveryClass::RecreatePending;
     }
-    if error.downcast_ref::<SelectedIntegrity>().is_some()
+    if error.is::<NativeProducerIncompatible>()
+        || error.downcast_ref::<SelectedIntegrity>().is_some()
         || error.downcast_ref::<ControlIntegrity>().is_some()
     {
         return RecoveryClass::Rebuild;
@@ -11193,12 +11207,12 @@ fn validate_paired_metadata(
     // another native producer version holds IDs this binary cannot reproduce, so it is never
     // served; the integrity failure forces an in-place rebaseline from fresh measurement.
     let producer_version = one_row(db, "SELECT id,version FROM native_producers LIMIT 2")?;
-    control_ensure!(
-        producer_version
-            .as_ref()
-            .is_none_or(|(_, version)| version == crate::native_evidence::NATIVE_VERSION),
-        "incompatible_index: native producer version mismatch"
-    );
+    if producer_version
+        .as_ref()
+        .is_some_and(|(_, version)| version != crate::native_evidence::NATIVE_VERSION)
+    {
+        return Err(NativeProducerIncompatible.into());
+    }
     let source = one_row(db, "SELECT id,root_id FROM native_source_sets LIMIT 2")?;
     let revision = one_row(
         db,
@@ -13092,7 +13106,7 @@ impl Store {
                 if let Some(obsolete) = error.downcast_ref::<ObsoleteIndexFormat>() {
                     *store.obsolete_format_marker.lock().unwrap() = Some(obsolete.clone());
                 }
-                store.mark_recovery(RecoveryDisposition::Rebuild);
+                store.note_index_failure(&error);
                 Ok(store)
             }
             Err(error) if error.to_string() == "root_changed: index root identity mismatch" => {
@@ -13262,9 +13276,9 @@ impl Store {
                             "unavailable"
                         }
                     })?;
-            if marker.is_obsolete()
-                || version != DATABASE_SCHEMA_VERSION
-                || marker.schema_version != i64::from(DATABASE_SCHEMA_VERSION)
+            if version == 0
+                || version > DATABASE_SCHEMA_VERSION
+                || marker.schema_version > i64::from(DATABASE_SCHEMA_VERSION)
             {
                 return Err("corrupt");
             }
@@ -13328,7 +13342,9 @@ impl Store {
                 }
             }
             let db = open_index(&index, false).map_err(|error| {
-                if recovery_class(&error) == RecoveryClass::RecreatePending {
+                if error.is::<ObsoleteIndexFormat>() {
+                    topology::IndexNotReady::new("index upgrade requires reconciliation").into()
+                } else if recovery_class(&error) == RecoveryClass::RecreatePending {
                     anyhow::anyhow!(
                         "recovery_required: exceptional index format; run explicit trellis index"
                     )
@@ -13355,7 +13371,14 @@ impl Store {
                 json(&options)? == raw_options && options.version == 2,
                 "incompatible_index: unsupported reconcile options"
             );
-            let status = store.read_status(&db)?;
+            let status = store.read_status(&db).map_err(|error| {
+                if error.is::<NativeProducerIncompatible>() {
+                    topology::IndexNotReady::new("native producer upgrade requires reconciliation")
+                        .into()
+                } else {
+                    error
+                }
+            })?;
             store.identity.verify_readonly()?;
             guard.verify()?;
             Ok(status)
@@ -14094,8 +14117,7 @@ impl Store {
             let db = match opened {
                 Ok(db) => db,
                 Err(error)
-                    if self.disposition() == RecoveryDisposition::Rebuild
-                        && recovery_class(&error) == RecoveryClass::Rebuild =>
+                    if self.needs_rebuild() && recovery_class(&error) == RecoveryClass::Rebuild =>
                 {
                     open_index_marker_probe(&path, writable, Duration::from_secs(5))?
                 }
@@ -14112,12 +14134,20 @@ impl Store {
             self.note_index_failure(error);
         })
     }
+    fn needs_rebuild(&self) -> bool {
+        matches!(
+            self.disposition(),
+            RecoveryDisposition::UpgradePending | RecoveryDisposition::Rebuild
+        )
+    }
+
     fn disposition(&self) -> RecoveryDisposition {
         match self.recovery_disposition.load(Ordering::Acquire) {
             0 => RecoveryDisposition::Ready,
-            1 => RecoveryDisposition::Rebuild,
-            2 => RecoveryDisposition::RecreatePending,
-            3 => RecoveryDisposition::RootReplaced,
+            1 => RecoveryDisposition::UpgradePending,
+            2 => RecoveryDisposition::Rebuild,
+            3 => RecoveryDisposition::RecreatePending,
+            4 => RecoveryDisposition::RootReplaced,
             _ => unreachable!("invalid recovery disposition"),
         }
     }
@@ -14162,7 +14192,13 @@ impl Store {
     fn note_index_failure(&self, error: &anyhow::Error) -> RecoveryClass {
         let class = recovery_class(error);
         match class {
-            RecoveryClass::Rebuild => self.mark_recovery(RecoveryDisposition::Rebuild),
+            RecoveryClass::Rebuild => {
+                self.mark_recovery(if error.is::<NativeProducerIncompatible>() {
+                    RecoveryDisposition::UpgradePending
+                } else {
+                    RecoveryDisposition::Rebuild
+                })
+            }
             RecoveryClass::RecreatePending => {
                 self.mark_recovery(RecoveryDisposition::RecreatePending)
             }
@@ -14547,6 +14583,9 @@ impl Store {
                 index_diagnostic_stage("public_read_latched");
                 Err(topology::IndexNotReady::new("reconciliation required").into())
             }
+            RecoveryDisposition::UpgradePending => {
+                Err(topology::IndexNotReady::new("native producer upgrade pending").into())
+            }
             RecoveryDisposition::Rebuild => {
                 anyhow::bail!(
                     "incompatible_index: reconciliation required after invalid current index"
@@ -14583,7 +14622,10 @@ impl Store {
                 .map_err(|error| self.report_index_failure(error))?;
             // startup reconciliation may keep a valid prior head readable, but a selected document
             // already proved corrupt cannot be admitted by that same path.
-            if self.disposition() == RecoveryDisposition::Rebuild {
+            if self.disposition() == RecoveryDisposition::UpgradePending {
+                return Err(topology::IndexNotReady::new("native producer upgrade pending").into());
+            }
+            if self.needs_rebuild() {
                 anyhow::bail!(
                     "incompatible_index: reconciliation required after invalid current index"
                 );
@@ -15001,7 +15043,9 @@ impl Store {
     /// snapshot. The root and selected revision are rechecked at finish.
     pub fn evidence_response_daemon_local(&self) -> Result<EvidenceResponse> {
         (|| {
-            if self.is_recreate_pending() {
+            if self.disposition() == RecoveryDisposition::UpgradePending
+                || self.is_recreate_pending()
+            {
                 return Err(topology::IndexNotReady::new(
                     "exceptional index reconciliation pending",
                 )
@@ -16258,7 +16302,7 @@ impl Store {
             "oracle fixture baseline is incompatible"
         );
         ensure!(
-            self.disposition() != RecoveryDisposition::Rebuild,
+            !self.needs_rebuild(),
             "oracle fixture store requires rebuild"
         );
         ensure!(
@@ -18313,7 +18357,7 @@ impl Store {
             && let ExpectedPublication::Recovery(baseline) = &expected
             && baseline.compatible
             && let Some(pin) = baseline.pin().filter(|pin| pin.index_revision > 0)
-            && self.disposition() != RecoveryDisposition::Rebuild
+            && !self.needs_rebuild()
         {
             if self.selected_links_for_reconciliation(pin)? {
                 self.selected_native_inputs_at(pin, loaded_docs.as_ref())?
@@ -18634,8 +18678,7 @@ impl Store {
             );
             let rebaseline = !compatible
                 || !decoded
-                || (matches!(target, PublicationTarget::Live)
-                    && self.disposition() == RecoveryDisposition::Rebuild);
+                || (matches!(target, PublicationTarget::Live) && self.needs_rebuild());
             let prior_scan = (!rebaseline)
                 .then(|| compare_capture_snapshot(&tx, capture))
                 .transpose()?;

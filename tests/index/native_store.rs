@@ -747,7 +747,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
                 .unwrap_err(),
         ] {
             assert!(
-                error.to_string().contains("incompatible_index"),
+                error.to_string().starts_with("index_not_ready:"),
                 "{error:#}"
             );
         }
