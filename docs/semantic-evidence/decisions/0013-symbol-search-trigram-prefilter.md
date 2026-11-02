@@ -8,6 +8,7 @@
   The number 0013 was last used by the closed, unmerged WAL draft (#215), which never became a record.
 - **Amends:** nothing in W2's output. [`../../mcp-readonly-pilot-contract.md`](../../mcp-readonly-pilot-contract.md) § W2 keeps its literal ASCII-`lower`/`instr` rule, ranking, limits and truncation. This record adds only how candidates are found.
 - **Search-side table:** [Decision 0018](0018-semantic-symbol-retrieval.md) specifies a separate head-only split-identifier ranking table. Both trigram prefilters and all literal matching/output rules in this decision remain unchanged. Neither trigram table serves semantic-search ranking.
+- **Ranking amendment (#594):** W2 now orders stored production declarations before test declarations within each exact/prefix/substring tier, before the limit. The literal and trigram paths use this same amended rule. The browser/CLI graph search order is unchanged. Ordered W2 queries use separate production/test passes in each tier to retain the indexed name/ID early stop; the native indexes are no longer covering because they do not store the role.
 - **Compatibility:** none needed for disposable derived indexes. The new tables change the index format, so the index schema version changes and existing indexes are recreated, not migrated.
 
 ## Decision
