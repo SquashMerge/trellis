@@ -752,6 +752,11 @@ fn isolated(test: &str) -> Option<PathBuf> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+        "isolated test did not run exactly once: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     None
 }
 
