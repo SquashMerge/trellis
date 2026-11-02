@@ -66,7 +66,8 @@ test("Files opens pinned catalog without choosing source; explicit file reads ze
 });
 
 test("callable mini uses measured renderer; Open full preserves exact DTO seed/pin without another request", async () => {
-  const h=harness(), item=outline("measured"); indexedNetwork(h,item);
+  const h=harness(), item=outline("measured");
+  indexedNetwork(h,item,url=>url==="/api/sequence" ? response({...view(item),steps:[{id:"call",callId:"call",kind:"call",label:"helper",path:"main.java",range:{startLine:1,endLine:1},children:[],alternate:[],hidden:false}]}) : undefined);
   await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
   await h.run('selectFilesSymbol(item)');
   assert.ok(all(h.get("files-mini-sequence")).some(node=>node.tagName==="svg"));

@@ -22,6 +22,7 @@
   }
   function project(view, expanded = new Set(), options = {}) {
     if (!view || !view.seed || !Array.isArray(view.steps) || !Array.isArray(view.participants) || !view.revision) unsupported("Invalid sequence view");
+    const displayProjection = window.TrellisSequence.display(view, options);
     const seen = new Set(), rows = [], frames = [], frameHeaders = [], closeFrames = [], closeHeaders = [], noteOrder = [null];
     const intro = "Static possible paths - not a runtime trace";
     // One lane per type or module (#558); its targets are the exact methods drawn in it.
@@ -47,7 +48,7 @@
     const add = (step, preview) => {
       const ordinal = rows.length + 1;
       if (ordinal > 200) unsupported("Too many source notes");
-      const early = window.TrellisSequence.earlyReturn?.(step) || "";
+      const early = displayProjection.earlyReturn(step);
       let label = options.showDetails ? step.label || step.kind : window.TrellisSequence.compactLabel(step);
       if (step.kind === "call" || step.kind === "boundary" && step.callId) label = step.callEvidence
         ? `${window.TrellisSequence.evidenceLabel(step, view)} - ${label}`
@@ -91,7 +92,7 @@
             !Array.isArray(step.children) || !Array.isArray(step.alternate) || typeof step.hidden !== "boolean" || !witness(step)) unsupported("Unsupported sequence step");
         if (seen.has(step.id)) unsupported("Duplicate sequence identity");
         seen.add(step.id);
-        if (step.hidden) continue;
+        if (!displayProjection.visible.has(step)) continue;
         const children = step.children, alternate = step.alternate;
         const collapsed = step.kind === "group" && !expanded.has(step.id);
         const preview = collapsed && !alternate.length && children.length && children.every(child => child.kind === "call" && !child.hidden && !child.children?.length && !child.alternate?.length && witness(child) && child.path === step.path) ? children[0] : null;
