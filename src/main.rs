@@ -1607,6 +1607,33 @@ mod daemon_shutdown_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn retained_shutdown_cannot_race_serve_socket_configuration() {
+        let (control, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _peer = ControlPeer(peer);
+        let (shutdown, stopped) = tokio::sync::watch::channel(true);
+        let (finished, wait) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            wait_for_serve_disconnect_ordered(
+                control,
+                stopped,
+                &runtime,
+                Some(ServeDisconnectTestOrder {
+                    shutdown_finished: finished,
+                    wait_for_shutdown: wait,
+                }),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            result.is_ok(),
+            "retained shutdown raced socket setup: {result:?}"
+        );
+        assert!(*shutdown.borrow());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn shutdown_finishes_the_serve_control_read_before_returning() {
         let (control, peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let _peer = ControlPeer(peer);
@@ -2395,22 +2422,55 @@ fn dispatch_connection(
     Ok(())
 }
 
+#[cfg(test)]
+struct ServeDisconnectTestOrder {
+    shutdown_finished: std::sync::mpsc::Sender<()>,
+    wait_for_shutdown: std::sync::mpsc::Receiver<()>,
+}
+
 fn wait_for_serve_disconnect(
+    stream: std::os::unix::net::UnixStream,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<()> {
+    wait_for_serve_disconnect_ordered(
+        stream,
+        shutdown,
+        runtime,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn wait_for_serve_disconnect_ordered(
     mut stream: std::os::unix::net::UnixStream,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     runtime: &tokio::runtime::Handle,
+    #[cfg(test)] order: Option<ServeDisconnectTestOrder>,
 ) -> Result<()> {
+    stream.set_read_timeout(None)?;
     let closer = stream.try_clone()?;
     let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+    #[cfg(test)]
+    let (shutdown_finished, wait_for_shutdown) = order
+        .map(|order| (Some(order.shutdown_finished), Some(order.wait_for_shutdown)))
+        .unwrap_or((None, None));
     let watcher = runtime.spawn(async move {
         tokio::select! {
             _ = shutdown.wait_for(|stopped| *stopped) => {
                 let _ = closer.shutdown(std::net::Shutdown::Both);
+                #[cfg(test)]
+                if let Some(finished) = shutdown_finished {
+                    let _ = finished.send(());
+                }
             }
             _ = closed_rx => {}
         }
     });
-    stream.set_read_timeout(None)?;
+    #[cfg(test)]
+    if let Some(wait) = wait_for_shutdown {
+        wait.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    }
     let mut one = [0u8; 1];
     use std::io::Read;
     while matches!(stream.read(&mut one), Ok(n) if n > 0) {}
