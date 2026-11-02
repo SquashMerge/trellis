@@ -332,17 +332,6 @@ fn held(pid: libc::pid_t) -> bool {
     unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &raw mut info, flags) == 0 }
 }
 
-/// The group status of an exited leader alone in its group: the final SIGKILL reaches a
-/// zombie-only group on Linux, while macOS refuses it with EPERM, so termination there is
-/// unknown rather than assumed (#624).
-fn alone_status() -> GroupStatus {
-    if cfg!(target_os = "macos") {
-        GroupStatus::Unknown
-    } else {
-        GroupStatus::Empty
-    }
-}
-
 type Signals = Vec<(i32, bool)>;
 
 /// Runs `spec`, recording every group signal with whether the leader was still held then.
@@ -396,12 +385,14 @@ fn leader_is_held_through_the_last_group_signal_then_reaped() {
 }
 
 #[test]
-fn exited_leader_alone_reports_established_or_unknown_status() {
+fn exited_leader_alone_is_proven_empty_on_every_platform() {
+    // Linux accepts the final SIGKILL to the zombie-only group. macOS refuses it with EPERM,
+    // and the signal-0 probe after the reap (ESRCH) proves the group empty instead (#624).
     let run_dir = Run::new();
     let outcome = run(&run_dir.spec(&json!({})), &fast());
     assert_eq!(outcome.ending, Ending::Exited);
     assert_eq!(outcome.diagnostics.exit.code, Some(0));
-    assert_eq!(outcome.diagnostics.group_status, alone_status());
+    assert_eq!(outcome.diagnostics.group_status, GroupStatus::Empty);
 }
 
 #[test]

@@ -311,6 +311,8 @@ fn explicit_run_imports_stub_artifact() {
     assert!(reply["import"]["publishedRevision"].is_object());
     assert!(reply["import"]["report"].is_object());
     assert_eq!(reply["diagnostics"]["exit"]["code"], 0);
+    // An ordinary exit is proven empty on every platform, so no snapshot preflight runs.
+    assert_eq!(reply["diagnostics"]["groupStatus"], "empty");
 
     assert_eq!(marker_lines(&world), 1, "the stub ran exactly once");
     assert_eq!(world.run_ids(), [reply["runId"].as_str().unwrap()]);

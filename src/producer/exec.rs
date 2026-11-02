@@ -409,7 +409,24 @@ fn terminate(leader: &mut Leader<'_>, limits: &Limits) -> (Option<ExitStatus>, G
     }
     let status = group_status(final_kill, exited, only_leader(pgid));
     // A leader that never exited stays held, unreaped.
-    (if exited { leader.reap() } else { None }, status)
+    if !exited {
+        return (None, status);
+    }
+    let exit = leader.reap();
+    // After the reap, a signal-0 probe delivers nothing even to a reused ID, and ESRCH (no
+    // process has the group ID) proves the group empty. This settles macOS, whose final
+    // SIGKILL to a zombie-only group answers EPERM.
+    let probe_esrch = status == GroupStatus::Unknown && !process_info::group_exists(pgid);
+    (exit, after_reap(status, probe_esrch))
+}
+
+/// The status once the leader is reaped: an unknown group is proven empty only by a probe
+/// that found no process with the group ID; any other answer stays unknown.
+pub(crate) fn after_reap(status: GroupStatus, probe_esrch: bool) -> GroupStatus {
+    match status {
+        GroupStatus::Unknown if probe_esrch => GroupStatus::Empty,
+        other => other,
+    }
 }
 
 /// Whether SIGCHLD is ignored or set not to keep zombies: the kernel would then

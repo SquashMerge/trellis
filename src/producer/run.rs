@@ -468,6 +468,15 @@ impl Run<'_> {
                 "producer_output_invalid",
                 format!("invalid_request: {detail}"),
             ),
+            // Claim proofs the artifact's decoded facts could not establish.
+            Some(
+                failure @ (ScipCaptureError::MissingProof
+                | ScipCaptureError::NonUniqueProof
+                | ScipCaptureError::DigestCollision),
+            ) => Finish::failed(
+                "producer_output_invalid",
+                format!("invalid_artifact: {}", failure.detail()),
+            ),
             _ => return self.finish_from_error(error, Some(diagnostics)),
         };
         finish.with(diagnostics)

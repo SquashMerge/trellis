@@ -141,13 +141,15 @@ pub struct Diagnostics {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GroupStatus {
-    /// Every member was signalled and only the unreaped leader was left.
+    /// Every member was signalled and only the unreaped leader was left, or, once
+    /// the leader was reaped, no process had the group ID at all.
     Empty,
     /// A member was still in the group after the kill wait.
     Survived,
-    /// Termination was not established: the final signal was refused (macOS
-    /// refuses a group whose only member is the unreaped leader), the group
-    /// could not be listed, or ownership was never provable (crash recovery).
+    /// Termination was not established: the final signal was refused or the
+    /// group could not be listed, and after the reap a process still had the
+    /// group ID (possibly a reuse); or ownership was never provable (crash
+    /// recovery).
     #[default]
     Unknown,
 }
