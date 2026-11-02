@@ -1263,6 +1263,42 @@ fn occurrence_roles(bytes: &[u8]) -> Result<u64, ScipCaptureError> {
 /// pending position list stays bounded however many occurrences the document has.
 const CAPPED_POSITION_BATCH: usize = 1 << 16;
 
+/// Fails `limit_exceeded: unit expansion` unless one entry of a capped document fits the batch
+/// live budget once parsed. Inside an excluded document an entry's own repeated fields may be
+/// over their counts (#634), so the generated parse is bounded here, before it allocates: every
+/// field the walk counts becomes at most one generated message, string or scalar element, plus
+/// the entry's bytes.
+fn entry_within_budget(
+    bytes: &[u8],
+    node: Node,
+    limits: &BatchLimits,
+    cancel: &CancelFlag,
+) -> Result<(), ScipCaptureError> {
+    use std::mem::size_of;
+    let mut budget = WireBudget::new(limits);
+    budget.in_document = true;
+    wire(bytes, node, 2, &mut budget, cancel)?;
+    let per_field = [
+        size_of::<types::Occurrence>(),
+        size_of::<types::SymbolInformation>(),
+        size_of::<types::Relationship>(),
+        size_of::<types::Diagnostic>(),
+        size_of::<types::Signature>(),
+        size_of::<String>(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0) as u64;
+    let bound = budget
+        .fields
+        .saturating_mul(per_field)
+        .saturating_add(bytes.len() as u64);
+    if bound > limits.unit_expansion_bytes {
+        return Err(limit("unit expansion"));
+    }
+    Ok(())
+}
+
 /// Admits an over-cap `Document` unit partially, in place: validates every occurrence exactly
 /// as an admitted one is validated, then keeps every other field and only the definition
 /// occurrences (none if they alone exceed the cap), in wire order. Under
@@ -1277,11 +1313,12 @@ fn cap_document(
     path: &str,
     text: Option<&str>,
     cap: DocumentCap,
-    occurrence_cap: u64,
+    limits: &BatchLimits,
     traversed: &mut usize,
     cancel: &CancelFlag,
 ) -> Result<(), ScipCaptureError> {
     let excluded = cap == DocumentCap::Document;
+    let occurrence_cap = limits.document_occurrences;
     let mut definitions = 0u64;
     let mut at = 0;
     while !excluded && at < bytes.len() {
@@ -1303,6 +1340,7 @@ fn cap_document(
             if traversed.is_multiple_of(1024) {
                 cancelled(cancel)?;
             }
+            entry_within_budget(&bytes[payload.clone()], Node::Occurrence, limits, cancel)?;
             let o = types::Occurrence::parse_from_bytes(&bytes[payload])
                 .map_err(|_| invalid("protobuf parse"))?;
             let first = positions.len();
@@ -1322,6 +1360,7 @@ fn cap_document(
             if traversed.is_multiple_of(1024) {
                 cancelled(cancel)?;
             }
+            entry_within_budget(&bytes[payload.clone()], Node::Symbol, limits, cancel)?;
             let s = types::SymbolInformation::parse_from_bytes(&bytes[payload])
                 .map_err(|_| invalid("protobuf parse"))?;
             symbol(&s, artifact.position_encoding, cancel, traversed, false)?;
@@ -1504,7 +1543,7 @@ pub fn decode_streaming<'s, R: Read>(
                         &path,
                         text,
                         cap,
-                        limits.document_occurrences,
+                        limits,
                         &mut traversed,
                         cancel,
                     )?;
@@ -3517,6 +3556,90 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// #635 review: an entry of an excluded document may be over its own counts, so its parse is
+    /// bounded by the batch live budget before anything is allocated. Under a reduced budget an
+    /// occurrence with 1,001 diagnostics fails `unit expansion` typed; the same document without
+    /// them is excluded and the artifact imports under that budget.
+    #[test]
+    fn excluded_entry_parse_is_bounded_by_the_unit_budget() {
+        let diagnostics = |count: usize| {
+            message(
+                2,
+                &[
+                    message(1, &[0, 9, 10]),
+                    message(2, b"H#"),
+                    vec![0x18, 1],
+                    message(6, b"").repeat(count),
+                ]
+                .concat(),
+            )
+        };
+        let limits = BatchLimits {
+            unit_expansion_bytes: 64 * 1024,
+            ..symbols_capped_at(2)
+        };
+        let mut fields = b_fields();
+        fields.push(diagnostics(0));
+        let small = decode_two(&two_documents(&fields, &[]), &limits).unwrap();
+        assert_eq!(small.capped_documents, excluded_b());
+        let mut fields = b_fields();
+        fields.push(diagnostics(1001));
+        let bytes = two_documents(&fields, &[]);
+        assert!((bytes.len() as u64) < limits.unit_expansion_bytes);
+        assert_eq!(
+            decode_two(&bytes, &limits).unwrap_err(),
+            limit("unit expansion")
+        );
+        // Under the production budget the same entry fits and the document is excluded.
+        assert_eq!(
+            decode_two(&bytes, &symbols_capped_at(2))
+                .unwrap()
+                .capped_documents,
+            excluded_b()
+        );
+    }
+
+    /// #635 review reproduction (Prime): 1,001 empty diagnostics in one occurrence of a document
+    /// excluded over the diagnostics count would materialize at least 1,001 generated
+    /// `Diagnostic`s, more than a 4,096-byte live budget, from a 2 KB artifact. The parse is
+    /// refused typed before it allocates.
+    #[test]
+    fn review635_excluded_diagnostic_expansion_obeys_live_budget() {
+        let diagnostic_count = 1001;
+        let diagnostic_size = std::mem::size_of::<types::Diagnostic>();
+        let diagnostic_vec_lower_bound = diagnostic_count * diagnostic_size;
+        let diagnostics = message(
+            2,
+            &[
+                message(1, &[0, 9, 10]),
+                message(2, b"H#"),
+                vec![0x18, 1],
+                message(6, b"").repeat(diagnostic_count),
+            ]
+            .concat(),
+        );
+        let limits = BatchLimits {
+            unit_expansion_bytes: 4096,
+            ..BatchLimits::PRODUCTION
+        };
+        let bytes = two_documents(&[diagnostics], &[]);
+        assert!(bytes.len() < limits.unit_expansion_bytes as usize);
+        assert!(diagnostic_vec_lower_bound > limits.unit_expansion_bytes as usize);
+        let actual = decode_two(&bytes, &limits);
+        assert_eq!(
+            actual.as_ref().err(),
+            Some(&limit("unit expansion")),
+            "artifact_bytes={} diagnostic_count={} Diagnostic_size={} vector_lower_bound={} cap_result={:?}",
+            bytes.len(),
+            diagnostic_count,
+            diagnostic_size,
+            diagnostic_vec_lower_bound,
+            actual
+                .as_ref()
+                .map(|inventory| (&inventory.capped_documents, inventory.claims.len()))
+        );
     }
 
     /// Caps outside a document, aggregate caps and a repeated singular field still refuse the
