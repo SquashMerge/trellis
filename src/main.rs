@@ -62,6 +62,8 @@ enum Command {
     References(ReferencesArgs),
     /// Query a bounded static call view. This is not a runtime sequence.
     Query(QueryArgs),
+    /// Explicitly install, inspect or remove pinned local search models.
+    Model(ModelArgs),
     /// Inspect existing derived indexes and the vector cache without changing them.
     Gc(GcArgs),
 }
@@ -94,6 +96,28 @@ struct NavigationFixtureArgs {
         "sequence-missing", "sequence-constructor", "sequence-library", "sequence-expand"
     ])]
     mode: String,
+}
+#[derive(Args)]
+struct ModelArgs {
+    #[command(subcommand)]
+    command: ModelCommand,
+}
+#[derive(Subcommand)]
+enum ModelCommand {
+    /// Download and verify the reviewed pinned model. Nothing downloads implicitly.
+    Install {
+        name: Option<String>,
+        #[arg(long)]
+        revision: Option<String>,
+    },
+    /// List managed snapshots and effective settings without starting a daemon.
+    List,
+    /// Delete one managed snapshot. This does not restart a running daemon.
+    Remove {
+        name: String,
+        #[arg(long)]
+        revision: String,
+    },
 }
 #[derive(Args)]
 struct RulesArgs {
@@ -408,6 +432,7 @@ async fn main() -> Result<()> {
                 client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
             })?;
         }
+        Command::Model(args) => model_command(args).await?,
         Command::Gc(_) => {
             let request = daemon_request("gc_report", serde_json::json!({}));
             print_json(&send_daemon(&request, true)?)?;
@@ -421,6 +446,41 @@ async fn main() -> Result<()> {
         | Command::Metrics(_)
         | Command::Rules(_)
         | Command::References(_)) => dispatch_cli(&command)?,
+    }
+    Ok(())
+}
+
+async fn model_command(args: ModelArgs) -> Result<()> {
+    let roots = TopologyRoots::production()?;
+    let resolved = trellis::search_config::resolve(&roots)?;
+    match args.command {
+        ModelCommand::Install { name, revision } => {
+            let name = name.unwrap_or_else(|| resolved.diagnostics.model_name.clone());
+            let revision = revision.unwrap_or_else(|| resolved.diagnostics.model_revision.clone());
+            let report = trellis::model_management::install(
+                &resolved.diagnostics.models_dir,
+                &name,
+                &revision,
+            )
+            .await?;
+            print_json(&report)?;
+        }
+        ModelCommand::List => {
+            let installed = trellis::model_management::list(&resolved.diagnostics.models_dir)?;
+            print_json(&serde_json::json!({
+                "configuration": resolved.diagnostics,
+                "installed": installed,
+                "appliesTo": "next_daemon_start",
+            }))?;
+        }
+        ModelCommand::Remove { name, revision } => {
+            let report = trellis::model_management::remove(
+                &resolved.diagnostics.models_dir,
+                &name,
+                &revision,
+            )?;
+            print_json(&report)?;
+        }
     }
     Ok(())
 }

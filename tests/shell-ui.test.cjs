@@ -231,6 +231,17 @@ test("inspector reset and disconnect erase source callback and workspace metadat
   h.shell.selectStep(call(),view(),()=>opened++);h.shell.showSource("workspace");h.shell.setConnected(false);h.get("inspector-open-source").listeners.click();
   assert.equal(opened,0);assert.equal(h.get("source-dock").hidden,true);assert.equal(h.get("workspace-name").textContent,"No workspace");
 });
+test("model diagnostics show missing files and clear on disconnect",()=>{
+  const h=harness();
+  const config={modelName:"voyageai/voyage-4-nano",modelRevision:"reviewed-pin",modelPath:"/models/reviewed-pin",configFile:"/home/.config/trellis/config.toml"};
+  h.shell.updateWorkspace({workspaceRoot:"/repo",revision:{indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1},searchIndex:{unavailableReason:"model_not_configured",configuration:config}});
+  assert.equal(h.get("search-model-status").hidden,false);
+  assert.match(h.get("search-model-status").textContent,/Lexical search only/);
+  assert.match(h.get("search-model-status").textContent,/Looked in: \/models\/reviewed-pin/);
+  h.shell.setConnected(false);
+  assert.equal(h.get("search-model-status").hidden,true);
+  assert.equal(h.get("search-model-status").textContent,"");
+});
 test("responsive drawers use classes rather than hiding desktop panels",()=>{
   const h=harness();h.context.window.matchMedia=()=>({matches:true});h.get("explorer-toggle").listeners.click();assert.ok(h.document.body.classList.contains("explorer-open"));
   h.get("inspector-toggle").listeners.click();assert.equal(h.get("inspector-toggle").attrs["aria-expanded"],"true");

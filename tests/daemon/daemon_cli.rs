@@ -280,6 +280,127 @@ fn run(home: &Path, command: &str, root: &Path) -> Value {
     );
     serde_json::from_slice(&output.stdout).unwrap()
 }
+const REVIEWED_MODEL_NAME: &str = "voyageai/voyage-4-nano";
+const REVIEWED_MODEL_REVISION: &str = "5fb34e870f49f19e79c94d5e118f5ee730133279";
+
+fn expected_search_configuration(home: &Path, models: &Path, configured: bool) -> Value {
+    serde_json::json!({
+        "configFile": home.join(".config/trellis/config.toml"),
+        "modelsDir": models,
+        "modelName": REVIEWED_MODEL_NAME,
+        "modelRevision": REVIEWED_MODEL_REVISION,
+        "modelPath": models.join(REVIEWED_MODEL_NAME).join(REVIEWED_MODEL_REVISION),
+        "backend": if configured { "cpu" } else { "auto" },
+        "sources": {
+            "modelsDir": if configured { "config_file" } else { "default" },
+            "model": "default",
+            "backend": if configured { "config_file" } else { "default" }
+        }
+    })
+}
+
+fn write_search_configuration(home: &Path, models: &Path) -> Value {
+    let config = home.join(".config/trellis/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        config,
+        format!(
+            "models_dir = {:?}\nbackend = \"cpu\"\n",
+            models.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    expected_search_configuration(home, models, true)
+}
+
+#[test]
+fn model_list_reads_user_configuration_without_workspace_or_runtime_state() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let roots = fixture_roots(&home);
+    let config = home.join(".config/trellis/config.toml");
+    let custom_models = temp.path().join("custom-models");
+    for configured in [false, true] {
+        let expected = if configured {
+            write_search_configuration(&home, &custom_models)
+        } else {
+            expected_search_configuration(&home, &roots.data.join("models"), false)
+        };
+        let output = cli(&home)
+            .args(["model", "list"])
+            .current_dir(&home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "model list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let listing: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(listing["configuration"], expected);
+        assert_eq!(listing["installed"], serde_json::json!([]));
+        assert_eq!(listing["appliesTo"], "next_daemon_start");
+        assert_eq!(config.exists(), configured, "list wrote a default config");
+        assert!(!home.join("auto-daemon.pid").exists());
+        assert!(!fixture_socket_paths(&home).run.exists());
+        assert!(!roots.data.exists(), "list created runtime or model state");
+        assert!(!roots.cache.exists(), "list created index or vector state");
+        assert!(!custom_models.exists(), "list installed a model");
+    }
+}
+
+#[test]
+fn configured_search_status_reports_startup_configuration_without_model_files() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let models = temp.path().join("configured-models");
+    let expected = write_search_configuration(&home, &models);
+    let root = checkout(temp.path(), "configured-search");
+    run(&home, "index", &root);
+    let status = run(&home, "status", &root);
+    assert_eq!(status["searchIndex"]["configuration"], expected);
+    assert_eq!(status["searchIndex"]["backend"], "cpu");
+    assert_eq!(
+        status["searchIndex"]["unavailableReason"],
+        "model_not_configured"
+    );
+    assert!(!models.exists(), "status installed a missing model");
+    assert!(!fixture_roots(&home).vectors_db().exists());
+}
+
+#[test]
+fn malformed_search_configuration_refuses_direct_daemon_without_index_state() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = home.join(".config/trellis/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "backend = [\n").unwrap();
+    let mut command = cli(&home);
+    command.arg("daemon");
+    let (mut daemon, log) = detached_with_log(command);
+    let mut exit = None;
+    trellis::testing::wait_until("invalid configuration startup failure", || {
+        exit = daemon.0.try_wait().unwrap();
+        exit.is_some()
+    });
+    assert!(!exit.unwrap().success());
+    let stderr = bounded_fixture_stderr(&log);
+    assert!(stderr.contains("parse search configuration"), "{stderr}");
+    assert!(stderr.contains(config.to_str().unwrap()), "{stderr}");
+    let roots = fixture_roots(&home);
+    assert!(
+        !roots.cache.exists(),
+        "failed startup created index/vector state"
+    );
+    assert!(!roots.data.join("models").exists());
+    assert_eq!(fs::read_to_string(config).unwrap(), "backend = [\n");
+}
+
 async fn serve_banner_address(child: &mut Child, log: &Path, home: &Path) -> SocketAddr {
     let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {

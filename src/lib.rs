@@ -35,6 +35,7 @@ mod indexer_rust;
 pub mod mcp;
 pub mod metrics;
 pub mod model;
+pub mod model_management;
 #[cfg(feature = "test-support")]
 pub mod native_capture;
 pub mod native_evidence;
@@ -51,6 +52,7 @@ pub mod scip_admission;
 pub mod scip_raw;
 pub mod search_capture;
 pub mod search_card;
+pub mod search_config;
 pub mod search_embed;
 pub mod search_lexical;
 pub mod search_model;

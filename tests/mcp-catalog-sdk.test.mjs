@@ -62,7 +62,7 @@ test("the eleven-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 4);
+  assert.equal(describe.toolVersion.const, 5);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
@@ -71,6 +71,44 @@ test("the eleven-tool order and unchanged schemas are explicit", () => {
   assert.deepEqual(symbolFields, findSymbol.properties);
   assert.deepEqual(search.outputSchema.$defs.SearchHit.required,
     [...findSymbol.required, "rank", "matchedBy"]);
+});
+
+test("describe configuration is optional, closed, and separate from query readiness", () => {
+  const schema = tools[0].outputSchema;
+  const validate = ajv.compile({ $schema: schema.$schema, $defs: schema.$defs,
+    $ref: "#/$defs/SearchAvailability" });
+  const availability = { backend: "cpu", unavailableReason: "model_not_configured" };
+  const configuration = {
+    configFile: "/home/test/.config/trellis/config.toml", modelsDir: "/home/test/models",
+    modelName: "voyageai/voyage-4-nano", modelRevision: "reviewed-revision",
+    modelPath: "/home/test/models/voyageai/voyage-4-nano/reviewed-revision", backend: "auto",
+    sources: { modelsDir: "default", model: "config_file", backend: "environment" },
+  };
+  assert.ok(validate(availability), JSON.stringify(validate.errors));
+  assert.ok(validate({ ...availability, configuration }), JSON.stringify(validate.errors));
+  assert.ok(validate({ ...availability, configuration: { ...configuration, modelPath: null } }));
+  for (const field of Object.keys(configuration)) {
+    const incomplete = { ...configuration };
+    delete incomplete[field];
+    assert.equal(validate({ ...availability, configuration: incomplete }), false, field);
+  }
+  for (const invalid of [
+    null,
+    { ...configuration, extra: true },
+    { ...configuration, backend: "gpu" },
+    { ...configuration, modelPath: 7 },
+    { ...configuration, sources: { ...configuration.sources, model: "other" } },
+    { ...configuration, sources: { ...configuration.sources, extra: "default" } },
+    { ...configuration, sources: { model: "default", backend: "default" } },
+  ]) {
+    assert.equal(validate({ ...availability, configuration: invalid }), false);
+  }
+  const validateReadiness = ajv.compile({ $schema: search.outputSchema.$schema,
+    $defs: search.outputSchema.$defs, $ref: "#/$defs/SearchIndexStatus" });
+  const readiness = { state: "unavailable", modelId: null, modelName: null, backend: "cpu",
+    declarations: 1, embedded: 0, lexical: "complete", unavailableReason: "model_not_configured" };
+  assert.ok(validateReadiness(readiness), JSON.stringify(validateReadiness.errors));
+  assert.equal(validateReadiness({ ...readiness, configuration }), false);
 });
 
 test("search accepts only its closed public input", () => {
