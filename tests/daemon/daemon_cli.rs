@@ -197,14 +197,41 @@ impl AutoDaemonGuard {
 }
 impl Drop for AutoDaemonGuard {
     fn drop(&mut self) {
-        if let Ok(pid) = fs::read_to_string(&self.0)
-            && let Ok(pid) = pid.parse::<u32>()
-            && pid <= i32::MAX as u32
-        {
-            // The private test HOME and PID marker are created by this fixture.
-            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        }
+        let _ = trellis::testing::signal_daemon_marker(&self.0, libc::SIGTERM);
     }
+}
+
+#[test]
+fn daemon_cleanup_uses_its_recorded_identity_across_restarts() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let marker = home.join("auto-daemon.pid");
+    let socket = fixture_socket_paths(&home).socket;
+    let start = || {
+        let mut command = cli(&home);
+        command.arg("daemon");
+        let mut daemon = detached(command);
+        trellis::testing::wait_until("fixture daemon socket", || {
+            assert!(daemon.0.try_wait().unwrap().is_none());
+            fs::read_to_string(&marker).ok().as_deref() == Some(&daemon.0.id().to_string())
+                && trellis::testing::daemon_marker_identity(&marker)
+                    .is_some_and(|identity| identity.matches())
+                && std::os::unix::net::UnixStream::connect(&socket).is_ok()
+        });
+        daemon
+    };
+    let mut first = start();
+    let original = trellis::testing::daemon_marker_identity(&marker).unwrap();
+    assert!(trellis::testing::signal_daemon_marker(&marker, libc::SIGTERM).unwrap());
+    first.0.wait().unwrap();
+    assert!(!original.signal(libc::SIGTERM).unwrap());
+    let mut successor = start();
+    assert!(!original.signal(libc::SIGTERM).unwrap());
+    assert!(successor.0.try_wait().unwrap().is_none());
+    assert!(trellis::testing::signal_daemon_marker(&marker, libc::SIGKILL).unwrap());
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(successor.0.wait().unwrap().signal(), Some(libc::SIGKILL));
 }
 
 struct Owned(Child);
@@ -1722,9 +1749,15 @@ async fn serve_shutdown(signal: i32, kill_daemon: bool) {
     let mut daemon_command = cli(&home);
     let mut owner = (signal == 0).then(|| Owned(Command::new("sleep").arg("120").spawn().unwrap()));
     daemon_command.arg("daemon");
-    if let Some(owner) = &owner {
-        daemon_command.env(trellis::testing::OWNER_PID_ENV, owner.0.id().to_string());
-    }
+    let owner_observed = owner.as_ref().map(|owner| {
+        let path = temp.path().join("owner-gone.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        daemon_command
+            .env(trellis::testing::OWNER_PID_ENV, owner.0.id().to_string())
+            .env("TRELLIS_TEST_DAEMON_OWNER_GONE_SOCKET", path);
+        listener
+    });
     let mut daemon = detached(daemon_command);
     let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while UnixStream::connect(&socket).is_err() {
@@ -1787,6 +1820,14 @@ async fn serve_shutdown(signal: i32, kill_daemon: bool) {
     if let Some(owner) = &mut owner {
         owner.0.kill().unwrap();
         owner.0.wait().unwrap();
+        let mut observation = None;
+        trellis::testing::wait_until("daemon observing owner exit", || {
+            observation = owner_observed.as_ref().unwrap().accept().ok();
+            observation.is_some()
+        });
+        // Accept proves the daemon reached the owner-gone branch. The hook
+        // reports that transition only; it never waits for this test.
+        drop(observation.unwrap());
     } else {
         assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
     }

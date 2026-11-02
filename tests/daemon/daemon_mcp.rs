@@ -191,11 +191,7 @@ fn stop_fixture_daemon(home: &Path) {
     let Some(connection) = owned_daemon_connection(home, pid) else {
         return;
     };
-    let sent = Command::new("/bin/kill")
-        .args(["-TERM", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
+    let sent = trellis::testing::signal_daemon_marker(&marker, libc::SIGTERM).unwrap_or(false);
     if !sent {
         return;
     }

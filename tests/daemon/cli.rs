@@ -179,13 +179,15 @@ fn connected_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
 }
 
 /// Test-scope guard for only the daemon elected under this disposable HOME.
-struct FixtureDaemon(std::path::PathBuf);
+struct FixtureDaemon(std::path::PathBuf, std::cell::Cell<bool>);
 impl FixtureDaemon {
     fn new(home: &std::path::Path) -> Self {
-        Self(home.to_path_buf())
+        Self(home.to_path_buf(), std::cell::Cell::new(false))
     }
 
     fn stop_attested(&self) -> Result<(), &'static str> {
+        // Explicit calls may retire a restarted fixture. Drop must not discover one.
+        self.1.set(true);
         let marker = self.0.join("auto-daemon.pid");
         let raw = fs::read_to_string(&marker).map_err(|_| "pid_marker_missing")?;
         let pid = raw.parse::<u32>().map_err(|_| "pid_marker_invalid")?;
@@ -225,11 +227,7 @@ impl FixtureDaemon {
         {
             return Err("daemon_command_mismatch");
         }
-        let sent = Command::new("/bin/kill")
-            .args(["-TERM", &pid.to_string()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+        let sent = trellis::testing::signal_daemon_marker(&marker, libc::SIGTERM).unwrap_or(false);
         if !sent {
             return Err("daemon_kill_failed");
         }
@@ -247,7 +245,9 @@ impl FixtureDaemon {
 }
 impl Drop for FixtureDaemon {
     fn drop(&mut self) {
-        let _ = self.stop_attested();
+        if !self.1.get() {
+            let _ = self.stop_attested();
+        }
     }
 }
 
@@ -3576,13 +3576,7 @@ fn daemon_publication_is_independent_of_cli_output_file() {
     struct ElectedDaemon(std::path::PathBuf);
     impl Drop for ElectedDaemon {
         fn drop(&mut self) {
-            if let Ok(pid) = fs::read_to_string(&self.0)
-                && let Ok(pid) = pid.parse::<u32>()
-                && pid <= i32::MAX as u32
-            {
-                // The elected daemon writes this marker under the private fixture.
-                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            }
+            let _ = trellis::testing::signal_daemon_marker(&self.0, libc::SIGTERM);
         }
     }
     let _daemon = ElectedDaemon(daemon_pid.clone());
@@ -4062,6 +4056,8 @@ async fn architecture_cli_waits_for_startup_reconciliation_after_typed_admission
         String::from_utf8_lossy(&indexed.stderr)
     );
     let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    let initial_identity = trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid"))
+        .expect("initial fixture daemon identity");
     daemon.stop_attested().unwrap();
     let dbpath = real_index_db(&home);
     let use_lock = dbpath.parent().unwrap().with_extension("lock");
@@ -4082,6 +4078,7 @@ async fn architecture_cli_waits_for_startup_reconciliation_after_typed_admission
     let wait_listener = tokio::net::UnixListener::bind(&wait_path).unwrap();
     let stdout_path = temp.path().join("references.stdout");
     let stderr_path = temp.path().join("references.stderr");
+    let replacement = FixtureDaemon::new(&home);
     let mut read = command(&root, &home, "references");
     read.env("TRELLIS_TEST_DAEMON_STARTUP_SOCKET", &startup_path)
         .env("TRELLIS_TEST_CLI_READ_WAIT_SOCKET", &wait_path)
@@ -4136,4 +4133,17 @@ async fn architecture_cli_waits_for_startup_reconciliation_after_typed_admission
         references["payload"]["production"][0]["target"]["path"],
         "src/high.rs"
     );
+    let successor = trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid"))
+        .expect("replacement fixture daemon identity");
+    assert!(
+        successor.matches(),
+        "replacement daemon exited before cleanup"
+    );
+    assert_ne!(
+        serde_json::to_value(initial_identity).unwrap(),
+        serde_json::to_value(successor).unwrap(),
+        "references must have elected a replacement daemon",
+    );
+    drop(replacement);
+    trellis::testing::wait_until("replacement daemon cleanup", || !successor.matches());
 }

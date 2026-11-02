@@ -443,7 +443,10 @@ fn selected_case(change_b: &str) {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert!(
+            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
+                .unwrap()
+        );
         trellis::testing::wait_until("seed daemon exit", || {
             !trellis::testing::process_running(pid)
         });
@@ -497,7 +500,10 @@ fn selected_case(change_b: &str) {
                 .unwrap()
                 .parse()
                 .unwrap();
-            assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+            assert!(
+                trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
+                    .unwrap()
+            );
             trellis::testing::wait_until("replacement daemon exit", || {
                 !trellis::testing::process_running(pid)
             });
@@ -585,7 +591,10 @@ fn selected_case(change_b: &str) {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert!(
+            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
+                .unwrap()
+        );
         trellis::testing::wait_until("fixture daemon exit", || {
             !trellis::testing::process_running(pid)
         });
@@ -728,7 +737,10 @@ fn selected_case(change_b: &str) {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert!(
+            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
+                .unwrap()
+        );
         trellis::testing::wait_until("fixture daemon exit", || {
             !trellis::testing::process_running(pid)
         });
@@ -897,7 +909,10 @@ fn selected_case(change_b: &str) {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert!(
+            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
+                .unwrap()
+        );
         trellis::testing::wait_until("fixture daemon exit", || {
             !trellis::testing::process_running(pid)
         });
@@ -975,7 +990,10 @@ fn selected_case(change_b: &str) {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert!(
+            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
+                .unwrap()
+        );
         trellis::testing::wait_until("fixture daemon exit", || {
             !trellis::testing::process_running(pid)
         });
@@ -1006,7 +1024,10 @@ fn selected_case(change_b: &str) {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert!(
+            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
+                .unwrap()
+        );
         trellis::testing::wait_until("fixture daemon exit", || {
             !trellis::testing::process_running(pid)
         });
@@ -1039,11 +1060,10 @@ fn selected_case(change_b: &str) {
         return;
     }
     if matches!(change_b, "cancel_before" | "cancel_after") {
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        assert!(
+            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGKILL)
+                .unwrap()
+        );
         let options = trellis::indexer::IndexOptions::new(root.clone());
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let baseline = prior;
@@ -1201,7 +1221,10 @@ fn selected_case(change_b: &str) {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert!(
+            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
+                .unwrap()
+        );
         trellis::testing::wait_until("fixture daemon exit", || {
             !trellis::testing::process_running(pid)
         });
@@ -1789,7 +1812,10 @@ fn selected_case(change_b: &str) {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert!(
+            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
+                .unwrap()
+        );
         trellis::testing::wait_until("local branch daemon exit", || {
             !trellis::testing::process_running(pid)
         });

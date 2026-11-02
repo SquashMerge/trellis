@@ -653,7 +653,7 @@ fn daemon_watcher_keeps_cli_file_cap_and_selected_source_after_edit() {
                 String::from_utf8_lossy(&ps.stdout).trim(),
                 format!("{} daemon", env!("CARGO_BIN_EXE_trellis"))
             );
-            assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+            assert!(trellis::testing::signal_daemon_marker(&marker, libc::SIGTERM).unwrap());
             let until = Instant::now() + trellis::testing::HANG_BACKSTOP;
             while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
                 assert!(Instant::now() < until, "daemon did not release its socket");

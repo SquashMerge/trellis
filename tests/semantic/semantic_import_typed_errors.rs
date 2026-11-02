@@ -44,6 +44,7 @@ fn cache_dir(home: &Path) -> PathBuf {
 
 /// One indexed checkout with a daemon the first `index` call starts under `env`.
 struct World {
+    daemon: std::cell::Cell<Option<trellis::testing::ProcessIdentity>>,
     _temp: TempDir,
     home: PathBuf,
     root: PathBuf,
@@ -73,6 +74,7 @@ impl World {
             let requests_db = store.request_db_path().to_owned();
             drop(store);
             Self {
+                daemon: std::cell::Cell::new(None),
                 _temp: temp,
                 home,
                 root,
@@ -94,10 +96,14 @@ impl World {
         for (key, value) in env {
             command.env(key, value);
         }
-        command
+        let output = command
             .args(["index", "--workspace", self.root.to_str().unwrap()])
             .output()
-            .unwrap()
+            .unwrap();
+        self.daemon.set(trellis::testing::daemon_marker_identity(
+            &self.home.join("daemon.pid"),
+        ));
+        output
     }
 
     fn fixture(&self) -> BatchFixture {
@@ -177,7 +183,13 @@ impl World {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert!(
+            self.daemon
+                .take()
+                .expect("fixture daemon identity")
+                .signal(libc::SIGTERM)
+                .unwrap()
+        );
         trellis::testing::wait_until("daemon exit", || !trellis::testing::process_running(pid));
         let lock = trellis::daemon::SocketPaths::new(&data_dir(&self.home)).lock;
         trellis::testing::wait_until("daemon election lock released", || {
@@ -191,10 +203,8 @@ impl World {
 
 impl Drop for World {
     fn drop(&mut self) {
-        if let Ok(pid) = fs::read_to_string(self.home.join("daemon.pid"))
-            && let Ok(pid) = pid.parse::<i32>()
-        {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+        if let Some(identity) = self.daemon.take() {
+            let _ = identity.signal(libc::SIGTERM);
         }
     }
 }
