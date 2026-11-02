@@ -147,6 +147,7 @@ impl Drop for FixtureDaemon {
         let owned = || {
             let connection = std::os::unix::net::UnixStream::connect(&socket).ok()?;
             let pid = connected_peer_pid(&connection)?;
+            let identity = trellis::testing::ProcessIdentity::capture(pid as libc::pid_t)?;
             if marker_pid.is_some_and(|expected| expected != pid) {
                 return None;
             }
@@ -157,16 +158,12 @@ impl Drop for FixtureDaemon {
             (output.status.success()
                 && String::from_utf8_lossy(&output.stdout).trim()
                     == format!("{} daemon", env!("CARGO_BIN_EXE_trellis")))
-            .then_some((pid, connection))
+            .then_some((identity, connection))
         };
-        let Some((pid, connection)) = owned() else {
+        let Some((identity, connection)) = owned() else {
             return;
         };
-        let sent = Command::new("/bin/kill")
-            .args(["-TERM", &pid.to_string()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+        let sent = identity.signal(libc::SIGTERM).unwrap_or(false);
         if !sent {
             return;
         }

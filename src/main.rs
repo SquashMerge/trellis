@@ -1397,7 +1397,7 @@ async fn run_daemon() -> Result<()> {
     // Test-only ownership marker: only the elected daemon records its PID.
     #[cfg(feature = "test-support")]
     if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_PID_FILE") {
-        std::fs::write(path, std::process::id().to_string())?;
+        trellis::testing::write_daemon_marker(std::path::Path::new(&path))?;
     }
     let search = Arc::new(daemon::search::SearchService::from_environment(
         TopologyRoots::production()?,
