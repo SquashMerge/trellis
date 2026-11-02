@@ -168,12 +168,14 @@ class Rusage(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(RUNNER, "EVIDENCE", Path(tmp)), \
                 patch.object(RUNNER.os, "wait4", return_value=(4321, 0, usage)) as wait4, \
+                patch.object(RUNNER.os, "kill") as kill, \
                 patch.object(RUNNER, "stop_home_processes"), \
                 patch.object(RUNNER, "election_free", return_value=True), \
                 patch.object(RUNNER, "record"):
             daemon = RUNNER.Daemon(Path("/tmp/b"), Path("/tmp/h"), "t", record_rusage=True)
             daemon.proc = proc
             daemon.stop()
+        kill.assert_called_once_with(4321, signal.SIGTERM)
         wait4.assert_called_with(4321, RUNNER.os.WNOHANG)
         proc.poll.assert_not_called()
         proc.wait.assert_not_called()
