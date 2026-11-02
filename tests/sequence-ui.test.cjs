@@ -392,10 +392,9 @@ test("quiet protocol and unsupported boundaries remain individual evidence contr
   ];
   const steps=labels.map(([label],i)=>({id:`boundary-${i}`,kind:"boundary",label,path:"main.rs",range}));
   const d=diagram(freeze(viewWith(steps)));
-  assert.equal(d.row(steps[0].id),undefined);
-  assert.deepEqual(steps.slice(1).map(s=>rowLabel(d.row(s.id))),labels.slice(1).map(([,compact])=>compact));
-  assert.equal(d.nodes().filter(n=>n.attrs["data-presentation"] === "quiet-note").length,steps.length-1);
-  for(const step of steps.slice(1)) { d.row(step.id).listeners.keydown({key:"Enter",preventDefault(){}}); assert.equal(d.sources.at(-1),step); }
+  assert.deepEqual(steps.map(s=>rowLabel(d.row(s.id))),labels.map(([,compact])=>compact));
+  assert.equal(d.nodes().filter(n=>n.attrs["data-presentation"] === "quiet-note").length,steps.length);
+  for(const step of steps) { d.row(step.id).listeners.keydown({key:"Enter",preventDefault(){}}); assert.equal(d.sources.at(-1),step); }
   d.render({showDetails:true});
   assert.deepEqual(steps.map(s=>rowLabel(d.row(s.id))),labels.map(([label])=>`boundary · ${label}`));
 });
@@ -983,4 +982,19 @@ test("calls-first zero-call summary never claims that a method has no behavior",
   const view = viewWith([{id:"write",kind:"effect",label:"write state",children:[],alternate:[]}]);
   assert.match(window.TrellisSequence.emptySummary(view),/No measured calls.*non-call behavior.*Show all steps/i);
   assert.equal(window.TrellisSequence.emptySummary(view,{showDetails:true}),"");
+});
+
+test("calls-first hides deferred callables but keeps unexpanded initialization effects", () => {
+  const labels = [
+    "Nested callable boundary: body does not execute at definition; captures are not expanded.",
+    "Lambda boundary: body does not execute at definition; captures are not expanded.",
+    "Nested declaration boundary: bodies are not executed here; implicit initialization is not expanded.",
+    "Nested function/callback/class boundary: bodies are not executed here; class definition effects (base, computed keys, static initialization) are not expanded."
+  ];
+  const steps = labels.map((label,i)=>({id:`deferred-${i}`,kind:"boundary",label,path:"main.rs",range,children:[],alternate:[],hidden:false}));
+  const view = freeze(viewWith(steps)), d = diagram(view);
+  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]),["deferred-2","deferred-3"]);
+  assert.deepEqual(Array.from(peleProjector().project({...view,revision:{indexGeneration:"pin",indexRevision:1}}).rows,row=>row.id),["deferred-2","deferred-3"]);
+  d.render({showDetails:true});
+  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]),steps.map(step=>step.id));
 });

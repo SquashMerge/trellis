@@ -235,7 +235,7 @@ test("logging macro hides under the incidental toggle with its reason",{timeout:
  assert.equal(work.label,"work");assert.equal(dto.incidentalSteps,1);assert.equal(dto.hiddenSteps,1);
  assert.equal(await page.locator(`#sequence-diagram .pele-note[data-trellis-step-id="${logging.id}"]`).count(),0);
  const toggle=page.locator("#sequence-incidental");
- assert.equal(await toggle.textContent(),"Show 1 incidental call");
+ assert.equal(await toggle.textContent(),"Show all steps");
  await toggle.click();
  const note=page.locator(`#sequence-diagram .pele-note[data-trellis-step-id="${logging.id}"]`);
  await note.waitFor();await note.click();
@@ -246,7 +246,7 @@ test("logging macro hides under the incidental toggle with its reason",{timeout:
 test("a method whose every step is hidden says so and shows them on request",{timeout:240000},async()=>published("fn measured() {\n    work();\n}\nfn quiet() {\n    log::info!(\"x\");\n}\n",async({page})=>{
  await page.locator(".method-pick").filter({hasText:"quiet"}).first().click();
  const empty=page.locator("#sequence-diagram .sequence-empty");await empty.waitFor();
- assert.equal(await empty.textContent(),"Only incidental calls (1 hidden). Show them");
+ assert.equal(await empty.textContent(),"Only incidental calls (1 hidden). Show all steps");
  assert.equal(await page.locator("#sequence-diagram svg").count(),0);
  assert.doesNotMatch(await page.locator("#sequence-state").innerText(),/Pele/);
  assert.equal(await page.locator("#sequence-fit").isVisible(),false);

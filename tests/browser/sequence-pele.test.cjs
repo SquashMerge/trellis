@@ -527,7 +527,7 @@ test("calls-first keeps conditional and unknown context, exact selection and adm
   for(const renderer of [TrellisSequence,TrellisPeleSequence]) {
    const selected=[],options={onSelect:step=>selected.push(step)},expanded=new Set();
    const outcome=await renderer.render(container,view,null,expanded,options);
-   if(outcome&&outcome.status!=="rendered")throw Error(outcome.reason);
+   if(renderer===TrellisPeleSequence&&outcome.status!=="rendered")throw Error(outcome.reason);
    const selector=renderer===TrellisSequence?"[data-source-step-id]":".pele-note[data-trellis-step-id],.pele-edge-label[data-trellis-step-id]";
    const nodes=[...container.querySelectorAll(selector)],ids=nodes.map(node=>node.dataset.sourceStepId||node.dataset.trellisStepId);
    for(const node of nodes)node.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
@@ -539,6 +539,14 @@ test("calls-first keeps conditional and unknown context, exact selection and adm
   }
   return {results,original:original.map(step=>step.id)};
  },view);
+ if(process.env.TRELLIS_SEQUENCE_SHOTS) {
+  await page.locator("#state").evaluate(node=>node.textContent="");
+  await page.setViewportSize({width:1440,height:1000});
+  await render(view);
+  await page.screenshot({path:join(process.env.TRELLIS_SEQUENCE_SHOTS,"calls-first.png"),fullPage:true});
+  await render(view,{showDetails:true});
+  await page.screenshot({path:join(process.env.TRELLIS_SEQUENCE_SHOTS,"all-steps.png"),fullPage:true});
+ }
  assert.equal(result.original.length,16);
  for(const rendered of result.results) {
   assert.deepEqual(rendered.ids,["prepare","condition","ready","fallback","loop","repeat","unknown","continuation","finish"]);

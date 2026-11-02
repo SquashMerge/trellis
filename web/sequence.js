@@ -166,9 +166,7 @@ const STANDARD_LIBRARIES = new Set(["std", "core", "alloc"]);
 // Membership keeps source controls and both adapters bound to the exact original objects.
 const deferredSequenceBoundaries = new Set([
   "Nested callable boundary: body does not execute at definition; captures are not expanded.",
-  "Lambda boundary: body does not execute at definition; captures are not expanded.",
-  "Nested declaration boundary: bodies are not executed here; implicit initialization is not expanded.",
-  "Nested function/callback/class boundary: bodies are not executed here; class definition effects (base, computed keys, static initialization) are not expanded."
+  "Lambda boundary: body does not execute at definition; captures are not expanded."
 ]);
 function sequenceDisplay(view, options = {}) {
   const visible = new Set(), exits = new Set();
