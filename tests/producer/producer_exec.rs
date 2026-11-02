@@ -89,12 +89,39 @@ impl Drop for Reaper {
         if !self.1 {
             return;
         }
-        if let Ok(text) = fs::read_to_string(&self.0) {
-            for pid in text.lines().filter_map(|l| l.parse::<libc::pid_t>().ok()) {
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+        if let Ok(bytes) = fs::read(self.0.with_extension("identity.json"))
+            && let Ok(identities) =
+                serde_json::from_slice::<Vec<trellis::testing::ProcessIdentity>>(&bytes)
+        {
+            for identity in identities {
+                let _ = identity.signal(libc::SIGKILL);
             }
         }
     }
+}
+
+#[test]
+fn reaper_does_not_signal_a_reused_recorded_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("pids");
+    let mut child = std::process::Command::new("sleep")
+        .arg("120")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let identity = trellis::testing::ProcessIdentity::capture(pid as libc::pid_t).unwrap();
+    let mut stale = serde_json::to_value(identity).unwrap();
+    stale["start_time"] = json!(stale["start_time"].as_u64().unwrap() + 1);
+    fs::write(
+        marker.with_extension("identity.json"),
+        serde_json::to_vec(&vec![stale]).unwrap(),
+    )
+    .unwrap();
+    drop(Reaper::new(marker));
+    let alive = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(alive, "reaper signaled a different process identity");
 }
 
 fn wait_all_gone(pids: &[libc::pid_t]) {

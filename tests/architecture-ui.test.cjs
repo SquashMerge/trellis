@@ -298,6 +298,39 @@ test("external package evidence and deny results display without fabricated nati
   assert.equal(h.reads[0].site.path, "src/a.rs", "only the genuine importing native file can be read");
 });
 
+test("unassigned file review counts native files, not the broader identity catalog", async () => {
+  const h = harness(), payload = fixture();
+  payload.modules[0].layer = null;
+  payload.modules.push({identity:identity("src/isolated.rs"),layer:null,physicalLines:1,declarationCount:0,metrics:{}});
+  const external = {kind:"externalPackage",sourceSetId:"workspace",language:"rust",package:"legacy-db",standardLibrary:false};
+  payload.references.externalPackages = [{identity:external,ecosystem:"cargo",layer:null,evidence:[]}];
+  payload.references.production.push({...payload.references.production[0],target:external,count:1,omittedSites:0});
+  payload.rules.unassigned = [payload.modules[0].identity, payload.modules[2].identity, external];
+  payload.rules.unassignedCount = payload.rules.unassigned.length;
+  h.setResponse(async () => ({payload})); await h.controller.refresh();
+  const assertFileReview = async () => {
+    assert.equal(h.get("architecture-unassigned").textContent, "2 unassigned files");
+    await h.get("architecture-unassigned").fire("click");
+    const rows = descendants(h.get("architecture-review-list")).filter(item => item.className === "architecture-rule-row");
+    assert.deepEqual(rows.map(row => row.dataset.source), ["src/a.rs", "src/isolated.rs"], "includes an isolated native file, not the assigned file or external identity");
+    assert.equal(payload.rules.unassignedCount, 3, "the broader catalog is unchanged");
+    assert.match(text(h.get("architecture-notice-content")), /3 unassigned identities \(native files and external packages\)/);
+  };
+  await assertFileReview();
+  const initial = h.renders[0].view;
+  assert.equal(initial.indexGeneration, pin.indexGeneration); assert.equal(initial.indexRevision, pin.indexRevision);
+  assert.equal(initial.rulesFile.contentHash, "rules-one");
+  payload.role = "all"; h.get("architecture-metric-tests").checked = true;
+  await h.get("architecture-metric-tests").fire("change");
+  await assertFileReview();
+  for (const call of h.calls) {
+    const query = new URL(call.url, "http://local").searchParams;
+    assert.equal(query.get("indexGeneration"), pin.indexGeneration); assert.equal(query.get("indexRevision"), String(pin.indexRevision));
+    assert.equal(query.has("paths"), false); assert.equal(query.has("path"), false, "Architecture requests checkout-wide file inventory");
+  }
+  assert.equal(h.renders.at(-1).view.rulesFile.contentHash, initial.rulesFile.contentHash);
+});
+
 function authoringFixture(hash = "rules-one") {
   const payload = fixture("max",hash), a = payload.modules[0].identity, b = payload.modules[1].identity;
   const pair = payload.references.production[0];
@@ -713,7 +746,7 @@ test("the full stack stays drawn with deviations, and counted review chips open 
   assert.equal(h.get("architecture-inspector").hidden, false, "the review overview rests in the inspector");
   assert.equal(h.get("architecture-inspector-title").textContent, "Architecture review");
   const chips = () => descendants(h.get("architecture-inspector-content")).filter(item => item.className === "architecture-chip");
-  assert.deepEqual(chips().map(item => item.textContent), ["23 deviations", "156 unassigned", "0 exceptions"]);
+  assert.deepEqual(chips().map(item => item.textContent), ["23 deviations", "1 unassigned file", "0 exceptions"]);
   assert.equal(chips()[0].dataset.tone, "error");
   assert.doesNotMatch(text(h.get("architecture-inspector-content")), /reference sites mapped/, "#525: the coverage sentence is said once, under the arrow key");
   assert.match(text(h.get("architecture-notice-content")), /563 of 897 production rule instances unknown/, "rule counts sit behind the ⓘ");
@@ -724,7 +757,7 @@ test("the full stack stays drawn with deviations, and counted review chips open 
   assert.equal(query.get("role"), "production"); assert.equal(query.get("status"), "deviates"); assert.equal(query.get("excepted"), "false");
   options.onSelectModule(payload.modules[0]); await flush();
   assert.equal(h.get("architecture-inspector-title").textContent, "src/a.rs");
-  assert.deepEqual(chips().map(item => item.textContent), ["23 deviations", "156 unassigned", "0 exceptions"], "every inspection keeps the counted chips");
+  assert.deepEqual(chips().map(item => item.textContent), ["23 deviations", "1 unassigned file", "0 exceptions"], "every inspection keeps the counted chips");
   await h.get("architecture-unassigned").fire("click");
   assert.match(text(h.get("architecture-review-list")), /src\/no-edges.rs/);
 });

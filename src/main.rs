@@ -1234,6 +1234,9 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     #[cfg(unix)]
     let mut termination = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("register serve SIGTERM handler")?;
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("register serve SIGINT handler")?;
     ensure!(
         args.bind.ip().is_loopback(),
         "only loopback bind addresses are supported"
@@ -1313,47 +1316,77 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     let reply: protocol::Reply = protocol::read_frame(&mut stream)
         .map_err(|_| anyhow::anyhow!("outcome_unknown: inspect daemon listener status"))?;
     let address = checked_reply(reply)?;
+    stream
+        .set_read_timeout(None)
+        .context("daemon_unavailable: prepare serve control read")?;
+    let signal_stream = stream
+        .try_clone()
+        .context("daemon_unavailable: clone serve control connection")?;
     eprintln!(
         "Trellis: http://{}/\nState: {}\nToken file: {}\nRefresh is explicit. No repository commands run.",
         address.as_str().unwrap_or("unknown"),
         roots.cache.display(),
         token_file.display()
     );
-    // The opt-in test pause exposes the banner-to-select window. SIGTERM must
-    // already be armed; normal serve executions never pause here.
+    // The test hook exposes the banner-to-select window. Both signals must
+    // already be armed before a caller sees the banner.
     #[cfg(feature = "test-support")]
-    if std::env::var("TRELLIS_TEST_SERVE_AFTER_BANNER_PAUSE").as_deref() == Ok("1") {
-        std::thread::sleep(Duration::from_millis(750));
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_SERVE_AFTER_BANNER_SOCKET") {
+        use std::io::{Read, Write};
+        let mut hook = std::os::unix::net::UnixStream::connect(path)?;
+        hook.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))?;
+        hook.write_all(b"B")?;
+        hook.read_exact(&mut [0])?;
     }
-    // The registration is a control connection, not a checkout attachment. Its
-    // normal EOF is the daemon's intentional idle exit; never respawn here.
-    stream.set_read_timeout(None)?;
-    let signal_stream = stream.try_clone()?;
+    // The registration observes the daemon's lifetime, not a child wait status.
+    // Even a normal EOF is unexpected while serve is running; never respawn here.
     let mut monitor = tokio::task::spawn_blocking(move || {
         let mut one = [0u8; 1];
         use std::io::Read;
-        match stream.read(&mut one) {
-            Ok(0) => Ok(()),
-            _ => anyhow::bail!("daemon_unavailable: serve control interrupted"),
-        }
+        serve_control_failure(stream.read(&mut one))
     });
     let shutdown = async {
         #[cfg(unix)]
-        tokio::select! {
-            _ = termination.recv() => {},
-            _ = tokio::signal::ctrl_c() => {},
+        {
+            tokio::select! {
+                _ = termination.recv() => "SIGTERM",
+                _ = interrupt.recv() => "SIGINT",
+            }
         }
         #[cfg(not(unix))]
-        let _ = tokio::signal::ctrl_c().await;
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
     };
     tokio::select! {
-        result = &mut monitor => result??,
-        _ = shutdown => {
+        result = &mut monitor => {
+            let error = match result {
+                Ok(error) => error,
+                Err(error) => anyhow::anyhow!("daemon_unavailable: serve monitor failed: {error}"),
+            };
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(), "Trellis serve stopping: {error}");
+            return Err(error);
+        }
+        signal = shutdown => {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(), "Trellis serve stopping: received {signal}");
             signal_stream.shutdown(std::net::Shutdown::Both)?;
             let _ = monitor.await?;
         }
     }
     Ok(())
+}
+
+fn serve_control_failure(result: std::io::Result<usize>) -> anyhow::Error {
+    match result {
+        Ok(0) => anyhow::anyhow!(
+            "daemon_unavailable: daemon control connection closed (EOF); daemon exit status unavailable"
+        ),
+        Ok(_) => anyhow::anyhow!("daemon_unavailable: unexpected data on serve control connection"),
+        Err(error) => anyhow::anyhow!("daemon_unavailable: serve control read failed: {error}"),
+    }
 }
 
 async fn run_daemon() -> Result<()> {
@@ -1364,7 +1397,7 @@ async fn run_daemon() -> Result<()> {
     // Test-only ownership marker: only the elected daemon records its PID.
     #[cfg(feature = "test-support")]
     if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_PID_FILE") {
-        std::fs::write(path, std::process::id().to_string())?;
+        trellis::testing::write_daemon_marker(std::path::Path::new(&path))?;
     }
     let search = Arc::new(daemon::search::SearchService::from_environment(
         TopologyRoots::production()?,
@@ -1383,6 +1416,34 @@ async fn run_daemon() -> Result<()> {
     checkouts.set_search_fill(search_fill);
     checkouts.set_search_service(search.clone());
     let registry = Arc::new(tokio::sync::Mutex::new(checkouts));
+    // A private fixture socket moves the existing virtual lifecycle clock;
+    // no production delay or daemon protocol is changed.
+    #[cfg(feature = "test-support")]
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_CLOCK_SOCKET") {
+        let registry = registry.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            use std::io::{Read, Write};
+            let mut hook = std::os::unix::net::UnixStream::connect(path)?;
+            hook.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))?;
+            let mut now = Instant::now();
+            let mut command = [0];
+            while hook.read_exact(&mut command).is_ok() {
+                if command == *b"T" {
+                    now += registry::DAEMON_IDLE_DELAY + Duration::from_secs(1);
+                }
+                let exit = runtime
+                    .block_on(async {
+                        let mut registry = registry.lock().await;
+                        registry.set_clock_override_for_tests(now);
+                        registry.advance(now).map(|tick| tick.exit)
+                    })
+                    .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+                hook.write_all(&[u8::from(exit)])?;
+            }
+            Ok(())
+        });
+    }
     #[cfg(feature = "test-support")]
     if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STARTUP_SOCKET") {
         registry
@@ -1409,6 +1470,7 @@ async fn run_daemon() -> Result<()> {
     let browser = Arc::new(tokio::sync::Mutex::new(daemon::BrowserProvisioner::new()));
     let next_session = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
+    let mut connections = tokio::task::JoinSet::new();
     let idle = daemon::run_idle_lifecycle(registry.clone());
     tokio::pin!(idle);
     // A test-elected daemon ends with the test process that owns it (#130),
@@ -1423,6 +1485,10 @@ async fn run_daemon() -> Result<()> {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if !trellis::testing::process_running(pid) {
+                    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_OWNER_GONE_SOCKET") {
+                        let _observed = std::os::unix::net::UnixStream::connect(path)
+                            .expect("connect owner-exit observation fixture");
+                    }
                     return;
                 }
             }
@@ -1442,6 +1508,7 @@ async fn run_daemon() -> Result<()> {
         tokio::select! {
             result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break; }
             () = &mut owner_gone => break,
+            _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = async {
                 #[cfg(feature = "test-support")]
                 if let Some(errno) = injected_accept_errno {
@@ -1474,16 +1541,93 @@ async fn run_daemon() -> Result<()> {
                 let search = search.clone();
                 let id = next_session.fetch_add(1, Ordering::Relaxed);
                 let browser_shutdown = browser_shutdown.clone();
-                tokio::task::spawn_blocking(move || {
+                connections.spawn_blocking(move || {
                     let _ = dispatch_connection(stream, id, registry, browser, search, browser_shutdown, accepted_at);
                 });
             }
         }
     }
-    let _ = browser_shutdown.send(true);
+    stop_daemon_connections(&browser_shutdown, &mut connections).await;
     drop(listener);
     drop(owner);
     Ok(())
+}
+
+async fn stop_daemon_connections(
+    shutdown: &tokio::sync::watch::Sender<bool>,
+    connections: &mut tokio::task::JoinSet<()>,
+) {
+    shutdown.send_replace(true);
+    while connections.join_next().await.is_some() {}
+}
+
+#[cfg(test)]
+mod daemon_shutdown_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct ControlPeer(std::os::unix::net::UnixStream);
+    impl Drop for ControlPeer {
+        fn drop(&mut self) {
+            let _ = self.0.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_is_retained_for_a_late_serve_subscriber() {
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        drop(receiver);
+        let (control, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _peer = ControlPeer(peer);
+        let mut connections = tokio::task::JoinSet::new();
+        let (release, admitted) = std::sync::mpsc::channel();
+        let (observed, observation) = tokio::sync::oneshot::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let late_shutdown = shutdown.clone();
+        connections.spawn_blocking(move || {
+            admitted.recv().unwrap();
+            let stopped = late_shutdown.subscribe();
+            let retained = *stopped.borrow();
+            if retained {
+                wait_for_serve_disconnect(control, stopped, &runtime).unwrap();
+            }
+            let _ = observed.send(retained);
+        });
+        // This current-thread task runs only after shutdown publishes its value
+        // and yields while draining the accepted dispatch.
+        tokio::spawn(async move { release.send(()).unwrap() });
+        stop_daemon_connections(&shutdown, &mut connections).await;
+        assert!(
+            observation.await.unwrap(),
+            "daemon shutdown was lost before a serve control watcher subscribed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_finishes_the_serve_control_read_before_returning() {
+        let (control, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _peer = ControlPeer(peer);
+        let (shutdown, stopped) = tokio::sync::watch::channel(false);
+        let mut connections = tokio::task::JoinSet::new();
+        let completed = Arc::new(AtomicBool::new(false));
+        let finished = completed.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        connections.spawn_blocking(move || {
+            let _ = started.send(());
+            wait_for_serve_disconnect(control, stopped, &runtime).unwrap();
+            finished.store(true, Ordering::Release);
+        });
+        ready.await.unwrap();
+        stop_daemon_connections(&shutdown, &mut connections).await;
+        assert!(
+            completed.load(Ordering::Acquire),
+            "daemon shutdown returned before its serve control read finished"
+        );
+    }
 }
 
 fn checked_serve_options(raw: serde_json::Value) -> Result<registry::CheckoutOptions> {
@@ -1497,6 +1641,49 @@ fn checked_serve_options(raw: serde_json::Value) -> Result<registry::CheckoutOpt
 mod serve_option_transport_tests {
     use super::*;
     #[test]
+    fn serve_control_failures_are_typed_and_preserve_read_errors() {
+        for result in [Ok(0), Ok(1)] {
+            assert!(
+                serve_control_failure(result)
+                    .to_string()
+                    .starts_with("daemon_unavailable:")
+            );
+        }
+        let message = serve_control_failure(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "fixture connection reset",
+        )))
+        .to_string();
+        assert!(message.starts_with("daemon_unavailable:"));
+        assert!(message.contains("serve control read failed: fixture connection reset"));
+    }
+
+    #[tokio::test]
+    async fn serve_registration_releases_on_handler_error_and_disconnect() {
+        for failed in [false, true] {
+            let registry = Arc::new(tokio::sync::Mutex::new(registry::CheckoutRegistry::new()));
+            let shared = registry.clone();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                let handler = || -> Result<()> {
+                    let _registration = ServeRegistration::new(shared.clone(), runtime.clone(), 1);
+                    assert!(
+                        runtime
+                            .block_on(async { shared.lock().await.idle_exit_deadline() })
+                            .is_none()
+                    );
+                    ensure!(!failed, "fixture registration or reply failure");
+                    Ok(())
+                };
+                assert_eq!(handler().is_err(), failed);
+            })
+            .await
+            .unwrap();
+            assert!(registry.lock().await.idle_exit_deadline().is_some());
+        }
+    }
+
+    #[test]
     fn daemon_receipt_keeps_omitted_and_explicit_default_distinct() {
         let options = serde_json::to_value(registry::BrowserOptions::default()).unwrap();
         let mut omitted = options.clone();
@@ -1507,6 +1694,43 @@ mod serve_option_transport_tests {
         assert_eq!(explicit.0["maxFileBytes"], 2_097_152);
         assert!(explicit.0.get("scip").is_none());
         assert!(explicit.0.get("manifest").is_none());
+    }
+}
+
+/// Scoped to one blocking control handler, including registration/reply errors.
+struct ServeRegistration {
+    registry: Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+    runtime: tokio::runtime::Handle,
+    session: u64,
+}
+
+impl ServeRegistration {
+    fn new(
+        registry: Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+        runtime: tokio::runtime::Handle,
+        session: u64,
+    ) -> Self {
+        runtime.block_on(async { registry.lock().await.retain_serve(session) });
+        Self {
+            registry,
+            runtime,
+            session,
+        }
+    }
+}
+
+impl Drop for ServeRegistration {
+    fn drop(&mut self) {
+        self.runtime.block_on(async {
+            self.registry.lock().await.disconnect(self.session);
+        });
+        #[cfg(feature = "test-support")]
+        if let Some(path) = std::env::var_os("TRELLIS_TEST_SERVE_RELEASE_SOCKET") {
+            use std::io::Write;
+            if let Ok(mut hook) = std::os::unix::net::UnixStream::connect(path) {
+                let _ = hook.write_all(b"R");
+            }
+        }
     }
 }
 
@@ -1701,6 +1925,8 @@ fn dispatch_connection(
         return write_daemon_reply(&mut stream, &reply);
     }
     let serve = request.operation == "serve";
+    let _serve_registration =
+        serve.then(|| ServeRegistration::new(registry.clone(), runtime.clone(), session));
     // One deadline for the whole CLI read (#142): activation contention, the
     // wait for startup reconciliation and every SQLite busy wait share it, so
     // they cannot stack. When it passes the read fails typed.
@@ -2133,6 +2359,7 @@ fn dispatch_connection(
     {
         std::thread::sleep(delay);
     }
+    let serve_registered = serve && result.is_ok();
     let expired_success = metrics && result.is_ok() && Instant::now() >= request_deadline;
     let reply = protocol::Reply {
         id: request.id,
@@ -2159,28 +2386,36 @@ fn dispatch_connection(
     } else {
         write_daemon_reply(&mut stream, &reply)?;
     }
-    if serve {
-        // This control connection only observes the daemon process lifetime:
-        // it ends when the client closes it or the daemon stops, signalled by
+    if serve_registered {
+        // The scoped registration holds the daemon alive until this control
+        // connection closes or the daemon stops, signalled by
         // the shutdown channel instead of a polled flag (#138 item 21).
-        let closer = stream.try_clone()?;
-        let mut shutdown = browser_shutdown.subscribe();
-        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
-        let watcher = runtime.spawn(async move {
-            tokio::select! {
-                _ = shutdown.wait_for(|stopped| *stopped) => {
-                    let _ = closer.shutdown(std::net::Shutdown::Both);
-                }
-                _ = closed_rx => {}
-            }
-        });
-        stream.set_read_timeout(None)?;
-        let mut one = [0u8; 1];
-        use std::io::Read;
-        while matches!(stream.read(&mut one), Ok(n) if n > 0) {}
-        let _ = closed_tx.send(());
-        let _ = runtime.block_on(watcher);
+        wait_for_serve_disconnect(stream, browser_shutdown.subscribe(), &runtime)?;
     }
+    Ok(())
+}
+
+fn wait_for_serve_disconnect(
+    mut stream: std::os::unix::net::UnixStream,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<()> {
+    let closer = stream.try_clone()?;
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+    let watcher = runtime.spawn(async move {
+        tokio::select! {
+            _ = shutdown.wait_for(|stopped| *stopped) => {
+                let _ = closer.shutdown(std::net::Shutdown::Both);
+            }
+            _ = closed_rx => {}
+        }
+    });
+    stream.set_read_timeout(None)?;
+    let mut one = [0u8; 1];
+    use std::io::Read;
+    while matches!(stream.read(&mut one), Ok(n) if n > 0) {}
+    let _ = closed_tx.send(());
+    let _ = runtime.block_on(watcher);
     Ok(())
 }
 

@@ -62,7 +62,7 @@ trellis serve --token-file ~/.trellis-private/token
 - `--workspace PATH` serves a checkout other than the current one.
 - `--bind 127.0.0.1:9000` uses another port. Only loopback addresses are accepted.
 
-**Stopping.** `serve` is a thin client of a per-user background process, `trellis daemon`, which does the work. Ctrl-C ends `serve`, but the daemon keeps running and the web app keeps working. Running the same `serve` command again attaches to it.
+**Stopping.** `serve` is a thin client of a per-user background process, `trellis daemon`, which does the work. Ctrl-C ends `serve`, but the daemon keeps running and the web app keeps working. Running the same `serve` command again attaches to it. While `serve` runs, its control connection keeps the daemon alive even without an open browser. After the last `serve` stops, the daemon may exit after its ordinary 30-minute idle grace if no other clients or work remain.
 
 To stop everything, or before you change the port or token file, stop the daemon. Otherwise `serve` fails with `serve bind conflicts with running listener` or `serve token file conflicts with running listener`.
 
@@ -70,6 +70,46 @@ To stop everything, or before you change the port or token file, stop the daemon
 pgrep -fl 'trellis daemon'    # find the PID and check it's yours
 kill -TERM <pid>
 ```
+
+### Keep a live serve detached
+
+For a long-running live instance, do not leave `serve` owned by an agent's tool
+shell. Use both `nohup` (ignore terminal hangup) and a new session (detach from
+the shell's process group), with stdin and both output streams redirected.
+Use an installed binary and absolute paths, not `cargo run`.
+
+On **Linux**, `setsid` is provided by util-linux:
+
+```sh
+mkdir -m 700 -p "$HOME/.trellis-private"
+nohup setsid /absolute/path/to/trellis serve \
+  --workspace /absolute/path/to/checkout \
+  --token-file "$HOME/.trellis-private/token" \
+  </dev/null >"$HOME/.trellis-private/serve.log" 2>&1 &
+```
+
+**macOS does not ship `setsid`.** With Python 3 installed, create the session
+before replacing the launcher with Trellis:
+
+```sh
+mkdir -m 700 -p "$HOME/.trellis-private"
+nohup python3 -c 'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+  /absolute/path/to/trellis serve \
+  --workspace /absolute/path/to/checkout \
+  --token-file "$HOME/.trellis-private/token" \
+  </dev/null >"$HOME/.trellis-private/serve.log" 2>&1 &
+```
+
+Check `serve.log` for the readiness banner. `nohup` alone does not create a new
+session, and `&` alone does not detach it. Detachment does not prevent a tool
+that explicitly kills all its descendants from stopping it; use a persistent
+terminal or a user service manager in that environment.
+
+`serve` logs `SIGTERM` or `SIGINT` when explicitly stopped and exits successfully.
+If its daemon control connection closes independently, even after a normal daemon
+exit, it logs `daemon_unavailable` and exits nonzero. EOF cannot reveal the
+daemon's OS exit status: `serve` may have attached to an already-running daemon.
+The log says the status is unavailable rather than guessing it.
 
 **More checkouts.** One daemon handles all your checkouts. Run `trellis index` in another checkout, and it appears in the checkout menu at the top of the web app.
 

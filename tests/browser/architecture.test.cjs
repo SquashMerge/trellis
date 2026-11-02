@@ -2,7 +2,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {mkdirSync, readFileSync, writeFileSync, rmSync} = require("node:fs");
-const {spawnSync} = require("node:child_process");
+const {spawn, spawnSync} = require("node:child_process");
+const {createInterface} = require("node:readline");
 const {dirname, join} = require("node:path");
 const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
@@ -61,7 +62,7 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(config, callback, extra = new Map(), base = sources) {
+async function published(config, callback, extra = new Map(), base = sources, {git = false} = {}) {
   const paths = H.fixture("", "placeholder.txt");
   rmSync(paths.source);
   for (const [path, text] of [...base, ...extra]) {
@@ -74,6 +75,10 @@ async function published(config, callback, extra = new Map(), base = sources) {
   }
   let server, browser, context;
   try {
+    if (git) {
+      const initialized = spawnSync("git", ["init", "-q", paths.workspace], {env:paths.env, encoding:"utf8"});
+      assert.equal(initialized.status, 0, initialized.stderr);
+    }
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
     const pin = indexed.json().status.revision;
     server = await H.startDaemon(paths, pin.indexRevision);
@@ -589,7 +594,7 @@ test("Architecture draws the full stack, module chips per band, lower-bound coun
   assert.equal(await page.locator("#architecture-inspector").isVisible(), true);
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), "Architecture review");
   assert.deepEqual(await page.locator("#architecture-inspector-content .architecture-chip").allTextContents(),
-    [`${check.counts.deviates} deviation${check.counts.deviates === 1 ? "" : "s"}`, `${check.unassigned.length} unassigned`, "0 exceptions"]);
+    [`${check.counts.deviates} deviation${check.counts.deviates === 1 ? "" : "s"}`, `${check.unassignedFileCount} unassigned file${check.unassignedFileCount === 1 ? "" : "s"}`, "0 exceptions"]);
   await page.locator("#architecture-review").click(); await settled(page);
   assert.equal(await page.locator("#architecture-review-list [data-rule]").count(), check.counts.deviates, "the deviations chip lists exactly what it counts");
   await page.locator("#architecture-review-close").click();
@@ -1021,6 +1026,82 @@ const libraryFiles = new Map([
   ["src/uses_library.rs", "use local_library::candidate_only;\npub fn uses_library() { candidate_only(); }\n"],
   ["src/lib.rs", `${sources.get("src/lib.rs")}pub mod uses_library;\n`],
 ]);
+async function mcpRulesCheck(selected) {
+  const {paths, pin} = selected;
+  const child = spawn(H.binary, ["mcp", "--workspace", paths.workspace], {env:paths.env, stdio:["pipe", "pipe", "pipe"]});
+  let stderr = "";
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  const lines = createInterface({input:child.stdout});
+  const replies = lines[Symbol.asyncIterator]();
+  const closed = new Promise(resolve => child.once("close", resolve));
+  const send = frame => child.stdin.write(`${JSON.stringify(frame)}\n`);
+  const reply = async id => {
+    for (;;) {
+      const next = await replies.next();
+      assert.equal(next.done, false, stderr);
+      const frame = JSON.parse(next.value);
+      if (frame.id === id) { assert.equal(frame.error, undefined, JSON.stringify(frame)); return frame.result; }
+    }
+  };
+  try {
+    send({jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:"2025-11-25",capabilities:{},clientInfo:{name:"architecture-count-test",version:"1"}}});
+    await reply(1);
+    send({jsonrpc:"2.0",method:"notifications/initialized"});
+    send({jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"trellis_rules_check",arguments:{schemaVersion:1,expectedBasis:pin}}});
+    const result = await reply(2);
+    assert.notEqual(result.isError, true, JSON.stringify(result));
+    const envelope = result.structuredContent;
+    assert.deepEqual(envelope.evidenceBasis, pin);
+    return envelope.data;
+  } finally {
+    lines.close(); child.stdin.end(); child.kill("SIGTERM"); await closed;
+  }
+}
+
+test("Architecture unassigned files match rules_check without counting external package identities", {timeout:240000}, async () => published(rules, async selected => {
+  const {page} = selected;
+  await ready(page);
+  const asset = await page.request.get(`${selected.server.base}/architecture.js`);
+  assert.equal(asset.status(), 200);
+  assert.equal(await asset.text(), readFileSync(join(__dirname, "../../web/architecture.js"), "utf8"), "the running binary embeds this worktree's Architecture controller");
+  const checked = rulesCheck(selected), mcp = await mcpRulesCheck(selected);
+  assert.equal(mcp.unassignedFileCount, checked.unassignedFileCount, "the MCP and CLI share the checkout-wide count");
+  assert.deepEqual(mcp.rulesFile, checked.rulesFile);
+  assert.ok(checked.unassigned.some(identity => identity.kind === "externalPackage"), "the rule catalog includes an unassigned dependency");
+  assert.ok(checked.unassigned.length > checked.unassignedFileCount, "identity and file totals genuinely differ");
+  for (const role of ["production", "all"]) {
+    if (role === "all") await rerendered(page, async () => {
+      await H.reveal(page, "#architecture-metric-tests");
+      await page.locator("#architecture-metric-tests").check();
+    });
+    const dto = (await architecture(selected, "max", role)).data.payload;
+    assert.equal(dto.indexGeneration, mcp.indexGeneration); assert.equal(dto.indexRevision, mcp.indexRevision);
+    assert.deepEqual(dto.rulesFile, mcp.rulesFile);
+    const files = dto.modules.filter(module => module.layer === null).map(module => module.identity.path).sort();
+    assert.equal(files.length, mcp.unassignedFileCount, "the full native inventory agrees with the checkout-wide rules count");
+    assert.ok(files.includes("src/only.rs"), "test-only files still belong to the file inventory");
+    assert.ok(files.includes("src/isolated.rs"), "files without references still belong to the file inventory");
+    assert.ok(files.includes("src/latin.rs"), "a module-only file without references still belongs to the file inventory");
+    assert.ok(dto.partialFiles.some(file => file.path === "src/latin.rs" && file.reason === "not_utf8"));
+    const partialModule = dto.modules.find(module => module.identity.path === "src/latin.rs");
+    assert.equal(partialModule.declarationCount, 0);
+    assert.equal(typeof partialModule.revisionId, "string");
+    assert.equal(typeof partialModule.contentHash, "string");
+    assert.equal(typeof partialModule.provenanceId, "string");
+    assert.ok(checked.unassigned.some(identity => identityKey(identity) === identityKey(partialModule.identity)));
+    assert.ok(dto.edges.every(edge => edge.pairs.every(pair => pair.source.path !== "src/latin.rs" && pair.target.path !== "src/latin.rs")), "the partial module invents no reference edges");
+    assert.equal(await page.locator("#architecture-unassigned").textContent(), `${checked.unassignedFileCount} unassigned files`);
+    await page.locator("#architecture-unassigned").click();
+    assert.deepEqual(await page.locator("#architecture-review-list .architecture-rule-row").evaluateAll(rows => rows.map(row => row.dataset.source).sort()), files);
+    await page.locator("#architecture-review-close").click();
+  }
+  assert.ok((await page.locator("#architecture-notice-content").textContent()).includes(`${checked.unassigned.length} unassigned identities (native files and external packages)`));
+  await capture(page, "architecture-unassigned-desktop");
+  await page.setViewportSize({width:390, height:844});
+  await noOverflow(page);
+  await capture(page, "architecture-unassigned-mobile");
+}, new Map([...libraryFiles, ["src/isolated.rs", "// No references or declarations.\n"], ["src/latin.rs", Buffer.from([0xff])]]), sources, {git:true}));
+
 test("Architecture opens an external package reference in the library catalog, without a Libraries tab", {timeout:240000}, async () => published(rules, async selected => {
   const {page, paths, server, requests} = selected;
   assert.equal(await page.locator("#view-libraries, #dependency-library").count(), 0, "the Libraries tab and its route are gone");
