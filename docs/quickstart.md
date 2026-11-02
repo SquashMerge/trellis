@@ -6,7 +6,10 @@ See [known limitations](known-limitations.md) before you rely on it.
 
 ## 1. Install
 
-Release archives are on the [GitHub Releases page](https://github.com/SquashMerge/trellis/releases).
+Check the [GitHub Releases page](https://github.com/SquashMerge/trellis/releases) for published
+archives. The commands below use `0.1.0` as an example; they do not mean that version has
+been published. Set `VERSION` to an available release. Manual and pull-request workflow
+artifacts are candidates, not published releases; see [Release builds](releases.md).
 
 | Platform | Target name |
 | --- | --- |
@@ -36,6 +39,27 @@ Add the `export` line to your shell's startup file (such as `~/.zshrc`) to keep 
 The archive holds only `trellis` and `LICENSE`. The binaries aren't signed. If you downloaded the archive with a browser on macOS, clear the quarantine flag after checking the checksum: `xattr -d com.apple.quarantine trellis`.
 
 The examples below also use [`jq`](https://jqlang.org) to read Trellis's JSON output.
+
+### Optional local semantic search
+
+For semantic symbol search, install the local embedding model before starting Trellis:
+
+```sh
+trellis model install
+```
+
+This explicit command needs network access on first install. It downloads and verifies
+the reviewed `voyageai/voyage-4-nano` model into a shared user-wide directory, so you
+only need to install it once across checkouts. Defaults work without a configuration file
+or model environment variables, including for Claude Desktop. Backend selection is
+automatic: official macOS ARM64 releases support Metal with CPU fallback; Linux
+releases use CPU.
+
+The model is optional for the browser and lexical symbol search, but required for
+vector-based semantic symbol search. Trellis never downloads weights implicitly.
+If a daemon is already running, installing the model does not reconfigure it: follow the [manual restart steps](semantic-search-local-cache.md#configuration-and-daemon-restart).
+See the [local model guide](semantic-search-local-cache.md) for optional configuration
+and availability diagnostics.
 
 ## 2. Start Trellis and connect the web app
 
@@ -134,14 +158,15 @@ The **Inspector** panel on the right shows the evidence for whatever you've sele
 
 `trellis mcp` is a read-only MCP server that talks over stdin and stdout. It needs no token, and it starts the daemon if it isn't running, so you don't need `serve` for it.
 
-**Claude Code.** Put this in `.mcp.json` at the root of your repository:
+**Claude Code.** Put this in `.mcp.json` at the root of your repository. Replace
+both example paths with the absolute binary and checkout paths on your machine:
 
 ```json
 {
   "mcpServers": {
     "trellis": {
-      "command": "trellis",
-      "args": ["mcp"]
+      "command": "/absolute/path/to/trellis",
+      "args": ["mcp", "--workspace", "/absolute/path/to/repo"]
     }
   }
 }
