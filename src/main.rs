@@ -1234,6 +1234,9 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     #[cfg(unix)]
     let mut termination = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("register serve SIGTERM handler")?;
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("register serve SIGINT handler")?;
     ensure!(
         args.bind.ip().is_loopback(),
         "only loopback bind addresses are supported"
@@ -1313,47 +1316,77 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     let reply: protocol::Reply = protocol::read_frame(&mut stream)
         .map_err(|_| anyhow::anyhow!("outcome_unknown: inspect daemon listener status"))?;
     let address = checked_reply(reply)?;
+    stream
+        .set_read_timeout(None)
+        .context("daemon_unavailable: prepare serve control read")?;
+    let signal_stream = stream
+        .try_clone()
+        .context("daemon_unavailable: clone serve control connection")?;
     eprintln!(
         "Trellis: http://{}/\nState: {}\nToken file: {}\nRefresh is explicit. No repository commands run.",
         address.as_str().unwrap_or("unknown"),
         roots.cache.display(),
         token_file.display()
     );
-    // The opt-in test pause exposes the banner-to-select window. SIGTERM must
-    // already be armed; normal serve executions never pause here.
+    // The test hook exposes the banner-to-select window. Both signals must
+    // already be armed before a caller sees the banner.
     #[cfg(feature = "test-support")]
-    if std::env::var("TRELLIS_TEST_SERVE_AFTER_BANNER_PAUSE").as_deref() == Ok("1") {
-        std::thread::sleep(Duration::from_millis(750));
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_SERVE_AFTER_BANNER_SOCKET") {
+        use std::io::{Read, Write};
+        let mut hook = std::os::unix::net::UnixStream::connect(path)?;
+        hook.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))?;
+        hook.write_all(b"B")?;
+        hook.read_exact(&mut [0])?;
     }
-    // The registration is a control connection, not a checkout attachment. Its
-    // normal EOF is the daemon's intentional idle exit; never respawn here.
-    stream.set_read_timeout(None)?;
-    let signal_stream = stream.try_clone()?;
+    // The registration observes the daemon's lifetime, not a child wait status.
+    // Even a normal EOF is unexpected while serve is running; never respawn here.
     let mut monitor = tokio::task::spawn_blocking(move || {
         let mut one = [0u8; 1];
         use std::io::Read;
-        match stream.read(&mut one) {
-            Ok(0) => Ok(()),
-            _ => anyhow::bail!("daemon_unavailable: serve control interrupted"),
-        }
+        serve_control_failure(stream.read(&mut one))
     });
     let shutdown = async {
         #[cfg(unix)]
-        tokio::select! {
-            _ = termination.recv() => {},
-            _ = tokio::signal::ctrl_c() => {},
+        {
+            tokio::select! {
+                _ = termination.recv() => "SIGTERM",
+                _ = interrupt.recv() => "SIGINT",
+            }
         }
         #[cfg(not(unix))]
-        let _ = tokio::signal::ctrl_c().await;
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
     };
     tokio::select! {
-        result = &mut monitor => result??,
-        _ = shutdown => {
+        result = &mut monitor => {
+            let error = match result {
+                Ok(error) => error,
+                Err(error) => anyhow::anyhow!("daemon_unavailable: serve monitor failed: {error}"),
+            };
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(), "Trellis serve stopping: {error}");
+            return Err(error);
+        }
+        signal = shutdown => {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(), "Trellis serve stopping: received {signal}");
             signal_stream.shutdown(std::net::Shutdown::Both)?;
             let _ = monitor.await?;
         }
     }
     Ok(())
+}
+
+fn serve_control_failure(result: std::io::Result<usize>) -> anyhow::Error {
+    match result {
+        Ok(0) => anyhow::anyhow!(
+            "daemon_unavailable: daemon control connection closed (EOF); daemon exit status unavailable"
+        ),
+        Ok(_) => anyhow::anyhow!("daemon_unavailable: unexpected data on serve control connection"),
+        Err(error) => anyhow::anyhow!("daemon_unavailable: serve control read failed: {error}"),
+    }
 }
 
 async fn run_daemon() -> Result<()> {
@@ -1496,6 +1529,24 @@ fn checked_serve_options(raw: serde_json::Value) -> Result<registry::CheckoutOpt
 #[cfg(test)]
 mod serve_option_transport_tests {
     use super::*;
+    #[test]
+    fn serve_control_failures_are_typed_and_preserve_read_errors() {
+        for result in [Ok(0), Ok(1)] {
+            assert!(
+                serve_control_failure(result)
+                    .to_string()
+                    .starts_with("daemon_unavailable:")
+            );
+        }
+        let message = serve_control_failure(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "fixture connection reset",
+        )))
+        .to_string();
+        assert!(message.starts_with("daemon_unavailable:"));
+        assert!(message.contains("serve control read failed: fixture connection reset"));
+    }
+
     #[test]
     fn daemon_receipt_keeps_omitted_and_explicit_default_distinct() {
         let options = serde_json::to_value(registry::BrowserOptions::default()).unwrap();

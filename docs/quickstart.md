@@ -71,6 +71,46 @@ pgrep -fl 'trellis daemon'    # find the PID and check it's yours
 kill -TERM <pid>
 ```
 
+### Keep a live serve detached
+
+For a long-running live instance, do not leave `serve` owned by an agent's tool
+shell. Use both `nohup` (ignore terminal hangup) and a new session (detach from
+the shell's process group), with stdin and both output streams redirected.
+Use an installed binary and absolute paths, not `cargo run`.
+
+On **Linux**, `setsid` is provided by util-linux:
+
+```sh
+mkdir -m 700 -p "$HOME/.trellis-private"
+nohup setsid /absolute/path/to/trellis serve \
+  --workspace /absolute/path/to/checkout \
+  --token-file "$HOME/.trellis-private/token" \
+  </dev/null >"$HOME/.trellis-private/serve.log" 2>&1 &
+```
+
+**macOS does not ship `setsid`.** With Python 3 installed, create the session
+before replacing the launcher with Trellis:
+
+```sh
+mkdir -m 700 -p "$HOME/.trellis-private"
+nohup python3 -c 'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+  /absolute/path/to/trellis serve \
+  --workspace /absolute/path/to/checkout \
+  --token-file "$HOME/.trellis-private/token" \
+  </dev/null >"$HOME/.trellis-private/serve.log" 2>&1 &
+```
+
+Check `serve.log` for the readiness banner. `nohup` alone does not create a new
+session, and `&` alone does not detach it. Detachment does not prevent a tool
+that explicitly kills all its descendants from stopping it; use a persistent
+terminal or a user service manager in that environment.
+
+`serve` logs `SIGTERM` or `SIGINT` when explicitly stopped and exits successfully.
+If its daemon control connection closes independently, even after a normal daemon
+exit, it logs `daemon_unavailable` and exits nonzero. EOF cannot reveal the
+daemon's OS exit status: `serve` may have attached to an already-running daemon.
+The log says the status is unavailable rather than guessing it.
+
 **More checkouts.** One daemon handles all your checkouts. Run `trellis index` in another checkout, and it appears in the checkout menu at the top of the web app.
 
 **Staying up to date.** Trellis watches each open checkout and refreshes its index a few seconds after you save a file or switch branches. It doesn't run your code or your build to do this.

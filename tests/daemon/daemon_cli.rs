@@ -521,8 +521,8 @@ fn serve_request_preserves_explicit_default_file_cap_presence() {
         }
         let stderr = bounded_fixture_stderr(&stderr_path);
         assert!(
-            stderr.contains("Trellis:"),
-            "serve did not receive fake acknowledgement: {stderr}; {}",
+            stderr.contains("daemon_unavailable"),
+            "serve did not report the fake daemon's closed connection: {stderr}; {}",
             fixture_daemon_diagnostic(&home, &fixture_socket_paths(&home).socket)
         );
         options.push(
@@ -1522,7 +1522,30 @@ fn concurrent_cold_cli_indexes_share_one_daemon_and_keep_fifo_results() {
 #[cfg(unix)]
 #[tokio::test]
 async fn serve_arms_sigterm_before_banner_to_control_wait() {
-    use std::os::unix::net::UnixStream;
+    serve_shutdown(libc::SIGTERM, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_arms_sigint_before_banner_to_control_wait() {
+    serve_shutdown(libc::SIGINT, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_fails_when_daemon_is_killed() {
+    serve_shutdown(libc::SIGKILL, true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_fails_even_when_daemon_exits_successfully() {
+    serve_shutdown(0, true).await;
+}
+
+#[cfg(unix)]
+async fn serve_shutdown(signal: i32, kill_daemon: bool) {
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     let temp = short_temp();
     let home = temp.path().join("home");
@@ -1534,7 +1557,11 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
     let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let socket = fixture_socket_paths(&home).socket;
     let mut daemon_command = cli(&home);
+    let mut owner = (signal == 0).then(|| Owned(Command::new("sleep").arg("120").spawn().unwrap()));
     daemon_command.arg("daemon");
+    if let Some(owner) = &owner {
+        daemon_command.env(trellis::testing::OWNER_PID_ENV, owner.0.id().to_string());
+    }
     let mut daemon = detached(daemon_command);
     let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while UnixStream::connect(&socket).is_err() {
@@ -1552,9 +1579,12 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
     }
     let original_pid = daemon.0.id();
     let log = temp.path().join("serve.log");
+    let hook_path = temp.path().join("banner.sock");
+    let hook = UnixListener::bind(&hook_path).unwrap();
+    hook.set_nonblocking(true).unwrap();
     let mut command = serve(&home, &root, address, &token);
     command
-        .env("TRELLIS_TEST_SERVE_AFTER_BANNER_PAUSE", "1")
+        .env("TRELLIS_TEST_SERVE_AFTER_BANNER_SOCKET", &hook_path)
         .stdout(Stdio::null())
         .stderr(Stdio::from(fs::File::create(&log).unwrap()));
     let mut served = Owned(command.spawn().unwrap());
@@ -1574,24 +1604,72 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
         assert!(Instant::now() < deadline, "serve banner not printed");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // The opt-in pause keeps the serve select unpolled. Without pre-arming
-    // SIGTERM, this signal terminates the process instead of closing control.
-    assert_eq!(
-        unsafe { libc::kill(served.0.id() as i32, libc::SIGTERM) },
-        0
-    );
+    // Wait for the explicit hook, then signal before the select is polled.
+    let mut arrived = None;
+    trellis::testing::wait_until("serve reaching the banner hook", || {
+        arrived = hook.accept().ok();
+        arrived.is_some()
+    });
+    let (mut release, _) = arrived.unwrap();
+    use std::io::{Read, Write};
+    release
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    release.read_exact(&mut [0]).unwrap();
+    let pid = if kill_daemon {
+        daemon.0.id()
+    } else {
+        served.0.id()
+    };
+    if let Some(owner) = &mut owner {
+        owner.0.kill().unwrap();
+        owner.0.wait().unwrap();
+    } else {
+        assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
+    }
+    if kill_daemon {
+        let mut daemon_status = None;
+        trellis::testing::wait_until("daemon exiting", || {
+            daemon_status = daemon.0.try_wait().unwrap();
+            daemon_status.is_some()
+        });
+        assert_eq!(daemon_status.unwrap().success(), signal == 0);
+    }
+    release.write_all(b"R").unwrap();
     let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let status = loop {
         if let Some(status) = served.0.try_wait().unwrap() {
             break status;
         }
-        assert!(Instant::now() < deadline, "serve did not exit on SIGTERM");
+        assert!(
+            Instant::now() < deadline,
+            "serve did not exit after shutdown"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
+    let logged = fs::read_to_string(&log).unwrap();
+    if kill_daemon {
+        assert!(!status.success(), "serve unexpectedly succeeded: {logged}");
+        assert!(logged.contains("daemon_unavailable"), "{logged}");
+        assert!(logged.contains("EOF"), "{logged}");
+        assert!(
+            logged.contains("daemon exit status unavailable"),
+            "{logged}"
+        );
+        return;
+    }
     assert!(
         status.success(),
-        "serve did not shut down gracefully: {status}; log: {}",
-        fs::read_to_string(&log).unwrap()
+        "serve did not shut down gracefully: {status}; log: {logged}"
+    );
+    let signal_name = if signal == libc::SIGTERM {
+        "SIGTERM"
+    } else {
+        "SIGINT"
+    };
+    assert!(
+        logged.contains(&format!("received {signal_name}")),
+        "{logged}"
     );
     assert_eq!(daemon.0.id(), original_pid);
     assert!(
