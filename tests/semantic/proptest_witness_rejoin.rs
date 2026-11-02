@@ -514,14 +514,13 @@ fn publish_local(
     stats.steps += 1;
     check_publication(&work, label, expected_reusable, stats)?;
     // Publication is atomic: a revision that already existed still reads the same rows.
-    if let Some(snapshot) = before_snapshot {
-        if let Ok(after) = world.store.semantic_at(before) {
-            if after != snapshot {
-                return Err(format!(
-                    "{label}: an already published revision changed after a later publication"
-                ));
-            }
-        }
+    if let Some(snapshot) = before_snapshot
+        && let Ok(after) = world.store.semantic_at(before)
+        && after != snapshot
+    {
+        return Err(format!(
+            "{label}: an already published revision changed after a later publication"
+        ));
     }
     Ok(())
 }
@@ -592,12 +591,12 @@ fn run_history(world: &World, counts: &Path, history: &[Op]) -> Result<Stats, St
                 }
             }
             Op::Add { path } => {
-                if read_text(world, PATHS[*path]).is_none() {
-                    if let Some(template) = choose_edit(world, *path, 0) {
-                        write_text(world, PATHS[*path], template);
-                        let expected = model.expected(world);
-                        publish_local(world, counts, &label, expected, &mut stats)?;
-                    }
+                if read_text(world, PATHS[*path]).is_none()
+                    && let Some(template) = choose_edit(world, *path, 0)
+                {
+                    write_text(world, PATHS[*path], template);
+                    let expected = model.expected(world);
+                    publish_local(world, counts, &label, expected, &mut stats)?;
                 }
             }
             Op::MultiEdit { mask, choices } => {
@@ -679,12 +678,12 @@ fn run_history(world: &World, counts: &Path, history: &[Op]) -> Result<Stats, St
             Op::Extra { add } => {
                 let file = world.root.join(PATHS[3]);
                 if *add {
-                    if !file.exists() {
-                        if let Some(template) = choose_edit(world, 3, 0) {
-                            write_text(world, PATHS[3], template);
-                            let expected = model.expected(world);
-                            publish_local(world, counts, &label, expected, &mut stats)?;
-                        }
+                    if !file.exists()
+                        && let Some(template) = choose_edit(world, 3, 0)
+                    {
+                        write_text(world, PATHS[3], template);
+                        let expected = model.expected(world);
+                        publish_local(world, counts, &label, expected, &mut stats)?;
                     }
                 } else if file.exists() && existing_documents(world) > 1 {
                     fs::remove_file(&file)
