@@ -32,7 +32,9 @@
 .classes-compartment { min-height: 0; flex: 1; display: flex; flex-direction: column; border-top: 1px solid var(--line-strong); }
 .classes-compartment h4 { flex: none; margin: 0; padding: 5px 12px; color: var(--secondary); font-size: 12px; }
 .classes-members { min-height: 0; overflow: auto; padding: 0 8px 6px; overscroll-behavior: contain; }
-.classes-member { display: flex; align-items: center; font: 13px/1.55 var(--mono); padding: 3px 4px; white-space: nowrap; min-width: max-content; }
+.classes-member { display: flex; flex-wrap: wrap; align-items: center; font: 13px/1.55 var(--mono); padding: 3px 4px; min-width: 0; gap: 0 3px; }
+.classes-member-name, .classes-member-type { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.classes-member > .classes-member-type { flex: 1 1 140px; }
 .classes-member > button { flex: none; font: inherit; text-align: left; padding: 2px 3px; margin: 0; background: var(--clear); border-color: var(--clear); }
 .classes-member > button:hover { background: var(--selected); border-color: var(--selected); color: var(--on-selected); }
 .classes-member > button:focus-visible { outline-offset: 3px; }
