@@ -93,51 +93,69 @@ pub(crate) const DIMENSIONS: usize = 1024;
 const QUERY_PROMPT: &str = "Represent the query for retrieving supporting documents: ";
 const DOCUMENT_PROMPT: &str = "Represent the document for retrieval: ";
 
+/// One pinned artifact used by both local verification and explicit downloads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ModelFile<'a> {
+    pub(crate) path: &'a str,
+    pub(crate) sha256: &'a str,
+    pub(crate) size: u64,
+}
+
 // voyageai/voyage-4-nano@5fb34e870f49f19e79c94d5e118f5ee730133279.
 // The Python file identifies the reproduced architecture; it is never executed.
-const MODEL_FILES: &[(&str, &str)] = &[
-    (
-        "1_Pooling/config.json",
-        "2bc529695125f68de57d1fd347e3d2920b993bc635c5f4f09a45e130c102a989",
-    ),
-    (
-        "config.json",
-        "bcba1ed5644d9bc592aa6bf0e36e11c6642294b5aef0fe65fdc2d0c8cf098cae",
-    ),
-    (
-        "config_sentence_transformers.json",
-        "4b0f3b9dea0ccb018b705084289d09ad1c4a02ddd277bf2e80bde9887539ef08",
-    ),
-    (
-        "model.safetensors",
-        "3dae0c63c81dcab79ac213af331940a1bf2b8a53ec8646be878552890291ad30",
-    ),
-    (
-        "modeling_qwen3_bidirectional.py",
-        "425304da2571d17bf04add3b70fab46d4b7d4466abbe118ef553ccb6fe8fadfe",
-    ),
-    (
-        "modules.json",
-        "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
-    ),
-    (
-        "sentence_bert_config.json",
-        "ae8658c7cf91db1a3ceee800af0f9bda2c7ad60a88b5c2b4d6d5cb0a4394c9c1",
-    ),
-    (
-        "tokenizer.json",
-        "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
-    ),
-    (
-        "tokenizer_config.json",
-        "58c4abbc36eeccd8b3c8453f262225e8f2803855c88790760b618f4cd9e43be9",
-    ),
+// Sizes are download bounds, not part of the embedding/cache identity.
+const MODEL_FILES: &[ModelFile<'static>] = &[
+    ModelFile {
+        path: "1_Pooling/config.json",
+        sha256: "2bc529695125f68de57d1fd347e3d2920b993bc635c5f4f09a45e130c102a989",
+        size: 313,
+    },
+    ModelFile {
+        path: "config.json",
+        sha256: "bcba1ed5644d9bc592aa6bf0e36e11c6642294b5aef0fe65fdc2d0c8cf098cae",
+        size: 1_041,
+    },
+    ModelFile {
+        path: "config_sentence_transformers.json",
+        sha256: "4b0f3b9dea0ccb018b705084289d09ad1c4a02ddd277bf2e80bde9887539ef08",
+        size: 378,
+    },
+    ModelFile {
+        path: "model.safetensors",
+        sha256: "3dae0c63c81dcab79ac213af331940a1bf2b8a53ec8646be878552890291ad30",
+        size: 692_919_112,
+    },
+    ModelFile {
+        path: "modeling_qwen3_bidirectional.py",
+        sha256: "425304da2571d17bf04add3b70fab46d4b7d4466abbe118ef553ccb6fe8fadfe",
+        size: 3_491,
+    },
+    ModelFile {
+        path: "modules.json",
+        sha256: "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+        size: 349,
+    },
+    ModelFile {
+        path: "sentence_bert_config.json",
+        sha256: "ae8658c7cf91db1a3ceee800af0f9bda2c7ad60a88b5c2b4d6d5cb0a4394c9c1",
+        size: 59,
+    },
+    ModelFile {
+        path: "tokenizer.json",
+        sha256: "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+        size: 7_031_645,
+    },
+    ModelFile {
+        path: "tokenizer_config.json",
+        sha256: "58c4abbc36eeccd8b3c8453f262225e8f2803855c88790760b618f4cd9e43be9",
+        size: 7_228,
+    },
 ];
 
 struct SupportedModel {
     name: &'static str,
     revision: &'static str,
-    files: &'static [(&'static str, &'static str)],
+    files: &'static [ModelFile<'static>],
 }
 
 const SUPPORTED_MODEL: SupportedModel = SupportedModel {
@@ -151,8 +169,8 @@ impl SupportedModel {
         serde_json::json!({
             "name": self.name,
             "revision": self.revision,
-            "modelFiles": self.files.iter().map(|(path, sha256)| {
-                serde_json::json!({"path": path, "sha256": sha256})
+            "modelFiles": self.files.iter().map(|file| {
+                serde_json::json!({"path": file.path, "sha256": file.sha256})
             }).collect::<Vec<_>>(),
             "dimensions": DIMENSIONS,
             "quantization": "int8-prefix-maxabs-f64-ties-even.v1",
@@ -174,7 +192,7 @@ pub(crate) fn supported_model_revision() -> &'static str {
     SUPPORTED_MODEL.revision
 }
 
-pub(crate) fn supported_model_files() -> &'static [(&'static str, &'static str)] {
+pub(crate) fn supported_model_files() -> &'static [ModelFile<'static>] {
     SUPPORTED_MODEL.files
 }
 
@@ -217,12 +235,13 @@ struct FileIdentity {
 
 fn file_identities(
     path: &Path,
-    files: &[(&str, &str)],
+    files: &[ModelFile<'_>],
     control: &EmbeddingControl<'_>,
 ) -> Result<Vec<FileIdentity>, EmbedError> {
     files
         .iter()
-        .map(|(name, _)| {
+        .map(|file| {
+            let name = file.path;
             control.check()?;
             let metadata = std::fs::metadata(path.join(name))
                 .map_err(|error| EmbedError::ModelUnavailable(format!("{name}: {error}")))?;
@@ -258,7 +277,7 @@ impl ModelVerification {
     fn unchanged_files(
         &self,
         path: &Path,
-        files: &[(&str, &str)],
+        files: &[ModelFile<'_>],
         control: &EmbeddingControl<'_>,
     ) -> Result<bool, EmbedError> {
         let identities = file_identities(path, files, control)?;
@@ -277,7 +296,7 @@ impl ModelVerification {
     fn read_files(
         &mut self,
         path: &Path,
-        files: &[(&str, &str)],
+        files: &[ModelFile<'_>],
         control: &EmbeddingControl<'_>,
     ) -> Result<VerifiedModel, EmbedError> {
         let before = file_identities(path, files, control)?;
@@ -310,7 +329,7 @@ impl ModelVerification {
 
 fn verify_files(
     path: &Path,
-    files: &[(&str, &str)],
+    files: &[ModelFile<'_>],
     control: &EmbeddingControl<'_>,
 ) -> Result<VerifiedModel, EmbedError> {
     let mut verified = VerifiedModel {
@@ -318,8 +337,9 @@ fn verify_files(
         tokenizer: Vec::new(),
         weights: Vec::new(),
     };
-    for &(name, expected_hash) in files {
-        let bytes = read_model_file(path, name, Some(expected_hash), control)?;
+    for file in files {
+        let name = file.path;
+        let bytes = read_model_file(path, name, Some(file.sha256), control)?;
         match name {
             "config.json" => verified.config = bytes,
             "tokenizer.json" => verified.tokenizer = bytes,
@@ -1184,7 +1204,11 @@ mod tests {
         assert!(matches!(
             verification.read_files(
                 directory.path(),
-                &[("model.safetensors", hash.as_str())],
+                &[ModelFile {
+                    path: "model.safetensors",
+                    sha256: hash.as_str(),
+                    size: bytes.len() as u64,
+                }],
                 &EmbeddingControl::with_budget(&cancel, &budget),
             ),
             Err(EmbedError::BudgetExceeded)
@@ -1194,7 +1218,11 @@ mod tests {
         let verified = verification
             .read_files(
                 directory.path(),
-                &[("model.safetensors", hash.as_str())],
+                &[ModelFile {
+                    path: "model.safetensors",
+                    sha256: hash.as_str(),
+                    size: bytes.len() as u64,
+                }],
                 &EmbeddingControl::new(&cancel),
             )
             .unwrap();
@@ -1286,7 +1314,11 @@ mod tests {
         let pins = names
             .iter()
             .zip(&hashes)
-            .map(|(name, hash)| (*name, hash.as_str()))
+            .map(|(name, hash)| ModelFile {
+                path: name,
+                sha256: hash.as_str(),
+                size: name.len() as u64,
+            })
             .collect::<Vec<_>>();
         let mut verification = ModelVerification::default();
         let first = verification
@@ -1339,7 +1371,11 @@ mod tests {
         let pins: Vec<_> = names
             .iter()
             .zip(&hashes)
-            .map(|(name, hash)| (*name, hash.as_str()))
+            .map(|(name, hash)| ModelFile {
+                path: name,
+                sha256: hash.as_str(),
+                size: name.len() as u64,
+            })
             .collect();
         let verified = verify_files(temp.path(), &pins, &control).unwrap();
         std::fs::write(temp.path().join("config.json"), b"changed").unwrap();

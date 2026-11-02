@@ -6,13 +6,34 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::search_config::snapshot_path;
-use crate::search_embed::{supported_model_files, supported_model_name, supported_model_revision};
+use crate::search_embed::{
+    ModelFile, supported_model_files, supported_model_name, supported_model_revision,
+};
+
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn download_client(connect_timeout: Duration, read_timeout: Duration) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .build()?)
+}
+
+fn download_error(error: reqwest::Error) -> anyhow::Error {
+    if error.is_timeout() {
+        io::Error::new(io::ErrorKind::TimedOut, error).into()
+    } else {
+        error.into()
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,7 +79,7 @@ pub async fn install(models_dir: &Path, name: &str, revision: &str) -> Result<In
         revision,
         supported_model_files(),
         &HttpSource {
-            client: reqwest::Client::new(),
+            client: download_client(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)?,
             name,
             revision,
         },
@@ -199,35 +220,73 @@ impl FileSource for HttpSource<'_> {
             "https://huggingface.co/{}/resolve/{}/{relative}",
             self.name, self.revision
         );
-        let mut response = self.client.get(url).send().await?.error_for_status()?;
-        while let Some(chunk) = response.chunk().await? {
+        self.write_url(&url, destination).await
+    }
+}
+
+impl HttpSource<'_> {
+    async fn write_url(&self, url: &str, destination: &mut HashingWriter<File>) -> Result<()> {
+        let mut response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(download_error)?
+            .error_for_status()?;
+        if let Some(length) = response.content_length()
+            && length != destination.expected_size
+        {
+            return Err(size_error(destination.expected_size, length).into());
+        }
+        while let Some(chunk) = response.chunk().await.map_err(download_error)? {
             destination.write_all(&chunk)?;
         }
         Ok(())
     }
 }
 
+fn size_error(expected: u64, actual: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("model file size mismatch: expected {expected} bytes, received {actual}"),
+    )
+}
+
 struct HashingWriter<W> {
     output: W,
     digest: Sha256,
+    expected_size: u64,
+    written: u64,
 }
 
 impl<W> HashingWriter<W> {
-    fn new(output: W) -> Self {
+    fn new(output: W, expected_size: u64) -> Self {
         Self {
             output,
             digest: Sha256::new(),
+            expected_size,
+            written: 0,
         }
     }
 
-    fn hash(self) -> String {
-        hex::encode(self.digest.finalize())
+    fn hash(self) -> io::Result<String> {
+        if self.written != self.expected_size {
+            return Err(size_error(self.expected_size, self.written));
+        }
+        Ok(hex::encode(self.digest.finalize()))
     }
 }
 
 impl<W: Write> Write for HashingWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() as u64 > self.expected_size - self.written {
+            return Err(size_error(
+                self.expected_size,
+                self.written.saturating_add(bytes.len() as u64),
+            ));
+        }
         let written = self.output.write(bytes)?;
+        self.written += written as u64;
         self.digest.update(&bytes[..written]);
         Ok(written)
     }
@@ -241,7 +300,7 @@ async fn install_with(
     models_dir: &Path,
     name: &str,
     revision: &str,
-    files: &[(&str, &str)],
+    files: &[ModelFile<'_>],
     source: &impl FileSource,
 ) -> Result<InstallReport> {
     let _lock = management_lock(models_dir)?;
@@ -255,9 +314,9 @@ async fn install_with(
         restart_required: true,
     };
     if report.directory.try_exists()? {
-        verify_snapshot(&report.directory, files).context(
-            "model files are incomplete or invalid; remove this revision, then install again",
-        )?;
+        verify_snapshot(&report.directory, files).with_context(|| format!(
+            "model files are incomplete or invalid; run `trellis model remove {name} --revision {revision}`, then `trellis model install {name} --revision {revision}`"
+        ))?;
         report.already_installed = true;
         return Ok(report);
     }
@@ -266,10 +325,11 @@ async fn install_with(
     let stage = tempfile::Builder::new()
         .prefix(".install-")
         .tempdir_in(parent)?;
-    for &(relative, expected_hash) in files {
+    for file in files {
+        let relative = file.path;
         let path = stage.path().join(relative);
         fs::create_dir_all(path.parent().expect("reviewed file parent"))?;
-        let mut destination = HashingWriter::new(File::create(&path)?);
+        let mut destination = HashingWriter::new(File::create(&path)?, file.size);
         source
             .write_file(relative, &mut destination)
             .await
@@ -278,7 +338,7 @@ async fn install_with(
             .output
             .sync_all()
             .with_context(|| format!("sync model file {relative}"))?;
-        if destination.hash() != expected_hash {
+        if destination.hash()? != file.sha256 {
             bail!("SHA-256 mismatch for model file {relative}");
         }
     }
@@ -291,13 +351,14 @@ async fn install_with(
     Ok(report)
 }
 
-fn verify_snapshot(directory: &Path, files: &[(&str, &str)]) -> Result<()> {
-    for &(relative, expected_hash) in files {
+fn verify_snapshot(directory: &Path, files: &[ModelFile<'_>]) -> Result<()> {
+    for descriptor in files {
+        let relative = descriptor.path;
         let mut file = File::open(directory.join(relative))
             .with_context(|| format!("read model file {relative}"))?;
-        let mut hash = HashingWriter::new(io::sink());
+        let mut hash = HashingWriter::new(io::sink(), descriptor.size);
         io::copy(&mut file, &mut hash).with_context(|| format!("hash model file {relative}"))?;
-        if hash.hash() != expected_hash {
+        if hash.hash()? != descriptor.sha256 {
             bail!("SHA-256 mismatch for model file {relative}");
         }
     }
@@ -319,7 +380,7 @@ fn list_with(
     models_dir: &Path,
     name: &str,
     reviewed_revision: &str,
-    files: &[(&str, &str)],
+    files: &[ModelFile<'_>],
 ) -> Result<Vec<InstalledModel>> {
     let namespace = models_dir.join(name);
     let entries = match fs::read_dir(&namespace) {
@@ -338,8 +399,8 @@ fn list_with(
         }
         let files_present = if revision == reviewed_revision {
             let mut present = true;
-            for &(relative, _) in files {
-                match fs::metadata(entry.path().join(relative)) {
+            for file in files {
+                match fs::metadata(entry.path().join(file.path)) {
                     Ok(metadata) => present &= metadata.is_file(),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => present = false,
                     Err(error) => return Err(error).context("inspect managed model files"),
@@ -400,14 +461,16 @@ mod tests {
             if self.missing_file == Some(relative) {
                 bail!("fixture source missing file");
             }
+            let expected = CONTENTS
+                .iter()
+                .find(|(path, _)| *path == relative)
+                .unwrap()
+                .1;
+            let wrong = vec![b'!'; expected.len()];
             let bytes = if self.wrong_file == Some(relative) {
-                b"wrong bytes".as_slice()
+                wrong.as_slice()
             } else {
-                CONTENTS
-                    .iter()
-                    .find(|(path, _)| *path == relative)
-                    .unwrap()
-                    .1
+                expected
             };
             // Exercise hashing across writes rather than just a whole-file digest.
             for chunk in bytes.chunks(3) {
@@ -424,11 +487,144 @@ mod tests {
             .collect()
     }
 
-    fn descriptor<'a>(hashes: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    fn descriptor<'a>(hashes: &'a [(&'static str, String)]) -> Vec<ModelFile<'a>> {
         hashes
             .iter()
-            .map(|(path, hash)| (*path, hash.as_str()))
+            .map(|(path, hash)| ModelFile {
+                path,
+                sha256: hash.as_str(),
+                size: CONTENTS
+                    .iter()
+                    .find(|(name, _)| name == path)
+                    .unwrap()
+                    .1
+                    .len() as u64,
+            })
             .collect()
+    }
+
+    #[test]
+    fn bounded_hashing_rejects_excess_before_writing_and_requires_exact_size() {
+        let mut writer = HashingWriter::new(Vec::new(), 3);
+        writer.write_all(b"ab").unwrap();
+        let error = writer.write_all(b"cd").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(writer.output, b"ab");
+        writer.write_all(b"c").unwrap();
+        assert_eq!(writer.hash().unwrap(), hex::encode(Sha256::digest(b"abc")));
+        let mut short = HashingWriter::new(Vec::new(), 3);
+        short.write_all(b"ab").unwrap();
+        assert_eq!(short.hash().unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn incorrect_pinned_lengths_never_publish_even_with_matching_hash() {
+        for delta in [-1i64, 1] {
+            let temp = tempfile::tempdir().unwrap();
+            let hashes = hashes();
+            let mut files = descriptor(&hashes);
+            files[0].size = (files[0].size as i64 + delta) as u64;
+            let error = install_with(
+                temp.path(),
+                supported_model_name(),
+                supported_model_revision(),
+                &files,
+                &FixtureSource::good(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(list(temp.path()).unwrap().is_empty());
+            assert_eq!(
+                fs::read_dir(temp.path().join(supported_model_name()))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_headers_and_body_return_typed_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for send_headers in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/fixture", listener.local_addr().unwrap());
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                stream.read(&mut request).await.unwrap();
+                if send_headers {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\na",
+                        )
+                        .await
+                        .unwrap();
+                }
+                ready_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let temp = tempfile::tempdir().unwrap();
+            let mut destination =
+                HashingWriter::new(File::create(temp.path().join("partial")).unwrap(), 3);
+            let source = HttpSource {
+                client: download_client(Duration::from_secs(1), Duration::from_millis(100))
+                    .unwrap(),
+                name: supported_model_name(),
+                revision: supported_model_revision(),
+            };
+            let result = source.write_url(&url, &mut destination).await;
+            server.abort();
+            let _ = server.await;
+            ready_rx.await.unwrap();
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::TimedOut
+            );
+            assert!(destination.written <= 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_tls_handshake_returns_typed_connect_timeout() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}/fixture", listener.local_addr().unwrap());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut hello = [0; 1024];
+            assert!(stream.read(&mut hello).await.unwrap() > 0);
+            ready_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let source = HttpSource {
+            client: download_client(Duration::from_millis(100), Duration::from_secs(5)).unwrap(),
+            name: supported_model_name(),
+            revision: supported_model_revision(),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let mut destination =
+            HashingWriter::new(File::create(temp.path().join("partial")).unwrap(), 3);
+        let result = source.write_url(&url, &mut destination).await;
+        server.abort();
+        let _ = server.await;
+        ready_rx.await.unwrap();
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(destination.written, 0);
     }
 
     #[test]
@@ -484,11 +680,9 @@ mod tests {
         let error = install_with(&models, name, revision, &files, &source)
             .await
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("remove this revision, then install again")
-        );
+        assert!(error.to_string().contains(&format!(
+            "trellis model remove {name} --revision {revision}"
+        )));
         assert!(source.calls.borrow().is_empty());
         assert_eq!(
             fs::read(report.directory.join("weights.bin")).unwrap(),

@@ -169,7 +169,8 @@ impl ResolvedSearchConfig {
             // Presence is not verification. The existing loader still checks every
             // pinned hash and owns the verified bytes before constructing a model.
             let mut present = true;
-            for (name, _) in supported_model_files() {
+            for file in supported_model_files() {
+                let name = file.path;
                 match std::fs::metadata(managed_path.join(name)) {
                     Ok(metadata) => present &= metadata.is_file(),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => present = false,
@@ -339,7 +340,8 @@ mod tests {
     #[test]
     fn managed_presence_requires_every_file_but_does_not_claim_hash_verification() {
         let fixture = Fixture::new();
-        for (name, _) in supported_model_files() {
+        for file in supported_model_files() {
+            let name = file.path;
             let path = fixture.snapshot().join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "not a verified model").unwrap();
@@ -349,7 +351,7 @@ mod tests {
             resolved.runtime_config().unwrap().model_path(),
             Some(fixture.snapshot().as_path())
         );
-        std::fs::remove_file(fixture.snapshot().join(supported_model_files()[0].0)).unwrap();
+        std::fs::remove_file(fixture.snapshot().join(supported_model_files()[0].path)).unwrap();
         assert_eq!(
             fixture
                 .resolve(None, None)

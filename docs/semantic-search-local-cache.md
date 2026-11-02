@@ -30,8 +30,13 @@ trellis model install voyageai/voyage-4-nano --revision 5fb34e870f49f19e79c94d5e
 
 Only `voyageai/voyage-4-nano` at revision
 `5fb34e870f49f19e79c94d5e118f5ee730133279` is supported for installation and loading.
-Install downloads these nine files from that immutable revision, verifies every pinned
-SHA-256 hash, and publishes the new snapshot atomically only after all files pass:
+Install downloads these nine files from that immutable revision. Each stream is limited
+to its pinned byte size before writes; exact size and SHA-256 must both match before
+the new snapshot is published atomically. Connections time out after 15 seconds, and
+headers or body reads stall out after 30 seconds without progress. Timeout failures
+retain a typed `TimedOut` I/O error and remove the incomplete stage. There is no total
+transfer deadline for a download that keeps making progress:
+
 
 ```text
 1_Pooling/config.json
