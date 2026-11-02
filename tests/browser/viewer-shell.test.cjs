@@ -526,7 +526,8 @@ test("Sequence URLs wait for authentication and checkout, use the returned seed,
       assert.equal(response.status(), 200, JSON.stringify(dto));
       assert.equal(response.request().postDataJSON().seed, seed); assert.deepEqual(response.request().postDataJSON().expectedRevision, pin);
       assert.equal(dto.seed.id, seed); assert.equal(dto.seed.name, "transform"); assert.deepEqual(dto.revision, pin);
-      await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+      await page.locator("#sequence-diagram .sequence-empty").waitFor();
+      assert.match(await page.locator("#sequence-diagram .sequence-empty").textContent(), /No measured calls.*Non-call behavior may be hidden/);
       assert.equal(await page.locator("#method-source").isEnabled(), true);
       await page.locator("#method-source").click();
       await assertExactSource(page, flowSource);

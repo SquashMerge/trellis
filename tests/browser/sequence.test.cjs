@@ -73,7 +73,7 @@ test("method source Sequence uses the clicked declaration, not the left-tree sel
  const response = await responsePromise, selected = await response.json();
  assert.equal(response.status(), 200, JSON.stringify(selected));
  assert.equal(selected.seed.id, helperId); assert.equal(selected.seed.name, "first"); assert.deepEqual(selected.revision, pin);
- await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), helperId);
+ await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-diagram .sequence-empty")?.textContent.includes("No measured calls"), helperId);
  await page.goBack();
  await page.waitForFunction(text => document.querySelector("#source")?.textContent === text && !document.querySelector("#workspace-source-panel")?.hidden, before);
  assert.deepEqual(await page.locator("#source .highlight .line-number").allTextContents(), highlighted);
@@ -111,7 +111,7 @@ test("published source roves one tabbable declaration action and invokes exact s
  await page.keyboard.press("Enter");
  const response = await responsePromise, selected = await response.json();
  assert.equal(response.status(), 200, JSON.stringify(selected));assert.equal(selected.seed.id, exactId);assert.deepEqual(selected.revision, pin);
- await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), exactId);
+ await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-diagram .sequence-empty")?.textContent.includes("No measured calls"), exactId);
  await page.goBack();
  await page.waitForFunction(({id,text}) => document.activeElement?.dataset.symbolId === id && document.querySelector("#source")?.textContent === text, {id:exactId,text:before});
  assert.equal(await sourcePane.getAttribute("data-navigation-line"), "2");assert.equal(await tabbable.count(), 1);
@@ -133,10 +133,12 @@ test("published JavaScript nested try/handler/exit retains order and original so
  assert.ok(steps.some(s=>s.label.includes("catch: only if")),"handler remains distinct");
  assert.ok(steps.some(s=>s.label.includes("finally: on both")),"cleanup remains distinct");
  assert.ok(steps.some(s=>s.kind==="throw"));assert.ok(steps.some(s=>s.kind==="return"));
- const visible=steps.filter(s=>!s.hidden);
+ const visible=steps.filter(s=>!s.hidden && !["return","throw","exit","effect","definition"].includes(s.kind));
  const notes=await page.locator(".pele-note[data-trellis-step-id]").evaluateAll(ns=>ns.map(n=>({id:n.dataset.trellisStepId,text:n.textContent,callId:n.dataset.trellisCallId})));
  assert.deepEqual(notes.map(n=>n.id),visible.map(s=>s.id),"note order follows original control/alternate/handler order");
- for(const kind of ["try","throw","return"]){const step=visible.find(s=>s.kind===kind);assert.ok(step,kind);assert.ok(notes.find(n=>n.id===step.id)?.text.includes(kind));}
+ const attempt=visible.find(s=>s.kind==="try");assert.ok(attempt);
+ assert.match(notes.find(n=>n.id===attempt.id).text,/may exit early/);
+ for(const step of steps.filter(s=>["throw","return"].includes(s.kind))) assert.ok(!notes.some(note=>note.id===step.id),"exit leaves wait for full detail");
  const handler=visible.find(s=>s.label.includes("catch: only if"));assert.ok(handler);
  const target=page.locator(`.pele-note[data-trellis-step-id="${handler.id}"]`);await target.focus();await page.keyboard.press("Enter");
  assert.equal(await target.getAttribute("aria-pressed"),"true");assert.match(await page.locator("#call-inspector").innerText(),/catch: only if/);
@@ -152,6 +154,9 @@ test("published JavaScript nested try/handler/exit retains order and original so
  await page.waitForFunction(()=>document.querySelector("#sequence-state")?.textContent?.includes("Pele rendered")&&document.querySelector("#sequence-state")?.textContent?.includes("0 incidental steps hidden"));
  assert.ok(serverRequests.some(body=>body.showAll===true&&body.expectedRevision.indexGeneration===pin.indexGeneration&&body.expectedRevision.indexRevision===pin.indexRevision));
  assert.ok((await page.locator(".pele-note[data-trellis-step-id]").allTextContents()).some(text=>text.includes("console.log")));
+ for(const step of steps.filter(s=>["throw","return"].includes(s.kind))) {
+  assert.match(await page.locator(`.pele-note[data-trellis-step-id="${step.id}"]`).textContent(),new RegExp(step.kind));
+ }
  // The same published view remains navigable with a narrow scroll canvas and
  // keyboard-visible focus. No library-injected controls or inline CSS.
  await page.setViewportSize({width:540,height:780});
