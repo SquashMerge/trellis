@@ -26,6 +26,8 @@ The [merged edit-path fix (#573)](https://github.com/SquashMerge/trellis/pull/57
 
 Config, toolchain or extractor changes, multi-artifact batches and `scip-java` can still take that full path. Ordinary edits can also take tens of seconds because publications rewrite semantic rows. The proposed lower-memory full path is not a measured fix.
 
+Edit latency and contention remain required 0.1 work in [#620](https://github.com/SquashMerge/trellis/issues/620) and [#624](https://github.com/SquashMerge/trellis/issues/624), separate from #61's nonblocking historical gate. The physical-payload reuse experiment did not meet its latency gate and is not a shipped fix.
+
 ## Evidence
 
 ### Rust macros

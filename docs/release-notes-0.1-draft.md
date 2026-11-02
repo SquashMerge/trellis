@@ -5,9 +5,9 @@ and [#618](https://github.com/SquashMerge/trellis/issues/618). Release version, 
 qualification results are **TBD**. These notes describe merged code, not a qualified
 archive or an available release. They authorize no build, tag or publication.
 
-**Source cutoff:** 2026-11-02 09:32:02 UTC. Base and inspected `main` head:
-[`1f072981b977a69a3e5e797733315896ce1698fe`](https://github.com/SquashMerge/trellis/commit/1f072981b977a69a3e5e797733315896ce1698fe),
-through merged [PR #614](https://github.com/SquashMerge/trellis/pull/614).
+**Source cutoff:** 2026-11-02 18:03:28 UTC. Base and inspected `main` head:
+[`95eed4305edee23e2309fe2a786d1bb6a94147f9`](https://github.com/SquashMerge/trellis/commit/95eed4305edee23e2309fe2a786d1bb6a94147f9),
+through merged [PR #622](https://github.com/SquashMerge/trellis/pull/622).
 This is a first-release feature summary, not a comparison with a prior release.
 
 ## A local code browser for people and agents
@@ -90,15 +90,31 @@ explicit trust settings.
   ([#602](https://github.com/SquashMerge/trellis/pull/602),
   [#601](https://github.com/SquashMerge/trellis/pull/601),
   [#590](https://github.com/SquashMerge/trellis/pull/590))
+- Local edit publication avoids repeated semantic statement preparation and
+  unnecessary publication notifications. Edit latency remains open work; these
+  changes do not establish a performance qualification pass.
+  ([#627](https://github.com/SquashMerge/trellis/pull/627))
+- Shutdown ordering and fixture process cleanup have regression coverage. The MCP
+  contract suite checks every advertised tool against real Rust and JavaScript
+  imports, including structured errors.
+  ([#615](https://github.com/SquashMerge/trellis/pull/615),
+  [#625](https://github.com/SquashMerge/trellis/pull/625),
+  [#626](https://github.com/SquashMerge/trellis/pull/626),
+  [#616](https://github.com/SquashMerge/trellis/pull/616))
 
 ## Install and limitations
 
 The release build targets are ARM64 macOS 14+ (Metal enabled) and x86-64/ARM64
 Linux GNU (glibc 2.31+, CPU-only). Archives are unsigned and contain no model
 weights. Release packaging and validated tag publication are implemented, but this
-draft does not establish that any candidate passed qualification.
+draft does not establish that any candidate passed qualification. The installed-binary
+MCP smoke runner checks every advertised tool and reports missing capabilities;
+it does not turn a partial-capability run into release qualification. Release-candidate
+jobs also free unused hosted-runner SDK space before building.
 ([#345](https://github.com/SquashMerge/trellis/pull/345),
-[#354](https://github.com/SquashMerge/trellis/pull/354))
+[#354](https://github.com/SquashMerge/trellis/pull/354),
+[#617](https://github.com/SquashMerge/trellis/pull/617),
+[#622](https://github.com/SquashMerge/trellis/pull/622))
 
 Use the [quickstart](quickstart.md) for archive installation, explicit model setup,
 `serve --token-file`, Claude Code/Desktop MCP configuration and producer setup.
@@ -116,9 +132,9 @@ runtime dispatch resolution.
   and the [release process](releases.md), including native target/archive checks,
   full verification and installed-binary/MCP/UI dogfood. A PR's test report is not
   release qualification.
-- [ ] Resolve or explicitly disposition pending test cleanup
-  [#615](https://github.com/SquashMerge/trellis/pull/615), real-import MCP catalog
-  validation [#616](https://github.com/SquashMerge/trellis/pull/616), and post-install
-  MCP smoke [#617](https://github.com/SquashMerge/trellis/pull/617).
-  **All three were open at the source cutoff and are not included above.**
+- [ ] Resolve the remaining edit-latency and contention work
+  [#620](https://github.com/SquashMerge/trellis/issues/620) and
+  [#624](https://github.com/SquashMerge/trellis/issues/624). The physical-payload
+  reuse experiment did not meet its latency gate; it is not a shipped feature or
+  an approved schema change.
 - [ ] Owner approves final notes and separately controls any tag/publication.
