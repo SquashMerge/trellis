@@ -619,6 +619,8 @@ macro_rules! control_ensure {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PublishStage {
+    #[cfg(test)]
+    BeforeReuseAuthentication,
     BeforeTransaction,
     AfterFile,
     BeforeCommit,
@@ -18549,6 +18551,8 @@ impl Store {
             // values from different connections cannot fence a concurrent SQL rewrite.
             let admitted_version: i64 =
                 storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
+            #[cfg(test)]
+            during_tx(PublishStage::BeforeReuseAuthentication, &db)?;
             #[cfg(test)]
             if let Some(spool) = stream {
                 let hook = self

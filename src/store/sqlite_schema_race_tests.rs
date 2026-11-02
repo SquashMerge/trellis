@@ -42,6 +42,77 @@ fn ready() -> (
 }
 
 #[test]
+fn valid_competing_publication_preserves_the_winner_at_each_version_fence() {
+    for pause in [
+        Some(PublishStage::BeforeReuseAuthentication),
+        Some(PublishStage::BeforeTransaction),
+        None,
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(
+            work.path().join("flow.js"),
+            "function go() { measured(); }\n",
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(work.path().to_owned()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let baseline = store.index_baseline().unwrap();
+        assert_eq!(baseline.index_revision, 0);
+        let session = store.writer_session().unwrap();
+        let leader = session.writer_guard().unwrap();
+        let winner = RefCell::new(None);
+        let publish_winner = || {
+            let pin = store
+                .publish_native(&graph, &capture, &native, leader, baseline, &cancel)
+                .unwrap();
+            *winner.borrow_mut() = Some(pin);
+        };
+        if pause.is_none() {
+            publish_winner();
+        }
+        let error = store
+            .publish_inner_checked(
+                (&graph, &capture, &native),
+                leader,
+                baseline,
+                &cancel,
+                |stage, _connection| {
+                    if Some(stage) == pause {
+                        publish_winner();
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        match pause {
+            Some(PublishStage::BeforeReuseAuthentication) => assert_eq!(
+                error.to_string(),
+                "incompatible_index: cache changed during reuse authentication"
+            ),
+            Some(PublishStage::BeforeTransaction) => assert_eq!(
+                error.to_string(),
+                "incompatible_index: cache changed after admission"
+            ),
+            None => assert!(error.to_string().starts_with("revision conflict:")),
+            _ => unreachable!(),
+        }
+        let winner = winner.into_inner().unwrap();
+        assert_eq!(winner.index_revision, 1);
+        assert_eq!(store.status().unwrap().revision, winner);
+        assert!(store.source("flow.js").unwrap().is_some());
+        assert!(!store.recovery_pending_for_tests());
+    }
+}
+
+#[test]
 fn retained_two_revision_tree_survives_partial_third_publication_rollback() {
     let (_state, work, store, graph, capture, native, first, cancel, session) = ready();
     let leader = session.writer_guard().unwrap();
@@ -695,6 +766,9 @@ fn publication_connection_runs_with_the_publication_page_cache() {
             old,
             &cancel,
             |stage, connection| {
+                if stage == PublishStage::BeforeReuseAuthentication {
+                    return Ok(());
+                }
                 let kib: i64 = connection.pragma_query_value(None, "cache_size", |r| r.get(0))?;
                 seen.borrow_mut()
                     .push((stage == PublishStage::BeforeCommit, kib));

@@ -822,11 +822,13 @@ fn concurrent_publish_cas_has_one_winner() {
                 .as_ref()
                 .err()
                 .is_some_and(|e| e.to_string().starts_with("storage_busy")))
-            || outcomes
-                .iter()
-                .any(|(result, _)| result.as_ref().err().is_some_and(
-                    |e| e.to_string() == "incompatible_index: cache changed after admission"
-                )),
+            || outcomes.iter().any(
+                |(result, _)| result.as_ref().err().is_some_and(|e| matches!(
+                    e.to_string().as_str(),
+                    "incompatible_index: cache changed during reuse authentication"
+                        | "incompatible_index: cache changed after admission"
+                ))
+            ),
         "unexpected typed CAS loser: {:?}",
         outcomes
             .iter()
