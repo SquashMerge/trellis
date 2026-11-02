@@ -10,6 +10,7 @@ mod common;
 #[path = "../common/graph_fixtures.rs"]
 mod graph_fixtures;
 
+mod architecture_cache_properties;
 mod architecture_http;
 mod architecture_precompute;
 mod browse_http;
