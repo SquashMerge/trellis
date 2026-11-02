@@ -11,6 +11,7 @@ const SOURCE_P = "fn seed(value: i32) -> i32 { old_step(value) }\nfn old_step(va
 const scoped = (key,suffix) => `/api/checkouts/${encodeURIComponent(key)}/${suffix}`;
 let binary, suiteBinaryDir, cleanupPromise, closing = false;
 const clients = new Set();
+const fixtureHomes = new Set();
 function ownClient(child) {
   clients.add(child);
   child.once("exit", () => clients.delete(child));
@@ -34,22 +35,25 @@ function run(command, args, {cwd = ROOT, env = process.env, timeout = 180000} = 
     if (command === binary && closing) { reject(new Error("sequence suite is closing")); return; }
     const child = spawn(command, args, {cwd, env, stdio:["ignore", "pipe", "pipe"]});
     if (command === binary) ownClient(child);
-    let stdout = "", stderr = "", settled = false;
+    let stdout = "", stderr = "", settled = false, escalation;
     const timer = setTimeout(() => {
       if (settled) return;
       child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 1000).unref();
+      escalation = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }, 1000);
+      escalation.unref();
       reject(new Error(`${basename(command)} ${args.join(" ")} timed out after ${timeout}ms`));
     }, timeout);
     child.stdout.on("data", chunk => { stdout += chunk; if (stdout.length > 16_000_000) child.kill("SIGTERM"); });
     child.stderr.on("data", chunk => { stderr += chunk; if (stderr.length > 16_000_000) child.kill("SIGTERM"); });
-    child.on("error", error => { if (!settled) { settled = true; clearTimeout(timer); reject(error); } });
+    child.on("error", error => { if (!settled) { settled = true; clearTimeout(timer); clearTimeout(escalation); reject(error); } });
     // #475: "exit" can fire before the child's stdout has been read, which gave an
     // empty stdout for a successful CLI. "close" fires once the process has exited
     // and its stdio has ended, so the result holds everything the child wrote.
     child.on("close", (code, signal) => {
       if (settled) return;
-      settled = true; clearTimeout(timer);
+      settled = true; clearTimeout(timer); clearTimeout(escalation);
       const label = `${basename(command)} ${args.join(" ")}`;
       // A parse failure names the exit code, the stdout size and stderr.
       const json = () => {
@@ -73,23 +77,49 @@ async function builtBinary() {
   await run("cargo", ["build", "--locked", "--bin", "trellis"], {timeout:900000});
   return join(target, "debug", process.platform === "win32" ? "trellis.exe" : "trellis");
 }
-// The CLI `index` each test runs elects a user-level daemon from the suite's
-// own binary copy, and that daemon outlives serve by design. The suite stops
-// exactly the daemons it started: no other process runs this run-unique
-// binary (#130). They are not our children, so exit is observed by signal 0.
-async function stopSuiteDaemons() {
-  if (!binary) return;
-  const commands = new Set([binary, realpathSync(binary)].map(path => `${path} daemon`));
-  const listed = await run("ps", ["-axww", "-o", "pid=,args="], {timeout:10000});
-  const pids = listed.stdout.split("\n").map(line => line.trim().match(/^(\d+) (.*)$/))
-    .filter(match => match && commands.has(match[2])).map(match => Number(match[1]));
-  const alive = pid => { try { process.kill(pid,0); return true; } catch { return false; } };
-  for (const pid of pids) try { process.kill(pid,"SIGTERM"); } catch {}
-  for (const deadline = Date.now()+HANG_BACKSTOP_MS; pids.some(alive); await delay(25)) {
-    if (Date.now() > deadline) {
-      for (const pid of pids.filter(alive)) try { process.kill(pid,"SIGKILL"); } catch {}
-      throw new Error(`suite daemons ignored SIGTERM: ${pids.filter(alive).join(",")}`);
+// Detached daemons are discovered only within this suite's unique binary and
+// private HOMEs. Recheck the recorded start identity before each signal. This
+// deliberately narrows, but does not make atomic, the check/signal window.
+// ps lstart has second resolution and cannot distinguish identical same-second
+// launches; this suite also uses a unique binary path and private HOME.
+async function stopSuiteDaemons({suiteBinary = binary, homes = fixtureHomes, runCommand = run,
+  signal = process.kill, pause = delay, grace = HANG_BACKSTOP_MS} = {}) {
+  if (!suiteBinary) return;
+  const commands = new Set([suiteBinary, realpathSync(suiteBinary)].map(path => `${path} daemon`));
+  async function snapshot(pid) {
+    const args = ["eww", ...(pid === undefined ? ["-A"] : ["-p", String(pid)]),
+      "-o", "pid=,lstart=,stat=,command="];
+    // ps exit 1 means the selected PID has gone. Other failures stay visible.
+    let listed;
+    try { listed = await runCommand("ps", args, {timeout:10000}); }
+    catch (error) { if (pid !== undefined && /failed \(1\)/.test(error.message)) return new Map(); throw error; }
+    const found = new Map();
+    for (const line of listed.stdout.split("\n")) {
+      const match = line.trim().match(/^(\d+)\s+((?:\S+\s+){4}\S+)\s+(\S+)\s+(.*)$/);
+      if (!match || Number(match[1]) <= 0 || match[3].startsWith("Z")) continue;
+      const command = match[4];
+      if (![...commands].some(expected => command.startsWith(expected + " "))) continue;
+      const home = command.match(/(?:^| )HOME=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|$)/)?.[1];
+      if (homes.has(home)) found.set(Number(match[1]), match[2].replace(/\s+/g," "));
     }
+    return found;
+  }
+  const recorded = await snapshot();
+  const matches = async (pid, start) => (await snapshot(pid)).get(pid) === start;
+  async function send(pid, start, name) {
+    if (!await matches(pid,start)) return;
+    try { signal(pid,name); } catch (error) { if (error.code !== "ESRCH") throw error; }
+  }
+  for (const [pid,start] of recorded) await send(pid,start,"SIGTERM");
+  const deadline = Date.now()+grace;
+  while (recorded.size) {
+    for (const [pid,start] of recorded) if (!await matches(pid,start)) recorded.delete(pid);
+    if (!recorded.size) return;
+    if (Date.now() >= deadline) {
+      for (const [pid,start] of recorded) await send(pid,start,"SIGKILL");
+      throw new Error(`suite daemons ignored SIGTERM: ${[...recorded.keys()].join(",")}`);
+    }
+    await pause(25);
   }
 }
 
@@ -114,6 +144,7 @@ function fixture(source = SOURCE_P, filename = "flow.rs") {
   for (const path of Object.values(paths).slice(1)) mkdirSync(path, {recursive:true, mode:0o700});
   paths.source = join(paths.workspace, filename); paths.tokenFile = join(paths.secrets, "daemon.token"); paths.token = randomBytes(32).toString("hex");
   writeFileSync(paths.source, source); writeFileSync(paths.tokenFile, paths.token, {mode:0o600}); chmodSync(paths.tokenFile,0o600);
+  fixtureHomes.add(paths.home);
   paths.env = isolatedEnv(paths);
   return paths;
 }
@@ -327,4 +358,4 @@ function cleanup() {
   }
   return cleanupPromise;
 }
-module.exports = {reveal,setup,cleanup,fixture,run,startDaemon,stopDaemon,api,scoped,connect,seedId,indexThroughApi,chromiumPath:undefined,get binary(){return binary;}};
+module.exports = {stopSuiteDaemons,reveal,setup,cleanup,fixture,run,startDaemon,stopDaemon,api,scoped,connect,seedId,indexThroughApi,chromiumPath:undefined,get binary(){return binary;}};
