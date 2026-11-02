@@ -1299,13 +1299,7 @@ fn cancellation_during_staging_publishes_nothing_and_request_completes_after_res
     );
     // The next daemon reclaims the accepted request; the hook stays out of its way.
     fs::write(socket.with_extension("done"), []).unwrap();
-    let restarted = succeeded(
-        &cli(&world.home)
-            .env("TRELLIS_TEST_SEMANTIC_STAGING_SOCKET", &socket)
-            .args(["index", "--workspace", world.root.to_str().unwrap()])
-            .output()
-            .unwrap(),
-    );
+    let restarted = restart_and_index(&world, &[("TRELLIS_TEST_SEMANTIC_STAGING_SOCKET", &socket)]);
     assert!(restarted["publishedRevision"].is_object());
     let accepted = world
         .queue()
