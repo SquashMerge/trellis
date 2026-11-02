@@ -428,6 +428,9 @@ fn compare(
 }
 
 #[cfg(test)]
+mod glob_model_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use globset::{GlobBuilder, GlobSetBuilder};
