@@ -528,3 +528,29 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
 /* Interactions (#636): dashed returns and activation bars. */
 .sequence-return { stroke-dasharray: 4 4; }
 .sequence-activation { fill: var(--node); stroke: var(--line-strong); }
+
+/* Selection owns its nested labels too, including package metadata and badges. */
+button:is(.selected, [aria-pressed="true"]),
+button:is(.selected, [aria-pressed="true"]):hover {
+  background: var(--selected); border-color: var(--selected); color: var(--on-selected);
+}
+button:is(.selected, [aria-pressed="true"]) :is(span, strong, small, code, .detail, .muted) { color: inherit; }
+button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); color: inherit; border-color: currentColor; }
+
+/* Desktop: the inspector column appears only for a selection and can be hidden (#391). */
+#inspector-collapse { display: none; padding: 3px 6px; }
+@media (min-width: 901px) {
+  body:not(.files-section) #inspector-collapse { display: inline-block; }
+  body:not(.files-section).inspector-idle .call-inspector, body:not(.files-section).inspector-collapsed .call-inspector { display: none; }
+  body:not(.files-section).inspector-idle .workspace-frame, body:not(.files-section).inspector-collapsed .workspace-frame { grid-template-columns: 244px minmax(0, 1fr); }
+  body:not(.files-section):not(.inspector-idle) #inspector-toggle { display: inline-block; padding: 5px 8px; }
+  body:not(.files-section):not(.inspector-idle) #inspector-toggle[aria-expanded=true] { color: var(--on-selected); border-color: var(--selected); background: var(--selected); }
+}
+@media (min-width: 1600px) {
+  body:not(.files-section).inspector-idle .workspace-frame, body:not(.files-section).inspector-collapsed .workspace-frame { grid-template-columns: 268px minmax(0, 1fr); }
+}
+@media (min-width: 901px) and (max-width: 1200px) {
+  body:not(.files-section).inspector-idle .workspace-frame, body:not(.files-section).inspector-collapsed .workspace-frame { grid-template-columns: 214px minmax(0, 1fr); }
+}
+
+.git-marker { margin-left: 6px; flex: 0 0 auto; font: 600 11px/1.5 var(--mono); color: var(--ink); }
