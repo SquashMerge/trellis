@@ -22,11 +22,13 @@ The [owner's macOS memory ruling](https://github.com/SquashMerge/trellis/issues/
 
 ### Edits after a large semantic import
 
+Trellis 0.1 keeps native and semantic publication atomic. On a large repository with semantic imports, ordinary edits can take **about 35 seconds** to publish because the edit path rewrites semantic rows. This is an observed latency, not a guaranteed bound. Native-first publication and the WAL proof of concept are not shipped fixes.
+
 The [merged edit-path fix (#573)](https://github.com/SquashMerge/trellis/pull/573) reduced memory for ordinary edits on its tested Rust artifacts, but did not bound a full semantic rejoin. [#574 remains open](https://github.com/SquashMerge/trellis/issues/574): a `Cargo.toml` edit with a roughly 67 MB artifact was measured at about **21 GB peak memory and 756 seconds**. This was a shared-host test, not a quiet reference-host benchmark.
 
-Config, toolchain or extractor changes, multi-artifact batches and `scip-java` can still take that full path. Ordinary edits can also take tens of seconds because publications rewrite semantic rows. The proposed lower-memory full path is not a measured fix.
+Config, toolchain or extractor changes, multi-artifact batches and `scip-java` can still take that full path. The proposed lower-memory full path is not a measured fix.
 
-Edit latency and contention remain required 0.1 work in [#620](https://github.com/SquashMerge/trellis/issues/620) and [#624](https://github.com/SquashMerge/trellis/issues/624), separate from #61's nonblocking historical gate. The physical-payload reuse experiment did not meet its latency gate and is not a shipped fix.
+The first post-0.1 work is planned for **0.1.1**: bound semantic catch-up through witnessed rejoin ([#574](https://github.com/SquashMerge/trellis/issues/574)), then WAL, then native-first publication ([#620](https://github.com/SquashMerge/trellis/issues/620)). These are planned changes, not current capabilities or latency guarantees. The physical-payload reuse experiment did not meet its latency gate and is not a shipped fix.
 
 ## Evidence
 
