@@ -1,0 +1,57 @@
+name: Nightly property tests
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TRELLIS_PROPTEST_CASES: 256
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+      - uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+        with:
+          mold-version: 2.42.1
+      - name: Link with mold
+        run: echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold' >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: cargo-nextest@0.9.150
+      - name: Run curated properties
+        run: >-
+          cargo nextest run --locked --features test-support --no-fail-fast --test index --test semantic --test http --test scip_decoding_properties
+          -E 'binary(index) & (test(proptest_absence::) | test(proptest_java_absence::) | test(proptest_python_absence::) | test(proptest_rust_absence::)) | binary(semantic) & (test(proptest_witness_rejoin::) | test(proptest_retention::)) | binary(http) & (test(architecture_cache_properties::) | test(architecture_precompute::concurrent_readers_wait_for_one_build) | test(architecture_precompute::a_rules_edit_during_a_build_is_built_next)) | binary(scip_decoding_properties)'
+
+  report:
+    if: ${{ always() && needs.deep.result == 'failure' }}
+    needs: deep
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update a failure issue
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const title = 'Nightly property tests failed';
+            const {owner, repo} = context.repo;
+            const url = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const body = `The curated deep property run failed at ${context.sha}.\n\n[Run logs](${url})`;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {owner, repo, state: 'open', per_page: 100});
+            const existing = issues.find(issue => !issue.pull_request && issue.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({owner, repo, issue_number: existing.number, body});
+            } else {
+              await github.rest.issues.create({owner, repo, title, body});
+            }

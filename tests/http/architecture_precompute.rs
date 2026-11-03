@@ -75,6 +75,12 @@ impl Hold {
     }
 }
 
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 fn head(payload: &Value) -> String {
     format!(
         "?indexGeneration={}&indexRevision={}",
@@ -178,6 +184,27 @@ async fn concurrent_readers_wait_for_one_build() {
     }
     assert_eq!(*waiting.0.lock().unwrap(), 3);
     assert_eq!(scheduler.architecture_builds_for_tests(), 1);
+    let pin = serde_json::from_value(json!({
+        "indexGeneration": a.1["payload"]["indexGeneration"],
+        "indexRevision": a.1["payload"]["indexRevision"]
+    }))
+    .unwrap();
+    let (fresh, _) = runtime.evidence_response().unwrap();
+    let computed = fresh
+        .architecture_view(
+            &MetricsOptions {
+                pin: Some(pin),
+                aggregate: "max".into(),
+                ..MetricsOptions::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    fresh.finish(()).unwrap();
+    assert_eq!(
+        a.1["payload"], computed,
+        "coalesced result matches fresh computation"
+    );
 }
 
 #[tokio::test]
@@ -447,6 +474,27 @@ async fn a_rules_edit_during_a_build_is_built_next() {
     assert_eq!(status, StatusCode::OK, "{read}");
     assert_eq!(read["payload"]["layers"][0]["name"], "other");
     assert_eq!(scheduler.architecture_builds_for_tests(), 2);
+    let pin = serde_json::from_value(json!({
+        "indexGeneration": read["payload"]["indexGeneration"],
+        "indexRevision": read["payload"]["indexRevision"]
+    }))
+    .unwrap();
+    let (fresh, _) = runtime.evidence_response().unwrap();
+    let computed = fresh
+        .architecture_view(
+            &MetricsOptions {
+                pin: Some(pin),
+                aggregate: "max".into(),
+                ..MetricsOptions::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    fresh.finish(()).unwrap();
+    assert_eq!(
+        read["payload"], computed,
+        "edited rules match fresh computation"
+    );
 }
 
 #[tokio::test]
