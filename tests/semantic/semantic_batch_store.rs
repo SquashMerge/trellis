@@ -1,6 +1,8 @@
 #![cfg(feature = "test-support")]
 use crate::semantic_batch_support;
 
+mod admission_properties;
+
 use protobuf::Message;
 use semantic_batch_support::{
     BatchFixture, DocSpec, edit_descriptor, edit_page, long_path_workspace, uniform_workspace,
