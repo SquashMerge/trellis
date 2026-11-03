@@ -1,4 +1,7 @@
 //! Incremental native histories against a fresh same-root cold publication.
+#[path = "proptest_watcher_cutoff.rs"]
+mod watcher_cutoff;
+
 use super::{index_dir, sqlite_snapshot};
 use notify::{
     Event, EventKind,
