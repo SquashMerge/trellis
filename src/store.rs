@@ -1,6 +1,8 @@
 //! SQLite index snapshots and request queues. Connections are never shared between threads.
 pub mod anchors;
 mod architecture_core;
+mod bounded_rejoin;
+mod captured_witness;
 mod graph_read;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
@@ -708,11 +710,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 36;
+const DATABASE_SCHEMA_VERSION: u32 = 37;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V36: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=36), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V37: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=37), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -794,6 +796,8 @@ CREATE TABLE semantic_basis_lookup_dependencies(basis_id INTEGER NOT NULL REFERE
 CREATE TABLE semantic_raw_batches(batch_id INTEGER PRIMARY KEY,producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,profile_id TEXT NOT NULL,source_set_id TEXT NOT NULL,captured_revision TEXT NOT NULL,source_manifest_hash TEXT NOT NULL CHECK(length(source_manifest_hash)=64),descriptor_sha256 TEXT NOT NULL CHECK(length(descriptor_sha256)=64),descriptor_bytes BLOB NOT NULL,decoder_version TEXT NOT NULL,UNIQUE(producer_id,descriptor_sha256,captured_revision));
 CREATE TABLE semantic_raw_captures(capture_id INTEGER PRIMARY KEY,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),ordinal INTEGER NOT NULL,language TEXT NOT NULL,producer_id TEXT NOT NULL,artifact_hash TEXT NOT NULL CHECK(length(artifact_hash)=64),source_set_id TEXT NOT NULL,captured_revision TEXT NOT NULL,binary_bytes BLOB NOT NULL,decoder_version TEXT NOT NULL,UNIQUE(batch_id,ordinal),UNIQUE(producer_id,artifact_hash,source_set_id,captured_revision));
 CREATE INDEX semantic_raw_captures_batch ON semantic_raw_captures(batch_id);
+CREATE TABLE semantic_batch_witnesses(batch_id INTEGER PRIMARY KEY REFERENCES semantic_raw_batches(batch_id));
+CREATE TABLE semantic_batch_witness_documents(batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),language TEXT NOT NULL,path TEXT NOT NULL,snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),PRIMARY KEY(batch_id,language,path));
 CREATE TABLE semantic_raw_exclusions(batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),language TEXT NOT NULL,path TEXT NOT NULL,reason TEXT NOT NULL CHECK(reason IN ('notRequested','unsupported','failed')),PRIMARY KEY(batch_id,language,path));
 CREATE TABLE semantic_revision_raw_selections(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),captured_pin TEXT NOT NULL REFERENCES native_revisions(id),PRIMARY KEY(revision_id,producer_id));
 CREATE INDEX semantic_raw_selections_batch ON semantic_revision_raw_selections(batch_id);
@@ -945,6 +949,18 @@ pub struct NativeReader<'a> {
 }
 
 impl NativeReader<'_> {
+    pub(crate) fn pin(&self) -> IndexPin {
+        self.selected.pin
+    }
+
+    pub(crate) fn reuse_project_roots(
+        &self,
+        descriptor: &crate::semantic_batch::descriptor::Descriptor,
+    ) -> Result<Vec<String>> {
+        let workspace_uri = crate::scip_admission::file_uri(&self.store.identity.root)?;
+        Ok(descriptor.reuse_project_roots(&workspace_uri, &self.store.identity.root_key))
+    }
+
     #[cfg(feature = "test-support")]
     pub fn cache_size_kib(&self) -> Result<i64> {
         let pages: i64 = self
@@ -4015,7 +4031,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V36)?;
+    expected.execute_batch(CACHE_SCHEMA_V37)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -4039,7 +4055,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V36).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V37).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -6565,6 +6581,7 @@ type SelectedRawBatchResult = (
 );
 
 struct SelectedNativeInput {
+    bounded: bool,
     lightweight: bool,
     producer: crate::semantic_evidence::Producer,
     requested_documents: Vec<crate::native_evidence::DocumentKey>,
@@ -8957,6 +8974,17 @@ fn selected_native_rejoin(
     prior_pin: Option<IndexPin>,
     semantic_document_written: &mut impl FnMut(&Connection) -> Result<()>,
 ) -> Result<()> {
+    if selected.iter().all(|input| input.bounded) && !selected.is_empty() {
+        return bounded_rejoin::publish(
+            store,
+            tx,
+            selected,
+            native,
+            pin,
+            cancel,
+            semantic_document_written,
+        );
+    }
     if selected.iter().all(|input| input.lightweight) && !selected.is_empty() {
         tx.execute_batch("SAVEPOINT original_witness_rejoin")?;
         let attempt = selected_native_rejoin_once(
@@ -8989,20 +9017,16 @@ fn selected_native_rejoin(
                 record_rejoin_fallback(fallback.0);
                 let prior = prior_pin.context("missing selected prior pin for FULL fallback")?;
                 let read = ReadRevision::new(prior, semantic_pin_key(prior));
-                let full = store.selected_native_inputs_from_db(tx, &read, prior, None)?;
+                let full = store.selected_bounded_native_inputs_from_db(tx, &read, prior)?;
                 #[cfg(feature = "test-support")]
                 crate::semantic_import::note_full_fallback();
-                return selected_native_rejoin_once(
+                return bounded_rejoin::publish(
                     store,
                     tx,
                     &full,
                     native,
-                    sources,
                     pin,
                     cancel,
-                    local_reuse,
-                    prior_pin,
-                    true,
                     semantic_document_written,
                 );
             }
@@ -10135,14 +10159,40 @@ fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
                 return Ok(true);
             }
         }
+        db.execute(
+            "DELETE FROM semantic_batch_witnesses WHERE batch_id IN (
+                SELECT d.batch_id FROM semantic_batch_witness_documents d
+                WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=d.batch_id)
+                ORDER BY d.rowid LIMIT 64)", [],
+        )?;
+        let witnesses = db.execute(
+            "DELETE FROM semantic_batch_witness_documents WHERE rowid IN (
+                SELECT d.rowid FROM semantic_batch_witness_documents d
+                WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=d.batch_id)
+                ORDER BY d.rowid LIMIT 64)", [],
+        )?;
+        if witnesses > 0 {
+            return Ok(true);
+        }
+        let witness_headers = db.execute(
+            "DELETE FROM semantic_batch_witnesses WHERE batch_id IN (
+                SELECT w.batch_id FROM semantic_batch_witnesses w
+                WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=w.batch_id)
+                AND NOT EXISTS(SELECT 1 FROM semantic_batch_witness_documents d WHERE d.batch_id=w.batch_id)
+                LIMIT 64)", [],
+        )?;
         let proofs = db.execute(
             &format!("DELETE FROM semantic_raw_proofs WHERE rowid IN ({RAW_PROOF_RELEASE_SQL})"),
             [],
         )?;
         let captures = db.execute("DELETE FROM semantic_raw_captures WHERE capture_id IN (SELECT c.capture_id FROM semantic_raw_captures c WHERE NOT EXISTS(SELECT 1 FROM semantic_raw_proofs p WHERE p.capture_id=c.capture_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=c.batch_id) LIMIT 64)",[])?;
         let exclusions = db.execute("DELETE FROM semantic_raw_exclusions WHERE rowid IN (SELECT e.rowid FROM semantic_raw_exclusions e WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=e.batch_id) LIMIT 64)",[])?;
-        let batches = db.execute("DELETE FROM semantic_raw_batches WHERE batch_id IN (SELECT b.batch_id FROM semantic_raw_batches b WHERE NOT EXISTS(SELECT 1 FROM semantic_raw_captures c WHERE c.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_raw_exclusions e WHERE e.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=b.batch_id) LIMIT 64)",[])?;
-        return Ok(proofs > 0 || captures > 0 || exclusions > 0 || batches > 0);
+        let batches = db.execute("DELETE FROM semantic_raw_batches WHERE batch_id IN (SELECT b.batch_id FROM semantic_raw_batches b WHERE NOT EXISTS(SELECT 1 FROM semantic_raw_captures c WHERE c.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_raw_exclusions e WHERE e.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_batch_witnesses w WHERE w.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_batch_witness_documents d WHERE d.batch_id=b.batch_id) LIMIT 64)",[])?;
+        return Ok(witness_headers > 0
+            || proofs > 0
+            || captures > 0
+            || exclusions > 0
+            || batches > 0);
     };
     for (table, scope) in [
         ("semantic_reference_roles", "tuple_id=?1"),
@@ -10842,7 +10892,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V36 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V37 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -13550,7 +13600,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V36)?;
+                db.execute_batch(CACHE_SCHEMA_V37)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -18381,7 +18431,13 @@ impl Store {
             && !self.needs_rebuild()
         {
             if self.selected_links_for_reconciliation(pin)? {
-                self.selected_native_inputs_at(pin, loaded_docs.as_ref())?
+                if loaded_docs.is_some() {
+                    self.selected_native_inputs_at(pin, loaded_docs.as_ref())?
+                } else {
+                    self.native_at_reconcile(pin, |db, read| {
+                        self.selected_bounded_native_inputs_from_db(db, read, pin)
+                    })?
+                }
             } else {
                 Vec::new()
             }
@@ -18784,7 +18840,7 @@ impl Store {
             if rebaseline {
                 // An incompatible/corrupt generation is explicitly replaced, never served.
                 // Only compatible same-generation publication appends history.
-                tx.execute_batch("DELETE FROM semantic_reference_roles; DELETE FROM semantic_reference_candidates; DELETE FROM semantic_symbol_targets; DELETE FROM semantic_declaration_binding_symbols; DELETE FROM semantic_declaration_join_candidates; DELETE FROM semantic_call_candidates; DELETE FROM semantic_call_possible_dispatch; DELETE FROM semantic_call_join_candidates; DELETE FROM semantic_type_relationships; DELETE FROM semantic_references; DELETE FROM semantic_symbols; DELETE FROM semantic_declaration_bindings; DELETE FROM semantic_call_bindings; DELETE FROM semantic_provenance; DELETE FROM semantic_revision_raw_selections; DELETE FROM semantic_raw_proofs; DELETE FROM semantic_raw_captures; DELETE FROM semantic_raw_exclusions; DELETE FROM semantic_raw_batches; DELETE FROM semantic_import_reports; DELETE FROM semantic_basis_lookup_dependencies; DELETE FROM semantic_basis; DELETE FROM semantic_coverage_roles; DELETE FROM semantic_coverage_reasons; DELETE FROM semantic_coverage; DELETE FROM semantic_requested_producer_languages; DELETE FROM semantic_requested_producers; DELETE FROM semantic_revision_producers; DELETE FROM semantic_producer_languages; DELETE FROM semantic_producers; DELETE FROM revision_documents; DELETE FROM revision_capture_inputs;
+                tx.execute_batch("DELETE FROM semantic_reference_roles; DELETE FROM semantic_reference_candidates; DELETE FROM semantic_symbol_targets; DELETE FROM semantic_declaration_binding_symbols; DELETE FROM semantic_declaration_join_candidates; DELETE FROM semantic_call_candidates; DELETE FROM semantic_call_possible_dispatch; DELETE FROM semantic_call_join_candidates; DELETE FROM semantic_type_relationships; DELETE FROM semantic_references; DELETE FROM semantic_symbols; DELETE FROM semantic_declaration_bindings; DELETE FROM semantic_call_bindings; DELETE FROM semantic_provenance; DELETE FROM semantic_revision_raw_selections; DELETE FROM semantic_batch_witness_documents; DELETE FROM semantic_batch_witnesses; DELETE FROM semantic_raw_proofs; DELETE FROM semantic_raw_captures; DELETE FROM semantic_raw_exclusions; DELETE FROM semantic_raw_batches; DELETE FROM semantic_import_reports; DELETE FROM semantic_basis_lookup_dependencies; DELETE FROM semantic_basis; DELETE FROM semantic_coverage_roles; DELETE FROM semantic_coverage_reasons; DELETE FROM semantic_coverage; DELETE FROM semantic_requested_producer_languages; DELETE FROM semantic_requested_producers; DELETE FROM semantic_revision_producers; DELETE FROM semantic_producer_languages; DELETE FROM semantic_producers; DELETE FROM revision_documents; DELETE FROM revision_capture_inputs;
                 DELETE FROM native_version_references; DELETE FROM native_version_capability_gaps; DELETE FROM native_version_macro_expansions;
                 DELETE FROM native_version_capability_families;
                 DELETE FROM native_version_call_regions; DELETE FROM native_version_calls;
@@ -19035,7 +19091,8 @@ impl Store {
             // The spool header carries the complete revision but no per-document facts.
             // Reconstruct the measured inventory from that same private spool for the
             // semantic validator; never validate against the header's empty fact lists.
-            let measured_stream = if (semantic.is_some() || !selected.is_empty())
+            let measured_stream = if (semantic.is_some()
+                || selected.iter().any(|input| !input.bounded))
                 && let Some(spool) = stream
             {
                 let mut measured = native.clone();
@@ -19096,19 +19153,23 @@ impl Store {
             )?;
             if !selected.is_empty() {
                 let candidate = measured_stream.as_ref().unwrap_or(native);
-                let sources = source_files
-                    .iter()
-                    .map(|file| {
-                        Ok((
-                            crate::native_evidence::DocumentKey {
-                                source_set_id: candidate.revision.source_set_id.clone(),
-                                language: file.language.clone(),
-                                path: file.path.clone(),
-                            },
-                            file.text.as_bytes().to_vec(),
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>>>()?;
+                let sources = if selected.iter().all(|input| input.bounded) {
+                    BTreeMap::new()
+                } else {
+                    source_files
+                        .iter()
+                        .map(|file| {
+                            Ok((
+                                crate::native_evidence::DocumentKey {
+                                    source_set_id: candidate.revision.source_set_id.clone(),
+                                    language: file.language.clone(),
+                                    path: file.path.clone(),
+                                },
+                                file.text.as_bytes().to_vec(),
+                            ))
+                        })
+                        .collect::<Result<BTreeMap<_, _>>>()?
+                };
                 #[cfg(feature = "test-support")]
                 self.publication_before_semantic_hook.run();
                 check_cancel(cancel)?;
@@ -19472,7 +19533,7 @@ impl Store {
         metadata_only: bool,
     ) -> Result<Vec<SelectedRawBatchResult>> {
         let read = |db: &Connection, selected: &ReadRevision| {
-            self.selected_raw_input_results_from_db(db, selected, pin, metadata_only)
+            self.selected_raw_input_results_from_db(db, selected, pin, metadata_only, false)
         };
         if reconciling {
             self.native_at_reconcile(pin, read)
@@ -19487,6 +19548,7 @@ impl Store {
         selected: &ReadRevision,
         pin: IndexPin,
         metadata_only: bool,
+        omit_binary: bool,
     ) -> Result<Vec<SelectedRawBatchResult>> {
         let mut inputs = Vec::new();
         let links: Vec<(String, i64, String)> = db.prepare(
@@ -19551,7 +19613,11 @@ impl Store {
                             )
                         })?;
                 let captures = db.prepare(
-                    "SELECT capture_id,ordinal,language,artifact_hash,binary_bytes FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
+                    if omit_binary {
+                        "SELECT capture_id,ordinal,language,artifact_hash,X'' FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
+                    } else {
+                        "SELECT capture_id,ordinal,language,artifact_hash,binary_bytes FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
+                    }
                 )?.query_map([batch_id], |r| Ok(SelectedRawCapture {capture_id:r.get(0)?,ordinal:r.get(1)?,language:r.get(2)?,artifact_hash:r.get(3)?,binary_bytes:r.get(4)?}))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 selected_ensure!(
@@ -19635,6 +19701,27 @@ impl Store {
         Ok(inputs)
     }
 
+    fn selected_bounded_native_inputs_from_db(
+        &self,
+        db: &Connection,
+        selected: &ReadRevision,
+        pin: IndexPin,
+    ) -> Result<Vec<SelectedNativeInput>> {
+        self.selected_raw_input_results_from_db(db, selected, pin, true, true)?
+            .into_iter()
+            .map(|(producer, requested_documents, raw)| {
+                Ok(SelectedNativeInput {
+                    bounded: true,
+                    lightweight: false,
+                    producer,
+                    requested_documents,
+                    raw,
+                    captured: Err(anyhow::anyhow!("bounded rejoin uses transaction readers")),
+                })
+            })
+            .collect()
+    }
+
     fn selected_native_inputs_at(
         &self,
         pin: IndexPin,
@@ -19653,7 +19740,7 @@ impl Store {
         pin: IndexPin,
         loaded_docs: Option<&BTreeSet<crate::native_evidence::DocumentKey>>,
     ) -> Result<Vec<SelectedNativeInput>> {
-        self.selected_raw_input_results_from_db(db, selected, pin, loaded_docs.is_some())?
+        self.selected_raw_input_results_from_db(db, selected, pin, loaded_docs.is_some(), false)?
             .into_iter()
             .map(|(producer, requested_documents, raw)| {
                 let raw = match raw {
@@ -19680,6 +19767,7 @@ impl Store {
                     .into()),
                 };
                 Ok(SelectedNativeInput {
+                    bounded: false,
                     lightweight: loaded_docs.is_some(),
                     producer,
                     requested_documents,
@@ -21055,7 +21143,8 @@ impl Store {
     fn read_native_header(db: &Connection, selected: &ReadRevision) -> Result<NativeHeader> {
         use crate::native_evidence as n;
         let (source_set_id, native_id, toolchain_hash, config_hash, dependency_hash): (String,String,String,String,String) = db.query_row("SELECT source_set_id,native_revision_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1",[&selected.key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-        let (producer_id, producer_version): (String,String) = db.query_row("SELECT producer_id,producer_version FROM document_versions d JOIN revision_documents m ON m.vid=d.vid WHERE m.revision_id=?1 LIMIT 1",[&selected.key],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let producer_id = n::PRODUCER.to_owned();
+        let producer_version = n::NATIVE_VERSION.to_owned();
         let (executable_hash,kind,position_encoding): (String,String,String) = db.query_row("SELECT executable_hash,kind,position_encoding FROM native_producers WHERE id=?1 AND version=?2",params![producer_id,producer_version],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         let languages = semantic_ordered(
             db,
@@ -22683,7 +22772,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V36).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V37).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -22822,7 +22911,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V36).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V37).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];
