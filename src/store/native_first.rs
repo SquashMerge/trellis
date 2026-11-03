@@ -377,6 +377,25 @@ impl Store {
         anyhow::bail!("semantic fixture exceeded its unit bound")
     }
 
+    /// Offline fixtures that published native N with their own writer and dropped it: take
+    /// the writer again and drive any outstanding exact target at head to its S commit.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn catch_up_semantic_for_tests(&self, cancel: &CancelFlag) -> Result<IndexPin> {
+        let session = Arc::new(topology::WriterSession::writer(self.writer()?));
+        let head = self.index_baseline()?;
+        Ok(self
+            .complete_pending_semantic_for_tests(head, &session, cancel)?
+            .unwrap_or(head))
+    }
+
+    /// Whether the published head still has an outstanding semantic catch-up target.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn semantic_catch_up_pending_for_tests(&self) -> Result<bool> {
+        Ok(self.pending_semantic_target()?.is_some())
+    }
+
     pub(crate) fn pending_semantic_target(&self) -> Result<Option<PendingSemanticTarget>> {
         self.with_evidence(|db| {
             let target = pending_target(db)?;
@@ -542,6 +561,12 @@ impl Store {
         }
         copy_semantic_rows(&tx, &old, &key, true)?;
         let mut blocked = ReadersBlockedWatch::new(&self.publication_gate, 0);
+        #[cfg(feature = "test-support")]
+        let mut observer = self.semantic_publication_observer.lock().unwrap().take();
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = observer.as_mut() {
+            observer(crate::store::SemanticPublicationStage::BeforeSemantic, &tx);
+        }
         for output in prepared.iter_mut() {
             check_cancel(cancel)?;
             match &mut output.output {
@@ -555,6 +580,13 @@ impl Store {
                             check_cancel(cancel)?;
                             write_import_coverage(&tx, &key, &document)?;
                             blocked.check(&tx);
+                            #[cfg(feature = "test-support")]
+                            if let Some(observer) = observer.as_mut() {
+                                observer(
+                                    crate::store::SemanticPublicationStage::AfterDocument,
+                                    &tx,
+                                );
+                            }
                             Ok(())
                         },
                     )?;

@@ -2533,11 +2533,9 @@ fn local_class_only_refresh_writes_new_class_rows_and_rolls_back_atomically() {
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .unwrap();
     let mut immutable = ImmutableAppend::default();
-    let components = crate::native_evidence::captured_components(
-        &capture,
-        &native.producer.executable_hash,
-    )
-    .unwrap();
+    let components =
+        crate::native_evidence::captured_components(&capture, &native.producer.executable_hash)
+            .unwrap();
     let written = write_native(
         &tx,
         (&native, &capture, &graph, &catalog, &extractions),

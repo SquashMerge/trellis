@@ -398,7 +398,6 @@ pub struct Store {
     maintenance_unit_budget_us: Arc<AtomicU64>,
     publication_before_commit_hook: Arc<TestOneShotHook>,
     #[cfg(feature = "test-support")]
-    publication_before_semantic_hook: Arc<TestOneShotHook>,
     #[cfg(feature = "test-support")]
     semantic_publication_observer: Arc<Mutex<Option<SemanticPublicationObserver>>>,
     #[cfg(test)]
@@ -9101,7 +9100,11 @@ fn write_native(
     full_diagnostics: &[Diagnostic],
     class_complete: bool,
     mode: NativeWrite<'_>,
-    components: &(serde_json::Value, Vec<serde_json::Value>, Vec<serde_json::Value>),
+    components: &(
+        serde_json::Value,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+    ),
 ) -> Result<BTreeMap<String, V8DocumentProjection>> {
     let (write_header, ordinal_start, captured_file, precomputed) = match mode {
         NativeWrite::Header { ordinal_start } => (true, ordinal_start, None, None),
@@ -12074,7 +12077,6 @@ impl Store {
             )),
             publication_before_commit_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(feature = "test-support")]
-            publication_before_semantic_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(feature = "test-support")]
             semantic_publication_observer: Arc::default(),
             #[cfg(test)]
@@ -16238,12 +16240,7 @@ impl Store {
         )?;
         copy_semantic_rows(&tx, &selected.key, &revision_key, false)?;
         semantic_retention::copy(&tx, &selected.key, &revision_key, None)?;
-        semantic_retention::discarded(
-            &tx,
-            &selected.key,
-            &revision_key,
-            retained_state.is_some(),
-        )?;
+        semantic_retention::discarded(&tx, &selected.key, &revision_key, retained_state.is_some())?;
         self.materialize_reimport(
             &tx,
             &revision_key,
@@ -17689,7 +17686,8 @@ impl Store {
             tx.set_prepared_statement_cache_capacity(512);
             let mut immutable = ImmutableAppend::default();
             let components = crate::native_evidence::captured_components(
-                capture, &native.producer.executable_hash,
+                capture,
+                &native.producer.executable_hash,
             )?;
             let projections = if let Some(spool) = stream {
                 let mut seen_paths = BTreeSet::new();
@@ -17939,8 +17937,13 @@ impl Store {
             let prior = old_pin.filter(|pin| !rebaseline && pin.index_revision > 0);
             if let (None, Some(prior)) = (semantic, prior) {
                 native_first::write_pending(
-                    &tx, prior, revision, &self.identity.root_key,
-                    &components.1, &components.2, cancel,
+                    &tx,
+                    prior,
+                    revision,
+                    &self.identity.root_key,
+                    &components.1,
+                    &components.2,
+                    cancel,
                 )?;
             } else {
                 write_semantic(&tx, native, prior, revision, semantic)?;
@@ -18668,15 +18671,6 @@ impl Store {
         hook: impl FnOnce() + Send + 'static,
     ) {
         self.publication_before_commit_hook.set(hook);
-    }
-
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn set_publication_before_semantic_hook_for_tests(
-        &self,
-        hook: impl FnOnce() + Send + 'static,
-    ) {
-        self.publication_before_semantic_hook.set(hook);
     }
 
     #[cfg(feature = "test-support")]

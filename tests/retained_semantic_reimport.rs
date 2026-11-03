@@ -385,27 +385,35 @@ fn ordinary_context_edit_keeps_retained_run_out_of_generated_fifo() {
 
 fn ordinary_retained_edit(context_only: bool) {
     use std::sync::{Arc, atomic::AtomicBool};
-    use trellis::{index_coordinator::{IndexJobCoordinator, reconcile_workspace}, indexer::IndexOptions, store::Store};
+    use trellis::{
+        index_coordinator::{IndexJobCoordinator, reconcile_workspace},
+        indexer::IndexOptions,
+        store::Store,
+    };
 
     let snapshot = |db: &Connection| -> rusqlite::Result<Value> {
         let (key, native, producer, toolchain): (String, String, String, String) = db.query_row(
             "SELECT n.id,n.native_revision_id,b.producer_sha,n.retained_toolchain
              FROM index_metadata m JOIN native_revisions n
                ON n.id='pin:v1:'||m.index_generation||':'||m.index_revision
-             JOIN revision_producer_bindings b ON b.revision_id=n.id WHERE m.singleton=1", [],
+             JOIN revision_producer_bindings b ON b.revision_id=n.id WHERE m.singleton=1",
+            [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         let toolchain: Value = serde_json::from_str(&toolchain).unwrap();
         let reasons = db.prepare("SELECT producer,language,reason FROM semantic_reimport WHERE revision_id=?1 ORDER BY producer,language")?
             .query_map([&key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(json!({"head":key,"nativeRevisionId":native,"producerSha":producer,
-            "nativeExecutable":toolchain["nativeExecutable"],"reimport":reasons}))
+        Ok(
+            json!({"head":key,"nativeRevisionId":native,"producerSha":producer,
+            "nativeExecutable":toolchain["nativeExecutable"],"reimport":reasons}),
+        )
     };
     let world = World::new();
     let before_run = {
         // The daemon is another process; this test owns no Store handles yet.
-        let db = Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         snapshot(&db).unwrap()
     };
     let (_run, original, original_options) = world.run_once();
@@ -413,50 +421,97 @@ fn ordinary_retained_edit(context_only: bool) {
     assert_eq!(descriptor["generation"]["origin"], "trellisRun");
     support::stop_daemon(&world.checkout.home);
     let after_run = {
-        let db = Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         snapshot(&db).unwrap()
     };
     assert!(before_run["reimport"].as_array().unwrap().is_empty());
     assert!(after_run["reimport"].as_array().unwrap().is_empty());
     let baseline_invocations = world.invocation_count();
-    let roots = TopologyRoots::isolated_for_tests(cache_dir(&world.checkout.home), data_dir(&world.checkout.home));
-    let identity = WorkspaceIdentity::discover(Some(&world.checkout.root), &world.checkout.root).unwrap();
+    let roots = TopologyRoots::isolated_for_tests(
+        cache_dir(&world.checkout.home),
+        data_dir(&world.checkout.home),
+    );
+    let identity =
+        WorkspaceIdentity::discover(Some(&world.checkout.root), &world.checkout.root).unwrap();
     let store = Store::open(roots, identity).unwrap();
     let options = IndexOptions::new(world.checkout.root.clone());
     let cancel = Arc::new(AtomicBool::new(false));
     let (_unchanged, session) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
-    let after_reconcile = store.with_index_read_for_tests(|db| Ok(snapshot(db)?)).unwrap();
-    assert_ne!(after_run["producerSha"], after_reconcile["producerSha"],
-        "bootstrap must exercise actual CLI-to-test executable recovery");
+    let after_reconcile = store
+        .with_index_read_for_tests(|db| Ok(snapshot(db)?))
+        .unwrap();
+    assert_ne!(
+        after_run["producerSha"], after_reconcile["producerSha"],
+        "bootstrap must exercise actual CLI-to-test executable recovery"
+    );
     // Complete that legitimate recovery before the ordinary-edit experiment.
-    let state = trellis::http::new(store.clone(), options.clone(),
+    let state = trellis::http::new(
+        store.clone(),
+        options.clone(),
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        "127.0.0.1:7331".parse().unwrap()).unwrap();
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
     state.retain_serving_session_without_tick_for_tests(session.clone());
     state.force_root_transition_tick_for_tests().unwrap();
     let bootstrap_request = store.current_request().unwrap().unwrap();
     assert_eq!(bootstrap_request.state, "done");
-    assert_eq!(bootstrap_request.request_kind, trellis::store::requests::RequestKind::SemanticImport);
-    assert_eq!(serde_json::from_str::<Value>(&bootstrap_request.options_json).unwrap(), original_options);
-    let baseline = store.with_index_read_for_tests(|db| Ok(snapshot(db)?)).unwrap();
-    assert!(baseline["reimport"].as_array().unwrap().is_empty(), "{baseline}");
-    let pending: i64 = store.with_index_read_for_tests(|db| {
-        Ok(db.query_row("SELECT count(*) FROM semantic_pending_target", [], |row| row.get(0))?)
-    }).unwrap();
+    assert_eq!(
+        bootstrap_request.request_kind,
+        trellis::store::requests::RequestKind::SemanticImport
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&bootstrap_request.options_json).unwrap(),
+        original_options
+    );
+    let baseline = store
+        .with_index_read_for_tests(|db| Ok(snapshot(db)?))
+        .unwrap();
+    assert!(
+        baseline["reimport"].as_array().unwrap().is_empty(),
+        "{baseline}"
+    );
+    let pending: i64 = store
+        .with_index_read_for_tests(|db| {
+            Ok(
+                db.query_row("SELECT count(*) FROM semantic_pending_target", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        })
+        .unwrap();
     assert_eq!(pending, 0);
     use sha2::Digest;
-    let executing = hex::encode(sha2::Sha256::digest(fs::read(std::env::current_exe().unwrap()).unwrap()));
+    let executing = hex::encode(sha2::Sha256::digest(
+        fs::read(std::env::current_exe().unwrap()).unwrap(),
+    ));
     assert_eq!(baseline["producerSha"], executing);
     assert_eq!(baseline["nativeExecutable"], executing);
     let prior = store.index_baseline().unwrap();
-    let stable = IndexJobCoordinator::prepare_with_session(&store, None, session.clone()).unwrap()
-        .run_serving(&options, &cancel, |_| {}).unwrap();
-    assert_eq!(stable, prior, "post-recovery unchanged reconciliation moved the head");
-    assert_eq!(store.with_index_read_for_tests(|db| Ok(snapshot(db)?)).unwrap(), baseline);
+    let stable = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
+        .unwrap()
+        .run_serving(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(
+        stable, prior,
+        "post-recovery unchanged reconciliation moved the head"
+    );
+    assert_eq!(
+        store
+            .with_index_read_for_tests(|db| Ok(snapshot(db)?))
+            .unwrap(),
+        baseline
+    );
     let baseline_generated = world.generated_rows().len();
     assert_eq!(world.invocation_count(), baseline_invocations);
-    assert_eq!(fs::read(original_options["descriptor"].as_str().unwrap()).unwrap(), original);
-    let key = |pin: trellis::model::IndexPin| format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+    assert_eq!(
+        fs::read(original_options["descriptor"].as_str().unwrap()).unwrap(),
+        original
+    );
+    let key = |pin: trellis::model::IndexPin| {
+        format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
+    };
     let raw_identity = |pin| {
         store.with_index_read_for_tests(|db| {
             Ok(db.query_row(
@@ -467,26 +522,51 @@ fn ordinary_retained_edit(context_only: bool) {
     };
     let original_raw = raw_identity(prior);
     let edited = "function u00000() { g(); } // ordinary native edit\nfunction g() {}\n";
-    let original_source = fs::read_to_string(world.checkout.root.join("javascript/u00000.js")).unwrap();
+    let original_source =
+        fs::read_to_string(world.checkout.root.join("javascript/u00000.js")).unwrap();
     if context_only {
         fs::write(world.checkout.root.join("Cargo.lock"), "version = 4\n").unwrap();
     } else {
         fs::write(world.checkout.root.join("javascript/u00000.js"), edited).unwrap();
     }
-    let native = IndexJobCoordinator::prepare_with_session(&store, None, session.clone()).unwrap()
-        .run_serving(&options, &cancel, |_| {}).unwrap();
-    let after_native = store.with_index_read_for_tests(|db| Ok(snapshot(db)?)).unwrap();
+    let native = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
+        .unwrap()
+        .run_serving(&options, &cancel, |_| {})
+        .unwrap();
+    let after_native = store
+        .with_index_read_for_tests(|db| Ok(snapshot(db)?))
+        .unwrap();
     assert_eq!(after_native["producerSha"], baseline["producerSha"]);
-    assert_eq!(after_native["nativeExecutable"], baseline["nativeExecutable"]);
+    assert_eq!(
+        after_native["nativeExecutable"],
+        baseline["nativeExecutable"]
+    );
     assert_ne!(native, prior);
     assert_eq!(raw_identity(native), original_raw);
     let response = store.evidence_response().unwrap();
-    assert_eq!(response.source_at("javascript/u00000.js", Some(native)).unwrap().unwrap().1.text,
-        if context_only { original_source.as_str() } else { edited });
+    assert_eq!(
+        response
+            .source_at("javascript/u00000.js", Some(native))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        if context_only {
+            original_source.as_str()
+        } else {
+            edited
+        }
+    );
     response.finish(()).unwrap();
     drop(response);
-    let projection = store.semantic_projection_at(native, PRODUCER, "javascript", "javascript/u00000.js").unwrap().unwrap();
-    assert_eq!(projection.semantic_status, trellis::model::SemanticStatus::CatchingUp);
+    let projection = store
+        .semantic_projection_at(native, PRODUCER, "javascript", "javascript/u00000.js")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        projection.semantic_status,
+        trellis::model::SemanticStatus::CatchingUp
+    );
     let reimport_at_native: i64 = store.with_index_read_for_tests(|db| {
         let pending: (String, i64, String, String) = db.query_row(
             "SELECT t.revision_id,s.batch_id,s.captured_pin,s.basis_pin
@@ -507,11 +587,20 @@ fn ordinary_retained_edit(context_only: bool) {
     drop(state);
     drop(store);
     let generated = world.generated_rows();
-    assert!(foreground.is_ok(), "ordinary foreground selection failed: {foreground:?}");
-    assert_eq!((reimport_at_native, generated.len()), (0, baseline_generated),
-        "ordinary projected N manufactured reimport state or generated FIFO work: {generated:?}");
+    assert!(
+        foreground.is_ok(),
+        "ordinary foreground selection failed: {foreground:?}"
+    );
+    assert_eq!(
+        (reimport_at_native, generated.len()),
+        (0, baseline_generated),
+        "ordinary projected N manufactured reimport state or generated FIFO work: {generated:?}"
+    );
     assert_eq!(world.invocation_count(), baseline_invocations);
-    assert_eq!(fs::read(original_options["descriptor"].as_str().unwrap()).unwrap(), original);
+    assert_eq!(
+        fs::read(original_options["descriptor"].as_str().unwrap()).unwrap(),
+        original
+    );
     assert_eq!(generated.last().unwrap().2, original_options);
 }
 
@@ -774,7 +863,10 @@ fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, 
             rusqlite::params![target, returned, recovered_key],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
-        assert!(same_native, "returned pin and target must share native identity");
+        assert!(
+            same_native,
+            "returned pin and target must share native identity"
+        );
         assert!(changed_native, "context drift must change native identity");
         let (basis_pin, pending): (String, bool) = db.query_row(
             "SELECT o.basis_pin,d.pending FROM semantic_projection_origins o JOIN semantic_projection_documents d USING(revision_id,producer_id) WHERE o.revision_id=?1 AND o.producer_id=?2 AND d.language=?3",

@@ -288,8 +288,8 @@ impl Descriptor {
         if pinned.name == profiles::STUB_NAME {
             return Ok(None);
         }
-        let producer = ProducerName::parse(&pinned.name)
-            .ok_or_else(|| admission("producer profile pin"))?;
+        let producer =
+            ProducerName::parse(&pinned.name).ok_or_else(|| admission("producer profile pin"))?;
         profiles::row(profiles::Target::Real(producer), trust)
             .map(Some)
             .map_err(|_| admission("generation trust profile"))

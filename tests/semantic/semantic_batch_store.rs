@@ -748,6 +748,11 @@ impl World {
                 &self.cancel,
             )
             .unwrap();
+        drop(leader);
+        // Native N first, then the bounded semantic S the checkout worker would run.
+        self.store
+            .catch_up_semantic_for_tests(&self.cancel)
+            .unwrap();
     }
 
     fn join_with(
@@ -4403,6 +4408,11 @@ fn multi_artifact_reference_batch_records_multi_artifact_fallback() {
         .store
         .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
         .unwrap();
+    drop(leader);
+    world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
     let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
     let reasons: Vec<&str> = work["fallbackReasons"]
         .as_array()
@@ -4450,7 +4460,15 @@ fn local_edit(world: &World, path: &str, text: &str, counts: &Path) -> Value {
         .store
         .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
         .unwrap();
-    serde_json::from_slice(&fs::read(counts).unwrap()).unwrap()
+    drop(leader);
+    // Native N publishes first; the counts belong to the bounded semantic S that follows.
+    let semantic = world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
+    let work: Value = serde_json::from_slice(&fs::read(counts).unwrap()).unwrap();
+    assert_eq!(work["indexPin"], json!(semantic), "{work}");
+    work
 }
 
 /// An R1 reference batch first imported after C changed, optionally with its target absent.
@@ -5178,6 +5196,11 @@ fn a_lost_target_takes_full(shape: fn(DocSpec, &str) -> DocSpec) {
         world
             .store
             .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+            .unwrap();
+        drop(leader);
+        world
+            .store
+            .catch_up_semantic_for_tests(&world.cancel)
             .unwrap();
         let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
         assert_eq!(
@@ -7522,7 +7545,10 @@ forbid = [{ calls = "helper" }]
         if historical {
             write_files(
                 &world.root,
-                &[("src/pending.js", "export function pending() { return missing(); }\n")],
+                &[(
+                    "src/pending.js",
+                    "export function pending() { return missing(); }\n",
+                )],
             );
             let (graph, native, capture) = index_workspace_bundle(
                 &IndexOptions::new(world.root.clone()),
@@ -7656,7 +7682,10 @@ forbid = [{ calls = "helper" }]
                 assert_eq!(row["freshness"], "possiblyStale");
                 assert_eq!(row["projection"]["currentPin"], basis);
                 assert_eq!(row["projection"]["semanticBasisPin"], json!(p));
-                assert_eq!(row["projection"]["basisNativeRevisionId"], native_p.revision.id);
+                assert_eq!(
+                    row["projection"]["basisNativeRevisionId"],
+                    native_p.revision.id
+                );
                 assert_eq!(row["projection"]["semanticStatus"], "olderBasis");
                 assert_eq!(row["historicalTargets"], historical_targets);
                 assert_eq!(
@@ -8381,6 +8410,11 @@ fn witnessed_local_rejoin_does_not_keep_a_method_direct_in_an_edited_document() 
         .store
         .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
         .unwrap();
+    drop(leader);
+    world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
     let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
     assert_eq!(work["witnessedRejoins"], 1, "{work}");
     assert_eq!(calls(&world), [call("f", "Unknown"), call("g", "Direct")]);
@@ -8546,15 +8580,24 @@ fn witnessed_semantic_spill_marks_readers_before_commit() {
         let options = IndexOptions::new(world.root.clone());
         let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
         let leader = world.store.publication_for_tests().unwrap();
-        let result =
-            world
-                .store
-                .publish_local_for_tests(&options, &capture, &leader, &world.cancel);
+        let native = world
+            .store
+            .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+            .unwrap();
+        drop(leader);
+        assert_ne!(native, prior);
+        // Native N never spills semantic work; the bounded S commit is what spills.
+        let result = world.store.catch_up_semantic_for_tests(&world.cancel);
         assert!(observed.load(Ordering::Acquire));
         world.cancel.store(false, Ordering::Release);
         let expected = if rollback {
             assert!(result.is_err());
-            prior
+            // Cancelling S rolls back only S; N stays readable and S retries to completion.
+            assert_eq!(world.store.status().unwrap().revision, native);
+            world
+                .store
+                .catch_up_semantic_for_tests(&world.cancel)
+                .unwrap()
         } else {
             result.unwrap()
         };

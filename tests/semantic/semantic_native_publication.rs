@@ -100,6 +100,18 @@ fn run(home: &Path, args: &[&str]) -> Value {
     stdout.read_to_end(&mut bytes).unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
+/// Native N completes the CLI index request; wait for the daemon's bounded semantic S.
+fn caught_up(store: &trellis::store::Store, reply: &Value) -> trellis::model::IndexPin {
+    let native: trellis::model::IndexPin =
+        serde_json::from_value(reply["publishedRevision"].clone()).unwrap();
+    trellis::testing::wait_until("semantic catch-up", || {
+        !store.semantic_catch_up_pending_for_tests().unwrap()
+    });
+    let head = store.index_baseline().unwrap();
+    assert_eq!(head.index_generation, native.index_generation);
+    assert!(head.index_revision >= native.index_revision);
+    head
+}
 fn copy_seed(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     fs::set_permissions(to, fs::metadata(from).unwrap().permissions()).unwrap();
@@ -414,10 +426,8 @@ fn selected_case(change_b: &str) {
             "fixture must select a proven anchor"
         );
     }
-    let unchanged: trellis::model::IndexPin = serde_json::from_value(
-        run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
-    )
-    .unwrap();
+    let unchanged: trellis::model::IndexPin =
+        caught_up(&store, &run(&home, &["index", "--workspace", root_string]));
     assert_eq!(unchanged, prior);
     assert_eq!(
         store.semantic_at(prior).unwrap().provenance,
@@ -425,10 +435,7 @@ fn selected_case(change_b: &str) {
     );
     if change_b == "oracle_fork_successive_local" {
         fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
-        prior = serde_json::from_value(
-            run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
-        )
-        .unwrap();
+        prior = caught_up(&store, &run(&home, &["index", "--workspace", root_string]));
         prior_semantic = store.semantic_at(prior).unwrap();
         assert!(
             prior_semantic
@@ -465,10 +472,13 @@ fn selected_case(change_b: &str) {
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
         let leader = store.publication_for_tests().unwrap();
-        let seeded = store
+        let native_seed = store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
             .unwrap();
-        assert!(seeded.index_revision > prior.index_revision);
+        drop(leader);
+        let seeded = store.catch_up_semantic_for_tests(&cancel).unwrap();
+        assert!(seeded.index_revision >= native_seed.index_revision);
+        assert!(native_seed.index_revision > prior.index_revision);
         let store = if change_b == "oracle_fork_raw_replacement" {
             let mut extra = scip::types::Occurrence::new();
             extra.range = vec![0, 0, 8];
@@ -623,10 +633,13 @@ fn selected_case(change_b: &str) {
         let (graph, native, capture) =
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
-        let clean_head = store
+        let clean_native = store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
             .unwrap();
-        assert!(clean_head.index_revision > prior.index_revision);
+        drop(leader);
+        let clean_head = store.catch_up_semantic_for_tests(&cancel).unwrap();
+        let leader = store.publication_for_tests().unwrap();
+        assert!(clean_native.index_revision > prior.index_revision);
         assert!(
             store
                 .semantic_at(clean_head)
@@ -721,10 +734,7 @@ fn selected_case(change_b: &str) {
     }
     if matches!(change_b, "oracle_retained_target" | "oracle_restored_b") {
         fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
-        prior = serde_json::from_value(
-            run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
-        )
-        .unwrap();
+        prior = caught_up(&store, &run(&home, &["index", "--workspace", root_string]));
         prior_semantic = store.semantic_at(prior).unwrap();
     }
     if change_b == "native_before_catchup" {
@@ -1063,7 +1073,7 @@ fn selected_case(change_b: &str) {
         }).unwrap();
         return;
     }
-    if matches!(change_b, "cancel_before" | "cancel_after") {
+    if change_b == "cancel_after" {
         assert!(
             trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGKILL)
                 .unwrap()
@@ -1104,27 +1114,21 @@ fn selected_case(change_b: &str) {
         };
         fs::write(root.join("src/B.js"), changed_b).unwrap();
         let cancelled = cancel.clone();
-        if change_b == "cancel_before" {
-            store.set_publication_before_semantic_hook_for_tests(move || {
-                cancelled.store(true, std::sync::atomic::Ordering::Release)
-            });
-        } else {
-            let audit = store.clone();
-            store.set_publication_before_commit_hook_for_tests(move || {
-                let writes = audit.take_search_fts_writes_for_tests();
-                assert!(
-                    writes
-                        .iter()
-                        .any(|(operation, _)| *operation == rusqlite::ffi::SQLITE_DELETE)
-                );
-                assert!(
-                    writes
-                        .iter()
-                        .any(|(operation, _)| *operation == rusqlite::ffi::SQLITE_INSERT)
-                );
-                cancelled.store(true, std::sync::atomic::Ordering::Release)
-            });
-        }
+        let audit = store.clone();
+        store.set_publication_before_commit_hook_for_tests(move || {
+            let writes = audit.take_search_fts_writes_for_tests();
+            assert!(
+                writes
+                    .iter()
+                    .any(|(operation, _)| *operation == rusqlite::ffi::SQLITE_DELETE)
+            );
+            assert!(
+                writes
+                    .iter()
+                    .any(|(operation, _)| *operation == rusqlite::ffi::SQLITE_INSERT)
+            );
+            cancelled.store(true, std::sync::atomic::Ordering::Release)
+        });
         let (graph, native, capture) =
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
@@ -1238,10 +1242,12 @@ fn selected_case(change_b: &str) {
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
         let leader = store.publication_for_tests().unwrap();
-        let next = store
+        let native_next = store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
             .unwrap();
-        assert!(next.index_revision > prior.index_revision);
+        drop(leader);
+        let next = store.catch_up_semantic_for_tests(&cancel).unwrap();
+        assert!(native_next.index_revision > prior.index_revision);
         let snapshot = store.semantic_at(next).unwrap();
         assert!(
             snapshot
@@ -1264,8 +1270,7 @@ fn selected_case(change_b: &str) {
     } else {
         vec!["index", "--workspace", root_string]
     };
-    let next: trellis::model::IndexPin =
-        serde_json::from_value(run(&home, &index_args)["publishedRevision"].clone()).unwrap();
+    let next = caught_up(&store, &run(&home, &index_args));
     assert!(next.index_revision > prior.index_revision);
     let snapshot = store.semantic_at(next).unwrap();
     if change_b.starts_with("oracle_") {
@@ -2273,8 +2278,8 @@ fn native_publication_rejoins_accepted_capture_and_unchanged_is_noop() {
 }
 
 #[test]
-fn cancellation_before_and_after_semantic_staging_rolls_back_native_pin() {
-    selected_case("cancel_before");
+fn cancellation_before_native_commit_rolls_back_native_pin() {
+    // Native N no longer stages semantic work; S cancellation is owned by the worker tests.
     selected_case("cancel_after");
 }
 
@@ -2542,9 +2547,8 @@ def seed_small(workspace, daemon, edited=None):
         shutil.copyfile(corpus / relative, dest)
     anchor_hash = m.sha_file(workspace / anchor)
     def publish():
-        output = m.command([str(binary), 'index', '--workspace', str(workspace)], env=m.env_for(daemon.home))
-        pin = json.loads(output)['publishedRevision']
-        return f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
+        m.command([str(binary), 'index', '--workspace', str(workspace)], env=m.env_for(daemon.home))
+        return m.wait_caught_up(daemon.home)
     r1 = publish()
     with closing(sqlite3.connect(f'file:{m.db_for(daemon.home)}?mode=ro', uri=True)) as db:
         assert db.execute('SELECT count(*) FROM revision_documents WHERE revision_id=?', (r1,)).fetchone()[0] == 4
@@ -2607,6 +2611,10 @@ try:
     observed = m.sample_publication(daemon.path, generation=request_generation, revision=request_revision,
         incarnation=incarnation, request=request, request_mode=complete['mode'], start_wall_ms=wall, cli_end_wall_ms=ended_wall)
     assert observed['publication_mode']=='local', observed
+    with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
+        m.check_changed_source(db, revision,relative.as_posix(),(workspace / relative).read_bytes())
+    revision = m.wait_caught_up(home)
+    assert revision == f'{generation}:{int(number)+2}', revision
     with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
         m.selected_proof(db, revision, anchor.as_posix(), artifact)
         m.check_changed_source(db, revision,relative.as_posix(),(workspace / relative).read_bytes())
@@ -2743,7 +2751,12 @@ fn full_rejoin_parses_each_document_a_bounded_number_of_times() {
     run(&home, &import_args(root_string, &descriptor, &digest));
     // One changed caller makes the next native publication rejoin the selected capture.
     fs::write(root.join("src/C0.js"), caller(0) + "// edited\n").unwrap();
+    let _ = fs::remove_file(home.join("work-counts.json"));
     run(&home, &["index", "--workspace", root_string]);
+    // Counts are exported once, by the bounded semantic S that follows native N.
+    trellis::testing::wait_until("semantic catch-up counts", || {
+        home.join("work-counts.json").exists()
+    });
     let work: Value =
         serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
     let mut parses = std::collections::BTreeMap::<String, usize>::new();

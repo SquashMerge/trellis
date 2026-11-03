@@ -309,6 +309,20 @@ def db_for(home):
     return found[0]
 
 
+def wait_caught_up(home):
+    """Native N completes an index request; return the head once semantic S cleared its target."""
+    while True:
+        with closing(sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)) as db:
+            db.execute("BEGIN")
+            pending = db.execute("SELECT count(*) FROM semantic_pending_target").fetchone()[0]
+            head = db.execute("SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1").fetchone()
+            db.execute("COMMIT")
+        if pending == 0:
+            return f"pin:v1:{head[0]}:{head[1]}"
+        require(time.monotonic() < DEADLINE, "semantic catch-up did not finish")
+        time.sleep(.01)
+
+
 def published(db, output, size):
     require(db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION,
             f"mixed performance requires schema{SCHEMA_VERSION}")
@@ -316,7 +330,8 @@ def published(db, output, size):
     pin = index_result["publishedRevision"]
     revision = f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
     head = db.execute("SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1").fetchone()
-    require(head == (pin["indexGeneration"], pin["indexRevision"]),
+    # Native N answers the CLI; a following semantic S may already be the head.
+    require(head[0] == pin["indexGeneration"] and head[1] in (pin["indexRevision"], pin["indexRevision"] + 1),
             f"{size}: CLI pin differs from durable index_metadata")
     require(db.execute("SELECT count(*) FROM native_revisions WHERE id=?", (revision,)).fetchone()[0] == 1,
             f"{size}: missing selected revision header")
@@ -1053,10 +1068,13 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
     require(sha_file(workspace / anchor) == expected, "full r2 changed frozen anchor")
     output = command([str(binary), "index", "--workspace", str(workspace)], env=env_for(daemon.home))
     full = json.loads(output)["publishedRevision"]
-    r2 = f"pin:v1:{full['indexGeneration']}:{full['indexRevision']}"
+    native_r2 = f"pin:v1:{full['indexGeneration']}:{full['indexRevision']}"
+    r2 = wait_caught_up(daemon.home)
     with closing(sqlite3.connect(f"file:{db_for(daemon.home)}?mode=ro", uri=True)) as db:
         selected_proof(db, r2, anchor.as_posix(), artifact)
         published(db, output, size)
+    require(r2 in (native_r2, f"pin:v1:{full['indexGeneration']}:{full['indexRevision'] + 1}"),
+            "semantic catch-up must pair with native r2")
     require(r2 not in (r1, imported), "untimed full r2 must publish a new selected pin")
     with closing(sqlite3.connect(f"file:{db_for(daemon.home)}?mode=ro", uri=True)) as db:
         native_ids = db.execute("SELECT native_revision_id FROM native_revisions WHERE id IN (?,?)",
@@ -1464,6 +1482,7 @@ def main():
                 "before_requests": before, "start": started, "start_wall_ms": wall,
                 "expected_revision": f"{generation}:{int(number)+1}"})
             require(local["publication_mode"] == "local", "smoke edit did not publish LOCAL")
+            local["revision"] = wait_caught_up(home)
             with closing(sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)) as db:
                 selected_proof(db, local["revision"], anchor.as_posix(), artifact)
                 check_changed_source(db, local["revision"], relative.as_posix(),

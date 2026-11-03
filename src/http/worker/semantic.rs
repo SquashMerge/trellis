@@ -652,16 +652,26 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     fn two_pending_producers_fixture() -> (
-        tempfile::TempDir, crate::store::Store, Arc<DaemonState>,
-        crate::indexer::IndexOptions, CancelFlag, crate::model::IndexPin,
+        tempfile::TempDir,
+        crate::store::Store,
+        Arc<DaemonState>,
+        crate::indexer::IndexOptions,
+        CancelFlag,
+        crate::model::IndexPin,
     ) {
         two_producer_edit_fixture(false)
     }
 
     #[cfg(feature = "test-support")]
-    fn two_producer_edit_fixture(context_only: bool) -> (
-        tempfile::TempDir, crate::store::Store, Arc<DaemonState>,
-        crate::indexer::IndexOptions, CancelFlag, crate::model::IndexPin,
+    fn two_producer_edit_fixture(
+        context_only: bool,
+    ) -> (
+        tempfile::TempDir,
+        crate::store::Store,
+        Arc<DaemonState>,
+        crate::indexer::IndexOptions,
+        CancelFlag,
+        crate::model::IndexPin,
     ) {
         use crate::capture::Capture;
         use crate::index_coordinator::IndexJobCoordinator;
@@ -680,7 +690,9 @@ mod tests {
         let source = options.workspace_root.join("a.js");
         std::fs::write(&source, "function f(){g();}\n").unwrap();
         let mut selected = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
-            .unwrap().run_serving(&options, &cancel, |_| {}).unwrap();
+            .unwrap()
+            .run_serving(&options, &cancel, |_| {})
+            .unwrap();
         let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
         let mut scip = scip::types::Index::parse_from_bytes(
             &hex::decode("122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166").unwrap(),
@@ -700,18 +712,39 @@ mod tests {
                 std::fs::write(options.workspace_root.join(path), bytes).unwrap();
             }
             let mut admitted = stage_batch(
-                &store, &StageInput::external(&options.workspace_root).unwrap(),
-                StageOwner { request_id: producer, incarnation: "two-pending-producers" },
-                &options.workspace_root.join("descriptor.json"), &crate::scip_raw::sha(&descriptor),
-                &limits, &mut BatchCounters::default(), &cancel,
-            ).unwrap();
+                &store,
+                &StageInput::external(&options.workspace_root).unwrap(),
+                StageOwner {
+                    request_id: producer,
+                    incarnation: "two-pending-producers",
+                },
+                &options.workspace_root.join("descriptor.json"),
+                &crate::scip_raw::sha(&descriptor),
+                &limits,
+                &mut BatchCounters::default(),
+                &cancel,
+            )
+            .unwrap();
             let joined = join_staged(
-                &mut admitted, &store, selected, &limits, &mut LookupBudget::new(&limits),
-                &mut BatchCounters::default(), DestinationMutations::default(), &cancel,
-            ).unwrap();
-            selected = store.publish_semantic_batch(
-                &joined, admitted.stage_mut(), selected, session.writer_guard().unwrap(), &cancel,
-            ).unwrap();
+                &mut admitted,
+                &store,
+                selected,
+                &limits,
+                &mut LookupBudget::new(&limits),
+                &mut BatchCounters::default(),
+                DestinationMutations::default(),
+                &cancel,
+            )
+            .unwrap();
+            selected = store
+                .publish_semantic_batch(
+                    &joined,
+                    admitted.stage_mut(),
+                    selected,
+                    session.writer_guard().unwrap(),
+                    &cancel,
+                )
+                .unwrap();
             drop(admitted);
         }
         if context_only {
@@ -720,7 +753,9 @@ mod tests {
             std::fs::write(&source, "function f(){g();} // pending two producers\n").unwrap();
         }
         let native = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
-            .unwrap().run_serving(&options, &cancel, |_| {}).unwrap();
+            .unwrap()
+            .run_serving(&options, &cancel, |_| {})
+            .unwrap();
         (_tmp, store, state, options, cancel, native)
     }
 
@@ -731,29 +766,39 @@ mod tests {
         let session = state.runtime.lock().unwrap().session().unwrap().clone();
         let target = store.pending_semantic_target().unwrap().unwrap();
         assert_eq!(target.selections.len(), 2);
-        let key = format!("pin:v1:{}:{}", native.index_generation, native.index_revision);
-        store.with_index_read_for_tests(|db| {
-            let expected: i64 = db.query_row(
-                "SELECT count(*) FROM semantic_revision_raw_selections r
+        let key = format!(
+            "pin:v1:{}:{}",
+            native.index_generation, native.index_revision
+        );
+        store
+            .with_index_read_for_tests(|db| {
+                let expected: i64 = db.query_row(
+                    "SELECT count(*) FROM semantic_revision_raw_selections r
                  JOIN semantic_projection_origins o ON o.revision_id=r.revision_id
                     AND o.producer_id=r.producer_id WHERE r.revision_id=?1",
-                [&key], |row| row.get(0),
-            )?;
-            assert_eq!(expected, 2);
-            Ok(())
-        }).unwrap();
-        store.with_index_sql_for_tests(|db| {
-            let removed = db.execute(
-                "DELETE FROM semantic_pending_selections
-                 WHERE revision_id=?1 AND producer_id='trellis-synthetic-scip'", [&key],
-            )?;
-            assert_eq!(removed, 1);
-            Ok(())
-        }).unwrap();
+                    [&key],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(expected, 2);
+                Ok(())
+            })
+            .unwrap();
+        store
+            .with_index_sql_for_tests(|db| {
+                let removed = db.execute(
+                    "DELETE FROM semantic_pending_selections
+                 WHERE revision_id=?1 AND producer_id='trellis-synthetic-scip'",
+                    [&key],
+                )?;
+                assert_eq!(removed, 1);
+                Ok(())
+            })
+            .unwrap();
 
         let mut continuation = None;
         let _owner = state.step_lock.lock().unwrap();
-        let error = store.semantic_maintenance_unit(&session, &mut continuation, &cancel)
+        let error = store
+            .semantic_maintenance_unit(&session, &mut continuation, &cancel)
             .expect_err("missing one required pending producer must reject the first unit");
         assert!(crate::store::Store::is_rebuild_failure(&error), "{error:#}");
         assert!(store.recovery_pending_for_tests());
@@ -786,41 +831,79 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn explicit_import_fulfills_one_of_two_pending_producers() {
-        use crate::semantic_batch::{BatchCounters, BatchLimits, LookupBudget, StageInput, StageOwner, stage_batch};
+        use crate::semantic_batch::{
+            BatchCounters, BatchLimits, LookupBudget, StageInput, StageOwner, stage_batch,
+        };
         use crate::semantic_import::{DestinationMutations, join_staged};
 
         let (_tmp, store, state, options, cancel, native) = two_pending_producers_fixture();
         let session = state.runtime.lock().unwrap().session().unwrap().clone();
         let target = store.pending_semantic_target().unwrap().unwrap();
         assert_eq!(target.selections.len(), 2);
-        let key = |pin: crate::model::IndexPin| format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+        let key = |pin: crate::model::IndexPin| {
+            format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
+        };
         let counts = |pin: crate::model::IndexPin| {
-            store.with_index_read_for_tests(|db| {
-                let key = key(pin);
-                let count = |table: &str| -> anyhow::Result<i64> {
-                    Ok(db.query_row(&format!("SELECT count(*) FROM {table} WHERE revision_id=?1"), [&key], |row| row.get(0))?)
-                };
-                Ok((count("semantic_revision_raw_selections")?, count("semantic_projection_origins")?, count("semantic_pending_selections")?))
-            }).unwrap()
+            store
+                .with_index_read_for_tests(|db| {
+                    let key = key(pin);
+                    let count = |table: &str| -> anyhow::Result<i64> {
+                        Ok(db.query_row(
+                            &format!("SELECT count(*) FROM {table} WHERE revision_id=?1"),
+                            [&key],
+                            |row| row.get(0),
+                        )?)
+                    };
+                    Ok((
+                        count("semantic_revision_raw_selections")?,
+                        count("semantic_projection_origins")?,
+                        count("semantic_pending_selections")?,
+                    ))
+                })
+                .unwrap()
         };
         assert_eq!(counts(native), (2, 2, 2));
-        let retained = store.semantic_projection_at(native, "scip-typescript", "javascript", "a.js").unwrap().unwrap();
+        let retained = store
+            .semantic_projection_at(native, "scip-typescript", "javascript", "a.js")
+            .unwrap()
+            .unwrap();
         let limits = BatchLimits::PRODUCTION;
         // The fixture's last descriptor belongs to its synthetic producer.
         let descriptor = std::fs::read(options.workspace_root.join("descriptor.json")).unwrap();
         let mut admitted = stage_batch(
-            &store, &StageInput::external(&options.workspace_root).unwrap(),
-            StageOwner { request_id: "fulfill-one", incarnation: "two-pending-producers" },
-            &options.workspace_root.join("descriptor.json"), &crate::scip_raw::sha(&descriptor),
-            &limits, &mut BatchCounters::default(), &cancel,
-        ).unwrap();
+            &store,
+            &StageInput::external(&options.workspace_root).unwrap(),
+            StageOwner {
+                request_id: "fulfill-one",
+                incarnation: "two-pending-producers",
+            },
+            &options.workspace_root.join("descriptor.json"),
+            &crate::scip_raw::sha(&descriptor),
+            &limits,
+            &mut BatchCounters::default(),
+            &cancel,
+        )
+        .unwrap();
         let joined = join_staged(
-            &mut admitted, &store, native, &limits, &mut LookupBudget::new(&limits),
-            &mut BatchCounters::default(), DestinationMutations::default(), &cancel,
-        ).unwrap();
-        let imported = store.publish_semantic_batch(
-            &joined, admitted.stage_mut(), native, session.writer_guard().unwrap(), &cancel,
-        ).unwrap();
+            &mut admitted,
+            &store,
+            native,
+            &limits,
+            &mut LookupBudget::new(&limits),
+            &mut BatchCounters::default(),
+            DestinationMutations::default(),
+            &cancel,
+        )
+        .unwrap();
+        let imported = store
+            .publish_semantic_batch(
+                &joined,
+                admitted.stage_mut(),
+                native,
+                session.writer_guard().unwrap(),
+                &cancel,
+            )
+            .unwrap();
         drop(admitted);
         assert_ne!(imported, native);
         assert_eq!(counts(imported), (2, 1, 1));
@@ -829,26 +912,56 @@ mod tests {
         assert_eq!(remaining.native_revision_id, target.native_revision_id);
         assert_eq!(remaining.selections.len(), 1);
         assert_eq!(remaining.selections[0].producer_id, "scip-typescript");
-        assert_eq!(remaining.selections[0], target.selections.into_iter().find(|s| s.producer_id == "scip-typescript").unwrap());
+        assert_eq!(
+            remaining.selections[0],
+            target
+                .selections
+                .into_iter()
+                .find(|s| s.producer_id == "scip-typescript")
+                .unwrap()
+        );
 
         let mut continuation = None;
         let mut published = false;
         for _ in 0..128 {
             let _owner = state.step_lock.lock().unwrap();
-            match store.semantic_maintenance_unit(&session, &mut continuation, &cancel).unwrap() {
-                SemanticUnitOutcome::Progress => assert_eq!(store.index_baseline().unwrap(), imported),
-                SemanticUnitOutcome::Published => { published = true; break; }
+            match store
+                .semantic_maintenance_unit(&session, &mut continuation, &cancel)
+                .unwrap()
+            {
+                SemanticUnitOutcome::Progress => {
+                    assert_eq!(store.index_baseline().unwrap(), imported)
+                }
+                SemanticUnitOutcome::Published => {
+                    published = true;
+                    break;
+                }
                 other => panic!("unexpected remaining-producer unit: {other:?}"),
             }
         }
         assert!(published, "remaining producer never published S");
         let semantic = store.index_baseline().unwrap();
         assert_ne!(semantic, imported);
-        assert_eq!(store.with_native_reader(semantic, |reader| Ok(reader.header()?.revision.id.clone())).unwrap(), remaining.native_revision_id);
+        assert_eq!(
+            store
+                .with_native_reader(semantic, |reader| Ok(reader.header()?.revision.id.clone()))
+                .unwrap(),
+            remaining.native_revision_id
+        );
         assert_eq!(counts(semantic), (2, 0, 0));
         assert!(store.pending_semantic_target().unwrap().is_none());
-        assert_eq!(store.semantic_projection_at(native, "scip-typescript", "javascript", "a.js").unwrap().unwrap(), retained);
-        assert_eq!(counts(native), (2, 2, 2), "retained N selections were mutated");
+        assert_eq!(
+            store
+                .semantic_projection_at(native, "scip-typescript", "javascript", "a.js")
+                .unwrap()
+                .unwrap(),
+            retained
+        );
+        assert_eq!(
+            counts(native),
+            (2, 2, 2),
+            "retained N selections were mutated"
+        );
     }
 
     #[cfg(feature = "test-support")]
@@ -860,8 +973,15 @@ mod tests {
         assert_eq!(target.pin, native);
         assert_eq!(target.selections.len(), 2);
         let response = store.evidence_response().unwrap();
-        assert_eq!(response.source_at("a.js", Some(native)).unwrap().unwrap().1.text,
-            "function f(){g();}\n");
+        assert_eq!(
+            response
+                .source_at("a.js", Some(native))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            "function f(){g();}\n"
+        );
         response.finish(()).unwrap();
         drop(response);
         state.worker_step().unwrap();
@@ -875,10 +995,16 @@ mod tests {
 
         let request = state.enqueue_index(&options, None).unwrap();
         assert_eq!(semantic.run_unit(&state, &cancel), None);
-        assert_eq!(store.request_by_id(&request.id).unwrap().unwrap().state, "queued");
+        assert_eq!(
+            store.request_by_id(&request.id).unwrap().unwrap().state,
+            "queued"
+        );
         assert_eq!(store.pending_semantic_target().unwrap().unwrap(), target);
         state.worker_step().unwrap();
-        assert_eq!(store.request_by_id(&request.id).unwrap().unwrap().state, "done");
+        assert_eq!(
+            store.request_by_id(&request.id).unwrap().unwrap().state,
+            "done"
+        );
         state.worker_step().unwrap();
         state.next_wake();
         state.inbox.wait(Some(Instant::now()));
@@ -888,7 +1014,8 @@ mod tests {
             let watcher = &mut work.as_mut().unwrap().1;
             watcher.submit_watch_event_for_tests(Ok(notify::Event::new(
                 notify::EventKind::Modify(notify::event::ModifyKind::Any),
-            ).add_path(options.workspace_root.join("a.js"))));
+            )
+            .add_path(options.workspace_root.join("a.js"))));
             // Existing forced inventory makes this accepted hint due without a timer.
             watcher.force_periodic_inventory_for_tests();
             state.publish_watch_status(watcher, &options);
@@ -920,20 +1047,38 @@ mod tests {
         }
         let published = published.expect("bounded context units never committed S");
         assert_eq!(published.index_generation, native.index_generation);
-        assert_eq!(store.with_native_reader(published, |reader| Ok(reader.header()?.revision.id.clone())).unwrap(), native_revision);
+        assert_eq!(
+            store
+                .with_native_reader(published, |reader| Ok(reader.header()?.revision.id.clone()))
+                .unwrap(),
+            native_revision
+        );
         assert!(store.pending_semantic_target().unwrap().is_none());
         assert!(semantic.continuation.is_none());
-        store.with_index_read_for_tests(|db| {
-            let committed: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM semantic_catchup_commits
+        store
+            .with_index_read_for_tests(|db| {
+                let committed: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM semantic_catchup_commits
                  WHERE revision_id=?1 AND target_revision_id=?2)",
-                rusqlite::params![format!("pin:v1:{}:{}", published.index_generation, published.index_revision),
-                    format!("pin:v1:{}:{}", native.index_generation, native.index_revision)],
-                |row| row.get(0),
-            )?;
-            assert!(committed, "head movement was not this owner's target S commit");
-            Ok(())
-        }).unwrap();
+                    rusqlite::params![
+                        format!(
+                            "pin:v1:{}:{}",
+                            published.index_generation, published.index_revision
+                        ),
+                        format!(
+                            "pin:v1:{}:{}",
+                            native.index_generation, native.index_revision
+                        )
+                    ],
+                    |row| row.get(0),
+                )?;
+                assert!(
+                    committed,
+                    "head movement was not this owner's target S commit"
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
