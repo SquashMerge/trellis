@@ -500,16 +500,19 @@ async fn a_rules_edit_during_a_build_is_built_next() {
 #[tokio::test]
 async fn a_panicked_build_is_reported_once_and_the_next_read_builds_again() {
     let (base, runtime, browser, key) = fixture().await;
-    write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
     let panics = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let injected = panics.clone();
     scheduler.set_architecture_hook_for_tests(Arc::new(move |point| {
-        if point == "resolving" && panics.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        if point == "resolving" && injected.swap(false, std::sync::atomic::Ordering::AcqRel) {
             panic!("injected build panic");
         }
     }));
+    // Rules make this build eligible; install the panic hook before publishing them.
+    write_rules(&base, RULES);
     let app = browser.clone().router();
     let (status, failed) = request(app.clone(), &key, "").await;
+    assert!(!panics.load(std::sync::atomic::Ordering::Acquire));
     assert!(status.is_server_error(), "{status} {failed}");
     let (status, ready) = request(app, &key, "").await;
     assert_eq!(status, StatusCode::OK, "{ready}");

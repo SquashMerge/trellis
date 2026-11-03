@@ -128,17 +128,19 @@ an auto-started daemon running. Its report does not attest the daemon's binary.
 
 The script discovers the live catalog, validates inputs and every returned
 `structuredContent` against its live JSON Schemas, and records per-call timings
-and result sizes. It discovers a real callable symbol, its source location, and a
-real rules instance for explanation. All advertised tools must be exercised;
+and result sizes, plus host load averages (1, 5 and 15 minutes) before and after
+the run. It prefers a matching callable from a language with a selected semantic
+producer, then discovers its source location and a real rules instance for explanation. All advertised tools must be exercised;
 missing recipes, symbols or rules instances are failures, not skips. Rules
 pagination stops after finding an instance. This is a smoke, not exhaustive graph
 or source verification. Native partial coverage, rule deviations and `unknown`
 conformance are not by themselves tool errors.
 
 A nonzero exit blocks this qualification step: investigate every tool error
-(including `deadline_exceeded`), schema mismatch, missing/stale semantic evidence
-for the selected language, unavailable or incomplete search index, unready
-workspace or missing capability. Watcher degradation is reported separately.
+(including `deadline_exceeded`), schema mismatch, missing/stale evidence for any
+selected semantic producer, unavailable or incomplete search index, unready
+workspace or missing capability. Languages with no selected producer are reported
+as `not_configured`, not failed; that does not qualify semantic support for them. Watcher degradation is reported separately.
 A lexical search response does not pass when its
 model is missing. Finish setup and rerun; do not mark a failed or partial run as
 qualified. The JSON report contains only fixed labels, codes, counts, sizes and

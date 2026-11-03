@@ -395,6 +395,7 @@ fn last_run(record: &RunRecord) -> Value {
         "sourceRevision": record.source_revision,
         "createdAt": record.created_at,
         "finishedAt": record.finished_at,
+        "groupStatus": record.group_status,
     })
 }
 

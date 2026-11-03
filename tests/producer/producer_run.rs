@@ -102,6 +102,21 @@ impl World {
         path
     }
 
+    /// An artifact the shallow batch scan accepts but admission refuses: its tool version is
+    /// not the pin's.
+    fn unpinned_artifact(&self) -> PathBuf {
+        self.artifact(|index| {
+            index
+                .metadata
+                .as_mut()
+                .unwrap()
+                .tool_info
+                .as_mut()
+                .unwrap()
+                .version = "0.0.0-not-the-pin".into();
+        })
+    }
+
     /// The stub's behavior: it records its argv, then does `extra`.
     fn mode(&self, extra: Value) {
         let mut mode = json!({"marker": self.marker});
@@ -296,6 +311,8 @@ fn explicit_run_imports_stub_artifact() {
     assert!(reply["import"]["publishedRevision"].is_object());
     assert!(reply["import"]["report"].is_object());
     assert_eq!(reply["diagnostics"]["exit"]["code"], 0);
+    // An ordinary exit is proven empty on every platform, so no snapshot preflight runs.
+    assert_eq!(reply["diagnostics"]["groupStatus"], "empty");
 
     assert_eq!(marker_lines(&world), 1, "the stub ran exactly once");
     assert_eq!(world.run_ids(), [reply["runId"].as_str().unwrap()]);
@@ -354,10 +371,10 @@ fn run_times_out_and_reports() {
     assert_eq!(reply["errorCode"], "timed_out");
     assert!(stderr(&output).contains("timed_out"), "{}", stderr(&output));
     assert!(reply["diagnostics"]["durationMs"].as_u64().unwrap() >= 1000);
-    assert_eq!(reply["diagnostics"]["groupSurvived"], false);
+    assert_ne!(reply["diagnostics"]["groupStatus"], "survived");
     let record = world.record(reply["runId"].as_str().unwrap());
     assert_eq!(record["outcome"], "timed_out");
-    assert_eq!(record["diagnostics"]["groupSurvived"], false);
+    assert_ne!(record["diagnostics"]["groupStatus"], "survived");
     assert_descendants_gone(&pids);
 }
 
@@ -687,23 +704,15 @@ fn status_reports_restricted_and_trusted_modes() {
 
 #[test]
 fn run_reply_carries_typed_import_error() {
-    let world = World::new();
-    let artifact = world.artifact(|index| {
-        index
-            .metadata
-            .as_mut()
-            .unwrap()
-            .tool_info
-            .as_mut()
-            .unwrap()
-            .version = "0.0.0-not-the-pin".into();
-    });
+    let world = World::with_env(&[], &[("TRELLIS_TEST_PRODUCER_GROUP_EMPTY", "1")]);
+    let artifact = world.unpinned_artifact();
     world.mode(json!({"emit": artifact}));
     let output = world.run(&[]);
     assert!(!output.status.success());
     let reply = reply(&output);
     assert_eq!(reply["state"], "failed");
     assert_eq!(reply["outcome"], "import_failed");
+    assert_eq!(reply["diagnostics"]["groupStatus"], "empty");
     let code = reply["errorCode"].as_str().unwrap();
     assert!(code.starts_with("invalid_artifact"), "{code}");
     assert!(stderr(&output).contains(code), "{}", stderr(&output));
@@ -714,6 +723,131 @@ fn run_reply_carries_typed_import_error() {
     assert!(only_record_remains(&world.runs_dir().join(run_id)));
 }
 
+/// With the group not proven empty, the same artifact is refused by the snapshot preflight's
+/// full admission before anything is queued, with the code the import would report (#624).
+#[test]
+fn unknown_group_refuses_a_snapshot_that_fails_full_admission_before_enqueue() {
+    let world = World::with_env(&[], &[("TRELLIS_TEST_PRODUCER_GROUP_UNKNOWN", "1")]);
+    let artifact = world.unpinned_artifact();
+    world.mode(json!({"emit": artifact}));
+    let before = index_revision(&world);
+    let output = world.run(&[]);
+    assert!(!output.status.success());
+    let reply = reply(&output);
+    assert_eq!(reply["state"], "failed");
+    assert_eq!(reply["outcome"], "producer_output_invalid", "{reply}");
+    let code = reply["errorCode"].as_str().unwrap();
+    assert!(code.starts_with("invalid_artifact"), "{code}");
+    assert_eq!(reply["import"], Value::Null, "nothing was queued");
+    assert_eq!(reply["diagnostics"]["groupStatus"], "unknown");
+    let run_id = reply["runId"].as_str().unwrap();
+    let record = world.record(run_id);
+    assert_eq!(record["requestId"], Value::Null);
+    assert_eq!(record["groupStatus"], "unknown");
+    assert_eq!(world.stub_entry()["lastRun"]["groupStatus"], "unknown");
+    assert!(only_record_remains(&world.runs_dir().join(run_id)));
+    assert_eq!(index_revision(&world), before);
+    assert!(
+        stage_residue(&world).is_empty(),
+        "the failed preflight's stage is gone"
+    );
+}
+
+/// A full decode alone is not enough: a document the artifact names but that is not in the
+/// retained inventory is refused, so every requested document has a validated disposition.
+#[test]
+fn unknown_group_refuses_a_snapshot_with_an_unlisted_document() {
+    let world = World::with_env(&[], &[("TRELLIS_TEST_PRODUCER_GROUP_UNKNOWN", "1")]);
+    let artifact = world.artifact(|index| {
+        let mut extra = index.documents[0].clone();
+        extra.relative_path = "not-in-the-inventory.js".into();
+        index.documents.push(extra);
+    });
+    world.mode(json!({"emit": artifact}));
+    let reply = reply(&world.run(&[]));
+    assert_eq!(reply["outcome"], "producer_output_invalid", "{reply}");
+    assert_eq!(reply["import"], Value::Null);
+}
+
+/// Whether a semantic stage directory (an import's or a preflight's) is left in the index
+/// directory.
+fn stage_residue(world: &World) -> Vec<String> {
+    entries(world.index_db().parent().unwrap())
+        .into_iter()
+        .filter(|name| name.starts_with("semantic-stage-"))
+        .collect()
+}
+
+/// A cancel that lands while the snapshot preflight runs ends the run `cancelled` with
+/// nothing queued and no stage left behind.
+#[test]
+fn cancel_during_the_snapshot_preflight_queues_nothing() {
+    let world = World::with_env(
+        &[("TRELLIS_TEST_PRODUCER_PREFLIGHT_SOCKET", "preflight.sock")],
+        &[("TRELLIS_TEST_PRODUCER_GROUP_UNKNOWN", "1")],
+    );
+    world.emitting();
+    let before = index_revision(&world);
+    let child = world.spawn_run(&[]);
+    world.wait_hook("preflight.sock");
+    let active = world.active_run();
+    assert_eq!(active["state"], "writingBatch");
+    assert_eq!(active["groupStatus"], "unknown");
+    let output = world.producer("cancel", &["--run", active["runId"].as_str().unwrap()]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    world.release_hook("preflight.sock");
+
+    let output = child.wait_with_output().unwrap();
+    let reply = reply(&output);
+    assert_eq!(reply["state"], "cancelled", "{reply}");
+    assert_eq!(reply["import"], Value::Null);
+    assert_eq!(
+        world.record(reply["runId"].as_str().unwrap())["requestId"],
+        Value::Null
+    );
+    assert!(stage_residue(&world).is_empty());
+    assert_eq!(index_revision(&world), before);
+}
+
+/// The group was not proven empty, so a process left in it may rewrite `out/index.scip`
+/// after the batch was written. The queued import reads the frozen snapshot instead and
+/// publishes the bytes the run validated (#624).
+#[test]
+fn unknown_group_imports_the_frozen_snapshot_despite_a_later_rewrite() {
+    let world = World::with_env(
+        &[("TRELLIS_TEST_PRODUCER_ENQUEUED_SOCKET", "enqueued.sock")],
+        &[("TRELLIS_TEST_PRODUCER_GROUP_UNKNOWN", "1")],
+    );
+    world.emitting();
+    let child = world.spawn_run(&[]);
+    world.wait_hook("enqueued.sock");
+    let active = world.active_run();
+    assert_eq!(active["state"], "importing");
+    assert_eq!(active["groupStatus"], "unknown");
+    let dir = world.runs_dir().join(active["runId"].as_str().unwrap());
+    let emitted = fs::read(dir.join("out/index.scip")).unwrap();
+    assert_eq!(fs::read(dir.join("snapshot/index.scip")).unwrap(), emitted);
+    // A surviving producer rewrites its output after the snapshot was frozen.
+    fs::write(
+        dir.join("out/index.scip"),
+        b"rewritten by a surviving producer",
+    )
+    .unwrap();
+    world.release_hook("enqueued.sock");
+
+    let output = child.wait_with_output().unwrap();
+    let reply = reply(&output);
+    assert!(output.status.success(), "{reply} {}", stderr(&output));
+    assert_eq!(reply["outcome"], "imported");
+    assert_eq!(reply["diagnostics"]["groupStatus"], "unknown");
+    let record = world.record(reply["runId"].as_str().unwrap());
+    assert_eq!(record["groupStatus"], "unknown");
+    assert_eq!(record["diagnostics"]["groupStatus"], "unknown");
+    assert_eq!(world.stub_entry()["lastRun"]["groupStatus"], "unknown");
+    assert!(only_record_remains(&dir));
+    assert!(stage_residue(&world).is_empty());
+}
+
 fn entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .unwrap()
@@ -721,6 +855,16 @@ fn entries(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// What a queued generated import reads from its run directory: the producer's `out/`, or,
+/// when the group was not proven empty, also the frozen `snapshot/` its batch names (#624).
+fn import_inputs(record: &Value) -> Vec<&'static str> {
+    match record["groupStatus"].as_str() {
+        Some("empty") => vec!["batch", "out", "run.json"],
+        Some("unknown" | "survived") => vec!["batch", "out", "run.json", "snapshot"],
+        other => panic!("group status {other:?}"),
+    }
 }
 
 fn index_revision(world: &World) -> u64 {
@@ -805,11 +949,10 @@ fn import_inputs_survive_until_the_request_is_terminal() {
     let active = world.active_run();
     let dir = world.runs_dir().join(active["runId"].as_str().unwrap());
     // The producer phase is over; only the import's inputs and the record remain.
-    assert_eq!(entries(&dir), ["batch", "out", "run.json"]);
-    assert_eq!(
-        world.record(active["runId"].as_str().unwrap())["state"],
-        "importing"
-    );
+    let record = world.record(active["runId"].as_str().unwrap());
+    assert_eq!(entries(&dir), import_inputs(&record));
+    assert_eq!(record["state"], "importing");
+    assert_eq!(active["groupStatus"], record["groupStatus"]);
     world.release_hook("enqueued.sock");
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
@@ -828,7 +971,7 @@ fn unwritable_importing_record_does_not_fail_the_accepted_import() {
     let active = world.active_run();
     let run_id = active["runId"].as_str().unwrap().to_owned();
     let dir = world.runs_dir().join(&run_id);
-    assert_eq!(entries(&dir), ["batch", "out", "run.json"]);
+    assert_eq!(entries(&dir), import_inputs(&world.record(&run_id)));
     assert_eq!(world.record(&run_id)["state"], "writingBatch");
     world.release_hook("enqueued.sock");
 
@@ -867,8 +1010,8 @@ fn lost_import_wait_keeps_inputs_and_an_importing_record() {
         stderr(&output)
     );
     let dir = world.runs_dir().join(&run_id);
-    assert_eq!(entries(&dir), ["batch", "out", "run.json"]);
     let record = world.record(&run_id);
+    assert_eq!(entries(&dir), import_inputs(&record));
     assert_eq!(record["state"], "importing");
     assert_eq!(record["requestId"], request_id);
     assert_eq!(record["outcome"], Value::Null);
