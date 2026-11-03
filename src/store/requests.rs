@@ -2265,6 +2265,9 @@ impl Store {
 }
 
 #[cfg(test)]
+mod queue_model_tests;
+
+#[cfg(test)]
 mod recovery_blocked_tests;
 
 #[cfg(test)]
