@@ -14411,6 +14411,9 @@ async fn mcp_search_during_startup_defers_background_head_and_serves_valid_prior
 
 use crate::graph_fixtures;
 
+#[path = "stable_projection_properties.rs"]
+mod stable_projection_properties;
+
 /// A published synthetic index served through an in-process daemon-socket MCP session. Startup
 /// reconciliation is held for the session's life, so the published head is served as published.
 struct GraphMcp {
