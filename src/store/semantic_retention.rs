@@ -1,0 +1,140 @@
+//! Revision-owned recovery status. Readers only consult their admitted SQLite snapshot.
+use super::*;
+use crate::producer::{retention, state::StateDir};
+
+pub(super) fn semantic_reimport_at(
+    db: &Connection,
+    key: &str,
+) -> Result<BTreeMap<String, SemanticReimport>> {
+    let mut statement = db.prepare("SELECT language,producer,reason FROM semantic_reimport WHERE revision_id=?1 ORDER BY language,producer")?;
+    let rows = statement
+        .query_map([key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (language, reason) in rows {
+        reasons.entry(language).or_default().push(reason);
+    }
+    Ok(reasons
+        .into_iter()
+        .map(|(language, reasons)| {
+            (
+                language,
+                SemanticReimport::NeedsReimport {
+                    reason: reasons.join("; "),
+                },
+            )
+        })
+        .collect())
+}
+
+pub(super) fn copy(db: &Connection, old: &str, new: &str, clear: Option<&str>) -> Result<()> {
+    db.execute("INSERT INTO semantic_reimport SELECT ?1,producer,language,reason FROM semantic_reimport WHERE revision_id=?2 AND (?3 IS NULL OR producer<>?3)",params![new,old,clear])?;
+    Ok(())
+}
+
+impl Store {
+    pub(crate) fn attach_retention(&self, db: &Connection) -> Result<StateDir> {
+        let state = StateDir::open(&self.roots, &self.identity)?;
+        retention::attach(
+            db,
+            &state,
+            &format!(
+                "{}:{}:{}",
+                self.identity.record_id, self.identity.device, self.identity.inode
+            ),
+        )?;
+        Ok(state)
+    }
+
+    pub(super) fn materialize_reimport(
+        &self,
+        db: &Connection,
+        key: &str,
+        state: Option<&StateDir>,
+        recovery: bool,
+    ) -> Result<()> {
+        if state.is_some() {
+            let slots = retention::slots(db)?;
+            for retention::RetainedRun {
+                producer,
+                languages,
+                options,
+                ..
+            } in slots
+            {
+                let published: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_revision_producers WHERE revision_id=?1 AND id=?2)", params![key,producer], |row| row.get(0))?;
+                if published {
+                    continue;
+                }
+                let reason = retention::recovery_reason(db, key, &options)?;
+                for language in languages {
+                    db.execute(
+                        "INSERT OR REPLACE INTO semantic_reimport VALUES(?1,?2,?3,?4)",
+                        params![key, producer, language, reason],
+                    )?;
+                }
+            }
+            if recovery {
+                db.execute("INSERT OR IGNORE INTO retained.legacy_languages SELECT DISTINCT language FROM revision_documents WHERE revision_id=?1 AND language NOT IN (SELECT language FROM semantic_reimport WHERE revision_id=?1)", [key])?;
+            }
+            db.execute("INSERT OR IGNORE INTO semantic_reimport SELECT ?1,'',language,'original run inputs were not retained before this upgrade; import a current artifact' FROM retained.legacy_languages", [key])?;
+        } else if recovery {
+            db.execute("INSERT OR IGNORE INTO semantic_reimport SELECT ?1,'',language,'retained run state is unavailable; import a current artifact' FROM revision_documents WHERE revision_id=?1 GROUP BY language", [key])?;
+        }
+        Ok(())
+    }
+
+    /// Called by the single checkout worker after native reconciliation, before the FIFO.
+    /// This is admission into the existing queue, not a second retry owner.
+    pub(crate) fn enqueue_retained_runs(&self) -> Result<()> {
+        let db = self.cache_write()?;
+        match self.attach_retention(&db) {
+            Ok(_) => {}
+            Err(error) if nonterminal_storage_busy(&error) => return Err(error),
+            Err(error) if retention::unavailable_catalog(&error) => return Ok(()),
+            Err(error) => return Err(typed_storage_full(error)),
+        }
+        let pin = self.index_baseline()?;
+        let key = semantic_pin_key(pin);
+        let generation = pin.index_generation.to_string();
+        let pending = self.pending_generation_ids()?;
+        for retention::RetainedRun {
+            producer,
+            options,
+            attempted_generation,
+            ..
+        } in retention::slots(&db)?
+        {
+            let needed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_reimport WHERE revision_id=?1 AND producer=?2)",params![key,producer], |row| row.get(0))?;
+            if !needed || attempted_generation.as_deref() == Some(&generation) {
+                continue;
+            }
+            if retention::inputs_present(&options)?
+                && !pending
+                    .iter()
+                    .any(|(origin, id)| *origin == options.origin && *id == options.generation_id)
+            {
+                match self
+                    .enqueue_generated_semantic_import(Path::new(self.workspace_root()), &options)
+                {
+                    Ok(_) => {}
+                    Err(error) if nonterminal_storage_busy(&error) => return Err(error),
+                    // Missing input is already published as needs-reimport. Do not retry it
+                    // forever, and never rewrite the original captured identity.
+                    Err(error)
+                        if error
+                            .to_string()
+                            .starts_with("invalid_request: generation directory") => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            db.execute(
+                "UPDATE retained.retained_runs SET attempted_generation=?1 WHERE producer=?2",
+                params![generation, producer],
+            )?;
+        }
+        Ok(())
+    }
+}

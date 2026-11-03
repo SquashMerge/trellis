@@ -458,7 +458,12 @@ async function refreshStatus(followup = false) {
   }
   if (serial !== statusSerial || session !== epoch || status !== data) return;
   const stats = status.stats || {};
-  $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
+  const semantic = (status.semanticLanguages || []).map(row => {
+    const evidence = `${row.language}: semantic evidence ${row.semanticState}`;
+    return row.reimport?.state === "needsReimport"
+      ? `${evidence}; needs re-import — ${row.reimport.reason}. Re-import a current artifact.` : evidence;
+  }).join(" · ") || `Semantic evidence ${stats.semanticState || "unavailable"}`;
+  $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · ${semantic} · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
   $("diagnostics").textContent = describe(status.diagnostics || []);
   if (job && !activeJob(job)) showJob();
   staleMessage = ""; $("stale").hidden = true;

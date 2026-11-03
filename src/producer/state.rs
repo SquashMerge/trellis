@@ -251,6 +251,23 @@ impl StateDir {
         &self.path
     }
 
+    /// A SQLite leaf in the private state directory, absent or a private regular file.
+    pub(crate) fn sqlite_path(&self, name: &str) -> Result<PathBuf> {
+        let path = self.path.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) => ensure!(
+                meta.is_file()
+                    && !meta.file_type().is_symlink()
+                    && meta.uid() == unsafe { libc::geteuid() }
+                    && meta.mode() & 0o077 == 0,
+                "{UNSAFE_STATE}"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(path)
+    }
+
     pub fn run_dir(&self, run_id: &str) -> Result<PathBuf> {
         Ok(self.path.join("runs").join(generation_id(run_id)?))
     }
@@ -338,10 +355,14 @@ impl StateDir {
             .try_for_each(|name| remove_tree(&dir.join(name)))
     }
 
-    /// The import request is terminal: nothing but `run.json` remains.
+    /// The import request is terminal. Keep the SQL-published last successful
+    /// run's inputs in place; other generations retain only `run.json`.
     pub fn strip_to_record(&self, run_id: &str) -> Result<()> {
         self.end_producer_phase(run_id)?;
         let dir = self.run_dir(run_id)?;
+        if super::retention::held_dirs(self)?.contains(&dir) {
+            return Ok(());
+        }
         IMPORT_DIRS
             .iter()
             .try_for_each(|name| remove_tree(&dir.join(name)))
@@ -351,9 +372,11 @@ impl StateDir {
     /// `keep` (named by a queued or running generated import) is neither deleted nor counted:
     /// its inputs live until the request is terminal (T09).
     pub fn prune_runs(&self, keep: &BTreeSet<PathBuf>) -> Result<()> {
+        let mut keep = keep.clone();
+        keep.extend(super::retention::held_dirs(self)?);
         let mut terminal = Vec::new();
         for record in self.runs()? {
-            if record.state.is_terminal() && !kept(keep, &self.run_dir(&record.run_id)?) {
+            if record.state.is_terminal() && !kept(&keep, &self.run_dir(&record.run_id)?) {
                 terminal.push(record);
             }
         }
@@ -401,7 +424,9 @@ impl StateDir {
         this_daemon: &DaemonIdentity,
         keep: &BTreeSet<PathBuf>,
     ) -> Result<SweepReport> {
-        let kept = |dir: &Path| kept(keep, dir);
+        let mut keep = keep.clone();
+        keep.extend(super::retention::held_dirs(self)?);
+        let kept = |dir: &Path| kept(&keep, dir);
         let mut report = SweepReport::default();
         for (run_id, record) in self.scan_runs()? {
             let dir = self.run_dir(&run_id)?;
@@ -428,9 +453,9 @@ impl StateDir {
                 }
             };
             if record.state.is_terminal() {
-                // An abandoned run kept its import inputs for a pending request; they go
-                // once no request names the directory.
-                if record.outcome.as_deref() == Some("abandoned") && !kept(&dir) {
+                // Reclaim superseded successful inputs as well as abandoned requests.
+                // The current successful hold and queued/running requests stay intact.
+                if !kept(&dir) {
                     self.strip_to_record(&run_id)?;
                 }
                 continue;
@@ -465,7 +490,7 @@ impl StateDir {
             self.write_run_record(&record)?;
             report.abandoned_runs.push(run_id);
         }
-        self.prune_runs(keep)?;
+        self.prune_runs(&keep)?;
         let pickups = self.path.join("pickups");
         if let Ok(entries) = fs::read_dir(&pickups) {
             for entry in entries {

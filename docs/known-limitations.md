@@ -52,6 +52,12 @@ Every language has syntax evidence only until you [import semantic evidence](qui
 
 `scip-typescript` covers JavaScript only. Trellis doesn't index `.ts`, `.tsx` or `.jsx` files.
 
+### Semantic evidence after an upgrade
+
+An index rebuild does not make retained producer evidence fresh by itself. Trellis tries the last successful `producer run` batch again through normal validated import. Missing inputs, a changed native capture or incompatible producer pins leave a typed **semantic evidence needs re-import** reason in status, the web app and MCP. Trellis never runs the producer automatically.
+
+The first upgrade onto this behavior needs re-import because previous versions deleted successful run inputs. There is no old-index migration. Only one successful run's inputs are retained per producer, in place, and GC may remove them. This is not an artifact archive. See [upgrade recovery](quickstart.md#upgrading-trellis).
+
 ### Stale evidence after edits
 
 Semantic evidence is tied to one version of the checkout. After any edit to an indexed file or project config, the changed file's evidence is stale, and every other file's evidence, in every language, is [possibly stale](quickstart.md#stale-and-possibly-stale) until you re-import. Sequence falls back to syntax, and possibly stale calls aren't followed. Trellis never re-runs a producer by itself. With `producer pickup`, it only re-imports a file that has changed.

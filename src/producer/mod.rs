@@ -13,6 +13,7 @@ pub mod pickup_watch;
 pub mod plan;
 pub mod process_info;
 pub mod profiles;
+pub(crate) mod retention;
 pub mod run;
 pub mod state;
 pub mod worktree;

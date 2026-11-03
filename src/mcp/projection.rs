@@ -72,7 +72,7 @@ fn language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
             json!({"language":language,"nativeCoverageTier":"syntax","coverage":counts(row),
             "semantic":{"available":tier.semantic(),"producerId":tier.producer_id,
                 "freshness":if tier.freshness.is_empty() {"unavailable"} else {tier.freshness},
-                "coverage":counts(&tier.counts),"note":tier.note}})
+                "coverage":counts(&tier.counts),"note":tier.note,"reimport":tier.reimport}})
         })
         .collect()
 }
@@ -138,7 +138,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":6,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":7,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
@@ -170,7 +170,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 6);
+        assert_eq!(ready["data"]["toolVersion"], 7);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -184,7 +184,125 @@ mod tests {
             assert_eq!(language["semantic"]["available"], false);
             assert_eq!(language["semantic"]["producerId"], Value::Null);
             assert_eq!(language["semantic"]["freshness"], "unavailable");
+            assert_eq!(language["semantic"]["reimport"], Value::Null);
         }
+    }
+
+    #[test]
+    fn reimport_is_shared_by_describe_and_scope_without_claiming_evidence() {
+        let mut tiers = Tiers::default();
+        tiers[1].reimport = Some(crate::model::SemanticReimport::NeedsReimport {
+            reason: "producer profile pin changed".into(),
+        });
+        let rows = [[0; 5]; 4];
+        let described = describe(
+            &json!(1),
+            "project",
+            "ready",
+            None,
+            Some((rows, tiers.clone())),
+            None,
+            false,
+        );
+        let scope = language_status(&rows, &tiers);
+        let semantic = &described["data"]["languages"][1]["semantic"];
+        assert_eq!(
+            semantic["reimport"],
+            json!({
+                "state":"needsReimport", "reason":"producer profile pin changed"
+            })
+        );
+        assert_eq!(scope[1]["semantic"]["reimport"], semantic["reimport"]);
+        assert_eq!(semantic["available"], false);
+        assert_eq!(semantic["producerId"], Value::Null);
+        assert_eq!(semantic["freshness"], "unavailable");
+        assert_eq!(described["partial"], false);
+        assert!(syntax_only(&tiers, ["rust"]).is_some());
+        // Another producer's fresh publication may coexist with retained work.
+        tiers[1].producer_id = Some("other-producer".into());
+        tiers[1].freshness = "fresh";
+        tiers[1].counts = [1, 1, 0, 0, 0];
+        let fresh = language_status(&rows, &tiers);
+        assert_eq!(fresh[1]["semantic"]["available"], true);
+        assert_eq!(fresh[1]["semantic"]["reimport"], semantic["reimport"]);
+    }
+
+    #[test]
+    fn reimport_describe_and_find_outputs_satisfy_the_closed_catalog() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut tiers = Tiers::default();
+        tiers[1].reimport = Some(crate::model::SemanticReimport::NeedsReimport {
+            reason: "retained artifact no longer matches captured inputs".into(),
+        });
+        let basis = json!({
+            "indexGeneration":"123e4567-e89b-42d3-a456-426614174000", "indexRevision":1
+        });
+        let mut rows = [[0; 5]; 4];
+        rows[1] = [1, 1, 0, 0, 0];
+        let mut described = describe(
+            &json!(1),
+            "project",
+            "ready",
+            None,
+            Some((rows, tiers.clone())),
+            Some(basis),
+            false,
+        );
+        described["workspace"] = json!("/selected");
+        described["catchingUp"] = json!(false);
+        let found = find(
+            &json!(2),
+            super::find_tests::fixture(&[], rows, false),
+            &tiers,
+            std::path::Path::new("/selected"),
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            found["data"]["scopeCoverage"][1]["semantic"]["reimport"],
+            described["data"]["languages"][1]["semantic"]["reimport"]
+        );
+        let script = r#"
+const {createRequire} = require('node:module');
+const {readFileSync} = require('node:fs');
+const local = createRequire(process.cwd() + '/tests/mcp/package.json');
+const Ajv = local('ajv/dist/2020.js').default;
+const ajv = new Ajv({strict:false});
+const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json','utf8'));
+for (const [name, output] of JSON.parse(readFileSync(0,'utf8'))) {
+  const validate = ajv.compile(catalog.find(tool => tool.name === name).outputSchema);
+  if (!validate(output)) throw Error(name + ': ' + JSON.stringify(validate.errors));
+}
+"#;
+        let mut child = Command::new("node")
+            .args(["-e", script])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Node is required by tools/verify");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                &serde_json::to_vec(&json!([
+                    ["trellis_workspace_describe", described],
+                    ["trellis_find_symbols", found]
+                ]))
+                .unwrap(),
+            )
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// Rust selects a `rust-analyzer` import; the other languages have no producer.

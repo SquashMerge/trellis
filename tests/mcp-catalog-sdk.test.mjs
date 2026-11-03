@@ -62,7 +62,7 @@ test("the eleven-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 6);
+  assert.equal(describe.toolVersion.const, 7);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
@@ -119,7 +119,7 @@ test("native coverage labels do not claim the selected semantic tier", () => {
       $ref: "#/$defs/LanguageStatus" });
     const coverage = { selected: 2, complete: 1, partial: 1, failed: 0, unselected: 0 };
     const semantic = { available: true, producerId: "rust-analyzer", freshness: "fresh",
-      coverage, note: null };
+      coverage, note: null, reimport: null };
     if (tool.name === "trellis_workspace_describe") semantic.partialReasons = null;
     const status = { language: "rust", nativeCoverageTier: "syntax", coverage, semantic };
     assert.ok(validate(status), `${tool.name}: ${JSON.stringify(validate.errors)}`);
@@ -127,6 +127,14 @@ test("native coverage labels do not claim the selected semantic tier", () => {
     const { nativeCoverageTier, ...legacy } = status;
     assert.equal(validate({ ...legacy, evidenceTier: "syntax" }), false, tool.name);
     assert.equal(validate({ ...status, evidenceTier: "syntax" }), false, tool.name);
+    const reimport = { state: "needsReimport", reason: "producer profile pin changed" };
+    assert.ok(validate({ ...status, semantic: { ...semantic, reimport } }), tool.name);
+    const { reimport: _, ...missing } = semantic;
+    assert.equal(validate({ ...status, semantic: missing }), false, tool.name);
+    for (const invalid of [{ state: "fresh", reason: "changed" }, { state: "needsReimport" },
+      { ...reimport, extra: true }, { ...reimport, reason: "" }]) {
+      assert.equal(validate({ ...status, semantic: { ...semantic, reimport: invalid } }), false, tool.name);
+    }
   }
   // The field rename must not rewrite item-level evidence semantics.
   assert.deepEqual(tools[1].outputSchema.$defs.Symbol.properties.evidenceTier,

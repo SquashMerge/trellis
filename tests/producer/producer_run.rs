@@ -813,7 +813,7 @@ fn import_inputs_survive_until_the_request_is_terminal() {
     world.release_hook("enqueued.sock");
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(only_record_remains(&dir));
+    assert_eq!(entries(&dir), ["batch", "out", "run.json"]);
 }
 
 #[test]
@@ -839,7 +839,7 @@ fn unwritable_importing_record_does_not_fail_the_accepted_import() {
     let record = world.record(&run_id);
     assert_eq!(record["state"], "done");
     assert_eq!(record["requestId"], reply["import"]["requestId"]);
-    assert!(only_record_remains(&dir));
+    assert_eq!(entries(&dir), ["batch", "out", "run.json"]);
 }
 
 #[test]

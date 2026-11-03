@@ -1447,6 +1447,7 @@ impl DaemonState {
         if let Some(ref session) = retained
             && session.verify().is_ok()
         {
+            self.store.enqueue_retained_runs()?;
             #[cfg(test)]
             self.test_queue_current_phase.store(2, Ordering::Release);
             let gate_deferred = std::cell::Cell::new(false);
