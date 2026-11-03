@@ -118,6 +118,34 @@ impl Store {
         Ok(())
     }
 
+    /// Only an already published, still-held original run can use retained recovery admission.
+    /// A fresh producer run has no matching slot until its successful publication.
+    pub(crate) fn is_retained_reimport(
+        &self,
+        options: &crate::store::requests::GeneratedImportOptions,
+        producer: &str,
+        destination: IndexPin,
+    ) -> Result<bool> {
+        if options.origin != crate::semantic_batch::descriptor::GenerationOrigin::TrellisRun {
+            return Ok(false);
+        }
+        let db = self.cache_write()?;
+        match self.attach_retention(&db) {
+            Ok(_) => {}
+            Err(error) if retention::unavailable_catalog(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let needed: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM semantic_reimport WHERE revision_id=?1 AND producer=?2)",
+            params![semantic_pin_key(destination), producer],
+            |row| row.get(0),
+        )?;
+        Ok(needed
+            && retention::slots(&db)?
+                .iter()
+                .any(|slot| slot.producer == producer && slot.options == *options))
+    }
+
     /// Called by the single checkout worker after native reconciliation, before the FIFO.
     /// This is admission into the existing queue, not a second retry owner.
     pub(crate) fn enqueue_retained_runs(&self) -> Result<()> {

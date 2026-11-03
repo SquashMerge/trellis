@@ -425,7 +425,7 @@ pub struct SemanticImportOptions {
 /// The persisted options of a Trellis-written import. Only
 /// `Store::enqueue_generated_semantic_import` writes this shape, so an external caller can
 /// neither name a generation nor reach the generated input root.
-#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct GeneratedImportOptions {
     pub version: u8,

@@ -565,8 +565,16 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: std::env::var("TRELLIS_PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(8), ..ProptestConfig::default() })]
     #[test]
     fn decision_0006_multi_slot_histories(ops in prop::collection::vec(operation(), 1..15)) {
+        let started = std::env::var_os("TRELLIS_RETENTION_TRACE").map(|_| {
+            eprintln!("retention history start: {ops:?}");
+            std::time::Instant::now()
+        });
         let mut m = Machine::new();
         for op in ops { m.apply(op); }
+        drop(m);
+        if let Some(started) = started {
+            eprintln!("retention history complete: {:.3}s", started.elapsed().as_secs_f64());
+        }
     }
 }
 
