@@ -41,16 +41,27 @@ impl World {
     }
 
     fn with_hook(hook: Option<&Path>) -> Self {
+        Self::with_named_hook("TRELLIS_TEST_SEMANTIC_CRASH_AFTER_PUBLISH_SOCKET", hook)
+    }
+
+    fn with_named_hook(name: &str, hook: Option<&Path>) -> Self {
         let stub = tempfile::tempdir().unwrap();
         let marker = stub.path().join("invocations");
         let mut env = support::stub_env(stub.path(), &json!({"marker":marker}));
         if let Some(hook) = hook {
-            env.push((
-                "TRELLIS_TEST_SEMANTIC_CRASH_AFTER_PUBLISH_SOCKET".into(),
-                hook.to_string_lossy().into_owned(),
-            ));
+            env.push((name.into(), hook.to_string_lossy().into_owned()));
         }
-        let checkout = start_checkout(|root| uniform_workspace(root, &["javascript"], 1), &env);
+        let checkout = start_checkout(
+            |root| {
+                uniform_workspace(root, &["javascript"], 1);
+                fs::write(
+                    root.join("javascript/u00000.js"),
+                    "function u00000() { g(); }\nfunction g() {}\n",
+                )
+                .unwrap();
+            },
+            &env,
+        );
         let roots =
             TopologyRoots::isolated_for_tests(cache_dir(&checkout.home), data_dir(&checkout.home));
         let identity = WorkspaceIdentity::discover(Some(&checkout.root), &checkout.root).unwrap();
@@ -72,7 +83,17 @@ impl World {
     fn spawn_run_variant(&self, variant: u32) -> Child {
         let mut fixture =
             BatchFixture::from_published(&self.index, &self.checkout.root).synthetic();
-        let docs = fixture.paths("javascript");
+        let docs = fixture
+            .paths("javascript")
+            .into_iter()
+            .map(|doc| {
+                doc.occurrence(&[0, 9, 15], &[], "pkg u00000().", 1)
+                    .occurrence(&[0, 20, 21], &[], "pkg g().", 0)
+                    .occurrence(&[1, 9, 10], &[], "pkg g().", 1)
+                    .symbol("pkg u00000().", 17, &[])
+                    .symbol("pkg g().", 17, &[])
+            })
+            .collect::<Vec<_>>();
         fixture.artifact("javascript", docs.clone());
         let bytes = edit_scip(&fixture.scip_bytes("javascript", &docs), |index| {
             let metadata = index.metadata.as_mut().unwrap();
@@ -193,6 +214,49 @@ impl World {
     fn invocation_count(&self) -> usize {
         fs::read_to_string(&self.marker).map_or(0, |text| text.lines().count())
     }
+
+    fn assert_recovered_basis(&self, status: &Value, original: &Value) {
+        let js = status["semanticLanguages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["language"] == "javascript")
+            .unwrap();
+        assert_eq!(js["reimport"], Value::Null);
+        assert_eq!(js["semanticProducerId"], PRODUCER);
+        assert_eq!(js["coverage"]["complete"], 1);
+        assert_eq!(js["coverage"]["failed"], 0);
+        assert!(
+            js["internal"].as_u64().unwrap() > 0,
+            "recovered semantic call target must remain usable"
+        );
+        // Same source bytes with a different captured revision retain conservative freshness.
+        assert_eq!(js["semanticState"], "stale");
+        let key = format!(
+            "pin:v1:{}:{}",
+            status["revision"]["indexGeneration"].as_str().unwrap(),
+            status["revision"]["indexRevision"].as_u64().unwrap()
+        );
+        let db =
+            Connection::open_with_flags(&self.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let (proofs, conservative, changed): (i64, i64, i64) = db.query_row(
+            "SELECT COUNT(*),SUM(p.freshness='possiblyStale'),SUM(p.freshness='stale') FROM semantic_provenance p JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.selected=1",
+            rusqlite::params![key, PRODUCER], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert!(
+            proofs > 0,
+            "recovery must select nonempty semantic evidence"
+        );
+        assert_eq!(proofs, conservative);
+        assert_eq!(changed, 0);
+        let basis_revisions: Vec<String> = db.prepare(
+            "SELECT DISTINCT b.captured_native_revision_id FROM semantic_basis b JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.selected=1",
+        ).unwrap().query_map(rusqlite::params![key, PRODUCER], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            basis_revisions,
+            vec![original["sourceRevision"].as_str().unwrap().to_owned()]
+        );
+    }
 }
 
 #[test]
@@ -201,6 +265,22 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
 
     let world = World::new();
     let (_, original, options) = world.run_once();
+    let descriptor: Value = serde_json::from_slice(&original).unwrap();
+    let run_dir = Path::new(options["descriptor"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let original_pages: Vec<_> = descriptor["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|page| {
+            let path = run_dir.join(page["relativePath"].as_str().unwrap());
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
     let old = world.status()["revision"].clone();
     support::stop_daemon(&world.checkout.home);
     // A previous attempt for this generation must not suppress a new capture identity.
@@ -248,15 +328,44 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
         trellis::native_ids::digest(b"", &fs::read(&binary).unwrap()),
         trellis::native_ids::digest(b"", &fs::read(env!("CARGO_BIN_EXE_trellis")).unwrap())
     );
+    let socket = world._stub.path().join("after-startup.sock");
+    let index = rebuilt_cli()
+        .env("TRELLIS_TEST_RETAINED_AFTER_STARTUP_SOCKET", &socket)
+        .args(["index", "--workspace"])
+        .arg(&world.checkout.root)
+        .args(["--max-file-bytes", "1048576"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    trellis::testing::wait_until("startup capture held before retained admission", || {
+        socket.with_extension("ready").exists()
+    });
+    let startup_native = native_identity();
+    assert_ne!(startup_native, old_native);
+    trellis::testing::wait_until(
+        "post-start index accepted ahead of retained recovery",
+        || {
+            let db = Connection::open_with_flags(&world.requests, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+            db.query_row("SELECT EXISTS(SELECT 1 FROM requests WHERE request_kind='index' AND state='queued')", [], |row| row.get::<_, bool>(0)).unwrap()
+        },
+    );
+    assert_eq!(
+        world.generated_rows().len(),
+        1,
+        "retained input not enqueued before hook release"
+    );
+    std::os::unix::net::UnixStream::connect(&socket).unwrap();
     reply(
         "index under changed executable",
-        rebuilt_cli()
-            .args(["index", "--workspace"])
-            .arg(&world.checkout.root)
-            .output()
-            .unwrap(),
+        index.wait_with_output().unwrap(),
     );
-    assert_ne!(native_identity(), old_native);
+    assert_ne!(
+        native_identity(),
+        startup_native,
+        "own post-start native capture must supersede startup before retained import"
+    );
     trellis::testing::wait_until(
         "new native capture identity readmits retained input",
         || {
@@ -288,32 +397,24 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
         .iter()
         .find(|row| row["language"] == "javascript")
         .unwrap();
-    if rows[1].0 == "done" {
-        assert_eq!(js["reimport"], Value::Null);
-        assert!(matches!(
-            js["semanticState"].as_str(),
-            Some("fresh" | "possiblyStale")
-        ));
-    } else {
-        assert_eq!(js["reimport"]["state"], "needsReimport");
-        assert!(
-            js["reimport"]["reason"]
-                .as_str()
-                .is_some_and(|reason| !reason.is_empty())
-        );
-        assert_ne!(js["semanticState"], "fresh");
-    }
+    assert_eq!(
+        rows[1].0, "done",
+        "retained recovery failed after own post-start capture: {rows:?}"
+    );
+    assert_eq!(js["reimport"], Value::Null);
+    world.assert_recovered_basis(&status, &descriptor);
     assert_eq!(
         fs::read(options["descriptor"].as_str().unwrap()).unwrap(),
         original
     );
-    // Restarting the same binary/capture identity must not retry a refused import.
+    // Restarting the same binary/capture identity must not repeat successful recovery.
     support::stop_daemon(&world.checkout.home);
     reply(
         "unchanged rebuilt restart",
         rebuilt_cli()
             .args(["index", "--workspace"])
             .arg(&world.checkout.root)
+            .args(["--max-file-bytes", "1048576"])
             .output()
             .unwrap(),
     );
@@ -340,6 +441,7 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
             .cli()
             .args(["index", "--workspace"])
             .arg(&world.checkout.root)
+            .args(["--max-file-bytes", "1048576"])
             .output()
             .unwrap(),
     );
@@ -347,10 +449,275 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
         let rows = world.generated_rows();
         rows.len() == 3 && matches!(rows[2].0.as_str(), "done" | "failed")
     });
-    assert_eq!(world.generated_rows()[2].2, options);
+    let returned = world.generated_rows();
     assert_eq!(
-        world.status()["revision"]["indexGeneration"],
+        returned[2].0, "done",
+        "returning executable recovery failed: {returned:?}"
+    );
+    assert_eq!(returned[2].2, options);
+    let returned_status = world.status();
+    let returned_js = returned_status["semanticLanguages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["language"] == "javascript")
+        .unwrap();
+    assert_eq!(returned_js["reimport"], Value::Null);
+    world.assert_recovered_basis(&returned_status, &descriptor);
+    assert_eq!(
+        returned_status["revision"]["indexGeneration"],
         old["indexGeneration"]
+    );
+    assert_eq!(world.invocation_count(), 1);
+    for (path, bytes) in original_pages {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            bytes,
+            "recovery must not remint source or coverage pages"
+        );
+    }
+}
+
+#[test]
+fn retained_recovery_refuses_changed_source_pages_before_binding_destination() {
+    use std::io::Write;
+
+    let world = World::new();
+    let (_, original, options) = world.run_once();
+    let old_generation = world.status()["revision"]["indexGeneration"].clone();
+    support::stop_daemon(&world.checkout.home);
+    let binary = world._stub.path().join("trellis-changed-source");
+    fs::copy(env!("CARGO_BIN_EXE_trellis"), &binary).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&binary)
+        .unwrap()
+        .write_all(b"TRELLIS-RETAINED-SOURCE-PARITY")
+        .unwrap();
+    let socket = world._stub.path().join("source-before-bind.sock");
+    let mut cli = trellis::testing::owned(std::process::Command::new(&binary));
+    let index = cli
+        .env("HOME", &world.checkout.home)
+        .env(
+            "TRELLIS_TEST_DAEMON_PID_FILE",
+            world.checkout.home.join("daemon.pid"),
+        )
+        .env("TRELLIS_TEST_RETAINED_AFTER_STARTUP_SOCKET", &socket)
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .args(["index", "--workspace"])
+        .arg(&world.checkout.root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    trellis::testing::wait_until("new binary H held before recovery enqueue", || {
+        socket.with_extension("ready").exists()
+    });
+    trellis::testing::wait_until("own native request accepted before source edit", || {
+        let db =
+            Connection::open_with_flags(&world.requests, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM requests WHERE request_kind='index' AND state='queued')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    });
+    fs::write(
+        world.checkout.root.join("javascript/u00000.js"),
+        "function changed() { g(); }\nfunction g() {}\n",
+    )
+    .unwrap();
+    std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    reply(
+        "changed-source rebuilt index",
+        index.wait_with_output().unwrap(),
+    );
+    trellis::testing::wait_until("source parity refusal reaches terminal row", || {
+        let rows = world.generated_rows();
+        rows.len() == 2 && matches!(rows[1].0.as_str(), "done" | "failed")
+    });
+    let rows = world.generated_rows();
+    assert_eq!(rows[1].0, "failed");
+    assert_eq!(
+        rows[1].1,
+        "stale_basis: retained source pages no longer match"
+    );
+    assert_eq!(rows[1].2, options);
+    assert_eq!(
+        fs::read(options["descriptor"].as_str().unwrap()).unwrap(),
+        original
+    );
+    let db = Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let generation: String = db
+        .query_row("SELECT index_generation FROM index_metadata", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(generation, old_generation.as_str().unwrap());
+    let selected: i64 = db.query_row("SELECT COUNT(*) FROM semantic_coverage c JOIN index_metadata m ON c.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE selected=1", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        selected, 0,
+        "source mismatch must not publish a retained overlay"
+    );
+    let reasons: i64 = db.query_row("SELECT COUNT(*) FROM semantic_reimport r JOIN index_metadata m ON r.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision", [], |row| row.get(0)).unwrap();
+    assert!(reasons > 0);
+    assert_eq!(world.invocation_count(), 1);
+}
+
+#[test]
+fn fresh_trellis_run_keeps_strict_basis_without_a_successful_retention_slot() {
+    let hooks = tempfile::tempdir().unwrap();
+    let socket = hooks.path().join("claim.sock");
+    let world = World::with_named_hook(
+        "TRELLIS_TEST_SEMANTIC_CRASH_AFTER_CLAIM_SOCKET",
+        Some(&socket),
+    );
+    let run = world.spawn_run();
+    trellis::testing::wait_until("fresh generated request claimed before admission", || {
+        socket.exists()
+    });
+    assert_eq!(world.generated_rows()[0].0, "running");
+    fs::write(
+        world.checkout.root.join("javascript/u00000.js"),
+        "function changed() { other(); }\n",
+    )
+    .unwrap();
+    fs::write(socket.with_extension("done"), []).unwrap();
+    std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let output = run.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let rows = world.generated_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "failed");
+    assert_eq!(rows[0].1, "stale_basis: head revision changed");
+    assert_eq!(rows[0].2["origin"], "trellisRun");
+    assert_eq!(world.invocation_count(), 1);
+}
+
+#[test]
+fn retained_recovery_does_not_follow_a_later_native_change_at_cutoff() {
+    let hooks = tempfile::tempdir().unwrap();
+    let socket = hooks.path().join("cutoff.sock");
+    let after_startup = hooks.path().join("after-startup.sock");
+    let world = World::with_named_hook("TRELLIS_TEST_SEMANTIC_CUTOFF_SOCKET", Some(&socket));
+    let (_, original, options) = world.run_once();
+    support::stop_daemon(&world.checkout.home);
+    use std::io::Write;
+    let binary = world._stub.path().join("trellis-cutoff");
+    fs::copy(env!("CARGO_BIN_EXE_trellis"), &binary).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&binary)
+        .unwrap()
+        .write_all(b"TRELLIS-RETAINED-CUTOFF")
+        .unwrap();
+    let rebuilt_cli = || {
+        let mut cli = trellis::testing::owned(std::process::Command::new(&binary));
+        cli.env("HOME", &world.checkout.home)
+            .env(
+                "TRELLIS_TEST_DAEMON_PID_FILE",
+                world.checkout.home.join("daemon.pid"),
+            )
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("XDG_DATA_HOME");
+        cli
+    };
+    let index = rebuilt_cli()
+        .env("TRELLIS_TEST_SEMANTIC_CUTOFF_SOCKET", &socket)
+        .env("TRELLIS_TEST_RETAINED_AFTER_STARTUP_SOCKET", &after_startup)
+        .args(["index", "--workspace"])
+        .arg(&world.checkout.root)
+        .args(["--max-file-bytes", "1048576"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    trellis::testing::wait_until("startup held before retained recovery enqueue", || {
+        after_startup.with_extension("ready").exists()
+    });
+    trellis::testing::wait_until("index accepted ahead of retained cutoff", || {
+        let db =
+            Connection::open_with_flags(&world.requests, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM requests WHERE request_kind='index' AND state='queued')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    });
+    let descriptor: Value = serde_json::from_slice(&original).unwrap();
+    let db = Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let captured: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM native_revisions r WHERE native_revision_id=?1 AND NOT EXISTS(SELECT 1 FROM revision_capture_inputs WHERE revision_id=r.id AND input_key IN ('__released:v1','__pending_release:v1')))",
+        [descriptor["sourceRevision"].as_str().unwrap()], |row| row.get(0),
+    ).unwrap();
+    assert!(
+        captured,
+        "original capture must still be retained before recovery admission"
+    );
+    drop(db);
+    std::os::unix::net::UnixStream::connect(&after_startup).unwrap();
+    trellis::testing::wait_until("retained recovery bound before publication cutoff", || {
+        let rows = world.generated_rows();
+        assert!(
+            !rows
+                .get(1)
+                .is_some_and(|row| matches!(row.0.as_str(), "done" | "failed")),
+            "recovery terminalized before cutoff hook: {rows:?}"
+        );
+        socket.with_extension("ready").exists()
+    });
+    assert_eq!(world.generated_rows()[1].0, "running");
+    fs::write(
+        world.checkout.root.join("javascript/u00000.js"),
+        "function changed() { later(); }\n",
+    )
+    .unwrap();
+    std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    reply(
+        "index during retained cutoff",
+        index.wait_with_output().unwrap(),
+    );
+    trellis::testing::wait_until("later native change refuses retained request", || {
+        world.generated_rows()[1].0 == "failed"
+    });
+    // The later native identity can trigger one separate retained attempt under the
+    // existing owner policy; it cannot move this terminal request backwards.
+    trellis::testing::wait_until(
+        "new native identity gets its one source-parity refusal",
+        || {
+            let rows = world.generated_rows();
+            rows.len() == 3 && rows[2].0 == "failed"
+        },
+    );
+    let rows = world.generated_rows();
+    assert_eq!(rows[1].1, "stale_basis: head revision changed");
+    assert_eq!(
+        rows[2].1,
+        "stale_basis: retained source pages no longer match"
+    );
+    assert_eq!(rows[1].2, options);
+    assert_eq!(rows[2].2, options);
+    support::stop_daemon(&world.checkout.home);
+    reply(
+        "unchanged native identity restart after refusal",
+        rebuilt_cli()
+            .args(["index", "--workspace"])
+            .arg(&world.checkout.root)
+            .args(["--max-file-bytes", "1048576"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        world.generated_rows(),
+        rows,
+        "unchanged identity cannot repeat or reverse either refusal"
+    );
+    assert_eq!(
+        fs::read(options["descriptor"].as_str().unwrap()).unwrap(),
+        original
     );
     assert_eq!(world.invocation_count(), 1);
 }
@@ -425,7 +792,10 @@ fn upgraded_changed_sources_keep_syntax_and_report_reimport_without_rerunning_pr
         rows[1].0, "failed",
         "mismatched input was published: {rows:?}"
     );
-    assert!(!rows[1].1.is_empty());
+    assert_eq!(
+        rows[1].1,
+        "capture_unavailable: captured revision not retained"
+    );
     let status = world.status();
     assert!(status["stats"]["symbols"].as_u64().unwrap() > 0);
     let js = status["semanticLanguages"]
