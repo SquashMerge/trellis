@@ -559,6 +559,7 @@ impl PickupOwner {
                         workspace: Path::new(store.workspace_root()),
                         dir: &dir,
                         generation: batch::pickup_generation(&generation_id),
+                        snapshot: false,
                     },
                 );
                 Ok((revision, Step::Write(written)))

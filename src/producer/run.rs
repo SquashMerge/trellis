@@ -11,10 +11,17 @@ use super::profiles::{self, Stub};
 use super::state::{DaemonIdentity, RunRecord, RunState, StateDir, SweepReport, now_millis};
 use super::worktree;
 use super::{
-    Diagnostics, NOT_CANCELLABLE, NOT_FOUND, PLAN_CHANGED, PRODUCER_BUSY, ProcessIdentity,
-    ROOT_CHANGED,
+    Diagnostics, GroupStatus, NOT_CANCELLABLE, NOT_FOUND, PLAN_CHANGED, PRODUCER_BUSY,
+    ProcessIdentity, ROOT_CHANGED,
 };
-use crate::{http::DaemonState, semantic_batch::descriptor::GenerationOrigin, store::Store};
+use crate::{
+    http::DaemonState,
+    semantic_batch::{
+        BatchCounters, BatchLimits, StageInput, StageOwner, descriptor::GenerationOrigin,
+        stage_batch,
+    },
+    store::Store,
+};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -97,6 +104,8 @@ struct Control {
     reason: Option<CancelReason>,
     request_id: Option<String>,
     process: Option<ProcessIdentity>,
+    /// What the ended producer phase established about the group.
+    group_status: Option<GroupStatus>,
 }
 
 /// The one run of a checkout that is in flight.
@@ -107,8 +116,8 @@ struct ActiveRun {
     plan_sha256: String,
     source_revision: String,
     created_at: u64,
-    /// Read by the worktree writer and the monitor loop.
-    cancel: AtomicBool,
+    /// Read by the worktree writer, the monitor loop and the snapshot preflight.
+    cancel: Arc<AtomicBool>,
     control: Mutex<Control>,
 }
 
@@ -185,13 +194,9 @@ impl Drop for RunCleanup<'_> {
         if !self.armed {
             return;
         }
-        let (process, enqueued) = {
-            let mut control = self.run.control();
-            (control.process.take(), control.request_id.is_some())
-        };
-        if let Some(process) = process {
-            unsafe { libc::killpg(process.pgid, libc::SIGKILL) };
-        }
+        // The producer's group was stopped by the leader's owner in `spawn_producer`, the only
+        // code that can prove it still holds the group ID; nothing here signals a recorded group.
+        let enqueued = self.run.control().request_id.is_some();
         // The queued import still reads `out/` and `batch/`, and its record says so.
         if enqueued {
             return;
@@ -272,6 +277,17 @@ fn test_fault(variable: &str) -> Result<()> {
 #[cfg(not(all(feature = "test-support", unix)))]
 fn test_fault(_variable: &str) -> Result<()> {
     Ok(())
+}
+
+/// Test-support switch: whether `variable` is set.
+#[cfg(all(feature = "test-support", unix))]
+fn test_flag(variable: &str) -> bool {
+    std::env::var_os(variable).is_some()
+}
+
+#[cfg(not(all(feature = "test-support", unix)))]
+fn test_flag(_variable: &str) -> bool {
+    false
 }
 
 /// Test-support hold point: bind the socket, announce it, and wait for the
@@ -405,6 +421,67 @@ impl Run<'_> {
         Ok(true)
     }
 
+    /// Admits the frozen batch in full, as the import will: the descriptor, every source and
+    /// coverage page (a validated disposition for every requested document), the snapshot's
+    /// digest, its full decode and the closure that every covered document was decoded. The
+    /// stage is discarded; nothing is published.
+    fn preflight(&self, written: &batch::WrittenBatch) -> Result<()> {
+        test_hook("TRELLIS_TEST_PRODUCER_PREFLIGHT_SOCKET");
+        let store = self.ctx.store;
+        let input = StageInput::generated(
+            Path::new(store.workspace_root()),
+            GenerationOrigin::TrellisRun,
+            &self.active.run_id,
+            &self.dir,
+        )?;
+        let limits = BatchLimits::effective().map_err(|error| anyhow::anyhow!("{error}"))?;
+        stage_batch(
+            store,
+            &input,
+            StageOwner {
+                request_id: &self.active.run_id,
+                incarnation: "preflight",
+            },
+            &written.descriptor,
+            &written.descriptor_sha256,
+            &limits,
+            &mut BatchCounters::default(),
+            &self.active.cancel,
+        )
+        .map(drop)
+    }
+
+    /// A snapshot that fails its preflight is the producer's output, refused with the code
+    /// the import would have reported.
+    fn preflight_finish(&self, error: &anyhow::Error, diagnostics: &Diagnostics) -> Finish {
+        use crate::scip_raw::ScipCaptureError;
+        let finish = match error.downcast_ref::<ScipCaptureError>() {
+            _ if self.cancelled() => return self.cancel_finish(Some(diagnostics)),
+            Some(ScipCaptureError::LimitExceeded(detail)) => {
+                Finish::failed("limit_exceeded", format!("limit_exceeded: {detail}"))
+            }
+            Some(ScipCaptureError::InvalidArtifact(detail)) => Finish::failed(
+                "producer_output_invalid",
+                format!("invalid_artifact: {detail}"),
+            ),
+            Some(ScipCaptureError::InvalidAdmission(detail)) => Finish::failed(
+                "producer_output_invalid",
+                format!("invalid_request: {detail}"),
+            ),
+            // Claim proofs the artifact's decoded facts could not establish.
+            Some(
+                failure @ (ScipCaptureError::MissingProof
+                | ScipCaptureError::NonUniqueProof
+                | ScipCaptureError::DigestCollision),
+            ) => Finish::failed(
+                "producer_output_invalid",
+                format!("invalid_artifact: {}", failure.detail()),
+            ),
+            _ => return self.finish_from_error(error, Some(diagnostics)),
+        };
+        finish.with(diagnostics)
+    }
+
     fn execute(&mut self) -> Result<Finish> {
         let store = self.ctx.store;
         let prepared = self.prepared;
@@ -468,22 +545,41 @@ impl Run<'_> {
             };
             let mut hooks = Hooks {
                 spawned: Some(&mut on_spawn),
+                ..Hooks::default()
             };
             exec::spawn_producer(&spec, &limits, &active.cancel, &mut hooks)
         };
-        self.active.control().process = None;
+        let started = self.active.control().process.take().is_some();
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
+                // A started producer whose leader could no longer be observed was not signalled.
+                if started {
+                    self.active.control().group_status = Some(GroupStatus::Unknown);
+                    let _ = self
+                        .recorder
+                        .update(|record| record.group_status = Some(GroupStatus::Unknown));
+                }
                 let _ = writeln_stderr(&format!("producer did not start: {error:#}"));
                 return Ok(Finish::failed("producer_failed", "producer_failed"));
             }
         };
-        // The producer phase is over: the group is empty, so what only it
-        // needed goes now. The log tails are in the diagnostics.
+        let mut diagnostics = outcome.diagnostics;
+        if test_flag("TRELLIS_TEST_PRODUCER_GROUP_UNKNOWN") {
+            diagnostics.group_status = GroupStatus::Unknown;
+        }
+        if test_flag("TRELLIS_TEST_PRODUCER_GROUP_EMPTY") {
+            diagnostics.group_status = GroupStatus::Empty;
+        }
+        let group_status = diagnostics.group_status;
+        self.active.control().group_status = Some(group_status);
+        let _ = self
+            .recorder
+            .update(|record| record.group_status = Some(group_status));
+        // The producer phase is over, so what only it needed goes now. The log tails are in
+        // the diagnostics.
         let _ = self.recorder.state.end_producer_phase(&run_id);
         test_hook("TRELLIS_TEST_PRODUCER_EXITED_SOCKET");
-        let diagnostics = outcome.diagnostics;
         match outcome.ending {
             Ending::Cancelled => return Ok(self.cancel_finish(Some(&diagnostics))),
             Ending::TimedOut => {
@@ -513,6 +609,10 @@ impl Run<'_> {
         if !self.transition(RunState::WritingBatch)? {
             return Ok(self.cancel_finish(Some(&diagnostics)));
         }
+        // A group not proven empty may still hold a producer process that rewrites
+        // `out/index.scip`: the batch then names a snapshot only Trellis writes, admitted in
+        // full before the queue accepts it (owner ruling 2026-11-02, #624).
+        let frozen = group_status != GroupStatus::Empty;
         let generation = batch::run_generation(
             &profiles::run_generation(&row, &prepared.resolution),
             GenerationOrigin::TrellisRun,
@@ -532,6 +632,7 @@ impl Run<'_> {
                     workspace: Path::new(store.workspace_root()),
                     dir: &self.dir,
                     generation,
+                    snapshot: frozen,
                 },
             )
         });
@@ -539,6 +640,9 @@ impl Run<'_> {
             Ok(written) => written,
             Err(error) => return Ok(self.finish_from_error(&error, Some(&diagnostics))),
         };
+        if frozen && let Err(error) = self.preflight(&written) {
+            return Ok(self.preflight_finish(&error, &diagnostics));
+        }
         let options = import::options_for(&written, GenerationOrigin::TrellisRun, &run_id)?;
 
         // Enqueue under the control lock: a cancel either lands before it and
@@ -618,6 +722,7 @@ impl ProducerOwner {
             "createdAt": run.created_at,
             "requestId": control.request_id,
             "process": control.process,
+            "groupStatus": control.group_status,
         })
     }
 
@@ -689,13 +794,14 @@ impl ProducerOwner {
             plan_sha256: request.plan_sha256.clone(),
             source_revision: prepared.basis.source_revision.clone(),
             created_at: now_millis(),
-            cancel: AtomicBool::new(false),
+            cancel: Arc::new(AtomicBool::new(false)),
             control: Mutex::new(Control {
                 phase: RunState::Materializing,
                 finished: false,
                 reason: None,
                 request_id: None,
                 process: None,
+                group_status: None,
             }),
         });
         self.install(&active)?;
@@ -729,6 +835,7 @@ impl ProducerOwner {
             created_at: active.created_at,
             finished_at: None,
             diagnostics: None,
+            group_status: None,
         };
         state.write_run_record(&record)?;
         let mut run = Run {
@@ -805,13 +912,14 @@ mod tests {
             plan_sha256: "0".repeat(64),
             source_revision: "revision".to_owned(),
             created_at: 1,
-            cancel: AtomicBool::new(false),
+            cancel: Arc::new(AtomicBool::new(false)),
             control: Mutex::new(Control {
                 phase: RunState::Materializing,
                 finished: false,
                 reason: None,
                 request_id: None,
                 process: None,
+                group_status: None,
             }),
         })
     }

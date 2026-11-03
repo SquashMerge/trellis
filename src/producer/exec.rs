@@ -3,7 +3,7 @@
 //! run's diagnostics report how it ended.
 
 use super::process_info;
-use super::{Diagnostics, ExitReport, ProcessIdentity};
+use super::{Diagnostics, ExitReport, GroupStatus, ProcessIdentity};
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeMap,
@@ -132,6 +132,8 @@ pub struct ProcessOutcome {
 pub struct Hooks<'a> {
     /// The child is running and its group identity is known.
     pub spawned: Option<&'a mut dyn FnMut(&ProcessIdentity)>,
+    /// A group signal is about to be sent; the leader is still unreaped.
+    pub signal: Option<&'a mut dyn FnMut(i32)>,
 }
 
 /// Output of one stream: bytes seen, bytes written to disk, and the tail.
@@ -252,42 +254,198 @@ fn artifact_len(spec: &ProducerSpec) -> u64 {
     fs::metadata(&spec.artifact).map_or(0, |meta| meta.len())
 }
 
-/// SIGTERM, the grace period, SIGKILL, then wait for the group to empty.
-/// Returns the leader's status and whether any group member survived.
-fn terminate(child: &mut Child, pgid: i32, limits: &Limits) -> (Option<ExitStatus>, bool) {
-    unsafe { libc::killpg(pgid, libc::SIGTERM) };
-    let deadline = Instant::now() + limits.grace;
-    while Instant::now() < deadline {
-        let leader_gone = child.try_wait().ok().flatten().is_some();
-        if leader_gone && !process_info::group_exists(pgid) {
-            break;
+/// The producer's leader, owned until it is reaped (#624). While it is unreaped,
+/// running or a zombie, its PID and therefore its group ID cannot be reused, so a
+/// group signal reaches only the producer's group. Its exit is observed with
+/// `waitid(WNOWAIT)`, which leaves it a zombie; it is reaped only after the last
+/// group signal. Nothing else in the process reaps it: no production code waits
+/// for any child (`waitpid(-1)`) or installs a SIGCHLD reaper, which a static
+/// check enforces, and a spawn is refused while SIGCHLD is ignored.
+struct Leader<'h> {
+    child: Child,
+    pgid: i32,
+    /// Reaped, or its wait status can no longer be observed: the group ID may be
+    /// reused and the group is never signalled again.
+    released: bool,
+    kill_wait: Duration,
+    on_signal: Option<&'h mut dyn FnMut(i32)>,
+}
+
+/// What a group signal returned: `Ok` or the errno.
+pub(crate) type Sent = std::result::Result<(), i32>;
+
+impl Leader<'_> {
+    /// Whether the leader has exited, without reaping it. An error means its
+    /// wait status is gone (another reaper took it): ownership is lost.
+    fn exited(&mut self) -> std::io::Result<bool> {
+        if self.released {
+            return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pgid as libc::id_t,
+                    &raw mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                return Ok(unsafe { info.si_pid() } == self.pgid);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                self.released = true;
+                return Err(error);
+            }
+        }
     }
-    // The leader may have exited while descendants still run.
-    unsafe { libc::killpg(pgid, libc::SIGKILL) };
-    // A SIGKILLed leader is reaped at once; the bound only covers a leader
-    // stuck in the kernel.
-    let reap_deadline = Instant::now() + limits.kill_wait;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Err(_) => break None,
-            Ok(None) if Instant::now() >= reap_deadline => break None,
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+
+    /// Signal the group, only while the leader is held.
+    fn signal(&mut self, signal: i32) -> Sent {
+        if self.released {
+            return Err(libc::ESRCH);
         }
+        if let Some(hook) = self.on_signal.as_mut() {
+            hook(signal);
+        }
+        if unsafe { libc::killpg(self.pgid, signal) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO))
+        }
+    }
+
+    /// Wait up to `bound` for the leader to exit; false on timeout or lost ownership.
+    fn wait_exit(&mut self, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        loop {
+            match self.exited() {
+                Ok(true) => return true,
+                Err(_) => return false,
+                Ok(false) if Instant::now() >= deadline => return false,
+                Ok(false) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    /// Reap the exited leader. The group is never signalled after this.
+    fn reap(&mut self) -> Option<ExitStatus> {
+        self.released = true;
+        self.child.wait().ok()
+    }
+}
+
+impl Drop for Leader<'_> {
+    /// An early return or an unwind while the leader is still held: stop its
+    /// group, then reap the leader once it has exited.
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let _ = self.signal(libc::SIGKILL);
+        if self.wait_exit(self.kill_wait) {
+            self.reap();
+        }
+    }
+}
+
+/// Whether `pgid`'s only listed member is its leader; `None` when the listing
+/// does not show the leader, which is held unreaped and so must be listed.
+fn only_leader(pgid: i32) -> Option<bool> {
+    let members = process_info::group_members(pgid);
+    members
+        .contains(&pgid)
+        .then(|| members.iter().all(|pid| *pid == pgid))
+}
+
+/// The group status from the final SIGKILL, whether the leader exited, and the
+/// listing after the kill wait. Survival is proven by a live leader or another
+/// listed member; an empty group only by a signal that reached the group and a
+/// listing of the leader alone. A refused signal (macOS answers EPERM when the
+/// only member is the zombie leader) or an unusable listing is unknown.
+pub(crate) fn group_status(
+    final_kill: Sent,
+    leader_exited: bool,
+    only: Option<bool>,
+) -> GroupStatus {
+    match (final_kill, leader_exited, only) {
+        (_, false, _) | (_, _, Some(false)) => GroupStatus::Survived,
+        (Ok(()), true, Some(true)) => GroupStatus::Empty,
+        _ => GroupStatus::Unknown,
+    }
+}
+
+/// SIGTERM and the grace period unless only the exited leader is left, then the
+/// final SIGKILL and the kill wait while the leader is still held, and only then
+/// the reap. Returns the leader's status and what was established about the group.
+fn terminate(leader: &mut Leader<'_>, limits: &Limits) -> (Option<ExitStatus>, GroupStatus) {
+    let pgid = leader.pgid;
+    let settled = |leader: &mut Leader<'_>| {
+        leader.exited().unwrap_or(false) && only_leader(pgid) == Some(true)
     };
+    if !settled(leader) && !leader.released {
+        let _ = leader.signal(libc::SIGTERM);
+        let deadline = Instant::now() + limits.grace;
+        while Instant::now() < deadline && !leader.released && !settled(leader) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    if leader.released {
+        return (None, GroupStatus::Unknown);
+    }
+    let final_kill = leader.signal(libc::SIGKILL);
+    // A SIGKILLed leader exits at once; the bound only covers one stuck in the kernel.
+    let exited = leader.wait_exit(limits.kill_wait);
+    if leader.released {
+        return (None, GroupStatus::Unknown);
+    }
     let deadline = Instant::now() + limits.kill_wait;
-    while process_info::group_exists(pgid) && Instant::now() < deadline {
+    while only_leader(pgid) == Some(false) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    (status, process_info::group_exists(pgid))
+    let status = group_status(final_kill, exited, only_leader(pgid));
+    // A leader that never exited stays held, unreaped.
+    if !exited {
+        return (None, status);
+    }
+    let exit = leader.reap();
+    // After the reap, a signal-0 probe delivers nothing even to a reused ID, and ESRCH (no
+    // process has the group ID) proves the group empty. This settles macOS, whose final
+    // SIGKILL to a zombie-only group answers EPERM.
+    let probe_esrch = status == GroupStatus::Unknown && !process_info::group_exists(pgid);
+    (exit, after_reap(status, probe_esrch))
+}
+
+/// The status once the leader is reaped: an unknown group is proven empty only by a probe
+/// that found no process with the group ID; any other answer stays unknown.
+pub(crate) fn after_reap(status: GroupStatus, probe_esrch: bool) -> GroupStatus {
+    match status {
+        GroupStatus::Unknown if probe_esrch => GroupStatus::Empty,
+        other => other,
+    }
+}
+
+/// Whether SIGCHLD is ignored or set not to keep zombies: the kernel would then
+/// reap the leader itself, and its group ID could not be held.
+pub(crate) fn children_auto_reaped(action: &libc::sigaction) -> bool {
+    action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0
+}
+
+fn sigchld_auto_reaps() -> bool {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    let read = unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &raw mut action) };
+    read == 0 && children_auto_reaped(&action)
 }
 
 /// Run one producer to the end of its bounds. The child leads a new session
 /// and group; `env_clear` plus `spec.env` is its whole environment. Every
-/// ending leaves the group empty unless a descendant escaped it, which is
-/// reported as `groupSurvived`.
+/// ending stops the group while its leader is held and reports what was
+/// established about it as `groupStatus`; a descendant that left the group is
+/// not tracked.
 pub fn spawn_producer(
     spec: &ProducerSpec,
     limits: &Limits,
@@ -324,22 +482,34 @@ pub fn spawn_producer(
             Ok(())
         });
     }
+    ensure!(
+        !sigchld_auto_reaps(),
+        "producer_failed: SIGCHLD is ignored, so the producer group cannot be held"
+    );
     let started = Instant::now();
-    let mut child = command
+    let child = command
         .spawn()
         .with_context(|| format!("spawn {}", spec.argv[0].to_string_lossy()))?;
     let pgid = child.id() as i32;
+    // From here every return or unwind leaves through the leader's owner.
+    let mut leader = Leader {
+        child,
+        pgid,
+        released: false,
+        kill_wait: limits.kill_wait,
+        on_signal: hooks.signal.take(),
+    };
     let process = ProcessIdentity {
         pgid,
         leader_start_time: process_info::start_time(pgid).unwrap_or(0),
     };
     let stdout = start_reader(
-        child.stdout.take().context("producer stdout")?,
+        leader.child.stdout.take().context("producer stdout")?,
         stdout_log,
         limits.log_bytes,
     );
     let stderr = start_reader(
-        child.stderr.take().context("producer stderr")?,
+        leader.child.stderr.take().context("producer stderr")?,
         stderr_log,
         limits.log_bytes,
     );
@@ -351,20 +521,14 @@ pub fn spawn_producer(
     let tick = TICK.min(limits.sample).max(Duration::from_millis(1));
     let mut next_sample = Instant::now();
     let mut peak_rss = 0_u64;
-    let mut status = None;
     let mut ending = Ending::Exited;
     loop {
-        match child.try_wait() {
-            Ok(Some(exited)) => {
-                status = Some(exited);
-                break;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                // Leave no group behind even when the leader cannot be polled.
-                terminate(&mut child, pgid, limits);
-                return Err(e).context("wait for producer");
-            }
+        match leader.exited() {
+            Ok(true) => break,
+            Ok(false) => {}
+            // The wait status is gone, so the group ID may already be reused:
+            // nothing is signalled (fail closed).
+            Err(e) => return Err(e).context("wait for producer"),
         }
         let now = Instant::now();
         if cancel.load(Ordering::SeqCst) {
@@ -391,14 +555,8 @@ pub fn spawn_producer(
         std::thread::sleep(tick);
     }
 
-    // Every exit path ends with the group empty, whether the leader left on
-    // its own or was stopped.
-    let mut group_survived = false;
-    if status.is_none() || process_info::group_exists(pgid) {
-        let (final_status, survived) = terminate(&mut child, pgid, limits);
-        status = status.or(final_status);
-        group_survived = survived;
-    }
+    // Every ending stops the group while the leader is held, then reaps it.
+    let (status, group_status) = terminate(&mut leader, limits);
     let artifact_bytes = artifact_len(spec);
     // The sample may have missed a short burst: the size after exit is final.
     if ending == Ending::Exited && artifact_bytes > limits.artifact_bytes {
@@ -420,7 +578,7 @@ pub fn spawn_producer(
             stdout_tail,
             stderr_tail,
             truncated: stdout_truncated || stderr_truncated,
-            group_survived,
+            group_status,
         },
     })
 }
