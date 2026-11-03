@@ -50,6 +50,198 @@ fn target_counts(counts: &[VisitObservation], kind: &str, end: usize) -> Vec<usi
         .collect()
 }
 
+// Count the Python hazard walk independently from the instrumentation. Its visitor
+// skips children of comments and strings; these fixtures have no errors/depth gaps.
+fn python_hazard_nodes(node: tree_sitter::Node<'_>) -> usize {
+    if matches!(node.kind(), "comment" | "string" | "concatenated_string") {
+        return 1;
+    }
+    let mut cursor = node.walk();
+    1 + node
+        .named_children(&mut cursor)
+        .map(python_hazard_nodes)
+        .sum::<usize>()
+}
+
+#[test]
+fn generated_python_reference_visit_budget_differentials() {
+    let cases = std::env::var("TRELLIS_PY_VISIT_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32usize);
+    let mut rng = 20261102u64;
+    let mut random = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut totals = [0usize; 8];
+    let mut scan_bounds = (usize::MAX, 0usize);
+    let mut walk_bounds = (usize::MAX, 0usize);
+    for case in 0..cases {
+        let shape = case % 3; // unique, distinct collision, same-identity diamond
+        let hazard = (case / 3) % 2 == 1;
+        let reverse = random() % 2 == 0;
+        let before = random() % 2 == 0;
+        let filler = 100 + random() as usize % 160;
+        let left = if shape == 2 {
+            "from origin import name\n"
+        } else {
+            "def name():\n    pass\n"
+        };
+        let export = match shape {
+            0 => "def other():\n    pass\n",
+            1 => "def name():\n    pass\n",
+            _ => "from origin import name\n",
+        };
+        let padding = format!(
+            "_padding = [{}]\n{}",
+            "0,".repeat(filler),
+            if hazard { "exec(code)\n" } else { "" }
+        );
+        let right = if before {
+            format!("{padding}{export}")
+        } else {
+            format!("{export}{padding}")
+        };
+        let barrel = if reverse {
+            "from right import *\nfrom left import *\n"
+        } else {
+            "from left import *\nfrom right import *\n"
+        };
+        let input = snapshot(&[
+            ("use.py", "from barrel import *\n"),
+            ("barrel.py", barrel),
+            ("left.py", left),
+            ("right.py", &right),
+            ("origin.py", "def name():\n    pass\n"),
+        ]);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&right, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let end = tree.root_node().end_byte();
+        let named = python_hazard_nodes(tree.root_node());
+        let project = |budget, workers| {
+            let (p, observations) = references::project_with_visit_budget(
+                &input,
+                &["use.py".into()],
+                50,
+                workers,
+                budget,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            (p.data, observations)
+        };
+        let (healthy, measured) = project(1_000_000, 2);
+        assert!(healthy["partialFiles"].as_array().unwrap().is_empty());
+        let scans = target_counts(&measured, "scan", end);
+        let walks = target_counts(&measured, "walk", end);
+        let scan = *scans.iter().max().unwrap();
+        assert!(
+            walks.contains(&named),
+            "case={case} named={named} walks={walks:?}"
+        );
+        assert!(named > 80 && scan > named);
+        scan_bounds = (scan_bounds.0.min(scan), scan_bounds.1.max(scan));
+        walk_bounds = (walk_bounds.0.min(named), walk_bounds.1.max(named));
+        let normal =
+            references::project_with_workers(&input, &["use.py".into()], 50, 2, &mut || Ok(()))
+                .unwrap()
+                .data;
+        assert_eq!(normal, healthy);
+        if !hazard {
+            match shape {
+                0 => {
+                    assert!(has_edge(&healthy, "use.py", "left.py"), "{healthy}");
+                    totals[0] += 1;
+                }
+                1 => {
+                    assert!(
+                        !has_edge(&healthy, "use.py", "left.py")
+                            && !has_edge(&healthy, "use.py", "right.py"),
+                        "{healthy}"
+                    );
+                    assert!(
+                        healthy["unresolved"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|row| row["reason"] == "python_wildcard_name_ambiguous"),
+                        "{healthy}"
+                    );
+                    totals[1] += 1;
+                }
+                _ => {
+                    assert!(has_edge(&healthy, "use.py", "origin.py"), "{healthy}");
+                    totals[2] += 1;
+                }
+            }
+        } else {
+            assert!(
+                !has_edge(&healthy, "use.py", "left.py")
+                    && !has_edge(&healthy, "use.py", "origin.py"),
+                "{healthy}"
+            );
+            totals[3] += 1;
+        }
+        for budget in [
+            named - 1,
+            named,
+            named + 1,
+            scan - 1,
+            scan,
+            scan + 1,
+            70 + random() as usize % 60,
+        ] {
+            let (partial, observed) = project(budget, if case % 2 == 0 { 1 } else { 3 });
+            let got = sites(&partial);
+            let want = sites(&healthy);
+            assert!(
+                got.is_subset(&want),
+                "case={case} shape={shape} hazard={hazard} reverse={reverse} before={before} filler={filler} budget={budget} scan={scan} named={named} gained={:?}\nhealthy={healthy}\npartial={partial}",
+                got.difference(&want).collect::<Vec<_>>()
+            );
+            let is_partial = partial["partialFiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["path"] == "right.py" && p["reason"] == "visit_limit");
+            assert_eq!(
+                is_partial,
+                budget < scan,
+                "case={case} budget={budget} scan={scan}"
+            );
+            assert!(target_counts(&observed, "scan", end).contains(&scan.min(budget + 1)));
+            let actual = target_counts(&observed, "walk", end);
+            assert!(
+                actual.contains(&named.min(budget + 1)),
+                "case={case} budget={budget} named={named} actual={actual:?}"
+            );
+            if budget < named {
+                totals[4] += 1;
+            }
+            if is_partial {
+                totals[5] += 1;
+            } else {
+                totals[6] += 1;
+            }
+            if is_partial && !hazard && shape == 0 && !has_edge(&partial, "use.py", "left.py") {
+                totals[7] += 1;
+            }
+        }
+    }
+    eprintln!(
+        "python visit cases={cases} unique={} collision={} diamond={} dynamic={} walk_exhaustions={} partial={} whole={} suppressed_unique={} scan_range={scan_bounds:?} named_range={walk_bounds:?}",
+        totals[0], totals[1], totals[2], totals[3], totals[4], totals[5], totals[6], totals[7]
+    );
+    assert!(totals.iter().all(|n| *n > 0), "coverage: {totals:?}");
+}
+
 #[test]
 fn generated_reference_visit_budget_differentials() {
     let cases = std::env::var("TRELLIS_VISIT_CASES")
