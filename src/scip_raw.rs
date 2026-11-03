@@ -15,8 +15,8 @@ use std::sync::atomic::Ordering;
 
 pub mod cargo_targets;
 pub mod module_roots;
-pub use cargo_targets::{CargoTarget, CargoTargets, CargoTargetsBuilder};
 pub(crate) use cargo_targets::CargoTargetsContinuation;
+pub use cargo_targets::{CargoTarget, CargoTargets, CargoTargetsBuilder};
 pub use module_roots::ModuleRoots;
 
 pub const DECODER_VERSION: &str = "scip-0.10.0/CapturedScipFactV1/2";
@@ -102,6 +102,7 @@ fn cancelled(flag: &CancelFlag) -> Result<(), ScipCaptureError> {
 pub(crate) fn sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub(crate) struct AuthenticatedScipDocument<'a> {
     pub language: String,
@@ -199,7 +200,6 @@ pub(crate) struct RawProofIdentity {
 pub(crate) struct ProofInventory {
     pub(crate) artifact_hashes: Vec<String>,
     pub(crate) source_manifest_hash: String,
-    pub(crate) exclusions: Vec<Exclusion>,
     pub(crate) capped_documents: CappedDocuments,
     pub(crate) claims: Vec<RawProofIdentity>,
 }
@@ -280,7 +280,6 @@ impl CapturedScipInventory {
         ProofInventory {
             artifact_hashes: self.artifact_hashes.clone(),
             source_manifest_hash: self.source_manifest_hash.clone(),
-            exclusions: self.exclusions.clone(),
             capped_documents: self.capped_documents.clone(),
             claims: self
                 .claims
@@ -1602,7 +1601,9 @@ pub fn decode_streaming<'s, R: Read>(
     cancelled(cancel)?;
     let mut continuation = ScipDecodeContinuation::new(reader, byte_length, limits)?;
     loop {
-        if let Some(summary) = continuation.advance(artifact, resolve, counters, limits, sink, cancel)? {
+        if let Some(summary) =
+            continuation.advance(artifact, resolve, counters, limits, sink, cancel)?
+        {
             return Ok(summary);
         }
     }
@@ -1624,7 +1625,11 @@ impl<R: Read> ScipDecodeContinuation<R> {
         self.input.fault.take()
     }
 
-    pub(crate) fn new(reader: R, byte_length: u64, limits: &BatchLimits) -> Result<Self, ScipCaptureError> {
+    pub(crate) fn new(
+        reader: R,
+        byte_length: u64,
+        limits: &BatchLimits,
+    ) -> Result<Self, ScipCaptureError> {
         if byte_length > limits.artifact_bytes {
             return Err(limit("artifact bytes"));
         }
@@ -1658,7 +1663,8 @@ impl<R: Read> ScipDecodeContinuation<R> {
                 unknown(&meta.special_fields)?;
                 if known(meta.version)? != artifact.protocol_version
                     || known(meta.text_document_encoding)? != artifact.text_document_encoding
-                    || !meta.project_root.is_empty() && meta.project_root != artifact.project_root_uri
+                    || !meta.project_root.is_empty()
+                        && meta.project_root != artifact.project_root_uri
                 {
                     return Err(invalid("metadata binding"));
                 }
@@ -1728,7 +1734,8 @@ impl<R: Read> ScipDecodeContinuation<R> {
         unit.counters.candidates = budget.candidates;
         walked?;
         match number {
-            1 => self.metadata
+            1 => self
+                .metadata
                 .get_or_insert_with(types::Metadata::new)
                 .merge_from_bytes(&unit.bytes)
                 .map_err(|_| invalid("protobuf parse"))?,
@@ -1818,7 +1825,7 @@ impl<R: Read> ScipDecodeContinuation<R> {
                             text,
                             DocumentCap::InvalidRange,
                             limits,
-                            &mut traversed,
+                            &mut self.traversed,
                             cancel,
                         )?);
                         d = types::Document::parse_from_bytes(&unit.bytes)
@@ -1894,8 +1901,13 @@ impl<R: Read> ScipDecodeContinuation<R> {
                     if self.traversed.is_multiple_of(1024) {
                         cancelled(cancel)?;
                     }
-                    let (info, rels) =
-                        symbol(s, artifact.position_encoding, cancel, &mut self.traversed, true)?;
+                    let (info, rels) = symbol(
+                        s,
+                        artifact.position_encoding,
+                        cancel,
+                        &mut self.traversed,
+                        true,
+                    )?;
                     if !read {
                         continue;
                     }
@@ -4110,36 +4122,80 @@ mod continuation_tests {
     #[test]
     fn cursor_yields_for_every_original_wire_unit_and_preserves_claims() {
         let documents = tests::vector_documents(tests::FULL);
-        let wire = [tests::message(1, &[0x20, 1]), hex::decode(tests::EXTERNAL).unwrap()].concat();
+        let wire = [
+            tests::message(1, &[0x20, 1]),
+            hex::decode(tests::EXTERNAL).unwrap(),
+        ]
+        .concat();
         let input = tests::vector_input(&wire, documents);
         let roots = ModuleRoots::default();
         let cargo = CargoTargets::default();
         let artifact = AuthenticatedArtifact {
-            artifact_hash: &input.artifact_hash, producer_id: &input.producer_id,
-            producer_version: &input.producer_version, source_set_id: &input.source_set_id,
-            source_revision: &input.source_revision, position_encoding: input.position_encoding,
-            protocol_version: input.protocol_version, text_document_encoding: input.text_document_encoding,
-            project_root_uri: &input.project_root_uri, module_roots: &roots, cargo_targets: &cargo,
+            artifact_hash: &input.artifact_hash,
+            producer_id: &input.producer_id,
+            producer_version: &input.producer_version,
+            source_set_id: &input.source_set_id,
+            source_revision: &input.source_revision,
+            position_encoding: input.position_encoding,
+            protocol_version: input.protocol_version,
+            text_document_encoding: input.text_document_encoding,
+            project_root_uri: &input.project_root_uri,
+            module_roots: &roots,
+            cargo_targets: &cargo,
             assigned_documents: 2,
         };
         let flag = Arc::new(AtomicBool::new(false));
         let limits = BatchLimits::PRODUCTION;
         let mut counters = BatchCounters::default();
         let mut sink = VecSink::default();
-        let mut cursor = ScipDecodeContinuation::new(wire.as_slice(), wire.len() as u64, &limits).unwrap();
+        let mut cursor =
+            ScipDecodeContinuation::new(wire.as_slice(), wire.len() as u64, &limits).unwrap();
         let mut resolve = |path: &str, _: &str| {
-            let doc = input.documents.iter().find(|doc| doc.relative_path == path).unwrap();
-            Ok(DocumentSource { language: doc.language.clone(), bytes: Cow::Borrowed(doc.source_bytes), content_hash: doc.content_hash.clone() })
+            let doc = input
+                .documents
+                .iter()
+                .find(|doc| doc.relative_path == path)
+                .unwrap();
+            Ok(DocumentSource {
+                language: doc.language.clone(),
+                bytes: Cow::Borrowed(doc.source_bytes),
+                content_hash: doc.content_hash.clone(),
+            })
         };
         for expected_documents in [0, 1, 2, 2] {
-            assert!(cursor.advance(&artifact, &mut resolve, &mut counters, &limits, &mut sink, &flag).unwrap().is_none());
+            assert!(
+                cursor
+                    .advance(
+                        &artifact,
+                        &mut resolve,
+                        &mut counters,
+                        &limits,
+                        &mut sink,
+                        &flag
+                    )
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(cursor.documents, expected_documents);
             assert_eq!(counters.live_unit_buffers, 0);
         }
-        let summary = cursor.advance(&artifact, &mut resolve, &mut counters, &limits, &mut sink, &flag).unwrap().unwrap();
+        let summary = cursor
+            .advance(
+                &artifact,
+                &mut resolve,
+                &mut counters,
+                &limits,
+                &mut sink,
+                &flag,
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(summary.documents, 2);
         assert_eq!(summary.external_symbols, 1);
-        assert_eq!(sink.finish().unwrap(), decode_authenticated(&input, &flag).unwrap().claims);
+        assert_eq!(
+            sink.finish().unwrap(),
+            decode_authenticated(&input, &flag).unwrap().claims
+        );
         assert_eq!(counters.live_unit_buffers_high_water, 1);
     }
 
@@ -4148,21 +4204,68 @@ mod continuation_tests {
         let wire = [tests::message(1, &[]), tests::message(1, &[])].concat();
         let roots = ModuleRoots::default();
         let cargo = CargoTargets::default();
-        let artifact = AuthenticatedArtifact { artifact_hash: "", producer_id: "", producer_version: "",
-            source_set_id: "", source_revision: "", position_encoding: 1, protocol_version: 0,
-            text_document_encoding: 1, project_root_uri: "", module_roots: &roots, cargo_targets: &cargo,
-            assigned_documents: 0 };
+        let artifact = AuthenticatedArtifact {
+            artifact_hash: "",
+            producer_id: "",
+            producer_version: "",
+            source_set_id: "",
+            source_revision: "",
+            position_encoding: 1,
+            protocol_version: 0,
+            text_document_encoding: 1,
+            project_root_uri: "",
+            module_roots: &roots,
+            cargo_targets: &cargo,
+            assigned_documents: 0,
+        };
         let mut limits = BatchLimits::PRODUCTION;
         limits.wire_fields = 1;
         let flag = Arc::new(AtomicBool::new(true));
         let mut counters = BatchCounters::default();
         let mut sink = VecSink::default();
-        let mut cursor = ScipDecodeContinuation::new(wire.as_slice(), wire.len() as u64, &limits).unwrap();
+        let mut cursor =
+            ScipDecodeContinuation::new(wire.as_slice(), wire.len() as u64, &limits).unwrap();
         let mut resolve = |_: &str, _: &str| Err(invalid("unexpected document"));
-        assert_eq!(cursor.advance(&artifact, &mut resolve, &mut counters, &limits, &mut sink, &flag).unwrap_err(), ScipCaptureError::Cancelled);
+        assert_eq!(
+            cursor
+                .advance(
+                    &artifact,
+                    &mut resolve,
+                    &mut counters,
+                    &limits,
+                    &mut sink,
+                    &flag
+                )
+                .unwrap_err(),
+            ScipCaptureError::Cancelled
+        );
         assert_eq!(cursor.input.remaining, wire.len() as u64);
         flag.store(false, Ordering::Relaxed);
-        assert!(cursor.advance(&artifact, &mut resolve, &mut counters, &limits, &mut sink, &flag).unwrap().is_none());
-        assert_eq!(cursor.advance(&artifact, &mut resolve, &mut counters, &limits, &mut sink, &flag).unwrap_err(), limit("wire fields"));
+        assert!(
+            cursor
+                .advance(
+                    &artifact,
+                    &mut resolve,
+                    &mut counters,
+                    &limits,
+                    &mut sink,
+                    &flag
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            cursor
+                .advance(
+                    &artifact,
+                    &mut resolve,
+                    &mut counters,
+                    &limits,
+                    &mut sink,
+                    &flag
+                )
+                .unwrap_err(),
+            limit("wire fields")
+        );
     }
 }

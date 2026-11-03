@@ -2336,12 +2336,21 @@ fn non_ambiguous_multi_match_for_one_call_stays_integrity() {
     }
 }
 
-fn historical_projection(status: trellis::model::SemanticStatus) -> trellis::model::SemanticProjection {
+fn historical_projection(
+    status: trellis::model::SemanticStatus,
+) -> trellis::model::SemanticProjection {
     let generation = "123e4567-e89b-42d3-a456-426614174000".parse().unwrap();
     trellis::model::SemanticProjection {
-        current_pin: IndexPin { index_generation: generation, index_revision: 2 },
-        semantic_basis_pin: IndexPin { index_generation: generation, index_revision: 1 },
-        basis_native_revision_id: REV.into(), semantic_status: status,
+        current_pin: IndexPin {
+            index_generation: generation,
+            index_revision: 2,
+        },
+        semantic_basis_pin: IndexPin {
+            index_generation: generation,
+            index_revision: 1,
+        },
+        basis_native_revision_id: REV.into(),
+        semantic_status: status,
     }
 }
 
@@ -2349,59 +2358,105 @@ fn historical_projection(status: trellis::model::SemanticStatus) -> trellis::mod
 fn projected_graph_keeps_basis_and_checks_each_hop() {
     use trellis::model::SemanticStatus::{CatchingUp, OlderBasis};
     let mut w = world(true);
-    for (id,path) in [(1,"a.rs"),(2,"b.rs"),(3,"c.rs")] { w.decl(id,path); }
-    w.call(1,11,1); w.bind(11,direct(2));
-    w.call(2,12,2); w.bind(12,direct(3));
-    for path in ["a.rs","b.rs","c.rs"] {
+    for (id, path) in [(1, "a.rs"), (2, "b.rs"), (3, "c.rs")] {
+        w.decl(id, path);
+    }
+    w.call(1, 11, 1);
+    w.bind(11, direct(2));
+    w.call(2, 12, 2);
+    w.bind(12, direct(3));
+    for path in ["a.rs", "b.rs", "c.rs"] {
         let doc = w.doc(path);
         doc.projection = Some(historical_projection(OlderBasis));
         doc.semantic.as_mut().unwrap().projection = doc.projection.clone();
     }
     let doc = w.doc("c.rs");
-    doc.projection = Some(historical_projection(CatchingUp)); doc.semantic = None;
+    doc.projection = Some(historical_projection(CatchingUp));
+    doc.semantic = None;
     let mut facts = w.build();
-    let result = run(&mut facts,&request(1,true));
-    assert_eq!(result.nodes.len(),2);
-    assert_eq!(result.edges[0].to,Some(sid(2)));
-    assert_eq!(result.edges[1].boundary_reason,BoundaryReason::CatchingUp);
-    assert_eq!(result.edges[1].to,None);
-    assert_eq!(result.edges[0].historical_freshness,Some(Freshness::Fresh));
-    assert_eq!(result.edges[0].effective_freshness,Some(Freshness::PossiblyStale));
+    let result = run(&mut facts, &request(1, true));
+    assert_eq!(result.nodes.len(), 2);
+    assert_eq!(result.edges[0].to, Some(sid(2)));
+    assert_eq!(result.edges[1].boundary_reason, BoundaryReason::CatchingUp);
+    assert_eq!(result.edges[1].to, None);
+    assert_eq!(result.edges[0].historical_freshness, Some(Freshness::Fresh));
+    assert_eq!(
+        result.edges[0].effective_freshness,
+        Some(Freshness::PossiblyStale)
+    );
     assert!(result.partial);
     assert!(!result.projected_provenance.is_empty());
-    assert!(result.projected_provenance.iter().all(|proof| proof.effective_freshness != Freshness::Fresh));
-    assert_eq!(result.edges[0].binding.as_ref().unwrap().declared_target.as_ref().unwrap(),
-        &Target::Internal { syntax_id:sid(2),document:dkey("b.rs"),revision_id:REV.into() });
+    assert!(
+        result
+            .projected_provenance
+            .iter()
+            .all(|proof| proof.effective_freshness != Freshness::Fresh)
+    );
+    assert_eq!(
+        result.edges[0]
+            .binding
+            .as_ref()
+            .unwrap()
+            .declared_target
+            .as_ref()
+            .unwrap(),
+        &Target::Internal {
+            syntax_id: sid(2),
+            document: dkey("b.rs"),
+            revision_id: REV.into()
+        }
+    );
 }
 
 #[test]
 fn pending_empty_root_is_partial_not_absence() {
-    let mut w = world(true); w.decl(1,"a.rs");
+    let mut w = world(true);
+    w.decl(1, "a.rs");
     let doc = w.doc("a.rs");
-    doc.projection = Some(historical_projection(trellis::model::SemanticStatus::CatchingUp));
+    doc.projection = Some(historical_projection(
+        trellis::model::SemanticStatus::CatchingUp,
+    ));
     doc.semantic = None;
-    let result = run(&mut w.build(),&request(1,true));
+    let result = run(&mut w.build(), &request(1, true));
     assert!(result.edges.is_empty());
     assert!(result.partial);
-    assert_eq!(result.semantic_documents[0].path,"a.rs");
-    assert_eq!(result.semantic_documents[0].projection.semantic_status,trellis::model::SemanticStatus::CatchingUp);
+    assert_eq!(result.semantic_documents[0].path, "a.rs");
+    assert_eq!(
+        result.semantic_documents[0].projection.semantic_status,
+        trellis::model::SemanticStatus::CatchingUp
+    );
 }
 
 #[test]
 fn historical_dispatch_alternative_is_a_hard_boundary() {
-    use trellis::model::SemanticStatus::{CatchingUp,OlderBasis};
+    use trellis::model::SemanticStatus::{CatchingUp, OlderBasis};
     let mut w = world(true);
-    for (id,path) in [(1,"a.rs"),(2,"b.rs"),(3,"c.rs")] { w.decl(id,path); }
-    w.call(1,11,1);
-    let mut binding=direct(2); binding.possible=vec![3]; w.bind(11,binding);
-    for path in ["a.rs","b.rs","c.rs"] {
-        let doc=w.doc(path); doc.projection=Some(historical_projection(OlderBasis));
-        doc.semantic.as_mut().unwrap().projection=doc.projection.clone();
+    for (id, path) in [(1, "a.rs"), (2, "b.rs"), (3, "c.rs")] {
+        w.decl(id, path);
     }
-    let doc=w.doc("c.rs"); doc.projection=Some(historical_projection(CatchingUp)); doc.semantic=None;
-    let result=run(&mut w.build(),&request(1,true));
-    assert_eq!(result.nodes.len(),1);
-    assert_eq!(result.edges[0].boundary_reason,BoundaryReason::CatchingUp);
-    assert_eq!(result.edges[0].to,None);
-    assert!(result.edges[0].binding.as_ref().unwrap().possible_dispatch.iter().any(|target| matches!(target,Target::Internal{document,..} if document.path=="c.rs")));
+    w.call(1, 11, 1);
+    let mut binding = direct(2);
+    binding.possible = vec![3];
+    w.bind(11, binding);
+    for path in ["a.rs", "b.rs", "c.rs"] {
+        let doc = w.doc(path);
+        doc.projection = Some(historical_projection(OlderBasis));
+        doc.semantic.as_mut().unwrap().projection = doc.projection.clone();
+    }
+    let doc = w.doc("c.rs");
+    doc.projection = Some(historical_projection(CatchingUp));
+    doc.semantic = None;
+    let result = run(&mut w.build(), &request(1, true));
+    assert_eq!(result.nodes.len(), 1);
+    assert_eq!(result.edges[0].boundary_reason, BoundaryReason::CatchingUp);
+    assert_eq!(result.edges[0].to, None);
+    assert!(
+        result.edges[0]
+            .binding
+            .as_ref()
+            .unwrap()
+            .possible_dispatch
+            .iter()
+            .any(|target| matches!(target,Target::Internal{document,..} if document.path=="c.rs"))
+    );
 }

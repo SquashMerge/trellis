@@ -237,3 +237,190 @@ fn worktree_dirs_and_files_are_private() {
     assert_eq!(mode(&tree.join("src/a.js")), 0o600);
     assert_eq!(mode(&tree.join("package.json")), 0o600);
 }
+
+fn context_hash(source: &Retained, rules: &profiles::Rules) -> String {
+    worktree::context_hash(
+        rules,
+        &source.config,
+        &source.dependencies,
+        &|path| {
+            Ok(source
+                .documents
+                .iter()
+                .any(|(document, _)| *document == path))
+        },
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+}
+
+#[test]
+fn context_uses_profile_omissions_but_keeps_supplied_and_unknown_inputs() {
+    let rules = profiles::rules(
+        &profiles::row(
+            Target::Real(ProducerName::ScipPython),
+            TrustProfile::Restricted,
+        )
+        .unwrap(),
+    );
+    let mut source = retained();
+    let original = context_hash(&source, &rules);
+    source
+        .config
+        .retain(|entry| entry["path"] != "pyproject.toml");
+    source
+        .dependencies
+        .retain(|entry| entry["path"] != "pyproject.toml");
+    assert_eq!(context_hash(&source, &rules), original);
+    source
+        .config
+        .push(json!({"path":"pyproject.toml","type":"absent"}));
+    source
+        .dependencies
+        .push(present("pyproject.toml", b"changed omitted input"));
+    assert_eq!(context_hash(&source, &rules), original);
+
+    source
+        .config
+        .push(json!({"path":"requirements.txt","type":"absent"}));
+    assert_eq!(context_hash(&source, &rules), original);
+    source
+        .config
+        .push(present("requirements.txt", b"# supplied\n"));
+    let added = context_hash(&source, &rules);
+    assert_ne!(added, original);
+    source
+        .config
+        .retain(|entry| entry["path"] != "requirements.txt");
+    assert_eq!(context_hash(&source, &rules), original);
+    source.config.push(json!({"futureContext":{"mode":"a"}}));
+    assert_ne!(context_hash(&source, &rules), original);
+    source.config.pop();
+    source
+        .config
+        .push(json!({"path":"Cargo.toml","type":"future","mode":"a"}));
+    assert_ne!(context_hash(&source, &rules), original);
+    source.config.pop();
+    source
+        .config
+        .iter_mut()
+        .find(|entry| entry.get("nativeAdmission").is_some())
+        .unwrap()["nativeAdmission"]["maxFileBytes"] = json!(1024);
+    assert_ne!(context_hash(&source, &rules), original);
+
+    let trusted = profiles::rules(
+        &profiles::row(
+            Target::Real(ProducerName::ScipPython),
+            TrustProfile::Trusted,
+        )
+        .unwrap(),
+    );
+    let trusted_original = context_hash(&source, &trusted);
+    source
+        .dependencies
+        .retain(|entry| entry["path"] != "pyproject.toml");
+    assert_ne!(context_hash(&source, &trusted), trusted_original);
+    let generated_original = context_hash(&source, &rules);
+    let mut changed_generated = rules;
+    changed_generated.generated[0].bytes.push(b' ');
+    assert_ne!(
+        context_hash(&source, &changed_generated),
+        generated_original
+    );
+}
+
+#[test]
+fn context_first_wins_agrees_with_materialization_and_listing() {
+    let rules = profiles::Rules::default();
+    let mut source = Retained {
+        documents: vec![("source.py", b"source wins")],
+        config: vec![
+            present("source.py", b"ignored config"),
+            present("root.json", b"config wins"),
+        ],
+        dependencies: vec![present("root.json", b"ignored dependency")],
+    };
+    let original = context_hash(&source, &rules);
+    source.config[0] = present("source.py", b"changed ignored config");
+    source.dependencies[0] = present("root.json", b"changed ignored dependency");
+    assert_eq!(context_hash(&source, &rules), original);
+    let dir = tempfile::tempdir().unwrap();
+    worktree::materialize(&source, &rules, dir.path(), &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("worktree/source.py")).unwrap(),
+        b"source wins"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("worktree/root.json")).unwrap(),
+        b"config wins"
+    );
+    let layout = worktree::layout(&RetainedInputs::read(&source).unwrap(), &rules);
+    assert!(layout.dependency_manifests.is_empty());
+    source.config[1] = present("root.json", b"changed config winner");
+    assert_ne!(context_hash(&source, &rules), original);
+}
+
+#[test]
+fn context_tracks_effective_generated_defaults_including_source_precedence() {
+    let mut rules = profiles::rules(
+        &profiles::row(
+            Target::Real(ProducerName::ScipTypescript),
+            TrustProfile::Restricted,
+        )
+        .unwrap(),
+    );
+    let mut source = Retained {
+        documents: vec![],
+        config: vec![],
+        dependencies: vec![],
+    };
+    let generated = context_hash(&source, &rules);
+    source
+        .config
+        .push(json!({"path":"tsconfig.json","type":"absent"}));
+    assert_eq!(context_hash(&source, &rules), generated);
+    rules.generated[0].bytes.push(b' ');
+    assert_ne!(context_hash(&source, &rules), generated);
+    source.config.push(present("tsconfig.json", b"root config"));
+    let supplied = context_hash(&source, &rules);
+    assert_ne!(supplied, generated);
+    rules.generated[0].bytes.push(b' ');
+    assert_eq!(context_hash(&source, &rules), supplied);
+    let layout = worktree::layout(&RetainedInputs::read(&source).unwrap(), &rules);
+    assert!(layout.generated.is_empty());
+    let dir = tempfile::tempdir().unwrap();
+    worktree::materialize(&source, &rules, dir.path(), &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("worktree/tsconfig.json")).unwrap(),
+        b"root config"
+    );
+
+    source.documents.push(("tsconfig.json", b"source config"));
+    let source_wins = context_hash(&source, &rules);
+    source
+        .config
+        .push(present("tsconfig.json", b"later ignored config"));
+    source.config[1] = present("tsconfig.json", b"changed ignored config");
+    assert_eq!(context_hash(&source, &rules), source_wins);
+    let dir = tempfile::tempdir().unwrap();
+    worktree::materialize(&source, &rules, dir.path(), &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("worktree/tsconfig.json")).unwrap(),
+        b"source config"
+    );
+    rules.generated[0].path = "worktree/another.json".into();
+    assert_ne!(context_hash(&source, &rules), source_wins);
+}
+
+#[test]
+fn context_cancellation_is_checked_even_without_inputs() {
+    let error = worktree::context_hash(
+        &profiles::Rules::default(),
+        &[],
+        &[],
+        &|_| Ok(false),
+        &AtomicBool::new(true),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "cancelled");
+}

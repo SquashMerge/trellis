@@ -27,7 +27,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 38
+SCHEMA_VERSION = 40
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -655,7 +655,7 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# schema-38 tables, immutable surrogate keys, and current pin normalization.
+# schema-40 tables, immutable surrogate keys, and current pin normalization.
 # Match tests/daemon/cli.rs: check FTS shadow inventory, compare logical corpus cells.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
@@ -680,6 +680,9 @@ semantic_reference_candidates semantic_call_bindings semantic_call_candidates
 semantic_call_possible_dispatch semantic_call_join_candidates semantic_type_relationships
 semantic_raw_batches semantic_raw_captures semantic_raw_exclusions semantic_revision_raw_selections
 semantic_raw_proofs semantic_raw_documents semantic_import_reports semantic_reimport
+semantic_projection_origins semantic_projection_documents semantic_projection_dependencies
+semantic_projection_contexts semantic_projection_lookup_dependencies
+semantic_pending_target semantic_pending_selections semantic_catchup_commits
 """.split())
 CONTROL_TABLES = {"native_revision_supersessions", "native_binding_epoch", "revision_producer_bindings"}
 # Witness caches depend on prior work, not published evidence; check their schema only.
@@ -710,7 +713,9 @@ def selected_where(table):
         return "? IS NOT NULL"
     elif table in {"revision_capture_inputs", "revision_documents", "semantic_revision_producers",
                    "semantic_requested_producers", "semantic_requested_producer_languages",
-                   "semantic_coverage", "semantic_revision_raw_selections", "semantic_reimport"}:
+                   "semantic_coverage", "semantic_revision_raw_selections", "semantic_reimport",
+                   "semantic_projection_origins", "semantic_projection_documents",
+                   "semantic_pending_target", "semantic_pending_selections", "semantic_catchup_commits"}:
         return "revision_id=?"
     elif table == "native_source_sets":
         return "id=(SELECT source_set_id FROM native_revisions WHERE id=?)"
@@ -736,7 +741,9 @@ def selected_where(table):
     elif table in {"semantic_coverage_roles", "semantic_coverage_reasons", "semantic_basis",
                    "semantic_provenance",
                    "semantic_symbols", "semantic_declaration_bindings", "semantic_references",
-                   "semantic_call_bindings", "semantic_type_relationships"}:
+                   "semantic_call_bindings", "semantic_type_relationships",
+                   "semantic_projection_dependencies", "semantic_projection_contexts",
+                   "semantic_projection_lookup_dependencies"}:
         return f"tuple_id IN ({selected})"
     elif table in {"semantic_basis_lookup_dependencies"}:
         return f"basis_id IN (SELECT basis_id FROM semantic_basis WHERE tuple_id IN ({selected}))"
@@ -1062,7 +1069,7 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
 
 
 class SelectedView:
-    """Closed schema-38 view retaining all selected columns plus input-closure digests."""
+    """Closed schema-40 view retaining all selected columns plus input-closure digests."""
     def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
         self.physical_root = physical_root.resolve(strict=True)
@@ -1270,6 +1277,9 @@ class SelectedView:
                     "native source set is not tied to root identity")
             cells["root_id"] = "<physical-root>"
             cells["id"] = self.map("source-set", cells["id"])
+        if table == "semantic_pending_target":
+            require(cells["root_id"] == self.root_id, "pending target belongs to another root")
+            cells["root_id"] = "<physical-root>"
         if table == "native_revisions":
             inventory = json.loads(cells["source_inventory"])
             require(len(inventory) == len(self.docs), "selected native inventory is incomplete")
@@ -1341,7 +1351,7 @@ class SelectedView:
                 family = column.removesuffix("_id") if column.endswith("_id") else column
             elif column == "source_set_id":
                 family = "source-set"
-            elif column in ("revision_id", "captured_pin") or (table == "native_revisions" and column == "id"):
+            elif column in ("revision_id", "captured_pin", "basis_pin", "target_revision_id") or (table == "native_revisions" and column == "id"):
                 family = "pin"
             elif column in ("native_revision_id", "captured_revision", "captured_native_revision_id",
                             "join_native_revision_id", "internal_native_revision_id",

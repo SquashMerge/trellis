@@ -417,9 +417,10 @@ pub trait GraphSource {
         Ok(target.projection.as_ref().is_some_and(|other| {
             other.semantic_status == crate::model::SemanticStatus::OlderBasis
                 && other.semantic_basis_pin == projection.semantic_basis_pin
-        }) && target.semantic.as_ref().is_some_and(|semantic| {
-            semantic.coverage.producer_id == producer
-        }))
+        }) && target
+            .semantic
+            .as_ref()
+            .is_some_and(|semantic| semantic.coverage.producer_id == producer))
     }
     fn document(&mut self, key: &DocumentKey) -> Result<Arc<DocumentFacts>>;
     /// The role of an exactly located declaration, without requiring its whole document.
@@ -517,14 +518,28 @@ impl GraphSource for &GraphFacts {
     }
 
     fn projection_endpoint(
-        &mut self, projection: &crate::model::SemanticProjection, producer: &str, document: &DocumentKey,
+        &mut self,
+        projection: &crate::model::SemanticProjection,
+        producer: &str,
+        document: &DocumentKey,
     ) -> Result<bool> {
-        let key = (producer.to_owned(), document.clone(), serde_json::to_string(&projection.semantic_basis_pin)?);
-        if let Some(eligible) = self.projection_endpoints.get(&key) { return Ok(*eligible); }
-        if self.memo { return Err(anyhow!(FACTS_MISS)); }
-        Ok(self.documents.get(document).is_some_and(|doc| doc.projection.as_ref().is_some_and(|other| {
-            other.semantic_status == crate::model::SemanticStatus::OlderBasis && other.semantic_basis_pin == projection.semantic_basis_pin
-        })))
+        let key = (
+            producer.to_owned(),
+            document.clone(),
+            serde_json::to_string(&projection.semantic_basis_pin)?,
+        );
+        if let Some(eligible) = self.projection_endpoints.get(&key) {
+            return Ok(*eligible);
+        }
+        if self.memo {
+            return Err(anyhow!(FACTS_MISS));
+        }
+        Ok(self.documents.get(document).is_some_and(|doc| {
+            doc.projection.as_ref().is_some_and(|other| {
+                other.semantic_status == crate::model::SemanticStatus::OlderBasis
+                    && other.semantic_basis_pin == projection.semantic_basis_pin
+            })
+        }))
     }
 
     fn history(&mut self, key: &DocumentKey, syntax_id: &str) -> Result<Option<Arc<HistoryFacts>>> {
@@ -557,7 +572,10 @@ impl GraphSource for GraphFacts {
         (&*self).document(key)
     }
     fn projection_endpoint(
-        &mut self, projection: &crate::model::SemanticProjection, producer: &str, document: &DocumentKey,
+        &mut self,
+        projection: &crate::model::SemanticProjection,
+        producer: &str,
+        document: &DocumentKey,
     ) -> Result<bool> {
         (&*self).projection_endpoint(projection, producer, document)
     }
@@ -690,7 +708,10 @@ pub(crate) fn semantic<'a>(
         Some(semantic) => Ok(Some(semantic)),
         None if doc.projection.as_ref().is_some_and(|projection| {
             projection.semantic_status == crate::model::SemanticStatus::CatchingUp
-        }) => Ok(None),
+        }) =>
+        {
+            Ok(None)
+        }
         None => Err(integrity("missing producer coverage tuple")),
     }
 }
@@ -785,11 +806,18 @@ pub(crate) fn call_disposition<'a>(
     if let (Some(projection), Some((binding, proof))) = (projection, selected) {
         let mut eligible = projection.semantic_status == crate::model::SemanticStatus::OlderBasis
             && source.projection_endpoint(projection, &proof.producer_id, &call.document)?;
-        for target in binding.declared_target.iter()
+        for target in binding
+            .declared_target
+            .iter()
             .chain(&binding.candidates)
             .chain(&binding.possible_dispatch)
         {
-            if let Target::Internal { document, revision_id, .. } = target {
+            if let Target::Internal {
+                document,
+                revision_id,
+                ..
+            } = target
+            {
                 eligible &= revision_id == &projection.basis_native_revision_id
                     && source.projection_endpoint(projection, &proof.producer_id, document)?;
             }
@@ -812,7 +840,11 @@ pub(crate) fn call_disposition<'a>(
         }
     });
     let exact_target = match target {
-        Some((id, key)) if reason != BoundaryReason::CatchingUp && source.locate(id)?.as_ref() == Some(key) => Some((id, key)),
+        Some((id, key))
+            if reason != BoundaryReason::CatchingUp && source.locate(id)?.as_ref() == Some(key) =>
+        {
+            Some((id, key))
+        }
         _ => None,
     };
     if reason == BoundaryReason::None && exact_target.is_none() {
@@ -935,9 +967,14 @@ pub fn evaluate(
                 source.check_work()?;
                 let disposition = call_disposition(semantic, call, source)?;
                 let selected = disposition.selected;
-                let reason = if semantic.is_none() && doc.projection.as_ref().is_some_and(|projection| projection.semantic_status == crate::model::SemanticStatus::CatchingUp) {
+                let reason = if semantic.is_none()
+                    && doc.projection.as_ref().is_some_and(|projection| {
+                        projection.semantic_status == crate::model::SemanticStatus::CatchingUp
+                    }) {
                     BoundaryReason::CatchingUp
-                } else { disposition.boundary_reason };
+                } else {
+                    disposition.boundary_reason
+                };
                 let exact_target = disposition.exact_target;
                 let external = selected.is_some_and(|(b, _)| b.resolution == Resolution::External);
                 let target_role = exact_target
@@ -1011,9 +1048,13 @@ pub fn evaluate(
                         binding: selected.map(|(b, _)| b.clone()),
                         projection: semantic.and_then(|s| s.projection.clone()),
                         historical_freshness: selected.map(|(_, p)| p.freshness),
-                        effective_freshness: selected.map(|(_, p)| semantic
-                            .and_then(|s| s.projection.as_ref())
-                            .map_or(p.freshness, |projection| projection.effective_freshness(p.freshness))),
+                        effective_freshness: selected.map(|(_, p)| {
+                            semantic
+                                .and_then(|s| s.projection.as_ref())
+                                .map_or(p.freshness, |projection| {
+                                    projection.effective_freshness(p.freshness)
+                                })
+                        }),
                         visit: Visit::Boundary,
                         boundary_reason: reason,
                     },
@@ -1248,7 +1289,11 @@ fn finish(
             && proof.producer_id != document.native_provenance.producer_id
         {
             let historical = proof.freshness;
-            projected_provenance.push(sem::ProjectedEvidence::new(proof, projection.clone(), historical));
+            projected_provenance.push(sem::ProjectedEvidence::new(
+                proof,
+                projection.clone(),
+                historical,
+            ));
         } else {
             provenance.push(proof);
         }
@@ -1258,18 +1303,33 @@ fn finish(
         .any(|f| f.reason != FrontierReason::Filtered);
     let mut semantic_projections = Vec::new();
     let mut semantic_documents = Vec::new();
-    let documents: BTreeSet<_> = nodes.iter().map(|node| node.declaration.document.clone())
-        .chain(edges.iter().map(|edge| edge.call.document.clone())).collect();
+    let documents: BTreeSet<_> = nodes
+        .iter()
+        .map(|node| node.declaration.document.clone())
+        .chain(edges.iter().map(|edge| edge.call.document.clone()))
+        .collect();
     for key in documents {
         let document = source.document(&key)?;
         if let Some(projection) = &document.projection {
-            if !semantic_projections.contains(projection) { semantic_projections.push(projection.clone()); }
-            let producer_id = document.semantic.as_ref().map(|semantic| semantic.coverage.producer_id.clone())
+            if !semantic_projections.contains(projection) {
+                semantic_projections.push(projection.clone());
+            }
+            let producer_id = document
+                .semantic
+                .as_ref()
+                .map(|semantic| semantic.coverage.producer_id.clone())
                 .or_else(|| request.semantic_producer_id.clone())
-                .or_else(|| defaults.and_then(|defaults| defaults.producer(&key.language)).map(str::to_owned))
+                .or_else(|| {
+                    defaults
+                        .and_then(|defaults| defaults.producer(&key.language))
+                        .map(str::to_owned)
+                })
                 .ok_or_else(|| integrity("projected document has no selected producer"))?;
             semantic_documents.push(crate::model::DocumentSemanticStatus {
-                producer_id,language:key.language,path:key.path,projection:projection.clone(),
+                producer_id,
+                language: key.language,
+                path: key.path,
+                projection: projection.clone(),
             });
         }
     }

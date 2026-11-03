@@ -158,7 +158,12 @@ fn push_reserved<T>(
 }
 
 impl<'a> CompletedGlobal<'a> {
-    pub(super) fn new(ctx: &'a JoinCtx<'a>, side: u8, filtered: bool, source_set_id: &str) -> Result<Self> {
+    pub(super) fn new(
+        ctx: &'a JoinCtx<'a>,
+        side: u8,
+        filtered: bool,
+        source_set_id: &str,
+    ) -> Result<Self> {
         Ok(Self {
             ctx,
             side,
@@ -480,13 +485,19 @@ pub(super) fn remaining_document_status(
 ) -> Result<()> {
     let ctx = captured.ctx;
     let (side, sql) = if captured_status {
-        (captured, "SELECT g.syntax_id FROM g_definitions g WHERE g.side=1 AND g.owner_doc=?1 \
+        (
+            captured,
+            "SELECT g.syntax_id FROM g_definitions g WHERE g.side=1 AND g.owner_doc=?1 \
          AND NOT EXISTS (SELECT 1 FROM g_definitions c WHERE c.side=0 \
-         AND c.owner_doc=g.owner_doc AND c.syntax_id=g.syntax_id) ORDER BY g.syntax_id")
+         AND c.owner_doc=g.owner_doc AND c.syntax_id=g.syntax_id) ORDER BY g.syntax_id",
+        )
     } else {
-        (destination, "SELECT g.syntax_id FROM g_definitions g WHERE g.side=0 AND g.owner_doc=?1 \
+        (
+            destination,
+            "SELECT g.syntax_id FROM g_definitions g WHERE g.side=0 AND g.owner_doc=?1 \
          AND NOT EXISTS (SELECT 1 FROM w_docs w WHERE w.source_ord=g.owner_doc \
-         AND w.eligible=1 AND w.failed=0) ORDER BY g.syntax_id")
+         AND w.eligible=1 AND w.failed=0) ORDER BY g.syntax_id",
+        )
     };
     ctx.charge(1)?;
     let mut statement = ctx.conn.prepare_cached(sql)?;
@@ -498,12 +509,17 @@ pub(super) fn remaining_document_status(
         ctx.charge(1)?;
         let value = row.get_ref(0)?;
         reservation.grow(sizes::sum(&[
-            sizes::map_entries::<String, ()>(1)?, codec::sid_len(value)?,
+            sizes::map_entries::<String, ()>(1)?,
+            codec::sid_len(value)?,
         ])?)?;
         targets.insert(codec::sid_text(value)?);
     }
-    if targets.is_empty() { return Ok(()); }
-    let Some((ord, _)) = side.doc_row(document)? else { return Ok(()); };
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let Some((ord, _)) = side.doc_row(document)? else {
+        return Ok(());
+    };
     let group = side.group(document)?.context("missing native document")?;
     write_target_status(ctx, side.rev, ord, &group, &targets)
 }
@@ -1506,8 +1522,8 @@ pub(super) fn discover_document(
         for symbol in local.type_uses(document, range.start, range.end)? {
             let _summary_reservation = side.ctx.live.reserve(sizes::sum(&[
                 sizes::declaration(declaration)?,
-                (std::mem::size_of::<MethodSummary>()
-                    - std::mem::size_of::<native::Declaration>()) as u64,
+                (std::mem::size_of::<MethodSummary>() - std::mem::size_of::<native::Declaration>())
+                    as u64,
             ])?)?;
             let summary = MethodSummary {
                 target_owner_matches: method_target_owner_matches(

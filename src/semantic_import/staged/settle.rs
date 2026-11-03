@@ -133,7 +133,15 @@ impl StagedJoin<'_> {
                 if let Some(captured) = memo.external.get(&symbol.symbol) {
                     return Ok(!captured);
                 }
-                let captured = CompletedGlobal::captured_symbol(self.ctx, &symbol.symbol)?;
+                let captured = if self.witnessed {
+                    exists(
+                        self.conn(),
+                        "SELECT 1 FROM witness_internal_symbols WHERE symbol=?1 LIMIT 1",
+                        &[&symbol.symbol],
+                    )?
+                } else {
+                    CompletedGlobal::captured_symbol(self.ctx, &symbol.symbol)?
+                };
                 if entry::<String, bool>(&mut memo.retained, symbol.symbol.len() as u64).is_ok() {
                     memo.external.insert(symbol.symbol.clone(), captured);
                 }
@@ -239,6 +247,7 @@ impl StagedJoin<'_> {
         id: &str,
         kind: semantic::EvidenceKind,
         anchor: Option<&native::DocumentKey>,
+        witnessed: Option<semantic::WitnessFact<'_>>,
         check: impl for<'a> FnOnce(
             &'a EmissionValidator<'_>,
             &semantic::Provenance,
@@ -247,6 +256,35 @@ impl StagedJoin<'_> {
     ) -> Result<()> {
         view.proof(raw)?
             .context("dangling semantic fact provenance")?;
+        anyhow::ensure!(
+            !self.witnessed || witnessed.is_some(),
+            "missing witnessed source association"
+        );
+        if let Some(row) = witnessed {
+            let document = view
+                .document
+                .as_ref()
+                .context("missing witnessed source document")?;
+            anyhow::ensure!(
+                anchor.is_none_or(|anchor| anchor == document),
+                "semantic fact/provenance tuple mismatch"
+            );
+            let (_, current) = view
+                .doc_row(document)?
+                .context("missing witnessed current source")?;
+            return self.validator.witnessed_fact(
+                row,
+                raw,
+                id,
+                document,
+                &current.content_hash,
+                &|sid, document| {
+                    Ok(!self
+                        .declaration_status(self.destination.rev, document, sid)?
+                        .is_empty())
+                },
+            );
+        }
         let group = view
             .local_group
             .as_ref()
@@ -308,32 +346,63 @@ impl StagedJoin<'_> {
     ) -> Result<DocumentOutcome> {
         let encoding = self.admitted_encoding;
         let _keys = self.view_keys(doc, 2)?;
-        // The captured join eligibility already computed for this document, over the same
-        // claims and captured context, or a fresh one.
-        let (claims, mut captured, _captured_reservation) = match prepared {
-            Some(joined) => (joined.claims, joined.facts, joined.reservation),
-            None => {
-                let claims = Rc::new(DocumentClaims::load(&self.filtered, doc)?);
-                let captured_view =
-                    streaming::claims_side(&self.captured, doc.clone(), claims.clone())?;
-                let (facts, reservation) =
-                    streaming::join_document(&captured_view, captured_global, encoding)?;
-                (claims, facts, reservation)
+        let witness = if self.witnessed {
+            Some(witness::prepare(self, doc)?)
+        } else {
+            None
+        };
+        let measured = if witness.is_none() {
+            let (claims, facts, reservation) = match prepared {
+                Some(joined) => (joined.claims, joined.facts, joined.reservation),
+                None => {
+                    let claims = Rc::new(DocumentClaims::load(&self.filtered, doc)?);
+                    let captured_view =
+                        streaming::claims_side(&self.captured, doc.clone(), claims.clone())?;
+                    let (facts, reservation) =
+                        streaming::join_document(&captured_view, captured_global, encoding)?;
+                    (claims, facts, reservation)
+                }
+            };
+            Some((claims, facts, reservation))
+        } else {
+            None
+        };
+        let view = if let Some((claims, _, _)) = &measured {
+            streaming::claims_side(&self.filtered, doc.clone(), claims.clone())?
+        } else {
+            StagedSide {
+                ctx: self.ctx,
+                reader: self.filtered.reader,
+                header: self.filtered.header,
+                rev: self.filtered.rev,
+                side: self.filtered.side,
+                filtered: false,
+                document: Some(doc.clone()),
+                local_claims: None,
+                local_group: None,
             }
         };
-        let view = streaming::claims_side(&self.filtered, doc.clone(), claims)?;
-        // The document's validation index, dropped (and its charge released) with the document.
         let index = ValidationIndex::new();
-        // Same claims, native revision and global rows: the destination join would recompute
-        // the captured facts, so the destination rows are read from the captured join itself.
-        // Settlement reads destination rows by reference and copies one at a time.
-        let (separate, _destination_reservation) = if self.identical_joins.get() {
-            (None, None)
-        } else {
-            let (facts, reservation) =
-                streaming::join_document(&view, destination_global, encoding)?;
-            (Some(facts), Some(reservation))
-        };
+        let (mut captured, separate, _source_reservation, _destination_reservation) =
+            if let Some(prepared) = witness {
+                (
+                    prepared.facts,
+                    Some(prepared.destination),
+                    prepared.reservation,
+                    None,
+                )
+            } else {
+                let (_, facts, reservation) =
+                    measured.context("missing measured source preparation")?;
+                let (separate, destination_reservation) = if self.identical_joins.get() {
+                    (None, None)
+                } else {
+                    let (facts, reservation) =
+                        streaming::join_document(&view, destination_global, encoding)?;
+                    (Some(facts), Some(reservation))
+                };
+                (facts, separate, reservation, destination_reservation)
+            };
         #[cfg(feature = "test-support")]
         crate::semantic_batch::testing::run_document_common_observer(
             1,
@@ -434,9 +503,24 @@ impl StagedJoin<'_> {
                 symbol.provenance_id = id.clone();
                 #[cfg(feature = "test-support")]
                 crate::semantic_batch::testing::edit_row("symbol", &mut symbol)?;
-                self.check_row(&view, &index, &raw, &id, kind, None, |v, p, f| {
-                    v.symbol(&symbol, p, f)
-                })?;
+                self.check_row(
+                    &view,
+                    &index,
+                    &raw,
+                    &id,
+                    kind,
+                    None,
+                    self.witnessed
+                        .then(|| {
+                            captured
+                                .symbols
+                                .iter()
+                                .find(|r| r.provenance_id == raw && r.key == symbol.key)
+                                .map(|prior| semantic::WitnessFact::Symbol(prior, &symbol))
+                        })
+                        .flatten(),
+                    |v, p, f| v.symbol(&symbol, p, f),
+                )?;
                 self.emit_fact("out_symbols", SYMBOLS, &mut symbol)?;
             } else if own {
                 outcome.omitted = true;
@@ -467,6 +551,8 @@ impl StagedJoin<'_> {
                 &id,
                 kind,
                 Some(&binding.join.anchor.document),
+                self.witnessed
+                    .then_some(semantic::WitnessFact::Declaration(row, &binding)),
                 |v, p, f| v.declaration_binding(&binding, p, f),
             )?;
             self.emit_fact("out_declaration_bindings", BINDINGS, &mut binding)?;
@@ -626,6 +712,14 @@ impl StagedJoin<'_> {
                 &proof_id,
                 kind,
                 Some(&reference.document),
+                self.witnessed
+                    .then(|| {
+                        captured
+                            .reference_claims
+                            .get(&raw)
+                            .map(|prior| semantic::WitnessFact::Reference(prior, &reference))
+                    })
+                    .flatten(),
                 |v, p, f| v.reference(&reference, p, f),
             )?;
             let body = codec::fact_body(&mut reference)?;
@@ -815,6 +909,15 @@ impl StagedJoin<'_> {
                 &id,
                 kind,
                 Some(&call.join.anchor.document),
+                self.witnessed
+                    .then(|| {
+                        captured
+                            .call_bindings
+                            .iter()
+                            .find(|r| r.provenance_id == raw)
+                            .map(|prior| semantic::WitnessFact::Call(prior, &call))
+                    })
+                    .flatten(),
                 |v, p, f| v.call_binding(&call, p, f),
             )?;
             self.emit_fact("out_call_bindings", CALLS, &mut call)?;
@@ -822,6 +925,11 @@ impl StagedJoin<'_> {
 
         // Captured type relationships of eligible claims survive when both endpoints retarget.
         for mut relationship in relationships {
+            let original = if self.witnessed {
+                Some(working_copy(live, &relationship, sizes::type_relationship)?)
+            } else {
+                None
+            };
             if view.proof(&relationship.provenance_id)?.is_none() {
                 continue;
             }
@@ -837,15 +945,42 @@ impl StagedJoin<'_> {
                 relationship.provenance_id = id.clone();
                 #[cfg(feature = "test-support")]
                 crate::semantic_batch::testing::edit_row("typeRelationship", &mut relationship)?;
-                self.check_row(&view, &index, &raw, &id, kind, None, |v, p, f| {
-                    v.type_relationship(&relationship, p, f)
-                })?;
+                self.check_row(
+                    &view,
+                    &index,
+                    &raw,
+                    &id,
+                    kind,
+                    None,
+                    original.as_ref().map(|(_, prior)| {
+                        semantic::WitnessFact::Relationship(prior, &relationship)
+                    }),
+                    |v, p, f| v.type_relationship(&relationship, p, f),
+                )?;
                 self.emit_fact("out_type_relationships", RELATIONSHIPS, &mut relationship)?;
             } else {
                 outcome.omitted = true;
             }
         }
 
+        if self.witnessed {
+            if outcome.omitted
+                && (!captured.fused_proofs.is_empty() || !captured.fused_calls.is_empty())
+            {
+                return Err(crate::semantic_batch::staging::WitnessFallback(
+                    "lost target in fused original association",
+                )
+                .into());
+            }
+            for raw in &captured.fused_proofs {
+                source(
+                    &mut sources,
+                    &mut owner,
+                    raw,
+                    semantic::EvidenceKind::SemanticReference,
+                )?;
+            }
+        }
         outcome.provenance = self.provenance(&view, doc, &sources, destination_manifest_hash)?;
         for value in outcomes.values() {
             match value {
@@ -892,12 +1027,8 @@ impl StagedJoin<'_> {
         }
         // Every derived proof is a claim of this document, decoded from its staged row.
         let lookup = |proof: &str, kind: &str, digest: &str| -> Result<RawClaimDocument> {
-            let (claim, _) = view.local_claim(proof, kind, digest)?;
-            Ok(RawClaimDocument {
-                language: claim.language.clone(),
-                path: claim.envelope.relative_path.clone(),
-                artifact_hash: claim.artifact_hash.clone(),
-            })
+            let (claim, _) = view.proof_identity(proof, kind, digest)?;
+            Ok(claim)
         };
         let basis = self
             .basis
@@ -965,7 +1096,7 @@ impl StagedJoin<'_> {
                 template = Some(codec::provenance_template(&provenance)?);
             }
             self.ctx.charge(1)?;
-            let (_, claim_id) = view.local_claim(raw, &claim.record_kind, &claim.fact_digest)?;
+            let (_, claim_id) = view.proof_identity(raw, &claim.record_kind, &claim.fact_digest)?;
             self.emit(
                 "out_provenance",
                 "INSERT INTO out_provenance VALUES(?1,?2,?3,?4,?5)",

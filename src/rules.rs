@@ -1036,7 +1036,21 @@ fn reference_evidence(module: &Value, site: &Value) -> Value {
     let mut evidence = json!({"document":{"sourceSetId":module["identity"]["sourceSetId"],"language":module["identity"]["language"],"path":module["identity"]["path"]},
         "revisionId":module["revisionId"],"range":site["range"],"kind":kind,"syntaxId":site["ownerSyntaxId"],"callId":site["callId"],"provenanceId":provenance});
     if site["mapping"] == "semantic" {
-        for key in ["projection", "freshness", "historicalFreshness", "historicalContentHash", "evidenceKind", "captureId", "derivedFrom", "basis", "historicalTargets", "historicalExternalTargets", "historicalResolution", "historicalDispatch", "historicalJoin", "semanticBoundary"] {
+        for key in [
+            "projection",
+            "freshness",
+            "historicalFreshness",
+            "historicalContentHash",
+            "evidenceKind",
+            "derivedFrom",
+            "basis",
+            "historicalTargets",
+            "historicalExternalTargets",
+            "historicalResolution",
+            "historicalDispatch",
+            "historicalJoin",
+            "semanticBoundary",
+        ] {
             if let Some(value) = site.get(key) {
                 evidence[key] = value.clone();
             }
@@ -1534,7 +1548,9 @@ fn constraint(
                 evidence.push(semantic_evidence(json!({"document":d.document,"revisionId":d.revision_id,"range":d.range,"kind":"typeRelationship","syntaxId":d.syntax_id,"callId":null,"provenanceId":relationship.provenance_id}), &relationship.metadata));
             }
             let Some((key, sid)) = &relationship.target else {
-                uncertain += usize::from(relationship.metadata.get("semanticBoundary") == Some(&json!(true)));
+                uncertain += usize::from(
+                    relationship.metadata.get("semanticBoundary") == Some(&json!(true)),
+                );
                 continue;
             };
             match select(key, sid) {
@@ -1562,10 +1578,17 @@ fn constraint(
     };
     let (status, reason) = match (c.mode, bound, hits > 0) {
         (_, false, _) => ("unknown", Some(unavailable)),
-        (_, _, false) if doc.semantic.projection.is_some() => ("unknown", Some("historical_semantic_absence_unproven")),
+        (_, _, false) if doc.semantic.projection.is_some() => {
+            ("unknown", Some("historical_semantic_absence_unproven"))
+        }
         ("require", _, true) => ("conforms", None),
         ("forbid", _, true) => ("deviates", None),
-        ("forbid", _, false) if calls && uncertain == 0 && doc.semantic.complete && doc.semantic.projection.is_none() => {
+        ("forbid", _, false)
+            if calls
+                && uncertain == 0
+                && doc.semantic.complete
+                && doc.semantic.projection.is_none() =>
+        {
             ("conforms", None)
         }
         _ if uncertain > 0 || (calls && !doc.semantic.complete) => ("unknown", Some(incomplete)),
@@ -2236,12 +2259,21 @@ mod document_parallel_tests {
     #[test]
     fn detached_rule_proof_retains_historical_basis_and_revision() {
         let metadata = BTreeMap::from([
-            ("projection".into(), json!({"currentPin":{"indexRevision":4},"semanticBasisPin":{"indexRevision":3},"basisNativeRevisionId":"basis-native","semanticStatus":"olderBasis"})),
+            (
+                "projection".into(),
+                json!({"currentPin":{"indexRevision":4},"semanticBasisPin":{"indexRevision":3},"basisNativeRevisionId":"basis-native","semanticStatus":"olderBasis"}),
+            ),
             ("historicalFreshness".into(), json!("fresh")),
             ("freshness".into(), json!("possiblyStale")),
-            ("basis".into(), json!({"artifactHash":"artifact","revisionId":"capture-native"})),
+            (
+                "basis".into(),
+                json!({"artifactHash":"artifact","revisionId":"capture-native"}),
+            ),
         ]);
-        let proof = semantic_evidence(json!({"revisionId":"current-native","kind":"semanticBinding"}), &metadata);
+        let proof = semantic_evidence(
+            json!({"revisionId":"current-native","kind":"semanticBinding"}),
+            &metadata,
+        );
         assert_eq!(proof["revisionId"], "basis-native");
         assert_eq!(proof["freshness"], "possiblyStale");
         assert_eq!(proof["historicalFreshness"], "fresh");
@@ -2257,7 +2289,10 @@ mod document_parallel_tests {
         doc.semantic.complete = true;
         doc.semantic.projection = Some(crate::model::SemanticProjection {
             current_pin: snapshot.pin,
-            semantic_basis_pin: crate::model::IndexPin { index_revision: snapshot.pin.index_revision - 1, ..snapshot.pin },
+            semantic_basis_pin: crate::model::IndexPin {
+                index_revision: snapshot.pin.index_revision - 1,
+                ..snapshot.pin
+            },
             basis_native_revision_id: "basis-native".into(),
             semantic_status: crate::model::SemanticStatus::OlderBasis,
         });
@@ -2265,8 +2300,14 @@ mod document_parallel_tests {
         assert!(!base.declarations.is_empty());
         for row in &base.declarations {
             assert_eq!(row["status"], "unknown");
-            assert_eq!(row["constraints"][0]["unresolved"][0], "historical_semantic_absence_unproven");
-            assert_eq!(row["constraints"][0]["projection"]["semanticStatus"], "olderBasis");
+            assert_eq!(
+                row["constraints"][0]["unresolved"][0],
+                "historical_semantic_absence_unproven"
+            );
+            assert_eq!(
+                row["constraints"][0]["projection"]["semanticStatus"],
+                "olderBasis"
+            );
         }
     }
 

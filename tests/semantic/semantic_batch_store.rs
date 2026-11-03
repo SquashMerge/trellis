@@ -6227,7 +6227,7 @@ const ajv = new Ajv2020({strict: false, allErrors: true});
 const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json', 'utf8'));
 for (const {name, structuredContent} of JSON.parse(readFileSync(0, 'utf8'))) {
     const validate = ajv.compile(catalog.find(tool => tool.name === name).outputSchema);
-    if (!validate(structuredContent)) throw Error(`${name}: ${JSON.stringify(validate.errors)}`);
+    if (!validate(structuredContent)) throw Error(`${name}: ${JSON.stringify(validate.errors)} structuredContent=${JSON.stringify(structuredContent)}`);
     const missingVersion = {...structuredContent};
     delete missingVersion.schemaVersion;
     if (validate(missingVersion)) throw Error(`${name}: validator accepted missing schemaVersion`);
@@ -7452,6 +7452,229 @@ fn witnessed_local_rejoin_preserves_real_partial_import_metadata() {
             .reasons,
         reasons
     );
+}
+
+/// Architecture wire evidence keeps the imported proof's identity beside native N.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn architecture_wire_preserves_canonical_proof_identity_at_current_and_older_basis() {
+    use trellis::model::SemanticStatus;
+    let files = ["src/lib.js", "src/main.js"];
+    let (world, _) = real_fixture_world("issue444-javascript-calls", &files);
+    let (p, producer) = publish_real_fixture(&world, "issue444-javascript-calls", &files);
+    let published = world.store.semantic_at(p).unwrap();
+    let (native_p, _) = world.store.retained_native_snapshot_at(p).unwrap();
+    let helper_call = native_p
+        .calls
+        .iter()
+        .find(|call| {
+            call.document.path == "src/main.js" && call.spelling.as_deref() == Some("helper")
+        })
+        .unwrap();
+    let binding = published
+        .call_bindings
+        .iter()
+        .find(|binding| binding.call_id.as_deref() == Some(helper_call.id.as_str()))
+        .unwrap();
+    let proof = published
+        .provenance
+        .iter()
+        .find(|proof| proof.id == binding.provenance_id)
+        .unwrap();
+    assert_eq!(proof.freshness, Freshness::Fresh);
+    assert!(proof.basis.is_some());
+    assert!(proof.derived_from.is_some());
+    let trellis::semantic_evidence::Target::Internal {
+        syntax_id,
+        document,
+        revision_id,
+    } = binding.declared_target.as_ref().unwrap()
+    else {
+        panic!("real helper call must have an internal target");
+    };
+    assert_eq!(document.path, "src/lib.js");
+    assert_eq!(revision_id, &native_p.revision.id);
+    assert!(binding.candidates.is_empty());
+    assert!(binding.possible_dispatch.is_empty());
+    let historical_targets = json!([{"role":"declared","kind":"internal",
+        "language":document.language,"path":document.path,"syntaxId":syntax_id,
+        "revisionId":revision_id}]);
+    fs::create_dir_all(world.root.join(".trellis")).unwrap();
+    fs::write(
+        world.root.join(".trellis/rules.toml"),
+        r#"version = 1
+[roles.entry]
+select = { name = "caller", language = ["javascript"] }
+[roles.helper]
+select = { name = "helper", language = ["javascript"] }
+[[rules]]
+id = "entry-must-not-call-helper"
+for_each = "entry"
+forbid = [{ calls = "helper" }]
+"#,
+    )
+    .unwrap();
+    // The startup channel holds the writer before capture. Architecture has its own
+    // owner and can publish P and N cores while startup remains held; no S is driven.
+    let mut mcp = McpSession::start(&world, 600);
+    mcp.catalog();
+    let mut pin = p;
+    for historical in [false, true] {
+        if historical {
+            write_files(
+                &world.root,
+                &[("src/pending.js", "export function pending() { return missing(); }\n")],
+            );
+            let (graph, native, capture) = index_workspace_bundle(
+                &IndexOptions::new(world.root.clone()),
+                world.store.root_id(),
+                &world.cancel,
+                |_| {},
+            )
+            .unwrap();
+            let leader = world.store.publication_for_tests().unwrap();
+            pin = world
+                .store
+                .publish_native(&graph, &capture, &native, &leader, p, &world.cancel)
+                .unwrap();
+            drop(leader);
+            assert_ne!(pin, p);
+            assert_ne!(native.revision.id, native_p.revision.id);
+            for path in files {
+                let projection = world
+                    .store
+                    .semantic_projection_at(pin, &producer, "javascript", path)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(projection.semantic_status, SemanticStatus::OlderBasis);
+                assert_eq!(projection.current_pin, pin);
+                assert_eq!(projection.semantic_basis_pin, p);
+                assert_eq!(projection.basis_native_revision_id, native_p.revision.id);
+            }
+            let pending = world
+                .store
+                .semantic_projection_at(pin, &producer, "javascript", "src/pending.js")
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.semantic_status, SemanticStatus::CatchingUp);
+        }
+        let basis = json!(pin);
+        let arguments = json!({"schemaVersion":1,"expectedBasis":basis,"limit":50});
+        let references = mcp.success("trellis_references", arguments.clone());
+        let checked = mcp.success("trellis_rules_check", arguments.clone());
+        let instance = checked["data"]["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|instance| instance["rule"] == "entry-must-not-call-helper")
+            .unwrap();
+        assert_eq!(instance["status"], "deviates", "{checked}");
+        let mut explain_arguments = arguments;
+        explain_arguments["rule"] = instance["rule"].clone();
+        explain_arguments["target"] = instance["target"].clone();
+        let explained = mcp.success("trellis_rules_explain", explain_arguments);
+        let (native, _) = world.store.retained_native_snapshot_at(pin).unwrap();
+        for reply in [&references, &checked, &explained] {
+            assert_eq!(reply["evidenceBasis"], basis, "{reply}");
+            assert_eq!(reply["data"]["indexGeneration"], basis["indexGeneration"]);
+            assert_eq!(reply["data"]["indexRevision"], basis["indexRevision"]);
+            if historical {
+                let pending = reply["data"]["semanticDocuments"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|status| status["path"] == "src/pending.js")
+                    .unwrap();
+                assert_eq!(pending["producerId"], producer);
+                assert_eq!(pending["projection"]["semanticStatus"], "catchingUp");
+                assert_eq!(pending["projection"]["currentPin"], basis);
+                assert_eq!(pending["projection"]["semanticBasisPin"], json!(p));
+                assert_eq!(pending["coverageState"], Value::Null);
+                assert_eq!(pending["boundary"], true);
+                for field in ["provenanceId", "basis", "derivedFrom"] {
+                    assert!(pending.get(field).is_none(), "{pending}");
+                }
+                assert_eq!(reply["data"]["partial"], true);
+            }
+        }
+        let sites: Vec<_> = references["data"]["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|edge| edge["sites"].as_array().unwrap())
+            .filter(|site| site["provenanceId"] == proof.id)
+            .collect();
+        assert!(!sites.is_empty(), "{references}");
+        for site in &sites {
+            assert_eq!(site["mapping"], "semantic");
+            assert_eq!(site["callId"], helper_call.id);
+        }
+        let mut evidence = sites;
+        for reply in [&checked, &explained] {
+            let constraint = &reply["data"]["instances"][0]["constraints"][0];
+            let rows = constraint["evidence"].as_array().unwrap();
+            let semantic: Vec<_> = rows
+                .iter()
+                .filter(|row| row["provenanceId"] == proof.id)
+                .collect();
+            assert!(!semantic.is_empty(), "{reply}");
+            evidence.extend(semantic);
+            // Native declarations and calls remain measured N facts, not derived proofs.
+            for kind in ["declaration", "call"] {
+                let row = rows.iter().find(|row| row["kind"] == kind).unwrap();
+                let expected = if kind == "declaration" {
+                    let declaration = native
+                        .declarations
+                        .iter()
+                        .find(|declaration| json!(declaration.syntax_id) == row["syntaxId"])
+                        .unwrap();
+                    json!({"document":declaration.document,"revisionId":declaration.revision_id,
+                        "range":declaration.range,"kind":"declaration",
+                        "syntaxId":declaration.syntax_id,"callId":null,
+                        "provenanceId":declaration.provenance_id})
+                } else {
+                    let call = native
+                        .calls
+                        .iter()
+                        .find(|call| json!(call.id) == row["callId"])
+                        .unwrap();
+                    json!({"document":call.document,"revisionId":call.revision_id,
+                        "range":call.range,"kind":"call","syntaxId":call.owner_syntax_id,
+                        "callId":call.id,"provenanceId":call.provenance_id})
+                };
+                assert_eq!(row, &expected);
+            }
+        }
+        for row in evidence {
+            assert_eq!(row["provenanceId"], proof.id);
+            assert_eq!(row["basis"], json!(proof.basis));
+            assert_eq!(row["derivedFrom"], json!(proof.derived_from));
+            assert_eq!(row["historicalContentHash"], proof.content_hash);
+            assert_eq!(row["historicalFreshness"], json!(proof.freshness));
+            assert_eq!(row["evidenceKind"], json!(proof.evidence_kind));
+            assert!(row.get("captureId").is_none(), "{row}");
+            if historical {
+                assert_eq!(row["freshness"], "possiblyStale");
+                assert_eq!(row["projection"]["currentPin"], basis);
+                assert_eq!(row["projection"]["semanticBasisPin"], json!(p));
+                assert_eq!(row["projection"]["basisNativeRevisionId"], native_p.revision.id);
+                assert_eq!(row["projection"]["semanticStatus"], "olderBasis");
+                assert_eq!(row["historicalTargets"], historical_targets);
+                assert_eq!(
+                    row["historicalJoin"]["revisionId"],
+                    binding.join.anchor.revision_id
+                );
+                if row["kind"] == "semanticBinding" {
+                    assert_eq!(row["revisionId"], proof.revision_id);
+                }
+            } else {
+                assert_eq!(row["freshness"], json!(proof.freshness));
+                assert!(row["projection"].is_null(), "{row}");
+            }
+        }
+    }
+    // The causal startup hold, not an elapsed quiet period, kept N selected until now.
+    assert_eq!(world.store.index_baseline().unwrap(), pin);
+    mcp.finish();
 }
 
 /// #599: enumerate the live catalog, not a hand-picked subset of MCP tools. All responses

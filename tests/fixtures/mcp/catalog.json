@@ -13998,9 +13998,6 @@
                 "typeRelationship"
               ]
             },
-            "captureId": {
-              "$ref": "#/$defs/Text"
-            },
             "derivedFrom": {
               "anyOf": [
                 {
@@ -14398,9 +14395,6 @@
                 "semanticReference",
                 "typeRelationship"
               ]
-            },
-            "captureId": {
-              "$ref": "#/$defs/Text"
             },
             "derivedFrom": {
               "anyOf": [
@@ -16721,9 +16715,6 @@
                 "typeRelationship"
               ]
             },
-            "captureId": {
-              "$ref": "#/$defs/Text"
-            },
             "derivedFrom": {
               "anyOf": [
                 {
@@ -17121,9 +17112,6 @@
                 "semanticReference",
                 "typeRelationship"
               ]
-            },
-            "captureId": {
-              "$ref": "#/$defs/Text"
             },
             "derivedFrom": {
               "anyOf": [
@@ -19743,9 +19731,6 @@
                 "typeRelationship"
               ]
             },
-            "captureId": {
-              "$ref": "#/$defs/Text"
-            },
             "derivedFrom": {
               "anyOf": [
                 {
@@ -20143,9 +20128,6 @@
                 "semanticReference",
                 "typeRelationship"
               ]
-            },
-            "captureId": {
-              "$ref": "#/$defs/Text"
             },
             "derivedFrom": {
               "anyOf": [

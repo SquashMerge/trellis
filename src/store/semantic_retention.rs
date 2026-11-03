@@ -2,6 +2,30 @@
 use super::*;
 use crate::producer::{retention, state::StateDir};
 
+// Only an exact retained selection on the same native executable belongs to ordinary S work.
+const ORDINARY_RETAINED_PENDING: &str = "WITH ordinary_retained_pending AS (
+    SELECT p.producer_id
+    FROM semantic_pending_target t
+    JOIN native_revisions n
+      ON n.id=t.revision_id AND n.native_revision_id=t.native_revision_id
+    JOIN semantic_pending_selections p ON p.revision_id=t.revision_id
+    JOIN semantic_revision_raw_selections r
+      ON r.revision_id=p.revision_id AND r.producer_id=p.producer_id
+     AND r.batch_id=p.batch_id AND r.captured_pin=p.captured_pin
+    JOIN semantic_projection_origins o
+      ON o.revision_id=p.revision_id AND o.producer_id=p.producer_id
+     AND o.basis_pin=p.basis_pin
+    JOIN semantic_raw_batches b
+      ON b.batch_id=r.batch_id AND b.producer_id=r.producer_id
+    JOIN retained.retained_runs held
+      ON held.producer=r.producer_id
+     AND held.descriptor_sha256=b.descriptor_sha256
+    JOIN revision_producer_bindings old_binding ON old_binding.revision_id=?1
+    JOIN revision_producer_bindings new_binding ON new_binding.revision_id=?2
+    WHERE t.revision_id=?2
+      AND old_binding.producer_sha=new_binding.producer_sha
+) ";
+
 pub(super) fn semantic_reimport_at(
     db: &Connection,
     key: &str,
@@ -35,9 +59,13 @@ pub(super) fn copy(db: &Connection, old: &str, new: &str, clear: Option<&str>) -
 }
 
 /// Record evidence discarded by a new native identity, not ordinary unavailable languages.
-pub(super) fn discarded(db: &Connection, old: &str, new: &str) -> Result<()> {
-    db.execute(
-        "INSERT OR IGNORE INTO semantic_reimport
+pub(super) fn discarded(
+    db: &Connection,
+    old: &str,
+    new: &str,
+    retention_attached: bool,
+) -> Result<()> {
+    let sql = "INSERT OR IGNORE INTO semantic_reimport
          SELECT DISTINCT ?2,prior.producer_id,prior.language,
          'native revision identity changed; prior semantic evidence cannot be carried over; import a current artifact'
          FROM semantic_coverage prior
@@ -47,9 +75,17 @@ pub(super) fn discarded(db: &Connection, old: &str, new: &str) -> Result<()> {
          AND previous.native_revision_id<>current.native_revision_id
          AND NOT EXISTS(SELECT 1 FROM semantic_coverage selected
              WHERE selected.revision_id=?2 AND selected.producer_id=prior.producer_id
-             AND selected.language=prior.language AND selected.selected=1)",
-        params![old, new],
-    )?;
+             AND selected.language=prior.language AND selected.selected=1)";
+    let sql = if retention_attached {
+        format!(
+            "{ORDINARY_RETAINED_PENDING}{sql} AND NOT EXISTS(
+                SELECT 1 FROM ordinary_retained_pending owned
+                WHERE owned.producer_id=prior.producer_id)"
+        )
+    } else {
+        sql.to_owned()
+    };
+    db.execute(&sql, params![old, new])?;
     Ok(())
 }
 
@@ -77,6 +113,14 @@ impl Store {
     ) -> Result<()> {
         if state.is_some() {
             let slots = retention::slots(db)?;
+            let published_or_pending_sql = format!(
+                "{ORDINARY_RETAINED_PENDING}SELECT EXISTS(
+                    SELECT 1 FROM semantic_coverage
+                    WHERE revision_id=?2 AND producer_id=?3 AND selected=1
+                ) OR EXISTS(
+                    SELECT 1 FROM ordinary_retained_pending WHERE producer_id=?3
+                )"
+            );
             for retention::RetainedRun {
                 producer,
                 languages,
@@ -84,8 +128,12 @@ impl Store {
                 ..
             } in slots
             {
-                let published: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND selected=1)", params![key,producer], |row| row.get(0))?;
-                if published {
+                let published_or_pending: bool = db.query_row(
+                    &published_or_pending_sql,
+                    params![previous, key, producer],
+                    |row| row.get(0),
+                )?;
+                if published_or_pending {
                     continue;
                 }
                 // A failed attempt belongs to its native capture identity. Semantic-only

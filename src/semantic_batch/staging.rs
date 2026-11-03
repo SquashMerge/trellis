@@ -9,6 +9,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// A reusable witness is unavailable; the caller must run bounded FULL admission/join.
+#[derive(Debug)]
+pub(crate) struct WitnessFallback(pub &'static str);
+
+impl std::fmt::Display for WitnessFallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "witness fallback: {}", self.0)
+    }
+}
+
+impl std::error::Error for WitnessFallback {}
+
 pub const STAGE_PREFIX: &str = "semantic-stage-";
 const STAGE_DB: &str = "stage.db";
 
@@ -49,6 +61,12 @@ CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, sou
 CREATE INDEX claims_order ON claims(source_ord, canonical_bytes);
 CREATE UNIQUE INDEX claims_proof ON claims(proof_id);
 CREATE INDEX claims_symbol ON claims(symbol, presence, target_root) WHERE symbol IS NOT NULL;
+CREATE TABLE witness_proofs(identity_id INTEGER PRIMARY KEY CHECK(identity_id<0), artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL UNIQUE, capture_id INTEGER NOT NULL, UNIQUE(artifact,fact_digest));
+CREATE VIEW proof_identities AS SELECT claim_id AS identity_id, claim_id, artifact, source_ord, record_kind, fact_digest, proof_id, NULL AS capture_id FROM claims c UNION ALL SELECT identity_id, identity_id AS claim_id, artifact, source_ord, record_kind, fact_digest, proof_id, capture_id FROM witness_proofs w;
+CREATE TABLE witness_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), internal_symbols_complete INTEGER NOT NULL DEFAULT 0 CHECK(internal_symbols_complete IN (0,1)), staged_rows INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE source_witnesses(source_ord INTEGER PRIMARY KEY, decision TEXT NOT NULL CHECK(decision IN ('reused','changedBytes','newDocument')), body TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0,1)));
+CREATE TABLE original_associations(source_ord INTEGER NOT NULL, ordinal INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, PRIMARY KEY(source_ord,ordinal)) WITHOUT ROWID;
+CREATE TABLE witness_internal_symbols(scope INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(scope,language,path,symbol)) WITHOUT ROWID;
 CREATE TABLE join_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation TEXT NOT NULL, revision INTEGER NOT NULL, attempt INTEGER NOT NULL);
 CREATE TABLE nat_done(rev INTEGER PRIMARY KEY);
 CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, reserve INTEGER, PRIMARY KEY(rev, ord), UNIQUE(rev, language, path)) WITHOUT ROWID;
@@ -287,6 +305,235 @@ pub fn remove_abandoned_semantic_stages(index_dir: &Path) -> usize {
         }
     }
     removed
+}
+
+/// Charges serialization before allocating the private event payload.
+fn serialized_len(value: &impl serde::Serialize, limit: u64) -> Result<u64> {
+    struct Counter {
+        bytes: u64,
+        limit: u64,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self.bytes.saturating_add(bytes.len() as u64);
+            if self.bytes > self.limit {
+                return Err(std::io::Error::other("witness serialization limit"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, limit };
+    let result = serde_json::to_writer(&mut counter, value);
+    if counter.bytes > limit {
+        return Err(ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into());
+    }
+    result?;
+    Ok(counter.bytes)
+}
+
+pub(crate) fn charge_witness_row(conn: &Connection, limits: &BatchLimits) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE witness_state SET staged_rows=staged_rows+1 WHERE singleton=1 AND staged_rows<?1",
+        [i64::try_from(limits.staged_rows)?],
+    )?;
+    if changed != 1 {
+        return Err(ScipCaptureError::LimitExceeded("staged rows".into()).into());
+    }
+    Ok(())
+}
+
+/// One bounded page writer. It owns no main-index connection or source reconstruction.
+pub(crate) struct WitnessStageWriter<'a> {
+    conn: &'a Connection,
+    budget: StageBudget,
+    limits: &'a BatchLimits,
+    counters: &'a mut super::BatchCounters,
+    changes_before: u64,
+}
+
+impl<'a> WitnessStageWriter<'a> {
+    pub(crate) fn new(
+        stage: &'a mut Stage,
+        limits: &'a BatchLimits,
+        counters: &'a mut super::BatchCounters,
+    ) -> Result<Self> {
+        let budget = stage.budget(limits);
+        let conn = stage.conn()?;
+        Ok(Self {
+            conn,
+            budget,
+            limits,
+            counters,
+            changes_before: conn.total_changes(),
+        })
+    }
+
+    fn payload(&mut self, value: &impl serde::Serialize) -> Result<(String, u64)> {
+        let length = serialized_len(value, self.limits.unit_expansion_bytes)?;
+        let reservation = length.saturating_mul(2);
+        if reservation > self.limits.unit_expansion_bytes {
+            return Err(ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into());
+        }
+        charge_witness_row(self.conn, self.limits)?;
+        self.budget.check()?;
+        let body = serde_json::to_string(value)?;
+        self.counters.retained_admission_bytes_high_water = self
+            .counters
+            .retained_admission_bytes_high_water
+            .max(reservation);
+        Ok((body, length))
+    }
+
+    pub(crate) fn stage_source_witness(
+        &mut self,
+        source_ord: i64,
+        witness: &crate::store::native_first::witness::OriginalSourceWitness,
+    ) -> Result<()> {
+        ensure!(
+            witness.captured_version == witness.current_version,
+            "witness source version mismatch"
+        );
+        self.header(source_ord, "reused", witness)
+    }
+
+    pub(crate) fn stage_witness_coverage(
+        &mut self,
+        source_ord: i64,
+        coverage: &crate::store::native_first::witness::CoverageInput,
+        decision: &str,
+    ) -> Result<()> {
+        ensure!(
+            matches!(decision, "changedBytes" | "newDocument"),
+            "witness coverage decision"
+        );
+        self.header(source_ord, decision, coverage)
+    }
+
+    fn header(
+        &mut self,
+        source_ord: i64,
+        decision: &str,
+        value: &impl serde::Serialize,
+    ) -> Result<()> {
+        let (body, _) = self.payload(value)?;
+        self.conn.execute(
+            "INSERT INTO source_witnesses(source_ord,decision,body) VALUES(?1,?2,?3)",
+            params![source_ord, decision, body],
+        )?;
+        self.budget.check()?;
+        Ok(())
+    }
+
+    pub(crate) fn stage_original_row(
+        &mut self,
+        source_ord: i64,
+        ordinal: i64,
+        row: &crate::store::native_first::witness::OriginalRow,
+    ) -> Result<()> {
+        let open: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM source_witnesses WHERE source_ord=?1 AND decision='reused' AND complete=0)",
+            [source_ord], |row| row.get(0),
+        )?;
+        ensure!(open && ordinal >= 0, "witness association source not open");
+        let (body, bytes) = self.payload(row)?;
+        self.conn.execute(
+            "INSERT INTO original_associations VALUES(?1,?2,?3,?4)",
+            params![source_ord, ordinal, body, i64::try_from(bytes)?],
+        )?;
+        self.budget.check()?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_source_witness(&mut self, source_ord: i64) -> Result<()> {
+        ensure!(
+            self.conn.execute(
+                "UPDATE source_witnesses SET complete=1 WHERE source_ord=?1 AND complete=0",
+                [source_ord],
+            )? == 1,
+            "witness source completion"
+        );
+        self.budget.check()?;
+        Ok(())
+    }
+
+    pub(crate) fn stage_internal_symbol(
+        &mut self,
+        key: &crate::semantic_evidence::SymbolKey,
+    ) -> Result<()> {
+        // Scopes are represented exactly as in the original semantic SymbolKey.
+        let scope = match key.scope {
+            crate::semantic_evidence::SymbolScope::Global => 0,
+            crate::semantic_evidence::SymbolScope::Document => 1,
+            crate::semantic_evidence::SymbolScope::Target => 2,
+        };
+        let (language, path) = key
+            .document
+            .as_ref()
+            .map(|document| (document.language.as_str(), document.path.as_str()))
+            .unwrap_or(("", ""));
+        let bytes = serialized_len(key, self.limits.unit_expansion_bytes)?;
+        self.counters.retained_admission_bytes_high_water =
+            self.counters.retained_admission_bytes_high_water.max(bytes);
+        charge_witness_row(self.conn, self.limits)?;
+        self.budget.check()?;
+        self.conn.execute(
+            "INSERT INTO witness_internal_symbols VALUES(?1,?2,?3,?4) ON CONFLICT DO NOTHING",
+            params![scope, language, path, key.symbol],
+        )?;
+        self.budget.check()?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_internal_symbols(&mut self) -> Result<()> {
+        ensure!(self.conn.execute(
+            "UPDATE witness_state SET internal_symbols_complete=1 WHERE singleton=1 AND internal_symbols_complete=0", [],
+        )? == 1, "witness internal symbol completion");
+        self.budget.check()?;
+        Ok(())
+    }
+}
+
+impl Drop for WitnessStageWriter<'_> {
+    fn drop(&mut self) {
+        self.counters.retained_admission_units += 1;
+        self.counters.retained_admission_rows_high_water = self
+            .counters
+            .retained_admission_rows_high_water
+            .max(self.conn.total_changes() - self.changes_before);
+    }
+}
+
+/// Conservative owned decoding allowance, queried before reading event payloads.
+pub(crate) fn original_rows_reservation(conn: &Connection, source_ord: i64) -> Result<u64> {
+    let (bytes, rows): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(body_bytes),0),COUNT(*) FROM original_associations WHERE source_ord=?1",
+        [source_ord], |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    u64::try_from(bytes)?
+        .checked_mul(8)
+        .and_then(|bytes| {
+            u64::try_from(rows)
+                .ok()?
+                .checked_mul(512)
+                .and_then(|rows| bytes.checked_add(rows))
+        })
+        .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into())
+}
+
+/// Both metadata routes must resolve every emitted provenance row, never silently drop it.
+pub(crate) fn check_proof_identity_closure(conn: &Connection) -> Result<()> {
+    let invalid: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM claims WHERE claim_id<=0) OR
+         EXISTS(SELECT 1 FROM claims c WHERE EXISTS(SELECT 1 FROM witness_proofs w WHERE w.proof_id=c.proof_id)) OR
+         EXISTS(SELECT 1 FROM claims c WHERE EXISTS(SELECT 1 FROM witness_proofs w WHERE w.artifact=c.artifact AND w.fact_digest=c.fact_digest)) OR
+         EXISTS(SELECT 1 FROM out_provenance p WHERE NOT EXISTS(SELECT 1 FROM proof_identities i WHERE i.identity_id=p.claim_id))",
+        [], |row| row.get(0),
+    )?;
+    ensure!(!invalid, "staged proof identity closure");
+    Ok(())
 }
 
 /// `claims.presence` bit of a definition occurrence's symbol.

@@ -405,10 +405,21 @@ impl Passes<'_> {
             self.limits,
         )?;
         let assigned: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM coverage WHERE artifact=?1", [entry.ordinal], |row| row.get(0),
+            "SELECT COUNT(*) FROM coverage WHERE artifact=?1",
+            [entry.ordinal],
+            |row| row.get(0),
         )?;
-        let assigned = u64::try_from(assigned).map_err(|_| admission("invalid assigned document count"))?;
-        while !self.decode_advance(entry, &mut decoder, conn, native, cargo_targets, counters, assigned)? {}
+        let assigned =
+            u64::try_from(assigned).map_err(|_| admission("invalid assigned document count"))?;
+        while !self.decode_advance(
+            entry,
+            &mut decoder,
+            conn,
+            native,
+            cargo_targets,
+            counters,
+            assigned,
+        )? {}
         Ok(())
     }
 
@@ -484,21 +495,35 @@ impl Passes<'_> {
         };
         let previous: (i64, i64) = conn.query_row(
             "SELECT documents,claims FROM artifacts WHERE ordinal=?1",
-            [entry.ordinal], |row| Ok((row.get(0)?, row.get(1)?)),
+            [entry.ordinal],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let decoded = decoder.advance(
-            &context, &mut resolve, counters, self.limits, &mut sink, self.cancel,
+            &context,
+            &mut resolve,
+            counters,
+            self.limits,
+            &mut sink,
+            self.cancel,
         );
         let complete = match decoded {
             Ok(summary) => summary.is_some(),
-            Err(error) => return Err(sink.take_fault().or(fault)
-                .or_else(|| decoder.take_read_fault().map(Into::into))
-                .unwrap_or_else(|| error.into())),
+            Err(error) => {
+                return Err(sink
+                    .take_fault()
+                    .or(fault)
+                    .or_else(|| decoder.take_read_fault().map(Into::into))
+                    .unwrap_or_else(|| error.into()));
+            }
         };
         let totals = sink.finish()?;
         conn.execute(
             "UPDATE artifacts SET documents=?2,claims=?3 WHERE ordinal=?1",
-            params![entry.ordinal, previous.0 + totals.documents as i64, previous.1 + totals.claims as i64],
+            params![
+                entry.ordinal,
+                previous.0 + totals.documents as i64,
+                previous.1 + totals.claims as i64
+            ],
         )?;
         self.budget.check()?;
         Ok(complete)

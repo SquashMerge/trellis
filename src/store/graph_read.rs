@@ -106,9 +106,19 @@ impl SnapshotGraphSource<'_> {
             derived_from: None,
         })?;
         let producer = self.producer_for(&key.language)?;
-        let projection = producer.as_deref().map(|producer| {
-            native_first::semantic_projection_for(self.db, self.selected.pin, producer, &key.language, &key.path)
-        }).transpose()?.flatten();
+        let projection = producer
+            .as_deref()
+            .map(|producer| {
+                native_first::semantic_projection_for(
+                    self.db,
+                    self.selected.pin,
+                    producer,
+                    &key.language,
+                    &key.path,
+                )
+            })
+            .transpose()?
+            .flatten();
         let semantic = match producer {
             Some(producer) => self.read_semantic(&producer, key)?,
             None => None,
@@ -126,11 +136,22 @@ impl SnapshotGraphSource<'_> {
 
     /// `None` when the producer has no coverage row for the document; the engine reports it.
     fn read_semantic(&self, producer: &str, key: &DocumentKey) -> Result<Option<SemanticDocument>> {
-        let projection = native_first::semantic_projection_for(self.db, self.selected.pin, producer, &key.language, &key.path)?;
-        if projection.as_ref().is_some_and(|projection| projection.semantic_status == crate::model::SemanticStatus::CatchingUp) {
+        let projection = native_first::semantic_projection_for(
+            self.db,
+            self.selected.pin,
+            producer,
+            &key.language,
+            &key.path,
+        )?;
+        if projection.as_ref().is_some_and(|projection| {
+            projection.semantic_status == crate::model::SemanticStatus::CatchingUp
+        }) {
             return Ok(None);
         }
-        let basis_key = projection.as_ref().map_or_else(|| self.selected.key.clone(), |projection| semantic_pin_key(projection.semantic_basis_pin));
+        let basis_key = projection.as_ref().map_or_else(
+            || self.selected.key.clone(),
+            |projection| semantic_pin_key(projection.semantic_basis_pin),
+        );
         let tuple: Option<i64> = self.db.query_row(
             "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
             params![basis_key, producer, key.language, key.path], |r| r.get(0),
@@ -208,9 +229,22 @@ impl GraphSource for SnapshotGraphSource<'_> {
         producer: &str,
         document: &DocumentKey,
     ) -> Result<bool> {
-        let eligible = native_first::endpoint_eligible(self.db, self.selected.pin, producer,
-            &document.language, &document.path, projection.semantic_basis_pin)?;
-        self.facts.projection_endpoints.insert((producer.to_owned(), document.clone(), serde_json::to_string(&projection.semantic_basis_pin)?), eligible);
+        let eligible = native_first::endpoint_eligible(
+            self.db,
+            self.selected.pin,
+            producer,
+            &document.language,
+            &document.path,
+            projection.semantic_basis_pin,
+        )?;
+        self.facts.projection_endpoints.insert(
+            (
+                producer.to_owned(),
+                document.clone(),
+                serde_json::to_string(&projection.semantic_basis_pin)?,
+            ),
+            eligible,
+        );
         Ok(eligible)
     }
 
@@ -394,11 +428,22 @@ pub(super) fn navigation_calls(
         language: document.file.language.clone(),
         path: selector.path.clone(),
     };
-    let projection = native_first::semantic_projection_for(db, selected.pin, producer, &key.language, &key.path)?;
-    if projection.as_ref().is_some_and(|projection| projection.semantic_status == crate::model::SemanticStatus::CatchingUp) {
+    let projection = native_first::semantic_projection_for(
+        db,
+        selected.pin,
+        producer,
+        &key.language,
+        &key.path,
+    )?;
+    if projection.as_ref().is_some_and(|projection| {
+        projection.semantic_status == crate::model::SemanticStatus::CatchingUp
+    }) {
         return Ok(());
     }
-    let basis_key = projection.as_ref().map_or_else(|| selected.key.clone(), |projection| semantic_pin_key(projection.semantic_basis_pin));
+    let basis_key = projection.as_ref().map_or_else(
+        || selected.key.clone(),
+        |projection| semantic_pin_key(projection.semantic_basis_pin),
+    );
     let tuple: Option<i64> = db.query_row(
         "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
         params![basis_key, producer, key.language, key.path], |row| row.get(0),
@@ -443,14 +488,8 @@ pub(super) fn navigation_calls(
         if !navigation_call_budget(db, tuple, &encoded, reader)? {
             break;
         }
-        let facts = read_semantic_tuple_for_call(
-            db,
-            &basis_key,
-            Some(tuple),
-            None,
-            true,
-            Some(&encoded),
-        )?;
+        let facts =
+            read_semantic_tuple_for_call(db, &basis_key, Some(tuple), None, true, Some(&encoded))?;
         let [coverage] = <[_; 1]>::try_from(facts.coverage)
             .map_err(|_| SelectedIntegrity("corrupt selected semantic coverage".into()))?;
         let semantic = SemanticDocument {
@@ -466,9 +505,14 @@ pub(super) fn navigation_calls(
             symbols: vec![],
             type_relationships: vec![],
         };
-        let disposition = crate::graph_query::call_disposition(Some(&semantic), &call, &mut source).map_err(engine_error)?;
-        if disposition.boundary_reason != crate::graph_query::BoundaryReason::None { continue; }
-        let Some((id, target_key)) = disposition.exact_target else { continue; };
+        let disposition = crate::graph_query::call_disposition(Some(&semantic), &call, &mut source)
+            .map_err(engine_error)?;
+        if disposition.boundary_reason != crate::graph_query::BoundaryReason::None {
+            continue;
+        }
+        let Some((id, target_key)) = disposition.exact_target else {
+            continue;
+        };
         if source.locate(id)?.as_ref() != Some(target_key) {
             continue;
         }
@@ -553,10 +597,18 @@ pub(super) fn sequence_calls(
     let languages = defaults.languages();
     let document = source.document(&key)?;
     if let Some(projection) = &document.projection {
-        view.semantic.documents.push(crate::model::DocumentSemanticStatus {
-            producer_id: producer.clone(), language: key.language.clone(), path: key.path.clone(), projection: projection.clone(),
-        });
-        view.warnings.push("Native result with historical semantic basis; no current semantic absence is implied.".into());
+        view.semantic
+            .documents
+            .push(crate::model::DocumentSemanticStatus {
+                producer_id: producer.clone(),
+                language: key.language.clone(),
+                path: key.path.clone(),
+                projection: projection.clone(),
+            });
+        view.warnings.push(
+            "Native result with historical semantic basis; no current semantic absence is implied."
+                .into(),
+        );
     }
     let declaration = document
         .declarations
@@ -566,14 +618,23 @@ pub(super) fn sequence_calls(
     let Some(semantic) = engine::semantic(Some(&languages), &document).map_err(engine_error)?
     else {
         if let Some(projection) = &document.projection {
-            fn mark_pending(steps: &mut [crate::behavior::SequenceStep], projection: &crate::model::SemanticProjection) {
+            fn mark_pending(
+                steps: &mut [crate::behavior::SequenceStep],
+                projection: &crate::model::SemanticProjection,
+            ) {
                 for step in steps {
                     if step.call_id.is_some() {
                         step.call_evidence = Some(crate::behavior::CallEvidence {
-                            projection: Some(projection.clone()), historical_freshness: None,
+                            projection: Some(projection.clone()),
+                            historical_freshness: None,
                             boundary_reason: crate::graph_query::BoundaryReason::CatchingUp,
-                            resolution: None, dispatch: None, freshness: None, provenance_id: None,
-                            external_package: None, semantic_basis: None, dispatch_target: None,
+                            resolution: None,
+                            dispatch: None,
+                            freshness: None,
+                            provenance_id: None,
+                            external_package: None,
+                            semantic_basis: None,
+                            dispatch_target: None,
                         });
                     }
                     mark_pending(&mut step.children, projection);
@@ -698,11 +759,19 @@ pub(super) fn sequence_calls(
     };
     for document in source.facts.documents.values() {
         if let Some(projection) = &document.projection {
-            let producer_id = defaults.producer(&document.key.language).unwrap_or("").to_owned();
+            let producer_id = defaults
+                .producer(&document.key.language)
+                .unwrap_or("")
+                .to_owned();
             let status = crate::model::DocumentSemanticStatus {
-                producer_id, language: document.key.language.clone(), path: document.key.path.clone(), projection: projection.clone(),
+                producer_id,
+                language: document.key.language.clone(),
+                path: document.key.path.clone(),
+                projection: projection.clone(),
             };
-            if !view.semantic.documents.contains(&status) { view.semantic.documents.push(status); }
+            if !view.semantic.documents.contains(&status) {
+                view.semantic.documents.push(status);
+            }
         }
     }
     view.semantic_warnings =
@@ -751,8 +820,13 @@ fn syntax_fallback(
             .map_err(engine_error)?
             .selected
         {
-            Some((_, proof)) if proof.freshness == sem::Freshness::Fresh
-                || semantic.projection.is_some() && proof.freshness != sem::Freshness::Stale => return Ok(None),
+            Some((_, proof))
+                if proof.freshness == sem::Freshness::Fresh
+                    || semantic.projection.is_some()
+                        && proof.freshness != sem::Freshness::Stale =>
+            {
+                return Ok(None);
+            }
             Some(_) => stale = true,
             None => {}
         }
@@ -1061,9 +1135,14 @@ impl Enrichment<'_, '_> {
             };
             let disposition =
                 engine::call_disposition(semantic, call, self.source).map_err(engine_error)?;
-            let mut reason = if semantic.is_none() && document.projection.as_ref().is_some_and(|projection| projection.semantic_status == crate::model::SemanticStatus::CatchingUp) {
+            let mut reason = if semantic.is_none()
+                && document.projection.as_ref().is_some_and(|projection| {
+                    projection.semantic_status == crate::model::SemanticStatus::CatchingUp
+                }) {
                 BoundaryReason::CatchingUp
-            } else { disposition.boundary_reason };
+            } else {
+                disposition.boundary_reason
+            };
             // A hidden incidental step (an accessor, a logging call) takes no lane and has no
             // target (#547); its call evidence keeps the binding. Show all, which shows it,
             // gives it a lane.
@@ -1110,7 +1189,11 @@ impl Enrichment<'_, '_> {
                 boundary_reason: reason,
                 resolution: selected.map(|(binding, _)| binding.resolution),
                 dispatch: selected.map(|(binding, _)| binding.dispatch),
-                freshness: selected.map(|(_, proof)| projection.as_ref().map_or(proof.freshness, |projection| projection.effective_freshness(proof.freshness))),
+                freshness: selected.map(|(_, proof)| {
+                    projection.as_ref().map_or(proof.freshness, |projection| {
+                        projection.effective_freshness(proof.freshness)
+                    })
+                }),
                 provenance_id: selected.map(|(binding, _)| binding.provenance_id.clone()),
                 external_package: selected
                     .filter(|_| reason == BoundaryReason::External)
@@ -1131,7 +1214,11 @@ impl Enrichment<'_, '_> {
                 binding: selected.map(|(binding, _)| binding.clone()),
                 projection: projection.clone(),
                 historical_freshness: selected.map(|(_, proof)| proof.freshness),
-                effective_freshness: selected.map(|(_, proof)| projection.as_ref().map_or(proof.freshness, |projection| projection.effective_freshness(proof.freshness))),
+                effective_freshness: selected.map(|(_, proof)| {
+                    projection.as_ref().map_or(proof.freshness, |projection| {
+                        projection.effective_freshness(proof.freshness)
+                    })
+                }),
                 visit: if step.target.is_some() {
                     Visit::New
                 } else {

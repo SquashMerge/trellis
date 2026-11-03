@@ -31,10 +31,14 @@ pub(super) fn check(
                 actual.coverage.extend(document.coverage);
                 actual.provenance.extend(document.provenance);
                 actual.symbols.extend(document.symbols);
-                actual.declaration_bindings.extend(document.declaration_bindings);
+                actual
+                    .declaration_bindings
+                    .extend(document.declaration_bindings);
                 actual.references.extend(document.references);
                 actual.call_bindings.extend(document.call_bindings);
-                actual.type_relationships.extend(document.type_relationships);
+                actual
+                    .type_relationships
+                    .extend(document.type_relationships);
                 Ok(())
             },
         )?;
@@ -96,7 +100,10 @@ pub(super) fn check(
             &store.identity,
             cancel,
         )?;
-        ensure!(attested.matches(producer), "FULL oracle producer descriptor mismatch");
+        ensure!(
+            attested.matches(producer),
+            "FULL oracle producer descriptor mismatch"
+        );
         let mut basis = BTreeMap::new();
         for document in &captured_native.revision.documents {
             check_cancel(cancel)?;

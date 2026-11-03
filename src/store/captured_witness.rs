@@ -83,28 +83,6 @@ pub(super) fn document(
     .transpose()
 }
 
-/// Mirrors the public tuple scope query without materializing every document's snapshot.
-/// Semantic records serialize declaration_bindings/syntax_id as declarationBindings/syntaxId;
-/// each symbols entry is a SymbolKey, whose symbol field is the scope's string identity.
-pub(super) fn internal_symbols(tx: &Connection, batch_id: i64) -> Result<BTreeSet<String>> {
-    let mut statement = tx.prepare(
-        "SELECT DISTINCT json_extract(s.value,'$.symbol')
-         FROM semantic_batch_witness_documents d
-         JOIN semantic_batch_witnesses w ON w.batch_id=d.batch_id,
-              json_each(d.snapshot_json,'$.declarationBindings') b,
-              json_each(b.value,'$.symbols') s
-         WHERE d.batch_id=?1 AND json_extract(b.value,'$.syntaxId') IS NOT NULL",
-    )?;
-    let mut rows = statement.query([batch_id])?;
-    let mut symbols = BTreeSet::new();
-    while let Some(row) = rows.next()? {
-        symbols.insert(row.get(0).context(SelectedIntegrity(
-            "incompatible_index: corrupt captured witness symbol".into(),
-        ))?);
-    }
-    Ok(symbols)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,7 +90,7 @@ mod tests {
     #[test]
     fn orphan_witness_chunk_invalidates_marker_and_allows_complete_rebuild() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V38).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V40).unwrap();
         db.pragma_update(None, "foreign_keys", "ON").unwrap();
         db.execute(
             "INSERT INTO semantic_raw_batches VALUES(1,'producer','1','profile',
@@ -183,7 +161,7 @@ mod tests {
     #[test]
     fn orphan_witness_cleanup_defers_batches_past_the_header_chunk() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V38).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V40).unwrap();
         db.pragma_update(None, "foreign_keys", "ON").unwrap();
         let hash = "a".repeat(64);
         // One more header than a release chunk; the first batch keeps its capture through

@@ -48,14 +48,36 @@ mod tests {
     #[test]
     fn semantic_projection_is_closed_and_survives_compact_call_schemas() {
         for name in ["trellis_outgoing_calls", "trellis_incoming_calls"] {
-            let tool = entries().into_iter().find(|tool| tool["name"] == name).unwrap();
+            let tool = entries()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
             let defs = &tool["outputSchema"]["$defs"];
-            assert_eq!(defs["SemanticProjection"]["additionalProperties"], false);
-            assert_eq!(defs["SemanticProjection"]["properties"]["semanticStatus"]["enum"],
-                json!(["olderBasis", "catchingUp"]));
-            let item = if name == "trellis_outgoing_calls" { "CallItem" } else { "IncomingCaller" };
+            for definition in ["SemanticProjection", "DocumentSemanticStatus"] {
+                assert_eq!(defs[definition]["additionalProperties"], false);
+                let properties = defs[definition]["properties"].as_object().unwrap();
+                let required = defs[definition]["required"].as_array().unwrap();
+                assert_eq!(properties.len(), required.len());
+                for field in properties.keys() {
+                    assert!(required.contains(&json!(field)));
+                }
+            }
+            assert_eq!(
+                defs["SemanticProjection"]["properties"]["semanticStatus"]["enum"],
+                json!(["olderBasis", "catchingUp"])
+            );
+            let item = if name == "trellis_outgoing_calls" {
+                "CallItem"
+            } else {
+                "IncomingCaller"
+            };
             for field in ["projection", "historicalFreshness"] {
-                assert!(defs[item]["required"].as_array().unwrap().contains(&json!(field)));
+                assert!(
+                    defs[item]["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(field))
+                );
             }
         }
     }
@@ -286,23 +308,6 @@ mod tests {
                     .is_none()
             );
         }
-    }
-
-    #[test]
-    fn outgoing_calls_catalog_entry_unchanged() {
-        use sha2::{Digest, Sha256};
-        // Canonical whole-entry closure. #632 adds required nullable re-import status.
-        let entries = entries();
-        let outgoing = entries
-            .iter()
-            .find(|e| e["name"] == "trellis_outgoing_calls")
-            .unwrap();
-        assert_eq!(
-            hex::encode(Sha256::digest(
-                serde_json::to_string(outgoing).unwrap().as_bytes()
-            )),
-            "db28f041933e070781df13fda85646aca87790b63171eec89d4a1f645029631b"
-        );
     }
 
     #[test]

@@ -670,13 +670,18 @@ fn resolve(
         modules,
         sources,
         producers,
-        semantic_documents: docs.iter().filter_map(|doc| {
-            doc.semantic.projection.as_ref().map(|projection| json!({
-                "producerId":doc.semantic.producer_id,"language":doc.key.language,
-                "path":doc.key.path,"projection":projection,
-                "coverageState":doc.semantic.coverage_state,"boundary":doc.semantic.boundary
-            }))
-        }).collect(),
+        semantic_documents: docs
+            .iter()
+            .filter_map(|doc| {
+                doc.semantic.projection.as_ref().map(|projection| {
+                    json!({
+                        "producerId":doc.semantic.producer_id,"language":doc.key.language,
+                        "path":doc.key.path,"projection":projection,
+                        "coverageState":doc.semantic.coverage_state,"boundary":doc.semantic.boundary
+                    })
+                })
+            })
+            .collect(),
         sample_limit,
         work_used: rust.work.used,
     })
@@ -764,7 +769,9 @@ impl ReferenceBase {
                 let mut edge = json!({"source":identities[source],"target":target,"count":count,
                     "sites":sampled,"omittedSites":omitted,"evidenceTier":tier,"semanticSites":semantic});
                 // The edge itself is detachable even when sampling omits other sites.
-                if *semantic > 0 && let Some(projection) = &found.projection {
+                if *semantic > 0
+                    && let Some(projection) = &found.projection
+                {
                     edge["projection"] = json!(projection);
                 }
                 if *test {
@@ -839,12 +846,14 @@ fn semantic_resolution(
             Some(SiteResolution::unknown("historical_resolution_unproven"))
         }
         // A target outside this snapshot is stale: the structural result stands.
-        SemanticOutcome::Internal(document, sid) => {
-            locate(*document, sid).map(|target| SiteResolution {
+        SemanticOutcome::Internal(document, sid) => locate(*document, sid)
+            .map(|target| SiteResolution {
                 targets: BTreeSet::from([Target::Native(target)]),
                 ..SiteResolution::default()
-            }).or_else(|| historical.then(|| SiteResolution::unknown("semantic_endpoint_catching_up")))
-        }
+            })
+            .or_else(|| {
+                historical.then(|| SiteResolution::unknown("semantic_endpoint_catching_up"))
+            }),
         // A proved package target says more than a binding outside the checkout.
         SemanticOutcome::External => structural
             .is_none_or(|resolution| resolution.targets.is_empty())
@@ -1045,7 +1054,8 @@ fn prepare_file(
                 || !usable(anchor)
                 || (!matches!(anchor.outcome, SemanticOutcome::Internal(..))
                     && !anchor.metadata.contains_key("projection"))
-                || (anchor.call_id.is_none() && !anchor.type_role
+                || (anchor.call_id.is_none()
+                    && !anchor.type_role
                     && !anchor.metadata.contains_key("projection"))
                 || !covered.insert((anchor.range.start, anchor.range.end))
             {
@@ -1389,7 +1399,10 @@ mod historical_projection_tests {
             direct: false,
             outcome,
             provenance_id: "proof".into(),
-            metadata: BTreeMap::from([("projection".into(), json!({"semanticStatus":"olderBasis"}))]),
+            metadata: BTreeMap::from([(
+                "projection".into(),
+                json!({"semanticStatus":"olderBasis"}),
+            )]),
         }
     }
 
@@ -1399,8 +1412,14 @@ mod historical_projection_tests {
             targets: BTreeSet::from([Target::Native(4)]),
             ..SiteResolution::default()
         };
-        for outcome in [SemanticOutcome::Unresolved, SemanticOutcome::Ambiguous, SemanticOutcome::External, SemanticOutcome::Boundary] {
-            let result = semantic_resolution(&anchor(outcome), Some(&structural), &|_, _| Some(4)).unwrap();
+        for outcome in [
+            SemanticOutcome::Unresolved,
+            SemanticOutcome::Ambiguous,
+            SemanticOutcome::External,
+            SemanticOutcome::Boundary,
+        ] {
+            let result =
+                semantic_resolution(&anchor(outcome), Some(&structural), &|_, _| Some(4)).unwrap();
             assert!(result.targets.is_empty());
             assert!(result.residual.is_some());
         }
@@ -1412,7 +1431,8 @@ mod historical_projection_tests {
             &anchor(SemanticOutcome::Internal(1, "target".into())),
             None,
             &|_, _| None,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(result.targets.is_empty());
         assert_eq!(result.residual, Some("semantic_endpoint_catching_up"));
     }

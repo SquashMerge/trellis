@@ -466,14 +466,29 @@ mod projection_tests {
         use crate::semantic_evidence::Freshness;
         let generation = uuid::Uuid::new_v4();
         let projection = SemanticProjection {
-            current_pin: IndexPin { index_generation: generation, index_revision: 2 },
-            semantic_basis_pin: IndexPin { index_generation: generation, index_revision: 1 },
+            current_pin: IndexPin {
+                index_generation: generation,
+                index_revision: 2,
+            },
+            semantic_basis_pin: IndexPin {
+                index_generation: generation,
+                index_revision: 1,
+            },
             basis_native_revision_id: "basis-native".into(),
             semantic_status: SemanticStatus::OlderBasis,
         };
-        assert_eq!(projection.effective_freshness(Freshness::Fresh), Freshness::PossiblyStale);
-        assert_eq!(projection.effective_freshness(Freshness::PossiblyStale), Freshness::PossiblyStale);
-        assert_eq!(projection.effective_freshness(Freshness::Stale), Freshness::Stale);
+        assert_eq!(
+            projection.effective_freshness(Freshness::Fresh),
+            Freshness::PossiblyStale
+        );
+        assert_eq!(
+            projection.effective_freshness(Freshness::PossiblyStale),
+            Freshness::PossiblyStale
+        );
+        assert_eq!(
+            projection.effective_freshness(Freshness::Stale),
+            Freshness::Stale
+        );
         let value = serde_json::to_value(&projection).unwrap();
         assert_eq!(value["semanticStatus"], "olderBasis");
         assert_eq!(value["basisNativeRevisionId"], "basis-native");

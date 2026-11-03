@@ -727,7 +727,7 @@ fn selected_case(change_b: &str) {
         .unwrap();
         prior_semantic = store.semantic_at(prior).unwrap();
     }
-    if change_b == "oracle_mismatch" {
+    if change_b == "native_before_catchup" {
         use trellis::{
             semantic_batch::{BatchLimits, testing::stage_and_join_admitted},
             semantic_evidence as semantic,
@@ -824,16 +824,20 @@ fn selected_case(change_b: &str) {
         assert_eq!(store.selected_raw_inputs_at(prior).unwrap().len(), 1);
         fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
         let capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
-        let error = store
-            .publish_local_oracle_mismatch_for_tests(&options, &capture, &leader, &cancel)
-            .expect_err("oracle mismatch must abort publication");
-        assert!(
-            format!("{error:#}")
-                .contains("LOCAL publication differs from independent FULL rejoin oracle"),
-            "{error:#}"
-        );
-        assert_eq!(store.index_baseline().unwrap(), prior);
+        let native = store
+            .publish_local_for_tests(&options, &capture, &leader, &cancel)
+            .unwrap();
+        assert_ne!(native, prior);
+        assert_eq!(store.index_baseline().unwrap(), native);
         assert_eq!(store.semantic_at(prior).unwrap(), prior_semantic);
+        let projection = store
+            .semantic_projection_at(native, "scip-typescript", "javascript", "src/B.js")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection.semantic_status,
+            trellis::model::SemanticStatus::CatchingUp
+        );
         store
             .with_index_sql_for_tests(|db| {
                 let newer: i64 = db.query_row(
@@ -846,7 +850,7 @@ fn selected_case(change_b: &str) {
                     [format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision + 1)],
                     |row| row.get(0),
                 )?;
-                assert_eq!((newer, failed), (0, 0));
+                assert_eq!((newer, failed), (1, 0));
                 Ok(())
             })
             .unwrap();
@@ -2392,8 +2396,8 @@ fn forked_seeded_local_matches_forced_full_oracle() {
 }
 
 #[test]
-fn in_process_oracle_mismatch_aborts_without_failed_producer_publication() {
-    selected_case("oracle_mismatch");
+fn native_publication_keeps_prior_semantics_immutable_until_catchup() {
+    selected_case("native_before_catchup");
 }
 
 #[test]

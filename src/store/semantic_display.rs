@@ -8,7 +8,6 @@
 //! `call_disposition`, the reader that the call graph, sequence and line navigation share
 //! (#466).
 use super::*;
-use serde_json::json;
 use crate::{
     graph_query::{
         self as engine, BoundaryReason, DefaultProducers, DocumentFacts, GraphIntegrity,
@@ -18,6 +17,7 @@ use crate::{
     native_evidence::DocumentKey,
     semantic_evidence as sem,
 };
+use serde_json::json;
 
 pub use crate::graph_query::{LANGUAGE_NOTE, NO_PRODUCER_NOTE, multiple_producers_note};
 
@@ -176,8 +176,14 @@ impl GraphSource for Locate<'_> {
         producer: &str,
         document: &DocumentKey,
     ) -> Result<bool> {
-        native_first::endpoint_eligible(self.db, self.selected.pin, producer,
-            &document.language, &document.path, projection.semantic_basis_pin)
+        native_first::endpoint_eligible(
+            self.db,
+            self.selected.pin,
+            producer,
+            &document.language,
+            &document.path,
+            projection.semantic_basis_pin,
+        )
     }
     fn document(&mut self, _: &DocumentKey) -> Result<Arc<DocumentFacts>> {
         anyhow::bail!("store_unavailable: semantic display reads no graph documents")
@@ -233,12 +239,23 @@ impl<'a> SemanticCalls<'a> {
         if let Some(tuple) = self.tuples.get(&key) {
             return Ok(*tuple);
         }
-        let projection = native_first::semantic_projection_for(self.db, self.selected.pin, producer, language, path)?;
-        if projection.as_ref().is_some_and(|projection| projection.semantic_status == crate::model::SemanticStatus::CatchingUp) {
+        let projection = native_first::semantic_projection_for(
+            self.db,
+            self.selected.pin,
+            producer,
+            language,
+            path,
+        )?;
+        if projection.as_ref().is_some_and(|projection| {
+            projection.semantic_status == crate::model::SemanticStatus::CatchingUp
+        }) {
             self.tuples.insert(key, None);
             return Ok(None);
         }
-        let basis_key = projection.map_or_else(|| self.selected.key.clone(), |projection| semantic_pin_key(projection.semantic_basis_pin));
+        let basis_key = projection.map_or_else(
+            || self.selected.key.clone(),
+            |projection| semantic_pin_key(projection.semantic_basis_pin),
+        );
         let tuple: Option<i64> = self.db.query_row(
             "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
             params![basis_key, producer, language, path], |row| row.get(0),
@@ -258,10 +275,21 @@ impl<'a> SemanticCalls<'a> {
         };
         let encoded = id_codec::encode_occ(&call.id)
             .context(SelectedIntegrity("invalid selected call ID".into()))?;
-        let producer = self.selection.producer(&call.document.language).expect("selected tuple producer");
-        let projection = native_first::semantic_projection_for(self.db, self.selected.pin, producer,
-            &call.document.language, &call.document.path)?;
-        let basis_key = projection.as_ref().map_or_else(|| self.selected.key.clone(), |projection| semantic_pin_key(projection.semantic_basis_pin));
+        let producer = self
+            .selection
+            .producer(&call.document.language)
+            .expect("selected tuple producer");
+        let projection = native_first::semantic_projection_for(
+            self.db,
+            self.selected.pin,
+            producer,
+            &call.document.language,
+            &call.document.path,
+        )?;
+        let basis_key = projection.as_ref().map_or_else(
+            || self.selected.key.clone(),
+            |projection| semantic_pin_key(projection.semantic_basis_pin),
+        );
         let facts = read_semantic_tuple_for_call(
             self.db,
             &basis_key,
@@ -301,7 +329,9 @@ impl<'a> SemanticCalls<'a> {
             .collect();
         Ok(Some(CallSemantic {
             historical_freshness: proof.freshness,
-            effective_freshness: projection.as_ref().map_or(proof.freshness, |projection| projection.effective_freshness(proof.freshness)),
+            effective_freshness: projection.as_ref().map_or(proof.freshness, |projection| {
+                projection.effective_freshness(proof.freshness)
+            }),
             projection,
             binding: binding.clone(),
             provenance: proof.clone(),
@@ -332,8 +362,18 @@ impl<'a> SemanticCalls<'a> {
             [tuple],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let producer = self.selection.producer(language).expect("selected tuple producer");
-        let projected = native_first::semantic_projection_for(self.db, self.selected.pin, producer, language, path)?.is_some();
+        let producer = self
+            .selection
+            .producer(language)
+            .expect("selected tuple producer");
+        let projected = native_first::semantic_projection_for(
+            self.db,
+            self.selected.pin,
+            producer,
+            language,
+            path,
+        )?
+        .is_some();
         Ok(match (usable, stale || projected) {
             (false, _) => SemanticState::Unavailable,
             (true, true) => SemanticState::Stale,
@@ -348,15 +388,26 @@ pub(super) fn document_projections(
     selection: &ProducerSelection,
 ) -> Result<Vec<crate::model::DocumentSemanticStatus>> {
     let key = semantic_pin_key(pin);
-    let mut statement = db.prepare_cached("SELECT language,path FROM revision_documents WHERE revision_id=?1 ORDER BY language,path")?;
+    let mut statement = db.prepare_cached(
+        "SELECT language,path FROM revision_documents WHERE revision_id=?1 ORDER BY language,path",
+    )?;
     let mut rows = statement.query([key])?;
     let mut documents = Vec::new();
     while let Some(row) = rows.next()? {
         let language: String = row.get(0)?;
         let path: String = row.get(1)?;
-        let Some(producer) = selection.producer(&language) else { continue };
-        if let Some(projection) = native_first::semantic_projection_for(db, pin, producer, &language, &path)? {
-            documents.push(crate::model::DocumentSemanticStatus { producer_id: producer.to_owned(), language, path, projection });
+        let Some(producer) = selection.producer(&language) else {
+            continue;
+        };
+        if let Some(projection) =
+            native_first::semantic_projection_for(db, pin, producer, &language, &path)?
+        {
+            documents.push(crate::model::DocumentSemanticStatus {
+                producer_id: producer.to_owned(),
+                language,
+                path,
+                projection,
+            });
         }
     }
     Ok(documents)
@@ -429,28 +480,41 @@ pub(super) fn status_semantics(
     }
     let selection = select_producers(db, &key, None)?;
     for document in document_projections(db, status.revision, &selection)? {
-        if let Some(language) = status.semantic_languages.iter_mut().find(|row| row.language == document.language) {
+        if let Some(language) = status
+            .semantic_languages
+            .iter_mut()
+            .find(|row| row.language == document.language)
+        {
             if document.projection.semantic_status == crate::model::SemanticStatus::OlderBasis {
                 let basis = semantic_pin_key(document.projection.semantic_basis_pin);
                 let usable: bool = db.query_row("SELECT selected=1 AND state IN ('complete','partial') FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4", params![basis,document.producer_id,document.language,document.path], |row| row.get(0))?;
-                if usable { language.semantic_state = SemanticState::Stale; }
+                if usable {
+                    language.semantic_state = SemanticState::Stale;
+                }
                 let counts: (i64,i64,i64) = db.query_row(
                     "SELECT count(DISTINCT CASE WHEN b.resolution='resolved' THEN b.call_id END),count(DISTINCT CASE WHEN b.resolution='external' THEN b.call_id END),count(DISTINCT CASE WHEN b.resolution='ambiguous' THEN b.call_id END) FROM semantic_coverage c JOIN semantic_call_bindings b ON b.tuple_id=c.tuple_id WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.path=?4 AND c.selected=1 AND c.state IN ('complete','partial')",
                     params![basis, document.producer_id, document.language, document.path],
                     |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
                 )?;
-                let count = |value| usize::try_from(value).map_err(|_| {
-                    SelectedIntegrity("invalid projected semantic count".into())
-                });
+                let count = |value| {
+                    usize::try_from(value)
+                        .map_err(|_| SelectedIntegrity("invalid projected semantic count".into()))
+                };
                 language.internal += count(counts.0)?;
                 language.external += count(counts.1)?;
                 language.ambiguous += count(counts.2)?;
-                language.unresolved = language.calls.saturating_sub(language.internal + language.external + language.ambiguous);
+                language.unresolved = language
+                    .calls
+                    .saturating_sub(language.internal + language.external + language.ambiguous);
             }
             language.documents.push(document);
         }
     }
-    status.catching_up |= db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_pending_target WHERE revision_id=?1)", [&key], |row| row.get::<_,bool>(0))?;
+    status.catching_up |= db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM semantic_pending_target WHERE revision_id=?1)",
+        [&key],
+        |row| row.get::<_, bool>(0),
+    )?;
     let rows = &status.semantic_languages;
     let stats = &mut status.stats;
     if selected.is_empty() {
@@ -730,8 +794,17 @@ pub(super) fn view_walk(
         let language = &documents[&node.path].file.language;
         if reader.selection.producer(language).is_some() {
             node.provenance.semantic = reader.document_state(language, &node.path)?;
-            let producer = reader.selection.producer(language).expect("selected producer");
-            node.provenance.projection = native_first::semantic_projection_for(db,selected.pin,producer,language,&node.path)?;
+            let producer = reader
+                .selection
+                .producer(language)
+                .expect("selected producer");
+            node.provenance.projection = native_first::semantic_projection_for(
+                db,
+                selected.pin,
+                producer,
+                language,
+                &node.path,
+            )?;
         }
     }
     let mut regions = BTreeMap::new();
@@ -756,11 +829,20 @@ pub(super) fn view_walk(
     }
     for (path, document) in &documents {
         let language = &document.file.language;
-        let Some(producer) = reader.selection.producer(language) else { continue };
-        if let Some(projection) = native_first::semantic_projection_for(db, selected.pin, producer, language, path)? {
-            semantic.documents.push(crate::model::DocumentSemanticStatus {
-                producer_id: producer.to_owned(), language: language.clone(), path: path.clone(), projection,
-            });
+        let Some(producer) = reader.selection.producer(language) else {
+            continue;
+        };
+        if let Some(projection) =
+            native_first::semantic_projection_for(db, selected.pin, producer, language, path)?
+        {
+            semantic
+                .documents
+                .push(crate::model::DocumentSemanticStatus {
+                    producer_id: producer.to_owned(),
+                    language: language.clone(),
+                    path: path.clone(),
+                    projection,
+                });
         }
     }
     Ok(ViewWalk {
@@ -806,7 +888,14 @@ pub(super) fn mark_document_symbols(
 ) -> Result<()> {
     let mut reader = SemanticCalls::new(db, selected, None)?;
     let state = reader.document_state(language, path)?;
-    let projection = reader.selection.producer(language).map(|producer| native_first::semantic_projection_for(db,selected.pin,producer,language,path)).transpose()?.flatten();
+    let projection = reader
+        .selection
+        .producer(language)
+        .map(|producer| {
+            native_first::semantic_projection_for(db, selected.pin, producer, language, path)
+        })
+        .transpose()?
+        .flatten();
     for symbol in symbols {
         symbol.provenance.semantic = state;
         symbol.provenance.projection = projection.clone();
@@ -876,7 +965,11 @@ impl EvidenceResponse {
     /// Advisory work status from the admitted pin, not a publication eligibility proof.
     pub(crate) fn semantic_catching_up(&self) -> Result<bool> {
         let selected = self.selected(None)?;
-        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_pending_target WHERE revision_id=?1)", [&selected.key], |row| row.get(0))?)
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM semantic_pending_target WHERE revision_id=?1)",
+            [&selected.key],
+            |row| row.get(0),
+        )?)
     }
 
     /// Each MCP language's selected semantic evidence at the admitted head, in #22 order
@@ -992,18 +1085,33 @@ impl EvidenceResponse {
         }
         let selection = select_producers(&self.db, &selected.key, None)?;
         for document in document_projections(&self.db, selected.pin, &selection)? {
-            if let Some(at) = MCP_LANGUAGES.iter().position(|language| *language == document.language) {
+            if let Some(at) = MCP_LANGUAGES
+                .iter()
+                .position(|language| *language == document.language)
+            {
                 if document.projection.semantic_status == crate::model::SemanticStatus::OlderBasis {
                     let basis = semantic_pin_key(document.projection.semantic_basis_pin);
                     let tuple: Option<(bool,String)> = self.db.query_row(
                         "SELECT selected,state FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
                         params![basis,document.producer_id,document.language,document.path], |row| Ok((row.get(0)?,row.get(1)?)),
                     ).optional()?;
-                    let (selected,state) = tuple.context(SelectedIntegrity("missing projected coverage tuple".into()))?;
-                    let bucket = match (selected,state.as_str()) { (true,"complete") => Some(1), (true,"partial") => Some(2), (true,"failed") => Some(3), _ => None };
-                    if let Some(bucket) = bucket { tiers[at].counts[0] += 1; tiers[at].counts[bucket] += 1; }
-                    else { tiers[at].counts[4] += 1; }
-                    if tiers[at].freshness != "stale" { tiers[at].freshness = "possiblyStale"; }
+                    let (selected, state) = tuple
+                        .context(SelectedIntegrity("missing projected coverage tuple".into()))?;
+                    let bucket = match (selected, state.as_str()) {
+                        (true, "complete") => Some(1),
+                        (true, "partial") => Some(2),
+                        (true, "failed") => Some(3),
+                        _ => None,
+                    };
+                    if let Some(bucket) = bucket {
+                        tiers[at].counts[0] += 1;
+                        tiers[at].counts[bucket] += 1;
+                    } else {
+                        tiers[at].counts[4] += 1;
+                    }
+                    if tiers[at].freshness != "stale" {
+                        tiers[at].freshness = "possiblyStale";
+                    }
                 }
                 tiers[at].documents.push(document);
             }
@@ -1024,7 +1132,8 @@ impl EvidenceResponse {
         let mut reader = SemanticCalls::new(&self.db, &selected, explicit)?;
         let calls: Vec<_> = calls.into_iter().collect();
         let language = owner_document.language.as_str();
-        let mut call_documents: BTreeSet<_> = calls.iter().map(|call| call.document.clone()).collect();
+        let mut call_documents: BTreeSet<_> =
+            calls.iter().map(|call| call.document.clone()).collect();
         call_documents.insert(owner_document.clone());
         let mut languages: BTreeSet<&str> = calls
             .iter()
@@ -1048,10 +1157,21 @@ impl EvidenceResponse {
         }
         let mut documents = Vec::new();
         for document in call_documents {
-            let Some(producer) = reader.selection.producer(&document.language) else { continue };
-            if let Some(projection) = native_first::semantic_projection_for(&self.db, selected.pin, producer, &document.language, &document.path)? {
+            let Some(producer) = reader.selection.producer(&document.language) else {
+                continue;
+            };
+            if let Some(projection) = native_first::semantic_projection_for(
+                &self.db,
+                selected.pin,
+                producer,
+                &document.language,
+                &document.path,
+            )? {
                 documents.push(crate::model::DocumentSemanticStatus {
-                    producer_id: producer.to_owned(), language: document.language, path: document.path, projection,
+                    producer_id: producer.to_owned(),
+                    language: document.language,
+                    path: document.path,
+                    projection,
                 });
             }
         }
@@ -1067,6 +1187,25 @@ impl EvidenceResponse {
 /// At most this many semantic rows are admitted into one architecture snapshot (#523).
 const ARCHITECTURE_SEMANTIC_ROWS: usize = 2_000_000;
 
+fn architecture_derived_from(
+    capture_id: Option<i64>,
+    provenance_id: Option<String>,
+    record_kind: Option<String>,
+    fact_digest: Option<String>,
+) -> Result<Option<sem::DerivedFrom>> {
+    match (capture_id, provenance_id, record_kind, fact_digest) {
+        (None, None, None, None) => Ok(None),
+        (Some(_), Some(provenance_id), Some(record_kind), Some(fact_digest)) => {
+            Ok(Some(sem::DerivedFrom {
+                provenance_id,
+                record_kind: semantic_enum(record_kind)?,
+                fact_digest,
+            }))
+        }
+        _ => Err(SelectedIntegrity("incompatible_index: corrupt raw proof link".into()).into()),
+    }
+}
+
 /// Fresh bindings of each document under its language's default producer (#483), for
 /// architecture references and rules (#523). Only rows of a selected, complete or partial
 /// coverage tuple whose proof is fresh are read; anything else stays syntax-only. An
@@ -1080,15 +1219,24 @@ pub(super) fn architecture_semantic(
 ) -> Result<()> {
     use crate::references::{SemanticAnchor, SemanticOutcome, SemanticRelationship};
     let defaults = default_producers(db, revision_key)?;
-    let pin_text = revision_key.strip_prefix("pin:v1:")
+    let pin_text = revision_key
+        .strip_prefix("pin:v1:")
         .context(SelectedIntegrity("invalid architecture pin".into()))?;
-    let (generation, revision) = pin_text.rsplit_once(':')
+    let (generation, revision) = pin_text
+        .rsplit_once(':')
         .context(SelectedIntegrity("invalid architecture pin".into()))?;
     let pin = IndexPin {
-        index_generation: generation.parse().map_err(|_| SelectedIntegrity("invalid architecture generation".into()))?,
-        index_revision: revision.parse().map_err(|_| SelectedIntegrity("invalid architecture revision".into()))?,
+        index_generation: generation
+            .parse()
+            .map_err(|_| SelectedIntegrity("invalid architecture generation".into()))?,
+        index_revision: revision
+            .parse()
+            .map_err(|_| SelectedIntegrity("invalid architecture revision".into()))?,
     };
-    ensure!(pin.index_revision > 0 && semantic_pin_key(pin) == revision_key, SelectedIntegrity("invalid architecture pin".into()));
+    ensure!(
+        pin.index_revision > 0 && semantic_pin_key(pin) == revision_key,
+        SelectedIntegrity("invalid architecture pin".into())
+    );
     // Snapshot documents by language, then path.
     // A revision has one source set; its documents are keyed by language and path.
     let mut index: HashMap<String, HashMap<String, usize>> = HashMap::new();
@@ -1145,35 +1293,59 @@ pub(super) fn architecture_semantic(
     };
     let mut tuples = Vec::new();
     for (i, doc) in documents.iter_mut().enumerate() {
-        let Some(producer) = defaults.producer(&doc.key.language) else { continue; };
+        let Some(producer) = defaults.producer(&doc.key.language) else {
+            continue;
+        };
         check()?;
         let projection = super::native_first::semantic_projection_for(
-            db, pin, producer, &doc.key.language, &doc.key.path,
+            db,
+            pin,
+            producer,
+            &doc.key.language,
+            &doc.key.path,
         )?;
         doc.semantic.projection = projection.clone();
         // Pending still selects the producer, but publishes no semantic rows.
         doc.semantic.producer_id = Some(producer.to_owned());
-        if projection.as_ref().is_some_and(|p| p.semantic_status == crate::model::SemanticStatus::CatchingUp) {
+        if projection
+            .as_ref()
+            .is_some_and(|p| p.semantic_status == crate::model::SemanticStatus::CatchingUp)
+        {
             doc.semantic.boundary = true;
             continue;
         }
         let tuple = if projection.is_some() {
-            super::native_first::projection_tuple(db, pin, producer, &doc.key.language, &doc.key.path)?
-                .map(|(_, tuple, _)| tuple)
+            super::native_first::projection_tuple(
+                db,
+                pin,
+                producer,
+                &doc.key.language,
+                &doc.key.path,
+            )?
+            .map(|(_, tuple, _)| tuple)
         } else {
             db.query_row(
                 "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
                 params![revision_key, producer, doc.key.language, doc.key.path], |row| row.get(0),
             ).optional()?
         };
-        let tuple = tuple.context(SelectedIntegrity("missing architecture semantic tuple".into()))?;
+        let tuple = tuple.context(SelectedIntegrity(
+            "missing architecture semantic tuple".into(),
+        ))?;
         let (selected, state): (bool, String) = db.query_row(
-            "SELECT selected,state FROM semantic_coverage WHERE tuple_id=?1", [tuple],
+            "SELECT selected,state FROM semantic_coverage WHERE tuple_id=?1",
+            [tuple],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         doc.semantic.coverage_state = Some(state.clone());
         if selected && matches!(state.as_str(), "complete" | "partial") {
-            tuples.push((tuple, i, producer.to_owned(), state == "complete", projection));
+            tuples.push((
+                tuple,
+                i,
+                producer.to_owned(),
+                state == "complete",
+                projection,
+            ));
         }
     }
     // Only selected rows are loaded. Proof identities and basis metadata are keyed by
@@ -1191,9 +1363,15 @@ pub(super) fn architecture_semantic(
         "SELECT lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 ORDER BY ordinal",
     )?;
     let mut metadata_rows = 0usize;
-    let mut metadata = |tuple: i64, provenance: &str, projection: Option<&crate::model::SemanticProjection>| -> Result<BTreeMap<String, serde_json::Value>> {
+    let mut metadata = |tuple: i64,
+                        provenance: &str,
+                        projection: Option<&crate::model::SemanticProjection>|
+     -> Result<BTreeMap<String, serde_json::Value>> {
         metadata_rows += 1;
-        ensure!(metadata_rows <= ARCHITECTURE_SEMANTIC_ROWS, "bounded_work: architecture proof metadata");
+        ensure!(
+            metadata_rows <= ARCHITECTURE_SEMANTIC_ROWS,
+            "bounded_work: architecture proof metadata"
+        );
         let mut values = proof.query_row(params![tuple, provenance], |row| {
             let historical: String = row.get(0)?;
             let mut value = BTreeMap::new();
@@ -1201,23 +1379,43 @@ pub(super) fn architecture_semantic(
             value.insert("freshness".into(), json!(if projection.is_some() && historical != "stale" { "possiblyStale" } else { &historical }));
             value.insert("historicalContentHash".into(), json!(row.get::<_, String>(1)?));
             value.insert("evidenceKind".into(), json!(row.get::<_, String>(2)?));
-            value.insert("captureId".into(), json!(row.get::<_, Option<i64>>(3)?));
-            value.insert("derivedFrom".into(), json!({"provenanceId":row.get::<_, Option<String>>(4)?,"recordKind":row.get::<_, Option<String>>(5)?,"factDigest":row.get::<_, Option<String>>(6)?}));
+            let derivation = (
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            );
             value.insert("basis".into(), json!({"producerId":row.get::<_, String>(7)?,"producerVersion":row.get::<_, String>(8)?,"producerHash":row.get::<_, String>(9)?,"artifactHash":row.get::<_, String>(10)?,"language":row.get::<_, String>(11)?,"sourceSetId":row.get::<_, String>(12)?,"revisionId":row.get::<_, String>(13)?,"sourceManifestHash":row.get::<_, String>(14)?,"toolchainHash":row.get::<_, String>(15)?,"configHash":row.get::<_, String>(16)?,"dependencyHash":row.get::<_, String>(17)?}));
-            Ok((value, row.get::<_, i64>(18)?))
+            Ok((value, row.get::<_, i64>(18)?, derivation))
         })?;
-        let historical = values.0["historicalFreshness"].as_str().expect("stored string");
-        ensure!(matches!(historical, "fresh" | "possiblyStale" | "stale"), SelectedIntegrity("invalid architecture freshness".into()));
+        let (capture, proof, kind, digest) = values.2;
+        values.0.insert(
+            "derivedFrom".into(),
+            serde_json::to_value(architecture_derived_from(capture, proof, kind, digest)?)?,
+        );
+        let historical = values.0["historicalFreshness"]
+            .as_str()
+            .expect("stored string");
+        ensure!(
+            matches!(historical, "fresh" | "possiblyStale" | "stale"),
+            SelectedIntegrity("invalid architecture freshness".into())
+        );
         let mut dependencies = Vec::new();
         let mut dependency_rows = lookup_dependencies.query([values.1])?;
         while let Some(row) = dependency_rows.next()? {
             metadata_rows += 1;
-            ensure!(metadata_rows <= ARCHITECTURE_SEMANTIC_ROWS, "bounded_work: architecture lookup dependencies");
+            ensure!(
+                metadata_rows <= ARCHITECTURE_SEMANTIC_ROWS,
+                "bounded_work: architecture lookup dependencies"
+            );
             dependencies.push(row.get::<_, String>(0)?);
         }
-        values.0.get_mut("basis").expect("constructed basis")["lookupDependencies"] = json!(dependencies);
+        values.0.get_mut("basis").expect("constructed basis")["lookupDependencies"] =
+            json!(dependencies);
         if let Some(projection) = projection {
-            values.0.insert("projection".into(), serde_json::to_value(projection)?);
+            values
+                .0
+                .insert("projection".into(), serde_json::to_value(projection)?);
         }
         Ok(values.0)
     };
@@ -1264,10 +1462,19 @@ pub(super) fn architecture_semantic(
     for (tuple, i, producer, complete, projection) in tuples {
         let historical = projection.is_some();
         let endpoint = |language: Option<&str>, path: Option<&str>| -> Result<Option<usize>> {
-            let Some(target) = locate(language, path) else { return Ok(None); };
+            let Some(target) = locate(language, path) else {
+                return Ok(None);
+            };
             if let Some(projection) = &projection {
                 let doc = &documents[target];
-                if !super::native_first::endpoint_eligible(db, pin, &producer, &doc.key.language, &doc.key.path, projection.semantic_basis_pin)? {
+                if !super::native_first::endpoint_eligible(
+                    db,
+                    pin,
+                    &producer,
+                    &doc.key.language,
+                    &doc.key.path,
+                    projection.semantic_basis_pin,
+                )? {
                     return Ok(None);
                 }
             }
@@ -1299,8 +1506,12 @@ pub(super) fn architecture_semantic(
             }
             let mut binding_metadata = metadata(tuple, &provenance_id, projection.as_ref())?;
             if historical {
-                binding_metadata.insert("historicalResolution".into(), json!(row.get::<_, String>(3)?));
-                binding_metadata.insert("historicalDispatch".into(), json!(row.get::<_, String>(8)?));
+                binding_metadata.insert(
+                    "historicalResolution".into(),
+                    json!(row.get::<_, String>(3)?),
+                );
+                binding_metadata
+                    .insert("historicalDispatch".into(), json!(row.get::<_, String>(8)?));
                 binding_metadata.insert("historicalJoin".into(), json!({"status":row.get::<_, String>(12)?,"kind":row.get::<_, String>(13)?,"language":row.get::<_, String>(14)?,"path":row.get::<_, String>(15)?,"revisionId":row.get::<_, String>(16)?,"range":anchor_range}));
             }
             let mut eligible_endpoints = true;
@@ -1311,14 +1522,19 @@ pub(super) fn architecture_semantic(
                 while let Some(target) = alternatives.next()? {
                     admit()?;
                     if target.get_ref(0)?.as_str_or_null()? == Some("internal") {
-                        eligible_endpoints &= endpoint(target.get_ref(1)?.as_str_or_null()?, target.get_ref(2)?.as_str_or_null()?)?.is_some();
+                        eligible_endpoints &= endpoint(
+                            target.get_ref(1)?.as_str_or_null()?,
+                            target.get_ref(2)?.as_str_or_null()?,
+                        )?
+                        .is_some();
                         targets.push(json!({"role":target.get::<_, String>(10)?,"kind":"internal","language":target.get::<_, String>(1)?,"path":target.get::<_, String>(2)?,"syntaxId":sid(target.get_ref(3)?.as_blob_or_null()?)?,"revisionId":target.get::<_, String>(4)?}));
                     } else if target.get_ref(0)?.as_str_or_null()? == Some("external") {
                         external_targets.push(json!({"role":target.get::<_, String>(10)?,"scheme":target.get::<_, String>(5)?,"symbol":target.get::<_, String>(6)?,"scope":target.get::<_, String>(7)?,"language":target.get::<_, Option<String>>(8)?,"path":target.get::<_, Option<String>>(9)?}));
                     }
                 }
                 binding_metadata.insert("historicalTargets".into(), json!(targets));
-                binding_metadata.insert("historicalExternalTargets".into(), json!(external_targets));
+                binding_metadata
+                    .insert("historicalExternalTargets".into(), json!(external_targets));
             }
             let outcome = match (
                 row.get_ref(3)?.as_str()?,
@@ -1354,7 +1570,11 @@ pub(super) fn architecture_semantic(
                 call_id: Some(call_id.clone()),
                 type_role: false,
                 direct: is_direct,
-                outcome: if eligible_endpoints { outcome } else { SemanticOutcome::Boundary },
+                outcome: if eligible_endpoints {
+                    outcome
+                } else {
+                    SemanticOutcome::Boundary
+                },
                 provenance_id: provenance_id.clone(),
                 metadata: binding_metadata,
             };
@@ -1386,33 +1606,47 @@ pub(super) fn architecture_semantic(
                 ("external", _) => SemanticOutcome::External,
                 _ => return Err(SelectedIntegrity("corrupt semantic reference".into()).into()),
             };
-            let mut reference_metadata = metadata(tuple, row.get_ref(6)?.as_str()?, projection.as_ref())?;
+            let mut reference_metadata =
+                metadata(tuple, row.get_ref(6)?.as_str()?, projection.as_ref())?;
             if historical {
-                reference_metadata.insert("historicalResolution".into(), json!(row.get::<_, String>(2)?));
+                reference_metadata.insert(
+                    "historicalResolution".into(),
+                    json!(row.get::<_, String>(2)?),
+                );
             }
             let mut eligible_endpoints = true;
             if historical {
                 let mut targets = Vec::new();
                 let mut external_targets = Vec::new();
-                let mut alternatives = reference_endpoints.query(params![tuple, row.get_ref(8)?.as_blob()?])?;
+                let mut alternatives =
+                    reference_endpoints.query(params![tuple, row.get_ref(8)?.as_blob()?])?;
                 while let Some(target) = alternatives.next()? {
                     admit()?;
                     if target.get_ref(0)?.as_str_or_null()? == Some("internal") {
-                        eligible_endpoints &= endpoint(target.get_ref(1)?.as_str_or_null()?, target.get_ref(2)?.as_str_or_null()?)?.is_some();
+                        eligible_endpoints &= endpoint(
+                            target.get_ref(1)?.as_str_or_null()?,
+                            target.get_ref(2)?.as_str_or_null()?,
+                        )?
+                        .is_some();
                         targets.push(json!({"role":target.get::<_, String>(10)?,"kind":"internal","language":target.get::<_, String>(1)?,"path":target.get::<_, String>(2)?,"syntaxId":sid(target.get_ref(3)?.as_blob_or_null()?)?,"revisionId":target.get::<_, String>(4)?}));
                     } else if target.get_ref(0)?.as_str_or_null()? == Some("external") {
                         external_targets.push(json!({"role":target.get::<_, String>(10)?,"scheme":target.get::<_, String>(5)?,"symbol":target.get::<_, String>(6)?,"scope":target.get::<_, String>(7)?,"language":target.get::<_, Option<String>>(8)?,"path":target.get::<_, Option<String>>(9)?}));
                     }
                 }
                 reference_metadata.insert("historicalTargets".into(), json!(targets));
-                reference_metadata.insert("historicalExternalTargets".into(), json!(external_targets));
+                reference_metadata
+                    .insert("historicalExternalTargets".into(), json!(external_targets));
             }
             anchors.push(SemanticAnchor {
                 range: range(row.get(0)?, row.get(1)?)?,
                 call_id: None,
                 type_role: row.get(7)?,
                 direct: false,
-                outcome: if eligible_endpoints { outcome } else { SemanticOutcome::Boundary },
+                outcome: if eligible_endpoints {
+                    outcome
+                } else {
+                    SemanticOutcome::Boundary
+                },
                 provenance_id: row.get(6)?,
                 metadata: reference_metadata,
             });
@@ -1444,8 +1678,14 @@ pub(super) fn architecture_semantic(
                 .map(|target_doc| (target_doc, target)),
                 _ => None,
             };
-            let mut relationship_metadata = metadata(tuple, row.get_ref(6)?.as_str()?, projection.as_ref())?;
-            let source_eligible = !historical || endpoint(row.get_ref(7)?.as_str_or_null()?, row.get_ref(8)?.as_str_or_null()?)?.is_some();
+            let mut relationship_metadata =
+                metadata(tuple, row.get_ref(6)?.as_str()?, projection.as_ref())?;
+            let source_eligible = !historical
+                || endpoint(
+                    row.get_ref(7)?.as_str_or_null()?,
+                    row.get_ref(8)?.as_str_or_null()?,
+                )?
+                .is_some();
             if historical {
                 relationship_metadata.insert("historicalTargets".into(), json!([
                     {"kind":"internal","language":row.get::<_, String>(7)?,"path":row.get::<_, String>(8)?,"syntaxId":source,"revisionId":row.get::<_, String>(9)?},
@@ -1454,7 +1694,13 @@ pub(super) fn architecture_semantic(
                 if row.get_ref(2)?.as_str()? == "external" {
                     relationship_metadata.insert("historicalExternalTargets".into(), json!([{"scheme":row.get::<_, String>(11)?,"symbol":row.get::<_, String>(12)?,"scope":row.get::<_, String>(13)?,"language":row.get::<_, Option<String>>(14)?,"path":row.get::<_, Option<String>>(15)?}]));
                 }
-                relationship_metadata.insert("semanticBoundary".into(), json!(!source_eligible || (row.get_ref(2)?.as_str()? == "internal" && target.is_none())));
+                relationship_metadata.insert(
+                    "semanticBoundary".into(),
+                    json!(
+                        !source_eligible
+                            || (row.get_ref(2)?.as_str()? == "internal" && target.is_none())
+                    ),
+                );
             }
             found.push(SemanticRelationship {
                 kind: row.get(0)?,
@@ -1468,8 +1714,12 @@ pub(super) fn architecture_semantic(
         let semantic = &mut documents[i].semantic;
         semantic.producer_id = Some(producer);
         semantic.complete = complete && !historical;
-        semantic.boundary |= anchors.iter().any(|a| a.outcome == SemanticOutcome::Boundary)
-            || found.iter().any(|r| r.metadata.get("semanticBoundary") == Some(&json!(true)));
+        semantic.boundary |= anchors
+            .iter()
+            .any(|a| a.outcome == SemanticOutcome::Boundary)
+            || found
+                .iter()
+                .any(|r| r.metadata.get("semanticBoundary") == Some(&json!(true)));
         semantic.anchors = anchors;
         semantic.relationships = found;
     }
@@ -1479,6 +1729,36 @@ pub(super) fn architecture_semantic(
 #[cfg(test)]
 mod reimport_tests {
     use super::*;
+
+    #[test]
+    fn architecture_derivation_preserves_complete_null_and_corrupt_shapes() {
+        let proof = "a".repeat(64);
+        let digest = "b".repeat(64);
+        let derived = architecture_derived_from(
+            Some(1),
+            Some(proof.clone()),
+            Some("occurrence".into()),
+            Some(digest.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            derived,
+            Some(sem::DerivedFrom {
+                provenance_id: proof.clone(),
+                record_kind: sem::RecordKind::Occurrence,
+                fact_digest: digest.clone(),
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(architecture_derived_from(None, None, None, None).unwrap())
+                .unwrap(),
+            serde_json::Value::Null
+        );
+        let error =
+            architecture_derived_from(None, Some(proof), Some("occurrence".into()), Some(digest))
+                .unwrap_err();
+        assert!(error.is::<SelectedIntegrity>(), "{error:#}");
+    }
 
     #[test]
     fn no_history_keeps_plain_unavailable_status_without_reimport() {

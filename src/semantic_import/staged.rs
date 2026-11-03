@@ -56,6 +56,9 @@ pub(crate) mod publication;
 mod settle;
 pub(super) mod sizes;
 mod streaming;
+
+mod witness;
+
 pub(super) mod target_size;
 use live::{LiveBudget, Reservation};
 
@@ -814,6 +817,53 @@ impl<'a> StagedSide<'a> {
         Ok((claim, claim_id))
     }
 
+    fn proof_identity(
+        &self,
+        proof: &str,
+        kind: &str,
+        digest: &str,
+    ) -> Result<(RawClaimDocument, i64)> {
+        if self.local_claims.is_some() {
+            let (claim, id) = self.local_claim(proof, kind, digest)?;
+            return Ok((
+                RawClaimDocument {
+                    language: claim.language.clone(),
+                    path: claim.envelope.relative_path.clone(),
+                    artifact_hash: claim.artifact_hash.clone(),
+                },
+                id,
+            ));
+        }
+        let found = self
+            .ctx
+            .conn
+            .query_row(
+                "SELECT s.language,s.path,a.sha256,p.claim_id FROM proof_identities p \
+             JOIN sources s ON s.ord=p.source_ord JOIN artifacts a ON a.ordinal=p.artifact \
+             WHERE p.proof_id=?1 AND p.record_kind=?2 AND p.fact_digest=?3",
+                params![proof, kind, digest],
+                |row| {
+                    Ok((
+                        RawClaimDocument {
+                            language: row.get(0)?,
+                            path: row.get(1)?,
+                            artifact_hash: row.get(2)?,
+                        },
+                        row.get(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (claim, id) = found.ok_or(ScipCaptureError::MissingProof)?;
+        anyhow::ensure!(
+            self.document
+                .as_ref()
+                .is_none_or(|doc| doc.language == claim.language && doc.path == claim.path),
+            "foreign witness proof"
+        );
+        Ok((claim, id))
+    }
+
     fn proof_filter(&self) -> &'static str {
         if self.filtered { ELIGIBLE_JOIN } else { "" }
     }
@@ -1091,7 +1141,7 @@ impl ProofIdentities for StagedSide<'_> {
             }));
         }
         let sql = format!(
-            "SELECT s.language, s.path, c.record_kind, c.fact_digest, a.sha256 FROM claims c \
+            "SELECT s.language, s.path, c.record_kind, c.fact_digest, a.sha256 FROM proof_identities c \
              JOIN sources s ON s.ord=c.source_ord JOIN artifacts a ON a.ordinal=c.artifact {} WHERE c.proof_id=?1",
             self.proof_filter()
         );
@@ -1468,6 +1518,7 @@ struct StagedJoin<'a> {
     identical_joins: Cell<bool>,
     identity_kind: &'static str,
     descriptor_sha256: &'a str,
+    witnessed: bool,
 }
 
 const COVERAGE: usize = 0;
@@ -2553,32 +2604,6 @@ pub fn join_staged(
     )
 }
 
-/// Joins with caller-owned readers, including a destination in an unpublished writer
-/// transaction. The caller supplies readers for the admitted captured pin and `destination`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn join_staged_with_readers(
-    admitted: &mut AdmittedBatch,
-    captured: &NativeReader<'_>,
-    destination_reader: &NativeReader<'_>,
-    destination: IndexPin,
-    limits: &BatchLimits,
-    budget: &mut LookupBudget,
-    counters: &mut BatchCounters,
-    mutations: DestinationMutations,
-    cancel: &CancelFlag,
-) -> Result<JoinedBatch> {
-    join_staged_using(
-        admitted,
-        destination,
-        limits,
-        budget,
-        counters,
-        mutations,
-        cancel,
-        |body| body(captured, destination_reader),
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn join_staged_using(
     admitted: &mut AdmittedBatch,
@@ -2684,6 +2709,7 @@ fn join_staged_using(
                 identical_joins: Cell::new(false),
                 identity_kind: descriptor.producer.identity_kind.as_str(),
                 descriptor_sha256: parts.descriptor_sha256,
+                witnessed: false,
             };
             let report = join.run()?;
             emit_ledger_diagnostic(&ctx, ctx.budget.borrow().used());

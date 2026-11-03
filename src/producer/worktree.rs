@@ -113,6 +113,11 @@ fn omission<'a>(rules: &'a Rules, path: &str) -> Option<&'a Omission> {
     rules.omit.iter().find(|omission| omission.path == path)
 }
 
+/// Sources, config, then dependency inputs claim a path only once.
+fn supplied(rules: &Rules, path: &str, already_present: bool) -> bool {
+    omission(rules, path).is_none() && !already_present
+}
+
 /// Whether a default-only generated file gives way to a root input at its worktree path.
 fn replaced(file: &Generated, present: impl Fn(&str) -> bool) -> bool {
     file.default_only && file.path.strip_prefix("worktree/").is_some_and(present)
@@ -121,10 +126,14 @@ fn replaced(file: &Generated, present: impl Fn(&str) -> bool) -> bool {
 /// The listing for `rules`. Omitted paths leave the config and dependency
 /// lists and appear under `omitted` once, in sorted order.
 pub fn layout(inputs: &RetainedInputs, rules: &Rules) -> Layout {
-    let list = |files: &[RootInput]| -> Vec<Listed> {
+    let mut present = std::collections::BTreeSet::new();
+    let mut list = |files: &[RootInput]| -> Vec<Listed> {
         files
             .iter()
-            .filter(|file| omission(rules, &file.path).is_none())
+            .filter(|file| {
+                supplied(rules, &file.path, present.contains(&file.path))
+                    && present.insert(file.path.clone())
+            })
             .map(|file| Listed {
                 path: file.path.clone(),
                 sha256: file.sha256(),
@@ -137,29 +146,90 @@ pub fn layout(inputs: &RetainedInputs, rules: &Rules) -> Layout {
             omitted.insert(file.path.clone(), omission.reason.to_owned());
         }
     }
+    let config = list(&inputs.config);
+    let dependency_manifests = list(&inputs.dependencies);
     Layout {
-        config: list(&inputs.config),
-        dependency_manifests: list(&inputs.dependencies),
+        config,
+        dependency_manifests,
         omitted: omitted.into_iter().collect(),
         generated: rules
             .generated
             .iter()
-            .filter(|file| {
-                !replaced(file, |path| {
-                    omission(rules, path).is_none()
-                        && inputs
-                            .config
-                            .iter()
-                            .chain(&inputs.dependencies)
-                            .any(|input| input.path == path)
-                })
-            })
+            .filter(|file| !replaced(file, |path| present.contains(path)))
             .map(|file| Listed {
                 path: file.path.clone(),
                 sha256: hex::encode(Sha256::digest(&file.bytes)),
             })
             .collect(),
     }
+}
+
+/// A controlled profile's effective non-source context. Native identity and freshness
+/// keep their full captured hashes; this digest is only for P-to-N pending eligibility.
+/// Entries borrow retained metadata, including encoded bytes, without decoding file bodies.
+pub(crate) fn context_hash(
+    rules: &Rules,
+    config: &[Value],
+    dependencies: &[Value],
+    is_source: &dyn Fn(&str) -> Result<bool>,
+    cancel: &AtomicBool,
+) -> Result<String> {
+    let mut files = BTreeMap::new();
+    let mut metadata = Vec::new();
+    for entry in config.iter().chain(dependencies) {
+        check_cancel(cancel)?;
+        let Some(path) = entry["path"].as_str() else {
+            metadata.push(entry);
+            continue;
+        };
+        if omission(rules, path).is_some() {
+            continue;
+        }
+        match entry["type"].as_str() {
+            Some("absent") => {}
+            Some("present") => {
+                if supplied(rules, path, files.contains_key(path)) && !is_source(path)? {
+                    files.insert(path, entry);
+                }
+            }
+            _ => metadata.push(entry),
+        }
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"controlled-worktree-context:v1\0files[");
+    for entry in files.values() {
+        check_cancel(cancel)?;
+        crate::native_ids::canonical_into(entry, &mut |bytes| hash.update(bytes));
+        hash.update(b",");
+    }
+    hash.update(b"]metadata[");
+    for entry in metadata {
+        check_cancel(cancel)?;
+        crate::native_ids::canonical_into(entry, &mut |bytes| hash.update(bytes));
+        hash.update(b",");
+    }
+    hash.update(b"]generated[");
+    for file in &rules.generated {
+        check_cancel(cancel)?;
+        let present = if file.default_only {
+            match file.path.strip_prefix("worktree/") {
+                Some(path) if omission(rules, path).is_none() => {
+                    files.contains_key(path) || is_source(path)?
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if !replaced(file, |_| present) {
+            crate::native_ids::canonical_string_into(&file.path, &mut |bytes| hash.update(bytes));
+            hash.update(Sha256::digest(&file.bytes));
+            hash.update(b",");
+        }
+    }
+    hash.update(b"]");
+    check_cancel(cancel)?;
+    Ok(hex::encode(hash.finalize()))
 }
 
 fn private_dirs(path: &Path) -> Result<()> {
@@ -221,10 +291,11 @@ pub fn materialize(
     let mut written = std::collections::BTreeSet::new();
     let mut put = |path: &str, bytes: &[u8]| -> Result<()> {
         check_cancel(cancel)?;
-        if omission(rules, path).is_some() || !written.insert(path.to_owned()) {
-            return Ok(());
+        if supplied(rules, path, written.contains(path)) {
+            written.insert(path.to_owned());
+            write_new(&worktree.join(path), bytes)?;
         }
-        write_new(&worktree.join(path), bytes)
+        Ok(())
     };
     source.each_document(&mut |path, bytes| put(path, &bytes))?;
     for file in inputs.config.iter().chain(&inputs.dependencies) {
