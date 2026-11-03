@@ -852,7 +852,8 @@ fn unknown_group_imports_the_frozen_snapshot_despite_a_later_rewrite() {
     assert_eq!(record["groupStatus"], "unknown");
     assert_eq!(record["diagnostics"]["groupStatus"], "unknown");
     assert_eq!(world.stub_entry()["lastRun"]["groupStatus"], "unknown");
-    assert!(only_record_remains(&dir));
+    assert_eq!(entries(&dir), import_inputs(&record));
+    assert_eq!(fs::read(dir.join("snapshot/index.scip")).unwrap(), emitted);
     assert!(stage_residue(&world).is_empty());
 }
 
