@@ -276,11 +276,7 @@ mod tests {
     #[test]
     fn outgoing_calls_catalog_entry_unchanged() {
         use sha2::{Digest, Sha256};
-        // Digest of the canonical JSON (sorted keys, compact) of the entry: adding a tool must
-        // not touch another tool's schema. #467 amended it with the semantic binding tier;
-        // #528 with the per-response basis table, compact mode and default limit 6.
-        // #593 adds exact stable-key selectors and the candidate-only success branch.
-        // #594 labels native coverage separately in that branch.
+        // Canonical whole-entry closure. #632 adds required nullable re-import status.
         let entries = entries();
         let outgoing = entries
             .iter()
@@ -290,7 +286,31 @@ mod tests {
             hex::encode(Sha256::digest(
                 serde_json::to_string(outgoing).unwrap().as_bytes()
             )),
-            "941da59a15ce55b99f3e9c0adce99270e1d0b2a1206faa86d5f241b9139e10cf"
+            "db28f041933e070781df13fda85646aca87790b63171eec89d4a1f645029631b"
+        );
+    }
+
+    #[test]
+    fn outgoing_calls_status_requires_nullable_reimport() {
+        let entries = entries();
+        let outgoing = entries
+            .iter()
+            .find(|e| e["name"] == "trellis_outgoing_calls")
+            .unwrap();
+        let status = &outgoing["outputSchema"]["$defs"]["LanguageStatus"]["properties"]["semantic"];
+        assert!(
+            status["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("reimport"))
+        );
+        assert_eq!(
+            status["properties"]["reimport"],
+            json!({"anyOf":[{
+            "additionalProperties":false,
+            "properties":{"state":{"const":"needsReimport"},"reason":{"$ref":"#/$defs/Text"}},
+            "required":["state","reason"],"type":"object"
+        },{"type":"null"}]})
         );
     }
     #[test]

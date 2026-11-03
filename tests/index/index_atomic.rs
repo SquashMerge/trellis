@@ -741,7 +741,7 @@ fn sqlite_snapshot(
         .unwrap();
     // Check exact schema-35 names before comparing evidence and the logical
     // search corpus. FTS shadow bytes depend on publication/merge history.
-    const REQUIRED_V28_TABLES: [&str; 76] = [
+    const REQUIRED_V35_TABLES: [&str; 77] = [
         "class_projections",
         "class_relations",
         "classes",
@@ -811,6 +811,7 @@ fn sqlite_snapshot(
         "semantic_reference_candidates",
         "semantic_reference_roles",
         "semantic_references",
+        "semantic_reimport",
         "semantic_requested_producer_languages",
         "semantic_requested_producers",
         "semantic_revision_producers",
@@ -821,7 +822,7 @@ fn sqlite_snapshot(
     ];
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
-        REQUIRED_V28_TABLES,
+        REQUIRED_V35_TABLES,
         "exact schema-35 evidence and search table inventory"
     );
     if tables.contains(&"native_binding_epoch".to_string()) {
@@ -886,7 +887,7 @@ fn sqlite_snapshot(
             // Every table remains in the independent cold-source comparison.
             let (where_clause, alias) = match table.as_str() {
                 "native_revisions" => ("id=?1", ""),
-                "revision_capture_inputs" | "revision_documents"
+                "revision_capture_inputs" | "revision_documents" | "semantic_reimport"
                 | "native_revision_release_debt" | "native_release_candidate_versions"
                 | "native_release_candidate_graphs" | "native_release_candidate_classes" =>
                     ("revision_id=?1", ""),

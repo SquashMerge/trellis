@@ -382,6 +382,9 @@ impl StateDir {
         let mut terminal = Vec::new();
         for record in self.runs()? {
             if record.state.is_terminal() && !kept(&keep, &self.run_dir(&record.run_id)?) {
+                // Reclaim superseded inputs at the terminal owner's cleanup, not
+                // only when record-count retention eventually removes this run.
+                self.strip_to_record(&record.run_id)?;
                 terminal.push(record);
             }
         }

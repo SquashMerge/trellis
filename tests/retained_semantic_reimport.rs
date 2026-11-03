@@ -66,12 +66,23 @@ impl World {
     }
 
     fn spawn_run(&self) -> Child {
+        self.spawn_run_variant(0)
+    }
+
+    fn spawn_run_variant(&self, variant: u32) -> Child {
         let mut fixture =
             BatchFixture::from_published(&self.index, &self.checkout.root).synthetic();
         let docs = fixture.paths("javascript");
         fixture.artifact("javascript", docs.clone());
         let bytes = edit_scip(&fixture.scip_bytes("javascript", &docs), |index| {
-            index.metadata.as_mut().unwrap().project_root = String::new();
+            let metadata = index.metadata.as_mut().unwrap();
+            metadata.project_root = String::new();
+            metadata
+                .tool_info
+                .as_mut()
+                .unwrap()
+                .arguments
+                .push(format!("variant-{variant}"));
         });
         let artifact = self._stub.path().join("index.scip");
         fs::write(&artifact, bytes).unwrap();
@@ -107,7 +118,14 @@ impl World {
     }
 
     fn run_once(&self) -> (Value, Vec<u8>, Value) {
-        let run = reply("producer run", self.spawn_run().wait_with_output().unwrap());
+        self.run_once_variant(0)
+    }
+
+    fn run_once_variant(&self, variant: u32) -> (Value, Vec<u8>, Value) {
+        let run = reply(
+            "producer run",
+            self.spawn_run_variant(variant).wait_with_output().unwrap(),
+        );
         assert_eq!(run["outcome"], "imported");
         let run_id = run["runId"].as_str().unwrap();
         let descriptor = state_dir(&self.checkout)
@@ -437,6 +455,85 @@ fn corrupt_retention_catalog_does_not_block_native_index_fifo() {
     // A second explicit native request must still drain with the bad optional catalog.
     reply(
         "second index with corrupt retention catalog",
+        world
+            .checkout
+            .cli()
+            .args(["index", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(world.invocation_count(), 1);
+}
+
+#[test]
+fn second_successful_run_releases_previous_bundle_before_any_later_sweep() {
+    let world = World::new();
+    let (first, _, first_options) = world.run_once_variant(0);
+    let (second, second_bytes, second_options) = world.run_once_variant(1);
+    let first_dir = Path::new(first_options["descriptor"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let second_dir = Path::new(second_options["descriptor"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    // No status, plan, third run or restart may trigger a later sweep before this check.
+    assert!(
+        !first_dir.join("out").exists(),
+        "previous run output survived replacement publication"
+    );
+    assert!(
+        !first_dir.join("batch").exists(),
+        "previous run batch survived replacement publication"
+    );
+    assert!(second_dir.join("out").is_dir());
+    assert_eq!(
+        fs::read(second_options["descriptor"].as_str().unwrap()).unwrap(),
+        second_bytes
+    );
+    for (dir, run) in [(first_dir, &first), (second_dir, &second)] {
+        let record: Value =
+            serde_json::from_slice(&fs::read(dir.join("run.json")).unwrap()).unwrap();
+        assert_eq!(record["state"], "done");
+        assert_eq!(record["outcome"], "imported");
+        assert_eq!(record["requestId"], run["import"]["requestId"]);
+    }
+    let rows = world.generated_rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].2, second_options);
+    assert_eq!(world.invocation_count(), 2);
+}
+
+#[test]
+fn structurally_corrupt_retention_identity_does_not_block_native_index_fifo() {
+    let world = World::new();
+    let (_, original, options) = world.run_once();
+    let retention = state_dir(&world.checkout).join("retention.sqlite");
+    world.upgrade(|_| {
+        let db = Connection::open(&retention).unwrap();
+        assert_eq!(db.execute("DELETE FROM identity", []).unwrap(), 1);
+    });
+    let status = world.status();
+    assert!(status["stats"]["symbols"].as_u64().unwrap() > 0);
+    let js = status["semanticLanguages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["language"] == "javascript")
+        .unwrap();
+    assert_eq!(js["semanticState"], "unavailable");
+    assert_eq!(js["reimport"]["state"], "needsReimport");
+    assert!(!js["reimport"]["reason"].as_str().unwrap().is_empty());
+    assert_eq!(
+        fs::read(options["descriptor"].as_str().unwrap()).unwrap(),
+        original
+    );
+    reply(
+        "second index with structurally corrupt retention catalog",
         world
             .checkout
             .cli()

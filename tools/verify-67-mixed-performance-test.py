@@ -292,6 +292,10 @@ class SchemaParity(unittest.TestCase):
                   "artifacts": [], "languages": []}
         db.execute("INSERT INTO semantic_import_reports VALUES(?,?,?)",
                    (pins["import"], "scip-typescript", json.dumps(report)))
+        db.execute("INSERT INTO semantic_reimport VALUES(?,?,?,?)",
+                   (pins["r2"], "other-producer", "python", "normal validation is required"))
+        db.execute("INSERT INTO semantic_reimport VALUES(?,?,?,?)",
+                   (pins["r1"], "old-producer", "python", "not the selected revision"))
         return root, pins["r2"]
 
     def normalized_rows(self, workspace):
@@ -302,12 +306,13 @@ class SchemaParity(unittest.TestCase):
         for table in ("semantic_raw_batches", "semantic_raw_captures", "semantic_raw_exclusions",
                       "semantic_raw_documents", "semantic_raw_proofs", "semantic_revision_raw_selections",
                       "semantic_coverage", "semantic_basis", "semantic_provenance",
-                      "semantic_import_reports"):
+                      "semantic_import_reports", "semantic_reimport"):
             columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
             query = f'SELECT * FROM "{table}" selected WHERE {RUNNER.selected_where(table)}'
             rows[table] = [RUNNER.canonical(RUNNER.typed_cells(view.row(table, dict(zip(columns, row)))))
                            for row in db.execute(query, (revision,))]
             self.assertTrue(rows[table], table)
+        self.assertEqual(len(rows["semantic_reimport"]), 1)
         return rows
 
     def test_selected_view_normalizes_a_schema_35_batch_selection_identically_across_roots(self):

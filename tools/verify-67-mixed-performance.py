@@ -679,7 +679,7 @@ semantic_declaration_join_candidates semantic_references semantic_reference_role
 semantic_reference_candidates semantic_call_bindings semantic_call_candidates
 semantic_call_possible_dispatch semantic_call_join_candidates semantic_type_relationships
 semantic_raw_batches semantic_raw_captures semantic_raw_exclusions semantic_revision_raw_selections
-semantic_raw_proofs semantic_raw_documents semantic_import_reports
+semantic_raw_proofs semantic_raw_documents semantic_import_reports semantic_reimport
 """.split())
 CONTROL_TABLES = {"native_revision_supersessions", "native_binding_epoch", "revision_producer_bindings"}
 FTS_SHADOW_TABLES = {"head_search_fts_config", "head_search_fts_content", "head_search_fts_data",
@@ -708,7 +708,7 @@ def selected_where(table):
         return "? IS NOT NULL"
     elif table in {"revision_capture_inputs", "revision_documents", "semantic_revision_producers",
                    "semantic_requested_producers", "semantic_requested_producer_languages",
-                   "semantic_coverage", "semantic_revision_raw_selections"}:
+                   "semantic_coverage", "semantic_revision_raw_selections", "semantic_reimport"}:
         return "revision_id=?"
     elif table == "native_source_sets":
         return "id=(SELECT source_set_id FROM native_revisions WHERE id=?)"

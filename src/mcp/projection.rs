@@ -429,7 +429,7 @@ for (const [name, output] of JSON.parse(readFileSync(0,'utf8'))) {
             rust["semantic"],
             json!({"available":true,"producerId":"rust-analyzer","freshness":"fresh","note":null,
                 "coverage":{"selected":355,"complete":300,"partial":55,"failed":0,"unselected":0},
-                "partialReasons":null})
+                "partialReasons":null,"reimport":null})
         );
         assert_eq!(
             fresh["data"]["languages"][0]["semantic"]["available"],
@@ -1056,10 +1056,10 @@ mod find_tests {
             assert_eq!(
                 data["scopeCoverage"],
                 json!([
-                    {"language":"java","nativeCoverageTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
-                    {"language":"rust","nativeCoverageTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
-                    {"language":"python","nativeCoverageTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
-                    {"language":"javascript","nativeCoverageTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}}
+                    {"language":"java","nativeCoverageTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null}},
+                    {"language":"rust","nativeCoverageTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null}},
+                    {"language":"python","nativeCoverageTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null}},
+                    {"language":"javascript","nativeCoverageTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null}}
                 ])
             );
             // Incomplete selected scope: partial, one aggregate warning first.
