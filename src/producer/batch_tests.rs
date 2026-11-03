@@ -260,6 +260,7 @@ mod with_store {
                     workspace: &world.root,
                     dir: &dir,
                     generation: batch::pickup_generation(ID),
+                    snapshot: false,
                 },
             )
         })?;
@@ -414,6 +415,7 @@ mod with_store {
                         workspace: &world.root,
                         dir: &dir,
                         generation: batch::pickup_generation(ID),
+                        snapshot: false,
                     },
                 )
             })

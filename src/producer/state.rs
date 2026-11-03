@@ -4,7 +4,9 @@
 //! `TopologyRoots::producer_state_dir`.
 
 use super::process_info;
-use super::{Diagnostics, PRODUCER_STATE_CORRUPT, ProcessIdentity, TrustProfile, UNSAFE_STATE};
+use super::{
+    Diagnostics, GroupStatus, PRODUCER_STATE_CORRUPT, ProcessIdentity, TrustProfile, UNSAFE_STATE,
+};
 use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -14,13 +16,11 @@ use std::{
     io::Write,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Terminal run records kept per root key.
 pub const RETAINED_RUNS: usize = 10;
-/// How long the sweep waits for a killed group to empty.
-const SWEEP_KILL_WAIT: Duration = Duration::from_secs(10);
 /// Directories that exist only while the producer phase is running.
 const PHASE_DIRS: [&str; 7] = [
     "worktree",
@@ -32,7 +32,7 @@ const PHASE_DIRS: [&str; 7] = [
     "logs",
 ];
 /// Directories that survive until the generated import request is terminal.
-const IMPORT_DIRS: [&str; 2] = ["out", "batch"];
+const IMPORT_DIRS: [&str; 3] = ["out", "snapshot", "batch"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +89,9 @@ pub struct RunRecord {
     pub created_at: u64,
     pub finished_at: Option<u64>,
     pub diagnostics: Option<Diagnostics>,
+    /// What was established about the producer's process group once Trellis stopped owning
+    /// it; `None` while the producer runs or when none was started.
+    pub group_status: Option<GroupStatus>,
 }
 
 /// `pickup.json` (D6): at most one entry per producer.
@@ -122,7 +125,9 @@ pub struct LastImported {
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct SweepReport {
     pub abandoned_runs: Vec<String>,
-    pub killed_groups: Vec<i32>,
+    /// Recorded groups of abandoned runs that may still exist. They are never signalled: a
+    /// replacement daemon cannot prove it still owns them (owner ruling 2026-11-02, #624).
+    pub unestablished_groups: Vec<i32>,
     pub removed_pickups: Vec<String>,
     /// Runs whose record could not be read for a reason other than
     /// corruption; their directories are left in place.
@@ -390,8 +395,11 @@ impl StateDir {
     /// named by queued or running generated import requests.
     ///
     /// A non-terminal run owned by another daemon is stripped and then marked
-    /// `failed/abandoned`; its group is killed only when the
-    /// recorded leader is still the process that started it. A run directory
+    /// `failed/abandoned`. Its recorded group is never signalled: with only a PID
+    /// and start time, a replacement daemon cannot atomically prove it still owns
+    /// the group (owner ruling 2026-11-02, #624). A group that no longer exists is
+    /// recorded `empty`; otherwise termination is unestablished and the group
+    /// status `unknown`, and an orphaned producer may run to completion. A run directory
     /// whose record fails its closed parse is removed; one that cannot be read
     /// for another reason is left and reported. A pickup
     /// directory that no request names is removed. The inputs an abandoned run
@@ -438,17 +446,25 @@ impl StateDir {
             if record.daemon == *this_daemon {
                 continue;
             }
-            if let Some(process) = record.process
-                && leader_matches(&process)
+            // A run whose producer phase ended keeps what its owner established. Otherwise a
+            // probe, which signals nothing, decides: no process in the recorded group ID means
+            // the run's group is gone; any other answer may be the run's group or a reuse of
+            // its ID, so membership is unknown.
+            if record.group_status.is_none()
+                && let Some(process) = record.process
             {
-                unsafe { libc::killpg(process.pgid, libc::SIGKILL) };
-                let deadline = std::time::Instant::now() + SWEEP_KILL_WAIT;
-                while process_info::group_exists(process.pgid)
-                    && std::time::Instant::now() < deadline
-                {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                report.killed_groups.push(process.pgid);
+                record.group_status = Some(if process_info::group_exists(process.pgid) {
+                    GroupStatus::Unknown
+                } else {
+                    GroupStatus::Empty
+                });
+            }
+            let unestablished = matches!(
+                record.group_status,
+                Some(GroupStatus::Unknown | GroupStatus::Survived)
+            );
+            if unestablished && let Some(process) = record.process {
+                report.unestablished_groups.push(process.pgid);
             }
             // Strip first, then publish the terminal record, so a terminal record means the
             // sweep is done with the directory. A crash between the two leaves a stripped
@@ -460,7 +476,11 @@ impl StateDir {
             }
             record.state = RunState::Failed;
             record.outcome = Some("abandoned".to_owned());
-            record.error_code = Some("abandoned".to_owned());
+            record.error_code = Some(if unestablished {
+                "abandoned: producer termination unestablished".to_owned()
+            } else {
+                "abandoned".to_owned()
+            });
             record.finished_at = Some(now_millis());
             self.write_run_record(&record)?;
             report.abandoned_runs.push(run_id);
@@ -485,11 +505,4 @@ impl StateDir {
 /// Whether `dir`, spelled as given or canonicalized, is in `keep`.
 fn kept(keep: &BTreeSet<PathBuf>, dir: &Path) -> bool {
     keep.contains(dir) || fs::canonicalize(dir).is_ok_and(|real| keep.contains(&real))
-}
-
-/// The recorded group leader is alive and is still the process that started
-/// the run, so signalling its group cannot hit a reused process.
-fn leader_matches(process: &ProcessIdentity) -> bool {
-    process_info::start_time(process.pgid) == Some(process.leader_start_time)
-        && unsafe { libc::getpgid(process.pgid) } == process.pgid
 }

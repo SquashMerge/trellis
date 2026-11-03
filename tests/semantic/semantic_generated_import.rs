@@ -198,6 +198,7 @@ impl Inproc {
                     workspace: &self.root,
                     dir: &dir,
                     generation: batch::run_generation(&table, GenerationOrigin::TrellisRun, id),
+                    snapshot: false,
                 },
             )
         })?;

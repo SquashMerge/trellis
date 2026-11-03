@@ -31,6 +31,8 @@ use std::{
 
 /// The artifact's place under a generation directory.
 pub const ARTIFACT_PATH: &str = "out/index.scip";
+/// The frozen copy a batch names instead when the producer's group may still be running.
+pub const SNAPSHOT_PATH: &str = "snapshot/index.scip";
 const BATCH_DIR: &str = "batch";
 /// Documents an artifact may name.
 const MAX_SCANNED_DOCUMENTS: usize = 100_000;
@@ -194,6 +196,9 @@ pub struct BatchSpec<'a> {
     /// The canonical generation directory; the artifact is at `ARTIFACT_PATH` under it.
     pub dir: &'a Path,
     pub generation: Generation,
+    /// Freeze the artifact bytes this batch was written from into `SNAPSHOT_PATH`, a file
+    /// only Trellis writes, and name that in the descriptor (#624).
+    pub snapshot: bool,
 }
 
 /// A batch ready to import.
@@ -316,6 +321,17 @@ fn read_artifact(dir: &Path) -> Result<(Vec<u8>, String)> {
 /// artifact's language and the artifact omits it, and `notRequested` for any other language.
 pub fn write_batch(reader: &NativeReader<'_>, spec: &BatchSpec<'_>) -> Result<WrittenBatch> {
     let (artifact, artifact_sha256) = read_artifact(spec.dir)?;
+    let artifact_path = if spec.snapshot {
+        let dir = spec.dir.join("snapshot");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("create {}", dir.display()))?;
+        write_new(&spec.dir.join(SNAPSHOT_PATH), &artifact)?;
+        SNAPSHOT_PATH
+    } else {
+        ARTIFACT_PATH
+    };
     let scan = scan_artifact(&artifact)?;
     let generation = &spec.generation;
     let admitted = StageInput::generated(
@@ -441,7 +457,7 @@ pub fn write_batch(reader: &NativeReader<'_>, spec: &BatchSpec<'_>) -> Result<Wr
         pages,
         artifacts: vec![ArtifactEntry {
             ordinal: 0,
-            relative_path: ARTIFACT_PATH.to_owned(),
+            relative_path: artifact_path.to_owned(),
             byte_length: artifact.len() as u64,
             sha256: artifact_sha256,
             language: spec.language.to_owned(),
