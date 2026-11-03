@@ -1543,14 +1543,16 @@ async function selectMethod(symbol, admitted = null, callerCurrent = null) {
   if (callerCurrent() && selectedMethod === symbol && window.matchMedia?.("(max-width: 900px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
 }
 // One reversible detail setting controls non-call rows and incidental calls (#594).
-// This visible shortcut and Options → Show all steps always flip the same setting.
-function renderIncidentalToggle(data) {
+// This visible shortcut and Options → Show all steps always flip the same setting. An enriched
+// view returns to Interactions (#636); a syntax-only one to calls-first.
+function renderIncidentalToggle(data, options) {
   const button = $("sequence-incidental");
   if (!button) return;
   const count = Number.isSafeInteger(data?.incidentalSteps) ? data.incidentalSteps : 0, showing = !!$("all-steps").checked;
+  const interactions = !!window.TrellisSequence?.interactive(data, {...options, showDetails:false});
   button.hidden = false;
-  button.textContent = showing ? "Show calls" : "Show all steps";
-  button.title = `Calls-first keeps conditional and unknown context. Show all restores admitted non-call steps and ${count} incidental ${count === 1 ? "call" : "calls"}; sequence limits still apply.`;
+  button.textContent = showing ? interactions ? "Show interactions" : "Show calls" : "Show all steps";
+  button.title = `${interactions ? "Interactions draw calls between columns and fold the rest into badges." : "Calls-first keeps conditional and unknown context."} Show all restores admitted non-call steps and ${count} incidental ${count === 1 ? "call" : "calls"}; sequence limits still apply.`;
   button.setAttribute("aria-pressed", String(showing));
 }
 // The method Fit was asked for: a redraw of it keeps Fit, another opens at its own size (#558).
@@ -1576,7 +1578,8 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
     diagramSequence = data;
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
-    const options = {showDetails: !!$("all-steps").checked, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
+    // Interactions are the default for an enriched view (#636); Show all steps is unchanged.
+    const options = {showDetails: !!$("all-steps").checked, interactions:true, expandedBadges:new Set(), isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
     options.onOpenTarget = sequenceTargetAction(data, options.isCurrent);
     // A later group redraw can fail after the initial load succeeded. Preserve
     // the whole pinned DTO rather than leaving an inert, silently folded group.
@@ -1607,7 +1610,7 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     }
     if (empty) window.TrellisSequence.renderEmpty(diagram, empty, () => { if (options.isCurrent()) { $("all-steps").checked = true; void loadSequence(); } }, !onlyEmpty);
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
-    renderIncidentalToggle(data);
+    renderIncidentalToggle(data, options);
     $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
     published = true;

@@ -203,7 +203,87 @@ function sequenceDisplay(view, options = {}) {
     return {shows, transfers};
   };
   visit(view?.steps);
-  return {visible, earlyReturn:step => sequenceEarlyReturn(step) || (!options.showDetails && exits.has(step) ? " · may exit early" : "")};
+  const earlyReturn = step => sequenceEarlyReturn(step) || (!options.showDetails && exits.has(step) ? " · may exit early" : "");
+  return sequenceInteractive(view, options) ? sequenceInteractions(view, options, earlyReturn) : {visible, earlyReturn};
+}
+// The Interactions view (#636) is the default for an enriched view. A syntax-only view has
+// no columns (#558), so it keeps the calls-first display, as does Show all steps.
+function sequenceInteractive(view, options = {}) {
+  return !!options.interactions && !options.showDetails && view?.semantic?.tier === "semantic";
+}
+// The column a step runs in: its lane's, or the seed's for the seed's own steps.
+function sequenceStepColumn(view, step) {
+  const participants = view?.participants || [];
+  const owner = step?.lane != null && participants.find(p => p.id === step.lane);
+  return sequenceColumn(owner || participants.find(p => p.id === view?.seed?.id) || {id:view?.seed?.id, label:view?.seed?.name});
+}
+// The badge text of a run of folded steps (#636): counts of original DTO steps, never inferred.
+function sequenceBadgeLabel(badge) {
+  const steps = `${badge.count} internal ${badge.count === 1 ? "step" : "steps"}${badge.unresolved ? ` · ${badge.unresolved} unresolved` : ""}`;
+  return badge.expanded ? `▾ ${steps}` : `▸ +${steps}`;
+}
+// Interactions (#636) are a display projection of the same admitted DTO, as calls-first is:
+// - an arrow is a measured call whose exact target is drawn in another column than its own; it
+//   keeps source order, its callee's body (nested cross-column chains) and a return after it;
+// - every other shown step folds, with its subtree, into the run of its own column between two
+//   arrows: one badge per run, which expands in place to exactly those steps;
+// - a frame, chain or same-column call that encloses an arrow is `through`: it draws no row and
+//   its members draw in its place. An arrow inside a loop, or a branch or try other than a
+//   continuation guard, says so (" · in loop", " · conditional"); Show all steps has the frames.
+function sequenceInteractions(view, options, earlyReturn) {
+  const visible = new Set(), through = new Set(), badges = new Map(), returns = new Set(), holds = new Set(), scopes = new Map();
+  const expanded = options.expandedBadges || new Set();
+  const nested = step => [...(step.children || []), ...(step.alternate || [])];
+  const crosses = step => {
+    if (step.kind !== "call") return false;
+    const target = sequenceTarget(view, step);
+    return !!target && sequenceColumn(target).id !== sequenceStepColumn(view, step).id;
+  };
+  const scan = step => {
+    if (step.hidden) return false;
+    let any = crosses(step);
+    if (any) returns.add(step);
+    for (const child of nested(step)) any = scan(child) || any;
+    if (any) holds.add(step);
+    return any;
+  };
+  for (const step of view?.steps || []) scan(step);
+  const tally = (step, badge) => {
+    if (step.hidden) return;
+    badge.count++;
+    if (step.callId && step.callEvidence?.boundaryReason === "unresolved") badge.unresolved++;
+    if (badge.expanded) visible.add(step);
+    for (const child of nested(step)) tally(child, badge);
+  };
+  const LOOP = " · in loop", CONDITIONAL = " · conditional";
+  const continuation = step => step.kind === "branch" && step.label === "only if the preceding path continues normally";
+  let run = null;
+  const place = (steps, scope) => {
+    for (const step of steps || []) {
+      if (step.hidden) continue;
+      if (returns.has(step)) {
+        run = null; visible.add(step); if (scope) scopes.set(step, scope);
+        place(step.children, scope); place(step.alternate, scope);
+        run = null; continue;
+      }
+      if (holds.has(step)) {
+        through.add(step);
+        const inner = scope === LOOP || step.kind === "loop" ? LOOP
+          : ["branch", "try"].includes(step.kind) && !continuation(step) ? CONDITIONAL : scope;
+        place(step.children, inner); place(step.alternate, inner);
+        continue;
+      }
+      const column = sequenceStepColumn(view, step).id;
+      if (!run || run.column !== column) {
+        run = {id:step.id, column, first:step, steps:[], count:0, unresolved:0, expanded:expanded.has(step.id)};
+        badges.set(step, run);
+      }
+      run.steps.push(step); tally(step, run);
+    }
+  };
+  place(view?.steps, "");
+  for (const badge of badges.values()) badge.label = sequenceBadgeLabel(badge);
+  return {interactions:true, visible, through, badges, returns, earlyReturn:step => (scopes.get(step) || "") + earlyReturn(step)};
 }
 // What to say when the admitted view has no displayed calls (#594).
 // Counts come from the server; the reasons are the steps' own.
@@ -211,8 +291,16 @@ function sequenceEmptySummary(view, options = {}) {
   const steps = view?.steps || [];
   if (options.showDetails) return "";
   const display = sequenceDisplay(view, options);
-  if ([...display.visible].some(step => step.kind === "call" || step.callId)) return "";
-  if (steps.some(step => !step.hidden)) return "No measured calls in the admitted steps. Non-call behavior may be hidden; use Show all steps to inspect it.";
+  if (display.interactions) {
+    // Interactions (#636): no call crosses a column. Everything shown stays in the seed's.
+    if (display.returns.size) return "";
+    if (steps.some(step => !step.hidden)) {
+      const calls = sequenceDisplay(view, {...options, interactions:false});
+      if ([...calls.visible].some(step => step.kind === "call" || step.callId)) return `All calls stay within ${sequenceStepColumn(view, null).label}.`;
+      return "No measured calls in the admitted steps. Non-call behavior is folded; use Show all steps to inspect it.";
+    }
+  } else if ([...display.visible].some(step => step.kind === "call" || step.callId)) return "";
+  else if (steps.some(step => !step.hidden)) return "No measured calls in the admitted steps. Non-call behavior may be hidden; use Show all steps to inspect it.";
   if (!steps.length) return "No measured calls in the admitted steps. This does not mean no behavior; inspect source or Show all steps.";
   const hidden = [];
   const walk = items => { for (const step of items) { if (step.incidental) hidden.push(step); walk(step.children || []); walk(step.alternate || []); } };
@@ -244,7 +332,7 @@ function beginSequenceRender(container) {
 }
 function drawSequence(container, view, readSource, expandedGroups, options, selection) {
   const current = options.isCurrent, active = beginSequenceRender(container);
-  options = {...options, isCurrent:() => active() && (!current || current())};
+  options = {...options, isCurrent:() => active() && (!current || current()), expandedBadges:options.expandedBadges || new Set()};
   const groupControls = new Map(), rowControls = [], displayProjection = sequenceDisplay(view, options);
   const ns = "http://www.w3.org/2000/svg";
   const make = (tag, attrs = {}, text) => {
@@ -262,9 +350,13 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   const visibleTargets = new Set([view.seed.id]), targetProofs = new Map();
   const pending = (view.steps || []).map(step => ({step, depth:0})).reverse();
   let visibleDepth = 0;
+  const nestedPending = (step, depth) => [...(step.alternate || []).slice().reverse(), ...(step.children || []).slice().reverse()].map(step => ({step, depth}));
   while (pending.length) {
     const {step, depth} = pending.pop();
-    if (!displayProjection.visible.has(step)) continue;
+    if (!displayProjection.visible.has(step)) {
+      if (displayProjection.through?.has(step)) pending.push(...nestedPending(step, depth));
+      continue;
+    }
     visibleDepth = Math.max(visibleDepth, depth);
     if (step.kind === "group" && !expandedGroups.has(step.id)) {
       const entry = entryCall(step);
@@ -274,7 +366,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     }
     const target = sequenceTarget(view, step);
     if (target) { visibleTargets.add(target.id); targetProofs.set(target.id, step); }
-    pending.push(...[...(step.alternate || []).slice().reverse(), ...(step.children || []).slice().reverse()].map(step => ({step, depth:depth+1})));
+    pending.push(...nestedPending(step, depth + 1));
   }
   // Hidden chain members and replaced candidate hints must not leave ghost lanes.
   // One column per type or module (#558). A column with one method keeps its open action.
@@ -298,6 +390,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   // steps carry no lane.
   const laneX = step => (step?.lane != null && columnX(step.lane)) || origin;
   const lines = make("g", {class:"sequence-lifelines"}); svg.append(lines);
+  // Interactions (#636): an activation spans a cross-column call's arrow to its return.
+  const activations = make("g", {class:"sequence-activations"}); svg.append(activations);
+  const arrowTops = new Map();
   const kindLabels = {externalCandidate:"External type · candidate", unresolvedReceiver:"Receiver · type unresolved", unresolvedCallee:"Callee · unresolved", boundary:"Unknown target", builtin:"Built-in name", import:"Imported binding", receiver:"Receiver hint", internal:"Indexed target", method:"Selected method"};
   const compactKinds = {externalCandidate:"candidate", unresolvedReceiver:"unresolved", unresolvedCallee:"unresolved", boundary:"unknown", builtin:"source hint", import:"source hint", receiver:"source hint", internal:"indexed", method:"selected"};
   const shorten = (text, limit) => text.length > limit ? `${text.slice(0, limit-1)}…` : text;
@@ -342,7 +437,8 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   };
   const quietGuard = step => !options.showDetails && step.kind === "branch" &&
     step.label === "only if the preceding path continues normally" && !step.alternate?.length;
-  if (!options.showDetails) svg.append(make("text", {x:24, y:73, class:"sequence-meta"}, "Compact labels · select for details"));
+  if (!options.showDetails) svg.append(make("text", {x:24, y:73, class:"sequence-meta"}, displayProjection.interactions
+    ? "Interactions between columns · badges fold the rest · select for details" : "Compact labels · select for details"));
   let y = options.showDetails ? 78 : 98;
   let rows = 0; // Each row's number, as Pele counts them.
   function sourceControl(group, step, x, top, display = step, evidence = step, operator = null) {
@@ -414,6 +510,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     }
     if (arrow) {
       const end = columnX(target.id), arrowY = top + extra + 10, from = laneX(evidence);
+      arrowTops.set(step, arrowY);
       const d = end === from ? `M ${from} ${arrowY} h 48 v 18 h -48` : `M ${from} ${arrowY} H ${end}`;
       group.append(make("path", {d, class:"sequence-arrow", fill:"none", "data-trellis-call-id":evidence.callId, "data-trellis-target-id":target.id}));
       const direction = end === from ? -1 : end > from ? 1 : -1, headY = arrowY + (end === from ? 18 : 0);
@@ -422,9 +519,44 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     group.append(control);
     return extra + (target && columnX(target.id) === laneX(evidence) ? 20 : 0);
   }
+  // A badge sits on its run's column and expands in place to the run's own steps (#636).
+  function drawBadge(parent, badge) {
+    const x = positions.get(badge.column) ?? origin, width = Math.max(120, badge.label.length * 7.6 + 24);
+    const control = make("g", {class:"sequence-badge", role:"button", tabindex:0, "data-trellis-badge-id":badge.id, "aria-expanded":String(badge.expanded),
+      "aria-label":`${badge.expanded ? "Fold" : "Show"} ${badge.count} internal ${badge.count === 1 ? "step" : "steps"}${badge.unresolved ? `, ${badge.unresolved} unresolved` : ""}`});
+    control.append(make("rect", {x:x-width/2, y:y-15, width, height:22, rx:11, class:"sequence-badge-pill"}));
+    control.append(make("text", {x, y:y+1, "text-anchor":"middle", class:"sequence-badge-label"}, badge.label));
+    const toggle = () => {
+      if (!options.isCurrent()) return;
+      const top = container.scrollTop, left = container.scrollLeft, set = options.expandedBadges;
+      if (set.has(badge.id)) set.delete(badge.id); else set.add(badge.id);
+      drawSequence(container, view, readSource, expandedGroups, {...options, isCurrent:current}, selection);
+      [...container.querySelectorAll("[data-trellis-badge-id]")].find(node => node.getAttribute("data-trellis-badge-id") === badge.id)?.focus?.({preventScroll:true});
+      container.scrollTop = top; container.scrollLeft = left;
+    };
+    control.addEventListener("click", toggle);
+    control.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(); } });
+    parent.append(control); y += 30;
+  }
+  // The return of a cross-column call, after its expanded body: presentation, not an observed return.
+  function drawReturn(group, step) {
+    const target = sequenceTarget(view, step), from = target && columnX(target.id), to = laneX(step), top = arrowTops.get(step);
+    if (from == null || top == null) return;
+    const returnY = y - 6;
+    activations.append(make("rect", {x:from-5, y:top, width:10, height:Math.max(8, returnY-top), rx:2, class:"sequence-activation", "data-trellis-target-id":target.id}));
+    group.append(make("path", {d:`M ${from} ${returnY} H ${to}`, class:"sequence-arrow sequence-return", fill:"none", "data-trellis-return-step-id":step.id}));
+    const direction = to > from ? 1 : -1;
+    group.append(make("path", {d:`M ${to-direction*7} ${returnY-4} L ${to} ${returnY} L ${to-direction*7} ${returnY+4}`, class:"sequence-arrow sequence-return", fill:"none"}));
+    y += 18;
+  }
   function draw(steps, parent, depth) {
     for (const step of steps || []) {
-      if (!displayProjection.visible.has(step)) continue;
+      const badge = displayProjection.badges?.get(step);
+      if (badge) drawBadge(parent, badge);
+      if (!displayProjection.visible.has(step)) {
+        if (displayProjection.through?.has(step)) { draw(step.children, parent, depth); draw(step.alternate, parent, depth); }
+        continue;
+      }
       const group = make("g", {"data-kind":step.kind, "data-step-id":step.id}); parent.append(group);
       if (step.kind === "group") {
         const start = y, x = 18 + depth * 10, expanded = expandedGroups.has(step.id);
@@ -455,7 +587,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
         box.setAttribute("height", y-start+8); y += 8;
         continue;
       }
-      const fragment = ["branch", "loop", "try"].includes(step.kind) || step.children?.length || step.alternate?.length;
+      // A cross-column call's body is its activation (#636), not a frame.
+      const returns = displayProjection.returns?.has(step);
+      const fragment = !returns && (["branch", "loop", "try"].includes(step.kind) || step.children?.length || step.alternate?.length);
       if (quietGuard(step)) {
         // One rail per original generated guard. The rail encloses only that
         // guard's children and ends before its next sibling. No flattening.
@@ -488,6 +622,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
         const extra = sourceControl(group, step, labelX, y); y += extra;
         if (box) box.setAttribute("height", 24+extra);
         y += 28;
+        if (returns) { draw(step.children, group, depth+1); draw(step.alternate, group, depth+1); drawReturn(group, step); }
       }
     }
   }
@@ -499,4 +634,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty, interactive:sequenceInteractive, stepColumn:sequenceStepColumn};

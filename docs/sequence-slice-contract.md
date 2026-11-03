@@ -283,9 +283,49 @@ and #542's "any other guard is unchanged".
   excess hints share the unknown-operations lane and stay measured calls, so a view with
   many hints is neither truncated nor loses its arrows once enrichment resolves them.
 
+### Interactions view (#636)
+
+Owner issue #636 (2026-11-02). It amends the #594 calls-first default above for the
+Sequence view of an enriched view only. It is presentation: no DTO field, evidence, bound or
+contract meaning changes, and the server response is the same.
+
+- **When.** The Sequence panel opens an enriched view (`semantic.tier=semantic`) in
+  Interactions. A syntax-only view has no columns, so it keeps calls-first; so does the Files
+  preview. Options → Show all steps, and its shortcut, draw exactly what they drew before.
+- **Arrows.** An arrow is a measured call with a verified exact target whose column differs
+  from the column the call runs in (its `lane`'s column, or the seed's). Arrows keep source
+  order and their row numbers and labels (#558). A cross-column call's expanded body is drawn
+  under it, so a nested chain (`Inbox → FrameWindow`) leaves its callee's column.
+- **Returns and activations.** After a cross-column call's body, a dashed, unlabeled return
+  goes back to the caller's column, and an activation bar spans the callee column from the
+  call to the return. They mark only that the following steps are the caller's again, as the
+  DTO's order already says: not an observed return, value, timing or runtime activation.
+- **Folding.** Every other shown step folds with its whole subtree: branches, loops, effects,
+  boundaries, same-column calls, unresolved and other untargeted calls. Consecutive folded
+  steps of one column between two arrows form one run, drawn as one badge on that column:
+  "▸ +N internal steps", with " · M unresolved" for the calls among them whose
+  `boundaryReason` is `unresolved`. N counts the run's shown DTO steps, nested ones included;
+  hidden incidental steps are not counted, as they are not shown. A badge is a disclosure: it
+  expands in place to exactly those steps (compact labels, as calls-first draws them) and
+  folds again. Each revealed step selects the original DTO step, as before.
+- **Enclosing frames.** A branch, loop, try, chain or same-column call that encloses an arrow
+  draws no row or frame in Interactions; its steps draw in its place, and it is in no badge.
+  An arrow inside a loop is marked " · in loop", and one inside another branch or try
+  (other than an "only if the preceding path continues normally" guard) " · conditional".
+  Show all steps keeps every frame.
+- **Inspector.** Selecting an arrow, or a step revealed by a badge, shows the same step and
+  evidence as the step view.
+- **Empty.** An enriched view with shown calls and no arrow draws no diagram and says
+  "All calls stay within <seed column>." with "Show all steps". The #558 empty states (every
+  step hidden; no admitted measured call) keep their words, the latter noting that non-call
+  behavior is folded.
+- **Renderers.** Both renderers draw the same arrows, returns, activations and badges. Pele
+  validates the returns, activation count and badge notes it draws, as it validates rows.
+
 The browser draws an expanded step's arrows and notes from its `lane`, shows the tier and
-reason in the sequence status line, and offers a "Show all steps" / "Show calls" shortcut
-(the same `showAll` setting as Options → Show all steps, not a separate incidental toggle).
+reason in the sequence status line, and offers a "Show all steps" / "Show interactions"
+(or "Show calls" for a syntax-only view) shortcut (the same `showAll` setting as Options →
+Show all steps, not a separate incidental toggle).
 
 Typed integrity, busy and pin failures abort the entire response, never returning a
 partially enriched view. Lanes/arrows prove static declaration targets only: no runtime

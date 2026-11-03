@@ -525,6 +525,18 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
 #sequence-columns { position: relative; flex: none; height: 0; z-index: 2; pointer-events: none; }
 #sequence-columns span { position: absolute; top: 4px; transform: translateX(-50%); padding: 2px 8px; white-space: nowrap; font-size: 13px; color: var(--ink); background: var(--node); border: 1px solid var(--line-strong); border-radius: 4px; }
 .sequence-empty { margin: 12px 10px; color: var(--secondary); font-size: 14px; }
+/* Interactions (#636): dashed returns, activation bars and the badges that fold a column's
+   internal steps. A badge is a disclosure: it expands in place. */
+.sequence-return { stroke-dasharray: 4 4; }
+.sequence-activation { fill: var(--node); stroke: var(--line-strong); }
+.sequence-badge { cursor: pointer; }
+.sequence-badge-pill { fill: var(--card); stroke: var(--line-strong); }
+.sequence-scroll .sequence-badge-label { font-size: 12px; fill: var(--secondary); }
+.sequence-badge:hover .sequence-badge-pill { stroke: var(--link); }
+.sequence-badge:hover .sequence-badge-label { fill: var(--link); }
+.sequence-badge:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.sequence-scroll .trellis-pele .pele-note[data-trellis-badge-id] text { fill: var(--secondary); }
+.sequence-scroll .trellis-pele .pele-note[data-trellis-badge-id]:hover text { fill: var(--link); }
 
 /* Selection owns its nested labels too, including package metadata and badges. */
 button:is(.selected, [aria-pressed="true"]),
