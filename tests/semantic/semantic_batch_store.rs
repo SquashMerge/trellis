@@ -10458,6 +10458,95 @@ fn bounded_retained_cancellation_after_streaming_rolls_back_publication_and_cach
 }
 
 #[test]
+fn empty_last_selector_release_drains_orphan_capture_witnesses_and_raw_batch() {
+    let world = definitions_world();
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let captured = world.store.index_baseline().unwrap();
+    let (a, b) = definitions_docs();
+    let mut first = world.fixture().reference("scip-typescript");
+    first.artifact("javascript", vec![a.clone(), b.clone()]);
+    let first = world.write(&first);
+    let mut replacement = world.fixture().reference("scip-typescript");
+    replacement.artifact(
+        "javascript",
+        vec![a.occurrence(&[0, 0, 1], &[], "pkg extra.", 0), b],
+    );
+    let replacement = world.write(&replacement);
+
+    write_files(
+        &world.root,
+        &[("src/B.js", "function target(){ return 2; }\n")],
+    );
+    world.republish();
+    let imported = world.publish(&first).unwrap().0;
+    fs::remove_file(world.root.join("src/A.js")).unwrap();
+    fs::remove_file(world.root.join("src/B.js")).unwrap();
+    world.republish_with_rejoin();
+    let empty = world.store.index_baseline().unwrap();
+    let selected = world.store.selected_raw_inputs_at(empty).unwrap();
+    let retired_batch = selected[0].batch_id;
+    assert_eq!(selected[0].captured_pin, captured);
+    assert!(world.store.semantic_at(empty).unwrap().coverage.is_empty());
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_batch_witnesses"),
+        1
+    );
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_batch_witness_documents"),
+        2
+    );
+
+    let head = world.publish(&replacement).unwrap().0;
+    let replacement_selection = world.store.selected_raw_inputs_at(head).unwrap();
+    assert_ne!(replacement_selection[0].batch_id, retired_batch);
+    let retained_head = world.store.semantic_at(head).unwrap();
+    let retained_capture = world.store.retained_native_snapshot_at(captured).unwrap();
+    world.store.set_retention_clock_for_tests(2_001, 1_001);
+    run_maintenance(&world);
+    assert_eq!(revision_state(&world, imported), "released");
+    assert_eq!(revision_state(&world, empty), "released");
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM native_revision_release_debt"),
+        0
+    );
+    assert_eq!(
+        world.count(&format!(
+            "SELECT COUNT(*) FROM semantic_revision_raw_selections WHERE batch_id={retired_batch}"
+        )),
+        0
+    );
+    for table in [
+        "semantic_batch_witnesses",
+        "semantic_batch_witness_documents",
+        "semantic_raw_captures",
+        "semantic_raw_batches",
+    ] {
+        assert_eq!(
+            world.count(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE batch_id={retired_batch}"
+            )),
+            0,
+            "orphan rows remain in {table} after the last selector is released"
+        );
+    }
+    assert_eq!(world.store.semantic_at(head).unwrap(), retained_head);
+    let selected = world.store.selected_raw_inputs_at(head).unwrap();
+    assert_eq!(selected[0].batch_id, replacement_selection[0].batch_id);
+    assert_eq!(
+        selected[0].captured_pin,
+        replacement_selection[0].captured_pin
+    );
+    let capture = world.store.retained_native_snapshot_at(captured).unwrap();
+    assert_eq!(json!(capture.0), json!(retained_capture.0));
+    assert_eq!(capture.1, retained_capture.1);
+    run_maintenance(&world);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM native_revision_release_debt"),
+        0
+    );
+}
+
+#[test]
 fn bounded_full_rejoin_accepts_empty_destination_and_preserves_selected_capture() {
     let world = definitions_world();
     let (a, b) = definitions_docs();

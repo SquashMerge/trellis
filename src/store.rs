@@ -20115,7 +20115,7 @@ impl Store {
             [selected],
             |row| row.get(0),
         )?;
-        if !has_manifest && !has_candidates && !has_semantic {
+        if !semantic_progress && !has_manifest && !has_candidates && !has_semantic {
             tx.execute(
                 "DELETE FROM revision_capture_inputs WHERE revision_id=?1",
                 [selected],
