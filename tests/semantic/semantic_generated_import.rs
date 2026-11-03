@@ -40,6 +40,9 @@ use support::{Checkout, cache_dir, data_dir, start_checkout, state_dir};
 use crate::semantic_batch_support;
 use semantic_batch_support::{BatchFixture, edit_descriptor, edit_scip, uniform_workspace};
 
+#[path = "retained_worker_properties.rs"]
+mod retained_worker_properties;
+
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 const RUN_ID: &str = "0123456789abcdef0123456789abcdef";
 const OTHER_ID: &str = "fedcba9876543210fedcba9876543210";
@@ -99,6 +102,43 @@ fn inproc() -> Inproc {
 }
 
 impl Inproc {
+    fn rebuild(self) -> Self {
+        let Inproc {
+            _state,
+            _workspace,
+            root,
+            store,
+            cancel,
+        } = self;
+        let (roots, identity) = store.state_topology();
+        let index = roots.index_db(identity);
+        drop(store);
+        let db = rusqlite::Connection::open(index).unwrap();
+        let version: u32 = db
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 36);
+        db.pragma_update(None, "user_version", version - 1).unwrap();
+        drop(db);
+        let store = Store::open_for_tests(_state.path(), &root).unwrap();
+        assert!(store.recovery_pending_for_tests());
+        let world = Self {
+            _state,
+            _workspace,
+            root,
+            store,
+            cancel,
+        };
+        trellis::index_coordinator::reconcile_workspace(
+            &world.store,
+            &IndexOptions::new(world.root.clone()),
+            &world.cancel,
+            |_| {},
+        )
+        .unwrap();
+        world
+    }
+
     fn publish_native(&self) {
         let (graph, native, capture) = index_workspace_bundle(
             &IndexOptions::new(self.root.clone()),
@@ -164,6 +204,27 @@ impl Inproc {
         id: &str,
         artifact: impl FnOnce(&str) -> Vec<u8>,
     ) -> anyhow::Result<(PathBuf, PathBuf, String)> {
+        self.write_run_for(id, Target::Stub, "javascript", artifact)
+    }
+
+    fn write_run_for(
+        &self,
+        id: &str,
+        target: Target,
+        language: &str,
+        artifact: impl FnOnce(&str) -> Vec<u8>,
+    ) -> anyhow::Result<(PathBuf, PathBuf, String)> {
+        self.write_run_with_trust(id, target, language, TrustProfile::Restricted, artifact)
+    }
+
+    fn write_run_with_trust(
+        &self,
+        id: &str,
+        target: Target,
+        language: &str,
+        trust: TrustProfile,
+        artifact: impl FnOnce(&str) -> Vec<u8>,
+    ) -> anyhow::Result<(PathBuf, PathBuf, String)> {
         let state = self.state();
         let dir = fs::canonicalize(state.create_run_dir(id).unwrap()).unwrap();
         let worktree = StageInput::generated(&self.root, GenerationOrigin::TrellisRun, id, &dir)?
@@ -171,7 +232,7 @@ impl Inproc {
             .clone();
         fs::create_dir(dir.join("out")).unwrap();
         fs::write(dir.join(batch::ARTIFACT_PATH), artifact(&worktree)).unwrap();
-        let pin = Target::Stub.pin().unwrap();
+        let pin = target.pin().unwrap();
         let resolution = Resolution {
             launcher: "/stub".into(),
             verification: Verification {
@@ -184,17 +245,14 @@ impl Inproc {
             rustup: None,
             python3: None,
         };
-        let table = profiles::run_generation(
-            &profiles::row(Target::Stub, TrustProfile::Restricted)?,
-            &resolution,
-        );
+        let table = profiles::run_generation(&profiles::row(target, trust)?, &resolution);
         let head = self.store.index_baseline()?;
         let written = self.store.with_native_reader(head, |reader| {
             batch::write_batch(
                 reader,
                 &BatchSpec {
                     pin: &pin,
-                    language: "javascript",
+                    language,
                     workspace: &self.root,
                     dir: &dir,
                     generation: batch::run_generation(&table, GenerationOrigin::TrellisRun, id),
@@ -315,6 +373,496 @@ fn generated_batch_imports_from_private_run_dir() {
         before,
         "nothing was written into the workspace"
     );
+}
+
+/// An in-process retention investigation: no subprocess or listener is created.
+/// Each artifact changes which declarations its calls name, so a stale selection is visible.
+#[test]
+fn generated_retention_catalog_histories_in_process() {
+    use semantic_batch_support::DocSpec;
+    use std::collections::BTreeSet;
+
+    let cases: usize = std::env::var("TRELLIS_RETAINED_CASES")
+        .ok()
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(4);
+    let seed = 20261102_u64;
+    let mut rng = seed;
+    let mut steps = 0;
+    let mut rejected = 0;
+    for case in 0..cases {
+        let state = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir(root.join("javascript")).unwrap();
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let n = 2 + (rng as usize % 3);
+        for i in 0..n {
+            fs::write(
+                root.join(format!("javascript/u{i:05}.js")),
+                format!("function u{i:05}() {{ u{:05}(); }}\n", (i + 1) % n),
+            )
+            .unwrap();
+        }
+        let store = Store::open_for_tests(state.path(), &root).unwrap();
+        store.mcp_prepare_virgin_queue_for_tests().unwrap();
+        let mut world = Inproc {
+            _state: state,
+            _workspace: temp,
+            root,
+            store,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        world.publish_native();
+        let catalog = world.state().path().join("retention.sqlite");
+        for version in 0..3 {
+            let id = format!("{:032x}", version + 1);
+            let (dir, descriptor, sha) = world
+                .write_run(&id, |worktree| {
+                    let mut fixture =
+                        BatchFixture::from_published(&world.index_db(), &world.root).synthetic();
+                    let docs = (0..n)
+                        .map(|i| {
+                            let name = format!("pkg u{i:05}.");
+                            let target = format!("pkg u{:05}.", (i + 1 + version) % n);
+                            DocSpec::new(&format!("javascript/u{i:05}.js"))
+                                .occurrence(&[0, 9, 15], &[], &name, 1)
+                                .occurrence(&[0, 20, 26], &[0, 20, 28], &target, 0)
+                                .symbol(&name, 17, &[])
+                        })
+                        .collect::<Vec<_>>();
+                    fixture.artifact("javascript", docs.clone());
+                    edit_scip(&fixture.scip_bytes("javascript", &docs), |index| {
+                        index.metadata.as_mut().unwrap().project_root = worktree.into();
+                    })
+                })
+                .unwrap();
+            let pin = world.publish_run(&id, &dir, &descriptor, &sha);
+            let semantic = world.store.semantic_at(pin).unwrap();
+            let covered: BTreeSet<_> = semantic
+                .coverage
+                .iter()
+                .filter(|c| c.selected && c.producer_id == "trellis-synthetic-scip")
+                .map(|c| c.document_path.clone())
+                .collect();
+            let expected: BTreeSet<_> = (0..n).map(|i| format!("javascript/u{i:05}.js")).collect();
+            assert_eq!(
+                covered, expected,
+                "seed={seed} case={case} version={version}"
+            );
+            assert_eq!(
+                semantic.declaration_bindings.len(),
+                n,
+                "seed={seed} case={case} version={version}"
+            );
+            assert_eq!(
+                semantic.call_bindings.len(),
+                n,
+                "seed={seed} case={case} version={version}"
+            );
+            for binding in &semantic.call_bindings {
+                use trellis::semantic_evidence::{JoinStatus, Resolution, Target};
+                let path = &binding.join.anchor.document.path;
+                let i: usize = path
+                    .strip_prefix("javascript/u")
+                    .unwrap()
+                    .strip_suffix(".js")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(binding.join.status, JoinStatus::Exact);
+                assert_eq!(binding.resolution, Resolution::Resolved);
+                assert!(binding.call_id.is_some());
+                match &binding.declared_target {
+                    Some(Target::Internal { document, .. }) => assert_eq!(
+                        document.path,
+                        format!("javascript/u{:05}.js", (i + 1 + version) % n)
+                    ),
+                    target => panic!(
+                        "seed={seed} case={case} version={version} path={path} target={target:?}"
+                    ),
+                }
+            }
+            let read_slot = || {
+                let db = rusqlite::Connection::open_with_flags(
+                    &catalog,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let mut q = db
+                    .prepare("SELECT producer,options FROM retained_runs ORDER BY producer")
+                    .unwrap();
+                q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            let slot = read_slot();
+            assert_eq!(slot.len(), 1);
+            assert_eq!(slot[0].0, "trellis-synthetic-scip");
+            let options: Value = serde_json::from_str(&slot[0].1).unwrap();
+            assert_eq!(options["generationId"], id);
+            assert_eq!(options["descriptor"], descriptor.to_str().unwrap());
+            let input = StageInput::generated(&world.root, GenerationOrigin::TrellisRun, &id, &dir)
+                .unwrap();
+            let bad_sha = "0".repeat(64);
+            assert!(world.stage(&input, &descriptor, &bad_sha).is_err());
+            assert_eq!(
+                read_slot(),
+                slot,
+                "failed staging must not replace the slot"
+            );
+            assert_eq!(world.store.index_baseline().unwrap(), pin);
+            assert_eq!(world.store.semantic_at(pin).unwrap(), semantic);
+            steps += 1;
+            rejected += 1;
+        }
+        let catalog_db = rusqlite::Connection::open_with_flags(
+            &catalog,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let slot: String = catalog_db
+            .query_row(
+                "SELECT options FROM retained_runs WHERE producer='trellis-synthetic-scip'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(catalog_db);
+        let options: Value = serde_json::from_str(&slot).unwrap();
+        let id = options["generationId"].as_str().unwrap().to_owned();
+        let descriptor = PathBuf::from(options["descriptor"].as_str().unwrap());
+        let sha = options["descriptorSha256"].as_str().unwrap().to_owned();
+        let dir = descriptor.parent().unwrap().parent().unwrap().to_owned();
+        let original_generation = world.store.index_baseline().unwrap().index_generation;
+        let original_descriptor = fs::read(&descriptor).unwrap();
+        fs::remove_file(&descriptor).unwrap();
+        world = world.rebuild();
+        let rebuilt = world.store.index_baseline().unwrap();
+        assert_ne!(rebuilt.index_generation, original_generation);
+        let status = serde_json::to_value(world.store.status().unwrap()).unwrap();
+        let js = status["semanticLanguages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["language"] == "javascript")
+            .unwrap();
+        assert_eq!(js["reimport"]["state"], "needsReimport");
+        assert_eq!(js["semanticProducerId"], Value::Null);
+        assert!(
+            js["reimport"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("missing")
+        );
+        let empty = world.store.semantic_at(rebuilt).unwrap();
+        assert!(empty.producers.is_empty());
+        assert!(empty.provenance.is_empty());
+        assert!(empty.call_bindings.is_empty());
+        fs::write(&descriptor, &original_descriptor).unwrap();
+        let source = world.root.join("javascript/u00000.js");
+        let original_source = fs::read(&source).unwrap();
+        fs::write(&source, b"function changed() { other(); }\n").unwrap();
+        world = world.rebuild();
+        let changed_pin = world.store.index_baseline().unwrap();
+        let status = serde_json::to_value(world.store.status().unwrap()).unwrap();
+        let js = status["semanticLanguages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["language"] == "javascript")
+            .unwrap();
+        assert_eq!(js["reimport"]["state"], "needsReimport");
+        assert!(
+            js["reimport"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no longer matches")
+        );
+        assert_eq!(js["semanticProducerId"], Value::Null);
+        let input =
+            StageInput::generated(&world.root, GenerationOrigin::TrellisRun, &id, &dir).unwrap();
+        let error = world
+            .stage(&input, &descriptor, &sha)
+            .err()
+            .expect("changed source accepted");
+        if case == 0 {
+            eprintln!("damage=changed_source: {error:#}");
+        }
+        assert_eq!(
+            format!("{error:#}"),
+            "capture_unavailable: captured revision not retained"
+        );
+        assert!(
+            world
+                .store
+                .semantic_at(changed_pin)
+                .unwrap()
+                .call_bindings
+                .is_empty()
+        );
+        fs::write(source, original_source).unwrap();
+        world = world.rebuild();
+        let rebuilt = world.store.index_baseline().unwrap();
+        let empty = world.store.semantic_at(rebuilt).unwrap();
+        let input =
+            StageInput::generated(&world.root, GenerationOrigin::TrellisRun, &id, &dir).unwrap();
+        for damage in ["truncated", "corrupt", "wrong_source", "wrong_producer"] {
+            let (bytes, digest) = match damage {
+                "truncated" => (
+                    original_descriptor[..original_descriptor.len() / 2].to_vec(),
+                    sha.clone(),
+                ),
+                "corrupt" => (b"not json".to_vec(), sha.clone()),
+                _ => {
+                    let mut edited: Value = serde_json::from_slice(&original_descriptor).unwrap();
+                    if damage == "wrong_source" {
+                        edited["sourceRevision"] =
+                            json!("revision:v2:".to_owned() + &"0".repeat(64));
+                    } else {
+                        edited["producer"]["name"] = json!("wrong-producer");
+                    }
+                    let bytes = serde_json::to_vec(&edited).unwrap();
+                    let digest = semantic_batch_support::sha256(&bytes);
+                    (bytes, digest)
+                }
+            };
+            fs::write(&descriptor, bytes).unwrap();
+            let error = world
+                .stage(&input, &descriptor, &digest)
+                .err()
+                .expect("damaged retained batch accepted");
+            if case == 0 {
+                eprintln!("damage={damage}: {error:#}");
+            }
+            let expected = match damage {
+                "truncated" | "corrupt" => "InvalidAdmission(\"descriptor digest\")",
+                "wrong_source" => "capture_unavailable: captured revision not retained",
+                _ => "InvalidAdmission(\"producer profile pin\")",
+            };
+            assert_eq!(format!("{error:#}"), expected);
+            assert_eq!(world.store.index_baseline().unwrap(), rebuilt);
+            assert_eq!(world.store.semantic_at(rebuilt).unwrap(), empty);
+            let status = serde_json::to_value(world.store.status().unwrap()).unwrap();
+            let js = status["semanticLanguages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["language"] == "javascript")
+                .unwrap();
+            assert_eq!(js["reimport"]["state"], "needsReimport");
+            assert_eq!(js["semanticProducerId"], Value::Null);
+        }
+        fs::write(&descriptor, &original_descriptor).unwrap();
+        let artifact = dir.join(batch::ARTIFACT_PATH);
+        let original_artifact = fs::read(&artifact).unwrap();
+        fs::write(&artifact, &original_artifact[..original_artifact.len() / 2]).unwrap();
+        let error = world
+            .stage(&input, &descriptor, &sha)
+            .err()
+            .expect("truncated artifact accepted");
+        if case == 0 {
+            eprintln!("damage=truncated_artifact: {error:#}");
+        }
+        assert_eq!(
+            format!("{error:#}"),
+            "InvalidAdmission(\"artifact length\")"
+        );
+        assert_eq!(world.store.semantic_at(rebuilt).unwrap(), empty);
+        let mut damaged_artifact = original_artifact.clone();
+        damaged_artifact[0] ^= 1;
+        fs::write(&artifact, damaged_artifact).unwrap();
+        let error = world
+            .stage(&input, &descriptor, &sha)
+            .err()
+            .expect("corrupt artifact accepted");
+        if case == 0 {
+            eprintln!("damage=corrupt_artifact: {error:#}");
+        }
+        assert_eq!(
+            format!("{error:#}"),
+            "InvalidAdmission(\"artifact digest\")"
+        );
+        assert_eq!(world.store.semantic_at(rebuilt).unwrap(), empty);
+        fs::write(&artifact, original_artifact).unwrap();
+        let parsed: Value = serde_json::from_slice(&original_descriptor).unwrap();
+        let source_entry = parsed["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|page| page["kind"] == "source")
+            .unwrap();
+        let source_page = dir.join(
+            parsed["pages"][source_entry]["relativePath"]
+                .as_str()
+                .unwrap(),
+        );
+        let source_page_bytes = fs::read(&source_page).unwrap();
+        let (_, digest) =
+            semantic_batch_support::edit_page(&descriptor, source_entry, &dir, |page| {
+                page["rows"][0]["contentHash"] = json!("0".repeat(64));
+            });
+        let error = world
+            .stage(&input, &descriptor, &digest)
+            .err()
+            .expect("wrong source hash accepted");
+        if case == 0 {
+            eprintln!("damage=wrong_source_hash: {error:#}");
+        }
+        assert_eq!(
+            format!("{error:#}"),
+            "InvalidAdmission(\"captured source mismatch\")"
+        );
+        assert_eq!(world.store.semantic_at(rebuilt).unwrap(), empty);
+        fs::write(source_page, source_page_bytes).unwrap();
+        fs::write(&descriptor, &original_descriptor).unwrap();
+        let entry = parsed["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|page| page["kind"] == "coverage")
+            .unwrap();
+        let page = dir.join(parsed["pages"][entry]["relativePath"].as_str().unwrap());
+        let original_page = fs::read(&page).unwrap();
+        semantic_batch_support::edit_page(&descriptor, entry, &dir, |page| {
+            page["rows"].as_array_mut().unwrap().pop().unwrap();
+        });
+        let (_, new_sha) = edit_descriptor(&descriptor, |descriptor| {
+            let rows = descriptor["pages"][entry]["rowCount"].as_u64().unwrap();
+            descriptor["pages"][entry]["rowCount"] = json!(rows - 1);
+            let covered = descriptor["totals"]["coveredDocuments"].as_u64().unwrap();
+            descriptor["totals"]["coveredDocuments"] = json!(covered - 1);
+        });
+        let error = world
+            .stage(&input, &descriptor, &new_sha)
+            .err()
+            .expect("incomplete assignment accepted");
+        if case == 0 {
+            eprintln!("damage=unassigned_document: {error:#}");
+        }
+        assert_eq!(
+            format!("{error:#}"),
+            "InvalidAdmission(\"coverage completion\")"
+        );
+        assert_eq!(world.store.index_baseline().unwrap(), rebuilt);
+        assert_eq!(world.store.semantic_at(rebuilt).unwrap(), empty);
+        fs::write(page, original_page).unwrap();
+        fs::write(&descriptor, &original_descriptor).unwrap();
+        let recovered_pin = world.publish_run(&id, &dir, &descriptor, &sha);
+        let recovered = world.store.semantic_at(recovered_pin).unwrap();
+        assert_eq!(recovered.declaration_bindings.len(), n);
+        assert_eq!(recovered.call_bindings.len(), n);
+        world = world.rebuild();
+        let fresh_pin = world.publish_run(&id, &dir, &descriptor, &sha);
+        let fresh = world.store.semantic_at(fresh_pin).unwrap();
+        assert_eq!(
+            recovered, fresh,
+            "seed={seed} case={case}; full semantic snapshots after two rebuilds"
+        );
+    }
+    eprintln!(
+        "retention seed={seed} cases={cases} successful_publications={steps} rejected_stages={rejected}"
+    );
+}
+
+#[test]
+fn retention_slots_are_independent_for_two_published_producers() {
+    use semantic_batch_support::DocSpec;
+    use trellis::producer::ProducerName;
+    let world = inproc();
+    let (dir1, desc1, sha1) = world
+        .write_run("11111111111111111111111111111111", |root| {
+            world.artifact(root)
+        })
+        .unwrap();
+    world.publish_run("11111111111111111111111111111111", &dir1, &desc1, &sha1);
+    let java_id = "22222222222222222222222222222222";
+    let (java_dir, java_desc, java_sha) = world
+        .write_run_for(
+            java_id,
+            Target::Real(ProducerName::ScipJava),
+            "java",
+            |root| {
+                let mut fixture = BatchFixture::from_published(&world.index_db(), &world.root)
+                    .reference("scip-java");
+                let docs = (0..2)
+                    .map(|i| {
+                        DocSpec::new(&format!("java/u{i:05}.java"))
+                            .occurrence(&[0, 6, 12], &[], &format!("pkg U{i:05}#"), 1)
+                            .symbol(&format!("pkg U{i:05}#"), 7, &[])
+                    })
+                    .collect::<Vec<_>>();
+                fixture.artifact("java", docs.clone());
+                edit_scip(&fixture.scip_bytes("java", &docs), |index| {
+                    index.metadata.as_mut().unwrap().project_root = root.into()
+                })
+            },
+        )
+        .unwrap();
+    world.publish_run(java_id, &java_dir, &java_desc, &java_sha);
+    let (dir2, desc2, sha2) = world
+        .write_run("33333333333333333333333333333333", |root| {
+            world.artifact(root)
+        })
+        .unwrap();
+    let pin = world.publish_run("33333333333333333333333333333333", &dir2, &desc2, &sha2);
+    let catalog = world.state().path().join("retention.sqlite");
+    let read_slots = || {
+        let db = rusqlite::Connection::open_with_flags(
+            &catalog,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut q = db
+            .prepare("SELECT producer,options FROM retained_runs ORDER BY producer")
+            .unwrap();
+        q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let slots = read_slots();
+    assert_eq!(slots.len(), 2);
+    assert_eq!(slots[0].0, "scip-java");
+    assert_eq!(slots[1].0, "trellis-synthetic-scip");
+    assert_eq!(
+        serde_json::from_str::<Value>(&slots[0].1).unwrap()["generationId"],
+        java_id
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&slots[1].1).unwrap()["generationId"],
+        "33333333333333333333333333333333"
+    );
+    let semantic = world.store.semantic_at(pin).unwrap();
+    assert!(semantic.producers.iter().any(|p| p.id == "scip-java"));
+    assert!(
+        semantic
+            .producers
+            .iter()
+            .any(|p| p.id == "trellis-synthetic-scip")
+    );
+    assert_eq!(
+        semantic
+            .declaration_bindings
+            .iter()
+            .filter(|b| b.join.anchor.document.language == "java" && b.syntax_id.is_some())
+            .count(),
+        2
+    );
+    let input = StageInput::generated(
+        &world.root,
+        GenerationOrigin::TrellisRun,
+        java_id,
+        &java_dir,
+    )
+    .unwrap();
+    assert!(world.stage(&input, &java_desc, &"0".repeat(64)).is_err());
+    assert_eq!(read_slots(), slots);
+    assert_eq!(world.store.semantic_at(pin).unwrap(), semantic);
+    assert_eq!(world.store.index_baseline().unwrap(), pin);
 }
 
 #[test]
