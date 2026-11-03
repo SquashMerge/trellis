@@ -1,4 +1,6 @@
 #![cfg(feature = "test-support")]
+#[path = "witness_catchup_574.rs"]
+mod witness_catchup_574;
 use crate::semantic_batch_support;
 
 #[path = "proptest_retention.rs"]
