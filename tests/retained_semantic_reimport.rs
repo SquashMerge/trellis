@@ -196,6 +196,166 @@ impl World {
 }
 
 #[test]
+fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
+    use std::io::Write;
+
+    let world = World::new();
+    let (_, original, options) = world.run_once();
+    let old = world.status()["revision"].clone();
+    support::stop_daemon(&world.checkout.home);
+    // A previous attempt for this generation must not suppress a new capture identity.
+    let catalog = Connection::open(state_dir(&world.checkout).join("retention.sqlite")).unwrap();
+    catalog
+        .execute(
+            "UPDATE retained_runs SET attempted_generation=?1",
+            [old["indexGeneration"].as_str().unwrap()],
+        )
+        .unwrap();
+    drop(catalog);
+    let binary = world._stub.path().join("trellis-rebuilt");
+    fs::copy(env!("CARGO_BIN_EXE_trellis"), &binary).unwrap();
+    let mut image = fs::OpenOptions::new().append(true).open(&binary).unwrap();
+    image
+        .write_all(b"TRELLIS-RETAINED-CAPTURE-IDENTITY-DRIFT")
+        .unwrap();
+    image.sync_all().unwrap();
+    drop(image);
+    let rebuilt_cli = || {
+        let mut command = trellis::testing::owned(std::process::Command::new(&binary));
+        command
+            .env("HOME", &world.checkout.home)
+            .env(
+                "TRELLIS_TEST_DAEMON_PID_FILE",
+                world.checkout.home.join("daemon.pid"),
+            )
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("XDG_DATA_HOME");
+        command
+    };
+    let native_identity = || {
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.query_row(
+            "SELECT n.native_revision_id FROM native_revisions n JOIN index_metadata m
+            ON n.id='pin:v1:'||m.index_generation||':'||m.index_revision",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    let old_native = native_identity();
+    assert_ne!(
+        trellis::native_ids::digest(b"", &fs::read(&binary).unwrap()),
+        trellis::native_ids::digest(b"", &fs::read(env!("CARGO_BIN_EXE_trellis")).unwrap())
+    );
+    reply(
+        "index under changed executable",
+        rebuilt_cli()
+            .args(["index", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    assert_ne!(native_identity(), old_native);
+    trellis::testing::wait_until(
+        "new native capture identity readmits retained input",
+        || {
+            let rows = world.generated_rows();
+            rows.len() == 2 && matches!(rows[1].0.as_str(), "done" | "failed")
+        },
+    );
+    let rows = world.generated_rows();
+    assert_eq!(
+        rows[1].2, options,
+        "readmission must keep original capture identity"
+    );
+    // Use the running rebuilt binary, not the original CLI's executable pin.
+    let status = reply(
+        "rebuilt status",
+        rebuilt_cli()
+            .args(["status", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        status["revision"]["indexGeneration"],
+        old["indexGeneration"]
+    );
+    let js = status["semanticLanguages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["language"] == "javascript")
+        .unwrap();
+    if rows[1].0 == "done" {
+        assert_eq!(js["reimport"], Value::Null);
+        assert!(matches!(
+            js["semanticState"].as_str(),
+            Some("fresh" | "possiblyStale")
+        ));
+    } else {
+        assert_eq!(js["reimport"]["state"], "needsReimport");
+        assert!(
+            js["reimport"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+        );
+        assert_ne!(js["semanticState"], "fresh");
+    }
+    assert_eq!(
+        fs::read(options["descriptor"].as_str().unwrap()).unwrap(),
+        original
+    );
+    // Restarting the same binary/capture identity must not retry a refused import.
+    support::stop_daemon(&world.checkout.home);
+    reply(
+        "unchanged rebuilt restart",
+        rebuilt_cli()
+            .args(["index", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(world.generated_rows().len(), 2);
+    assert_eq!(native_identity(), {
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.query_row(
+            "SELECT native_revision_id FROM native_revisions WHERE id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                status["revision"]["indexGeneration"].as_str().unwrap(),
+                status["revision"]["indexRevision"].as_u64().unwrap()
+            )],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    });
+    support::stop_daemon(&world.checkout.home);
+    reply(
+        "return to original executable",
+        world
+            .checkout
+            .cli()
+            .args(["index", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    trellis::testing::wait_until("next distinct native identity retries once", || {
+        let rows = world.generated_rows();
+        rows.len() == 3 && matches!(rows[2].0.as_str(), "done" | "failed")
+    });
+    assert_eq!(world.generated_rows()[2].2, options);
+    assert_eq!(
+        world.status()["revision"]["indexGeneration"],
+        old["indexGeneration"]
+    );
+    assert_eq!(world.invocation_count(), 1);
+}
+
+#[test]
 fn upgrade_automatically_readmits_original_generated_run_without_rerunning_producer() {
     let world = World::new();
     let (run, original, options) = world.run_once();

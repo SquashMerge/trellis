@@ -34,6 +34,25 @@ pub(super) fn copy(db: &Connection, old: &str, new: &str, clear: Option<&str>) -
     Ok(())
 }
 
+/// Record evidence discarded by a new native identity, not ordinary unavailable languages.
+pub(super) fn discarded(db: &Connection, old: &str, new: &str) -> Result<()> {
+    db.execute(
+        "INSERT OR IGNORE INTO semantic_reimport
+         SELECT DISTINCT ?2,prior.producer_id,prior.language,
+         'native revision identity changed; prior semantic evidence cannot be carried over; import a current artifact'
+         FROM semantic_coverage prior
+         JOIN native_revisions previous ON previous.id=?1
+         JOIN native_revisions current ON current.id=?2
+         WHERE prior.revision_id=?1 AND prior.requested=1 AND prior.selected=1
+         AND previous.native_revision_id<>current.native_revision_id
+         AND NOT EXISTS(SELECT 1 FROM semantic_coverage selected
+             WHERE selected.revision_id=?2 AND selected.producer_id=prior.producer_id
+             AND selected.language=prior.language AND selected.selected=1)",
+        params![old, new],
+    )?;
+    Ok(())
+}
+
 impl Store {
     pub(crate) fn attach_retention(&self, db: &Connection) -> Result<StateDir> {
         let state = StateDir::open(&self.roots, &self.identity)?;
@@ -54,6 +73,7 @@ impl Store {
         key: &str,
         state: Option<&StateDir>,
         recovery: bool,
+        previous: Option<&str>,
     ) -> Result<()> {
         if state.is_some() {
             let slots = retention::slots(db)?;
@@ -64,9 +84,21 @@ impl Store {
                 ..
             } in slots
             {
-                let published: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_revision_producers WHERE revision_id=?1 AND id=?2)", params![key,producer], |row| row.get(0))?;
+                let published: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND selected=1)", params![key,producer], |row| row.get(0))?;
                 if published {
                     continue;
+                }
+                // A failed attempt belongs to its native capture identity. Semantic-only
+                // publications and unchanged worker cycles must not re-admit it again.
+                if let Some(previous) = previous {
+                    db.execute(
+                        "UPDATE retained.retained_runs SET attempted_generation=NULL
+                         WHERE producer=?1 AND EXISTS(
+                             SELECT 1 FROM native_revisions old JOIN native_revisions current
+                             WHERE old.id=?2 AND current.id=?3
+                             AND old.native_revision_id<>current.native_revision_id)",
+                        params![producer, previous, key],
+                    )?;
                 }
                 let reason = retention::recovery_reason(db, key, &options)?;
                 for language in languages {

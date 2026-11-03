@@ -373,7 +373,8 @@ pub(super) fn status_semantics(
         if let Some(producer) = producer {
             language_counts(db, &key, &producer, &mut row)?;
             selected.insert(producer);
-        } else if let Some(note) = &row.semantic_note
+        }
+        if let Some(note) = &row.semantic_note
             && !notes.contains(note)
         {
             notes.push(note.clone());

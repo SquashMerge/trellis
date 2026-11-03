@@ -4263,6 +4263,84 @@ fn mixed_language_batch(world: &World) -> (PathBuf, String) {
 }
 
 #[test]
+fn native_identity_change_external_import_reason_survives_failure_and_clears_on_success() {
+    use trellis::model::{SemanticReimport, SemanticState};
+    use trellis::store::BatchPublishFault;
+
+    let world = definitions_world();
+    let initial = split_definitions(&world, false);
+    let (first, _, _) = world.publish(&initial).unwrap();
+    let prior = world.store.semantic_at(first).unwrap();
+    assert!(
+        world
+            .store
+            .status()
+            .unwrap()
+            .semantic_languages
+            .iter()
+            .all(|row| row.reimport.is_none())
+    );
+    write_files(&world.root, &[("src/C.js", "function other(){}\n")]);
+    world.republish();
+    let status = world.store.status().unwrap();
+    assert_eq!(status.revision.index_generation, first.index_generation);
+    assert_eq!(status.revision.index_revision, first.index_revision + 1);
+    let language = &status.semantic_languages[0];
+    assert!(matches!(
+        language.reimport,
+        Some(SemanticReimport::NeedsReimport { ref reason }) if !reason.is_empty()
+    ));
+    assert_eq!(language.semantic_state, SemanticState::Unavailable);
+    assert_eq!(
+        status.stats.internal + status.stats.external + status.stats.ambiguous,
+        0
+    );
+    assert_eq!(status.semantic_note, language.semantic_note);
+    assert_eq!(world.store.semantic_at(first).unwrap(), prior);
+
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_semantic_batch_with_fault_for_tests(
+            &joined,
+            admitted.stage_mut(),
+            status.revision,
+            &leader,
+            &world.cancel,
+            BatchPublishFault::SqlFault,
+        )
+        .unwrap_err();
+    assert_eq!(world.store.status().unwrap(), status);
+    world
+        .store
+        .publish_semantic_batch(
+            &joined,
+            admitted.stage_mut(),
+            status.revision,
+            &leader,
+            &world.cancel,
+        )
+        .unwrap();
+    let refreshed = world.store.status().unwrap();
+    assert!(
+        refreshed
+            .semantic_languages
+            .iter()
+            .all(|row| row.reimport.is_none())
+    );
+    assert_eq!(refreshed.stats.semantic_state, SemanticState::Fresh);
+    assert_eq!(world.store.semantic_at(first).unwrap(), prior);
+}
+
+#[test]
 fn native_rejoin_after_batch_import_rejoins_every_artifact() {
     let world = mixed_language_world();
     let descriptor = mixed_language_batch(&world);
