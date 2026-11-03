@@ -17,6 +17,30 @@ pub(crate) fn unavailable_catalog(error: &anyhow::Error) -> bool {
         })
 }
 
+/// Only fixed catalog contract queries use this conversion. Operational failures
+/// remain retryable/reportable SQLite errors, not optional catalog corruption.
+fn catalog_query<T>(result: rusqlite::Result<T>) -> Result<T> {
+    result.map_err(|error| match &error {
+        rusqlite::Error::QueryReturnedNoRows
+        | rusqlite::Error::InvalidColumnType(..)
+        | rusqlite::Error::FromSqlConversionFailure(..)
+        | rusqlite::Error::IntegralValueOutOfRange(..) => anyhow::anyhow!(
+            "{}: retention catalog: {error}",
+            super::PRODUCER_STATE_CORRUPT
+        ),
+        rusqlite::Error::SqliteFailure(code, _)
+        | rusqlite::Error::SqlInputError { error: code, .. }
+            if code.extended_code & 0xff == rusqlite::ffi::SQLITE_ERROR =>
+        {
+            anyhow::anyhow!(
+                "{}: retention catalog: {error}",
+                super::PRODUCER_STATE_CORRUPT
+            )
+        }
+        _ => error.into(),
+    })
+}
+
 fn decode<T: serde::de::DeserializeOwned>(json: &str) -> Result<T> {
     serde_json::from_str(json).map_err(|error| {
         anyhow::anyhow!("{}: retained run: {error}", super::PRODUCER_STATE_CORRUPT)
@@ -78,7 +102,7 @@ fn attach_inner(db: &Connection, state: &StateDir, root_key: &str) -> Result<()>
             "producer_state_corrupt: retention schema"
         );
         let identity: String =
-            tx.query_row("SELECT root_key FROM identity", [], |row| row.get(0))?;
+            catalog_query(tx.query_row("SELECT root_key FROM identity", [], |row| row.get(0)))?;
         ensure!(
             identity == root_key,
             "producer_state_corrupt: retention root"
@@ -98,6 +122,9 @@ fn attach_inner(db: &Connection, state: &StateDir, root_key: &str) -> Result<()>
         db.pragma_update(Some(schema), "synchronous", "FULL")?;
     }
     slots(db)?;
+    let mut legacy = catalog_query(db.prepare("SELECT language FROM retained.legacy_languages"))?;
+    let rows = catalog_query(legacy.query_map([], |row| row.get::<_, String>(0)))?;
+    catalog_query(rows.collect::<rusqlite::Result<Vec<_>>>())?;
     Ok(())
 }
 
@@ -109,10 +136,10 @@ pub(crate) fn held_dirs(state: &StateDir) -> Result<BTreeSet<PathBuf>> {
     }
     let db = Connection::open(path)?;
     db.busy_timeout(Duration::from_millis(250))?;
-    let mut statement = db.prepare("SELECT options FROM retained_runs ORDER BY producer")?;
-    let options = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut statement =
+        catalog_query(db.prepare("SELECT options FROM retained_runs ORDER BY producer"))?;
+    let rows = catalog_query(statement.query_map([], |row| row.get::<_, String>(0)))?;
+    let options = catalog_query(rows.collect::<rusqlite::Result<Vec<_>>>())?;
     options
         .into_iter()
         .map(|json| {
@@ -169,17 +196,18 @@ pub(crate) struct RetainedRun {
 }
 
 pub(crate) fn slots(db: &Connection) -> Result<Vec<RetainedRun>> {
-    let mut statement = db.prepare("SELECT producer,languages,options,attempted_generation FROM retained.retained_runs ORDER BY producer")?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut statement = catalog_query(db.prepare("SELECT producer,languages,options,attempted_generation,descriptor_sha256,source_revision FROM retained.retained_runs ORDER BY producer"))?;
+    let rows = catalog_query(statement.query_map([], |row| {
+        let _: String = row.get(4)?;
+        let _: String = row.get(5)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    }))?;
+    let rows = catalog_query(rows.collect::<rusqlite::Result<Vec<_>>>())?;
     rows.into_iter()
         .map(|(producer, languages, options, attempted_generation)| {
             Ok(RetainedRun {
@@ -213,7 +241,7 @@ pub(crate) fn recovery_reason(
     } else if revision != captured {
         "retained run native revision no longer matches; import a current artifact".into()
     } else {
-        "retained run awaits normal validated re-import".into()
+        "retained semantic input needs re-import; normal validation is required".into()
     })
 }
 
@@ -327,6 +355,102 @@ mod tests {
         state.strip_to_record(&id1).unwrap();
         assert!(!state.run_dir(&id1).unwrap().join("batch").exists());
     }
+    #[test]
+    fn structural_catalog_faults_are_typed_and_never_recreated() {
+        for damage in [
+            "DELETE FROM identity",
+            "DROP TABLE identity",
+            "DROP TABLE retained_runs",
+            "DROP TABLE legacy_languages",
+            "ALTER TABLE legacy_languages RENAME COLUMN language TO wrong",
+            "UPDATE identity SET root_key=zeroblob(4)",
+        ] {
+            let (temp, state, key) = world();
+            let db = Connection::open(temp.path().join("index.db")).unwrap();
+            attach(&db, &state, &key).unwrap();
+            db.execute_batch(
+                &damage
+                    .replace("identity", "retained.identity")
+                    .replace("retained_runs", "retained.retained_runs")
+                    .replace("legacy_languages", "retained.legacy_languages"),
+            )
+            .unwrap();
+            drop(db);
+            let db = Connection::open(temp.path().join("index.db")).unwrap();
+            let error = attach(&db, &state, &key).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(super::super::PRODUCER_STATE_CORRUPT),
+                "{damage}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_operational_errors_are_not_optional_catalog_corruption() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_CANTOPEN,
+        ] {
+            let error = catalog_query::<()>(Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            )))
+            .unwrap_err();
+            assert!(!unavailable_catalog(&error), "{code}: {error:#}");
+            assert!(
+                matches!(error.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(actual, _)) if actual.extended_code == code)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_prune_releases_superseded_inputs_only_after_pending_hold_ends() {
+        let (temp, state, key) = world();
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        for (n, id) in [&a, &b].into_iter().enumerate() {
+            let dir = state.create_run_dir(id).unwrap();
+            fs::create_dir(dir.join("batch")).unwrap();
+            fs::create_dir(dir.join("out")).unwrap();
+            state
+                .write_run_record(&super::super::state::RunRecord {
+                    version: 1,
+                    run_id: id.clone(),
+                    producer: "producer".into(),
+                    trust_profile: super::super::TrustProfile::Restricted,
+                    plan_sha256: "a".repeat(64),
+                    source_revision: "native".into(),
+                    state: super::super::state::RunState::Done,
+                    outcome: Some("imported".into()),
+                    error_code: None,
+                    daemon: super::super::state::DaemonIdentity::current(),
+                    process: None,
+                    request_id: None,
+                    created_at: n as u64,
+                    finished_at: Some(n as u64),
+                    diagnostics: None,
+                })
+                .unwrap();
+        }
+        let db = Connection::open(temp.path().join("index.db")).unwrap();
+        attach(&db, &state, &key).unwrap();
+        insert(&db, &state, &b);
+        drop(db);
+        state
+            .prune_runs(&BTreeSet::from([state.run_dir(&a).unwrap()]))
+            .unwrap();
+        assert!(state.run_dir(&a).unwrap().join("batch").exists());
+        state.prune_runs(&BTreeSet::new()).unwrap();
+        assert!(!state.run_dir(&a).unwrap().join("batch").exists());
+        assert!(!state.run_dir(&a).unwrap().join("out").exists());
+        assert!(state.run_dir(&a).unwrap().join("run.json").exists());
+        assert!(state.run_dir(&b).unwrap().join("batch").exists());
+    }
+
     #[test]
     fn missing_capture_is_typed_without_invalidating_native_head() {
         let temp = tempfile::tempdir().unwrap();

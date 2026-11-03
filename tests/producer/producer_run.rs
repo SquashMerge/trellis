@@ -624,10 +624,14 @@ fn run_dir_cleaned_and_record_retained() {
     world.emitting_variant(1);
     let second = reply_of(&world.run(&["--trust", "trusted"]));
     assert_eq!(world.run_ids().len(), 2);
-    for reply in [&first, &second] {
-        let id = reply["runId"].as_str().unwrap();
-        // Only the record survives a finished, imported run.
-        assert!(only_record_remains(&world.runs_dir().join(id)), "{id}");
+    let first_id = first["runId"].as_str().unwrap();
+    let second_id = second["runId"].as_str().unwrap();
+    assert!(only_record_remains(&world.runs_dir().join(first_id)));
+    assert_eq!(
+        entries(&world.runs_dir().join(second_id)),
+        ["batch", "out", "run.json"]
+    );
+    for id in [first_id, second_id] {
         assert_eq!(world.record(id)["outcome"], "imported");
     }
 
@@ -637,6 +641,10 @@ fn run_dir_cleaned_and_record_retained() {
     let id = failed["runId"].as_str().unwrap();
     assert!(only_record_remains(&world.runs_dir().join(id)));
     assert_eq!(world.run_ids().len(), 3);
+    assert_eq!(
+        entries(&world.runs_dir().join(second_id)),
+        ["batch", "out", "run.json"]
+    );
 }
 
 #[test]

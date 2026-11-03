@@ -253,7 +253,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        34
+        35
     );
     let count: i64 = db
         .query_row(
@@ -855,7 +855,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        34
+        35
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -3529,7 +3529,7 @@ fn schemas16_19_23_24_26_27_28_29_30_and31_recreate_exclusively_without_migratio
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            34
+            35
         );
         assert_eq!(
             rebuilt
@@ -3538,7 +3538,7 @@ fn schemas16_19_23_24_26_27_28_29_30_and31_recreate_exclusively_without_migratio
                     0
                 ))
                 .unwrap(),
-            34
+            35
         );
         for table in [
             "native_version_references",

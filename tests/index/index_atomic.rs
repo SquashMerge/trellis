@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        34
+        35
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -739,9 +739,9 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // Check exact schema-34 names before comparing evidence and the logical
+    // Check exact schema-35 names before comparing evidence and the logical
     // search corpus. FTS shadow bytes depend on publication/merge history.
-    const REQUIRED_V28_TABLES: [&str; 76] = [
+    const REQUIRED_V35_TABLES: [&str; 77] = [
         "class_projections",
         "class_relations",
         "classes",
@@ -811,6 +811,7 @@ fn sqlite_snapshot(
         "semantic_reference_candidates",
         "semantic_reference_roles",
         "semantic_references",
+        "semantic_reimport",
         "semantic_requested_producer_languages",
         "semantic_requested_producers",
         "semantic_revision_producers",
@@ -821,8 +822,8 @@ fn sqlite_snapshot(
     ];
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
-        REQUIRED_V28_TABLES,
-        "exact schema-34 evidence and search table inventory"
+        REQUIRED_V35_TABLES,
+        "exact schema-35 evidence and search table inventory"
     );
     if tables.contains(&"native_binding_epoch".to_string()) {
         let (first, bound): (i64, i64) = db
@@ -886,7 +887,7 @@ fn sqlite_snapshot(
             // Every table remains in the independent cold-source comparison.
             let (where_clause, alias) = match table.as_str() {
                 "native_revisions" => ("id=?1", ""),
-                "revision_capture_inputs" | "revision_documents"
+                "revision_capture_inputs" | "revision_documents" | "semantic_reimport"
                 | "native_revision_release_debt" | "native_release_candidate_versions"
                 | "native_release_candidate_graphs" | "native_release_candidate_classes" =>
                     ("revision_id=?1", ""),
@@ -905,7 +906,7 @@ fn sqlite_snapshot(
                 name if name.starts_with("native_version_") =>
                     ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("semantic_") => ("?1 IS NOT NULL", ""),
-                _ => panic!("unhandled schema-34 evidence table: {table}"),
+                _ => panic!("unhandled schema-35 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {

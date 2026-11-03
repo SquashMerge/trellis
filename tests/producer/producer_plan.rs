@@ -193,6 +193,8 @@ fn plan_and_status_execute_nothing() {
         &json!({"marker": stub_marker, "emit": tmp.path().join("none.scip")}),
     );
     let checkout = start_checkout(sources, &envs);
+    let producer_state = support::state_dir(&checkout);
+    let before = support::workspace_tree_digest(&producer_state);
     let cli = |args: &[&str]| {
         let mut command = checkout.cli();
         for (key, value) in &envs {
@@ -231,11 +233,10 @@ fn plan_and_status_execute_nothing() {
     }
     assert!(!marker.exists(), "a tripwire script ran");
     assert!(!stub_marker.exists(), "the stub ran");
-    assert!(
-        !support::cache_dir(&checkout.home)
-            .join("producers")
-            .exists(),
-        "planning created state"
+    assert_eq!(
+        support::workspace_tree_digest(&producer_state),
+        before,
+        "planning or status changed producer state"
     );
 }
 
