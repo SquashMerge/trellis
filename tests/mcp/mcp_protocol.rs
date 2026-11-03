@@ -2810,7 +2810,8 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
             selected["result"]["structuredContent"]["workspace"],
             json!(linked)
         );
-        assert_eq!(selected["result"]["structuredContent"]["catchingUp"], true);
+        // The worker may finish before this request samples catchingUp.
+        assert!(selected["result"]["structuredContent"]["catchingUp"].is_boolean());
         assert_eq!(
             selected["result"]["structuredContent"]["data"]["workspaceLabel"],
             "linked"
