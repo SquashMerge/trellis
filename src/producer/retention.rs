@@ -78,17 +78,64 @@ pub(crate) fn attach(db: &Connection, state: &StateDir, root_key: &str) -> Resul
     })
 }
 
-fn attach_inner(db: &Connection, state: &StateDir, root_key: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+#[cfg(test)]
+type ProvisionHook = Box<dyn FnOnce(&std::path::Path)>;
+#[cfg(test)]
+thread_local! {
+    static PROVISION_HOOK: std::cell::RefCell<Option<ProvisionHook>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn provision_hook(path: &std::path::Path) {
+    if let Some(hook) = PROVISION_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook(path);
+    }
+}
+
+/// Publish a private empty SQLite leaf without exposing SQLite's default 0644
+/// creation mode. The staging descriptor is closed before the public name exists.
+fn provision_catalog(state: &StateDir) -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
     let path = state.sqlite_path(FILE)?;
-    let new = !path.try_exists()?;
+    if path.try_exists()? {
+        return Ok(path);
+    }
+    let staged = state
+        .path()
+        .join(format!(".{FILE}.tmp-{}", uuid::Uuid::new_v4()));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&staged)?;
+    struct StagedLeaf(std::path::PathBuf);
+    impl Drop for StagedLeaf {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let cleanup = StagedLeaf(staged.clone());
+    // Never close a separate descriptor once this inode is a live SQLite file.
+    drop(file);
+    match std::fs::hard_link(&staged, &path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::remove_file(&staged)?;
+    drop(cleanup);
+    let path = state.sqlite_path(FILE)?;
+    #[cfg(test)]
+    provision_hook(&path);
+    Ok(path)
+}
+
+fn attach_inner(db: &Connection, state: &StateDir, root_key: &str) -> Result<()> {
+    let path = provision_catalog(state)?;
     // Index connections deliberately lack SQLITE_OPEN_CREATE. ATTACH inherits
-    // that flag, so provision the disposable catalog through SQLite first.
+    // that flag; the private leaf exists before either SQLite connection opens it.
     {
         let mut catalog = Connection::open(&path)?;
-        if new {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
         catalog.busy_timeout(Duration::from_secs(5))?;
         catalog.pragma_update(None, "synchronous", "FULL")?;
         let tx = catalog.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -276,6 +323,99 @@ mod tests {
         };
         db.execute("INSERT OR REPLACE INTO retained.retained_runs VALUES('producer','[\"rust\"]',?1,?2,'native',NULL)",params![serde_json::to_string(&options).unwrap(),"a".repeat(64)]).unwrap();
     }
+    #[test]
+    fn concurrent_native_publishers_never_observe_nonprivate_catalog_creation() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::sync::{Arc, mpsc};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        // Observe the effective mask using an unrelated private test probe, never umask().
+        let probe = temp.path().join("mode-probe");
+        drop(
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o777)
+                .open(&probe)
+                .unwrap(),
+        );
+        let probe_mode = fs::metadata(&probe).unwrap().permissions().mode() & 0o777;
+        let store = crate::store::Store::open_for_tests(temp.path(), &root).unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bundle = Arc::new(
+            crate::indexer::index_workspace_bundle(
+                &crate::indexer::IndexOptions::new(root),
+                store.root_id(),
+                &cancel,
+                |_| {},
+            )
+            .unwrap(),
+        );
+        let session = store.writer_session().unwrap();
+        let baseline = store.index_baseline().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let a_store = store.clone();
+        let a_session = session.clone();
+        let a_bundle = bundle.clone();
+        let a_cancel = cancel.clone();
+        let publisher = std::thread::spawn(move || {
+            let hook_ready = ready_tx.clone();
+            PROVISION_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |path| {
+                    let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                    hook_ready.send(Some(mode)).unwrap();
+                    release_rx.recv().unwrap();
+                }))
+            });
+            let result = a_store.publish_native(
+                &a_bundle.0,
+                &a_bundle.2,
+                &a_bundle.1,
+                a_session.writer_guard().unwrap(),
+                baseline,
+                &a_cancel,
+            );
+            let _ = ready_tx.send(None);
+            result
+        });
+        let observed = ready_rx
+            .recv()
+            .unwrap()
+            .expect("publisher reached provisioning hook");
+        let other = store.publish_native(
+            &bundle.0,
+            &bundle.2,
+            &bundle.1,
+            session.writer_guard().unwrap(),
+            baseline,
+            &cancel,
+        );
+        release_tx.send(()).unwrap();
+        let first = publisher.join().unwrap();
+        eprintln!(
+            "effective test umask={:03o}, visible catalog mode={observed:03o}, first={first:?}, second={other:?}",
+            0o777 & !probe_mode
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(other.is_ok()), 1);
+        let loser = first
+            .as_ref()
+            .err()
+            .or_else(|| other.as_ref().err())
+            .unwrap();
+        assert!(
+            loser.to_string().starts_with("revision conflict")
+                || crate::store::nonterminal_storage_busy(loser),
+            "unexpected CAS loser: {loser:#}"
+        );
+        assert_eq!(
+            observed, 0o600,
+            "catalog must be private at its first public visibility"
+        );
+    }
+
     #[test]
     fn retention_authority_is_atomic_with_index_commit_before_ack() {
         let (temp, state, key) = world();
@@ -487,6 +627,44 @@ mod tests {
         assert!(!store.recovery_pending_for_tests());
         assert_eq!(store.status().unwrap().revision, pin);
         assert_eq!(store.status().unwrap().stats, graph.stats);
+    }
+
+    #[test]
+    fn provisioning_refuses_existing_nonprivate_and_symlink_leaves() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, state, _key) = world();
+        let path = state.path().join(FILE);
+        fs::write(&path, b"existing").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            provision_catalog(&state)
+                .unwrap_err()
+                .to_string()
+                .starts_with(super::super::UNSAFE_STATE)
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"existing");
+        fs::remove_file(&path).unwrap();
+        let target = state.path().join("target");
+        fs::write(&target, b"existing").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(
+            provision_catalog(&state)
+                .unwrap_err()
+                .to_string()
+                .starts_with(super::super::UNSAFE_STATE)
+        );
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"existing");
     }
 
     #[test]
