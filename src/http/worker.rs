@@ -95,7 +95,170 @@ impl RuntimePhase {
     }
 }
 
+pub(super) struct SemanticRetry {
+    pending: crate::store::PendingSemanticRejoin,
+    delay: Duration,
+    due: Instant,
+}
+
 impl DaemonState {
+    fn semantic_retry_due(&self, pending: &crate::store::PendingSemanticRejoin) -> bool {
+        let mut retry = self.semantic_retry.lock().unwrap();
+        match retry.as_ref() {
+            Some(retry) if retry.pending == *pending => self.worker_now() >= retry.due,
+            _ => {
+                *retry = None;
+                true
+            }
+        }
+    }
+
+    fn defer_semantic(&self, pending: crate::store::PendingSemanticRejoin) {
+        let mut retry = self.semantic_retry.lock().unwrap();
+        let delay = retry
+            .as_ref()
+            .filter(|retry| retry.pending == pending)
+            .map_or(STARTUP_BACKOFF_FIRST, |retry| {
+                retry.delay.saturating_mul(2).min(STARTUP_BACKOFF_MAX)
+            });
+        *retry = Some(SemanticRetry {
+            pending,
+            delay,
+            due: self.worker_now() + delay,
+        });
+    }
+
+    pub(super) fn run_pending_semantic(
+        self: &Arc<Self>,
+        session: &Arc<WriterSession>,
+    ) -> anyhow::Result<()> {
+        let operation = self.inbox.begin_semantic();
+        if operation.cancel.load(Ordering::Acquire)
+            || !matches!(*self.runtime.lock().unwrap(), RuntimeState::Ready(_))
+            || self.store.earliest_unfinished_request()?.is_some()
+            || self.store.has_recorded_completion(session)?
+        {
+            return Ok(());
+        }
+        let explicit = self.explicit_pending.lock().unwrap().clone();
+        let options = self.selected_watch_options(explicit.as_ref())?;
+        let fence = {
+            let work = self.watcher_work.lock().unwrap();
+            let Some((owner, watcher)) = work.as_ref() else {
+                return Ok(());
+            };
+            if !owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+            {
+                return Ok(());
+            }
+            let Some(fence) = watcher.semantic_fence(&options) else {
+                return Ok(());
+            };
+            fence
+        };
+        let Some(pending) = self.store.pending_semantic_rejoin_at_head()? else {
+            *self.semantic_retry.lock().unwrap() = None;
+            return Ok(());
+        };
+        if !self.semantic_retry_due(&pending) {
+            return Ok(());
+        }
+        if operation.cancel.load(Ordering::Acquire) || !fence.unchanged() {
+            return Ok(());
+        }
+        crate::index_coordinator::diagnostic_marker(
+            &session.incarnation().to_string(),
+            "semantic_rejoin_admitted",
+            &format!("target={:?}", pending.target_pin),
+        );
+        #[cfg(feature = "test-support")]
+        self.semantic_hook("admitted");
+        if operation.cancel.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let result = (|| {
+            let publication = match self
+                .store
+                .enter_publication(&operation.cancel, Duration::from_millis(250))
+            {
+                Ok(publication) => publication,
+                Err(_) if operation.cancel.load(Ordering::Acquire) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            self.store.verify_writer_session(session)?;
+            let result = self.store.continue_pending_semantic(
+                &pending,
+                session.writer_guard()?,
+                &operation.cancel,
+                || {
+                    let registration = self.explicit_pending.lock().unwrap();
+                    let same_registration = match (explicit.as_ref(), registration.as_ref()) {
+                        (Some(before), Some(current)) => Arc::ptr_eq(before, current),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    let guard = fence.lock()?;
+                    anyhow::ensure!(
+                        same_registration && !operation.cancel.load(Ordering::Acquire),
+                        "semantic rejoin superseded"
+                    );
+                    #[cfg(feature = "test-support")]
+                    self.semantic_hook("before_commit");
+                    Ok((registration, guard))
+                },
+            );
+            drop(publication);
+            result
+        })();
+        crate::index_coordinator::diagnostic_marker(
+            &session.incarnation().to_string(),
+            "semantic_rejoin_writer_released",
+            &format!(
+                "cancelled={} target={:?}",
+                operation.cancel.load(Ordering::Acquire),
+                pending.target_pin
+            ),
+        );
+        #[cfg(feature = "test-support")]
+        self.semantic_hook("writer_released");
+        if operation.cancel.load(Ordering::Acquire) {
+            // Storage resolves COMMIT ambiguity before returning. Cancellation is
+            // private background supersession, never a durable request failure.
+            return result.map(|_| ());
+        }
+        match result {
+            Ok(pin) => {
+                *self.semantic_retry.lock().unwrap() = None;
+                if pin.is_some() {
+                    self.step_progress.store(true, Ordering::Release);
+                }
+            }
+            Err(error) => {
+                self.defer_semantic(pending);
+                super::best_effort_queue_stderr(
+                    std::io::stderr(),
+                    format_args!("semantic continuation deferred: {error:#}\n"),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    fn semantic_hook(&self, point: &'static str) {
+        let hook = self.semantic_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_semantic_hook_for_tests(&self, hook: super::SemanticTestHook) {
+        *self.semantic_hook.lock().unwrap() = Some(hook);
+    }
+
     pub(super) fn worker_now(&self) -> Instant {
         #[cfg(test)]
         if let Some(now) = *self.test_worker_now.lock().unwrap() {
@@ -425,6 +588,8 @@ pub(super) struct WorkerInbox {
     wake: std::sync::Mutex<bool>,
     changed: std::sync::Condvar,
     shutdown: AtomicBool,
+    semantic: std::sync::Mutex<Option<crate::model::CancelFlag>>,
+    semantic_stopped: AtomicBool,
     /// While the worker is blocked with no wake pending: its deadline.
     #[cfg(feature = "test-support")]
     asleep: std::sync::Mutex<Option<Option<Instant>>>,
@@ -436,6 +601,41 @@ impl WorkerInbox {
         self.changed.notify_one();
     }
 
+    pub(super) fn native_wake(&self) {
+        let semantic = self.semantic.lock().unwrap();
+        if let Some(cancel) = semantic.as_ref() {
+            cancel.store(true, Ordering::Release);
+        }
+        self.wake();
+    }
+
+    fn begin_semantic(self: &Arc<Self>) -> SemanticOperation {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut semantic = self.semantic.lock().unwrap();
+        if self.shutdown.load(Ordering::Acquire)
+            || self.semantic_stopped.load(Ordering::Acquire)
+            || self.wake_pending()
+        {
+            cancel.store(true, Ordering::Release);
+        }
+        *semantic = Some(cancel.clone());
+        SemanticOperation {
+            inbox: self.clone(),
+            cancel,
+        }
+    }
+
+    pub(super) fn stop_semantic(&self) {
+        self.semantic_stopped.store(true, Ordering::Release);
+        self.cancel_semantic();
+    }
+
+    pub(super) fn cancel_semantic(&self) {
+        if let Some(cancel) = self.semantic.lock().unwrap().as_ref() {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+
     /// A wake arrived that the worker has not consumed yet: newer work.
     pub(super) fn wake_pending(&self) -> bool {
         *self.wake.lock().unwrap()
@@ -443,7 +643,7 @@ impl WorkerInbox {
 
     pub(super) fn shut_down(&self) {
         self.shutdown.store(true, Ordering::Release);
-        self.wake();
+        self.native_wake();
     }
 
     /// Block until woken or `deadline` passes (`None`: until woken).
@@ -470,6 +670,24 @@ impl WorkerInbox {
             *self.asleep.lock().unwrap() = None;
         }
         *woken = false;
+    }
+}
+
+struct SemanticOperation {
+    inbox: Arc<WorkerInbox>,
+    cancel: crate::model::CancelFlag,
+}
+
+impl Drop for SemanticOperation {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        let mut current = self.inbox.semantic.lock().unwrap();
+        if current
+            .as_ref()
+            .is_some_and(|cancel| Arc::ptr_eq(cancel, &self.cancel))
+        {
+            *current = None;
+        }
     }
 }
 
@@ -554,7 +772,15 @@ impl DaemonState {
             Some((_, watcher)) => watcher.next_due(),
             None => now,
         };
-        Some(watcher_due.min(self.maintenance_due_at()))
+        let native_due = watcher_due.min(self.maintenance_due_at());
+        let semantic_due = self
+            .semantic_retry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|retry| retry.due)
+            .filter(|due| *due > now);
+        Some(semantic_due.map_or(native_due, |due| due.min(native_due)))
     }
 
     /// The next retention unit is due 60 s after the last idle one, or soon
@@ -792,6 +1018,7 @@ impl DaemonState {
         {
             return RetireOutcome::Declined;
         }
+        self.inbox.cancel_semantic();
         let cutoff = self
             .watch_status
             .lock()
@@ -1109,6 +1336,9 @@ fn worker_loop_with_wait(
 
 #[cfg(test)]
 mod recovery_tests;
+
+#[cfg(test)]
+mod semantic_owner_tests;
 
 #[cfg(test)]
 mod missing_index_tests {

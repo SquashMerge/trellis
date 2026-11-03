@@ -275,6 +275,7 @@ pub struct CapturedScipInventory {
     pub claims: Vec<CapturedClaim>,
 }
 impl CapturedScipInventory {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn proof_identities(&self) -> ProofInventory {
         ProofInventory {
             artifact_hashes: self.artifact_hashes.clone(),

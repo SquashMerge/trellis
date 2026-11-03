@@ -798,10 +798,15 @@ fn java_override_uses_global_method_owner_from_another_language() {
 fn direct_base_rows_preserve_order_and_admit_output_before_build() {
     let source = b"interface I extends First, pkg.Second<T> {} class A extends pkg.Base<T> implements X, Y {}";
     let mut bytes = 0;
-    let rows = direct_java_types(source, None, &mut |amount| {
-        bytes += amount()?;
-        Ok(())
-    })
+    let rows = direct_java_types(
+        source,
+        None,
+        &mut |amount| {
+            bytes += amount()?;
+            Ok(())
+        },
+        &|| Ok(()),
+    )
     .unwrap();
     let names: Vec<_> = rows
         .iter()
@@ -844,6 +849,7 @@ fn direct_base_rows_preserve_order_and_admit_output_before_build() {
         "argument_list",
         None,
         &mut |_| Ok(()),
+        &|| Ok(()),
     )
     .unwrap();
     let names: Vec<_> = rows

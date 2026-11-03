@@ -1,6 +1,7 @@
 {
   "hiddenSteps": 0,
   "incidentalSteps": 0,
+  "partial": false,
   "participants": [
     {
       "id": "fixture-seed",
@@ -42,6 +43,7 @@
   "semantic": {
     "tier": "syntax"
   },
+  "semanticDocuments": [],
   "steps": [
     {
       "alternate": [],

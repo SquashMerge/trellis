@@ -229,6 +229,14 @@ class SchemaParity(unittest.TestCase):
         self.assertEqual(self.tables(self.schema_db()),
                          RUNNER.REQUIRED_TABLES | RUNNER.CONTROL_TABLES | RUNNER.FTS_SHADOW_TABLES)
 
+    def test_native_first_tables_are_selected_revision_scoped(self):
+        tables = {"semantic_native_origins", "semantic_document_origins", "semantic_ineligible_proofs",
+                  "semantic_pending_rejoins", "semantic_rejoin_completions"}
+        self.assertTrue(tables <= RUNNER.REQUIRED_TABLES)
+        self.assertEqual(len(self.tables(self.schema_db())), 81)
+        for table in tables:
+            self.assertEqual(RUNNER.selected_where(table), "revision_id=?")
+
     def test_every_schema_table_has_a_selected_scope(self):
         for table in sorted(self.tables(self.schema_db()) - self.EXCLUDED):
             self.assertTrue(RUNNER.selected_where(table), table)
@@ -253,8 +261,10 @@ class SchemaParity(unittest.TestCase):
         db.execute("INSERT INTO native_source_sets VALUES(?,?)", (source_set, root_id))
         for ordinal, language in enumerate(("javascript", "python")):
             db.execute("INSERT INTO native_source_set_languages VALUES(?,?,?)", (source_set, language, ordinal))
-        pins = {"r1": "pin:v1:gen:1", "import": "pin:v1:gen:2", "r2": "pin:v1:gen:3"}
-        natives = {"r1": "revision:v2:one", "import": "revision:v2:two", "r2": "revision:v2:two"}
+        pins = {"r1": "pin:v1:gen:1", "import": "pin:v1:gen:2", "native": "pin:v1:gen:3",
+                "r2": "pin:v1:gen:4"}
+        natives = {"r1": "revision:v2:one", "import": "revision:v2:two", "native": "revision:v2:two",
+                   "r2": "revision:v2:two"}
         for name, pin in pins.items():
             db.execute("INSERT INTO native_revisions VALUES(?,?,?,?,?,?,?,'[]','{}','[]','[]',NULL,'[]',0,'{}','[]',?)",
                        (pin, source_set, HEX, HEX, HEX, natives[name], inventory(natives[name]),
@@ -277,7 +287,7 @@ class SchemaParity(unittest.TestCase):
                    (hashes[paths[0]], HEX))
         db.execute("INSERT INTO semantic_raw_proofs VALUES(1,'proof','occurrence',?,'javascript','js/a.js',x'7b7d')",
                    (HEX,))
-        for name in ("import", "r2"):
+        for name in ("import", "native", "r2"):
             db.execute("INSERT INTO semantic_revision_raw_selections VALUES(?,'scip-typescript',1,?)",
                        (pins[name], pins["r1"]))
         db.execute("INSERT INTO semantic_coverage VALUES(1,?,'scip-typescript','1','javascript','js/a.js',1,1,'complete',NULL)",
@@ -288,10 +298,19 @@ class SchemaParity(unittest.TestCase):
                    (HEX, HEX))
         report = {"producerId": "scip-typescript", "identityKind": "executable",
                   "sourceSetId": source_set, "capturedRevision": natives["r1"],
-                  "destinationRevision": natives["r2"], "descriptorSha256": HEX,
+                  "destinationRevision": natives["import"], "descriptorSha256": sha,
                   "artifacts": [], "languages": []}
-        db.execute("INSERT INTO semantic_import_reports VALUES(?,?,?)",
-                   (pins["import"], "scip-typescript", json.dumps(report)))
+        for name in ("import", "native", "r2"):
+            db.execute("INSERT INTO semantic_import_reports VALUES(?,?,?)",
+                       (pins[name], "scip-typescript", json.dumps(report)))
+        db.execute("INSERT INTO semantic_native_origins VALUES(?,'scip-typescript',?)",
+                   (pins["native"], pins["import"]))
+        identity = RUNNER.hashlib.sha256(b"trellis.pending-semantic.v1\0" +
+                                        RUNNER.canonical(RUNNER.rejoin_input_identity(db, pins["native"]))).hexdigest()
+        db.execute("INSERT INTO semantic_pending_rejoins VALUES(?,?,?)",
+                   (pins["native"], natives["native"], identity))
+        db.execute("INSERT INTO semantic_rejoin_completions VALUES(?,?,?)",
+                   (pins["r2"], natives["r2"], identity))
         return root, pins["r2"]
 
     def normalized_rows(self, workspace):
@@ -310,9 +329,39 @@ class SchemaParity(unittest.TestCase):
             self.assertTrue(rows[table], table)
         return rows
 
-    def test_selected_view_normalizes_a_schema_34_batch_selection_identically_across_roots(self):
+    def test_selected_view_normalizes_a_schema_35_batch_selection_identically_across_roots(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             self.assertEqual(self.normalized_rows(first), self.normalized_rows(second))
+
+    def test_carried_report_is_current_scoped_and_matches_original_import(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            db = self.schema_db()
+            root, revision = self.populate(db, workspace)
+            view = RUNNER.SelectedView(db, revision, root)
+            where = RUNNER.selected_where("semantic_import_reports")
+            rows = db.execute(f"SELECT * FROM semantic_import_reports selected WHERE {where}",
+                              (revision,)).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][0], revision)
+            db.execute("UPDATE semantic_import_reports SET report_json=json_set(report_json,'$.languages',json('[1]')) "
+                       "WHERE revision_id=?", (revision,))
+            with self.assertRaisesRegex(RuntimeError, "carried selected import report changed"):
+                RUNNER.SelectedView(db, revision, root)
+
+    def test_completion_identity_is_checked_before_normalization(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            db = self.schema_db()
+            root, revision = self.populate(db, workspace)
+            view = RUNNER.SelectedView(db, revision, root)
+            row = db.execute("SELECT * FROM semantic_rejoin_completions WHERE revision_id=?",
+                             (revision,)).fetchone()
+            columns = [item[1] for item in db.execute("PRAGMA table_info(semantic_rejoin_completions)")]
+            cells = dict(zip(columns, row))
+            normalized = view.row("semantic_rejoin_completions", cells.copy())
+            self.assertEqual(normalized["selection_identity"]["selections"][0][0], "scip-typescript")
+            db.execute("UPDATE semantic_pending_rejoins SET selection_identity=?", ("f" * 64,))
+            with self.assertRaisesRegex(RuntimeError, "frozen pending predecessor"):
+                view.row("semantic_rejoin_completions", cells)
 
 
 class ImportBatch(unittest.TestCase):

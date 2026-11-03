@@ -171,6 +171,9 @@ impl MaintenanceTelemetry {
     }
 }
 
+#[cfg(feature = "test-support")]
+type SemanticTestHook = Arc<dyn Fn(&'static str) + Send + Sync>;
+
 pub struct DaemonState {
     store: Store,
     /// Decision 0009 §2: the checkout's one runtime state, shared by the worker
@@ -196,7 +199,7 @@ pub struct DaemonState {
     explicit_pending: Mutex<Option<Arc<IndexOptions>>>,
     /// The worker's wake inbox. The queue waker, registered with every Store
     /// for this root, also marks FIFO work pending at the enqueue COMMIT; the
-    /// watch waker only wakes.
+    /// watch waker also cancels the current low-priority semantic continuation.
     inbox: Arc<worker::WorkerInbox>,
     /// Owned here; the Store registry holds it weakly.
     _queue_waker: Arc<dyn Fn() + Send + Sync>,
@@ -255,8 +258,11 @@ pub struct DaemonState {
     /// Watcher inventories run on the worker and are never cancelled from
     /// outside it (Decision 0009 §1).
     watcher_cancel: CancelFlag,
+    semantic_retry: Mutex<Option<worker::SemanticRetry>>,
     #[cfg(feature = "test-support")]
     startup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(feature = "test-support")]
+    semantic_hook: Mutex<Option<SemanticTestHook>>,
     /// Startup reconciliation captures begun, for the single-owner tests.
     #[cfg(feature = "test-support")]
     startup_captures: AtomicU64,
@@ -402,12 +408,12 @@ pub fn new_with_config(
         let fifo_pending = fifo_pending.clone();
         Arc::new(move || {
             fifo_pending.store(true, Ordering::Release);
-            inbox.wake();
+            inbox.native_wake();
         })
     };
     let watch_waker: Arc<dyn Fn() + Send + Sync> = {
         let inbox = inbox.clone();
-        Arc::new(move || inbox.wake())
+        Arc::new(move || inbox.native_wake())
     };
     store.register_queue_waker(&queue_waker);
     Ok(Arc::new(DaemonState {
@@ -478,8 +484,11 @@ pub fn new_with_config(
         search_fill: Mutex::new(None),
         architecture: architecture::ArchitectureHandle(architecture::ArchitectureOwner::new()),
         watcher_cancel: Arc::new(AtomicBool::new(false)),
+        semantic_retry: Mutex::new(None),
         #[cfg(feature = "test-support")]
         startup_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        semantic_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
         startup_captures: AtomicU64::new(0),
         maintenance_telemetry: Mutex::new(MaintenanceTelemetry::default()),
@@ -1352,6 +1361,7 @@ impl DaemonState {
         #[cfg(test)]
         self.test_queue_before_stream.run();
         let _stream = self.step_lock.lock().unwrap();
+        let mut native_progress = false;
         #[cfg(test)]
         self.test_queue_current_phase.store(1, Ordering::Release);
         if self.retired() {
@@ -1406,6 +1416,7 @@ impl DaemonState {
                     .as_ref()
                     .map(|(_, watcher)| watcher.options());
                 self.run_rebuild_reconciliation(session, options)?;
+                native_progress = true;
                 if self.runtime.lock().unwrap().session().is_none() {
                     return Ok(());
                 }
@@ -1438,6 +1449,7 @@ impl DaemonState {
                 return Ok(());
             }
             self.run_startup_reconciliation()?;
+            native_progress = true;
             if self.runtime.lock().unwrap().session().is_none() {
                 return Ok(());
             }
@@ -1510,6 +1522,7 @@ impl DaemonState {
             #[cfg(test)]
             self.test_queue_current_phase.store(3, Ordering::Release);
             if processed > 0 {
+                native_progress = true;
                 self.start_dependency_index();
                 self.step_progress.store(true, Ordering::Release);
             }
@@ -1593,7 +1606,9 @@ impl DaemonState {
                         self.publish_watch_status(scheduler, &selected_options);
                         let accounted = reconciled?;
                         if accounted {
+                            native_progress = true;
                             self.finalize_watcher_gate(explicit.as_ref());
+                            self.step_progress.store(true, Ordering::Release);
                         }
                         #[cfg(test)]
                         self.test_queue_current_phase.store(5, Ordering::Release);
@@ -1604,6 +1619,11 @@ impl DaemonState {
                         // can be called settled. The reporter only try_sends here.
                     }
                 }
+            }
+            // Native progress is returned to callers/ACK observers before the
+            // low-priority semantic continuation starts in the next owner step.
+            if !native_progress {
+                self.run_pending_semantic(session)?;
             }
             return Ok(());
         }
@@ -1836,6 +1856,7 @@ impl DaemonState {
             .cloned()
     }
     pub fn cancel_active(&self) {
+        self.inbox.stop_semantic();
         let worker = {
             let mut dependencies = self.dependencies.lock().unwrap();
             dependencies.stopped = true;
@@ -3380,10 +3401,17 @@ async fn source(
         return Err(invalid());
     }
     let pin = q.pin.pin()?;
-    let (revision, file) = db(s, move |s| s.source_at(&q.path, pin))
-        .await?
-        .ok_or_else(missing)?;
-    Ok(Json(json!({"revision":revision,"file":file})))
+    let (file, semantic_status) = db(s, move |store| {
+        let response = store.evidence_response()?;
+        let file = response.source_at(&q.path, pin)?;
+        let semantic_status = response.document_semantic_status_at(&q.path, pin)?;
+        response.finish((file, semantic_status))
+    })
+    .await?;
+    let (revision, file) = file.ok_or_else(missing)?;
+    Ok(Json(
+        json!({"revision":revision,"file":file,"semanticStatus":semantic_status}),
+    ))
 }
 
 #[cfg(all(test, feature = "test-support"))]
@@ -5342,7 +5370,8 @@ async fn provisioned_core_answer(
             let (file, catching_up) = tokio::task::spawn_blocking(move || {
                 let (response, catching_up) = runtime.evidence_response()?;
                 let file = response.source_at(&q.path, pin)?;
-                Ok::<_, anyhow::Error>((response.finish(file)?, catching_up))
+                let semantic_status = response.document_semantic_status_at(&q.path, pin)?;
+                Ok::<_, anyhow::Error>((response.finish((file, semantic_status))?, catching_up))
             })
             .await
             .map_err(|_| {
@@ -5352,9 +5381,11 @@ async fn provisioned_core_answer(
                     "Operation failed",
                 )
             })??;
+            let (file, semantic_status) = file;
             let (revision, file) = file.ok_or_else(missing)?;
             Ok((
-                Json(json!({"revision":revision,"file":file})).into_response(),
+                Json(json!({"revision":revision,"file":file,"semanticStatus":semantic_status}))
+                    .into_response(),
                 catching_up,
             ))
         }

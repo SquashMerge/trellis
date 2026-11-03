@@ -500,6 +500,35 @@ fn sequence_without_fresh_bindings_falls_back_to_syntax_with_its_reason() {
         )
         .unwrap();
         syntax.semantic = view.semantic.clone();
+        assert_eq!(view.semantic_documents.len(), 1, "{mode}");
+        let semantic_document = &view.semantic_documents[0];
+        assert_eq!(semantic_document.document.path, "a.rs", "{mode}");
+        assert_eq!(
+            semantic_document.semantic_status.producer_id.as_deref(),
+            Some(graph_fixtures::PRODUCER),
+            "{mode}"
+        );
+        assert_eq!(
+            semantic_document
+                .semantic_status
+                .semantic_origin
+                .as_ref()
+                .unwrap()
+                .pin,
+            pin,
+            "{mode}"
+        );
+        assert_eq!(
+            semantic_document.semantic_status.state,
+            if mode == "failed" {
+                trellis::model::SemanticAvailability::Unavailable
+            } else {
+                trellis::model::SemanticAvailability::Fresh
+            },
+            "{mode}"
+        );
+        assert!(!view.partial, "{mode}");
+        syntax.semantic_documents = view.semantic_documents.clone();
         assert!(syntax.participants.len() > 1, "{mode}");
         assert_eq!(view, syntax, "{mode}");
     }
@@ -2032,27 +2061,12 @@ fn frozen_answer_prefixes_preserve_ancestor_closure_without_sql() {
     assert!(answer.facts.locate(unread).is_err());
 }
 
-fn cli(home: &Path, args: &[&str]) -> serde_json::Value {
-    let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
-    let output = cmd
-        .env("HOME", home)
-        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"))
-        .env_remove("XDG_CACHE_HOME")
-        .env_remove("XDG_DATA_HOME")
-        .stdin(std::process::Stdio::null())
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
-}
-
-/// A real SCIP capture of `run() -> target()` at r1, imported as a batch against the live r1 native revision.
-fn import_scip_capture(home: &Path, root: &Path, index_db: &Path) {
+/// A real SCIP capture of `run() -> target()` admitted through the batch validator.
+fn import_scip_capture(store: &Store, root: &Path, index_db: &Path) {
+    use trellis::{
+        semantic_batch::{BatchLimits, testing::stage_and_join_admitted},
+        semantic_import::DestinationMutations,
+    };
     let mut fixture = BatchFixture::from_published(index_db, root).reference("scip-typescript");
     let a = DocSpec::new("src/A.js")
         .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
@@ -2063,19 +2077,27 @@ fn import_scip_capture(home: &Path, root: &Path, index_db: &Path) {
         .symbol("pkg target.", 26, &[]);
     fixture.artifact("javascript", vec![a, b]);
     let (descriptor, digest) = fixture.write(&root.join(".trellis-semantic-batch"));
-    cli(
-        home,
-        &[
-            "semantic",
-            "import",
-            "--workspace",
-            root.to_str().unwrap(),
-            "--batch",
-            descriptor.to_str().unwrap(),
-            "--batch-sha256",
-            &digest,
-        ],
-    );
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (mut admitted, joined, _) = stage_and_join_admitted(
+        store,
+        root,
+        &descriptor,
+        &digest,
+        &BatchLimits::PRODUCTION,
+        DestinationMutations::default(),
+        &cancel,
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    store
+        .publish_semantic_batch(
+            &joined,
+            admitted.stage_mut(),
+            joined.destination_pin(),
+            &leader,
+            &cancel,
+        )
+        .unwrap();
 }
 
 #[test]
@@ -2085,54 +2107,60 @@ fn rejoined_binding_on_edited_workspace_is_a_stale_boundary_with_its_binding() {
         .prefix("graph-rejoin-")
         .tempdir_in("/tmp")
         .unwrap();
-    let home = temp.path().join("home");
-    std::fs::create_dir(&home).unwrap();
     let root = temp.path().join("checkout");
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join(".gitignore"), ".trellis-semantic-batch*/\n").unwrap();
     std::fs::write(root.join("src/A.js"), "function run(){ target(); }\n").unwrap();
     std::fs::write(root.join("src/B.js"), "function target(){ return 1; }\n").unwrap();
     let root = std::fs::canonicalize(root).unwrap();
-    let root_string = root.to_str().unwrap();
-    let _r1: trellis::model::IndexPin = serde_json::from_value(
-        cli(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
-    )
-    .unwrap();
-    let (cache, data) = if cfg!(target_os = "macos") {
-        (
-            home.join("Library/Caches/dev.squashmerge.trellis"),
-            home.join("Library/Application Support/dev.squashmerge.trellis"),
-        )
-    } else {
-        (
-            home.join(".cache/trellis"),
-            home.join(".local/share/trellis"),
-        )
+    let state = temp.path().join("state");
+    let store = Store::open_for_tests(&state, &root).unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let options = trellis::indexer::IndexOptions::new(root.clone());
+    let publish_native = || {
+        let (graph, native, capture) =
+            trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+                .unwrap();
+        let leader = store.publication_for_tests().unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &leader,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap()
     };
-    let open = || {
-        Store::open(
-            TopologyRoots::isolated_for_tests(cache.clone(), data.clone()),
-            WorkspaceIdentity::discover(Some(&root), &root).unwrap(),
-        )
-        .unwrap()
-    };
-    let index_db = TopologyRoots::isolated_for_tests(cache.clone(), data.clone())
+    publish_native();
+    let index_db = TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"))
         .index_db(&WorkspaceIdentity::discover(Some(&root), &root).unwrap());
-    import_scip_capture(&home, &root, &index_db);
-
+    import_scip_capture(&store, &root, &index_db);
     std::fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
-    let r2: trellis::model::IndexPin = serde_json::from_value(
-        cli(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
-    )
-    .unwrap();
-    let store = open();
-    let (r2_native, _) = store.retained_native_snapshot_at(r2).unwrap();
-    let run_id = syntax_id(&r2_native, "run");
-    let producer = store.semantic_at(r2).unwrap().producers[0].id.clone();
+    let native_pin = publish_native();
+    let (native, _) = store.retained_native_snapshot_at(native_pin).unwrap();
+    let run_id = syntax_id(&native, "run");
+    let producer = store.semantic_at(native_pin).unwrap().producers[0]
+        .id
+        .clone();
     let mut q = query(&run_id, true);
     q.semantic_producer_id = Some(producer);
+    let pending = result(run(&store, &q).unwrap());
+    assert_eq!(pending.edges.len(), 1);
+    assert_eq!(
+        pending.edges[0].boundary_reason,
+        BoundaryReason::MissingEvidence
+    );
+    assert!(pending.edges[0].binding.is_none());
+    assert!(pending.partial);
+    let leader = store.publication_for_tests().unwrap();
+    let completed = store
+        .complete_pending_semantic_for_tests(&leader, &cancel)
+        .unwrap()
+        .unwrap();
+    assert!(completed.index_revision > native_pin.index_revision);
     let result = result(run(&store, &q).unwrap());
-
     assert_eq!(result.edges.len(), 1);
     let edge = &result.edges[0];
     assert_eq!(edge.visit, Visit::Boundary);

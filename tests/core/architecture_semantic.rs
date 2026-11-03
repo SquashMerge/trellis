@@ -333,7 +333,7 @@ fn stale_unusable_and_unbound_evidence_reverts_to_structural() {
     let mut stale = semantic();
     stale.requested_version = "v2".into();
     let (_state, _root, store, pin) = publish(&stale);
-    assert_syntax_only_with_producer(&store, pin);
+    assert_syntax_only_with_producer(&store, pin, "call_binding_incomplete");
 
     // Unresolved and ambiguous bindings never guess a target, and an unresolved binding
     // at a structural site keeps the structural result.
@@ -376,7 +376,7 @@ fn stale_unusable_and_unbound_evidence_reverts_to_structural() {
 }
 
 /// Stale evidence keeps the producer listed but uses none of its bindings.
-fn assert_syntax_only_with_producer(store: &Store, pin: IndexPin) {
+fn assert_syntax_only_with_producer(store: &Store, pin: IndexPin, expected_reason: &str) {
     let references = read(store, "references", json!({"expectedBasis":pin}));
     assert_eq!(references["evidenceTier"], "syntax");
     assert_eq!(references["counts"]["semanticSites"], 0);
@@ -393,8 +393,196 @@ fn assert_syntax_only_with_producer(store: &Store, pin: IndexPin) {
     assert_eq!(row["status"], "unknown");
     assert_eq!(
         row["constraints"][0]["unresolved"],
-        json!(["call_binding_incomplete"])
+        json!([expected_reason])
     );
+}
+
+#[test]
+fn unrelated_native_edit_keeps_origin_proofs_but_never_traverses_them() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
+        graph_query::{BoundaryReason, GraphQuery, Visit},
+        indexer::{IndexOptions, index_workspace_bundle},
+        model::{SemanticAvailability, SemanticState, ViewQuery},
+    };
+
+    let mut spec = semantic();
+    spec.files.push((
+        "src/other.rs".into(),
+        "pub fn unrelated() -> usize { 1 }\n".into(),
+    ));
+    let (_state, root, store, original_pin) = publish(&spec);
+    let original = store.semantic_at(original_pin).unwrap();
+    assert_eq!(original.call_bindings.len(), 2);
+    assert_eq!(original.provenance.len(), 2);
+    assert!(
+        original
+            .provenance
+            .iter()
+            .all(|proof| proof.freshness == s::Freshness::Fresh)
+    );
+    let (original_native, _) = store.retained_native_snapshot_at(original_pin).unwrap();
+    let seed = crate::graph_fixtures::syntax_id(&original_native, "orphan");
+    let query: ViewQuery = serde_json::from_value(json!({
+        "seed":seed,"depth":3,"maxNodes":40
+    }))
+    .unwrap();
+    let fresh = store.query_view(&query).unwrap().unwrap();
+    assert_eq!(fresh.nodes.len(), 2);
+    assert_eq!(
+        fresh.semantic.bindings[0].boundary_reason,
+        BoundaryReason::None
+    );
+    assert_eq!(
+        read(&store, "references", json!({"expectedBasis":original_pin}))["counts"]["semanticSites"],
+        2
+    );
+
+    // Only an unrelated document changes. Neither bound call nor its target changes.
+    fs::write(
+        root.path().join("src/other.rs"),
+        "pub fn unrelated() -> usize { 2 }\n",
+    )
+    .unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(root.path().to_owned());
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    assert_ne!(native.revision.id, original_native.revision.id);
+    let leader = store.publication_for_tests().unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &leader, original_pin, &cancel)
+        .unwrap();
+    assert_ne!(pin, original_pin);
+    let mut compared = original.clone();
+    for proof in &mut compared.provenance {
+        proof.freshness = s::Freshness::PossiblyStale;
+    }
+    let selected = store.semantic_at(pin).unwrap();
+    assert_eq!(selected.call_bindings, original.call_bindings);
+    assert_eq!(selected.provenance, compared.provenance);
+    assert_eq!(store.semantic_at(original_pin).unwrap(), original);
+
+    // Availability and proof freshness are distinct: the unchanged source is available
+    // from its original semantic pin, but its proof is compared against this native head.
+    let response = store.evidence_response().unwrap();
+    let availability = response
+        .document_semantic_status_at("src/orphan.rs", Some(pin))
+        .unwrap();
+    assert_eq!(availability.state, SemanticAvailability::Fresh);
+    let origin = availability.semantic_origin.unwrap();
+    assert_eq!(origin.pin, original_pin);
+    assert_eq!(origin.revision_id, original_native.revision.id);
+    let status = response.status().unwrap();
+    let rust = status
+        .semantic_languages
+        .iter()
+        .find(|row| row.language == "rust")
+        .unwrap();
+    assert_eq!(rust.semantic_state, SemanticState::Stale);
+    let tiers = response.mcp_language_tiers().unwrap();
+    assert_eq!(tiers[1].freshness, "possiblyStale");
+    assert!(!tiers[1].semantic());
+    let answer = response
+        .graph_query(
+            &GraphQuery {
+                root_syntax_id: seed.clone(),
+                semantic_producer_id: Some(PRODUCER.into()),
+                depth: 3,
+                max_nodes: 40,
+                max_calls: 40,
+                include_external: true,
+                include_tests: true,
+            },
+            Some(pin),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(answer.basis, pin);
+    let result = answer.outcome.unwrap();
+    assert_eq!(result.nodes.len(), 1);
+    assert_eq!(result.edges.len(), 1);
+    assert_eq!(result.edges[0].visit, Visit::Boundary);
+    assert_eq!(result.edges[0].boundary_reason, BoundaryReason::Stale);
+    assert_eq!(result.edges[0].to, None);
+    assert_eq!(
+        result.edges[0].binding.as_ref().unwrap().provenance_id,
+        "call-orphan-0"
+    );
+    let proof = result
+        .provenance
+        .iter()
+        .find(|proof| proof.id == "call-orphan-0")
+        .unwrap();
+    assert_eq!(
+        proof,
+        compared
+            .provenance
+            .iter()
+            .find(|proof| proof.id == "call-orphan-0")
+            .unwrap()
+    );
+    response.finish(()).unwrap();
+
+    let calls = store.query_view(&query).unwrap().unwrap();
+    assert_eq!(calls.nodes.len(), 1);
+    assert_eq!(calls.semantic.bindings.len(), 1);
+    let binding = &calls.semantic.bindings[0];
+    assert_eq!(binding.freshness, s::Freshness::PossiblyStale);
+    assert_eq!(binding.boundary_reason, BoundaryReason::Stale);
+    assert_eq!(binding.target_id, None);
+    assert_eq!(binding.binding.provenance_id, "call-orphan-0");
+    let sequence = store.sequence_at(&seed, pin, false).unwrap().unwrap();
+    let step = sequence
+        .steps
+        .iter()
+        .find(|step| step.call_id.is_some())
+        .unwrap();
+    assert_eq!(step.target, None);
+    assert!(step.children.is_empty());
+    assert!(step.call_evidence.is_none());
+    assert_eq!(
+        sequence.semantic.tier,
+        trellis::behavior::EvidenceTier::Syntax
+    );
+    assert!(
+        sequence
+            .semantic
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("stale")
+    );
+
+    // Cross-revision origin tuples are excluded before Architecture admits a producer.
+    // The constraint has unavailable bindings, not an incomplete admitted tuple.
+    assert_syntax_only_with_producer(&store, pin, "call_binding_unavailable");
+    let references = read(&store, "references", json!({"expectedBasis":pin}));
+    let check = read(&store, "check", json!({"expectedBasis":pin}));
+    assert_eq!(
+        instance(&check, "orphan-never-goes", "src/orphan.rs", None)["status"],
+        "unknown"
+    );
+    let original_ids: Vec<_> = original
+        .provenance
+        .iter()
+        .map(|proof| proof.id.as_str())
+        .collect();
+    let mut pending = vec![&references, &check];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(fields) => {
+                for key in ["id", "provenanceId"] {
+                    if let Some(id) = fields.get(key).and_then(Value::as_str) {
+                        assert!(!original_ids.contains(&id), "origin proof leaked: {id}");
+                    }
+                }
+                pending.extend(fields.values());
+            }
+            Value::Array(values) => pending.extend(values),
+            _ => {}
+        }
+    }
 }
 
 #[test]

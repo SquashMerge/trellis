@@ -268,6 +268,25 @@ fn evidence(
     (semantic, captured)
 }
 
+fn failed_evidence(
+    native: &n::Artifact,
+    root: &std::path::Path,
+) -> (s::SemanticPublication, s::CapturedComponents) {
+    let (mut semantic, captured) = evidence(native, root);
+    for coverage in &mut semantic.coverage {
+        coverage.state = s::CoverageState::Failed;
+        coverage.observed_roles.clear();
+        coverage.diagnostic = Some("requested producer failed".into());
+    }
+    semantic.provenance.clear();
+    semantic.symbols.clear();
+    semantic.declaration_bindings.clear();
+    semantic.references.clear();
+    semantic.call_bindings.clear();
+    semantic.type_relationships.clear();
+    (semantic, captured)
+}
+
 #[test]
 fn latest_retained_history_is_declaration_keyed_and_keeps_captured_proof() {
     let state = tempfile::tempdir().unwrap();
@@ -486,6 +505,13 @@ fn populated_history_partitions_documents_and_producers() {
         "fn hello() { hello(); hello(); }\n",
     )
     .unwrap();
+    // Both documents must need history: unchanged eligible origins remain current evidence.
+    fs::write(
+        root.path().join("z.rs"),
+        "fn other() { let changed = 1; }
+",
+    )
+    .unwrap();
     let (graph, next, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let second = store
@@ -599,8 +625,13 @@ fn pending_release_excludes_history_and_released_requested_pin_expires() {
     let (graph, next, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     store.set_retention_clock_for_tests(1_001, 1);
+    // This fixture releases history; publish an owning failed selection rather than
+    // retaining the old tuple as a dependency of a native-first origin pin.
+    let (failed, requested) = failed_evidence(&next, root.path());
     let second = store
-        .publish_native(&graph, &capture, &next, &leader, first, &cancel)
+        .publish_native_semantic(
+            &graph, &capture, &next, &failed, &requested, &leader, first, &cancel,
+        )
         .unwrap();
     assert!(
         store
@@ -690,8 +721,11 @@ fn latest_eligible_tuple_does_not_fall_back_to_older_matching_facts() {
     .unwrap();
     let (graph, next, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (failed, requested) = failed_evidence(&next, root.path());
     let third = store
-        .publish_native(&graph, &capture, &next, &leader, second, &cancel)
+        .publish_native_semantic(
+            &graph, &capture, &next, &failed, &requested, &leader, second, &cancel,
+        )
         .unwrap();
     let history = store
         .semantic_history_for(third, &producer, &doc, &syntax)
@@ -1170,5 +1204,98 @@ fn history_uses_requested_heads_not_captured_descriptors() {
             store.semantic_at(first).unwrap().provenance,
             semantic.provenance
         );
+    }
+}
+
+#[test]
+fn origin_only_history_rejects_failed_or_omitted_tuples_with_facts() {
+    for invalid_state in ["failed", "omitted"] {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("hello.rs"), "fn hello() { hello(); }\n").unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(root.path().to_owned());
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let (semantic, captured) = evidence(&native, root.path());
+        let producer = semantic.producers[0].id.clone();
+        let document = native.revision.documents[0].key.clone();
+        let syntax = semantic.declaration_bindings[0].syntax_id.clone().unwrap();
+        let leader = store.publication_for_tests().unwrap();
+        let original = store
+            .publish_native_semantic(
+                &graph,
+                &capture,
+                &native,
+                &semantic,
+                &captured,
+                &leader,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        assert!(
+            store
+                .semantic_history_for(original, &producer, &document, &syntax)
+                .unwrap()
+                .is_none()
+        );
+        fs::write(
+            root.path().join("hello.rs"),
+            "fn hello() { hello(); hello(); }\n",
+        )
+        .unwrap();
+        let (graph, changed, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let selected = store
+            .publish_native(&graph, &capture, &changed, &leader, original, &cancel)
+            .unwrap();
+        let history = store
+            .semantic_history_for(selected, &producer, &document, &syntax)
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.presentation_freshness, s::Freshness::Stale);
+        assert_eq!(history.coverage.revision_id, native.revision.id);
+        assert!(!history.provenance.is_empty());
+        assert!(
+            history
+                .provenance
+                .iter()
+                .all(|proof| proof.revision_id == native.revision.id)
+        );
+        drop(leader);
+        drop(store);
+        let identity =
+            trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+                .unwrap();
+        let db = rusqlite::Connection::open(
+            state
+                .path()
+                .join("cache/indexes")
+                .join(identity.root_key)
+                .join("index.db"),
+        )
+        .unwrap();
+        let original_key = format!(
+            "pin:v1:{}:{}",
+            original.index_generation, original.index_revision
+        );
+        assert_eq!(db.execute(
+            "UPDATE semantic_coverage SET state=?1 WHERE revision_id=?2 AND producer_id=?3 AND path='hello.rs'",
+            rusqlite::params![invalid_state, original_key, producer],
+        ).unwrap(), 1);
+        drop(db);
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let error = store
+            .semantic_history_for(selected, &producer, &document, &syntax)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("corrupt unselected semantic tuple contains facts"),
+            "{invalid_state}: {error:#}"
+        );
+        assert!(store.recovery_pending_for_tests(), "{invalid_state}");
     }
 }

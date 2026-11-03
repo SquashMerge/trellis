@@ -260,6 +260,14 @@ Implementation may show that a rule needs to change. The change is then made to 
 **Amendment approved by the owner (2026-10-20, #199 R-3/S-4):**
 - **§§2, 4:** when startup reconciliation's capture is unchanged against the selected head, as defined in [Decision 0006's 2026-10-20 amendment](0006-revision-retention-and-index-gc.md#amendment-2026-10-20-no-revision-for-an-unchanged-capture), it publishes no new revision. It attests the existing head for the new writer incarnation, and `Reconciling → Ready` follows as after a commit. Startup reconciliation itself, the recovery order, FIFO order and the Q2→watcher→Q1 gate are otherwise unchanged; a no-op FIFO row completes `done` at the current head.
 
+## Draft amendment #620: cancellable semantic work below native priority
+
+**DRAFT FOR OWNER CONFIRMATION IN THE PR**, under the [2026-11-02 owner ruling](https://github.com/SquashMerge/trellis/issues/620#issuecomment-6586506796); implementation within that ruling needs no additional approval gate. The [topology amendment](../../local-topology.md#draft-amendment-620--native-first-semantic-publication) adds semantic catch-up to this same worker, not a second publication owner or durable queue. It is below startup/native FIFO/watcher work and above discretionary maintenance; existing native order and Q2→watcher→Q1 are unchanged.
+
+The “units are never preempted mid-way” rule in §4 does not make semantic catch-up uninterruptible: watcher ingress, accepted queue wake and shutdown promptly cancel its operation, including heavy loops and SQLite execution, unwind the attempt and release its writer. Cancellation is not corruption, contention or a FULL-fallback trigger. Before semantic COMMIT, verify the complete destination pin, native/input identities and ingress; a newer edit/import supersedes the older destination. Keep one coalesced pending destination derived from committed state, with cleanup scoped so it cannot clear a successor. No timeout or sampled busy flag proves completion.
+
+Startup readiness still requires validated native reconciliation or guarded unchanged attestation, not completion of semantic catch-up. Native requests complete at their readable native publication; explicit semantic imports retain durable completion semantics. Each separately committed phase gets a new paired index revision, without changing native `Revision.id` solely for semantic completion. Signals remain advisory; immutable document selections/status and durable request rows carry the respective truth. All root-loss settlement, terminal-COMMIT and retirement guarantees remain unchanged.
+
 ## Consequences
 
 - **What goes away:** the polling ticks, lane mutexes, lock-probe priority checks, the registry's `try_lock` release, serve's replacement wait, the CLI's request polling, and the relay's serial queue.

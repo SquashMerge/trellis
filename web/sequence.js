@@ -39,13 +39,35 @@ function sequenceEvidenceLabel(step, view) {
 function sequenceTargetActionLabel(declaration) {
   return ["function", "method"].includes(declaration.kind) ? "Open callee sequence" : "Read declaration source";
 }
-// The evidence tier of a view (#522): the producer whose fresh bindings built its lanes,
-// or why it shows syntax only. Server text, never inferred here.
+const semanticStatusLabels = {fresh:"Semantic ready", catchingUp:"Semantic catching up", unavailable:"Semantic unavailable"};
+function semanticStatusLabel(status) {
+  return semanticStatusLabels[status?.state] || "Semantic state not reported";
+}
+function semanticAvailabilitySummary(counts) {
+  if (!counts) return "Semantic state not reported";
+  return `Semantic: ${counts.fresh} ready · ${counts.catchingUp} catching up · ${counts.unavailable} unavailable`;
+}
+function semanticPendingDocuments(view) {
+  return (view?.semanticDocuments || []).filter(row => row.semanticStatus?.state === "catchingUp");
+}
+function semanticDocumentsSummary(view) {
+  const documents = view?.semanticDocuments;
+  if (!documents?.length) return "";
+  const counts = {fresh:0, catchingUp:0, unavailable:0};
+  for (const row of documents) if (Object.hasOwn(counts, row.semanticStatus?.state)) counts[row.semanticStatus.state]++;
+  return `${semanticAvailabilitySummary(counts)}${counts.catchingUp ? " · partial; missing results do not prove absence" : ""}`;
+}
+window.TrellisSemanticStatus = {label:semanticStatusLabel, summary:semanticAvailabilitySummary, pending:semanticPendingDocuments, documentsSummary:semanticDocumentsSummary};
+// Availability is independent of the freshness of each captured proof.
 function sequenceEvidenceSummary(view) {
   const semantic = view?.semantic;
+  const pending = semanticPendingDocuments(view).length;
+  const partial = pending ? "Semantic catching up · partial" : view?.partial ? "Semantic partial" : "";
   if (semantic?.tier === "semantic" && typeof semantic.producerId === "string" && semantic.producerId)
-    return `Semantic bindings · ${semantic.producerId}`;
-  return typeof semantic?.reason === "string" && semantic.reason ? `Syntax only · ${semantic.reason}` : "Syntax only";
+    return `${partial ? partial + " · " : ""}Semantic bindings · ${semantic.producerId}`;
+  if (pending) return `${partial} · measured syntax`;
+  const syntax = typeof semantic?.reason === "string" && semantic.reason ? `Syntax only · ${semantic.reason}` : "Syntax only";
+  return `${partial ? partial + " · " : ""}${syntax}`;
 }
 // The captured basis of a call's selected binding, as MCP reports it (#522).
 function sequenceBasisLabel(evidence) {
@@ -212,6 +234,7 @@ function sequenceEmptySummary(view, options = {}) {
   if (options.showDetails) return "";
   const display = sequenceDisplay(view, options);
   if ([...display.visible].some(step => step.kind === "call" || step.callId)) return "";
+  if (semanticPendingDocuments(view).length) return "Semantic catching up. No calls displayed; this partial view does not prove absence of calls.";
   if (steps.some(step => !step.hidden)) return "No measured calls in the admitted steps. Non-call behavior may be hidden; use Show all steps to inspect it.";
   if (!steps.length) return "No measured calls in the admitted steps. This does not mean no behavior; inspect source or Show all steps.";
   const hidden = [];

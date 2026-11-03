@@ -1478,7 +1478,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         };
                         let semantic = match response.mcp_call_semantics(
                             producer,
-                            &found.owner.selected.declaration.document.language,
+                            &found.owner.selected.declaration.document,
                             found.calls.iter().map(|call| &call.selected.call),
                         ) {
                             Err(error) if error.is::<crate::store::ProducerNotPublished>() => {
@@ -1522,14 +1522,14 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         } else {
                             symbol_id.expect("validated symbol ID")
                         };
-                        let Some(found) =
+                        let Some(mut found) =
                             response.mcp_incoming_with_lines(symbol_id, limit, expected)?
                         else {
                             return Ok(tools::failure(id, "not_found"));
                         };
                         let semantic = match response.mcp_call_semantics(
                             producer,
-                            &found.selected.selected.declaration.document.language,
+                            &found.selected.selected.declaration.document,
                             found.calls.iter().map(|call| &call.call),
                         ) {
                             Err(error) if error.is::<crate::store::ProducerNotPublished>() => {
@@ -1537,6 +1537,21 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             }
                             semantic => semantic?,
                         };
+                        if producer.is_some() {
+                            let language = &found.selected.selected.declaration.document.language;
+                            let bucket = match language.as_str() {
+                                "java" => 0,
+                                "rust" => 1,
+                                "python" => 2,
+                                "javascript" => 3,
+                                _ => anyhow::bail!("store_unavailable: invalid selected language"),
+                            };
+                            found.scope_semantic[bucket] = response
+                                .semantic_availability_for_producer_at(
+                                    Some(found.selected.selected.pin),
+                                    producer,
+                                )?[bucket];
+                        }
                         Ok(projection::incoming(
                             id,
                             found,

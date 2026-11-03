@@ -100,6 +100,51 @@ pub enum SemanticState {
     #[default]
     Unavailable,
 }
+/// Semantic work availability at one immutable native index pin, independent of proof freshness.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SemanticAvailability {
+    Fresh,
+    CatchingUp,
+    #[default]
+    Unavailable,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticOrigin {
+    pub pin: IndexPin,
+    pub revision_id: String,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentSemanticStatus {
+    pub state: SemanticAvailability,
+    pub producer_id: Option<String>,
+    pub semantic_origin: Option<SemanticOrigin>,
+    pub reason: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentSemantic {
+    pub document: crate::native_evidence::DocumentKey,
+    pub semantic_status: DocumentSemanticStatus,
+}
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticAvailabilityCounts {
+    pub fresh: u64,
+    pub catching_up: u64,
+    pub unavailable: u64,
+}
+impl SemanticAvailabilityCounts {
+    pub fn add(&mut self, state: SemanticAvailability) {
+        match state {
+            SemanticAvailability::Fresh => self.fresh += 1,
+            SemanticAvailability::CatchingUp => self.catching_up += 1,
+            SemanticAvailability::Unavailable => self.unavailable += 1,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Provenance {
@@ -310,6 +355,8 @@ pub struct IndexStatus {
     /// published (#483). `stats` is their combined total.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub semantic_languages: Vec<LanguageSemantic>,
+    #[serde(default)]
+    pub semantic_availability: SemanticAvailabilityCounts,
 }
 /// One language's semantic producer selection and its selected bindings in status (#483).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -321,6 +368,8 @@ pub struct LanguageSemantic {
     /// Why the language shows syntax only, when it does.
     pub semantic_note: Option<String>,
     pub semantic_state: SemanticState,
+    #[serde(default)]
+    pub semantic_availability: SemanticAvailabilityCounts,
     /// Measured calls in the language's documents.
     pub calls: usize,
     pub internal: usize,
@@ -467,6 +516,10 @@ impl ViewQuery {
 #[serde(rename_all = "camelCase")]
 pub struct ViewResult {
     pub revision: IndexPin,
+    #[serde(default)]
+    pub semantic_documents: Vec<DocumentSemantic>,
+    #[serde(default)]
+    pub partial: bool,
     pub query: ViewQuery,
     pub nodes: Vec<Symbol>,
     pub calls: Vec<CallSite>,

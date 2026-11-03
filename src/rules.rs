@@ -1460,6 +1460,7 @@ fn constraint(
     use crate::references::SemanticOutcome;
     let role = &config.roles[&c.role];
     let bound = doc.semantic.producer_id.is_some();
+    let availability = doc.semantic.semantic_status.state;
     let calls = c.kind == "calls";
     let mut evidence = vec![native_evidence(d)];
     let (mut hits, mut uncertain) = (0usize, 0usize);
@@ -1533,13 +1534,27 @@ fn constraint(
         )
     };
     let (status, reason) = match (c.mode, bound, hits > 0) {
+        ("require", true, true) => ("conforms", None),
+        ("forbid", true, true) => ("deviates", None),
+        _ if availability == crate::model::SemanticAvailability::CatchingUp => {
+            ("unknown", Some("semantic_catching_up"))
+        }
         (_, false, _) => ("unknown", Some(unavailable)),
-        ("require", _, true) => ("conforms", None),
-        ("forbid", _, true) => ("deviates", None),
-        ("forbid", _, false) if calls && uncertain == 0 && doc.semantic.complete => {
+        ("forbid", _, false)
+            if calls
+                && uncertain == 0
+                && doc.semantic.complete
+                && availability == crate::model::SemanticAvailability::Fresh =>
+        {
             ("conforms", None)
         }
-        _ if uncertain > 0 || (calls && !doc.semantic.complete) => ("unknown", Some(incomplete)),
+        _ if uncertain > 0
+            || (calls
+                && (!doc.semantic.complete
+                    || availability != crate::model::SemanticAvailability::Fresh)) =>
+        {
+            ("unknown", Some(incomplete))
+        }
         // Only a forbidden type relationship reaches here: absence is not proof.
         ("forbid", ..) => ("unknown", Some("type_relationship_absence_unproven")),
         _ => ("unknown", Some(absent)),
@@ -1947,6 +1962,12 @@ pub(crate) fn evaluate_prepared<'a>(
     check()?;
     let partial_files = &refs.data["partialFiles"];
     let mut limitations = limitations(semantic);
+    if refs.data["semanticAvailability"]["catchingUp"]
+        .as_u64()
+        .is_some_and(|count| count > 0)
+    {
+        limitations.push("Semantic enrichment is catching up for selected documents; missing semantic facts cannot establish conformance.".into());
+    }
     let partial = partial_files.as_array().map_or(0, Vec::len);
     if partial > 0 {
         limitations.push(crate::syntax_bounds::limitation(partial));
@@ -1954,7 +1975,8 @@ pub(crate) fn evaluate_prepared<'a>(
     Ok(Evaluation {
         data: json!({"rulesVersion":"rules:v2","indexGeneration":refs.data["indexGeneration"],"indexRevision":refs.data["indexRevision"],"rulesFile":descriptor(config),
         "counts":counts(&instances),"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"unassignedFileCount":unassigned_files,"externalPackages":external_packages,
-        "partialFiles":partial_files,"limitations":limitations}),
+        "partialFiles":partial_files,"semanticComplete":false,"partial":refs.data["partial"],
+        "semanticDocuments":refs.data["semanticDocuments"],"semanticAvailability":refs.data["semanticAvailability"],"limitations":limitations}),
         layers: assignments,
     })
 }
@@ -2191,6 +2213,132 @@ mod document_parallel_tests {
             documents,
             manifests: vec![],
             evidence_gaps: Default::default(),
+        }
+    }
+
+    #[test]
+    fn catching_up_zero_call_constraints_cannot_prove_absence() {
+        let config = parse(
+            "version=1\n[roles.idle]\nselect={name='idle'}\n\
+             [[rules]]\nid='never'\nfor_each='idle'\nforbid=[{calls='idle'}]\n\
+             [[rules]]\nid='required'\nfor_each='idle'\nrequire=[{calls='idle'}]\n",
+        )
+        .unwrap();
+        let mut snapshot = snapshot(&[("src/lib.rs", "pub fn idle() {}")]);
+        let doc = &mut snapshot.documents[0];
+        assert!(doc.calls.is_empty());
+        doc.semantic.producer_id = Some("selected".into());
+        doc.semantic.complete = true;
+        for (availability, forbidden_status) in [
+            (crate::model::SemanticAvailability::CatchingUp, "unknown"),
+            (crate::model::SemanticAvailability::Fresh, "conforms"),
+        ] {
+            doc.semantic.semantic_status.state = availability;
+            let rows = evaluate_document(
+                &config,
+                &Targets::new(),
+                doc,
+                false,
+                None,
+                100_000,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            let forbidden = rows
+                .instances
+                .iter()
+                .find(|row| row["rule"] == "never")
+                .unwrap();
+            assert_eq!(forbidden["status"], forbidden_status);
+            let required = rows
+                .instances
+                .iter()
+                .find(|row| row["rule"] == "required")
+                .unwrap();
+            assert_eq!(required["status"], "unknown");
+            if availability == crate::model::SemanticAvailability::CatchingUp {
+                for row in &rows.instances {
+                    assert_eq!(
+                        row["constraints"][0]["unresolved"],
+                        json!(["semantic_catching_up"])
+                    );
+                }
+            }
+        }
+        // Pending is explicit even when no producer bindings were admitted.
+        doc.semantic.producer_id = None;
+        doc.semantic.semantic_status.state = crate::model::SemanticAvailability::CatchingUp;
+        let rows = evaluate_document(
+            &config,
+            &Targets::new(),
+            doc,
+            false,
+            None,
+            100_000,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert!(rows.instances.iter().all(|row| row["status"] == "unknown"));
+        assert!(
+            rows.instances
+                .iter()
+                .all(|row| row["constraints"][0]["unresolved"] == json!(["semantic_catching_up"]))
+        );
+    }
+
+    #[test]
+    fn catching_up_keeps_independent_positive_call_facts() {
+        let config = parse(
+            "version=1\n[roles.run]\nselect={name='run'}\n[roles.target]\nselect={name='target'}\n\
+             [[rules]]\nid='required'\nfor_each='run'\nrequire=[{calls='target'}]\n\
+             [[rules]]\nid='forbidden'\nfor_each='run'\nforbid=[{calls='target'}]\n",
+        )
+        .unwrap();
+        let mut snapshot = snapshot(&[(
+            "src/lib.rs",
+            "pub fn run() { target(); } pub fn target() {}",
+        )]);
+        let doc = &mut snapshot.documents[0];
+        let target = doc
+            .declarations
+            .iter()
+            .find(|d| d.name.as_deref() == Some("target"))
+            .unwrap();
+        let sid = target.syntax_id.clone();
+        let call = &doc.calls[0];
+        doc.semantic.producer_id = Some("selected".into());
+        doc.semantic.semantic_status.state = crate::model::SemanticAvailability::CatchingUp;
+        doc.semantic
+            .anchors
+            .push(crate::references::SemanticAnchor {
+                range: call.range.clone(),
+                call_id: Some(call.id.clone()),
+                type_role: false,
+                direct: true,
+                outcome: crate::references::SemanticOutcome::Internal(0, sid),
+                provenance_id: "admitted-binding".into(),
+            });
+        let targets = doc
+            .declarations
+            .iter()
+            .map(|d| ((0, d.syntax_id.as_str()), d))
+            .collect();
+        let rows = evaluate_document(&config, &targets, doc, false, None, 100_000, &mut || Ok(()))
+            .unwrap();
+        for (rule, expected) in [("required", "conforms"), ("forbidden", "deviates")] {
+            let row = rows
+                .instances
+                .iter()
+                .find(|row| row["rule"] == rule)
+                .unwrap();
+            assert_eq!(row["status"], expected);
+            assert!(
+                row["constraints"][0]["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["provenanceId"] == "admitted-binding")
+            );
         }
     }
 

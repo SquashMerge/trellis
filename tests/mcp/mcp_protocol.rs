@@ -622,13 +622,43 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
         };
         (
             name,
-            format!("{name}: {count} {items}{truncated}; full result in structuredContent."),
+            format!(
+                "{name}: {count} {items}{}{}{}{truncated}; full result in structuredContent.",
+                if has_semantic_pending(data) {
+                    ", semantic catching up"
+                } else {
+                    ""
+                },
+                if envelope["partial"] == true {
+                    ", partial"
+                } else {
+                    ""
+                },
+                if data["counts"]["unknown"].as_u64().is_some_and(|n| n > 0) {
+                    ", unknown outcomes"
+                } else {
+                    ""
+                }
+            ),
         )
     };
     assert!(trellis::mcp::catalog::known(name));
     assert_eq!(text, expected);
     assert_eq!(v["result"]["content"].as_array().unwrap().len(), 1);
 }
+fn has_semantic_pending(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => fields.iter().any(|(key, value)| {
+            (key == "semanticStatus" && value["state"] == "catchingUp")
+                || (key == "semanticAvailability"
+                    && value["catchingUp"].as_u64().is_some_and(|n| n > 0))
+                || has_semantic_pending(value)
+        }),
+        Value::Array(rows) => rows.iter().any(has_semantic_pending),
+        _ => false,
+    }
+}
+
 /// Validate actual tool envelopes, not the summary string, with each catalog JSON Schema.
 fn validate_structured_content(pairs: &[Value]) {
     let script = r#"
@@ -760,7 +790,9 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str, home: &P
                     row["semantic"],
                     json!({"available":false,"producerId":null,"freshness":"unavailable",
                         "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
-                        "note":"no semantic producer published; showing syntax","partialReasons":null})
+                        "note":"no semantic producer published; showing syntax","partialReasons":null,
+                        "semanticAvailability":{"fresh":0,"catchingUp":0,"unavailable":
+                            row["coverage"]["selected"].as_u64().unwrap() + row["coverage"]["unselected"].as_u64().unwrap()}})
                 );
             }
             let partial = languages
@@ -855,7 +887,8 @@ fn empty_scope_coverage() -> Value {
             "selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
             "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
                 "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
-                "note":"no semantic producer published; showing syntax"}})
+                "note":"no semantic producer published; showing syntax",
+                "semanticAvailability":{"fresh":0,"catchingUp":0,"unavailable":0}}})
     };
     json!([row("java"), row("rust"), row("python"), row("javascript")])
 }
@@ -1873,7 +1906,14 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
         assert!(incoming_data["callers"][0]["binding"].is_null());
         assert!(incoming_data["callers"][0]["targetId"].is_null());
         assert_eq!(incoming_data["scopeCoverage"].as_array().unwrap().len(), 4);
-        assert_eq!(incoming_data["documents"].as_array().unwrap().len(), 1);
+        assert_eq!(incoming_data["documents"].as_array().unwrap().len(), 2);
+        assert!(
+            incoming_data["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|document| document.get("semanticStatus").is_some())
+        );
         assert_eq!(
             incoming["result"]["structuredContent"]["evidenceBasis"],
             pin
@@ -5077,7 +5117,11 @@ async fn describe_cold_initial_startup_reports_indexing_without_prior_coverage()
     assert_eq!(*envelope, expected);
     assert_eq!(
         answer["result"]["content"][0]["text"],
-        "trellis_workspace_describe: 1 workspace; full result in structuredContent."
+        if envelope["partial"] == true {
+            "trellis_workspace_describe: 1 workspace, partial; full result in structuredContent."
+        } else {
+            "trellis_workspace_describe: 1 workspace; full result in structuredContent."
+        }
     );
     resume_tx.send(()).unwrap();
     drop(client);
@@ -6847,7 +6891,8 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             "failed":counts[3],"unselected":counts[4]},
             "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
                 "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
-                "note":"no semantic producer published; showing syntax"}})
+                "note":"no semantic producer published; showing syntax",
+                "semanticAvailability":{"fresh":0,"catchingUp":0,"unavailable":counts[0]+counts[4]}}})
     };
     assert_eq!(
         data["data"]["scopeCoverage"],
@@ -10788,18 +10833,29 @@ fn assert_incoming_emitted_proof_closure(declaration: &Value, incoming: &Value) 
     let calls = data["callers"].as_array().unwrap();
     assert_eq!(
         docs.len(),
-        calls.len(),
-        "each distinct emitted caller owns one document"
+        calls.len() + 1,
+        "selected owner plus each distinct emitted caller owns one document"
     );
-    assert!(
-        docs.iter()
-            .all(|doc| doc["document"]["path"] != "target.js"),
-        "selected declaration is proof closure, not a caller document ref"
+    let selected_doc = docs
+        .iter()
+        .position(|doc| {
+            doc["document"] == selected_version["document"]
+                && doc["revisionId"] == selected_version["revisionId"]
+        })
+        .unwrap();
+    assert_eq!(
+        docs[selected_doc]["semanticStatus"],
+        selected_version["semanticStatus"]
     );
-    let referenced: BTreeSet<_> = calls
+    let mut referenced: BTreeSet<_> = calls
         .iter()
         .map(|call| call["doc"].as_u64().unwrap() as usize)
         .collect();
+    assert!(
+        !referenced.contains(&selected_doc),
+        "selected target is not a caller"
+    );
+    referenced.insert(selected_doc);
     assert_eq!(referenced, (0..docs.len()).collect());
     let mut expected_proofs: BTreeSet<_> = docs
         .iter()
@@ -10847,9 +10903,10 @@ async fn incoming_default_six_limit_twenty_and_one_keep_exact_required_closure()
         let docs = data["documents"].as_array().unwrap();
         assert_eq!(docs[0]["document"]["path"], "caller00.js");
         assert_eq!(
-            docs.last().unwrap()["document"]["path"],
+            docs[expected - 1]["document"]["path"],
             format!("caller{:02}.js", expected - 1)
         );
+        assert_eq!(docs.last().unwrap()["document"]["path"], "target.js");
         assert!(
             !docs
                 .iter()
@@ -10875,10 +10932,12 @@ async fn incoming_byte_clipping_overrides_limit_and_discards_omitted_proofs() {
     assert_eq!(envelope["truncated"], true);
     assert_incoming_emitted_proof_closure(&declaration, &response);
     let docs = data["documents"].as_array().unwrap();
+    let last_caller = data["callers"].as_array().unwrap().last().unwrap();
     assert_eq!(
-        docs.last().unwrap()["document"]["path"],
+        emitted_document(data, last_caller)["document"]["path"],
         format!("caller{:02}.js", count - 1)
     );
+    assert_eq!(docs.last().unwrap()["document"]["path"], "target.js");
     assert!(
         !docs
             .iter()
@@ -11505,16 +11564,25 @@ async fn rules_check_paths_scope_the_unassigned_list_through_every_page() {
     // The file the issue checked: assigned, so nothing unrelated comes back.
     let scoped = ask(1, json!({"schemaVersion":1,"paths":["app_main.js"]}));
     assert_eq!(paths(&scoped), Vec::<String>::new());
-    assert_eq!(scoped["page"]["total"], 0);
+    assert_eq!(scoped["page"]["total"], 1);
+    assert_eq!(
+        scoped["semanticDocuments"][0]["document"]["path"],
+        "app_main.js"
+    );
     assert_eq!(
         scoped["unassignedFileCount"], 60,
         "the total stays checkout-wide"
     );
     let one = ask(2, json!({"schemaVersion":1,"paths":["loose_007.js"]}));
     assert_eq!(paths(&one), ["loose_007.js"]);
-    assert_eq!(one["page"]["total"], 1);
+    assert_eq!(one["page"]["total"], 2);
+    assert_eq!(
+        one["semanticDocuments"][0]["document"]["path"],
+        "loose_007.js"
+    );
     let some = ask(3, json!({"schemaVersion":1,"paths":["loose_00*.js"]}));
-    assert_eq!(some["page"]["total"], 10);
+    assert_eq!(some["page"]["total"], 20);
+    assert_eq!(some["semanticDocuments"].as_array().unwrap().len(), 10);
     // Without paths, the whole catalog is still there.
     let mut all = Vec::new();
     let mut offset = 0;
@@ -14838,8 +14906,8 @@ async fn compact_outgoing_keeps_the_full_answers_hints_for_the_same_calls() {
 
 /// #528 review: a malformed stored semantic enum is typed corruption, never healthy
 /// availability. The store is reopened after the edit, as accidental corruption would be.
-#[test]
-fn malformed_semantic_freshness_or_state_fails_language_tiers() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_semantic_freshness_or_state_fails_language_tiers() {
     fn index_db(dir: &Path) -> Option<PathBuf> {
         for entry in fs::read_dir(dir).ok()? {
             let path = entry.ok()?.path();
@@ -14858,14 +14926,18 @@ fn malformed_semantic_freshness_or_state_fails_language_tiers() {
         "UPDATE semantic_coverage SET state='garbage'",
     ] {
         let state = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let mut publisher = graph_fixtures::Publisher::open(state.path(), root.path());
+        let root = checkout(state.path());
+        let mut publisher = graph_fixtures::Publisher::open(state.path(), &root);
+        publisher
+            .store
+            .mcp_prepare_virgin_queue_for_tests()
+            .unwrap();
         let mut spec = graph_fixtures::Spec::new(&[("src/lib.rs", "fn a(){b();} fn b(){}")]);
         spec.bindings = vec![graph_fixtures::bind("a", 0, "b")];
         publisher.publish(&spec);
         drop(publisher);
         // Healthy first: rust has fresh selected semantic evidence.
-        let store = trellis::store::Store::open_for_tests(state.path(), root.path()).unwrap();
+        let store = trellis::store::Store::open_for_tests(state.path(), &root).unwrap();
         let tiers = store
             .evidence_response()
             .unwrap()
@@ -14879,16 +14951,38 @@ fn malformed_semantic_freshness_or_state_fails_language_tiers() {
         ))
         .unwrap();
         drop(db);
-        let store = trellis::store::Store::open_for_tests(state.path(), root.path()).unwrap();
-        let error = store
-            .evidence_response()
+        // Every SQLite handle is closed before the runtime opens this index.
+        let identity = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
             .unwrap()
-            .mcp_language_tiers()
-            .unwrap_err();
-        assert!(
-            error.to_string().starts_with("store_unavailable:"),
-            "{corruption}: {error:#}"
+            .attach_marker()
+            .unwrap();
+        let topology = trellis::store::topology::TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
         );
+        let mut registry = trellis::daemon::registry::CheckoutRegistry::with_roots(topology);
+        registry.attach_launch(620, &identity).unwrap();
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP);
+        }));
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+        let (mut client, mut reader, session) = socket_session(&identity, &registry, 620, None);
+        writeln!(client, "{}", describe_call(1)).unwrap();
+        let reply = next_reply(&mut reader);
+        let _ = release_tx.send(());
+        tool(&reply, Some("store_unavailable"), true);
+        let envelope = &reply["result"]["structuredContent"];
+        assert!(envelope.get("data").is_none(), "{corruption}: {reply}");
+        validate_structured_content(&[json!({"name":"trellis_workspace_describe",
+            "structuredContent":envelope})]);
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
     }
 }
 

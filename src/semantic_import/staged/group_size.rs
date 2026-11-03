@@ -734,14 +734,22 @@ mod tests {
 
     #[test]
     fn group_denial_precedes_build_and_last_pin_retains_reservation() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (header, mut document, rows) = empty_group_input();
         document.content_hash = "bad hash".into();
         let measure = LiveBudget::new(BatchLimits::PRODUCTION.unit_expansion_bytes);
         let bytes = group_build(&header, &document, &rows, &measure).unwrap();
         let denied = LiveBudget::new(bytes - 1);
-        let error = DocGroup::build(&header, document, rows, denied.reserve(0).unwrap(), &denied)
-            .err()
-            .unwrap();
+        let error = DocGroup::build(
+            &header,
+            document,
+            rows,
+            denied.reserve(0).unwrap(),
+            &denied,
+            &cancel,
+        )
+        .err()
+        .unwrap();
         assert!(
             matches!(error.downcast_ref::<ScipCaptureError>(),Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion")
         );
@@ -754,6 +762,7 @@ mod tests {
             rows,
             measure.reserve(0).unwrap(),
             &measure,
+            &cancel,
         )
         .err()
         .unwrap();
@@ -762,7 +771,15 @@ mod tests {
         let bytes = group_build(&header, &document, &rows, &measure).unwrap();
         let live = LiveBudget::new(bytes);
         let group = Rc::new(
-            DocGroup::build(&header, document, rows, live.reserve(0).unwrap(), &live).unwrap(),
+            DocGroup::build(
+                &header,
+                document,
+                rows,
+                live.reserve(0).unwrap(),
+                &live,
+                &cancel,
+            )
+            .unwrap(),
         );
         let pin = group.clone();
         drop(group);
@@ -868,6 +885,7 @@ mod tests {
     /// within its admitted load and build charge.
     #[test]
     fn retained_group_charge_tracks_real_storage() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         for calls in [0, 1, 10, 1_000, 5_000] {
             let (header, document, rows) = call_group_input(calls);
             let measure = LiveBudget::new(BatchLimits::PRODUCTION.unit_expansion_bytes);
@@ -889,8 +907,15 @@ mod tests {
             let live = LiveBudget::new(BatchLimits::PRODUCTION.unit_expansion_bytes);
             let (group, kept, peak) = crate::test_alloc::measure_peak(|| {
                 Rc::new(
-                    DocGroup::build(&header, document, rows, live.reserve(0).unwrap(), &live)
-                        .unwrap(),
+                    DocGroup::build(
+                        &header,
+                        document,
+                        rows,
+                        live.reserve(0).unwrap(),
+                        &live,
+                        &cancel,
+                    )
+                    .unwrap(),
                 )
             });
             // The rows were allocated before the build and move into the group.

@@ -2017,9 +2017,22 @@ impl CheckoutRuntime {
         anyhow::ensure!((1..=150).contains(&limit), "limit must be 1..150");
         let (response, catching_up) = self.evidence_response()?;
         let (revision, items) = response.symbols_at(search, limit)?;
+        let mut documents = std::collections::BTreeMap::new();
+        for item in &items {
+            if !documents.contains_key(&item.path) {
+                documents.insert(
+                    item.path.clone(),
+                    response.document_semantic_status_at(&item.path, None)?,
+                );
+            }
+        }
+        let semantic_availability = response.semantic_availability_at(None)?;
         response.finish(())?;
         Ok(serde_json::json!({"catchingUp": catching_up,
-            "data": {"revision": revision, "items": items}}))
+            "data": {"revision": revision, "items": items,
+                "semanticDocuments": documents.into_iter().map(|(path, semantic_status)|
+                    serde_json::json!({"path":path,"semanticStatus":semantic_status})).collect::<Vec<_>>(),
+                "semanticAvailability": semantic_availability}}))
     }
 
     pub fn cli_query(&self, query: &crate::model::ViewQuery) -> anyhow::Result<serde_json::Value> {

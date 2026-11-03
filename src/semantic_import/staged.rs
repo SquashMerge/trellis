@@ -20,7 +20,7 @@ use super::{
         BasisFor, Bytes, DocumentJoinState, GlobalJoinReads, JoinFacts, JoinSink, JoinStore,
         MethodSummary, OccurrenceRow, ProofIdentities, ProofRef, RelationshipRow,
     },
-    mapped_range, occurrence_endpoints, range_endpoints, rejoin_provenance_id, source_role_sites,
+    mapped_range, occurrence_endpoints, range_endpoints, rejoin_provenance_id,
 };
 use crate::{
     model::{CancelFlag, IndexPin},
@@ -287,7 +287,9 @@ impl DocGroup {
         rows: crate::store::NativeDocumentRows,
         mut native_reservation: Reservation,
         live: &Rc<LiveBudget>,
+        cancel: &CancelFlag,
     ) -> Result<Self> {
+        super::check_semantic_cancel(cancel)?;
         native_reservation.grow(group_size::group_build(header, &document, &rows, live)?)?;
         let key = document.key.clone();
         let sources = BTreeMap::from([(key.clone(), rows.source)]);
@@ -307,13 +309,14 @@ impl DocGroup {
             capability_reports: vec![rows.capability_report],
             search_cards: vec![],
         };
-        let (candidates, support) = MeasuredFacts::anchor_parts(&mini, &sources, &key)?;
+        let (candidates, support) = MeasuredFacts::anchor_parts(&mini, &sources, &key, cancel)?;
         let bytes = sources.into_values().next().expect("one source");
         let text: Rc<str> = Rc::from(String::from_utf8(bytes).context("non-UTF8 native source")?);
         let (declarations, calls, references) = (&mini.declarations, &mini.calls, &mini.references);
         let mut declaration_ids: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut declaration_names = BTreeSet::new();
         for (index, d) in declarations.iter().enumerate() {
+            super::check_semantic_cancel(cancel)?;
             declaration_ids
                 .entry(d.syntax_id.clone())
                 .or_default()
@@ -324,10 +327,12 @@ impl DocGroup {
         }
         let mut call_ids: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (index, c) in calls.iter().enumerate() {
+            super::check_semantic_cancel(cancel)?;
             call_ids.entry(c.id.clone()).or_default().push(index);
         }
         let mut reference_ids: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (index, r) in references.iter().enumerate() {
+            super::check_semantic_cancel(cancel)?;
             reference_ids.entry(r.id.clone()).or_default().push(index);
         }
         // What the group does not keep drops before its charge shrinks to what it keeps.
@@ -680,7 +685,12 @@ impl<'a> StagedSide<'a> {
                 .reservation
                 .borrow_mut()
                 .grow(local.coordinate_bytes(admitted_encoding)?)?;
-            let maps = document_coordinates(&local.claims, &group.text, admitted_encoding)?;
+            let maps = document_coordinates(
+                &local.claims,
+                &group.text,
+                admitted_encoding,
+                &self.ctx.cancel,
+            )?;
             *local.coordinates.borrow_mut() = Some(maps);
         }
         let coordinates = local.coordinates.borrow();
@@ -749,6 +759,7 @@ impl<'a> StagedSide<'a> {
             rows,
             reservation,
             &self.ctx.live,
+            &self.ctx.cancel,
         )?);
         let mut cache = self.ctx.cache.borrow_mut();
         let mut counters = self.ctx.counters.borrow_mut();
@@ -1217,10 +1228,11 @@ impl<'a> JoinStore for StagedSide<'a> {
         #[cfg(feature = "test-support")]
         super::note_parsed_role_site_document(document);
         let group = self.require_group(document)?;
-        source_role_sites(
+        super::source_role_sites_reserved(
             document.language.as_str(),
             group.text.as_bytes(),
             group.native.capability_reports.first(),
+            &mut |_| self.ctx.check_cancel(),
         )
     }
 
@@ -1236,7 +1248,10 @@ impl<'a> JoinStore for StagedSide<'a> {
             document.language.as_str(),
             group.text.as_bytes(),
             group.native.capability_reports.first(),
-            &mut |bytes| operation.grow(bytes()?),
+            &mut |bytes| {
+                self.ctx.check_cancel()?;
+                operation.grow(bytes()?)
+            },
         )?;
         if let Some(local) = &self.local_claims {
             let text = (group.text.as_ptr() as usize, group.text.len());

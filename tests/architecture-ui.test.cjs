@@ -76,7 +76,7 @@ function harness() {
     clearArchitectureInspector:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
     showArchitectureInspector:() => {get("architecture-inspector").hidden=false;},
   }};
-  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/sequence.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
   const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
     if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; return emulateDetails(full, url); }
     calls.push({url,current,options}); const data = await response(url,options);
@@ -830,17 +830,37 @@ test("#523: inspectors describe semantic evidence for mixed edges and bound rule
   h.setResponse(async () => ({payload})); await h.controller.refresh();
   h.renders[0].options.onSelectEdge(payload.edges[0]); await flush();
   const edgeText = text(h.get("architecture-inspector-content"));
-  assert.match(edgeText, /Syntax evidence and fresh semantic bindings · not semantically complete/);
+  assert.match(edgeText, /Syntax evidence and captured semantic bindings · not semantically complete/);
   assert.match(edgeText, /reference sites, 2 bound by semantic evidence/);
   assert.doesNotMatch(edgeText, /not compiler-resolved calls/);
   const rule = descendants(h.get("architecture-review-list")).find(item => item.tagName === "button" && item.textContent.startsWith("$layers · "));
   assert.ok(rule); await rule.fire("click"); await flush();
   const ruleText = text(h.get("architecture-inspector-content"));
-  assert.match(ruleText, /Semantic evidence names a fresh producer binding/);
+  assert.match(ruleText, /Semantic evidence names a captured producer binding/);
   assert.doesNotMatch(ruleText, /not destination symbol bindings/);
   // A syntax-only snapshot keeps the syntax wording.
   const plain = harness(), syntax = authoringFixture();
   plain.setResponse(async () => ({payload:syntax})); await plain.controller.refresh();
   plain.renders[0].options.onSelectEdge(syntax.edges[0]); await flush();
   assert.match(text(plain.get("architecture-inspector-content")), /Syntax evidence · not compiler-resolved calls.*structural reference sites/s);
+});
+
+
+test("zero-site Architecture includes pending document state and origin instead of semantic absence", async () => {
+  const h = harness(), payload = fixture();
+  const semanticStatus = {state:"catchingUp",producerId:"rust",semanticOrigin:null,reason:"semantic join pending"};
+  payload.semanticDocuments = [{document:{sourceSetId:"workspace",language:"rust",path:"src/a.rs"},semanticStatus}];
+  payload.modules[0].semanticStatus = semanticStatus;
+  payload.references = {production:[],tests:[],unresolved:[],counts:{mappedSites:0,semanticSites:0,unresolvedSites:0},coverage:[],limitations:[]};
+  payload.edges = [];
+  h.setResponse(async () => ({payload,catchingUp:false}));
+  await h.controller.refresh();
+  assert.match(h.get("architecture-coverage").textContent, /Semantic catching up · partial/);
+  assert.match(text(h.get("architecture-notice-content")), /1 catching up.*missing results do not prove absence/);
+  assert.match(text(h.get("architecture-notice-content")), /semantic join pending/);
+  assert.match(text(h.get("architecture-notice-content")), /Missing sites do not prove absence/);
+  h.renders[0].options.onSelectModule(payload.modules[0]);
+  assert.match(text(h.get("architecture-inspector-content")), /Semantic catching up/);
+  assert.match(text(h.get("architecture-inspector-content")), /nativePin.*indexRevision.*semanticStatus/s);
+  assert.equal(payload.semanticComplete, false);
 });

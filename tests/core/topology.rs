@@ -766,7 +766,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        34
+        35
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -1122,9 +1122,9 @@ fn gc_classifies_current_schema_but_refuses_spoofed_shapes() {
     }
     db.pragma_update(None, "user_version", 0).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 35).unwrap();
+    db.pragma_update(None, "user_version", 36).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 34).unwrap();
+    db.pragma_update(None, "user_version", 35).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();
@@ -1141,7 +1141,7 @@ fn complete_current_schema_index_remains_gc_eligible() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        34
+        35
     );
     let now = 1_800_000_000_i64;
     db.execute(

@@ -105,12 +105,22 @@ impl SnapshotGraphSource<'_> {
             freshness: "fresh".into(),
             derived_from: None,
         })?;
-        let semantic = match self.producer_for(&key.language)? {
-            Some(producer) => self.read_semantic(&producer, key)?,
-            None => None,
+        let (semantic, semantic_status) = match self.producer_for(&key.language)? {
+            Some(producer) => (
+                self.read_semantic(&producer, key)?,
+                semantic_document_status(
+                    self.db,
+                    self.selected,
+                    &producer,
+                    &key.language,
+                    &key.path,
+                )?,
+            ),
+            None => (None, crate::model::DocumentSemanticStatus::default()),
         };
         Ok(DocumentFacts {
             key: key.clone(),
+            semantic_status,
             declarations,
             calls,
             native_coverage,
@@ -121,18 +131,17 @@ impl SnapshotGraphSource<'_> {
 
     /// `None` when the producer has no coverage row for the document; the engine reports it.
     fn read_semantic(&self, producer: &str, key: &DocumentKey) -> Result<Option<SemanticDocument>> {
-        let tuple: Option<i64> = self
-            .db
-            .query_row(
-                "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
-                params![self.selected.key, producer, key.language, key.path],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(tuple) = tuple else {
+        let origin =
+            semantic_document_origin(self.db, self.selected, producer, &key.language, &key.path)?;
+        if !origin.source_eligible && origin.catching_up {
+            return Ok(None);
+        }
+        let Some(tuple) = origin.tuple_id else {
             return Ok(None);
         };
-        let snapshot = read_semantic_tuple(self.db, &self.selected.key, Some(tuple), None, true)?;
+        let mut snapshot =
+            read_semantic_tuple(self.db, &origin.origin_key, Some(tuple), None, true)?;
+        semantic_display::filter_semantic_snapshot(self.db, self.selected, tuple, &mut snapshot)?;
         let [coverage] = <[_; 1]>::try_from(snapshot.coverage).map_err(|_| {
             SelectedIntegrity("incompatible_index: corrupt selected semantic coverage".into())
         })?;
@@ -377,11 +386,16 @@ pub(super) fn navigation_calls(
         language: document.file.language.clone(),
         path: selector.path.clone(),
     };
-    let tuple: Option<i64> = db.query_row(
-        "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
-        params![selected.key, producer, key.language, key.path], |row| row.get(0),
-    ).optional()?;
-    let tuple = tuple.context(SelectedIntegrity("missing producer coverage tuple".into()))?;
+    let origin = semantic_document_origin(db, selected, producer, &key.language, &key.path)?;
+    if !origin.source_eligible && origin.catching_up {
+        return Ok(());
+    }
+    let Some(tuple) = origin.tuple_id else {
+        if origin.catching_up {
+            return Ok(());
+        }
+        return Err(SelectedIntegrity("missing producer coverage tuple".into()).into());
+    };
     let proof_id = source.scope(&key)?.proof_id();
     let mut target_documents = BTreeMap::new();
     let local = document.graph_calls.iter().filter(|call| {
@@ -421,14 +435,15 @@ pub(super) fn navigation_calls(
         if !navigation_call_budget(db, tuple, &encoded, reader)? {
             break;
         }
-        let facts = read_semantic_tuple_for_call(
+        let mut facts = read_semantic_tuple_for_call(
             db,
-            &selected.key,
+            &origin.origin_key,
             Some(tuple),
             None,
             true,
             Some(&encoded),
         )?;
+        semantic_display::filter_semantic_snapshot(db, selected, tuple, &mut facts)?;
         let [coverage] = <[_; 1]>::try_from(facts.coverage)
             .map_err(|_| SelectedIntegrity("corrupt selected semantic coverage".into()))?;
         let semantic = SemanticDocument {
@@ -516,6 +531,8 @@ pub(super) fn sequence_calls(
     let key = source
         .locate(&view.seed.id)?
         .ok_or_else(|| SelectedIntegrity("selected sequence declaration missing".into()))?;
+    let document = source.document(&key)?;
+    publish_sequence_semantics(view, &source.facts);
     let defaults = source.defaults()?.clone();
     let Some(producer) = defaults.producer(&key.language).map(str::to_owned) else {
         if defaults
@@ -531,7 +548,6 @@ pub(super) fn sequence_calls(
         return Ok(());
     };
     let languages = defaults.languages();
-    let document = source.document(&key)?;
     let declaration = document
         .declarations
         .get(&view.seed.id)
@@ -539,6 +555,11 @@ pub(super) fn sequence_calls(
         .clone();
     let Some(semantic) = engine::semantic(Some(&languages), &document).map_err(engine_error)?
     else {
+        if document.semantic_status.state == crate::model::SemanticAvailability::CatchingUp {
+            view.semantic = SequenceSemantic::syntax(Some(
+                "Semantic evidence is catching up for this document; showing syntax.".into(),
+            ));
+        }
         cap_visible(view, crate::behavior::MAX_STEPS);
         return Ok(());
     };
@@ -548,7 +569,13 @@ pub(super) fn sequence_calls(
         .map(Vec::as_slice)
         .unwrap_or_default();
     if let Some(reason) = syntax_fallback(semantic, seed_calls, &key.path, &mut source)? {
-        view.semantic = SequenceSemantic::syntax(Some(reason));
+        view.semantic = SequenceSemantic::syntax(Some(
+            if document.semantic_status.state == crate::model::SemanticAvailability::CatchingUp {
+                "Semantic evidence is catching up for this document; showing syntax.".into()
+            } else {
+                reason
+            },
+        ));
         cap_visible(view, crate::behavior::MAX_STEPS);
         return Ok(());
     }
@@ -657,7 +684,31 @@ pub(super) fn sequence_calls(
             .iter()
             .map(|warning| warning.message.clone()),
     );
+    publish_sequence_semantics(view, &source.facts);
     Ok(())
+}
+
+fn publish_sequence_semantics(view: &mut crate::behavior::SequenceView, facts: &GraphFacts) {
+    view.semantic_documents = facts
+        .documents
+        .values()
+        .map(|document| crate::model::DocumentSemantic {
+            document: document.key.clone(),
+            semantic_status: document.semantic_status.clone(),
+        })
+        .collect();
+    view.partial |= view.semantic_documents.iter().any(|document| {
+        document.semantic_status.state == crate::model::SemanticAvailability::CatchingUp
+    });
+    if view.partial
+        && !view
+            .warnings
+            .iter()
+            .any(|warning| warning == "Semantic evidence is catching up; this sequence is partial.")
+    {
+        view.warnings
+            .push("Semantic evidence is catching up; this sequence is partial.".into());
+    }
 }
 
 /// Why a seed with a selected producer still shows syntax (#522): its coverage is not
@@ -1354,6 +1405,98 @@ mod tests {
             .unwrap();
         let missing = source.declaration_role(&key, &id).unwrap_err();
         assert!(missing.downcast_ref::<SelectedIntegrity>().is_some());
+    }
+
+    #[test]
+    fn pending_zero_call_sequence_is_partial_without_truncation() {
+        let pin = IndexPin {
+            index_generation: uuid::Uuid::new_v4(),
+            index_revision: 1,
+        };
+        let file = SourceFile {
+            path: "a.rs".into(),
+            hash: "a".repeat(64),
+            language: "rust".into(),
+            text: "fn seed() {}".into(),
+        };
+        let seed = Symbol {
+            id: format!("sid:v1:{}", "1".repeat(32)),
+            name: "seed".into(),
+            display_label: None,
+            kind: crate::model::SymbolKind::Function,
+            path: file.path.clone(),
+            range: crate::model::SourceRange {
+                start_byte: 0,
+                end_byte: file.text.len(),
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: file.text.len() + 1,
+            },
+            parent: None,
+            accessor: false,
+            provenance: crate::model::Provenance {
+                source: "syntax".into(),
+                semantic: crate::model::SemanticState::Unavailable,
+            },
+        };
+        let mut view = crate::behavior_rust::build(pin, &seed, &file, &[], false).unwrap();
+        let key = DocumentKey {
+            source_set_id: "app".into(),
+            language: "rust".into(),
+            path: file.path.clone(),
+        };
+        let mut facts = GraphFacts::memo(GraphSnapshot {
+            source_set_id: "app".into(),
+            revision_id: "native".into(),
+        });
+        facts.documents.insert(
+            key.clone(),
+            Arc::new(DocumentFacts {
+                key: key.clone(),
+                declarations: BTreeMap::new(),
+                calls: BTreeMap::new(),
+                native_coverage: sem::Coverage {
+                    producer_id: "native".into(),
+                    language: sem::Language::Rust,
+                    source_set_id: "app".into(),
+                    document_path: file.path.clone(),
+                    revision_id: "native".into(),
+                    requested: true,
+                    selected: true,
+                    state: sem::CoverageState::Complete,
+                    supported_roles: vec![],
+                    observed_roles: vec![],
+                    diagnostic: None,
+                    reasons: None,
+                },
+                native_provenance: sem::Provenance {
+                    id: "native-proof".into(),
+                    producer_id: "native".into(),
+                    document: key,
+                    revision_id: "native".into(),
+                    content_hash: file.hash,
+                    evidence_kind: sem::EvidenceKind::MeasuredSyntax,
+                    basis: None,
+                    freshness: sem::Freshness::Fresh,
+                    derived_from: None,
+                },
+                semantic: None,
+                semantic_status: crate::model::DocumentSemanticStatus {
+                    state: crate::model::SemanticAvailability::CatchingUp,
+                    ..Default::default()
+                },
+            }),
+        );
+        publish_sequence_semantics(&mut view, &facts);
+        assert!(view.partial);
+        assert!(!view.truncated);
+        assert!(view.steps.is_empty());
+        assert_eq!(view.semantic_documents.len(), 1);
+        assert_eq!(
+            view.semantic_documents[0].semantic_status.state,
+            crate::model::SemanticAvailability::CatchingUp
+        );
     }
 
     #[test]

@@ -1830,3 +1830,15 @@ test("Files zero-call preview keeps uncertainty and opens full admitted detail e
   assert.equal(opened[2],"sequence");
   assert.equal(opened[4],true,"Show all requests incidental calls as well as non-call detail");
 });
+
+
+test("semantic-complete newer head is only an affordance and cannot rewrite retained pending evidence", async () => {
+  const h = retainedHarness();
+  h.run(`status.semanticAvailability={fresh:0,catchingUp:1,unavailable:0}; workspaceSource={data:{revision:status.revision,semanticStatus:{state:"catchingUp",producerId:"rust",semanticOrigin:null,reason:"pending at selected pin"}}};`);
+  h.context.fetch = async () => response({workspaceRoot:"/synthetic",revision:newerHead,catchingUp:false,semanticAvailability:{fresh:1,catchingUp:0,unavailable:0}});
+  h.run("observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent, /Older than head/);
+  assert.equal(h.run("workspaceSource.data.semanticStatus.state"), "catchingUp");
+  assert.equal(h.run("status.semanticAvailability.catchingUp"), 1);
+  assertRetained(h);
+});

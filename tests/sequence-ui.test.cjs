@@ -1019,3 +1019,34 @@ test("calls-first preserves extractor-labelled uncertainty outside boundaries on
   d.render({showDetails:true});assert.deepEqual(ids(),view.steps.map(step=>step.id));
   assert.equal(JSON.stringify(view),before);
 });
+
+
+test("pending zero-call Sequence stays partial and availability never upgrades proof freshness", () => {
+  const window = {};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window});
+  const pending = {document:{sourceSetId:"workspace",language:"rust",path:"src/b.rs"},semanticStatus:{state:"catchingUp",producerId:"rust",semanticOrigin:null,reason:"native publication pending semantic join"}};
+  const view = {steps:[],semantic:{tier:"syntax",reason:"no bindings"},semanticDocuments:[pending],partial:true,truncated:false};
+  const before = JSON.stringify(view);
+  assert.match(window.TrellisSequence.evidenceSummary(view), /Semantic catching up · partial/);
+  assert.doesNotMatch(window.TrellisSequence.evidenceSummary(view), /no bindings|unavailable/);
+  assert.match(window.TrellisSequence.emptySummary(view), /partial view does not prove absence/);
+  assert.equal(view.truncated, false);
+  assert.equal(JSON.stringify(view), before);
+  assert.match(window.TrellisSemanticStatus.documentsSummary(view), /0 ready · 1 catching up · 0 unavailable.*partial/);
+  const step = {id:"call",callId:"call",kind:"call",path:"src/a.rs",range:{startLine:1,endLine:1},target:"target",callEvidence:{boundaryReason:"none",resolution:"resolved",freshness:"possiblyStale",dispatch:"direct",provenanceId:"original-proof"}};
+  const retained = {revision:{indexGeneration:"pin",indexRevision:2},semanticDocuments:[{document:{path:"src/a.rs"},semanticStatus:{state:"fresh",producerId:"rust",semanticOrigin:{pin:{indexGeneration:"pin",indexRevision:1},revisionId:"origin-revision"},reason:null}}],participants:[{id:"target",declaration:{id:"target",path:"src/a.rs",range:{startLine:2,endLine:2}}}]};
+  assert.equal(window.TrellisSemanticStatus.label(retained.semanticDocuments[0].semanticStatus), "Semantic ready");
+  assert.equal(window.TrellisSequence.target(retained, step), null, "ready availability does not authorize possibly-stale traversal");
+  assert.equal(step.callEvidence.freshness, "possiblyStale");
+});
+
+
+test("semantic availability labels report server counts without claiming proof freshness", () => {
+  const window = {};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window});
+  const state = window.TrellisSemanticStatus;
+  assert.equal(state.summary({fresh:2,catchingUp:1,unavailable:3}), "Semantic: 2 ready · 1 catching up · 3 unavailable");
+  assert.equal(state.label({state:"catchingUp"}), "Semantic catching up");
+  assert.equal(state.label({state:"unavailable"}), "Semantic unavailable");
+  assert.equal(state.label(null), "Semantic state not reported");
+});

@@ -3436,6 +3436,14 @@ def sink():
             expected_sequence.semantic = trellis::behavior::SequenceSemantic::syntax(Some(
                 trellis::graph_query::NO_PRODUCER_NOTE.into(),
             ));
+            expected_sequence.semantic_documents = vec![trellis::model::DocumentSemantic {
+                document: trellis::native_evidence::DocumentKey {
+                    source_set_id: native_after["sourceSet"]["id"].as_str().unwrap().to_owned(),
+                    language: graph_files[0]["language"].as_str().unwrap().to_owned(),
+                    path: file.to_owned(),
+                },
+                semantic_status: trellis::model::DocumentSemanticStatus::default(),
+            }];
             assert_eq!(
                 sequence,
                 serde_json::to_value(&expected_sequence).unwrap(),

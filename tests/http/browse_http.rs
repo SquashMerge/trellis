@@ -157,7 +157,9 @@ async fn catalog_filter_searches_the_whole_pinned_catalog() {
     assert_eq!(found["revision"], json!(pin));
     assert_eq!(
         found["items"],
-        json!([{"path":"z.js","language":"javascript","methodCount":0}])
+        json!([{"path":"z.js","language":"javascript","methodCount":0,
+            "semanticStatus":{"state":"unavailable","producerId":null,
+                "semanticOrigin":null,"reason":null}}])
     );
     assert_eq!(found["nextOffset"], Value::Null);
     let (_, both) = call(&app, "GET", &page("q=.js"), Value::Null).await;

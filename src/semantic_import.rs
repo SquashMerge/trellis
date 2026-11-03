@@ -1,11 +1,65 @@
 //! Exact measured joins for authenticated, document-local SCIP claims.
 use crate::{
+    model::CancelFlag,
     native_evidence as native, native_ids,
     scip_raw::{CapturedClaim, CapturedScipInventory},
     semantic_evidence as semantic,
 };
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Cooperative semantic cancellation is an internal outcome, never a failed witness.
+pub(crate) fn check_semantic_cancel(cancel: &CancelFlag) -> Result<()> {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(crate::scip_raw::ScipCaptureError::Cancelled.into());
+    }
+    Ok(())
+}
+
+pub(crate) fn proof_inventory_cancellable(
+    inventory: &CapturedScipInventory,
+    cancel: &CancelFlag,
+) -> Result<crate::scip_raw::ProofInventory> {
+    let mut claims = Vec::with_capacity(inventory.claims.len());
+    for claim in &inventory.claims {
+        check_semantic_cancel(cancel)?;
+        claims.push(crate::scip_raw::RawProofIdentity {
+            proof_id: claim.captured_proof_id.clone(),
+            record_kind: claim.envelope.record_kind.clone(),
+            fact_digest: claim.fact_digest.clone(),
+            language: claim.language.clone(),
+            path: claim.envelope.relative_path.clone(),
+            artifact_hash: claim.artifact_hash.clone(),
+        });
+    }
+    Ok(crate::scip_raw::ProofInventory {
+        artifact_hashes: inventory.artifact_hashes.clone(),
+        source_manifest_hash: inventory.source_manifest_hash.clone(),
+        exclusions: inventory.exclusions.clone(),
+        capped_documents: inventory.capped_documents.clone(),
+        claims,
+    })
+}
+
+fn clone_inventory_cancellable(
+    inventory: &CapturedScipInventory,
+    cancel: &CancelFlag,
+) -> Result<CapturedScipInventory> {
+    let mut claims = Vec::with_capacity(inventory.claims.len());
+    for claim in &inventory.claims {
+        check_semantic_cancel(cancel)?;
+        claims.push(claim.clone());
+    }
+    Ok(CapturedScipInventory {
+        artifact_hashes: inventory.artifact_hashes.clone(),
+        decoder_version: inventory.decoder_version.clone(),
+        source_manifest_hash: inventory.source_manifest_hash.clone(),
+        completion: inventory.completion,
+        exclusions: inventory.exclusions.clone(),
+        capped_documents: inventory.capped_documents.clone(),
+        claims,
+    })
+}
 
 mod join_store;
 mod memory;
@@ -74,18 +128,36 @@ struct MeasuredAnchors<'a> {
 impl<'a> MeasuredFacts<'a> {
     /// These facts over `destination`'s whole manifest: reused documents have no facts here,
     /// only their native document.
-    pub(crate) fn over_manifest(&self, destination: &'a native::Artifact) -> Self {
+    pub(crate) fn over_manifest(
+        &self,
+        destination: &'a native::Artifact,
+        cancel: &CancelFlag,
+    ) -> Result<Self> {
         let mut facts = self.clone();
         for doc in &destination.revision.documents {
+            check_semantic_cancel(cancel)?;
             facts.documents.insert(doc.key.clone(), doc);
         }
-        facts
+        Ok(facts)
     }
 
     pub fn new(
         native: &'a native::Artifact,
         sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
     ) -> Result<Self> {
+        Self::new_cancellable(
+            native,
+            sources,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    pub(crate) fn new_cancellable(
+        native: &'a native::Artifact,
+        sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
+        cancel: &CancelFlag,
+    ) -> Result<Self> {
+        check_semantic_cancel(cancel)?;
         let MeasuredAnchors {
             sources,
             documents,
@@ -95,7 +167,7 @@ impl<'a> MeasuredFacts<'a> {
             calls,
             references,
             support,
-        } = Self::anchors(native, sources)?;
+        } = Self::anchors(native, sources, cancel)?;
         let candidates = candidates
             .into_iter()
             .map(|((rank, start, end, kind), ids)| ((ranks[rank].clone(), start, end, kind), ids))
@@ -104,6 +176,7 @@ impl<'a> MeasuredFacts<'a> {
         let mut declaration_keys: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
         let mut by_document: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
         for d in &native.declarations {
+            check_semantic_cancel(cancel)?;
             by_document.entry(d.document.clone()).or_default().push(d);
             declaration_keys
                 .entry((
@@ -140,8 +213,9 @@ impl<'a> MeasuredFacts<'a> {
         native: &'a native::Artifact,
         sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
         document: &native::DocumentKey,
+        cancel: &CancelFlag,
     ) -> Result<AnchorParts> {
-        let anchors = Self::anchors(native, sources)?;
+        let anchors = Self::anchors(native, sources, cancel)?;
         let rank = anchors.ranks.binary_search(document).ok();
         Ok(Self::parts(
             anchors.candidates,
@@ -154,6 +228,7 @@ impl<'a> MeasuredFacts<'a> {
     fn anchors(
         native: &'a native::Artifact,
         sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
+        cancel: &CancelFlag,
     ) -> Result<MeasuredAnchors<'a>> {
         #[cfg(feature = "test-support")]
         count_publication_work(|work| {
@@ -167,6 +242,7 @@ impl<'a> MeasuredFacts<'a> {
         let mut documents = BTreeMap::new();
         let mut source_text = BTreeMap::new();
         for doc in &native.revision.documents {
+            check_semantic_cancel(cancel)?;
             let bytes = sources
                 .get(&doc.key)
                 .context("missing authenticated native source")?;
@@ -191,6 +267,7 @@ impl<'a> MeasuredFacts<'a> {
             .chain(native.calls.iter().map(|c| &c.document))
             .chain(native.references.iter().map(|r| &r.document));
         for document in named {
+            check_semantic_cancel(cancel)?;
             if keys.last() != Some(&document) {
                 keys.push(document);
             }
@@ -217,6 +294,7 @@ impl<'a> MeasuredFacts<'a> {
                 .insert(id.to_owned());
         };
         for d in &native.declarations {
+            check_semantic_cancel(cancel)?;
             declarations.entry(d.syntax_id.clone()).or_default().push(d);
             if let Some(range) = &d.name_range {
                 insert(
@@ -228,6 +306,7 @@ impl<'a> MeasuredFacts<'a> {
             }
         }
         for c in &native.calls {
+            check_semantic_cancel(cancel)?;
             calls.entry(c.id.clone()).or_default().push(c);
             let doc = rank(&c.document);
             if let Some(range) = &c.callee_range {
@@ -236,6 +315,7 @@ impl<'a> MeasuredFacts<'a> {
             insert(doc, &c.range, semantic::JoinKind::Invocation, &c.id);
         }
         for r in &native.references {
+            check_semantic_cancel(cancel)?;
             references.entry(r.id.clone()).or_default().push(r);
             insert(
                 rank(&r.document),
@@ -251,6 +331,7 @@ impl<'a> MeasuredFacts<'a> {
         let mut raw_ranges: BTreeMap<_, Vec<(usize, usize)>> = BTreeMap::new();
         // Each anchor keeps, in place, the candidates compatible with its spelling.
         for ((rank, start, end, kind), ids) in anchors.iter_mut() {
+            check_semantic_cancel(cancel)?;
             let document = keys[*rank];
             raw_ranges
                 .entry((*rank, *kind))
@@ -297,9 +378,11 @@ impl<'a> MeasuredFacts<'a> {
         }
         let candidates = anchors;
         for ranges in raw_ranges.values_mut() {
+            check_semantic_cancel(cancel)?;
             ranges.sort_unstable();
             let mut min_end = usize::MAX;
             for (_, end) in ranges.iter_mut().rev() {
+                check_semantic_cancel(cancel)?;
                 #[cfg(test)]
                 complexity_work(|work| work.native_gap_index_records += 1);
                 min_end = min_end.min(*end);
@@ -309,12 +392,14 @@ impl<'a> MeasuredFacts<'a> {
         let mut support = BTreeMap::new();
         let mut seen_reports = BTreeSet::new();
         for report in &native.capability_reports {
+            check_semantic_cancel(cancel)?;
             if report.revision_id != native.revision.id
                 || !seen_reports.insert(report.document.clone())
             {
                 continue;
             }
             for family in &report.families {
+                check_semantic_cancel(cancel)?;
                 let kind = match family.kind {
                     native::MeasurementKind::DeclarationName => semantic::JoinKind::DeclarationName,
                     native::MeasurementKind::Callee => semantic::JoinKind::Callee,
@@ -328,8 +413,10 @@ impl<'a> MeasuredFacts<'a> {
             }
         }
         for ((document, kind), family) in &support {
+            check_semantic_cancel(cancel)?;
             let source = source_text.get(document).context("missing anchor bytes")?;
             for gap in &family.gaps {
+                check_semantic_cancel(cancel)?;
                 ensure!(
                     gap.range.start < gap.range.end
                         && source.get(gap.range.start..gap.range.end).is_some(),
@@ -785,12 +872,31 @@ impl CoordinateMaps {
         sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
         admitted_encoding: u8,
     ) -> Result<Self> {
+        Self::new_cancellable(
+            inventory,
+            native,
+            sources,
+            admitted_encoding,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    fn new_cancellable(
+        inventory: &CapturedScipInventory,
+        native: &native::Artifact,
+        sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+        admitted_encoding: u8,
+        cancel: &CancelFlag,
+    ) -> Result<Self> {
+        check_semantic_cancel(cancel)?;
         let mut positions: BTreeMap<(String, String, u8), Vec<Position>> = BTreeMap::new();
         for claim in &inventory.claims {
+            check_semantic_cancel(cancel)?;
             if claim.envelope.record_kind != "occurrence" {
                 continue;
             }
             for enclosing in [false, true] {
+                check_semantic_cancel(cancel)?;
                 if enclosing && claim.envelope.raw["enclosingRange"].is_null() {
                     continue;
                 }
@@ -816,6 +922,7 @@ impl CoordinateMaps {
         }
         let mut offsets = BTreeMap::new();
         for ((language, path, encoding), mut positions) in positions {
+            check_semantic_cancel(cancel)?;
             let document = native::DocumentKey {
                 source_set_id: native.revision.source_set_id.clone(),
                 language: language.clone(),
@@ -827,12 +934,8 @@ impl CoordinateMaps {
             let source = std::str::from_utf8(bytes).context("non-UTF8 authenticated source")?;
             #[cfg(test)]
             complexity_work(|work| work.coordinate_batches += 1);
-            let map = crate::scip_raw::source_byte_offsets(
-                source,
-                encoding,
-                &mut positions,
-                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?;
+            let map =
+                crate::scip_raw::source_byte_offsets(source, encoding, &mut positions, cancel)?;
             offsets.insert((language, path, encoding), map);
         }
         Ok(Self { offsets })
@@ -863,6 +966,14 @@ struct InventoryIndex<'a> {
 
 impl<'a> InventoryIndex<'a> {
     fn new(inventory: &'a CapturedScipInventory) -> Result<Self> {
+        Self::new_cancellable(
+            inventory,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    fn new_cancellable(inventory: &'a CapturedScipInventory, cancel: &CancelFlag) -> Result<Self> {
+        check_semantic_cancel(cancel)?;
         let mut index = Self {
             claims: &inventory.claims,
             proofs: BTreeMap::new(),
@@ -872,6 +983,7 @@ impl<'a> InventoryIndex<'a> {
             information_symbols: BTreeSet::new(),
         };
         for claim in &inventory.claims {
+            check_semantic_cancel(cancel)?;
             #[cfg(test)]
             complexity_work(|work| work.raw_claims += 1);
             let key = (
@@ -1749,6 +1861,7 @@ fn discover_join_claim<S: JoinStore, G: GlobalDiscoverySink>(
 fn build_join_index<S: IndexedJoinStore>(admitted_encoding: u8, store: &S) -> Result<S::Index> {
     let mut index = store.new_index();
     for claim in store.claims() {
+        store.charge(0)?;
         let claim = claim?;
         let mut operation = store.operation()?;
         if let Some((range, row)) =
@@ -1768,6 +1881,7 @@ fn emit_join_symbols<S: JoinStore, G: GlobalJoinReads, K: JoinSink>(
 ) -> Result<()> {
     let source_set_id = store.source_set_id();
     for claim in store.claims() {
+        store.charge(0)?;
         let claim = claim?;
         if claim.envelope.record_kind != "symbolInformation" {
             continue;
@@ -1822,6 +1936,7 @@ fn join_occurrences<S: IndexedJoinStore, K: JoinSink>(
 ) -> Result<()> {
     let mut role_sites = None;
     for ordinal in 0..index.occurrence_count() {
+        store.charge(0)?;
         let mut operation = store.operation()?;
         store.reserve_operation(&mut operation, || index.occurrence_clone_bytes(ordinal))?;
         let row = index.occurrence(ordinal)?;
@@ -2058,6 +2173,7 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         }
         if !assigned.is_empty() {
             for target in resolved.iter().chain(candidates.iter()) {
+                store.charge(0)?;
                 store.reserve_operation(operation, || staged::sizes::target(target))?;
                 index.put_reference_claim(&r.id, &claim.captured_proof_id, target.clone())?;
             }
@@ -2227,6 +2343,7 @@ fn settle_join_references<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
     out: &mut K,
 ) -> Result<()> {
     for slot in 0..out.reference_count() {
+        store.charge(0)?;
         let mut operation = store.operation()?;
         store.reserve_operation(&mut operation, || out.reference_clone_bytes(slot))?;
         let mut reference = out.reference(slot)?;
@@ -2264,6 +2381,7 @@ fn settle_join_references<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         out.put_reference(Some(slot), reference)?;
     }
     for slot in 0..out.call_binding_count() {
+        store.charge(0)?;
         let mut operation = store.operation()?;
         store.reserve_operation(&mut operation, || out.call_binding_clone_bytes(slot))?;
         let mut binding = out.call_binding(slot)?;
@@ -2366,9 +2484,11 @@ fn method_target_owner_matches<S: JoinStore, I: DocumentJoinState>(
 
 fn discover_join_methods<S: IndexedJoinStore>(store: &S, index: &mut S::Index) -> Result<()> {
     for doc in store.documents() {
+        store.charge(0)?;
         let doc = doc?;
         let mut operation = store.operation()?;
         for declaration in store.document_declarations(&doc, &mut operation)? {
+            store.charge(0)?;
             #[cfg(test)]
             complexity_work(|work| work.method_index_rows += 1);
             if declaration.kind != "method" {
@@ -2382,6 +2502,7 @@ fn discover_join_methods<S: IndexedJoinStore>(store: &S, index: &mut S::Index) -
                 index.type_uses_clone_bytes(&declaration.document, range.start, range.end)
             })?;
             for symbol in index.type_uses(&declaration.document, range.start, range.end)? {
+                store.charge(0)?;
                 let summary = MethodSummary {
                     target_owner_matches: method_target_owner_matches(
                         store,
@@ -2403,6 +2524,7 @@ fn discover_relationship_claims<S: JoinStore, I: DocumentJoinState>(
     index: &mut I,
 ) -> Result<()> {
     for claim in store.claims() {
+        store.charge(0)?;
         let claim = claim?;
         if claim.envelope.record_kind != "relationship" {
             continue;
@@ -2450,6 +2572,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
 ) -> Result<()> {
     let revision_id = store.revision_id();
     for doc in store.documents() {
+        store.charge(0)?;
         let doc = &doc?;
         let bytes = store
             .bytes_of(doc)?
@@ -2464,7 +2587,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         let mut reserve_bases =
             |bytes: LazyBytes<'_>| store.reserve_operation(&mut relationship_operation, bytes);
         let bases = match doc.language.as_str() {
-            "java" => direct_java_types(bytes, parsed, &mut reserve_bases)?,
+            "java" => direct_java_types(bytes, parsed, &mut reserve_bases, &|| store.charge(0))?,
             "javascript" => direct_script_types(
                 bytes,
                 tree_sitter_javascript::LANGUAGE.into(),
@@ -2472,6 +2595,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 "class_heritage",
                 parsed,
                 &mut reserve_bases,
+                &|| store.charge(0),
             )?,
             "python" => direct_script_types(
                 bytes,
@@ -2480,6 +2604,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 "argument_list",
                 parsed,
                 &mut reserve_bases,
+                &|| store.charge(0),
             )?,
             _ => continue,
         };
@@ -2489,6 +2614,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         let mut java_bases = BTreeMap::new();
         if doc.language == "java" {
             for (owner, base, _) in &bases {
+                store.charge(0)?;
                 if let std::collections::btree_map::Entry::Vacant(entry) =
                     java_bases.entry((owner.start, owner.end))
                 {
@@ -2504,6 +2630,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         })?;
         let document_relationships = index.relationships(&doc.language, &doc.path)?;
         for (owner_range, base_range, kind) in bases {
+            store.charge(0)?;
             let mut operation = store.operation()?;
             store.reserve_operation(&mut operation, || {
                 index.type_uses_clone_bytes(doc, owner_range.start, owner_range.end)
@@ -2563,6 +2690,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 source_symbol,
                 target_symbol,
             )? {
+                store.charge(0)?;
                 let mut output_operation = store.operation()?;
                 store.reserve_operation(&mut output_operation, || {
                     staged::sizes::sum(&[
@@ -2581,6 +2709,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         }
         if doc.language == "java" {
             for claim in &document_relationships {
+                store.charge(0)?;
                 let mut operation = store.operation()?;
                 let (Some(source_symbol), Some(target_symbol)) = (
                     claim.source_symbol.as_deref(),
@@ -2717,15 +2846,18 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 .into_iter()
                 .filter(|d| d.kind == "type")
                 .collect();
-            for declaration in document_types.iter().filter(|d| {
-                std::str::from_utf8(bytes).ok().is_some_and(|source| {
-                    d.name_range
+            for declaration in &document_types {
+                store.charge(0)?;
+                if !std::str::from_utf8(bytes).ok().is_some_and(|source| {
+                    declaration
+                        .name_range
                         .as_ref()
                         .and_then(|r| source.get(..r.start))
                         .and_then(|prefix| prefix.rsplit(['{', '}', ';']).next())
                         .is_some_and(|prefix| prefix.split_whitespace().last() == Some("enum"))
-                })
-            }) {
+                }) {
+                    continue;
+                }
                 let mut enum_operation = store.operation()?;
                 let Some(name) = &declaration.name_range else {
                     continue;
@@ -2744,12 +2876,16 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 {
                     continue;
                 }
-                for claim in document_relationships.iter().filter(|c| {
-                    c.source_symbol.as_deref() == Some(source_symbol.as_str())
-                        && c.target_symbol
+                for claim in &document_relationships {
+                    store.charge(0)?;
+                    if !(claim.source_symbol.as_deref() == Some(source_symbol.as_str())
+                        && claim
+                            .target_symbol
                             .as_deref()
-                            .is_some_and(|s| s.ends_with("java/lang/Enum#"))
-                }) {
+                            .is_some_and(|s| s.ends_with("java/lang/Enum#")))
+                    {
+                        continue;
+                    }
                     let key = claim.target_symbol.as_deref().unwrap();
                     let mut output_operation = store.operation()?;
                     store.reserve_operation(&mut output_operation, || {
@@ -2824,10 +2960,37 @@ fn collect_direct_bases(
     Ok(result)
 }
 
+fn parse_semantic_source(
+    parser: &mut tree_sitter::Parser,
+    source: &[u8],
+    reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
+) -> Result<tree_sitter::Tree> {
+    let mut stopped = None;
+    let tree = parser.parse_with_options(
+        &mut |offset, _| &source[offset..],
+        None,
+        Some(
+            tree_sitter::ParseOptions::new().progress_callback(&mut |_| {
+                if let Err(error) = reserve(&mut || Ok(0)) {
+                    stopped = Some(error);
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            }),
+        ),
+    );
+    if let Some(error) = stopped {
+        return Err(error);
+    }
+    tree.context("semantic source parser failed")
+}
+
 fn direct_java_types(
     source: &[u8],
     parsed: Option<tree_sitter::Tree>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
+    check: &impl Fn() -> Result<()>,
 ) -> Result<Vec<DirectBase>> {
     let tree = match parsed {
         Some(tree) => tree,
@@ -2836,17 +2999,21 @@ fn direct_java_types(
             complexity_work(|work| work.java_type_parses += 1);
             let mut parser = tree_sitter::Parser::new();
             parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
-            parser.parse(source, None).context("Java parser failed")?
+            parse_semantic_source(&mut parser, source, reserve)?
         }
     };
-    collect_direct_bases(reserve, |emit| java_base_rows(tree.root_node(), emit))
+    collect_direct_bases(reserve, |emit| {
+        java_base_rows(tree.root_node(), emit, check)
+    })
 }
 
 fn java_base_rows(
     root: tree_sitter::Node<'_>,
     emit: &mut dyn FnMut(DirectBase) -> Result<()>,
+    check: &impl Fn() -> Result<()>,
 ) -> Result<()> {
     walk_named_reverse(root, &mut |node| {
+        check()?;
         let kind = node.kind();
         if matches!(
             kind,
@@ -2865,7 +3032,7 @@ fn java_base_rows(
                 ("interfaces", semantic::RelationshipKind::Implements),
             ] {
                 if let Some(clause) = node.child_by_field_name(field) {
-                    java_clause_rows(clause, &owner, relationship, emit)?;
+                    java_clause_rows(clause, &owner, relationship, emit, check)?;
                 }
             }
             if kind == "interface_declaration" {
@@ -2874,7 +3041,13 @@ fn java_base_rows(
                     .named_children(&mut cursor)
                     .filter(|child| child.kind() == "extends_interfaces")
                 {
-                    java_clause_rows(child, &owner, semantic::RelationshipKind::Extends, emit)?;
+                    java_clause_rows(
+                        child,
+                        &owner,
+                        semantic::RelationshipKind::Extends,
+                        emit,
+                        check,
+                    )?;
                 }
             }
         }
@@ -2886,8 +3059,10 @@ fn java_clause_rows(
     owner: &native::Range,
     relationship: semantic::RelationshipKind,
     emit: &mut dyn FnMut(DirectBase) -> Result<()>,
+    check: &impl Fn() -> Result<()>,
 ) -> Result<()> {
     walk_named_reverse(clause, &mut |item| {
+        check()?;
         let mut base = None;
         if item.kind() == "type_identifier" {
             base = Some(item);
@@ -2996,6 +3171,7 @@ fn reserve_role_span(
     Ok(())
 }
 
+#[cfg(test)]
 fn source_role_sites(
     language: &str,
     source: &[u8],
@@ -3033,11 +3209,10 @@ fn source_role_sites_parsed(
     };
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&grammar)?;
-    let tree = parser
-        .parse(source, None)
-        .context("semantic role source parser failed")?;
+    let tree = parse_semantic_source(&mut parser, source, reserve)?;
     let mut sites = RoleSites::default();
     let mut visit = |node: tree_sitter::Node<'_>| {
+        reserve(&mut || Ok(0))?;
         let kind = node.kind();
         let type_field = match language {
             "java"
@@ -3203,6 +3378,7 @@ fn collect_role_leaf_spans_reserved(
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<()> {
     walk_named_reverse(node, &mut |node| {
+        reserve(&mut || Ok(0))?;
         let leaf = match language {
             "java" | "rust" => matches!(node.kind(), "identifier" | "type_identifier"),
             "javascript" => matches!(
@@ -3226,19 +3402,19 @@ fn direct_script_types(
     clause_kind: &str,
     parsed: Option<tree_sitter::Tree>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
+    check: &impl Fn() -> Result<()>,
 ) -> Result<Vec<DirectBase>> {
     let tree = match parsed {
         Some(tree) => tree,
         None => {
             let mut parser = tree_sitter::Parser::new();
             parser.set_language(&language)?;
-            parser
-                .parse(source, None)
-                .context("semantic source parser failed")?
+            parse_semantic_source(&mut parser, source, reserve)?
         }
     };
     collect_direct_bases(reserve, |emit| {
         walk_named_reverse(tree.root_node(), &mut |node| {
+            check()?;
             if node.kind() == owner_kind
                 && let Some(name) = node.child_by_field_name("name")
             {
@@ -3287,121 +3463,149 @@ pub(crate) fn original_document_associations(
     inventory: &crate::scip_raw::ProofInventory,
     producer_id: &str,
     document: &native::DocumentKey,
-) -> Option<JoinedFacts> {
-    let mut by_provenance = BTreeMap::new();
-    let mut kinds = BTreeMap::new();
-    // One raw proof can stand behind several evidence kinds: a definition's binding and its
-    // reference. A proof is fused when a kind of it has no row.
-    let mut unclaimed = BTreeSet::new();
-    let proofs = inventory.proof_lookup();
-    for row in snapshot
-        .provenance
-        .iter()
-        .filter(|row| row.producer_id == producer_id)
-    {
-        let derived = row.derived_from.as_ref()?;
-        let kind = serde_json::to_value(derived.record_kind).ok()?;
-        let claim = proofs
-            .lookup(&derived.provenance_id, kind.as_str()?, &derived.fact_digest)
-            .ok()?;
-        if row.document.language != claim.language || row.document.path != claim.path {
-            return None;
-        }
-        by_provenance.insert(row.id.as_str(), derived.provenance_id.as_str());
-        kinds.insert(row.id.as_str(), row.evidence_kind);
-        unclaimed.insert((derived.provenance_id.as_str(), row.evidence_kind));
-    }
-    let mut facts = JoinedFacts::default();
-    let mut claimed = |id: &str| {
-        if let (Some(raw), Some(kind)) = (by_provenance.get(id), kinds.get(id)) {
-            unclaimed.remove(&(*raw, *kind));
-        }
-    };
-    for row in &snapshot.symbols {
-        if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
-            let mut value = row.clone();
-            value.provenance_id = (*raw).to_owned();
-            claimed(&row.provenance_id);
-            facts.symbols.push(value);
-        }
-    }
-    for row in &snapshot.declaration_bindings {
-        if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
-            let mut value = row.clone();
-            value.provenance_id = (*raw).to_owned();
-            claimed(&row.provenance_id);
-            facts.declaration_bindings.push(value);
-        }
-    }
-    for row in &snapshot.references {
-        if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
-            if facts.reference_claims.contains_key(*raw) {
+    cancel: &CancelFlag,
+) -> Result<Option<JoinedFacts>> {
+    check_semantic_cancel(cancel)?;
+    let associations = (|| {
+        let mut by_provenance = BTreeMap::new();
+        let mut kinds = BTreeMap::new();
+        // One raw proof can stand behind several evidence kinds: a definition's binding and its
+        // reference. A proof is fused when a kind of it has no row.
+        let mut unclaimed = BTreeSet::new();
+        let proofs = inventory.proof_lookup();
+        for row in snapshot
+            .provenance
+            .iter()
+            .filter(|row| row.producer_id == producer_id)
+        {
+            if check_semantic_cancel(cancel).is_err() {
                 return None;
             }
-            let mut value = row.clone();
-            value.provenance_id = (*raw).to_owned();
-            claimed(&row.provenance_id);
-            facts
-                .reference_claims
-                .insert((*raw).to_owned(), value.clone());
-            facts.references.push(value);
-        }
-    }
-    for row in &snapshot.call_bindings {
-        if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
-            if !facts.reference_claims.contains_key(*raw) {
-                // The call's reference was fused into another proof's row at the call's span.
-                let anchor = &row.join.anchor;
-                let mut reference = facts
-                    .references
-                    .iter()
-                    .find(|reference| {
-                        reference.roles.contains(&semantic::Role::Call)
-                            && (reference.range == anchor.range
-                                || (anchor.kind == semantic::JoinKind::Invocation
-                                    && anchor.range.start <= reference.range.start
-                                    && reference.range.end <= anchor.range.end))
-                    })?
-                    .clone();
-                facts.fused_calls.insert(reference.provenance_id.clone());
-                facts.fused_calls.insert((*raw).to_owned());
-                reference.provenance_id = (*raw).to_owned();
-                facts.reference_claims.insert((*raw).to_owned(), reference);
+            let derived = row.derived_from.as_ref()?;
+            let kind = serde_json::to_value(derived.record_kind).ok()?;
+            let claim = proofs
+                .lookup(&derived.provenance_id, kind.as_str()?, &derived.fact_digest)
+                .ok()?;
+            if row.document.language != claim.language || row.document.path != claim.path {
+                return None;
             }
-            let mut value = row.clone();
-            value.provenance_id = (*raw).to_owned();
-            claimed(&row.provenance_id);
-            facts.call_bindings.push(value);
+            by_provenance.insert(row.id.as_str(), derived.provenance_id.as_str());
+            kinds.insert(row.id.as_str(), row.evidence_kind);
+            unclaimed.insert((derived.provenance_id.as_str(), row.evidence_kind));
         }
-    }
-    for row in &snapshot.type_relationships {
-        if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
-            let mut value = row.clone();
-            value.provenance_id = (*raw).to_owned();
-            claimed(&row.provenance_id);
-            facts.type_relationships.push(value);
+        let mut facts = JoinedFacts::default();
+        let mut claimed = |id: &str| {
+            if let (Some(raw), Some(kind)) = (by_provenance.get(id), kinds.get(id)) {
+                unclaimed.remove(&(*raw, *kind));
+            }
+        };
+        for row in &snapshot.symbols {
+            if check_semantic_cancel(cancel).is_err() {
+                return None;
+            }
+            if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
+                let mut value = row.clone();
+                value.provenance_id = (*raw).to_owned();
+                claimed(&row.provenance_id);
+                facts.symbols.push(value);
+            }
         }
-    }
-    for (raw, kind) in unclaimed {
-        if kind != semantic::EvidenceKind::SemanticReference {
-            return None;
+        for row in &snapshot.declaration_bindings {
+            if check_semantic_cancel(cancel).is_err() {
+                return None;
+            }
+            if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
+                let mut value = row.clone();
+                value.provenance_id = (*raw).to_owned();
+                claimed(&row.provenance_id);
+                facts.declaration_bindings.push(value);
+            }
         }
-        facts.fused_proofs.insert(raw.to_owned());
-    }
-    if snapshot.coverage.iter().any(|row| {
-        row.reasons
-            .as_ref()
-            .is_some_and(|reasons| reasons.captured_diagnostics)
-    }) {
-        facts.diagnostics.insert(document.clone(), BTreeSet::new());
-    }
-    Some(facts)
+        for row in &snapshot.references {
+            if check_semantic_cancel(cancel).is_err() {
+                return None;
+            }
+            if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
+                if facts.reference_claims.contains_key(*raw) {
+                    return None;
+                }
+                let mut value = row.clone();
+                value.provenance_id = (*raw).to_owned();
+                claimed(&row.provenance_id);
+                facts
+                    .reference_claims
+                    .insert((*raw).to_owned(), value.clone());
+                facts.references.push(value);
+            }
+        }
+        for row in &snapshot.call_bindings {
+            if check_semantic_cancel(cancel).is_err() {
+                return None;
+            }
+            if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
+                if !facts.reference_claims.contains_key(*raw) {
+                    // The call's reference was fused into another proof's row at the call's span.
+                    let anchor = &row.join.anchor;
+                    let mut reference = facts
+                        .references
+                        .iter()
+                        .find(|reference| {
+                            reference.roles.contains(&semantic::Role::Call)
+                                && (reference.range == anchor.range
+                                    || (anchor.kind == semantic::JoinKind::Invocation
+                                        && anchor.range.start <= reference.range.start
+                                        && reference.range.end <= anchor.range.end))
+                        })?
+                        .clone();
+                    facts.fused_calls.insert(reference.provenance_id.clone());
+                    facts.fused_calls.insert((*raw).to_owned());
+                    reference.provenance_id = (*raw).to_owned();
+                    facts.reference_claims.insert((*raw).to_owned(), reference);
+                }
+                let mut value = row.clone();
+                value.provenance_id = (*raw).to_owned();
+                claimed(&row.provenance_id);
+                facts.call_bindings.push(value);
+            }
+        }
+        for row in &snapshot.type_relationships {
+            if check_semantic_cancel(cancel).is_err() {
+                return None;
+            }
+            if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
+                let mut value = row.clone();
+                value.provenance_id = (*raw).to_owned();
+                claimed(&row.provenance_id);
+                facts.type_relationships.push(value);
+            }
+        }
+        for (raw, kind) in unclaimed {
+            if check_semantic_cancel(cancel).is_err() {
+                return None;
+            }
+            if kind != semantic::EvidenceKind::SemanticReference {
+                return None;
+            }
+            facts.fused_proofs.insert(raw.to_owned());
+        }
+        if snapshot.coverage.iter().any(|row| {
+            row.reasons
+                .as_ref()
+                .is_some_and(|reasons| reasons.captured_diagnostics)
+        }) {
+            facts.diagnostics.insert(document.clone(), BTreeSet::new());
+        }
+        Some(facts)
+    })();
+    check_semantic_cancel(cancel)?;
+    Ok(associations)
 }
 
 /// The internal targets `facts` name.
 pub(crate) fn required_original_targets(
     facts: &JoinedFacts,
-) -> BTreeSet<(native::DocumentKey, String)> {
+    cancel: &CancelFlag,
+) -> Result<BTreeSet<(native::DocumentKey, String)>> {
     let mut keys = BTreeSet::new();
     let mut add = |target: &semantic::Target| {
         if let semantic::Target::Internal {
@@ -3414,34 +3618,42 @@ pub(crate) fn required_original_targets(
         }
     };
     for symbol in &facts.symbols {
+        check_semantic_cancel(cancel)?;
         for target in &symbol.declarations {
+            check_semantic_cancel(cancel)?;
             add(target);
         }
     }
     for reference in &facts.references {
+        check_semantic_cancel(cancel)?;
         if let Some(target) = &reference.declared_target {
             add(target);
         }
         for target in &reference.candidates {
+            check_semantic_cancel(cancel)?;
             add(target);
         }
     }
     for call in &facts.call_bindings {
+        check_semantic_cancel(cancel)?;
         if let Some(target) = &call.declared_target {
             add(target);
         }
         for target in &call.candidates {
+            check_semantic_cancel(cancel)?;
             add(target);
         }
         for target in &call.possible_dispatch {
+            check_semantic_cancel(cancel)?;
             add(target);
         }
     }
     for row in &facts.type_relationships {
+        check_semantic_cancel(cancel)?;
         add(&row.source);
         add(&row.target);
     }
-    keys
+    Ok(keys)
 }
 
 fn reuse_captured_source_associations(
@@ -3450,7 +3662,9 @@ fn reuse_captured_source_associations(
     inventory: &crate::scip_raw::ProofInventory,
     source_set_id: &str,
     revision: &str,
-) -> JoinedFacts {
+    cancel: &CancelFlag,
+) -> Result<JoinedFacts> {
+    check_semantic_cancel(cancel)?;
     let mut facts = captured.clone();
     let is_reused = |doc: &native::DocumentKey| reusable.contains(doc);
     let proof_documents: BTreeMap<_, _> = inventory
@@ -3485,6 +3699,7 @@ fn reuse_captured_source_associations(
     // A reused row is no destination classification of a target outside the reused documents:
     // the rejoin takes the captured one under its own rule, as a full rejoin would (#557).
     for row in &mut facts.call_bindings {
+        check_semantic_cancel(cancel)?;
         if matches!(
             &row.declared_target,
             Some(semantic::Target::Internal { document, .. }) if !is_reused(document)
@@ -3502,12 +3717,15 @@ fn reuse_captured_source_associations(
         .retain(|(_, join)| is_reused(&join.anchor.document));
     facts.diagnostics.retain(|doc, _| is_reused(doc));
     for (_, join) in &mut facts.joins {
+        check_semantic_cancel(cancel)?;
         join.anchor.revision_id = revision.to_owned();
     }
     for binding in &mut facts.declaration_bindings {
+        check_semantic_cancel(cancel)?;
         binding.join.anchor.revision_id = revision.to_owned();
     }
     for call in &mut facts.call_bindings {
+        check_semantic_cancel(cancel)?;
         call.join.anchor.revision_id = revision.to_owned();
     }
     for reference in facts
@@ -3515,9 +3733,11 @@ fn reuse_captured_source_associations(
         .iter_mut()
         .chain(facts.reference_claims.values_mut())
     {
+        check_semantic_cancel(cancel)?;
         reference.revision_id = revision.to_owned();
     }
-    facts
+    check_semantic_cancel(cancel)?;
+    Ok(facts)
 }
 
 /// Publication-time rejoin uses only retained, authenticated source and measured snapshots.
@@ -3539,7 +3759,8 @@ pub fn rejoin_inventory(
     basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
     admitted_encoding: u8,
 ) -> Result<RejoinResult> {
-    let r2 = MeasuredFacts::new(destination_native, destination_sources)?;
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let r2 = MeasuredFacts::new_cancellable(destination_native, destination_sources, &cancel)?;
     rejoin_inventory_with_destination(
         inventory,
         captured_native,
@@ -3550,6 +3771,7 @@ pub fn rejoin_inventory(
         basis,
         admitted_encoding,
         &r2,
+        &cancel,
     )
 }
 
@@ -3564,6 +3786,7 @@ pub(crate) fn rejoin_inventory_with_destination(
     basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
     admitted_encoding: u8,
     r2: &MeasuredFacts<'_>,
+    cancel: &CancelFlag,
 ) -> Result<RejoinResult> {
     rejoin_inventory_with_reuse(
         inventory,
@@ -3576,6 +3799,7 @@ pub(crate) fn rejoin_inventory_with_destination(
         admitted_encoding,
         r2,
         None,
+        cancel,
     )
 }
 
@@ -3591,22 +3815,27 @@ pub(crate) fn rejoin_inventory_with_reuse(
     admitted_encoding: u8,
     r2: &MeasuredFacts<'_>,
     reusable: Option<&BTreeSet<native::DocumentKey>>,
+    cancel: &CancelFlag,
 ) -> Result<RejoinResult> {
+    check_semantic_cancel(cancel)?;
     ensure!(
         inventory.source_manifest_hash == manifest_hash(&captured_native.revision)
             && captured_native.revision.source_set_id == destination_native.revision.source_set_id,
         "captured source manifest/source set mismatch"
     );
-    let r1 = MeasuredFacts::new(captured_native, captured_sources)?;
-    let raw_index = InventoryIndex::new(inventory)?;
-    let coordinates = CoordinateMaps::new(
+    let r1 = MeasuredFacts::new_cancellable(captured_native, captured_sources, cancel)?;
+    let raw_index = InventoryIndex::new_cancellable(inventory, cancel)?;
+    let coordinates = CoordinateMaps::new_cancellable(
         inventory,
         captured_native,
         captured_sources,
         admitted_encoding,
+        cancel,
     )?;
-    let captured_store = MemoryJoinStore::new(&raw_index, &coordinates, &r1, captured_sources);
-    let destination_store = MemoryJoinStore::new(&raw_index, &coordinates, r2, destination_sources);
+    let captured_store =
+        MemoryJoinStore::new_cancellable(&raw_index, &coordinates, &r1, captured_sources, cancel);
+    let destination_store =
+        MemoryJoinStore::new_cancellable(&raw_index, &coordinates, r2, destination_sources, cancel);
     rejoin_with_stores(
         inventory,
         captured_native,
@@ -3617,6 +3846,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
         &captured_store,
         &destination_store,
         reusable,
+        cancel,
     )
 }
 
@@ -3631,6 +3861,7 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
     captured_store: &S,
     destination_store: &S,
     reusable: Option<&BTreeSet<native::DocumentKey>>,
+    cancel: &CancelFlag,
 ) -> Result<RejoinResult> {
     let captured = join_into_facts(admitted_encoding, captured_store)?;
     let captured_declaration_proofs: BTreeSet<_> = captured
@@ -3684,6 +3915,7 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
         })
         .collect();
     for document in &captured_native.revision.documents {
+        check_semantic_cancel(cancel)?;
         let language: semantic::Language =
             serde_json::from_value(serde_json::json!(document.key.language))?;
         if producer.languages.contains(&language) {
@@ -3700,6 +3932,7 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
         }
     }
     for claim in captured_store.claims() {
+        check_semantic_cancel(cancel)?;
         let claim = claim?;
         captured_store.charge(1)?;
         captured_store.lookup_proof(
@@ -3864,23 +4097,30 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
         }
     }
     eligible.retain(|doc| !failed.contains(doc));
-    let mut filtered = inventory.clone();
-    filtered.claims.retain(|claim| {
-        eligible
+    let mut filtered = clone_inventory_cancellable(inventory, cancel)?;
+    let mut retained = Vec::with_capacity(filtered.claims.len());
+    for claim in filtered.claims {
+        check_semantic_cancel(cancel)?;
+        if eligible
             .iter()
             .any(|doc| doc.language == claim.language && doc.path == claim.envelope.relative_path)
-    });
+        {
+            retained.push(claim);
+        }
+    }
+    filtered.claims = retained;
     let filtered_store = destination_store.restrict(&filtered)?;
     let destination = if let Some(reusable) = reusable {
-        let metadata = inventory.proof_identities();
+        let metadata = proof_inventory_cancellable(inventory, cancel)?;
         let mut facts = reuse_captured_source_associations(
             &captured,
             reusable,
             &metadata,
             &destination_native.revision.source_set_id,
             &destination_native.revision.id,
-        );
-        let mut delta = filtered.clone();
+            cancel,
+        )?;
+        let mut delta = clone_inventory_cancellable(&filtered, cancel)?;
         delta.claims.retain(|claim| {
             !reusable.iter().any(|doc| {
                 doc.language == claim.language && doc.path == claim.envelope.relative_path
@@ -3902,6 +4142,7 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
         }
         let mut order = BTreeMap::new();
         for (ordinal, claim) in captured_store.claims().enumerate() {
+            check_semantic_cancel(cancel)?;
             order.insert(claim?.captured_proof_id.clone(), ordinal);
         }
         facts
@@ -3920,8 +4161,8 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
     } else {
         join_into_facts(admitted_encoding, &filtered_store)?
     };
-    let metadata = inventory.proof_identities();
-    let filtered_metadata = filtered.proof_identities();
+    let metadata = proof_inventory_cancellable(inventory, cancel)?;
+    let filtered_metadata = proof_inventory_cancellable(&filtered, cancel)?;
     let mut publication = empty_publication(&producer);
     let report = finish_rejoin(
         &metadata,
@@ -3944,7 +4185,9 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
         unsupported_documents,
         &mut publication,
         None,
+        cancel,
     )?;
+    check_semantic_cancel(cancel)?;
     Ok(RejoinResult {
         publication,
         report,
@@ -4041,13 +4284,16 @@ fn document_coordinates<'c>(
     claims: impl IntoIterator<Item = &'c CapturedClaim>,
     source: &str,
     admitted_encoding: u8,
+    cancel: &CancelFlag,
 ) -> Result<BTreeMap<u8, CoordinateMap>> {
     let mut positions: BTreeMap<u8, Vec<Position>> = BTreeMap::new();
     for claim in claims {
+        check_semantic_cancel(cancel)?;
         if claim.envelope.record_kind != "occurrence" {
             continue;
         }
         for enclosing in [false, true] {
+            check_semantic_cancel(cancel)?;
             if enclosing && claim.envelope.raw["enclosingRange"].is_null() {
                 continue;
             }
@@ -4062,14 +4308,10 @@ fn document_coordinates<'c>(
     }
     let mut maps = BTreeMap::new();
     for (encoding, mut positions) in positions {
+        check_semantic_cancel(cancel)?;
         maps.insert(
             encoding,
-            crate::scip_raw::source_byte_offsets(
-                source,
-                encoding,
-                &mut positions,
-                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            crate::scip_raw::source_byte_offsets(source, encoding, &mut positions, cancel)?,
         );
     }
     Ok(maps)
@@ -4092,9 +4334,10 @@ struct ProofIdentityIndex<'a> {
     by_proof: BTreeMap<String, &'a crate::scip_raw::RawProofIdentity>,
 }
 impl<'a> ProofIdentityIndex<'a> {
-    fn new(inventory: &'a crate::scip_raw::ProofInventory) -> Result<Self> {
+    fn new(inventory: &'a crate::scip_raw::ProofInventory, cancel: &CancelFlag) -> Result<Self> {
         let mut by_proof = BTreeMap::new();
         for claim in &inventory.claims {
+            check_semantic_cancel(cancel)?;
             ensure!(
                 by_proof.insert(claim.proof_id.clone(), claim).is_none(),
                 "non-unique original proof ID"
@@ -4148,12 +4391,16 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     unsupported_documents: BTreeMap<native::DocumentKey, [u64; 4]>,
     sink: &mut impl PublicationSink,
     scope: Option<&WitnessScope>,
+    cancel: &CancelFlag,
 ) -> Result<serde_json::Value> {
+    check_semantic_cancel(cancel)?;
     let mut captured_targets: BTreeMap<(native::DocumentKey, String), Vec<semantic::Target>> =
         BTreeMap::new();
     for binding in &captured.declaration_bindings {
+        check_semantic_cancel(cancel)?;
         if let Some(syntax_id) = &binding.syntax_id {
             for symbol in &binding.symbols {
+                check_semantic_cancel(cancel)?;
                 captured_targets
                     .entry((binding.join.anchor.document.clone(), symbol.symbol.clone()))
                     .or_default()
@@ -4166,6 +4413,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         }
     }
     for targets in captured_targets.values_mut() {
+        check_semantic_cancel(cancel)?;
         targets.sort_by_key(|target| {
             native_ids::canonical(&serde_json::to_value(target).expect("serializable target"))
         });
@@ -4199,6 +4447,9 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         scope.map_or(&captured_internal_symbols, |scope| &scope.internal_symbols);
     let prior_declarations = scope.map_or(&prior_declarations, |scope| &scope.declarations);
     let retarget = |target: &mut semantic::Target| -> bool {
+        if check_semantic_cancel(cancel).is_err() {
+            return false;
+        }
         match target {
             semantic::Target::External { symbol } if internal_symbols.contains(&symbol.symbol) => {
                 false
@@ -4269,10 +4520,12 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     let facts = destination;
     let mut provenance_sources = BTreeSet::<(String, semantic::EvidenceKind)>::new();
     for raw_id in &captured.fused_proofs {
+        check_semantic_cancel(cancel)?;
         provenance_sources.insert((raw_id.clone(), semantic::EvidenceKind::SemanticReference));
     }
     let mut symbol_rows = Vec::new();
     for mut symbol in facts.symbols {
+        check_semantic_cancel(cancel)?;
         let raw = filtered_index.proof(&symbol.provenance_id)?;
         if let Some(claim) = raw {
             let doc = native::DocumentKey {
@@ -4300,6 +4553,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     }
     let mut bindings = Vec::new();
     for binding in facts.declaration_bindings {
+        check_semantic_cancel(cancel)?;
         if binding.syntax_id.is_some()
             && captured_declarations.get(&binding.provenance_id) == binding.syntax_id.as_ref()
         {
@@ -4344,6 +4598,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     // Each destination call's join-time dispatch and the target it was classified against.
     let mut joined_dispatch = BTreeMap::new();
     for mut call in facts.call_bindings {
+        check_semantic_cancel(cancel)?;
         let Some((resolution, target, candidates)) = old_targets.get(&call.provenance_id) else {
             continue;
         };
@@ -4381,6 +4636,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     let mut reference_proofs = BTreeMap::<String, Vec<String>>::new();
     let mut accepted_reference_ids = BTreeMap::new();
     for (raw_id, mut reference) in facts.reference_claims {
+        check_semantic_cancel(cancel)?;
         let Some(prior) = captured.reference_claims.get(&raw_id) else {
             continue;
         };
@@ -4433,6 +4689,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     let mut references = Vec::new();
     let mut additional_reference_proofs = BTreeMap::new();
     for (id, mut reference) in reference_rows {
+        check_semantic_cancel(cancel)?;
         let mut targets = reference_targets.remove(&id).unwrap_or_default();
         targets.sort_by_key(|target| {
             native_ids::canonical(&serde_json::to_value(target).expect("serializable target"))
@@ -4454,6 +4711,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             reference.resolution = semantic::Resolution::Unresolved;
         }
         for raw_id in reference_proofs.remove(&id).unwrap_or_default() {
+            check_semantic_cancel(cancel)?;
             additional_reference_proofs.insert(
                 raw_id,
                 if reference.resolution == semantic::Resolution::Ambiguous {
@@ -4480,6 +4738,10 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     };
     let mut rejoin_failure = None;
     calls.retain_mut(|call| {
+        if let Err(error) = check_semantic_cancel(cancel) {
+            rejoin_failure = Some(error);
+            return false;
+        }
         let Some(reference) = accepted_reference_ids
             .get(&call.provenance_id)
             .and_then(|id| references_by_id.get(id))
@@ -4519,6 +4781,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         .filter(|row| eligible_proofs.contains(row.provenance_id.as_str()))
         .cloned()
     {
+        check_semantic_cancel(cancel)?;
         if retarget(&mut relationship.source) && retarget(&mut relationship.target) {
             provenance_sources.insert((
                 relationship.provenance_id.clone(),
@@ -4540,6 +4803,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     );
     let mut ids = BTreeMap::new();
     for (raw_id, kind) in provenance_sources {
+        check_semantic_cancel(cancel)?;
         let claim = raw_index
             .proof(&raw_id)?
             .context("missing raw fact for joined provenance")?;
@@ -4609,17 +4873,21 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         .iter()
         .filter(|c| c.record_kind != "symbolInformation")
     {
+        check_semantic_cancel(cancel)?;
         outcomes.insert(claim.proof_id.clone(), 2);
     }
     for raw_id in &unsupported_claims {
+        check_semantic_cancel(cancel)?;
         outcomes.insert(raw_id.clone(), 4);
     }
     for row in &bindings {
+        check_semantic_cancel(cancel)?;
         if row.syntax_id.is_some() {
             outcomes.insert(row.provenance_id.clone(), 1);
         }
     }
     for row in &references {
+        check_semantic_cancel(cancel)?;
         outcomes.insert(
             row.provenance_id.clone(),
             if row.resolution == semantic::Resolution::Ambiguous {
@@ -4630,6 +4898,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         );
     }
     for row in &calls {
+        check_semantic_cancel(cancel)?;
         outcomes.insert(
             row.provenance_id.clone(),
             if row.resolution == semantic::Resolution::Ambiguous {
@@ -4640,12 +4909,15 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         );
     }
     for (raw_id, outcome) in &additional_reference_proofs {
+        check_semantic_cancel(cancel)?;
         outcomes.insert(raw_id.clone(), *outcome);
     }
     for row in &relationships {
+        check_semantic_cancel(cancel)?;
         outcomes.insert(row.provenance_id.clone(), 1);
     }
     for row in &mut symbol_rows {
+        check_semantic_cancel(cancel)?;
         row.provenance_id = ids[&(
             row.provenance_id.clone(),
             semantic::EvidenceKind::DeclarationBinding,
@@ -4653,6 +4925,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             .clone();
     }
     for row in &mut bindings {
+        check_semantic_cancel(cancel)?;
         row.provenance_id = ids[&(
             row.provenance_id.clone(),
             semantic::EvidenceKind::DeclarationBinding,
@@ -4660,6 +4933,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             .clone();
     }
     for row in &mut references {
+        check_semantic_cancel(cancel)?;
         row.provenance_id = ids[&(
             row.provenance_id.clone(),
             semantic::EvidenceKind::SemanticReference,
@@ -4667,6 +4941,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             .clone();
     }
     for row in &mut calls {
+        check_semantic_cancel(cancel)?;
         row.provenance_id = ids[&(
             row.provenance_id.clone(),
             semantic::EvidenceKind::SemanticReference,
@@ -4674,6 +4949,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             .clone();
     }
     for row in &mut relationships {
+        check_semantic_cancel(cancel)?;
         row.provenance_id = ids[&(
             row.provenance_id.clone(),
             semantic::EvidenceKind::TypeRelationship,
@@ -4682,6 +4958,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     }
     let mut coverage = Vec::new();
     for doc in &destination_native.revision.documents {
+        check_semantic_cancel(cancel)?;
         let language: semantic::Language =
             serde_json::from_value(serde_json::json!(doc.key.language))?;
         if !producer.languages.contains(&language) {
@@ -4722,6 +4999,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             observed.insert(semantic::Role::Definition);
         }
         for row in references.iter().filter(|r| r.document == doc.key) {
+            check_semantic_cancel(cancel)?;
             observed.extend(row.roles.iter().copied());
         }
         if calls.iter().any(|b| b.join.anchor.document == doc.key) {
@@ -4783,17 +5061,21 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
     let mut language_counts: BTreeMap<semantic::Language, [usize; 5]> = BTreeMap::new();
     let mut reasons: BTreeMap<semantic::Language, LanguageReasons> = BTreeMap::new();
     for row in &coverage {
+        check_semantic_cancel(cancel)?;
         reasons.entry(row.language).or_default().add(row);
         let mut counts = [0usize; 5];
-        for claim in inventory.claims.iter().filter(|c| {
-            c.language
+        for claim in &inventory.claims {
+            check_semantic_cancel(cancel)?;
+            if !(claim.language
                 == serde_json::to_value(row.language)
                     .ok()
                     .and_then(|v| v.as_str().map(str::to_owned))
                     .unwrap_or_default()
-                && c.path == row.document_path
-                && c.record_kind != "symbolInformation"
-        }) {
+                && claim.path == row.document_path
+                && claim.record_kind != "symbolInformation")
+            {
+                continue;
+            }
             counts[0] += 1;
             let outcome = if row.state == semantic::CoverageState::Failed {
                 2
@@ -4810,6 +5092,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         );
         let aggregate = language_counts.entry(row.language).or_default();
         for (total, count) in aggregate.iter_mut().zip(counts) {
+            check_semantic_cancel(cancel)?;
             *total += count;
         }
     }
@@ -4839,24 +5122,31 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         "semantic import report exceeds response bound"
     );
     for row in coverage {
+        check_semantic_cancel(cancel)?;
         sink.coverage(row)?;
     }
     for row in provenance {
+        check_semantic_cancel(cancel)?;
         sink.provenance(row)?;
     }
     for row in symbol_rows {
+        check_semantic_cancel(cancel)?;
         sink.symbol(row)?;
     }
     for row in bindings {
+        check_semantic_cancel(cancel)?;
         sink.declaration_binding(row)?;
     }
     for row in references {
+        check_semantic_cancel(cancel)?;
         sink.reference(row)?;
     }
     for row in calls {
+        check_semantic_cancel(cancel)?;
         sink.call_binding(row)?;
     }
     for row in relationships {
+        check_semantic_cancel(cancel)?;
         sink.type_relationship(row)?;
     }
     Ok(report)
@@ -4875,6 +5165,7 @@ pub(crate) struct WitnessScope {
 
 /// One destination document of a witnessed rejoin.
 pub(crate) struct WitnessedRejoin<'a> {
+    pub cancel: &'a CancelFlag,
     pub document: &'a native::DocumentKey,
     /// The document's claims, exclusions and capped mark.
     pub inventory: &'a crate::scip_raw::ProofInventory,
@@ -4912,6 +5203,7 @@ pub(crate) fn rejoin_document_with_witness(
     rejoin: WitnessedRejoin<'_>,
 ) -> Result<Option<DocumentRejoin>> {
     let WitnessedRejoin {
+        cancel,
         document,
         inventory,
         captured_native,
@@ -4925,14 +5217,20 @@ pub(crate) fn rejoin_document_with_witness(
         destination,
         scope,
     } = rejoin;
+    check_semantic_cancel(cancel)?;
     let is_reused = reused.is_some();
     let captured = reused.unwrap_or_default();
-    let raw_index = ProofIdentityIndex::new(inventory)?;
-    let mut filtered = inventory.clone();
-    if !is_reused {
-        filtered.claims.clear();
-    }
-    let filtered_index = ProofIdentityIndex::new(&filtered)?;
+    let raw_index = ProofIdentityIndex::new(inventory, cancel)?;
+    let mut changed_inventory;
+    let changed_index;
+    let (filtered, filtered_index) = if is_reused {
+        (inventory, &raw_index)
+    } else {
+        changed_inventory = inventory.clone();
+        changed_inventory.claims.clear();
+        changed_index = ProofIdentityIndex::new(&changed_inventory, cancel)?;
+        (&changed_inventory, &changed_index)
+    };
     // `captured` holds this document's rows only, so `reusable` decides just their targets.
     let joined = reuse_captured_source_associations(
         &captured,
@@ -4940,7 +5238,8 @@ pub(crate) fn rejoin_document_with_witness(
         inventory,
         &destination_native.revision.source_set_id,
         &destination_native.revision.id,
-    );
+        cancel,
+    )?;
     let exclusions: BTreeMap<_, _> = inventory
         .exclusions
         .iter()
@@ -4983,8 +5282,8 @@ pub(crate) fn rejoin_document_with_witness(
         destination,
         Some(current_targets),
         &raw_index,
-        &filtered_index,
-        &filtered,
+        filtered_index,
+        filtered,
         &exclusions,
         captured,
         joined,
@@ -4994,6 +5293,7 @@ pub(crate) fn rejoin_document_with_witness(
         unsupported_documents,
         &mut publication,
         Some(scope),
+        cancel,
     )?;
     let omitted = publication
         .coverage
@@ -5014,9 +5314,11 @@ pub(crate) fn rejoin_document_with_witness(
                 .filter(|proof| !kept.contains(proof)),
         );
     }
+    check_semantic_cancel(cancel)?;
     if dropped.iter().any(|proof| fused_calls.contains(proof)) {
         return Ok(None);
     }
+    check_semantic_cancel(cancel)?;
     Ok(Some(DocumentRejoin {
         publication,
         dropped,
@@ -5035,6 +5337,170 @@ pub(crate) fn manifest_hash(revision: &native::Revision) -> String {
                 .collect::<Vec<_>>()
         )),
     )
+}
+
+#[cfg(test)]
+mod witnessed_rejoin_tests {
+    use super::*;
+    use crate::{capture::Capture, indexer::IndexOptions, scip_raw};
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    fn inventory() -> scip_raw::ProofInventory {
+        scip_raw::ProofInventory {
+            artifact_hashes: vec!["0".repeat(64)],
+            source_manifest_hash: "0".repeat(64),
+            exclusions: vec![],
+            capped_documents: Default::default(),
+            claims: vec![scip_raw::RawProofIdentity {
+                proof_id: "original-proof".into(),
+                record_kind: "occurrence".into(),
+                fact_digest: "0".repeat(64),
+                language: "javascript".into(),
+                path: "A.js".into(),
+                artifact_hash: "0".repeat(64),
+            }],
+        }
+    }
+
+    #[test]
+    fn proof_identity_index_preserves_kind_and_digest_failures() {
+        let inventory = inventory();
+        let index = ProofIdentityIndex::new(&inventory, &Arc::new(AtomicBool::new(false))).unwrap();
+        let claim = &inventory.claims[0];
+        index
+            .check_proof(&claim.proof_id, &claim.record_kind, &claim.fact_digest)
+            .unwrap();
+        for (id, kind, digest) in [
+            (
+                "absent",
+                claim.record_kind.as_str(),
+                claim.fact_digest.as_str(),
+            ),
+            (
+                claim.proof_id.as_str(),
+                "symbolInformation",
+                claim.fact_digest.as_str(),
+            ),
+            (
+                claim.proof_id.as_str(),
+                claim.record_kind.as_str(),
+                "different-digest",
+            ),
+        ] {
+            let error = index.check_proof(id, kind, digest).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<scip_raw::ScipCaptureError>(),
+                Some(&scip_raw::ScipCaptureError::MissingProof)
+            );
+        }
+    }
+
+    #[test]
+    fn witnessed_rejoin_rejects_duplicate_identity_even_for_changed_documents() {
+        let root = tempfile::tempdir().unwrap();
+        let physical = std::fs::canonicalize(root.path()).unwrap();
+        let source = b"function f() {}\n";
+        std::fs::write(physical.join("A.js"), source).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture =
+            Capture::admit(&IndexOptions::new(physical.clone()), &cancel, &|_| {}).unwrap();
+        let identity =
+            crate::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical)
+                .unwrap();
+        let native =
+            native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
+        let document = &native.revision.documents[0].key;
+        let sources = BTreeMap::from([(document.clone(), source.to_vec())]);
+        let destination = MeasuredFacts::new(&native, &sources).unwrap();
+        let producer = semantic::Producer {
+            id: "scip-typescript".into(),
+            version: "0.0".into(),
+            executable_hash: "0".repeat(64),
+            kind: semantic::SemanticKind::Semantic,
+            languages: vec![semantic::Language::Javascript],
+            position_encoding: semantic::PositionEncoding::Utf16,
+        };
+        let scope = WitnessScope {
+            internal_symbols: BTreeSet::new(),
+            declarations: BTreeSet::new(),
+            destination_manifest_hash: manifest_hash(&native.revision),
+        };
+        let inventory = inventory();
+        let mut duplicate = inventory.clone();
+        duplicate.claims.push(duplicate.claims[0].clone());
+        let basis = BTreeMap::new();
+        let reusable = BTreeSet::from([document.clone()]);
+        let targets = BTreeMap::new();
+        let rejoin = |inventory, reused: bool| {
+            rejoin_document_with_witness(WitnessedRejoin {
+                cancel: &cancel,
+                document,
+                inventory,
+                captured_native: &native,
+                destination_native: &native,
+                producer: &producer,
+                basis: &basis,
+                reused: reused.then(JoinedFacts::default),
+                reusable: &reusable,
+                gaps: [0; 4],
+                current_targets: &targets,
+                destination: &destination,
+                scope: &scope,
+            })
+        };
+        for reused in [true, false] {
+            let result = rejoin(&inventory, reused).unwrap().unwrap();
+            assert_eq!(
+                result.publication.coverage[0].state,
+                if reused {
+                    semantic::CoverageState::Complete
+                } else {
+                    semantic::CoverageState::Failed
+                }
+            );
+            assert!(rejoin(&duplicate, reused).is_err());
+        }
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        let error = MeasuredFacts::new_cancellable(&native, &sources, &cancel)
+            .err()
+            .expect("cancelled preparation");
+        assert!(matches!(
+            error.downcast_ref::<crate::scip_raw::ScipCaptureError>(),
+            Some(crate::scip_raw::ScipCaptureError::Cancelled)
+        ));
+        for reused in [true, false] {
+            let error = rejoin(&duplicate, reused).err().expect("cancelled rejoin");
+            assert!(matches!(
+                error.downcast_ref::<crate::scip_raw::ScipCaptureError>(),
+                Some(crate::scip_raw::ScipCaptureError::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
+    fn role_walk_stops_on_cancellation_after_preparation_started() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut visits = 0;
+        let error = source_role_sites_reserved(
+            "javascript",
+            b"class A { f() { return value; } }",
+            None,
+            &mut |_| {
+                visits += 1;
+                if visits == 4 {
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
+                check_semantic_cancel(&cancel)
+            },
+        )
+        .err()
+        .expect("cancelled role preparation");
+        assert_eq!(visits, 4);
+        assert!(matches!(
+            error.downcast_ref::<crate::scip_raw::ScipCaptureError>(),
+            Some(crate::scip_raw::ScipCaptureError::Cancelled)
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -27,7 +27,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 35
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -655,7 +655,7 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# schema-34 tables, immutable surrogate keys, and current pin normalization.
+# schema-35 tables, immutable surrogate keys, and current pin normalization.
 # Match tests/daemon/cli.rs: check FTS shadow inventory, compare logical corpus cells.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
@@ -680,6 +680,8 @@ semantic_reference_candidates semantic_call_bindings semantic_call_candidates
 semantic_call_possible_dispatch semantic_call_join_candidates semantic_type_relationships
 semantic_raw_batches semantic_raw_captures semantic_raw_exclusions semantic_revision_raw_selections
 semantic_raw_proofs semantic_raw_documents semantic_import_reports
+semantic_native_origins semantic_document_origins semantic_ineligible_proofs
+semantic_pending_rejoins semantic_rejoin_completions
 """.split())
 CONTROL_TABLES = {"native_revision_supersessions", "native_binding_epoch", "revision_producer_bindings"}
 FTS_SHADOW_TABLES = {"head_search_fts_config", "head_search_fts_content", "head_search_fts_data",
@@ -708,7 +710,9 @@ def selected_where(table):
         return "? IS NOT NULL"
     elif table in {"revision_capture_inputs", "revision_documents", "semantic_revision_producers",
                    "semantic_requested_producers", "semantic_requested_producer_languages",
-                   "semantic_coverage", "semantic_revision_raw_selections"}:
+                   "semantic_coverage", "semantic_revision_raw_selections",
+                   "semantic_native_origins", "semantic_document_origins", "semantic_ineligible_proofs",
+                   "semantic_pending_rejoins", "semantic_rejoin_completions"}:
         return "revision_id=?"
     elif table == "native_source_sets":
         return "id=(SELECT source_set_id FROM native_revisions WHERE id=?)"
@@ -752,11 +756,8 @@ def selected_where(table):
         return ("capture_id IN (SELECT c.capture_id FROM semantic_raw_captures c "
                 "JOIN semantic_revision_raw_selections s ON s.batch_id=c.batch_id WHERE s.revision_id=?)")
     elif table == "semantic_import_reports":
-        return ("EXISTS(SELECT 1 FROM semantic_revision_raw_selections r "
-                "JOIN semantic_revision_raw_selections current ON current.batch_id=r.batch_id "
-                "AND current.producer_id=r.producer_id "
-                "WHERE current.revision_id=? AND r.revision_id=selected.revision_id "
-                "AND r.producer_id=selected.producer_id)")
+        return ("revision_id=? AND EXISTS(SELECT 1 FROM semantic_revision_raw_selections r "
+                "WHERE r.revision_id=selected.revision_id AND r.producer_id=selected.producer_id)")
     else:
         raise RuntimeError(f"unclassified schema-{SCHEMA_VERSION} selected table: {table}")
 
@@ -832,6 +833,14 @@ def parity_digest(db, revision, physical_root):
                  "native_version_references", "native_version_control_regions", "graph_nodes",
                  "graph_projections", "class_projections", "classes")),
             "opaque hash input closure missing selected evidence")
+    # This fixture selects one raw producer and measures its completed full rejoin.
+    # Other product snapshots may legitimately retain unrejoined producer slots.
+    require(all(output[table]["rows"] == 0 for table in
+                ("semantic_native_origins", "semantic_document_origins", "semantic_ineligible_proofs",
+                 "semantic_pending_rejoins")),
+            "fixture parity requires completed semantic publication, not a native-first origin view")
+    require(output["semantic_rejoin_completions"]["rows"] == 1,
+            "completed semantic publication identity missing or ambiguous")
     require(output["semantic_import_reports"]["rows"] == 1,
             "selected capture import report missing or ambiguous")
     require(output["semantic_raw_proofs"]["rows"] > 0
@@ -1059,8 +1068,21 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
     return r2, artifact, anchor, expected
 
 
+def rejoin_input_identity(db, revision):
+    """The frozen metadata tuple used by storage's selection_identity, in SQL order."""
+    selections = db.execute("SELECT producer_id,batch_id,captured_pin FROM semantic_revision_raw_selections "
+                            "WHERE revision_id=? ORDER BY producer_id", (revision,)).fetchall()
+    requests = db.execute("""SELECT p.id,p.version,p.executable_hash,l.language,l.ordinal
+        FROM semantic_requested_producers p LEFT JOIN semantic_requested_producer_languages l
+          ON l.revision_id=p.revision_id AND l.id=p.id
+        WHERE p.revision_id=? ORDER BY p.id,l.ordinal""", (revision,)).fetchall()
+    origins = db.execute("SELECT producer_id,origin_revision_id FROM semantic_native_origins "
+                         "WHERE revision_id=? ORDER BY producer_id", (revision,)).fetchall()
+    return [selections, requests, origins]
+
+
 class SelectedView:
-    """Closed schema-34 view retaining all selected columns plus input-closure digests."""
+    """Closed schema-35 view retaining all selected columns plus input-closure digests."""
     def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
         self.physical_root = physical_root.resolve(strict=True)
@@ -1176,12 +1198,29 @@ class SelectedView:
             self.ids["capture"][capture] = (producer, artifact, ordinal, tuple(r1_doc))
             self.capture_descriptor = descriptor
             self.capture_pin = captured_pin
-            imported = db.execute("""SELECT r.revision_id FROM semantic_revision_raw_selections r
-                JOIN semantic_import_reports i ON i.revision_id=r.revision_id AND i.producer_id=r.producer_id
-                WHERE r.batch_id=? AND r.producer_id=?""", (batch, producer)).fetchall()
-            require(len(imported) == 1 and imported[0][0] != revision,
-                    "selected batch has no unique imported report pin")
-            self.ids["pin"][imported[0][0]] = "<import-pin>"
+            imported = db.execute("""SELECT s.revision_id,n.native_revision_id,i.report_json,
+                    n.published_index_revision FROM semantic_revision_raw_selections s
+                JOIN native_revisions n ON n.id=s.revision_id
+                JOIN semantic_import_reports i ON i.revision_id=s.revision_id AND i.producer_id=s.producer_id
+                WHERE s.batch_id=? AND s.producer_id=? AND s.captured_pin=?
+                ORDER BY n.published_index_revision""", (batch, producer, captured_pin)).fetchall()
+            require(imported and len({item[3] for item in imported}) == len(imported),
+                    "selected batch has no unambiguous chronological import origin")
+            origin_pin, origin_native, original_report, _ = imported[0]
+            require(origin_pin != revision, "selected parity requires a post-import publication")
+            report = json.loads(original_report)
+            require(report["producerId"] == producer
+                    and report["sourceSetId"] == source_set
+                    and report["capturedRevision"] == captured_revision
+                    and report["destinationRevision"] == origin_native
+                    and report["descriptorSha256"] == descriptor_sha,
+                    "import origin report does not bind selected batch/native identity")
+            require(all(item[2] == original_report for item in imported),
+                    "carried selected import report changed from authenticated import origin")
+            require(any(item[0] == revision for item in imported),
+                    "current selected batch import report missing")
+            self.ids["pin"][origin_pin] = "<import-pin>"
+            self.ids["native-revision"].setdefault(origin_native, "<import-native>")
             self.capture_bytes = descriptor_bytes
             self.r1_docs = r1_doc
             for raw, kind, language, path, fact, canonical_bytes in db.execute(
@@ -1313,6 +1352,39 @@ class SelectedView:
             report["destinationRevision"] = self.map("native-revision", report["destinationRevision"])
             report["sourceSetId"] = self.map("source-set", report["sourceSetId"])
             cells["report_json"] = report
+        if table in {"semantic_pending_rejoins", "semantic_rejoin_completions"}:
+            generation, number = self.revision.removeprefix("pin:v1:").rsplit(":", 1)
+            predecessor = (f"pin:v1:{generation}:{int(number)-1}"
+                           if table == "semantic_rejoin_completions" else self.revision)
+            pending = self.db.execute("SELECT native_revision_id,selection_identity FROM semantic_pending_rejoins "
+                                      "WHERE revision_id=?", (predecessor,)).fetchone()
+            require(pending == (cells["native_revision_id"], cells["selection_identity"]),
+                    "semantic completion does not match its frozen pending predecessor")
+            inputs = rejoin_input_identity(self.db, predecessor)
+            actual = hashlib.sha256(b"trellis.pending-semantic.v1\0" + canonical(inputs)).hexdigest()
+            require(actual == cells["selection_identity"], "pending semantic input identity mismatch")
+            selections, requests, origins = inputs
+            normalized_origins = []
+            for producer, origin in origins:
+                native = self.db.execute("SELECT source_set_id,source_inventory,toolchain_hash,config_hash,dependency_hash "
+                                         "FROM native_revisions WHERE id=?", (origin,)).fetchone()
+                require(native is not None and native[0] == self.source_set,
+                        "semantic origin is outside selected source set")
+                inventory = json.loads(native[1])
+                require(all(item["key"]["sourceSetId"] == self.source_set for item in inventory),
+                        "semantic origin source inventory mismatch")
+                normalized_origins.append((producer, {
+                    "documents": [(item["key"]["language"], item["key"]["path"], item["contentHash"])
+                                  for item in inventory],
+                    "components": native[2:]}))
+            cells["selection_identity"] = {
+                "selections": [(producer, self.map("batch", batch), self.map("pin", captured))
+                               for producer, batch, captured in selections],
+                "requestedProducers": requests, "origins": normalized_origins}
+        if table == "semantic_document_origins" and cells["origin_tuple_id"] is not None:
+            cells["origin_tuple_id"] = self.map("tuple", cells["origin_tuple_id"])
+        if table == "semantic_native_origins":
+            cells["origin_revision_id"] = self.map("pin", cells["origin_revision_id"])
         if table == "semantic_basis":
             cells["source_manifest_hash"] = self.descriptor()["sourceManifestHash"]
         if table in {"graph_projections", "classes", "class_relations"}:
