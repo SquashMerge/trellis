@@ -17274,6 +17274,14 @@ impl Store {
         // one metadata-only revision: the selected manifest under a fresh
         // header (toolchain hash and native revision ID) and fresh inputs.
         let mut db = db;
+        let retained_state = match self.attach_retention(&db) {
+            Ok(state) => Some(state),
+            Err(error) if crate::producer::retention::unavailable_catalog(&error) => {
+                let _ = db.execute_batch("DETACH DATABASE retained");
+                None
+            }
+            Err(error) => return Err(typed_storage_full(error)),
+        };
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let locked = self.recovery_baseline_preflight(&tx)?;
         let locked_version: i64 =
@@ -17357,6 +17365,14 @@ impl Store {
         )?;
         copy_semantic_rows(&tx, &selected.key, &revision_key, false)?;
         semantic_retention::copy(&tx, &selected.key, &revision_key, None)?;
+        semantic_retention::discarded(&tx, &selected.key, &revision_key)?;
+        self.materialize_reimport(
+            &tx,
+            &revision_key,
+            retained_state.as_ref(),
+            false,
+            Some(&selected.key),
+        )?;
         let (bound_hash, binding_sha) = revision_producer_binding(&tx, &revision_key)?;
         selected_ensure!(
             bound_hash == executing_hash,
@@ -19135,12 +19151,17 @@ impl Store {
             }
             if let Some(prior) = old_pin.filter(|pin| !rebaseline && pin.index_revision > 0) {
                 semantic_retention::copy(&tx, &semantic_pin_key(prior), &revision_key, None)?;
+                semantic_retention::discarded(&tx, &semantic_pin_key(prior), &revision_key)?;
             }
             self.materialize_reimport(
                 &tx,
                 &revision_key,
                 retained_state.as_ref(),
                 recovering_semantics,
+                old_pin
+                    .filter(|_| !rebaseline)
+                    .map(semantic_pin_key)
+                    .as_deref(),
             )?;
             search::publish_head(&tx, &revision_key)?;
             let publication_time = self.retention_time()?;

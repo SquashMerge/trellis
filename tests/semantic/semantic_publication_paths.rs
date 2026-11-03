@@ -894,6 +894,11 @@ fn streamed_new_native_revision_omits_old_facts_and_keeps_producers_separate() {
     assert_eq!(current.coverage.len(), 2);
     assert_eq!(current.coverage[0].state, s::CoverageState::Omitted);
     assert_eq!(current.coverage[1].state, s::CoverageState::NotRequested);
+    let status = store.status().unwrap();
+    assert!(matches!(
+        status.semantic_languages[0].reimport,
+        Some(trellis::model::SemanticReimport::NeedsReimport { ref reason }) if !reason.is_empty()
+    ));
     assert_ne!(current.coverage[0].revision_id, native.revision.id);
     assert_eq!(
         store.semantic_at(first).unwrap().references,
@@ -1159,6 +1164,27 @@ fn rebuilt_executable_retains_semantic_head_context_without_reusing_evidence() {
     let second = store.status().unwrap().revision;
     assert_eq!(second.index_generation, first.index_generation);
     assert_eq!(second.index_revision, first.index_revision + 1);
+    let status = store.status().unwrap();
+    let language = status
+        .semantic_languages
+        .iter()
+        .find(|row| row.language == "rust")
+        .unwrap();
+    assert!(
+        matches!(language.reimport, Some(trellis::model::SemanticReimport::NeedsReimport { ref reason }) if !reason.is_empty()),
+        "executable drift must explain the lost external evidence: {language:?}"
+    );
+    assert!(
+        language
+            .semantic_note
+            .as_ref()
+            .is_some_and(|note| !note.is_empty())
+    );
+    assert_eq!(status.semantic_note, language.semantic_note);
+    assert_eq!(
+        language.semantic_state,
+        trellis::model::SemanticState::Unavailable
+    );
     let current = store.semantic_at(second).unwrap();
     assert_eq!(current.producers, prior.producers);
     assert_eq!(current.coverage.len(), prior.coverage.len());
