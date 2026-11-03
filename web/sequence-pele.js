@@ -366,7 +366,7 @@
         note.setAttribute("data-trellis-badge-id", badge.id);
         note.setAttribute("role", "button"); note.setAttribute("tabindex", "0");
         note.setAttribute("aria-expanded", String(badge.expanded));
-        note.setAttribute("aria-label", `${badge.expanded ? "Fold" : "Show"} ${badge.count} internal ${badge.count === 1 ? "step" : "steps"}${badge.unresolved ? `, ${badge.unresolved} unresolved` : ""}`);
+        note.setAttribute("aria-label", badge.ariaLabel);
         const toggle = async () => {
           if (!active()) return;
           const top = container.scrollTop, left = container.scrollLeft;

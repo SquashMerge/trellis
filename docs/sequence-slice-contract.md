@@ -289,36 +289,50 @@ Owner issue #636 (2026-11-02). It amends the #594 calls-first default above for 
 Sequence view of an enriched view only. It is presentation: no DTO field, evidence, bound or
 contract meaning changes, and the server response is the same.
 
-- **When.** The Sequence panel opens an enriched view (`semantic.tier=semantic`) in
-  Interactions. A syntax-only view has no columns, so it keeps calls-first; so does the Files
-  preview. Options → Show all steps, and its shortcut, draw exactly what they drew before.
+- **When.** The Sequence panel opens an enriched view (`semantic.tier=semantic`) that shows
+  at least one measured call in Interactions. A syntax-only view has no columns, and a view
+  with no shown call has nothing to place, so both keep calls-first with its context markers
+  and empty states; so does the Files preview. Options → Show all steps, and its shortcut,
+  draw exactly what they drew before.
 - **Arrows.** An arrow is a measured call with a verified exact target whose column differs
   from the column the call runs in (its `lane`'s column, or the seed's). Arrows keep source
-  order and their row numbers and labels (#558). A cross-column call's expanded body is drawn
-  under it, so a nested chain (`Inbox → FrameWindow`) leaves its callee's column.
+  order and their #558 labels; their row numbers count the rows drawn, so expanding a badge
+  renumbers the arrows after it. A cross-column call's expanded body is drawn under it, so a
+  nested chain (`Inbox → FrameWindow`) leaves its callee's column.
 - **Returns and activations.** After a cross-column call's body, a dashed, unlabeled return
   goes back to the caller's column, and an activation bar spans the callee column from the
   call to the return. They mark only that the following steps are the caller's again, as the
   DTO's order already says: not an observed return, value, timing or runtime activation.
 - **Folding.** Every other shown step folds with its whole subtree: branches, loops, effects,
-  boundaries, same-column calls, unresolved and other untargeted calls. Consecutive folded
-  steps of one column between two arrows form one run, drawn as one badge on that column:
-  "▸ +N internal steps", with " · M unresolved" for the calls among them whose
-  `boundaryReason` is `unresolved`. N counts the run's shown DTO steps, nested ones included;
-  hidden incidental steps are not counted, as they are not shown. A badge is a disclosure: it
-  expands in place to exactly those steps (compact labels, as calls-first draws them) and
-  folds again. Each revealed step selects the original DTO step, as before.
+  boundaries, same-column calls and calls without an exact target. Consecutive folded steps
+  of one column form one run, drawn as one badge on that column, "▸ +N internal steps". A run
+  ends at an arrow and at the edge of a frame that holds one, so it never mixes the arms of a
+  branch. N counts the run's shown DTO steps, nested ones included (a collapsed chain's
+  members too); hidden incidental steps are not counted, as they are not shown. The badge
+  adds:
+  - " · M without a target" for the measured calls among them that have no verified exact
+    target (unresolved, ambiguous, dispatch, external, stale or unbound): the DTO does not
+    say which column they reach, so none is counted as staying;
+  - the run's scope (" · in loop" or " · conditional", below);
+  - " · may exit early" when a step in it is a `return`, `throw` or `exit`, or carries the
+    calls-first early-exit mark, so later arrows are not read as unconditional.
+
+  A badge is a disclosure: it expands in place to exactly those steps (compact labels, as
+  calls-first draws them, with the run's scope) and folds again. Each revealed step selects
+  the original DTO step, as before.
 - **Enclosing frames.** A branch, loop, try, chain or same-column call that encloses an arrow
   draws no row or frame in Interactions; its steps draw in its place, and it is in no badge.
-  An arrow inside a loop is marked " · in loop", and one inside another branch or try
-  (other than an "only if the preceding path continues normally" guard) " · conditional".
-  Show all steps keeps every frame.
+  An arrow or run inside a loop is marked " · in loop"; one inside another branch (other than
+  an "only if the preceding path continues normally" guard) or inside a try's handlers
+  (`alternate`) is marked " · conditional". A loop's mark wins over a branch inside it. Show
+  all steps keeps every frame.
 - **Inspector.** Selecting an arrow, or a step revealed by a badge, shows the same step and
-  evidence as the step view.
-- **Empty.** An enriched view with shown calls and no arrow draws no diagram and says
-  "All calls stay within <seed column>." with "Show all steps". The #558 empty states (every
-  step hidden; no admitted measured call) keep their words, the latter noting that non-call
-  behavior is folded.
+  evidence as the step view. A badge itself only expands and folds.
+- **Empty.** An enriched view whose shown calls draw no arrow draws no diagram and says why,
+  with "Show all steps": "All calls stay within <seed column>." when every shown call has an
+  exact target; "All resolved calls stay within <seed column>; N calls have no exact
+  target." when some do not; "None of the N calls has an exact target, so no arrow is drawn
+  between columns." (or "The one call has no exact target, …") when none does.
 - **Renderers.** Both renderers draw the same arrows, returns, activations and badges. Pele
   validates the returns, activation count and badge notes it draws, as it validates rows.
 

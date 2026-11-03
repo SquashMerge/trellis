@@ -1549,7 +1549,7 @@ function renderIncidentalToggle(data, options) {
   const button = $("sequence-incidental");
   if (!button) return;
   const count = Number.isSafeInteger(data?.incidentalSteps) ? data.incidentalSteps : 0, showing = !!$("all-steps").checked;
-  const interactions = !!window.TrellisSequence?.interactive(data, {...options, showDetails:false});
+  const interactions = !!window.TrellisSequence?.display(data, {...options, showDetails:false}).interactions;
   button.hidden = false;
   button.textContent = showing ? interactions ? "Show interactions" : "Show calls" : "Show all steps";
   button.title = `${interactions ? "Interactions draw calls between columns and fold the rest into badges." : "Calls-first keeps conditional and unknown context."} Show all restores admitted non-call steps and ${count} incidental ${count === 1 ? "call" : "calls"}; sequence limits still apply.`;

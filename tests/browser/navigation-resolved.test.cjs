@@ -131,10 +131,11 @@ for (const mode of ["sole", "constructor", "zero", "multiple", "unresolved", "am
         await empty.waitFor();
         assert.equal(await empty.textContent(), "Only external calls (2 hidden). Show all steps");
       } else if (["unresolved", "ambiguous", "dispatch"].includes(mode)) {
-        // #636: no call leaves the seed's column, so Interactions says so; Show all steps draws them.
+        // #636: no call has an exact target, so Interactions draws no arrow and says why, without
+        // claiming where the calls go; Show all steps draws them with their evidence.
         const empty = page.locator("#sequence-diagram .sequence-empty");
         await empty.waitFor();
-        assert.equal(await empty.textContent(), "All calls stay within flow. Show all steps");
+        assert.equal(await empty.textContent(), "None of the 2 calls has an exact target, so no arrow is drawn between columns. Show all steps");
         assert.equal(await page.locator("#sequence-diagram svg").count(), 0);
         await empty.locator("button").click();
         await page.waitForFunction(() => document.querySelector("#all-steps")?.checked && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));

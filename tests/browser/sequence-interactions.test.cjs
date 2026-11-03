@@ -71,8 +71,11 @@ const INTERACTIONS = {interactions:true};
 const ARROWS = ["c-open", "c-start", "c-refresh", "c-deliver", "c-deliver>show", "c-helper>run"];
 const LABELS = ["[001] open", "[002] start", "[003] refresh · conditional", "[004] deliver", "[005] show", "[006] run"];
 const RETURNS = ["c-open", "c-start", "c-refresh", "c-deliver>show", "c-deliver", "c-helper>run"];
-const BADGES = [["e1", "▸ +4 internal steps · 1 unresolved"], ["loop4", "▸ +3 internal steps · 1 unresolved"], ["e6", "▸ +2 internal steps · 1 unresolved"],
-  ["d1", "▸ +1 internal step"], ["d3", "▸ +1 internal step · 1 unresolved"], ["e9", "▸ +2 internal steps · 1 unresolved"]];
+// A run stops at an arrow and at the edge of a frame that holds one: the branch's two arms
+// are two runs, each marked conditional. A run that may exit says so.
+const BADGES = [["e1", "▸ +4 internal steps · 1 without a target · may exit early"], ["loop4", "▸ +3 internal steps · 1 without a target"],
+  ["e6", "▸ +1 internal step · conditional"], ["u3", "▸ +1 internal step · 1 without a target · conditional"],
+  ["d1", "▸ +1 internal step"], ["d3", "▸ +1 internal step · 1 without a target"], ["e9", "▸ +2 internal steps · 1 without a target"]];
 
 async function render(view, options = INTERACTIONS) {
   return page.evaluate(async ({view, options}) => {
@@ -137,11 +140,11 @@ test("a Pele badge expands in place to its exact steps and folds again", async (
   assert.equal((await render(view)).status, "rendered");
   const badge = page.locator('#sequence-diagram [data-trellis-badge-id="e1"]');
   assert.equal(await badge.getAttribute("aria-expanded"), "false");
-  assert.equal(await badge.getAttribute("aria-label"), "Show 4 internal steps, 1 unresolved");
+  assert.equal(await badge.getAttribute("aria-label"), "Show 4 internal steps · 1 without a target · may exit early");
   await badge.click();
   await page.waitForFunction(() => document.querySelector('[data-trellis-badge-id="e1"]')?.getAttribute("aria-expanded") === "true");
   const opened = page.locator('#sequence-diagram [data-trellis-badge-id="e1"]');
-  assert.equal(await opened.textContent(), "▾ 4 internal steps · 1 unresolved");
+  assert.equal(await opened.textContent(), "▾ 4 internal steps · 1 without a target · may exit early");
   assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("data-trellis-badge-id")), "e1", "focus stays on the badge");
   assert.deepEqual(await ids("#sequence-diagram .pele-note[data-trellis-step-id]", "data-trellis-step-id"), ["e1", "if2", "u1", "ret2"]);
   assert.deepEqual(await ids("#sequence-diagram .pele-edge-label", "data-trellis-step-id"), ARROWS, "the arrows do not change");
@@ -200,28 +203,47 @@ test("the legacy renderer draws the same arrows, returns and badges, and expands
   assert.deepEqual(await badgeTexts(), BADGES);
 });
 
-test("a seed whose calls all stay in its column says so; Show all steps and syntax views are unchanged", async () => {
+test("a seed with no arrow says why; a view with no call, Show all steps and syntax views are unchanged", async () => {
   const view = coordinateView();
   for (const step of [view.steps[2], view.steps[4], view.steps[6], view.steps[5].children[0]]) { step.target = "helper"; step.children = []; }
   view.steps[7].children = [];
-  const state = await page.evaluate(view => {
+  const summary = view => page.evaluate(view => {
     const options = {interactions:true};
     return {summary:TrellisSequence.emptySummary(view, options), visible:TrellisSequence.display(view, options).visible.size,
       all:TrellisSequence.emptySummary(view, {...options, showDetails:true})};
   }, view);
-  assert.deepEqual(state, {summary:"All calls stay within mcp.", visible:0, all:""});
-  // No calls at all, and only hidden calls, keep their own words.
+  // A call without an exact target proves nothing about its column: it is counted, not placed.
+  assert.deepEqual(await summary(view), {summary:"All resolved calls stay within mcp; 4 calls have no exact target.", visible:0, all:""});
+  assert.equal((await summary({...view, steps:[view.steps[2], view.steps[4]]})).summary, "All calls stay within mcp.");
+  assert.equal((await summary({...view, steps:[view.steps[9]]})).summary, "The one call has no exact target, so no arrow is drawn between columns.");
+  assert.equal((await summary({...view, steps:[view.steps[1], view.steps[9]]})).summary, "None of the 2 calls has an exact target, so no arrow is drawn between columns.");
+  // No call at all keeps calls-first, with its context and words; so does a view of hidden calls.
   const quiet = {...view, steps:[view.steps[0]]};
-  assert.match(await page.evaluate(view => TrellisSequence.emptySummary(view, {interactions:true}), quiet), /^No measured calls in the admitted steps\. Non-call behavior is folded/);
+  assert.equal(await page.evaluate(view => TrellisSequence.display(view, {interactions:true}).interactions, quiet), undefined);
+  assert.match(await page.evaluate(view => TrellisSequence.emptySummary(view, {interactions:true}), quiet), /^No measured calls in the admitted steps\. Non-call behavior may be hidden/);
   const hidden = {...view, steps:[view.steps.at(-1)]};
   assert.equal(await page.evaluate(view => TrellisSequence.emptySummary(view, {interactions:true}), hidden), "Only external calls (1 hidden).");
-  // Show all steps draws exactly what it drew before Interactions, and so does a syntax-only view.
+  // Show all steps draws what calls-first's detail view draws, and so does a syntax-only view.
   const source = (view, options) => page.evaluate(({view, options}) => TrellisPeleSequence.project(view, new Set(), options).source, {view, options});
   const full = coordinateView();
   assert.equal(await source(full, {interactions:true, showDetails:true}), await source(full, {showDetails:true}));
   const syntax = {...full, semantic:{tier:"syntax", reason:"no semantic producer"}};
   assert.equal(await source(syntax, {interactions:true}), await source(syntax, {}));
-  assert.equal(await page.evaluate(view => TrellisSequence.interactive(view, {interactions:true}), syntax), false);
+  assert.equal(await page.evaluate(view => TrellisSequence.display(view, {interactions:true}).interactions, syntax), undefined);
+});
+
+test("an arrow inside a call chain draws without the chain; its other members fold", async () => {
+  const view = coordinateView(), [open, start] = [view.steps[2], view.steps[4]];
+  const chain = {...structuredClone(open), id:"chain", kind:"group", label:"a.open().start()", callId:null, target:undefined, callEvidence:undefined,
+    children:[{...structuredClone(view.steps[9]), id:"chain:u", callId:"callid:chain:u"}, {...structuredClone(start), id:"chain:start", callId:"callid:chain:start"}]};
+  view.steps = [chain];
+  assert.equal((await render(view)).status, "rendered");
+  assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(), ["[001] start"]);
+  assert.deepEqual(await badgeTexts(), [["chain:u", "▸ +1 internal step · 1 without a target"]]);
+  assert.equal(await page.locator("#sequence-diagram .sequence-group-control").count(), 0, "the chain draws no row of its own");
+  await legacy(view);
+  assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ["chain:start"]);
+  assert.deepEqual(await badgeTexts(), [["chain:u", "▸ +1 internal step · 1 without a target"]]);
 });
 
 test("a large interactions diagram keeps readable text and the panel scrolls", async () => {

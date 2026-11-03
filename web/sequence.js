@@ -204,7 +204,9 @@ function sequenceDisplay(view, options = {}) {
   };
   visit(view?.steps);
   const earlyReturn = step => sequenceEarlyReturn(step) || (!options.showDetails && exits.has(step) ? " · may exit early" : "");
-  return sequenceInteractive(view, options) ? sequenceInteractions(view, options, earlyReturn) : {visible, earlyReturn};
+  // A view with no shown call keeps calls-first: its context markers and empty state (#594).
+  const calls = [...visible].some(step => step.kind === "call" || step.callId);
+  return calls && sequenceInteractive(view, options) ? sequenceInteractions(view, options, earlyReturn) : {visible, earlyReturn};
 }
 // The Interactions view (#636) is the default for an enriched view. A syntax-only view has
 // no columns (#558), so it keeps the calls-first display, as does Show all steps.
@@ -219,8 +221,11 @@ function sequenceStepColumn(view, step) {
 }
 // The badge text of a run of folded steps (#636): counts of original DTO steps, never inferred.
 function sequenceBadgeLabel(badge) {
-  const steps = `${badge.count} internal ${badge.count === 1 ? "step" : "steps"}${badge.unresolved ? ` · ${badge.unresolved} unresolved` : ""}`;
+  const steps = `${badge.count} internal ${badge.count === 1 ? "step" : "steps"}${sequenceBadgeDetail(badge)}`;
   return badge.expanded ? `▾ ${steps}` : `▸ +${steps}`;
+}
+function sequenceBadgeDetail(badge) {
+  return `${badge.untargeted ? ` · ${badge.untargeted} without a target` : ""}${badge.scope}${badge.exits ? " · may exit early" : ""}`;
 }
 // Interactions (#636) are a display projection of the same admitted DTO, as calls-first is:
 // - an arrow is a measured call whose exact target is drawn in another column than its own; it
@@ -251,14 +256,21 @@ function sequenceInteractions(view, options, earlyReturn) {
   const tally = (step, badge) => {
     if (step.hidden) return;
     badge.count++;
-    if (step.callId && step.callEvidence?.boundaryReason === "unresolved") badge.unresolved++;
+    if (step.callId && ["call", "boundary"].includes(step.kind) && !sequenceTarget(view, step)) badge.untargeted++;
+    if (["return", "throw", "exit"].includes(step.kind) || earlyReturn(step)) badge.exits = true;
     if (badge.expanded) visible.add(step);
     for (const child of nested(step)) tally(child, badge);
   };
+  // An arrow, or a run, inside a loop says so; inside a branch or a try's handlers, that it
+  // is conditional. Loop wins. A continuation guard only restates the path so far.
   const LOOP = " · in loop", CONDITIONAL = " · conditional";
   const continuation = step => step.kind === "branch" && step.label === "only if the preceding path continues normally";
+  const within = (step, scope, handlers) => scope === LOOP || step.kind === "loop" ? LOOP
+    : step.kind === "branch" && !continuation(step) || step.kind === "try" && handlers ? CONDITIONAL : scope;
   let run = null;
+  // A run never crosses an arrow, nor the edge of a frame that holds one.
   const place = (steps, scope) => {
+    run = null;
     for (const step of steps || []) {
       if (step.hidden) continue;
       if (returns.has(step)) {
@@ -268,21 +280,24 @@ function sequenceInteractions(view, options, earlyReturn) {
       }
       if (holds.has(step)) {
         through.add(step);
-        const inner = scope === LOOP || step.kind === "loop" ? LOOP
-          : ["branch", "try"].includes(step.kind) && !continuation(step) ? CONDITIONAL : scope;
-        place(step.children, inner); place(step.alternate, inner);
-        continue;
+        place(step.children, within(step, scope, false)); place(step.alternate, within(step, scope, true));
+        run = null; continue;
       }
       const column = sequenceStepColumn(view, step).id;
       if (!run || run.column !== column) {
-        run = {id:step.id, column, first:step, steps:[], count:0, unresolved:0, expanded:expanded.has(step.id)};
+        run = {id:step.id, column, first:step, steps:[], count:0, untargeted:0, exits:false, scope, expanded:expanded.has(step.id)};
         badges.set(step, run);
       }
+      if (scope) scopes.set(step, scope);
       run.steps.push(step); tally(step, run);
     }
+    run = null;
   };
   place(view?.steps, "");
-  for (const badge of badges.values()) badge.label = sequenceBadgeLabel(badge);
+  for (const badge of badges.values()) {
+    badge.label = sequenceBadgeLabel(badge);
+    badge.ariaLabel = `${badge.expanded ? "Fold" : "Show"} ${badge.count} internal ${badge.count === 1 ? "step" : "steps"}${sequenceBadgeDetail(badge)}`;
+  }
   return {interactions:true, visible, through, badges, returns, earlyReturn:step => (scopes.get(step) || "") + earlyReturn(step)};
 }
 // What to say when the admitted view has no displayed calls (#594).
@@ -292,13 +307,14 @@ function sequenceEmptySummary(view, options = {}) {
   if (options.showDetails) return "";
   const display = sequenceDisplay(view, options);
   if (display.interactions) {
-    // Interactions (#636): no call crosses a column. Everything shown stays in the seed's.
+    // Interactions (#636): no call crosses a column. A call without an exact target proves
+    // nothing about where it goes, so it is counted, never said to stay.
     if (display.returns.size) return "";
-    if (steps.some(step => !step.hidden)) {
-      const calls = sequenceDisplay(view, {...options, interactions:false});
-      if ([...calls.visible].some(step => step.kind === "call" || step.callId)) return `All calls stay within ${sequenceStepColumn(view, null).label}.`;
-      return "No measured calls in the admitted steps. Non-call behavior is folded; use Show all steps to inspect it.";
-    }
+    const calls = [...sequenceDisplay(view, {...options, interactions:false}).visible].filter(step => step.callId && ["call", "boundary"].includes(step.kind));
+    const untargeted = calls.filter(step => !sequenceTarget(view, step)).length, column = sequenceStepColumn(view, null).label;
+    if (!untargeted) return `All calls stay within ${column}.`;
+    if (untargeted === calls.length) return `${untargeted === 1 ? "The one call has no exact target" : `None of the ${untargeted} calls has an exact target`}, so no arrow is drawn between columns.`;
+    return `All resolved calls stay within ${column}; ${untargeted} ${untargeted === 1 ? "call has" : "calls have"} no exact target.`;
   } else if ([...display.visible].some(step => step.kind === "call" || step.callId)) return "";
   else if (steps.some(step => !step.hidden)) return "No measured calls in the admitted steps. Non-call behavior may be hidden; use Show all steps to inspect it.";
   if (!steps.length) return "No measured calls in the admitted steps. This does not mean no behavior; inspect source or Show all steps.";
@@ -523,7 +539,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   function drawBadge(parent, badge) {
     const x = positions.get(badge.column) ?? origin, width = Math.max(120, badge.label.length * 7.6 + 24);
     const control = make("g", {class:"sequence-badge", role:"button", tabindex:0, "data-trellis-badge-id":badge.id, "aria-expanded":String(badge.expanded),
-      "aria-label":`${badge.expanded ? "Fold" : "Show"} ${badge.count} internal ${badge.count === 1 ? "step" : "steps"}${badge.unresolved ? `, ${badge.unresolved} unresolved` : ""}`});
+      "aria-label":badge.ariaLabel});
     control.append(make("rect", {x:x-width/2, y:y-15, width, height:22, rx:11, class:"sequence-badge-pill"}));
     control.append(make("text", {x, y:y+1, "text-anchor":"middle", class:"sequence-badge-label"}, badge.label));
     const toggle = () => {
@@ -634,4 +650,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty, interactive:sequenceInteractive, stepColumn:sequenceStepColumn};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty, stepColumn:sequenceStepColumn};
