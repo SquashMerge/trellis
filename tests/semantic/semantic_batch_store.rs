@@ -8610,7 +8610,9 @@ fn invalid_range_655_rejects_atomically_through_publication() {
 }
 
 #[test]
-fn review655_empty_enclosing_publication_observation() {
+/// #655 review: an empty enclosing range on a non-marker occurrence excludes its document in
+/// the decoder, staging, the join and publication alike (#652).
+fn review655_empty_enclosing_excludes_its_document() {
     let world = world(|root| write_files(root, &[("src/a.js", "x;\n")]));
     let doc = DocSpec::new("src/a.js").occurrence(&[0, 0, 1], &[0, 1, 1], "s", 0);
     let mut fixture = world.fixture();
@@ -8636,32 +8638,45 @@ fn review655_empty_enclosing_publication_observation() {
     fixture.override_artifact_raw(ordinal, artifact);
     let descriptor = world.write(&fixture);
     let admission = world.memory_admission(&descriptor);
-    assert_eq!(admission.merged.claims.len(), 1);
-    assert!(admission.merged.capped_documents.is_empty());
-    let head = world.store.index_baseline().unwrap();
-    let stage = world
-        .admit(&descriptor)
-        .expect("private stage accepts the claim");
-    eprintln!("private stage accepted the one decoded claim");
-    drop(stage);
-    let join_error = world
+    assert!(admission.merged.claims.is_empty());
+    assert_eq!(
+        admission
+            .merged
+            .capped_documents
+            .values()
+            .collect::<Vec<_>>(),
+        [&trellis::scip_raw::DocumentCap::InvalidRange]
+    );
+    let (mut admitted, joined, _) = world
         .join_with(
             &descriptor,
             &BatchLimits::PRODUCTION,
             DestinationMutations::default(),
         )
-        .map(|_| ())
-        .unwrap_err();
-    eprintln!("join rejected: {join_error:#}");
-    assert!(
-        matches!(join_error.downcast_ref::<ScipCaptureError>(), Some(ScipCaptureError::InvalidArtifact(reason)) if reason == "empty or reversed SCIP range")
+        .expect("staging and the join agree with the decoder");
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    let memory = world
+        .memory_rejoin_with(
+            &descriptor,
+            DestinationMutations::default(),
+            &BatchLimits::PRODUCTION,
+        )
+        .unwrap()
+        .publication;
+    assert_same_publication(&staged, &memory, "empty enclosing");
+    assert_eq!(
+        coverage_of(&staged, "src/a.js").diagnostic.as_deref(),
+        Some("invalid_range")
     );
-    let error = world.publish(&descriptor).map(|_| ()).unwrap_err();
-    eprintln!("publication path rejected: {error:#}");
-    assert!(
-        matches!(error.downcast_ref::<ScipCaptureError>(), Some(ScipCaptureError::InvalidArtifact(reason)) if reason == "empty or reversed SCIP range")
-    );
-    assert_nothing_published(&world, head);
+    drop((admitted, joined));
+    let (pin, _, _) = world.publish(&descriptor).unwrap();
+    let published = world.store.semantic_at(pin).unwrap();
+    let row = published
+        .coverage
+        .iter()
+        .find(|row| row.document_path == "src/a.js")
+        .unwrap();
+    assert_eq!(row.diagnostic.as_deref(), Some("invalid_range"));
     assert!(world.stage_dirs().is_empty());
 }
 

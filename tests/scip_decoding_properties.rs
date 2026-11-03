@@ -456,23 +456,9 @@ proptest! {
     }
 }
 
+// #655 review: an empty enclosing range on a non-marker occurrence excludes its document
+// under `invalid_range`, as an empty primary one does (owner ruling 2026-11-03, #652).
 #[test]
-fn empty_enclosing_655_control() {
-    let primary = occurrence(legacy(&[0, 0, 1], 0), "s", 0);
-    let wire = doc_655(
-        "src/a.js",
-        &[[primary, range_655(&[0, 1, 1], 0, true)].concat()],
-    );
-    let (claims, caps) = decode_655(&wire, 1, 1).unwrap();
-    assert_eq!(claims.len(), 1);
-    assert!(caps.is_empty());
-    eprintln!("empty enclosing: admitted with one claim and no cap");
-}
-
-// Owner-requested behavior, intentionally retained as an ignored red witness:
-// #652's ratified paragraph explicitly names empty primary, not empty enclosing.
-#[test]
-#[ignore = "requested empty-enclosing exclusion differs from the ratified paragraph"]
 fn empty_enclosing_655_requested_exclusion() {
     let wire = doc_655(
         "src/a.js",
