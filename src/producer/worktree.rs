@@ -113,6 +113,11 @@ fn omission<'a>(rules: &'a Rules, path: &str) -> Option<&'a Omission> {
     rules.omit.iter().find(|omission| omission.path == path)
 }
 
+/// Whether a default-only generated file gives way to a root input at its worktree path.
+fn replaced(file: &Generated, present: impl Fn(&str) -> bool) -> bool {
+    file.default_only && file.path.strip_prefix("worktree/").is_some_and(present)
+}
+
 /// The listing for `rules`. Omitted paths leave the config and dependency
 /// lists and appear under `omitted` once, in sorted order.
 pub fn layout(inputs: &RetainedInputs, rules: &Rules) -> Layout {
@@ -139,6 +144,16 @@ pub fn layout(inputs: &RetainedInputs, rules: &Rules) -> Layout {
         generated: rules
             .generated
             .iter()
+            .filter(|file| {
+                !replaced(file, |path| {
+                    omission(rules, path).is_none()
+                        && inputs
+                            .config
+                            .iter()
+                            .chain(&inputs.dependencies)
+                            .any(|input| input.path == path)
+                })
+            })
             .map(|file| Listed {
                 path: file.path.clone(),
                 sha256: hex::encode(Sha256::digest(&file.bytes)),
@@ -216,9 +231,11 @@ pub fn materialize(
         put(&file.path, &file.bytes)?;
     }
     let count = written.len();
-    for Generated { path, bytes } in &rules.generated {
+    for file in &rules.generated {
         check_cancel(cancel)?;
-        write_new(&run_dir.join(path), bytes)?;
+        if !replaced(file, |path| written.contains(path)) {
+            write_new(&run_dir.join(&file.path), &file.bytes)?;
+        }
     }
     Ok(count)
 }

@@ -1815,7 +1815,8 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                         let occurrence = &mut invalid.documents[0].occurrences[0];
                         occurrence.range = match invalid_case {
                             2 => vec![0, split as i32, (split + 1) as i32],
-                            3 => vec![1, 0, 0, 1],
+                            // A reversed range excludes only its document (#652).
+                            3 => vec![1_000_000, 0, 1],
                             _ => {
                                 let line = &source[..source.find('\r').unwrap()];
                                 let end = if encoding == 1 {

@@ -99,7 +99,12 @@ fn plan_lists_every_inspectable_field() {
     assert!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()));
     let argv = plan_ts["command"]["argv"].as_array().unwrap();
     assert!(argv[0].as_str().unwrap().ends_with("/node"));
-    assert!(argv.contains(&json!("--infer-tsconfig")));
+    // #652: the plan generates an ES2022 tsconfig in the run's worktree instead of
+    // `--infer-tsconfig`, whose ES5 default target drops ES2015+ identifiers.
+    assert!(!argv.contains(&json!("--infer-tsconfig")), "{argv:?}");
+    let generated = plan_ts["inputs"]["generatedConfig"].as_array().unwrap();
+    assert_eq!(generated.len(), 1, "{generated:?}");
+    assert_eq!(generated[0]["path"], "worktree/tsconfig.json");
     let cwd = plan_ts["command"]["cwd"].as_str().unwrap();
     assert!(cwd.ends_with("/runs/{runId}/worktree"), "{cwd}");
     assert!(

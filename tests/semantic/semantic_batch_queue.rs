@@ -1058,18 +1058,15 @@ fn malformed_final_artifact_after_valid_artifacts_publishes_nothing() {
 }
 
 #[test]
-fn empty_occurrence_range_records_its_typed_cause() {
-    // The live #445 failure: a non-module occurrence with an empty range. The row and the CLI
-    // name `invalid_artifact` and the fixed reason, not only `index_failed`.
-    run_fault_cases(
-        &[("invalid_artifact: empty or reversed SCIP range", |world| {
-            batch_with_artifact_edit(world, "java", |index| {
-                let occurrence = &mut index.documents[0].occurrences[0];
-                let start = occurrence.range[1];
-                occurrence.range = vec![occurrence.range[0], start, start];
-            })
-        })],
-    );
+fn out_of_source_occurrence_range_records_its_typed_cause() {
+    // #445: a malformed occurrence range rejects the artifact typed. The row and the CLI name
+    // `invalid_artifact` and the fixed reason, not only `index_failed`. (An empty or reversed
+    // range excludes only its document since #652.)
+    run_fault_cases(&[("invalid_artifact: range line outside source", |world| {
+        batch_with_artifact_edit(world, "java", |index| {
+            index.documents[0].occurrences[0].range = vec![1_000_000, 0, 1];
+        })
+    })]);
 }
 
 /// A batch whose artifact for `language` is edited after generation, next to ordinary ones.

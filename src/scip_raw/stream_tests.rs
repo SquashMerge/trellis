@@ -196,7 +196,7 @@ pub(super) fn decode_whole_index_oracle(
                 d,
                 language,
                 "occurrence",
-                occurrence(o, &mut positions)?,
+                occurrence(o, &mut positions, false)?,
             );
         }
         validate_positions(text, input.position_encoding, &mut positions, flag)?;

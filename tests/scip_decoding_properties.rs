@@ -9,8 +9,8 @@ use std::{
 };
 use trellis::{
     scip_raw::{
-        self, AuthenticatedArtifact, CapturedClaim, CargoTargets, DocumentSource, ModuleRoots,
-        ScipCaptureError, VecSink,
+        self, AuthenticatedArtifact, CapturedClaim, CargoTargets, DocumentCap, DocumentSource,
+        ModuleRoots, ScipCaptureError, VecSink,
     },
     semantic_batch::{BatchCounters, BatchLimits},
 };
@@ -182,6 +182,12 @@ proptest! {
         let end_byte = if same {end.1} else {a.len()+sep.len()+end.1};
         prop_assert!(source.is_char_boundary(start.1) && source.is_char_boundary(end_byte));
         let four = [0,start.0,el,end.0];
+        if (0, start.0) == (el, end.0) {
+            // An empty non-marker range excludes its document with no claims (#652).
+            let (claims, capped, _) = decode(&document(&[occurrence(legacy(&four,0), "s", 0)], &[]), &source, enc, &BatchLimits::default()).unwrap();
+            prop_assert!(claims.is_empty() && capped);
+            return Ok(());
+        }
         let l4 = one(legacy(&four,0), &source, enc);
         prop_assert_eq!(endpoints(&l4.envelope.raw["range"]), expected);
         for mode in 1..=2 { let alt=one(legacy(&four,mode), &source, enc); prop_assert_eq!(&alt.canonical_bytes,&l4.canonical_bytes); prop_assert_eq!(&alt.fact_digest,&l4.fact_digest); }
@@ -341,5 +347,163 @@ fn invalid_unicode_and_crlf_columns_are_rejected() {
             decode(&wire, source, enc, &BatchLimits::default()),
             Err(ScipCaptureError::InvalidArtifact(_))
         ));
+    }
+}
+
+// #655: unlike the single-document coordinate property above, keep multiple
+// independently named documents and compare to the artifact without the bad ones.
+fn doc_655(path: &str, fields: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = [bytes(1, path.as_bytes()), bytes(4, b"javascript")].concat();
+    for field in fields {
+        body.extend(bytes(2, field));
+    }
+    bytes(2, &body)
+}
+
+fn decode_655(
+    wire: &[u8],
+    count: usize,
+    enc: u8,
+) -> Result<(Vec<CapturedClaim>, scip_raw::CappedDocuments), ScipCaptureError> {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(wire)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let roots = ModuleRoots::default();
+    let targets = CargoTargets::default();
+    let artifact = AuthenticatedArtifact {
+        artifact_hash: &hash,
+        producer_id: "test",
+        producer_version: "1",
+        source_set_id: "set",
+        source_revision: "rev",
+        position_encoding: enc,
+        protocol_version: 0,
+        text_document_encoding: 1,
+        project_root_uri: "",
+        module_roots: &roots,
+        cargo_targets: &targets,
+        assigned_documents: count as u64,
+    };
+    let mut sink = VecSink::default();
+    scip_raw::decode_streaming(
+        wire,
+        wire.len() as u64,
+        &artifact,
+        &mut |_: &str, _: &str| {
+            Ok(DocumentSource {
+                language: "javascript".into(),
+                bytes: Cow::Borrowed("aé😀xyz\nsecond".as_bytes()),
+                content_hash: "source".into(),
+            })
+        },
+        &mut BatchCounters::default(),
+        &BatchLimits::PRODUCTION,
+        &mut sink,
+        &Arc::new(AtomicBool::new(false)),
+    )?;
+    let caps = sink.capped_documents().clone();
+    Ok((sink.finish()?, caps))
+}
+
+fn range_655(values: &[u64], mode: u8, enclosing: bool) -> Vec<u8> {
+    match (mode, enclosing) {
+        (0, false) => legacy(values, 0),
+        (0, true) => bytes(
+            7,
+            &values.iter().flat_map(|v| varint(*v)).collect::<Vec<_>>(),
+        ),
+        (_, false) => typed(if values.len() == 3 { 8 } else { 9 }, values),
+        (_, true) => typed(if values.len() == 3 { 10 } else { 11 }, values),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(), ..ProptestConfig::default() })]
+    #[test]
+    fn invalid_range_655_multi_document_isolation(enc in 1u8..=3, mode in 0u8..=1, spec in prop::collection::vec((0u8..=3, any::<bool>()), 2..7), rotate in 0usize..10) {
+        // Three classes of bad document are always present; generated extras and
+        // rotation vary multiplicity, placement, wire shape and range positions.
+        let mut specs = vec![(0,false), (1,true), (2,false), (3,true)];
+        specs.extend(spec);
+        let len = specs.len(); specs.rotate_left(rotate % len);
+        let mut base = Vec::new(); let mut full = Vec::new(); let mut expected_caps = std::collections::BTreeMap::new();
+        for (i, (kind, multiline)) in specs.into_iter().enumerate() {
+            let path = format!("src/{i}.js");
+            let healthy = occurrence(range_655(&[0,0,1], mode, false), &format!("s{i}"), 1);
+            let mut fields = vec![healthy];
+            if kind != 3 {
+                let reversed = if multiline { vec![1,1,0,1] } else { vec![0,1,0] };
+                let empty = if multiline { vec![0,1,0,1] } else { vec![0,1,1] };
+                let bad = match kind {
+                    0 => occurrence(range_655(&reversed, mode, false), "bad", 0),
+                    1 => occurrence(range_655(&empty, mode, false), "bad", 0),
+                    _ => [occurrence(range_655(&[0,0,1], mode, false), "bad", 0), range_655(&reversed, mode, true)].concat(),
+                };
+                fields.push(bad);
+                expected_caps.insert(("javascript".to_string(), path.clone()), DocumentCap::InvalidRange);
+            } else { base.extend(doc_655(&path, &fields)); }
+            full.extend(doc_655(&path, &fields));
+        }
+        let (expected, base_caps) = decode_655(&base, len - expected_caps.len(), enc).unwrap();
+        let (actual, caps) = decode_655(&full, len, enc).unwrap();
+        prop_assert!(!expected.is_empty()); prop_assert!(base_caps.is_empty());
+        prop_assert_eq!(&caps, &expected_caps);
+        prop_assert!(actual.iter().all(|c| !caps.contains_key(&(c.language.clone(), c.envelope.relative_path.clone()))));
+        let project = |claims: &[CapturedClaim]| claims.iter().map(|c| (c.canonical_bytes.clone(), c.fact_digest.clone())).collect::<Vec<_>>();
+        prop_assert_eq!(project(&actual), project(&expected));
+    }
+}
+
+// #655 review: an empty enclosing range on a non-marker occurrence excludes its document
+// under `invalid_range`, as an empty primary one does (owner ruling 2026-11-03, #652).
+#[test]
+fn empty_enclosing_655_requested_exclusion() {
+    let wire = doc_655(
+        "src/a.js",
+        &[[
+            occurrence(legacy(&[0, 0, 1], 0), "s", 0),
+            range_655(&[0, 1, 1], 0, true),
+        ]
+        .concat()],
+    );
+    let (claims, caps) = decode_655(&wire, 1, 1).unwrap();
+    assert_eq!(
+        caps.get(&("javascript".into(), "src/a.js".into())),
+        Some(&DocumentCap::InvalidRange),
+        "owner-requested exclusion; claims={}",
+        claims.len()
+    );
+    assert!(claims.is_empty());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(), ..ProptestConfig::default() })]
+    #[test]
+    fn invalid_range_655_other_malformations_reject(kind in 0u8..4, before in any::<bool>(), same in any::<bool>(), enc in 1u8..=3, mode in 0u8..=1) {
+        let healthy = doc_655("src/a.js", &[occurrence(range_655(&[0,0,1], mode, false), "good", 1)]);
+        let invalid = occurrence(range_655(&[0,1,0], mode, false), "bad", 0);
+        let malformed = match kind {
+            0 => occurrence(range_655(&[9,0,1], mode, false), "outside", 0),
+            1 => occurrence(range_655(&[0,0,1], mode, false), "roles", 128),
+            // UTF-8 column 2 splits é; UTF-16 column 3 splits 😀. UTF-32
+            // has no split scalar, so use an unknown enum there.
+            2 if enc == 1 => occurrence(range_655(&[0,0,2], mode, false), "split", 0),
+            2 if enc == 2 => occurrence(range_655(&[0,0,3], mode, false), "split", 0),
+            2 => [occurrence(range_655(&[0,0,1], mode, false), "enum", 0), scalar(5,999)].concat(),
+            _ => vec![0x0a, 0x02, 0x80], // truncated packed range inside occurrence
+        };
+        let (b,c) = if same {
+            let fields = if before { vec![malformed, invalid] } else { vec![invalid, malformed] };
+            (doc_655("src/b.js", &fields), Vec::new())
+        } else {
+            let b = doc_655("src/b.js", &[invalid]);
+            let c = doc_655("src/c.js", &[malformed]);
+            if before { (c,b) } else { (b,c) }
+        };
+        let wire = [healthy,b,c].concat();
+        let result = decode_655(&wire, if same {2} else {3}, enc);
+        prop_assert!(matches!(result, Err(ScipCaptureError::InvalidArtifact(_))), "{result:?}");
     }
 }

@@ -1505,8 +1505,10 @@ fn java_fixed_methods_are_direct_and_other_methods_dynamic() {
     }
 }
 
+/// An empty range is valid only on a module marker. Since #652 (owner ruling 2026-11-03) any
+/// other empty occurrence excludes its document with no claims instead of the artifact.
 #[test]
-fn module_marker_exception_rejects_other_empty_occurrences() {
+fn module_marker_exception_excludes_documents_with_other_empty_occurrences() {
     for (language, symbol, roles, kind) in [
         ("javascript", "scip-typescript npm pkg 1.0.0 f().", 1, 17),
         ("javascript", "scip-typescript npm pkg 1.0.0 C#", 1, 7),
@@ -1537,14 +1539,16 @@ fn module_marker_exception_rejects_other_empty_occurrences() {
             vec![(0, 0, symbol, roles)],
             vec![(symbol, kind, vec![])],
         );
-        let error = join_inventory(&inventory, &native, &sources, 2).unwrap_err();
-        assert!(
-            matches!(
-                error.downcast_ref::<ScipCaptureError>(),
-                Some(ScipCaptureError::InvalidArtifact(_))
-            ),
-            "empty non-module-definition occurrence must fail typed: {language} {symbol} roles={roles}: {error:#}"
+        let case = format!("{language} {symbol} roles={roles}");
+        assert!(inventory.claims.is_empty(), "{case}");
+        assert_eq!(
+            inventory.capped_documents.values().collect::<Vec<_>>(),
+            [&trellis::scip_raw::DocumentCap::InvalidRange],
+            "{case}"
         );
+        let joined = join_inventory(&inventory, &native, &sources, 2)
+            .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+        assert!(joined.declaration_bindings.is_empty(), "{case}");
     }
 }
 

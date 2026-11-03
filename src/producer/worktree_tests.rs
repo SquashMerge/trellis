@@ -118,6 +118,46 @@ fn restricted_java_omits_build_files_and_writes_config() {
     assert_eq!(layout.generated[0].path, "worktree/lsif-java.json");
 }
 
+/// #652: scip-typescript gets a generated ES2022 `tsconfig.json` in its worktree, never one in
+/// the checkout; a checkout's own root `tsconfig.json` replaces it in the plan and the run.
+#[test]
+fn typescript_writes_a_default_tsconfig_unless_the_checkout_has_one() {
+    let rules = profiles::rules(
+        &profiles::row(
+            Target::Real(ProducerName::ScipTypescript),
+            TrustProfile::Restricted,
+        )
+        .unwrap(),
+    );
+    let tsconfig: Value =
+        serde_json::from_slice(profiles::SCIP_TYPESCRIPT_TSCONFIG).expect("valid JSON");
+    assert_eq!(tsconfig["compilerOptions"]["target"], "es2022");
+    assert_eq!(tsconfig["compilerOptions"]["allowJs"], true);
+    let source = retained();
+    let dir = run(
+        &source,
+        ProducerName::ScipTypescript,
+        TrustProfile::Restricted,
+    );
+    assert_eq!(
+        fs::read(dir.path().join("worktree/tsconfig.json")).unwrap(),
+        profiles::SCIP_TYPESCRIPT_TSCONFIG
+    );
+    let layout = worktree::layout(&RetainedInputs::read(&source).unwrap(), &rules);
+    assert_eq!(layout.generated.len(), 1);
+    assert_eq!(layout.generated[0].path, "worktree/tsconfig.json");
+
+    let mut own = retained();
+    own.config.push(present("tsconfig.json", b"{\"own\":true}"));
+    let dir = run(&own, ProducerName::ScipTypescript, TrustProfile::Restricted);
+    assert_eq!(
+        fs::read(dir.path().join("worktree/tsconfig.json")).unwrap(),
+        b"{\"own\":true}"
+    );
+    let layout = worktree::layout(&RetainedInputs::read(&own).unwrap(), &rules);
+    assert!(layout.generated.is_empty(), "{:?}", layout.generated);
+}
+
 #[test]
 fn trusted_java_includes_build_files() {
     let dir = run(&retained(), ProducerName::ScipJava, TrustProfile::Trusted);
