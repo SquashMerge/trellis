@@ -10458,6 +10458,172 @@ fn bounded_retained_cancellation_after_streaming_rolls_back_publication_and_cach
 }
 
 #[test]
+fn rust_below_head_rejoin_is_local_unless_cargo_context_differs_from_capture() {
+    const MANIFEST: &str = "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n";
+    const MOVED: &str =
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[lib]\npath = \"src/alt.rs\"\n";
+    const LIB: &str = "mod b;\nfn run() { b::target(); }\n";
+    const B: &str = "pub fn target() {}\n";
+    const RUN: &str = "rust-analyzer cargo fixture 0.1.0 run().";
+    const TARGET: &str = "rust-analyzer cargo fixture 0.1.0 b/target().";
+    let world = world_with(
+        |root| {
+            write_files(
+                root,
+                &[
+                    ("Cargo.toml", MANIFEST),
+                    ("src/lib.rs", LIB),
+                    ("src/b.rs", B),
+                    ("src/alt.rs", "mod b;\n"),
+                    ("src/c.rs", "fn extra() {}\n"),
+                ],
+            );
+        },
+        true,
+    );
+    let docs = || {
+        let lib = occ_at(DocSpec::new("src/lib.rs"), LIB, ("run", 0), None, RUN, 1);
+        let lib = occ_at(lib, LIB, ("target", 0), Some(8), TARGET, 0).symbol(RUN, 17, &[]);
+        let b = occ_at(DocSpec::new("src/b.rs"), B, ("target", 0), None, TARGET, 1).symbol(
+            TARGET,
+            17,
+            &[],
+        );
+        vec![DocSpec::new("src/alt.rs"), b, DocSpec::new("src/c.rs"), lib]
+    };
+    let captured = world.store.index_baseline().unwrap();
+    let (original_native, _) = world.store.retained_native_snapshot_at(captured).unwrap();
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact("rust", docs());
+    let descriptor = world.write(&fixture);
+    write_files(&world.root, &[("src/c.rs", "fn extra() { let _ = 0; }\n")]);
+    world.republish();
+    world.publish(&descriptor).unwrap();
+    let counts = world._state.path().join("rust-owner-counts.json");
+    // SAFETY: nextest isolates each test process; this test owns both hooks.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+    }
+    for value in 1..=2 {
+        let work = local_edit(
+            &world,
+            "src/c.rs",
+            &format!("fn extra() {{ let _ = {value}; }}\n"),
+            &counts,
+        );
+        assert_delayed_import_matches_full(&world, &descriptor);
+        if value == 1 {
+            assert_eq!(
+                work["fallbackReasons"],
+                json!(["original_import_missing"]),
+                "{work}"
+            );
+        } else {
+            assert_delayed_import_witnessed(&work);
+            assert_eq!(work["originalRawDecodes"], 0, "{work}");
+        }
+    }
+
+    write_files(&world.root, &[("Cargo.toml", MOVED)]);
+    let (moved, session) = trellis::index_coordinator::reconcile_workspace(
+        &world.store,
+        &IndexOptions::new(world.root.clone()),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    drop(session);
+    let (moved_native, _) = world.store.retained_native_snapshot_at(moved).unwrap();
+    assert_ne!(
+        original_native.revision.dependency_hash,
+        moved_native.revision.dependency_hash
+    );
+    for value in 3..=4 {
+        let old = world.store.index_baseline().unwrap();
+        let previous = world.store.semantic_at(old).unwrap();
+        let work = local_edit(
+            &world,
+            "src/c.rs",
+            &format!("fn extra() {{ let _ = {value}; }}\n"),
+            &counts,
+        );
+        assert_eq!(work["fullFallbacks"], 1, "{work}");
+        assert_eq!(work["witnessedRejoins"], 0, "{work}");
+        assert_eq!(
+            work["fallbackReasons"],
+            json!(["destination_witness_unavailable"]),
+            "{work}"
+        );
+        let published = assert_delayed_import_matches_full(&world, &descriptor);
+        assert_eq!(world.store.semantic_at(old).unwrap(), previous);
+        assert_eq!(
+            world
+                .store
+                .selected_raw_inputs_at(world.store.index_baseline().unwrap())
+                .unwrap()[0]
+                .captured_pin,
+            captured
+        );
+        let target = published
+            .symbols
+            .iter()
+            .find(|row| row.key.symbol == TARGET)
+            .unwrap();
+        assert_eq!(target.key.document.as_ref().unwrap().path, "src/lib.rs");
+        let (native, _) = world
+            .store
+            .retained_native_snapshot_at(world.store.index_baseline().unwrap())
+            .unwrap();
+        assert!(published.call_bindings.iter().any(|call| matches!(
+            &call.declared_target,
+            Some(trellis::semantic_evidence::Target::Internal { revision_id, document, .. })
+                if revision_id == &native.revision.id && document.path == "src/b.rs"
+        )));
+        assert!(
+            published
+                .references
+                .iter()
+                .any(|reference| reference.spelling == "target"
+                    && reference.resolution == Resolution::Resolved)
+        );
+    }
+
+    let recaptured = world.store.index_baseline().unwrap();
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let mut fresh_docs = docs();
+    fresh_docs[2] = DocSpec::new("src/c.rs")
+        .occurrence(
+            &[0, 3, 8],
+            &[],
+            "rust-analyzer cargo fixture 0.1.0 extra().",
+            1,
+        )
+        .symbol("rust-analyzer cargo fixture 0.1.0 extra().", 17, &[]);
+    fixture.artifact("rust", fresh_docs);
+    let replacement = world.write(&fixture);
+    world.publish(&replacement).unwrap();
+    let work = local_edit(&world, "src/c.rs", "fn extra() { let _ = 5; }\n", &counts);
+    assert_delayed_import_witnessed(&work);
+    assert_eq!(work["originalRawDecodes"], 0, "{work}");
+    let published = assert_delayed_import_matches_full(&world, &replacement);
+    let target = published
+        .symbols
+        .iter()
+        .find(|row| row.key.symbol == TARGET)
+        .unwrap();
+    assert_eq!(target.key.document.as_ref().unwrap().path, "src/alt.rs");
+    assert_eq!(
+        world
+            .store
+            .selected_raw_inputs_at(world.store.index_baseline().unwrap())
+            .unwrap()[0]
+            .captured_pin,
+        recaptured
+    );
+}
+
+#[test]
 fn empty_last_selector_release_drains_orphan_capture_witnesses_and_raw_batch() {
     let world = definitions_world();
     world.store.set_retention_clock_for_tests(1_000, 0);
