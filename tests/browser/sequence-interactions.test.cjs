@@ -246,6 +246,17 @@ test("an arrow inside a call chain draws without the chain; its other members fo
   assert.deepEqual(await badgeTexts(), [["chain:u", "▸ +1 internal step · 1 without a target"]]);
 });
 
+test("a final return is not an early exit; a branch that returns is", async () => {
+  const view = coordinateView(), [effect, branch, open] = view.steps, finish = {...structuredClone(branch.children[1]), id:"ret-final"};
+  open.children = [{...structuredClone(finish), id:"ret-callee", lane:"open"}];
+  view.steps = [open, effect, finish];
+  assert.equal((await render(view)).status, "rendered");
+  assert.deepEqual(await badgeTexts(), [["ret-callee", "▸ +1 internal step"], ["e1", "▸ +2 internal steps"]]);
+  view.steps = [branch, open];
+  assert.equal((await render(view)).status, "rendered");
+  assert.deepEqual(await badgeTexts(), [["if2", "▸ +3 internal steps · 1 without a target · may exit early"], ["ret-callee", "▸ +1 internal step"]]);
+});
+
 test("a large interactions diagram keeps readable text and the panel scrolls", async () => {
   const view = coordinateView();
   // Many cross-column calls make a tall diagram; each must stay at its own size.

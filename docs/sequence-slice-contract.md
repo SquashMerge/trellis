@@ -314,8 +314,9 @@ contract meaning changes, and the server response is the same.
     target (unresolved, ambiguous, dispatch, external, stale or unbound): the DTO does not
     say which column they reach, so none is counted as staying;
   - the run's scope (" · in loop" or " · conditional", below);
-  - " · may exit early" when a step in it is a `return`, `throw` or `exit`, or carries the
-    calls-first early-exit mark, so later arrows are not read as unconditional.
+  - " · may exit early" when a step in it carries the calls-first early-exit mark (a frame
+    holding a `return`, `throw` or `exit`, or a call with a folded `?`), so later arrows are
+    not read as unconditional. A plain final `return` is not an early exit.
 
   A badge is a disclosure: it expands in place to exactly those steps (compact labels, as
   calls-first draws them, with the run's scope) and folds again. Each revealed step selects

@@ -257,7 +257,9 @@ function sequenceInteractions(view, options, earlyReturn) {
     if (step.hidden) return;
     badge.count++;
     if (step.callId && ["call", "boundary"].includes(step.kind) && !sequenceTarget(view, step)) badge.untargeted++;
-    if (["return", "throw", "exit"].includes(step.kind) || earlyReturn(step)) badge.exits = true;
+    // The calls-first mark: a frame holding an exit, or a call with a folded `?`. A final
+    // `return` is not an early exit.
+    if (earlyReturn(step)) badge.exits = true;
     if (badge.expanded) visible.add(step);
     for (const child of nested(step)) tally(child, badge);
   };
@@ -310,7 +312,7 @@ function sequenceEmptySummary(view, options = {}) {
     // Interactions (#636): no call crosses a column. A call without an exact target proves
     // nothing about where it goes, so it is counted, never said to stay.
     if (display.returns.size) return "";
-    const calls = [...sequenceDisplay(view, {...options, interactions:false}).visible].filter(step => step.callId && ["call", "boundary"].includes(step.kind));
+    const calls = [...sequenceDisplay(view, {...options, interactions:false}).visible].filter(step => step.kind === "call" || step.callId);
     const untargeted = calls.filter(step => !sequenceTarget(view, step)).length, column = sequenceStepColumn(view, null).label;
     if (!untargeted) return `All calls stay within ${column}.`;
     if (untargeted === calls.length) return `${untargeted === 1 ? "The one call has no exact target" : `None of the ${untargeted} calls has an exact target`}, so no arrow is drawn between columns.`;
