@@ -2,6 +2,7 @@ import {createRequire} from 'node:module';
 import {isAbsolute, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {access, constants} from 'node:fs/promises';
+import {loadavg} from 'node:os';
 
 const require = createRequire(new URL('../tests/mcp/package.json', import.meta.url));
 const names = [
@@ -122,16 +123,26 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
   const basis = describe?.evidenceBasis;
   const pin = basis ? {expectedBasis: basis} : {};
   const found = await call('trellis_find_symbols', {...pin, query, limit: 20});
-  const symbol = found?.data?.symbols?.find(item => callableKinds.has(item.kind));
+  const describedLanguages = describe?.data?.languages ?? [];
+  const scopeLanguages = found?.data?.scopeCoverage ?? [];
+  const configuredLanguages = new Set([...describedLanguages, ...scopeLanguages]
+    .filter(row => row.semantic?.producerId).map(row => row.language));
+  const semanticCapabilities = ['java', 'rust', 'python', 'javascript'].map(language => {
+    const semantic = scopeLanguages.find(row => row.language === language)?.semantic;
+    const configured = configuredLanguages.has(language);
+    const ready = semantic?.producerId && semantic.available && semantic.freshness === 'fresh';
+    return {language, status: !configured ? 'not_configured' : ready ? 'ready' : 'unavailable'};
+  });
+  if (semanticCapabilities.some(row => row.status === 'unavailable')) {
+    results.push({tool: 'trellis_workspace_describe', status: 'fail', reason: 'missing_semantic_capability', elapsedMs: 0});
+  }
+  const documents = found?.data?.documents ?? [];
+  const callables = (found?.data?.symbols ?? []).filter(item => callableKinds.has(item.kind));
+  const symbol = callables.find(item => configuredLanguages.has(
+    documents.find(document => document.ref === item.doc)?.document.language)) ?? callables[0];
   const symbolBasis = found?.evidenceBasis;
   const symbolPin = symbolBasis ? {expectedBasis: symbolBasis} : pin;
-  const document = found?.data?.documents?.find(item => item.ref === symbol?.doc);
-  if (document) {
-    const semantic = found.data.scopeCoverage?.find(item => item.language === document.document.language)?.semantic;
-    if (!semantic?.available || semantic.freshness !== 'fresh') {
-      results.push({tool: 'trellis_workspace_describe', status: 'fail', reason: 'missing_semantic_capability', elapsedMs: 0});
-    }
-  }
+  const document = documents.find(item => item.ref === symbol?.doc);
   await call('trellis_search_symbols', {...symbolPin, query, limit: 1});
   if (symbol) {
     const selected = {...symbolPin, symbolId: symbol.symbolId};
@@ -180,7 +191,7 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
     missing('trellis_rules_explain', 'missing_rule_instance');
   }
   return {ok: results.length > 0 && results.every(row => row.status === 'pass'),
-    catalogTools: tools.length, calls, distinctToolsCalled: called.size,
+    catalogTools: tools.length, calls, distinctToolsCalled: called.size, semanticCapabilities,
     blockedTools: [...catalog.keys()].filter(name => !called.has(name)).length, results};
 }
 
@@ -219,6 +230,7 @@ export async function main(args) {
   });
   let report;
   const started = performance.now();
+  const loadBefore = loadavg();
   try {
     await client.connect(transport);
     const tools = [];
@@ -240,6 +252,7 @@ export async function main(args) {
     }
   }
   report.elapsedMs = Math.round((performance.now() - started) * 100) / 100;
+  report.loadAverage = {before: loadBefore, after: loadavg()};
   console.log(JSON.stringify(report, null, 2));
   return report.ok ? 0 : 1;
 }

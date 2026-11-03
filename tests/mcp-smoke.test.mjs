@@ -21,8 +21,8 @@ const instance = {rule: '$layers', target: identity, destination};
 function response(name) {
   let data = {};
   let evidenceBasis = basis;
-  if (name === 'trellis_workspace_describe') data = {indexState: 'ready', watcherDegraded: false, languages: [{language: 'rust', semantic: {available: true, freshness: 'fresh'}}], searchIndex: {unavailableReason: null}};
-  if (name === 'trellis_find_symbols') data = {symbols: [symbol], documents: [document], scopeCoverage: [{language: 'rust', semantic: {available: true, freshness: 'fresh'}}]};
+  if (name === 'trellis_workspace_describe') data = {indexState: 'ready', watcherDegraded: false, languages: [{language: 'rust', semantic: {producerId: 'rust-analyzer', available: true, freshness: 'fresh'}}], searchIndex: {unavailableReason: null}};
+  if (name === 'trellis_find_symbols') data = {symbols: [symbol], documents: [document], scopeCoverage: [{language: 'rust', semantic: {producerId: 'rust-analyzer', available: true, freshness: 'fresh'}}]};
   if (name === 'trellis_declaration') {
     data = {doc: 7, documents: [{...document, document: {...document.document, path: 'src/discovered.rs'}}], lines: {start: 10, end: 40}};
     evidenceBasis = declarationBasis;
@@ -151,6 +151,10 @@ createInterface({input: process.stdin}).on('line', line => {
     const report = JSON.parse(result.stdout);
     assert.equal(report.ok, true);
     assert.equal(report.results.length, tools.length);
+    for (const loads of Object.values(report.loadAverage)) {
+      assert.equal(loads.length, 3);
+      assert.ok(loads.every(value => Number.isFinite(value) && value >= 0));
+    }
     assert.equal(result.stderr, '');
     assert.ok(!result.stdout.includes('SECRET'));
   } finally { rmSync(temporary, {recursive: true, force: true}); }
@@ -189,6 +193,50 @@ test('an arbitrary error code advertised in the live schema never reaches the re
   assert.equal(report.ok, false);
   assert.equal(report.results.find(row => row.reason === 'tool_error').code, 'other');
   assert.ok(!JSON.stringify(report).includes('SECRET_TOKEN'));
+});
+
+test('probe prefers a configured language and reports unconfigured languages without failure', async () => {
+  const pythonDocument = {...document, ref: 8, document: {...document.document, language: 'python', path: 'tools/main.py'}};
+  const client = clientFor((name, result) => {
+    const data = result.structuredContent.data;
+    const python = {language: 'python', semantic: {producerId: null, available: false, freshness: 'unavailable'}};
+    if (name === 'trellis_workspace_describe') data.languages.unshift(python);
+    if (name === 'trellis_find_symbols') {
+      data.symbols.unshift({...symbol, doc: 8, symbolId: `sid:v1:${'b'.repeat(32)}`});
+      data.documents.unshift(pythonDocument);
+      data.scopeCoverage.unshift(python);
+    }
+    return result;
+  });
+  const report = await exercise(client, liveTools, '/fixture', 'main');
+  assert.equal(report.ok, true, JSON.stringify(report));
+  assert.equal(client.calls.find(call => call.name === 'trellis_declaration').args.symbolId, symbol.symbolId);
+  assert.deepEqual(report.semanticCapabilities.find(row => row.language === 'python'), {language: 'python', status: 'not_configured'});
+});
+
+test('a language without a selected producer is reported as not configured', async () => {
+  const client = clientFor((name, result) => {
+    const rows = name === 'trellis_workspace_describe' ? result.structuredContent.data.languages
+      : name === 'trellis_find_symbols' ? result.structuredContent.data.scopeCoverage : [];
+    for (const row of rows) row.semantic = {producerId: null, available: false, freshness: 'unavailable'};
+    return result;
+  });
+  const report = await exercise(client, liveTools, '/fixture', 'main');
+  assert.equal(report.ok, true, JSON.stringify(report));
+  assert.equal(report.semanticCapabilities.find(row => row.language === 'rust').status, 'not_configured');
+});
+
+test('a configured producer missing from scope still fails even when another language is fresh', async () => {
+  for (const mode of ['missing', 'stale']) {
+    const client = clientFor((name, result) => {
+      if (name === 'trellis_workspace_describe') result.structuredContent.data.languages.push({language: 'javascript', semantic: {producerId: 'scip-typescript', available: true, freshness: 'fresh'}});
+      if (name === 'trellis_find_symbols') result.structuredContent.data.scopeCoverage.push({language: 'javascript', semantic: {producerId: mode === 'missing' ? null : 'scip-typescript', available: false, freshness: mode === 'missing' ? 'unavailable' : 'stale'}});
+      return result;
+    });
+    const report = await exercise(client, liveTools, '/fixture', 'main');
+    assert.equal(report.ok, false, JSON.stringify(report));
+    assert.ok(report.results.some(row => row.reason === 'missing_semantic_capability'));
+  }
 });
 
 test('CLI requires explicit absolute installed binary and checkout', () => {
