@@ -261,7 +261,8 @@ function sequenceInteractions(view, options, earlyReturn) {
   // A loop may exit early when its frame draws an exit (calls-first's mark) or a step in it
   // carries a folded `?` or guard (#542, #558).
   const exits = step => !step.hidden && (!!sequenceEarlyReturn(step) || nested(step).some(exits));
-  const loopLabel = step => `loop${earlyReturn(step) || exits(step) ? " · may exit early" : ""}`;
+  // The frame's tag says "loop"; its guard says only what qualifies it, if anything.
+  const loopLabel = step => earlyReturn(step) || exits(step) ? "may exit early" : "";
   return {interactions:true, visible, through, loops, returns, hiddenSteps, loopLabel, earlyReturn};
 }
 // What to say when the admitted view has no displayed calls (#594).
@@ -522,9 +523,10 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
         const start = y, x = 18 + depth * 10, label = displayProjection.loopLabel(step);
         group.setAttribute("data-presentation", "interaction-loop");
         const box = make("rect", {x, y:start-19, width:width-x-18, height:34, class:"sequence-fragment"}); group.append(box);
-        const tabWidth = Math.max(80, label.length * 8 + 28);
+        const tabWidth = 80;
         group.append(make("path", {d:`M ${x} ${start-19} H ${x+tabWidth} V ${start+1} L ${x+tabWidth-10} ${start+11} H ${x} Z`, class:"sequence-fragment-tab"}));
-        group.append(make("text", {x:x+12, y:start, class:"sequence-fragment-operator"}, label));
+        group.append(make("text", {x:x+12, y:start, class:"sequence-fragment-operator"}, "loop"));
+        if (label) group.append(make("text", {x:x+tabWidth+12, y:start, class:"sequence-control-label"}, `[${label}]`));
         y += 34;
         draw(step.children, group, depth+1); draw(step.alternate, group, depth+1);
         y += 4; box.setAttribute("height", y-start+8); y += 14;

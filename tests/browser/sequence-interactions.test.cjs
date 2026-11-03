@@ -123,7 +123,8 @@ test("a loop around arrows is one labelled UML frame around exactly them, with n
   const frames = page.locator("#sequence-diagram .pele-frame-loop");
   assert.equal(await frames.count(), 1);
   assert.equal(await frames.locator(".pele-frame-kind").textContent(), "loop");
-  assert.equal((await frames.locator(".pele-frame-label").textContent()).replace(/\s+/g, " "), "[loop · may exit early]");
+  // The tag says "loop" once; the guard says only the qualifier.
+  assert.deepEqual(await frames.locator(".pele-frame-label").allTextContents(), ["[may exit early]"]);
   const frame = await box(frames.locator("rect, path").first());
   for (const id of ["c-loop-open", "c-loop-start"]) {
     const arrow = await box(label(id));
@@ -133,13 +134,16 @@ test("a loop around arrows is one labelled UML frame around exactly them, with n
     const arrow = await box(label(id));
     assert.ok(arrow.y < frame.top || arrow.y > frame.bottom, `${id} outside: ${JSON.stringify({frame, arrow})}`);
   }
-  // Without an exit in it, the frame says only "loop"; with a folded `?`, it may exit early.
+  // Without an exit in it, the frame has only its "loop" tag; with a folded `?`, it may exit early.
   const plain = coordinateView(), loop = plain.steps[3];
   loop.children = loop.children.filter(step => step.id !== "if-loop");
   assert.equal((await render(plain)).status, "rendered");
-  assert.equal((await page.locator("#sequence-diagram .pele-frame-loop .pele-frame-label").textContent()).trim(), "[loop]");
+  assert.equal(await page.locator("#sequence-diagram .pele-frame-loop .pele-frame-kind").textContent(), "loop");
+  assert.equal(await page.locator("#sequence-diagram .pele-frame-loop .pele-frame-label").count(), 0, "no [loop] guard");
+  await legacy(plain);
+  assert.equal(await page.locator('#sequence-diagram [data-presentation="interaction-loop"] .sequence-control-label').count(), 0);
   loop.children[1].folded = [{...structuredClone(loop.children[0]), id:"q", kind:"branch", label:"?: continue only on success; otherwise early return", callId:null}];
-  assert.equal(await page.evaluate(view => { const d = TrellisSequence.display(view, {interactions:true}); return d.loopLabel(view.steps[3]); }, plain), "loop · may exit early");
+  assert.equal(await page.evaluate(view => { const d = TrellisSequence.display(view, {interactions:true}); return d.loopLabel(view.steps[3]); }, plain), "may exit early");
 });
 
 test("a nested chain starts on its callee's column and returns before its caller does", async () => {
@@ -191,7 +195,8 @@ test("the legacy renderer draws the same arrows, returns and loop frame, and not
   assert.equal(await page.locator("#sequence-diagram .sequence-activation").count(), RETURNS.length);
   const loop = page.locator('#sequence-diagram [data-presentation="interaction-loop"]');
   assert.equal(await loop.count(), 1);
-  assert.equal(await loop.locator(".sequence-fragment-operator").textContent(), "loop · may exit early");
+  assert.equal(await loop.locator(".sequence-fragment-operator").textContent(), "loop");
+  assert.equal(await loop.locator(".sequence-control-label").textContent(), "[may exit early]");
   const frame = await box(loop.locator(".sequence-fragment"));
   for (const id of ["c-loop-open", "c-loop-start"]) {
     const arrow = await box(page.locator(`#sequence-diagram [data-source-step-id="${id}"]`));

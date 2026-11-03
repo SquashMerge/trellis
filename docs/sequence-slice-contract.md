@@ -306,7 +306,7 @@ meaning changes, and the server response is the same.
   call to the return. They mark only that the following steps are the caller's again, as the
   DTO's order already says: not an observed return, value, timing or runtime activation.
 - **Loops.** A loop that encloses an arrow is drawn as a UML loop frame around its arrows,
-  labelled "loop", or "loop · may exit early" when its frame draws an exit (calls-first's
+  tagged "loop", with the guard "[may exit early]" only when its frame draws an exit (calls-first's
   mark: a `return`, `throw` or `exit` in it) or a step in it carries a folded `?` or guard
   (#542, #558). The frame is not a row and takes no row number. Nested loops nest frames.
 - **Everything else draws nothing.** Internal steps (branches, effects, boundaries, loops

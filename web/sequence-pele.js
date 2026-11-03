@@ -128,9 +128,10 @@
         // Interactions (#636): a loop around arrows is a frame only, labelled, with no row.
         const loopFrame = !!displayProjection.loops?.has(step);
         const heading = loopFrame ? displayProjection.loopLabel(step) : options.showDetails ? step.label : shortened(window.TrellisSequence.compactLabel(step));
-        const header = frame && frame !== "rect" ? {kind:frame, header:`[${heading}]`, alternate:frame === "alt" ? "[alternate path]" : null} : null;
+        // An unqualified Interactions loop has a tag and no guard: Pele then draws no label.
+        const header = frame && frame !== "rect" ? {kind:frame, header:heading ? `[${heading}]` : null, alternate:frame === "alt" ? "[alternate path]" : null} : null;
         if (frame) {
-          emit(frame === "rect" ? "rect" : `${frame} ${encode(heading)}`);
+          emit(frame === "rect" ? "rect" : heading ? `${frame} ${encode(heading)}` : frame);
           frames.push(frame);
           if (header) frameHeaders.push(header);
         }
@@ -242,7 +243,7 @@
       if (frame.hasAttribute("data-id") || frame.querySelector("[data-id]")) unsupported("Unexpected Pele frame identity");
       if (frame.querySelector(".pele-frame-kind")?.textContent !== expected.kind) unsupported("Changed Pele frame kind");
       const labels = [...frame.querySelectorAll(".pele-frame-label")].map(n => n.textContent.replace(/\s+/g, ""));
-      const wanted = (expected.alternate ? [expected.alternate, expected.header] : [expected.header]).map(n => n.replace(/\s+/g, ""));
+      const wanted = [expected.alternate, expected.header].filter(Boolean).map(n => n.replace(/\s+/g, ""));
       if (labels.join("|") !== wanted.join("|")) unsupported("Changed Pele frame header");
     }
     // The alt frame has no native ID; its original header is the numbered note.
