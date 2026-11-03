@@ -1012,8 +1012,8 @@ pub const OCCURRENCE_CAP_EXCEEDED: &str = "occurrence_cap_exceeded";
 pub const DOCUMENT_CAP_EXCEEDED: &str = "document_cap_exceeded";
 
 /// Coverage diagnostic of a document admitted with no claims because one of its occurrences has
-/// a reversed range, or an empty primary range that is not a module marker (owner ruling
-/// 2026-11-03, #652). Every occurrence and symbol is still fully validated, so any other
+/// a reversed range, or an empty primary or enclosing range, and is not a module marker (owner
+/// ruling 2026-11-03, #652). Every occurrence and symbol is still fully validated, so any other
 /// malformation rejects the artifact; the rest of the artifact imports.
 pub const INVALID_RANGE: &str = "invalid_range";
 
@@ -1305,20 +1305,18 @@ fn raw_range_values(o: &types::Occurrence, enclosing: bool) -> Option<[i32; 4]> 
 }
 
 /// The first range that makes an occurrence's document [`DocumentCap::InvalidRange`] (owner
-/// ruling 2026-11-03, #652): a reversed primary or enclosing range, or an empty primary range
-/// on an occurrence that is not a module marker by shape. An empty marker that does not name
-/// its document stays an artifact error (#443, `check_module_markers`).
+/// ruling 2026-11-03, #652): a reversed primary or enclosing range, or an empty primary or
+/// enclosing range on an occurrence that is not a module marker by shape. An empty marker that
+/// does not name its document stays an artifact error (#443, `check_module_markers`).
 fn range_problem(o: &types::Occurrence, language: &str, path: &str) -> Option<[i32; 4]> {
-    let reversed = |values: [i32; 4]| (values[0], values[1]) > (values[2], values[3]);
-    if let Some(values) = raw_range_values(o, false) {
-        let empty = (values[0], values[1]) == (values[2], values[3]);
-        if reversed(values)
-            || empty && !(o.symbol_roles & 1 != 0 && module_marker_shape(language, path, &o.symbol))
-        {
-            return Some(values);
-        }
-    }
-    raw_range_values(o, true).filter(|values| reversed(*values))
+    let marker = o.symbol_roles & 1 != 0 && module_marker_shape(language, path, &o.symbol);
+    [false, true]
+        .into_iter()
+        .filter_map(|enclosing| raw_range_values(o, enclosing))
+        .find(|values| {
+            let (start, end) = ((values[0], values[1]), (values[2], values[3]));
+            start > end || start == end && !marker
+        })
 }
 
 /// Opt-in (`TRELLIS_INDEX_DIAGNOSTICS=1`), best-effort: names the document an invalid range
