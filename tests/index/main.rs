@@ -18,6 +18,7 @@ mod native_search_capture;
 mod native_store;
 mod native_whitespace;
 mod proptest_absence;
+mod proptest_java_absence;
 mod python_indexer;
 mod references;
 mod rust_indexer;
