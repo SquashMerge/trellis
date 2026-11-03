@@ -179,6 +179,19 @@ binary and use the same external `PLAYWRIGHT_BROWSERS_PATH`, then run:
 node --test --test-concurrency=1 tests/browser/architecture.test.cjs
 ```
 
+### Arrow routing (#637)
+
+`architecture-geometry.cjs` measures a drawn summary in page pixels: every arrow segment
+against every band and module box, every count tag against bands, chips and other tags,
+whether each long upward arrow runs in the left side channel, and each arrow's count and
+stroke width. `architecture.test.cjs` applies it to the real-daemon layouts above.
+`architecture-routing.test.cjs` applies it in real Chromium under the product CSP to
+`tests/fixtures/architecture/trellis-summary.json`, Trellis's own captured summary (native
+index plus pinned rust-analyzer and scip-typescript imports, trimmed to what the drawing
+reads), at three widths with and without test edges, and to a synthetic summary with peers,
+two shared boxes and a shared-to-shared arrow. It also checks the width scale's ordering and
+clamps. It needs no daemon.
+
 ## Treemap acceptance
 
 `treemap.test.cjs` drives the real daemon, indexed per-file line/role/metric response
