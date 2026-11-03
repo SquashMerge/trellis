@@ -822,6 +822,13 @@ impl WatcherWork {
         self.watch.disable_native_watcher_for_tests();
     }
 
+    pub(crate) fn semantic_fence(
+        &self,
+        options: &IndexOptions,
+    ) -> Option<crate::watch::WatchFence> {
+        (!self.accepted_watch_intent(options)).then(|| self.watch.publication_fence())
+    }
+
     /// Feed the same bounded ingress as notify in a deterministic scheduler
     /// fixture. The intent is visible before debounce and before drain.
     #[doc(hidden)]

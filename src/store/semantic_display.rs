@@ -7,13 +7,16 @@
 //! Producers are never merged. Bindings are selected by the call-graph engine's
 //! `call_disposition`, the reader that the call graph, sequence and line navigation share
 //! (#466).
+use super::native_first::DocumentSemanticOrigin;
 use super::*;
 use crate::{
     graph_query::{
         self as engine, BoundaryReason, DefaultProducers, DocumentFacts, GraphIntegrity,
         GraphSnapshot, GraphSource, HistoryFacts, SemanticDocument,
     },
-    model::SemanticState,
+    model::{
+        DocumentSemanticStatus, SemanticAvailability, SemanticAvailabilityCounts, SemanticState,
+    },
     native_evidence::DocumentKey,
     semantic_evidence as sem,
 };
@@ -182,8 +185,10 @@ impl GraphSource for Locate<'_> {
 pub(super) struct SemanticCalls<'a> {
     db: &'a Connection,
     selected: &'a ReadRevision,
+    selected_native_revision: String,
     pub selection: ProducerSelection,
-    tuples: BTreeMap<(String, String), Option<i64>>,
+    origins: BTreeMap<(String, String), DocumentSemanticOrigin>,
+    excluded_proofs: BTreeMap<i64, BTreeSet<String>>,
     locate: Locate<'a>,
 }
 
@@ -194,11 +199,14 @@ impl<'a> SemanticCalls<'a> {
         explicit: Option<&str>,
     ) -> Result<Self> {
         let selection = select_producers(db, &selected.key, explicit)?;
+        let selected_native_revision = semantic_comparison_revision(db, selected)?;
         Ok(Self {
             db,
             selected,
+            selected_native_revision,
             selection,
-            tuples: BTreeMap::new(),
+            origins: BTreeMap::new(),
+            excluded_proofs: BTreeMap::new(),
             locate: Locate {
                 db,
                 selected,
@@ -210,27 +218,26 @@ impl<'a> SemanticCalls<'a> {
         })
     }
 
-    /// The selected producer's coverage tuple of a document; `None` when its language has
-    /// no selected producer.
-    fn tuple(&mut self, language: &str, path: &str) -> Result<Option<i64>> {
+    /// The direct semantic origin; native-first descriptors never stand in for facts.
+    fn origin(&mut self, language: &str, path: &str) -> Result<Option<&DocumentSemanticOrigin>> {
         let Some(producer) = self.selection.producer(language) else {
             return Ok(None);
         };
         let key = (language.to_owned(), path.to_owned());
-        if let Some(tuple) = self.tuples.get(&key) {
-            return Ok(*tuple);
+        if !self.origins.contains_key(&key) {
+            let origin =
+                semantic_document_origin(self.db, self.selected, producer, language, path)?;
+            self.origins.insert(key.clone(), origin);
         }
-        let tuple: Option<i64> = self
-            .db
-            .query_row(
-                "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
-                params![self.selected.key, producer, language, path],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let tuple = tuple.context(SelectedIntegrity("missing producer coverage tuple".into()))?;
-        self.tuples.insert(key, Some(tuple));
-        Ok(Some(tuple))
+        Ok(self.origins.get(&key))
+    }
+
+    fn document_status(
+        &self,
+        language: &str,
+        path: &str,
+    ) -> Result<crate::model::DocumentSemanticStatus> {
+        selected_document_status(self.db, self.selected, &self.selection, language, path)
     }
 
     /// The selected binding of one measured call, or `None` for syntax-only evidence.
@@ -238,19 +245,39 @@ impl<'a> SemanticCalls<'a> {
         &mut self,
         call: &crate::native_evidence::Call,
     ) -> Result<Option<CallSemantic>> {
-        let Some(tuple) = self.tuple(&call.document.language, &call.document.path)? else {
+        let Some(origin) = self.origin(&call.document.language, &call.document.path)? else {
             return Ok(None);
         };
+        if !origin.source_eligible && origin.catching_up {
+            return Ok(None);
+        }
+        let tuple = origin
+            .tuple_id
+            .context(SelectedIntegrity("missing producer coverage tuple".into()))?;
+        let origin_key = origin.origin_key.clone();
+        let origin_native_revision = origin.native_revision_id.clone();
         let encoded = id_codec::encode_occ(&call.id)
             .context(SelectedIntegrity("invalid selected call ID".into()))?;
-        let facts = read_semantic_tuple_for_call(
+        let mut facts = read_semantic_tuple_for_call(
             self.db,
-            &self.selected.key,
+            &origin_key,
             Some(tuple),
             None,
             true,
             Some(&encoded),
         )?;
+        if !self.excluded_proofs.contains_key(&tuple) {
+            self.excluded_proofs.insert(
+                tuple,
+                semantic_ineligible_provenance(self.db, self.selected, tuple)?,
+            );
+        }
+        filter_semantic_facts(&mut facts, &self.excluded_proofs[&tuple]);
+        project_origin_freshness(
+            &mut facts,
+            &origin_native_revision,
+            &self.selected_native_revision,
+        );
         let [coverage] = <[_; 1]>::try_from(facts.coverage)
             .map_err(|_| SelectedIntegrity("corrupt selected semantic coverage".into()))?;
         let semantic = SemanticDocument {
@@ -299,21 +326,106 @@ impl<'a> SemanticCalls<'a> {
     /// The selected producer's state for one document: fresh or stale when its selected
     /// coverage tuple is complete or partial, otherwise unavailable.
     pub(super) fn document_state(&mut self, language: &str, path: &str) -> Result<SemanticState> {
-        let Some(tuple) = self.tuple(language, path)? else {
+        let Some(origin) = self.origin(language, path)? else {
             return Ok(SemanticState::Unavailable);
         };
-        let (usable, stale): (bool, bool) = self.db.query_row(
+        if !origin.source_eligible && origin.catching_up {
+            return Ok(SemanticState::Unavailable);
+        }
+        let tuple = origin
+            .tuple_id
+            .context(SelectedIntegrity("missing producer coverage tuple".into()))?;
+        let origin_native_revision = origin.native_revision_id.clone();
+        let comparison = semantic_comparison_freshness(
+            sem::Freshness::Fresh,
+            &origin_native_revision,
+            &self.selected_native_revision,
+        );
+        let (usable, stored_stale): (bool, bool) = self.db.query_row(
             "SELECT c.selected=1 AND c.state IN ('complete','partial'),
-                    EXISTS(SELECT 1 FROM semantic_provenance p WHERE p.tuple_id=c.tuple_id AND p.freshness<>'fresh')
+                    EXISTS(SELECT 1 FROM semantic_provenance p
+                           WHERE p.tuple_id=c.tuple_id AND p.freshness<>'fresh'
+                             AND NOT EXISTS(SELECT 1 FROM semantic_ineligible_proofs e
+                                            WHERE e.revision_id=?2 AND e.origin_tuple_id=p.tuple_id
+                                              AND e.provenance_id=p.provenance_id))
              FROM semantic_coverage c WHERE c.tuple_id=?1",
-            [tuple],
+            params![tuple, self.selected.key],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        let stale = stored_stale || comparison != sem::Freshness::Fresh;
         Ok(match (usable, stale) {
             (false, _) => SemanticState::Unavailable,
             (true, true) => SemanticState::Stale,
             (true, false) => SemanticState::Fresh,
         })
+    }
+}
+
+/// Keep the original origin identities and drop associations excluded at publication.
+pub(super) fn filter_semantic_snapshot(
+    db: &Connection,
+    selected: &ReadRevision,
+    origin_tuple: i64,
+    snapshot: &mut sem::SemanticSnapshot,
+) -> Result<()> {
+    let excluded = semantic_ineligible_provenance(db, selected, origin_tuple)?;
+    filter_semantic_facts(snapshot, &excluded);
+    let origin_revision: String = db.query_row(
+        "SELECT r.native_revision_id FROM semantic_coverage c JOIN native_revisions r ON r.id=c.revision_id WHERE c.tuple_id=?1",
+        [origin_tuple], |row| row.get(0),
+    )?;
+    let selected_revision = semantic_comparison_revision(db, selected)?;
+    project_origin_freshness(snapshot, &origin_revision, &selected_revision);
+    Ok(())
+}
+
+fn project_origin_freshness(
+    snapshot: &mut sem::SemanticSnapshot,
+    origin_revision: &str,
+    selected_revision: &str,
+) {
+    for proof in &mut snapshot.provenance {
+        proof.freshness =
+            semantic_comparison_freshness(proof.freshness, origin_revision, selected_revision);
+    }
+}
+
+fn filter_semantic_facts(snapshot: &mut sem::SemanticSnapshot, excluded: &BTreeSet<String>) {
+    snapshot
+        .symbols
+        .retain(|fact| !excluded.contains(&fact.provenance_id));
+    snapshot
+        .declaration_bindings
+        .retain(|fact| !excluded.contains(&fact.provenance_id));
+    snapshot
+        .references
+        .retain(|fact| !excluded.contains(&fact.provenance_id));
+    snapshot
+        .call_bindings
+        .retain(|fact| !excluded.contains(&fact.provenance_id));
+    snapshot
+        .type_relationships
+        .retain(|fact| !excluded.contains(&fact.provenance_id));
+    snapshot
+        .provenance
+        .retain(|proof| !excluded.contains(&proof.id));
+}
+
+/// Availability is independent from the freshness attached to admitted origin proofs.
+fn selected_document_status(
+    db: &Connection,
+    selected: &ReadRevision,
+    selection: &ProducerSelection,
+    language: &str,
+    path: &str,
+) -> Result<DocumentSemanticStatus> {
+    match selection.producer(language) {
+        Some(producer) => semantic_document_status(db, selected, producer, language, path),
+        None => Ok(DocumentSemanticStatus {
+            producer_id: selection.named(language).map(str::to_owned),
+            reason: selection.note(language),
+            ..Default::default()
+        }),
     }
 }
 
@@ -325,14 +437,10 @@ pub(super) fn status_semantics(
     status: &mut crate::model::IndexStatus,
 ) -> Result<()> {
     let key = semantic_pin_key(status.revision);
+    let read = ReadRevision::new(status.revision, key.clone());
     let defaults = default_producers(db, &key)?;
     status.semantic_languages.clear();
-    if !defaults.published {
-        status.semantic_producer_id = None;
-        status.semantic_note = Some(NO_PRODUCER_NOTE.into());
-        status.stats.semantic_state = SemanticState::Unavailable;
-        return Ok(());
-    }
+    status.semantic_availability = SemanticAvailabilityCounts::default();
     // Measured calls of each indexed language at this revision.
     let languages = db
         .prepare_cached(
@@ -353,6 +461,7 @@ pub(super) fn status_semantics(
             language,
             semantic_producer_id: producer.clone(),
             semantic_state: SemanticState::Unavailable,
+            semantic_availability: SemanticAvailabilityCounts::default(),
             calls,
             internal: 0,
             external: 0,
@@ -361,25 +470,43 @@ pub(super) fn status_semantics(
             coverage: None,
         };
         if let Some(producer) = producer {
-            language_counts(db, &key, &producer, &mut row)?;
+            language_counts(db, &read, &producer, &mut row)?;
             selected.insert(producer);
         } else if let Some(note) = &row.semantic_note
             && !notes.contains(note)
         {
             notes.push(note.clone());
         }
+        if row.semantic_producer_id.is_none() {
+            let unavailable: i64 = db.query_row(
+                "SELECT count(*) FROM revision_documents WHERE revision_id=?1 AND language=?2",
+                params![key, row.language],
+                |row| row.get(0),
+            )?;
+            row.semantic_availability.unavailable = u64::try_from(unavailable)
+                .context(SelectedIntegrity("corrupt semantic document count".into()))?;
+        }
+        status.semantic_availability.fresh += row.semantic_availability.fresh;
+        status.semantic_availability.catching_up += row.semantic_availability.catching_up;
+        status.semantic_availability.unavailable += row.semantic_availability.unavailable;
         status.semantic_languages.push(row);
     }
     let rows = &status.semantic_languages;
     let stats = &mut status.stats;
     if selected.is_empty() {
         status.semantic_producer_id = None;
-        status.semantic_note = Some(if notes.is_empty() {
+        status.semantic_note = Some(if !defaults.published {
+            NO_PRODUCER_NOTE.into()
+        } else if notes.is_empty() {
             LANGUAGE_NOTE.into()
         } else {
             notes.join("; ")
         });
         stats.semantic_state = SemanticState::Unavailable;
+        stats.internal = 0;
+        stats.external = 0;
+        stats.ambiguous = 0;
+        stats.unresolved = stats.calls;
         return Ok(());
     }
     // A language no published producer covers is ordinary; only conflicts are noted.
@@ -408,36 +535,81 @@ pub(super) fn status_semantics(
 /// One language's selected bindings and state under its producer.
 fn language_counts(
     db: &Connection,
-    key: &str,
+    selected: &ReadRevision,
     producer: &str,
     row: &mut crate::model::LanguageSemantic,
 ) -> Result<()> {
-    // Rows of one ambiguous call share its call ID; each call counts once.
-    let mut statement = db.prepare_cached(
-        "SELECT CASE WHEN b.resolution='resolved' AND b.declared_kind='internal' THEN 0
-                     WHEN b.resolution='external' OR b.declared_kind='external' THEN 1
-                     WHEN b.resolution='ambiguous' THEN 2 ELSE 3 END AS kind,
-                count(DISTINCT b.call_id)
-         FROM semantic_coverage c JOIN semantic_call_bindings b ON b.tuple_id=c.tuple_id
-         WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
-           AND c.state IN ('complete','partial') AND b.call_id IS NOT NULL
-         GROUP BY kind",
-    )?;
+    let paths = db.prepare_cached(
+        "SELECT path FROM revision_documents WHERE revision_id=?1 AND language=?2 ORDER BY path",
+    )?.query_map(params![selected.key, row.language], |row| row.get::<_, String>(0))?
+      .collect::<rusqlite::Result<Vec<_>>>()?;
+    let selected_revision = semantic_comparison_revision(db, selected)?;
     let mut counts = [0_usize; 4];
-    for result in statement.query_map(params![key, producer, row.language], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-    })? {
-        let (kind, count) = result?;
-        counts[kind as usize] = count as usize;
+    let mut usable = false;
+    let mut stale = false;
+    let mut coverage = crate::model::SemanticCoverageSummary::default();
+    for path in paths {
+        row.semantic_availability
+            .add(semantic_document_status(db, selected, producer, &row.language, &path)?.state);
+        let origin = semantic_document_origin(db, selected, producer, &row.language, &path)?;
+        if !origin.source_eligible && origin.catching_up {
+            continue;
+        }
+        let tuple = origin
+            .tuple_id
+            .context(SelectedIntegrity("missing producer coverage tuple".into()))?;
+        add_tuple_coverage(db, tuple, &mut coverage)?;
+        let selected_usable: bool = db.query_row(
+            "SELECT selected=1 AND state IN ('complete','partial') FROM semantic_coverage WHERE tuple_id=?1",
+            [tuple], |row| row.get(0),
+        )?;
+        if !selected_usable {
+            continue;
+        }
+        usable = true;
+        stale |= semantic_comparison_freshness(
+            sem::Freshness::Fresh,
+            &origin.native_revision_id,
+            &selected_revision,
+        ) != sem::Freshness::Fresh;
+        stale |= db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM semantic_provenance p
+                           WHERE p.tuple_id=?1 AND p.freshness<>'fresh'
+                             AND NOT EXISTS(SELECT 1 FROM semantic_ineligible_proofs e
+                                            WHERE e.revision_id=?2 AND e.origin_tuple_id=p.tuple_id
+                                              AND e.provenance_id=p.provenance_id))",
+            params![tuple, selected.key],
+            |row| row.get::<_, bool>(0),
+        )?;
+        // Aggregate eligible bindings in SQLite; never scan every proof in a status read.
+        let mut statement = db.prepare_cached(
+            "SELECT CASE WHEN b.resolution='resolved' AND b.declared_kind='internal' THEN 0
+                         WHEN b.resolution='external' OR b.declared_kind='external' THEN 1
+                         WHEN b.resolution='ambiguous' THEN 2 ELSE 3 END AS kind,
+                    count(DISTINCT b.call_id)
+             FROM semantic_call_bindings b
+             WHERE b.tuple_id=?1 AND b.call_id IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM semantic_ineligible_proofs e
+                              WHERE e.revision_id=?2 AND e.origin_tuple_id=b.tuple_id
+                                AND e.provenance_id=b.provenance_id)
+             GROUP BY kind",
+        )?;
+        for result in statement.query_map(params![tuple, selected.key], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (kind, count) = result?;
+            let kind = usize::try_from(kind)
+                .context(SelectedIntegrity("corrupt semantic binding kind".into()))?;
+            let count = usize::try_from(count)
+                .context(SelectedIntegrity("corrupt semantic binding count".into()))?;
+            let total = counts
+                .get_mut(kind)
+                .context(SelectedIntegrity("corrupt semantic binding kind".into()))?;
+            *total = total
+                .checked_add(count)
+                .context(SelectedIntegrity("semantic binding count overflow".into()))?;
+        }
     }
-    let (usable, stale): (bool, bool) = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND selected=1 AND state IN ('complete','partial')),
-                EXISTS(SELECT 1 FROM semantic_coverage c JOIN semantic_provenance p ON p.tuple_id=c.tuple_id
-                       WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
-                         AND c.state IN ('complete','partial') AND p.freshness<>'fresh')",
-        params![key, producer, row.language],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
     row.semantic_state = match (usable, stale) {
         (false, _) => SemanticState::Unavailable,
         (true, true) => SemanticState::Stale,
@@ -447,66 +619,93 @@ fn language_counts(
     row.external = counts[1];
     row.ambiguous = counts[2];
     row.unresolved = row.calls.saturating_sub(counts[0] + counts[1] + counts[2]);
-    row.coverage = Some(coverage_summary(db, key, producer, &row.language)?);
+    coverage.summary = coverage.describe();
+    row.coverage = Some(coverage);
     Ok(())
 }
 
-/// One language's coverage tuples under `producer` at revision `key`, by state, with the
-/// import-time reasons of its partial tuples (#520).
-pub(super) fn coverage_summary(
+/// Add coverage metadata from the direct origin without reading any fact rows.
+fn add_tuple_coverage(
     db: &Connection,
-    key: &str,
-    producer: &str,
-    language: &str,
-) -> Result<crate::model::SemanticCoverageSummary> {
-    use crate::model::{GapOccurrences, PartialReasons, SemanticCoverageSummary};
-    let mut summary = SemanticCoverageSummary::default();
-    let mut statement = db.prepare_cached(
-        "SELECT c.state, count(*), count(r.tuple_id),
-                coalesce(sum(r.macro_invocation+r.attribute_item+r.macro_definition+r.other>0),0),
-                coalesce(sum(r.macro_invocation+r.attribute_item+r.macro_definition+r.other>0
-                             AND r.capped=0 AND r.omitted=0 AND r.captured_diagnostics=0),0),
-                coalesce(sum(r.capped),0), coalesce(sum(r.omitted),0),
-                coalesce(sum(r.captured_diagnostics),0),
-                coalesce(sum(r.macro_invocation),0), coalesce(sum(r.attribute_item),0),
-                coalesce(sum(r.macro_definition),0), coalesce(sum(r.other),0)
-         FROM semantic_coverage c LEFT JOIN semantic_coverage_reasons r ON r.tuple_id=c.tuple_id
-         WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3
-         GROUP BY c.state",
+    tuple: i64,
+    summary: &mut crate::model::SemanticCoverageSummary,
+) -> Result<()> {
+    let state: String = db.query_row(
+        "SELECT state FROM semantic_coverage WHERE tuple_id=?1",
+        [tuple],
+        |row| row.get(0),
     )?;
-    let mut rows = statement.query(params![key, producer, language])?;
-    while let Some(row) = rows.next()? {
-        let state: String = row.get(0)?;
-        let count = row.get::<_, i64>(1)? as usize;
-        match state.as_str() {
-            "complete" => summary.complete += count,
-            "failed" => summary.failed += count,
-            "partial" => {
-                let documents =
-                    |index| -> rusqlite::Result<usize> { Ok(row.get::<_, i64>(index)? as usize) };
-                let occurrences =
-                    |index| -> rusqlite::Result<u64> { Ok(row.get::<_, i64>(index)? as u64) };
-                summary.partial += count;
-                summary.partial_reasons = PartialReasons {
-                    native_gaps: documents(3)?,
-                    native_gaps_only: documents(4)?,
-                    capped: documents(5)?,
-                    omitted: documents(6)?,
-                    captured_diagnostics: documents(7)?,
-                    unrecorded: count - documents(2)?,
-                    unsupported_occurrences: GapOccurrences {
-                        macro_invocation: occurrences(8)?,
-                        attribute_item: occurrences(9)?,
-                        macro_definition: occurrences(10)?,
-                        other: occurrences(11)?,
-                    },
-                };
-            }
-            _ => summary.unselected += count,
+    match state.as_str() {
+        "complete" => summary.complete += 1,
+        "failed" => summary.failed += 1,
+        "partial" => {
+            summary.partial += 1;
+            add_tuple_reasons(db, tuple, &mut summary.partial_reasons)?;
         }
+        "notRequested" | "omitted" | "unsupported" => summary.unselected += 1,
+        _ => return Err(SelectedIntegrity("corrupt semantic coverage state".into()).into()),
     }
-    summary.summary = summary.describe();
-    Ok(summary)
+    Ok(())
+}
+
+fn add_tuple_reasons(
+    db: &Connection,
+    tuple: i64,
+    totals: &mut crate::model::PartialReasons,
+) -> Result<()> {
+    let reasons = db.query_row(
+        "SELECT macro_invocation,attribute_item,macro_definition,other,capped,omitted,captured_diagnostics
+         FROM semantic_coverage_reasons WHERE tuple_id=?1", [tuple], |row| {
+            Ok([row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?])
+        },
+    ).optional()?;
+    let Some(
+        [
+            invocation,
+            attribute,
+            definition,
+            other,
+            capped,
+            omitted,
+            diagnostics,
+        ],
+    ) = reasons
+    else {
+        totals.unrecorded += 1;
+        return Ok(());
+    };
+    let invocation = u64::try_from(invocation).context(SelectedIntegrity(
+        "corrupt semantic occurrence count".into(),
+    ))?;
+    let attribute = u64::try_from(attribute).context(SelectedIntegrity(
+        "corrupt semantic occurrence count".into(),
+    ))?;
+    let definition = u64::try_from(definition).context(SelectedIntegrity(
+        "corrupt semantic occurrence count".into(),
+    ))?;
+    let other = u64::try_from(other).context(SelectedIntegrity(
+        "corrupt semantic occurrence count".into(),
+    ))?;
+    let capped = usize::try_from(capped)
+        .context(SelectedIntegrity("corrupt semantic partial count".into()))?;
+    let omitted = usize::try_from(omitted)
+        .context(SelectedIntegrity("corrupt semantic partial count".into()))?;
+    let diagnostics = usize::try_from(diagnostics)
+        .context(SelectedIntegrity("corrupt semantic partial count".into()))?;
+    let gaps = [invocation, attribute, definition, other]
+        .iter()
+        .any(|count| *count > 0);
+    totals.native_gaps += usize::from(gaps);
+    totals.native_gaps_only += usize::from(gaps && capped == 0 && omitted == 0 && diagnostics == 0);
+    totals.capped += capped;
+    totals.omitted += omitted;
+    totals.captured_diagnostics += diagnostics;
+    totals.unsupported_occurrences.macro_invocation += invocation;
+    totals.unsupported_occurrences.attribute_item += attribute;
+    totals.unsupported_occurrences.macro_definition += definition;
+    totals.unsupported_occurrences.other += other;
+    Ok(())
 }
 
 /// A CLI query's traversal: its nodes, calls, regions and selected bindings.
@@ -517,6 +716,8 @@ pub(super) struct ViewWalk {
     pub truncated: bool,
     pub omitted_nodes: usize,
     pub semantic: crate::model::ViewSemantic,
+    pub semantic_documents: Vec<crate::model::DocumentSemantic>,
+    pub partial: bool,
 }
 
 /// Walk a CLI query from its seed (#467, #483). The seed's measured calls are always
@@ -659,6 +860,30 @@ pub(super) fn view_walk(
             }
         }
     }
+    let source_set_id: String = db.query_row(
+        "SELECT source_set_id FROM native_revisions WHERE id=?1",
+        [&selected.key],
+        |row| row.get(0),
+    )?;
+    let semantic_documents = documents
+        .values()
+        .map(|document| {
+            let language = &document.file.language;
+            let path = &document.file.path;
+            Ok(crate::model::DocumentSemantic {
+                document: DocumentKey {
+                    source_set_id: source_set_id.clone(),
+                    language: language.clone(),
+                    path: path.clone(),
+                },
+                semantic_status: reader.document_status(language, path)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let partial = truncated
+        || semantic_documents
+            .iter()
+            .any(|document| document.semantic_status.state == SemanticAvailability::CatchingUp);
     Ok(ViewWalk {
         nodes,
         calls,
@@ -666,6 +891,8 @@ pub(super) fn view_walk(
         truncated,
         omitted_nodes,
         semantic,
+        semantic_documents,
+        partial,
     })
 }
 
@@ -711,6 +938,7 @@ pub(super) fn mark_document_symbols(
 /// The selected bindings of MCP call items, aligned with the calls (#467).
 pub struct McpSemantic {
     pub producer_id: Option<String>,
+    pub documents: Vec<crate::model::DocumentSemantic>,
     /// Why calls are syntax only: each distinct reason of a returned language without a
     /// producer (#483).
     pub note: Option<String>,
@@ -722,6 +950,7 @@ impl McpSemantic {
     pub fn syntax_only(note: &str, calls: usize) -> Self {
         Self {
             producer_id: None,
+            documents: Vec::new(),
             note: Some(note.to_owned()),
             calls: (0..calls).map(|_| None).collect(),
         }
@@ -738,6 +967,7 @@ impl McpSemantic {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LanguageTier {
     pub producer_id: Option<String>,
+    pub semantic_availability: SemanticAvailabilityCounts,
     /// Why the language shows syntax only, when no producer is selected.
     pub note: Option<String>,
     /// Tuple counts `[selected, complete, partial, failed, unselected]`, as native ones.
@@ -766,51 +996,48 @@ impl EvidenceResponse {
     /// (#528). Uses the per-language default producer, as status and the call tools do.
     pub fn mcp_language_tiers(&self) -> Result<[LanguageTier; 4]> {
         let selected = self.selected(None)?;
-        let defaults = default_producers(&self.db, &selected.key)?;
+        let selected_revision = semantic_comparison_revision(&self.db, &selected)?;
+        let selection = select_producers(&self.db, &selected.key, None)?;
         let mut tiers: [LanguageTier; 4] = Default::default();
         for (tier, language) in tiers.iter_mut().zip(MCP_LANGUAGES) {
             tier.freshness = "unavailable";
-            tier.note = defaults.note(language);
-            let Some(producer) = defaults.producer(language) else {
-                continue;
-            };
-            tier.producer_id = Some(producer.to_owned());
-            // Closed enums decode strictly: a malformed stored value is typed corruption,
-            // never healthy availability (#528 review).
-            let corrupt = |what: &str| -> anyhow::Error {
-                SelectedIntegrity(format!(
-                    "store_unavailable: invalid selected semantic {what}"
-                ))
-                .into()
-            };
-            let mut statement = self.db.prepare_cached(
-                "SELECT selected,state,count(*) FROM semantic_coverage
-                 WHERE revision_id=?1 AND producer_id=?2 AND language=?3 GROUP BY selected,state",
-            )?;
-            for row in statement.query_map(params![selected.key, producer, language], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })? {
-                let (chosen, state, count) = row?;
-                let count = u64::try_from(count).map_err(|_| corrupt("coverage count"))?;
-                if !matches!(chosen, 0 | 1)
-                    || !matches!(
-                        state.as_str(),
-                        "notRequested"
-                            | "omitted"
-                            | "unsupported"
-                            | "failed"
-                            | "partial"
-                            | "complete"
-                    )
-                {
-                    return Err(corrupt("coverage state"));
+            tier.note = selection.note(language);
+            tier.producer_id = selection.producer(language).map(str::to_owned);
+            let paths = self.db.prepare_cached(
+                "SELECT path FROM revision_documents WHERE revision_id=?1 AND language=?2 ORDER BY path",
+            )?.query_map(params![selected.key, language], |row| row.get::<_, String>(0))?
+              .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut coverage = crate::model::SemanticCoverageSummary::default();
+            let mut worst = 0;
+            let mut usable = false;
+            for path in paths {
+                tier.semantic_availability.add(
+                    selected_document_status(&self.db, &selected, &selection, language, &path)?
+                        .state,
+                );
+                let Some(producer) = selection.producer(language) else {
+                    continue;
+                };
+                let origin =
+                    semantic_document_origin(&self.db, &selected, producer, language, &path)?;
+                if !origin.source_eligible && origin.catching_up {
+                    continue;
                 }
-                // Unselected tuples, and selected ones not requested or unsupported, count as
-                // unselected, as native `scopeCoverage` does.
+                let tuple = origin
+                    .tuple_id
+                    .context(SelectedIntegrity("missing producer coverage tuple".into()))?;
+                add_tuple_coverage(&self.db, tuple, &mut coverage)?;
+                let (chosen, state): (i64, String) = self.db.query_row(
+                    "SELECT selected,state FROM semantic_coverage WHERE tuple_id=?1",
+                    [tuple],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if !matches!(chosen, 0 | 1) {
+                    return Err(SelectedIntegrity(
+                        "invalid selected semantic coverage state".into(),
+                    )
+                    .into());
+                }
                 let bucket = match (chosen, state.as_str()) {
                     (1, "complete") => Some(1),
                     (1, "partial") => Some(2),
@@ -819,66 +1046,129 @@ impl EvidenceResponse {
                 };
                 match bucket {
                     Some(bucket) => {
-                        tier.counts[0] += count;
-                        tier.counts[bucket] += count;
+                        tier.counts[0] += 1;
+                        tier.counts[bucket] += 1;
                     }
-                    None => tier.counts[4] += count,
+                    None => tier.counts[4] += 1,
                 }
-            }
-            if tier.counts[2] > 0 {
-                tier.partial_reasons = Some(coverage_summary(
-                    &self.db,
-                    &selected.key,
-                    producer,
-                    language,
-                )?);
-            }
-            if tier.counts[1] + tier.counts[2] == 0 {
-                continue;
-            }
-            // Publication derives a proof's freshness from its document and that document's
-            // captured basis only, so every proof of one tuple shares it: one proof per
-            // tuple is exact for what Trellis published (#261), and avoids scanning the
-            // hundreds of thousands of proofs a language can hold on every read. A tuple
-            // without proofs (an empty fact set) is valid and adds nothing.
-            let mut statement = self.db.prepare_cached(
-                "SELECT (SELECT p.freshness FROM semantic_provenance p
-                         WHERE p.tuple_id=c.tuple_id LIMIT 1)
-                 FROM semantic_coverage c
-                 WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
-                   AND c.state IN ('complete','partial')",
-            )?;
-            let mut worst = 0;
-            for freshness in statement
-                .query_map(params![selected.key, producer, language], |row| {
-                    row.get::<_, Option<String>>(0)
-                })?
-            {
-                worst = worst.max(match freshness?.as_deref() {
+                if !matches!(bucket, Some(1 | 2)) {
+                    continue;
+                }
+                usable = true;
+                worst = worst.max(
+                    match semantic_comparison_freshness(
+                        sem::Freshness::Fresh,
+                        &origin.native_revision_id,
+                        &selected_revision,
+                    ) {
+                        sem::Freshness::Fresh => 0,
+                        sem::Freshness::PossiblyStale => 1,
+                        sem::Freshness::Stale => 2,
+                    },
+                );
+                // Tuple proofs share publication freshness. Availability is separate.
+                let freshness: Option<String> = self
+                    .db
+                    .query_row(
+                        "SELECT p.freshness FROM semantic_provenance p WHERE p.tuple_id=?1
+                       AND NOT EXISTS(SELECT 1 FROM semantic_ineligible_proofs e
+                                      WHERE e.revision_id=?2 AND e.origin_tuple_id=p.tuple_id
+                                        AND e.provenance_id=p.provenance_id)
+                     LIMIT 1",
+                        params![tuple, selected.key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                worst = worst.max(match freshness.as_deref() {
                     None | Some("fresh") => 0,
                     Some("possiblyStale") => 1,
                     Some("stale") => 2,
-                    Some(_) => return Err(corrupt("proof freshness")),
+                    Some(_) => {
+                        return Err(SelectedIntegrity(
+                            "invalid selected semantic proof freshness".into(),
+                        )
+                        .into());
+                    }
                 });
             }
-            tier.freshness = match worst {
-                2 => "stale",
-                1 => "possiblyStale",
-                _ => "fresh",
-            };
+            if coverage.partial > 0 {
+                coverage.summary = coverage.describe();
+                tier.partial_reasons = Some(coverage);
+            }
+            if usable {
+                tier.freshness = match worst {
+                    2 => "stale",
+                    1 => "possiblyStale",
+                    _ => "fresh",
+                };
+            }
         }
         Ok(tiers)
     }
 
+    /// Per-document semantic availability at one selected native pin, in MCP language order.
+    pub fn semantic_availability_at(
+        &self,
+        pin: Option<IndexPin>,
+    ) -> Result<[SemanticAvailabilityCounts; 4]> {
+        self.semantic_availability_for_producer_at(pin, None)
+    }
+
+    /// Counts the selected producer's document availability over the pinned search scope.
+    pub fn semantic_availability_for_producer_at(
+        &self,
+        pin: Option<IndexPin>,
+        explicit: Option<&str>,
+    ) -> Result<[SemanticAvailabilityCounts; 4]> {
+        let selected = self.selected(pin)?;
+        let selection = select_producers(&self.db, &selected.key, explicit)?;
+        let mut counts = [SemanticAvailabilityCounts::default(); 4];
+        let mut statement = self.db.prepare_cached(
+            "SELECT language,path FROM revision_documents WHERE revision_id=?1 ORDER BY language,path",
+        )?;
+        for row in statement.query_map([&selected.key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (language, path) = row?;
+            let Some(index) = MCP_LANGUAGES.iter().position(|l| *l == language) else {
+                continue;
+            };
+            counts[index].add(
+                selected_document_status(&self.db, &selected, &selection, &language, &path)?.state,
+            );
+        }
+        Ok(counts)
+    }
+
+    /// Availability of the indexed document at `path` under its default selected producer.
+    pub fn document_semantic_status_at(
+        &self,
+        path: &str,
+        pin: Option<IndexPin>,
+    ) -> Result<DocumentSemanticStatus> {
+        let selected = self.selected(pin)?;
+        let language: Option<String> = self
+            .db
+            .query_row(
+                "SELECT language FROM revision_documents WHERE revision_id=?1 AND path=?2",
+                params![selected.key, path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let language = language.context("not_found: indexed document not found")?;
+        let selection = select_producers(&self.db, &selected.key, None)?;
+        selected_document_status(&self.db, &selected, &selection, &language, path)
+    }
+
     /// Bindings for measured calls of the admitted head, each under its document language's
-    /// producer (#483). `language` is the selected declaration's, which names the producer
-    /// and, without calls, the note.
+    /// producer (#483). The owner document is included even when it has no calls.
     pub(crate) fn mcp_call_semantics<'c>(
         &self,
         explicit: Option<&str>,
-        language: &str,
+        owner: &DocumentKey,
         calls: impl IntoIterator<Item = &'c crate::native_evidence::Call>,
     ) -> Result<McpSemantic> {
+        let language = owner.language.as_str();
         let selected = self.selected(None)?;
         let mut reader = SemanticCalls::new(&self.db, &selected, explicit)?;
         let calls: Vec<_> = calls.into_iter().collect();
@@ -886,9 +1176,7 @@ impl EvidenceResponse {
             .iter()
             .map(|call| call.document.language.as_str())
             .collect();
-        if languages.is_empty() {
-            languages.insert(language);
-        }
+        languages.insert(language);
         let mut notes: Vec<String> = Vec::new();
         for note in languages
             .into_iter()
@@ -899,11 +1187,29 @@ impl EvidenceResponse {
             }
         }
         let mut semantic = Vec::new();
-        for call in calls {
+        for call in &calls {
             semantic.push(reader.call(call)?);
+        }
+        let mut documents = BTreeMap::from([(
+            (owner.language.clone(), owner.path.clone()),
+            crate::model::DocumentSemantic {
+                document: owner.clone(),
+                semantic_status: reader.document_status(&owner.language, &owner.path)?,
+            },
+        )]);
+        for call in &calls {
+            let document = &call.document;
+            documents.insert(
+                (document.language.clone(), document.path.clone()),
+                crate::model::DocumentSemantic {
+                    document: document.clone(),
+                    semantic_status: reader.document_status(&document.language, &document.path)?,
+                },
+            );
         }
         Ok(McpSemantic {
             producer_id: reader.selection.named(language).map(str::to_owned),
+            documents: documents.into_values().collect(),
             note: (!notes.is_empty()).then(|| notes.join("; ")),
             calls: semantic,
         })
@@ -920,12 +1226,13 @@ const ARCHITECTURE_SEMANTIC_ROWS: usize = 2_000_000;
 /// internal target outside the snapshot's documents is left out.
 pub(super) fn architecture_semantic(
     db: &Connection,
-    revision_key: &str,
+    selected: &ReadRevision,
     documents: &mut [crate::references::DocumentInput],
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     use crate::references::{SemanticAnchor, SemanticOutcome, SemanticRelationship};
-    let defaults = default_producers(db, revision_key)?;
+    let selected_revision = semantic_comparison_revision(db, selected)?;
+    let defaults = default_producers(db, &selected.key)?;
     // Snapshot documents by language, then path.
     // A revision has one source set; its documents are keyed by language and path.
     let mut index: HashMap<String, HashMap<String, usize>> = HashMap::new();
@@ -981,27 +1288,42 @@ pub(super) fn architecture_semantic(
         }
     };
     let mut tuples = Vec::new();
-    for language in defaults.by_language.keys() {
+    for (i, document) in documents.iter_mut().enumerate() {
+        let language = &document.key.language;
+        let path = &document.key.path;
         let Some(producer) = defaults.producer(language) else {
+            document.semantic.semantic_status = DocumentSemanticStatus {
+                reason: defaults.note(language),
+                ..Default::default()
+            };
             continue;
         };
         check()?;
-        let mut statement = db.prepare_cached(
-            "SELECT tuple_id,path,state='complete' FROM semantic_coverage
-             WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND selected=1
-               AND state IN ('complete','partial')",
+        document.semantic.semantic_status =
+            semantic_document_status(db, selected, producer, language, path)?;
+        let origin = semantic_document_origin(db, selected, producer, language, path)?;
+        if !origin.source_eligible && origin.catching_up {
+            continue;
+        }
+        if semantic_comparison_freshness(
+            sem::Freshness::Fresh,
+            &origin.native_revision_id,
+            &selected_revision,
+        ) != sem::Freshness::Fresh
+        {
+            continue;
+        }
+        let tuple = origin
+            .tuple_id
+            .context(SelectedIntegrity("missing producer coverage tuple".into()))?;
+        let (usable, complete): (bool, bool) = db.query_row(
+            "SELECT selected=1 AND state IN ('complete','partial'),state='complete'
+             FROM semantic_coverage WHERE tuple_id=?1",
+            [tuple],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        for row in statement.query_map(params![revision_key, producer, language], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, bool>(2)?,
-            ))
-        })? {
-            let (tuple, path, complete) = row?;
-            if let Some(i) = locate(Some(language), Some(&path)) {
-                tuples.push((tuple, i, producer.to_owned(), complete));
-            }
+        if usable {
+            tuples.push((tuple, i, producer.to_owned(), complete));
         }
     }
     let mut calls = db.prepare_cached(
@@ -1011,7 +1333,10 @@ pub(super) fn architecture_semantic(
          FROM semantic_call_bindings b
          JOIN semantic_provenance p ON p.tuple_id=b.tuple_id AND p.provenance_id=b.provenance_id
          WHERE b.tuple_id=?1 AND b.call_id IS NOT NULL AND p.freshness='fresh'
-           AND b.join_document_language=?2 AND b.join_document_path=?3",
+           AND b.join_document_language=?2 AND b.join_document_path=?3
+           AND NOT EXISTS(SELECT 1 FROM semantic_ineligible_proofs e
+                          WHERE e.revision_id=?4 AND e.origin_tuple_id=b.tuple_id
+                            AND e.provenance_id=b.provenance_id)",
     )?;
     let mut references = db.prepare_cached(
         "SELECT r.start_byte,r.end_byte,r.resolution,r.declared_internal_syntax_id,
@@ -1021,7 +1346,10 @@ pub(super) fn architecture_semantic(
          FROM semantic_references r
          JOIN semantic_provenance p ON p.tuple_id=r.tuple_id AND p.provenance_id=r.provenance_id
          WHERE r.tuple_id=?1 AND r.site='use' AND p.freshness='fresh'
-           AND ((r.resolution='resolved' AND r.declared_kind='internal') OR r.resolution='external')",
+           AND ((r.resolution='resolved' AND r.declared_kind='internal') OR r.resolution='external')
+           AND NOT EXISTS(SELECT 1 FROM semantic_ineligible_proofs e
+                          WHERE e.revision_id=?2 AND e.origin_tuple_id=r.tuple_id
+                            AND e.provenance_id=r.provenance_id)",
     )?;
     let mut relationships = db.prepare_cached(
         "SELECT t.kind,t.source_internal_syntax_id,t.target_kind,t.target_internal_syntax_id,
@@ -1030,6 +1358,9 @@ pub(super) fn architecture_semantic(
          JOIN semantic_provenance p ON p.tuple_id=t.tuple_id AND p.provenance_id=t.provenance_id
          WHERE t.tuple_id=?1 AND p.freshness='fresh' AND t.source_kind='internal'
            AND t.kind IN ('extends','implements')
+           AND NOT EXISTS(SELECT 1 FROM semantic_ineligible_proofs e
+                          WHERE e.revision_id=?2 AND e.origin_tuple_id=t.tuple_id
+                            AND e.provenance_id=t.provenance_id)
          ORDER BY t.ordinal",
     )?;
     for (tuple, i, producer, complete) in tuples {
@@ -1042,7 +1373,7 @@ pub(super) fn architecture_semantic(
         // The lowest provenance represents a call, as in the call graph; an unusable one
         // (stale, or outside this snapshot) leaves the call without a binding.
         let mut by_call: BTreeMap<String, (String, Option<SemanticAnchor>)> = BTreeMap::new();
-        let mut cursor = calls.query(params![tuple, language, path])?;
+        let mut cursor = calls.query(params![tuple, language, path, selected.key])?;
         while let Some(row) = cursor.next()? {
             admit()?;
             let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
@@ -1101,9 +1432,10 @@ pub(super) fn architecture_semantic(
             .filter_map(|(_, anchor)| anchor)
             .collect();
         // Resolved and external use-site references: the names a site spells.
-        let mut cursor = references.query([tuple])?;
+        let mut cursor = references.query(params![tuple, selected.key])?;
         while let Some(row) = cursor.next()? {
             admit()?;
+            let provenance_id: String = row.get(6)?;
             let outcome = match (
                 row.get_ref(2)?.as_str()?,
                 sid(row.get_ref(3)?.as_blob_or_null()?)?,
@@ -1124,7 +1456,7 @@ pub(super) fn architecture_semantic(
                 type_role: row.get(7)?,
                 direct: false,
                 outcome,
-                provenance_id: row.get(6)?,
+                provenance_id,
             });
         }
         drop(cursor);
@@ -1137,9 +1469,10 @@ pub(super) fn architecture_semantic(
             ))
         });
         let mut found = Vec::new();
-        let mut cursor = relationships.query([tuple])?;
+        let mut cursor = relationships.query(params![tuple, selected.key])?;
         while let Some(row) = cursor.next()? {
             admit()?;
+            let provenance_id: String = row.get(6)?;
             let source = sid(row.get_ref(1)?.as_blob_or_null()?)?.context(SelectedIntegrity(
                 "corrupt semantic type relationship".into(),
             ))?;
@@ -1158,7 +1491,7 @@ pub(super) fn architecture_semantic(
                 kind: row.get(0)?,
                 source_syntax_id: source,
                 target,
-                provenance_id: row.get(6)?,
+                provenance_id,
             });
         }
         drop(cursor);
@@ -1169,4 +1502,124 @@ pub(super) fn architecture_semantic(
         semantic.relationships = found;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod origin_filter_tests {
+    use super::*;
+
+    #[test]
+    fn excludes_dependent_facts_without_rewriting_retained_origin_evidence() {
+        let document = DocumentKey {
+            source_set_id: "source".into(),
+            language: "rust".into(),
+            path: "src/lib.rs".into(),
+        };
+        let mut snapshot = sem::SemanticSnapshot {
+            producers: vec![],
+            coverage: vec![],
+            provenance: vec![],
+            symbols: vec![],
+            declaration_bindings: vec![],
+            references: vec![],
+            call_bindings: vec![],
+            type_relationships: vec![],
+        };
+        for id in ["dependent", "independent"] {
+            let symbol = sem::SymbolKey {
+                scheme: sem::SymbolScheme::Scip,
+                symbol: id.into(),
+                scope: sem::SymbolScope::Global,
+                document: None,
+            };
+            let target = sem::Target::External {
+                symbol: symbol.clone(),
+            };
+            let join = sem::Join {
+                anchor: sem::MeasuredAnchor {
+                    document: document.clone(),
+                    revision_id: "origin".into(),
+                    content_hash: "captured".into(),
+                    range: crate::native_evidence::Range { start: 1, end: 2 },
+                    kind: sem::JoinKind::Callee,
+                },
+                status: sem::JoinStatus::Exact,
+                candidate_ids: vec![],
+                diagnostic: None,
+            };
+            snapshot.provenance.push(sem::Provenance {
+                id: id.into(),
+                producer_id: "producer".into(),
+                document: document.clone(),
+                revision_id: "origin".into(),
+                content_hash: "captured".into(),
+                evidence_kind: sem::EvidenceKind::MeasuredSyntax,
+                basis: None,
+                freshness: sem::Freshness::PossiblyStale,
+                derived_from: None,
+            });
+            snapshot.symbols.push(sem::Symbol {
+                key: symbol.clone(),
+                display_name: None,
+                declarations: vec![target.clone()],
+                provenance_id: id.into(),
+            });
+            snapshot.declaration_bindings.push(sem::DeclarationBinding {
+                syntax_id: Some(id.into()),
+                symbols: vec![symbol],
+                join: join.clone(),
+                provenance_id: id.into(),
+            });
+            snapshot.references.push(sem::Reference {
+                id: id.into(),
+                owner_syntax_id: id.into(),
+                ordinal: 0,
+                document: document.clone(),
+                revision_id: "origin".into(),
+                range: crate::native_evidence::Range { start: 1, end: 2 },
+                spelling: id.into(),
+                lookup_key: id.into(),
+                site: sem::ReferenceSite::Use,
+                roles: vec![],
+                resolution: sem::Resolution::External,
+                declared_target: Some(target.clone()),
+                candidates: vec![],
+                provenance_id: id.into(),
+            });
+            snapshot.call_bindings.push(sem::CallBinding {
+                call_id: Some(id.into()),
+                join,
+                resolution: sem::Resolution::External,
+                declared_target: Some(target.clone()),
+                candidates: vec![],
+                dispatch: sem::Dispatch::Direct,
+                possible_dispatch: vec![],
+                possible_dispatch_complete: false,
+                stale_target: None,
+                provenance_id: id.into(),
+            });
+            snapshot.type_relationships.push(sem::TypeRelationship {
+                kind: sem::RelationshipKind::Extends,
+                source: target.clone(),
+                target,
+                provenance_id: id.into(),
+            });
+        }
+        let retained_proof = snapshot.provenance[1].clone();
+        let retained_call = snapshot.call_bindings[1].clone();
+        filter_semantic_facts(&mut snapshot, &BTreeSet::from(["dependent".to_owned()]));
+        assert_eq!(snapshot.provenance, vec![retained_proof]);
+        assert_eq!(snapshot.call_bindings, vec![retained_call]);
+        assert_eq!(snapshot.symbols.len(), 1);
+        assert_eq!(snapshot.declaration_bindings.len(), 1);
+        assert_eq!(snapshot.references.len(), 1);
+        assert_eq!(snapshot.type_relationships.len(), 1);
+        assert_eq!(snapshot.symbols[0].provenance_id, "independent");
+        assert_eq!(
+            snapshot.declaration_bindings[0].provenance_id,
+            "independent"
+        );
+        assert_eq!(snapshot.references[0].provenance_id, "independent");
+        assert_eq!(snapshot.type_relationships[0].provenance_id, "independent");
+    }
 }

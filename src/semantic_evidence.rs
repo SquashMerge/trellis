@@ -14,6 +14,11 @@ macro_rules! closed {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
         pub enum $name { $(#[serde(rename = $value)] $variant),+ }
+        impl $name {
+            pub(crate) const fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $value),+ }
+            }
+        }
     };
 }
 closed!(Language { Java => "java", Rust => "rust", Python => "python", Javascript => "javascript" });
@@ -39,7 +44,22 @@ macro_rules! record {
 }
 record!(Producer { id: String, version: String, executable_hash: String, kind: SemanticKind, languages: Vec<Language>, position_encoding: PositionEncoding });
 closed!(SemanticKind { Semantic => "semantic" });
-record!(SemanticBasis { producer_id: String, producer_version: String, producer_hash: String, artifact_hash: String, language: Language, source_set_id: String, revision_id: String, source_manifest_hash: String, toolchain_hash: String, config_hash: String, dependency_hash: String, lookup_dependencies: Vec<String> });
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SemanticBasis {
+    pub producer_id: String,
+    pub producer_version: String,
+    pub producer_hash: String,
+    pub artifact_hash: String,
+    pub language: Language,
+    pub source_set_id: String,
+    pub revision_id: String,
+    pub source_manifest_hash: String,
+    pub toolchain_hash: String,
+    pub config_hash: String,
+    pub dependency_hash: String,
+    pub lookup_dependencies: Vec<String>,
+}
 record!(Coverage { producer_id: String, language: Language, source_set_id: String, document_path: String, revision_id: String, requested: bool, selected: bool, state: CoverageState, supported_roles: Vec<Role>, observed_roles: Vec<Role>, #[serde(deserialize_with = "nullable")] diagnostic: Option<String>,
     /// Why a `partial` tuple is partial, recorded by the import that derived it (#520). It is
     /// absent on every other state and on rows no import derived, and no graph result returns it.
@@ -493,6 +513,17 @@ impl NativeIndex {
 
     /// Indexes every document of `native` in one pass over its facts.
     pub(crate) fn new(native: &native::Artifact) -> Self {
+        Self::new_cancellable(
+            native,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .expect("never cancelled")
+    }
+
+    fn new_cancellable(
+        native: &native::Artifact,
+        cancel: &crate::model::CancelFlag,
+    ) -> Result<Self> {
         fn entry<'m>(
             documents: &'m mut BTreeMap<native::DocumentKey, DocumentIndex>,
             key: &native::DocumentKey,
@@ -506,11 +537,13 @@ impl NativeIndex {
         }
         let mut documents = BTreeMap::new();
         for (position, d) in native.revision.documents.iter().enumerate() {
+            crate::semantic_import::check_semantic_cancel(cancel)?;
             entry(&mut documents, &d.key)
                 .document
                 .get_or_insert(position);
         }
         for (position, d) in native.declarations.iter().enumerate() {
+            crate::semantic_import::check_semantic_cancel(cancel)?;
             count_work(1);
             if let Some(range) = &d.name_range {
                 entry(&mut documents, &d.document)
@@ -519,6 +552,7 @@ impl NativeIndex {
             }
         }
         for (position, c) in native.calls.iter().enumerate() {
+            crate::semantic_import::check_semantic_cancel(cancel)?;
             count_work(1);
             let index = entry(&mut documents, &c.document);
             index.invocations.push(ranged(&c.range, position));
@@ -529,12 +563,14 @@ impl NativeIndex {
             }
         }
         for (position, r) in native.references.iter().enumerate() {
+            crate::semantic_import::check_semantic_cancel(cancel)?;
             count_work(1);
             entry(&mut documents, &r.document)
                 .references
                 .push(ranged(&r.range, position));
         }
         for index in documents.values_mut() {
+            crate::semantic_import::check_semantic_cancel(cancel)?;
             index.names.sort_unstable();
             index.callees.sort_unstable();
             index.invocations.sort_unstable();
@@ -543,7 +579,7 @@ impl NativeIndex {
                 .bare_calls
                 .sort_unstable_by_key(|position| (&native.calls[*position].spelling, *position));
         }
-        Self { documents }
+        Ok(Self { documents })
     }
 
     /// The index of `document`, or `empty` when the artifact has nothing for it.
@@ -967,7 +1003,14 @@ pub fn validate_evidence(
     native: &native::Artifact,
     captured: &CapturedComponents,
 ) -> Result<()> {
-    validate_evidence_inner(semantic, native, captured, None, None)
+    validate_evidence_inner(
+        semantic,
+        native,
+        captured,
+        None,
+        None,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
 }
 
 /// The whole-publication validator a profile-pinned batch runs, over an in-memory admission of
@@ -994,7 +1037,14 @@ pub fn validate_evidence_profile_pinned_for_tests(
             .collect(),
         inventory: inventory.proof_identities(),
     };
-    validate_evidence_inner(semantic, native, captured, Some(raw), Some(&attested))
+    validate_evidence_inner(
+        semantic,
+        native,
+        captured,
+        Some(raw),
+        Some(&attested),
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
 }
 
 struct ValidatedRaw<'a> {
@@ -1010,8 +1060,9 @@ impl<'a> ValidatedRaw<'a> {
     fn from_batch(
         raw: &'a crate::store::SelectedRawBatch,
         inventory: &crate::scip_raw::CapturedScipInventory,
-    ) -> Self {
-        Self {
+        cancel: &crate::model::CancelFlag,
+    ) -> Result<Self> {
+        Ok(Self {
             producer_id: &raw.producer_id,
             source_set_id: &raw.source_set_id,
             captured_revision: &raw.captured_revision,
@@ -1020,8 +1071,8 @@ impl<'a> ValidatedRaw<'a> {
                 .iter()
                 .map(|capture| (capture.artifact_hash.clone(), &capture.binary_bytes[..]))
                 .collect(),
-            inventory: inventory.proof_identities(),
-        }
+            inventory: crate::semantic_import::proof_inventory_cancellable(inventory, cancel)?,
+        })
     }
 }
 
@@ -1034,13 +1085,16 @@ pub(crate) fn validate_evidence_with_attested_batch(
     raw: &crate::store::SelectedRawBatch,
     inventory: &crate::scip_raw::CapturedScipInventory,
     attested: &crate::store::AttestedProfileProducer,
+    cancel: &crate::model::CancelFlag,
 ) -> Result<()> {
+    crate::semantic_import::check_semantic_cancel(cancel)?;
     validate_evidence_inner(
         semantic,
         native,
         captured,
-        Some(ValidatedRaw::from_batch(raw, inventory)),
+        Some(ValidatedRaw::from_batch(raw, inventory, cancel)?),
         Some(attested),
+        cancel,
     )
 }
 
@@ -1068,12 +1122,17 @@ struct WitnessIndex {
     type_relationships: BTreeMap<String, Vec<usize>>,
 }
 
-fn positions<'a, T>(rows: &'a [T], id: impl Fn(&'a T) -> &'a str) -> BTreeMap<String, Vec<usize>> {
+fn positions<'a, T>(
+    rows: &'a [T],
+    id: impl Fn(&'a T) -> &'a str,
+    cancel: &crate::model::CancelFlag,
+) -> Result<BTreeMap<String, Vec<usize>>> {
     let mut index: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (position, row) in rows.iter().enumerate() {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         index.entry(id(row).to_owned()).or_default().push(position);
     }
-    index
+    Ok(index)
 }
 
 fn rows_at<'a, T>(
@@ -1095,9 +1154,11 @@ impl WitnessedDocument {
         captured_version: String,
         current_version: String,
         original: SemanticSnapshot,
-    ) -> Self {
+        cancel: &crate::model::CancelFlag,
+    ) -> Result<Self> {
         let mut proofs: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (position, row) in original.provenance.iter().enumerate() {
+            crate::semantic_import::check_semantic_cancel(cancel)?;
             if let Some(derived) = &row.derived_from {
                 proofs
                     .entry(derived.provenance_id.clone())
@@ -1107,22 +1168,28 @@ impl WitnessedDocument {
         }
         let index = WitnessIndex {
             proofs,
-            symbols: positions(&original.symbols, |row| &row.provenance_id),
-            declaration_bindings: positions(&original.declaration_bindings, |row| {
-                &row.provenance_id
-            }),
-            references: positions(&original.references, |row| &row.provenance_id),
-            call_bindings: positions(&original.call_bindings, |row| &row.provenance_id),
-            type_relationships: positions(&original.type_relationships, |row| &row.provenance_id),
+            symbols: positions(&original.symbols, |row| &row.provenance_id, cancel)?,
+            declaration_bindings: positions(
+                &original.declaration_bindings,
+                |row| &row.provenance_id,
+                cancel,
+            )?,
+            references: positions(&original.references, |row| &row.provenance_id, cancel)?,
+            call_bindings: positions(&original.call_bindings, |row| &row.provenance_id, cancel)?,
+            type_relationships: positions(
+                &original.type_relationships,
+                |row| &row.provenance_id,
+                cancel,
+            )?,
         };
-        Self {
+        Ok(Self {
             source_hash,
             wire_digest,
             captured_version,
             current_version,
             original,
             index,
-        }
+        })
     }
 
     /// Whether a fact of provenance `id` names an internal target that is not `known`.
@@ -1936,7 +2003,9 @@ fn validate_evidence_inner(
     captured: &CapturedComponents,
     raw: Option<ValidatedRaw<'_>>,
     attested: Option<&crate::store::AttestedProfileProducer>,
+    cancel: &crate::model::CancelFlag,
 ) -> Result<()> {
+    crate::semantic_import::check_semantic_cancel(cancel)?;
     ensure!(
         captured.native_extraction_components.is_empty(),
         "undeclared native extraction components"
@@ -1952,6 +2021,7 @@ fn validate_evidence_inner(
     );
     let mut sources = BTreeMap::new();
     for doc in &captured.captured_revision.documents {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         ensure!(
             !sources.contains_key(&doc.key),
             "duplicate native manifest document"
@@ -1970,7 +2040,7 @@ fn validate_evidence_inner(
         captured.sources.len() == sources.len(),
         "extra captured source or witness"
     );
-    let manifest_hash = validate_captured_header(captured)?;
+    let manifest_hash = validate_captured_header(captured, cancel)?;
     if captured.captured_revision.id == revision.id {
         ensure!(
             captured.captured_revision == *revision,
@@ -1979,6 +2049,7 @@ fn validate_evidence_inner(
     }
     let mut producers = BTreeMap::new();
     for p in &semantic.producers {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         text(&p.id)?;
         text(&p.version)?;
         hash(&p.executable_hash)?;
@@ -2025,6 +2096,7 @@ fn validate_evidence_inner(
     );
     let mut requested_producers = BTreeMap::new();
     for p in &captured.requested_producers {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         text(&p.id)?;
         text(&p.version)?;
         hash(&p.executable_hash)?;
@@ -2036,6 +2108,7 @@ fn validate_evidence_inner(
     }
     let mut coverage = BTreeMap::new();
     for row in &semantic.coverage {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         let lang = validate_coverage_row(
             row,
             &producers,
@@ -2063,7 +2136,9 @@ fn validate_evidence_inner(
         );
     }
     for p in &semantic.producers {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         for d in &revision.documents {
+            crate::semantic_import::check_semantic_cancel(cancel)?;
             if p.languages.iter().any(|l| {
                 serde_json::to_value(l)
                     .ok()
@@ -2093,6 +2168,7 @@ fn validate_evidence_inner(
     );
     let mut artifact_hashes: BTreeMap<&String, BTreeSet<String>> = BTreeMap::new();
     for ((producer_id, keyed_hash), bytes) in &captured.artifacts {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         let digest = native_ids::digest(b"", bytes);
         ensure!(&digest == keyed_hash, "captured artifact key mismatch");
         if let Some(raw) = &raw {
@@ -2149,6 +2225,7 @@ fn validate_evidence_inner(
                 .map(|identity| (identity, &lookup as &ClaimLookup<'_>)),
             raw_manifest_hash: None,
         },
+        cancel,
     )?;
     let native_references: BTreeMap<_, _> = native
         .references
@@ -2160,13 +2237,14 @@ fn validate_evidence_inner(
         "duplicate native reference ID"
     );
     let known = |syntax_id: &str, document: &native::DocumentKey| -> Result<bool> {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         Ok(decls
             .get(syntax_id)
             .is_some_and(|d| &d.document == document))
     };
     // The whole publication's facts are already materialized; the index adds a range-ordered
     // position per fact, bounded by the artifact the request bounds already admitted.
-    let index = NativeIndex::new(native);
+    let index = NativeIndex::new_cancellable(native, cancel)?;
     let env = RowEnv {
         native,
         index: &index,
@@ -2178,14 +2256,18 @@ fn validate_evidence_inner(
         known: &known,
         witness: None,
     };
-    validate_fact_rows(semantic, &proof, &coverage, &env)
+    validate_fact_rows(semantic, &proof, &coverage, &env, cancel)
 }
 
 /// Checks the captured manifest's order and revision identity and its component hashes, and
 /// returns the manifest hash the captured bases name.
-fn validate_captured_header(captured: &CapturedComponents) -> Result<String> {
+fn validate_captured_header(
+    captured: &CapturedComponents,
+    cancel: &crate::model::CancelFlag,
+) -> Result<String> {
     let mut manifest = Vec::new();
     for doc in &captured.captured_revision.documents {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         key(&doc.key, &captured.captured_revision)?;
         ensure!(
             doc.revision_id == captured.captured_revision.id,
@@ -2226,6 +2308,7 @@ fn validate_captured_header(captured: &CapturedComponents) -> Result<String> {
             &captured.dependency,
         ),
     ] {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         hash(declared)?;
         ensure!(
             declared == &native_ids::digest(b"", bytes),
@@ -2268,9 +2351,11 @@ fn validate_provenance_rows<'a>(
     semantic: &'a SemanticPublication,
     coverage: &CoverageIndex<'a>,
     env: &ProofEnv<'_>,
+    cancel: &crate::model::CancelFlag,
 ) -> Result<BTreeMap<&'a str, &'a Provenance>> {
     let mut proof = BTreeMap::new();
     for p in &semantic.provenance {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         text(&p.id)?;
         key(&p.document, env.revision)?;
         hash(&p.content_hash)?;
@@ -2358,6 +2443,7 @@ fn validate_fact_rows(
     proof: &BTreeMap<&str, &Provenance>,
     coverage: &CoverageIndex<'_>,
     env: &RowEnv<'_>,
+    cancel: &crate::model::CancelFlag,
 ) -> Result<()> {
     let revision = env.revision;
     let fact =
@@ -2378,11 +2464,13 @@ fn validate_fact_rows(
         };
     let mut symbols = BTreeSet::new();
     for s in &semantic.symbols {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         let p = fact(&s.provenance_id, None, EvidenceKind::DeclarationBinding)?;
         validate_symbol_row(s, p, env, &mut symbols)?;
     }
     let mut binding_facts = BTreeSet::new();
     for b in &semantic.declaration_bindings {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         let p = fact(
             &b.provenance_id,
             Some(&b.join.anchor.document),
@@ -2392,6 +2480,7 @@ fn validate_fact_rows(
     }
     let mut references = BTreeSet::new();
     for r in &semantic.references {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         let p = fact(
             &r.provenance_id,
             Some(&r.document),
@@ -2401,6 +2490,7 @@ fn validate_fact_rows(
     }
     let mut references_by_proof: ReferencesByProof<'_> = BTreeMap::new();
     for r in &semantic.references {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         references_by_proof
             .entry(r.provenance_id.as_str())
             .or_default()
@@ -2409,6 +2499,7 @@ fn validate_fact_rows(
     let mut call_facts = BTreeSet::new();
     let mut call_resolutions: BTreeMap<(String, String), Vec<TargetClaim>> = BTreeMap::new();
     for b in &semantic.call_bindings {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         let proof = fact(
             &b.provenance_id,
             Some(&b.join.anchor.document),
@@ -2424,8 +2515,10 @@ fn validate_fact_rows(
         )?;
     }
     for proofs in call_resolutions.values() {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         let mut asserted = BTreeSet::new();
         for (_, target, candidates) in proofs {
+            crate::semantic_import::check_semantic_cancel(cancel)?;
             if let Some(target) = target {
                 asserted.insert(target.clone());
             }
@@ -2447,6 +2540,7 @@ fn validate_fact_rows(
     }
     let mut relationships = BTreeSet::new();
     for r in &semantic.type_relationships {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         let proof = fact(&r.provenance_id, None, EvidenceKind::TypeRelationship)?;
         validate_type_relationship_row(r, proof, env, &mut relationships)?;
     }
@@ -2467,23 +2561,28 @@ fn validate_fact_rows(
         }
     };
     for r in &semantic.references {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         observe(&r.provenance_id, &r.roles);
     }
     for b in &semantic.declaration_bindings {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         if b.syntax_id.is_some() {
             observe(&b.provenance_id, &[Role::Definition]);
         }
     }
     for b in &semantic.call_bindings {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         if b.call_id.is_some() {
             observe(&b.provenance_id, &[Role::Call]);
         }
     }
     for r in &semantic.type_relationships {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         observe(&r.provenance_id, &[Role::Type]);
     }
     let none = BTreeSet::new();
     for ((producer, lang, path), row) in coverage {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         let roles = observed
             .get(&(*producer, lang.as_str(), *path))
             .unwrap_or(&none);
@@ -2496,6 +2595,7 @@ fn validate_fact_rows(
             Role::Import,
             Role::Alias,
         ] {
+            crate::semantic_import::check_semantic_cancel(cancel)?;
             ensure!(
                 row.observed_roles.contains(role) == roles.contains(role),
                 "coverage observed roles differ from admitted evidence"
@@ -2727,6 +2827,7 @@ pub(crate) struct WitnessedRaw<'a> {
 /// changed document holds no semantic rows. Rows are unique across documents by construction:
 /// a raw proof and an occurrence ID belong to one document.
 pub(crate) struct WitnessValidator<'a> {
+    cancel: &'a crate::model::CancelFlag,
     native: &'a native::Artifact,
     captured: &'a CapturedComponents,
     raw: WitnessedRaw<'a>,
@@ -2752,7 +2853,9 @@ impl<'a> WitnessValidator<'a> {
         captured: &'a CapturedComponents,
         raw: WitnessedRaw<'a>,
         attested: &crate::store::AttestedProfileProducer,
+        cancel: &'a crate::model::CancelFlag,
     ) -> Result<Self> {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         let revision = &native.revision;
         ensure!(
             captured.native_extraction_components.is_empty(),
@@ -2764,6 +2867,7 @@ impl<'a> WitnessValidator<'a> {
             "unadmitted captured source set"
         );
         for (document, bytes) in &captured.sources {
+            crate::semantic_import::check_semantic_cancel(cancel)?;
             let measured = captured
                 .captured_revision
                 .documents
@@ -2776,7 +2880,7 @@ impl<'a> WitnessValidator<'a> {
                 "source digest/length mismatch"
             );
         }
-        let manifest_hash = validate_captured_header(captured)?;
+        let manifest_hash = validate_captured_header(captured, cancel)?;
         if captured.captured_revision.id == revision.id {
             ensure!(
                 captured.captured_revision == *revision,
@@ -2824,7 +2928,8 @@ impl<'a> WitnessValidator<'a> {
             .chain(native.capability_reports.iter().map(|r| &r.document))
             .collect();
         Ok(Self {
-            index: NativeIndex::new(native),
+            cancel,
+            index: NativeIndex::new_cancellable(native, cancel)?,
             declarations,
             references,
             measured_documents,
@@ -2846,6 +2951,7 @@ impl<'a> WitnessValidator<'a> {
 
     /// Checks a current target declaration; each is checked once, when it is looked up.
     pub(crate) fn target(&self, d: &TargetDeclaration) -> Result<()> {
+        crate::semantic_import::check_semantic_cancel(self.cancel)?;
         sid(&d.syntax_id)?;
         key(&d.document, &self.native.revision)?;
         text(&d.name)?;
@@ -2893,6 +2999,7 @@ impl<'a> WitnessValidator<'a> {
         }
         let mut coverage = BTreeMap::new();
         for row in &semantic.coverage {
+            crate::semantic_import::check_semantic_cancel(self.cancel)?;
             let lang = validate_coverage_row(
                 row,
                 &self.producers,
@@ -2918,6 +3025,7 @@ impl<'a> WitnessValidator<'a> {
         ensure!(coverage.len() == 1, "missing producer coverage tuple");
         if let Some(witness) = witness {
             for p in &semantic.provenance {
+                crate::semantic_import::check_semantic_cancel(self.cancel)?;
                 ensure!(p.derived_from.is_some(), "unwitnessed captured proof");
                 admitted_proof(witness, p)?;
             }
@@ -2943,8 +3051,10 @@ impl<'a> WitnessValidator<'a> {
                 raw: Some((&identity, claims)),
                 raw_manifest_hash: Some(self.raw.source_manifest_hash),
             },
+            self.cancel,
         )?;
         let known = |syntax_id: &str, target: &native::DocumentKey| -> Result<bool> {
+            crate::semantic_import::check_semantic_cancel(self.cancel)?;
             Ok(
                 targets.contains_key(&(target.clone(), syntax_id.to_owned()))
                     || self
@@ -2971,6 +3081,7 @@ impl<'a> WitnessValidator<'a> {
                 known: &known,
                 witness,
             },
+            self.cancel,
         )
     }
 
@@ -3029,22 +3140,25 @@ impl<'a> WitnessValidator<'a> {
         );
         let ids: BTreeSet<_> = original.provenance.iter().map(|p| p.id.as_str()).collect();
         let proofs =
-            |rows: &'_ [Provenance]| -> BTreeSet<(String, RecordKind, String, EvidenceKind)> {
-                rows.iter()
-                    .filter(|p| p.document == *document && p.producer_id == *self.producer_id)
-                    .filter_map(|p| {
-                        p.derived_from.as_ref().map(|d| {
-                            (
-                                d.provenance_id.clone(),
-                                d.record_kind,
-                                d.fact_digest.clone(),
-                                p.evidence_kind,
-                            )
-                        })
-                    })
-                    .collect()
+            |rows: &[Provenance]| -> Result<BTreeSet<(String, RecordKind, String, EvidenceKind)>> {
+                let mut proofs = BTreeSet::new();
+                for p in rows {
+                    crate::semantic_import::check_semantic_cancel(self.cancel)?;
+                    if p.document == *document
+                        && p.producer_id == *self.producer_id
+                        && let Some(d) = &p.derived_from
+                    {
+                        proofs.insert((
+                            d.provenance_id.clone(),
+                            d.record_kind,
+                            d.fact_digest.clone(),
+                            p.evidence_kind,
+                        ));
+                    }
+                }
+                Ok(proofs)
             };
-        let admitted = proofs(&original.provenance);
+        let admitted = proofs(&original.provenance)?;
         ensure!(
             ids.len() == original.provenance.len() && admitted.len() == original.provenance.len(),
             "duplicate or non-derived admitted proof"
@@ -3064,7 +3178,7 @@ impl<'a> WitnessValidator<'a> {
                 .all(|id| ids.contains(id.as_str())),
             "foreign admitted association proof"
         );
-        let output = proofs(&semantic.provenance);
+        let output = proofs(&semantic.provenance)?;
         ensure!(
             output.len() == semantic.provenance.len() && output.is_subset(&admitted),
             "incomplete witnessed document proof inventory"
@@ -3075,6 +3189,7 @@ impl<'a> WitnessValidator<'a> {
             .iter()
             .any(|row| row.reasons.as_ref().is_some_and(|reasons| reasons.omitted));
         for p in &original.provenance {
+            crate::semantic_import::check_semantic_cancel(self.cancel)?;
             let derived = p.derived_from.as_ref().context("non-derived proof")?;
             let proof = (
                 derived.provenance_id.clone(),
@@ -3106,6 +3221,26 @@ pub(crate) struct DocumentFacts<'a> {
 #[cfg(test)]
 mod witness_tests {
     use super::*;
+
+    #[test]
+    fn witness_index_stops_between_rows_with_typed_cancellation() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rows = ["first", "second"];
+        let result = positions(
+            &rows,
+            |row| {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                row
+            },
+            &cancel,
+        );
+        assert!(matches!(
+            result
+                .unwrap_err()
+                .downcast_ref::<crate::scip_raw::ScipCaptureError>(),
+            Some(crate::scip_raw::ScipCaptureError::Cancelled)
+        ));
+    }
 
     #[test]
     fn admitted_reference_requires_exact_proof_and_one_original_association() {
@@ -3168,7 +3303,9 @@ mod witness_tests {
                 "v".into(),
                 "v".into(),
                 original.clone(),
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
+            .unwrap()
         };
         let witness = witness_of(&original);
         assert_eq!(original_reference(&witness, &proof).unwrap().spelling, "a");

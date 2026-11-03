@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct SequenceView {
     pub revision: IndexPin,
+    #[serde(default)]
+    pub semantic_documents: Vec<crate::model::DocumentSemantic>,
+    #[serde(default)]
+    pub partial: bool,
     pub seed: Symbol,
     pub participants: Vec<Participant>,
     pub steps: Vec<SequenceStep>,

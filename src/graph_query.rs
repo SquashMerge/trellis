@@ -4,7 +4,7 @@
 //! store reader supplies a source over one admitted snapshot; fixtures and response-byte
 //! prefix projection use [`GraphFacts`].
 use crate::{
-    model::IndexPin,
+    model::{DocumentSemantic, DocumentSemanticStatus, IndexPin, SemanticAvailability},
     native_evidence::{self as native, DocumentKey},
     semantic_evidence::{
         self as sem, CallBinding, CoverageState, Dispatch, Freshness, Resolution, Target,
@@ -334,6 +334,8 @@ pub struct GraphResult {
     pub frontier: Vec<Frontier>,
     pub coverage: Vec<sem::Coverage>,
     pub provenance: Vec<sem::Provenance>,
+    /// Availability of inspected documents, retained across response-byte projection.
+    pub semantic_documents: Vec<DocumentSemantic>,
     pub partial: bool,
     pub truncated: bool,
     pub warnings: Vec<Warning>,
@@ -371,6 +373,8 @@ pub struct DocumentFacts {
     pub native_provenance: sem::Provenance,
     /// `Some` only for a document in producer scope whose coverage row exists.
     pub semantic: Option<SemanticDocument>,
+    /// Availability is independent of retained proofs and defaults to unavailable in fixtures.
+    pub semantic_status: DocumentSemanticStatus,
 }
 
 /// Historical coverage and provenance for one declaration of a document whose current row failed.
@@ -596,6 +600,10 @@ impl GraphAnswer {
                 .filter(|(owner, _)| retained.contains(*owner))
                 .map(|(owner, hints)| (owner.clone(), hints.clone()))
                 .collect(),
+            full.semantic_documents
+                .iter()
+                .map(|doc| (doc.document.clone(), doc.semantic_status.clone()))
+                .collect(),
         )
     }
 }
@@ -640,6 +648,7 @@ pub(crate) fn semantic<'a>(
     }
     match &doc.semantic {
         Some(semantic) => Ok(Some(semantic)),
+        None if doc.semantic_status.state == SemanticAvailability::CatchingUp => Ok(None),
         None => Err(integrity("missing producer coverage tuple")),
     }
 }
@@ -816,8 +825,10 @@ pub fn evaluate(
     };
     let scope = scope.as_ref();
 
-    let root = source
-        .document(&root_document)?
+    let root_facts = source.document(&root_document)?;
+    let mut semantic_documents =
+        BTreeMap::from([(root_document, root_facts.semantic_status.clone())]);
+    let root = root_facts
         .declarations
         .get(&request.root_syntax_id)
         .cloned()
@@ -847,6 +858,7 @@ pub fn evaluate(
                 continue;
             }
             let doc = source.document(&node.declaration.document)?;
+            semantic_documents.insert(doc.key.clone(), doc.semantic_status.clone());
             let mut local: Vec<_> = doc
                 .calls
                 .get(&node_id)
@@ -993,8 +1005,9 @@ pub fn evaluate(
                     omitted_calls: 0,
                 });
             } else {
-                let declaration = source
-                    .document(&key)?
+                let target_facts = source.document(&key)?;
+                semantic_documents.insert(key, target_facts.semantic_status.clone());
+                let declaration = target_facts
                     .declarations
                     .get(&id)
                     .cloned()
@@ -1024,6 +1037,7 @@ pub fn evaluate(
         edges,
         frontier,
         filtered_hints,
+        semantic_documents,
     )?))
 }
 
@@ -1114,6 +1128,7 @@ fn finish(
     edges: Vec<GraphEdge>,
     mut frontier: Vec<Frontier>,
     filtered_hints: BTreeMap<String, BTreeSet<String>>,
+    mut semantic_documents: BTreeMap<DocumentKey, DocumentSemanticStatus>,
 ) -> Result<GraphResult> {
     let order: BTreeMap<_, _> = nodes
         .iter()
@@ -1173,16 +1188,32 @@ fn finish(
     {
         hints.insert("rootSyntaxId".to_string());
     }
-    let (coverage, provenance) = select_evidence(source, scope, &nodes, &edges)?;
+    let SelectedEvidence {
+        coverage,
+        provenance,
+        semantic_documents: returned_documents,
+    } = select_evidence(source, scope, &nodes, &edges)?;
+    semantic_documents.extend(returned_documents);
+    let pending = semantic_documents
+        .values()
+        .any(|status| status.state == SemanticAvailability::CatchingUp);
+    let semantic_documents = semantic_documents
+        .into_iter()
+        .map(|(document, semantic_status)| DocumentSemantic {
+            document,
+            semantic_status,
+        })
+        .collect();
     let truncated = frontier
         .iter()
         .any(|f| f.reason != FrontierReason::Filtered);
     let partial = truncated
+        || pending
         || omitted.filtered > 0
         || selected_incomplete(&coverage)
         || edges.iter().any(|edge| edge.visit == Visit::Boundary);
     let syntax_only = syntax_only(request, defaults, &nodes, &edges);
-    let warnings = warnings_with(syntax_only, &coverage, &provenance, &edges);
+    let warnings = warnings_with(syntax_only, &coverage, &provenance, &edges, pending);
     Ok(GraphResult {
         request: request.clone(),
         resolved_revision_id: request.revision_id.clone(),
@@ -1191,6 +1222,7 @@ fn finish(
         frontier,
         coverage,
         provenance,
+        semantic_documents,
         partial,
         truncated,
         warnings,
@@ -1200,13 +1232,19 @@ fn finish(
     })
 }
 
+struct SelectedEvidence {
+    coverage: Vec<sem::Coverage>,
+    provenance: Vec<sem::Provenance>,
+    semantic_documents: BTreeMap<DocumentKey, DocumentSemanticStatus>,
+}
+
 /// Coverage and provenance relevant to the returned nodes and calls, deduplicated and sorted.
 fn select_evidence(
     source: &mut dyn GraphSource,
     scope: Option<&BTreeSet<String>>,
     nodes: &[GraphNode],
     edges: &[GraphEdge],
-) -> Result<(Vec<sem::Coverage>, Vec<sem::Provenance>)> {
+) -> Result<SelectedEvidence> {
     let mut returned: BTreeMap<DocumentKey, BTreeSet<&str>> = BTreeMap::new();
     for node in nodes {
         returned
@@ -1320,10 +1358,14 @@ fn select_evidence(
             }
         }
     }
-    Ok((
-        coverage.into_values().collect(),
-        provenance.into_values().collect(),
-    ))
+    Ok(SelectedEvidence {
+        coverage: coverage.into_values().collect(),
+        provenance: provenance.into_values().collect(),
+        semantic_documents: docs
+            .into_iter()
+            .map(|(key, doc)| (key, doc.semantic_status.clone()))
+            .collect(),
+    })
 }
 
 /// Engine evidence/warnings for ungrouped measured occurrences in another pinned view.
@@ -1334,8 +1376,22 @@ pub(crate) fn occurrence_warnings(
     nodes: &[GraphNode],
     edges: &[GraphEdge],
 ) -> Result<Vec<Warning>> {
-    let (coverage, provenance) = select_evidence(source, scope, nodes, edges)?;
-    Ok(warnings_v1(request, &coverage, &provenance, edges))
+    let evidence = select_evidence(source, scope, nodes, edges)?;
+    let pending = evidence
+        .semantic_documents
+        .values()
+        .any(|status| status.state == SemanticAvailability::CatchingUp);
+    let syntax_only = request
+        .semantic_producer_id
+        .is_none()
+        .then(|| UNSELECTED_MESSAGE.to_string());
+    Ok(warnings_with(
+        syntax_only,
+        &evidence.coverage,
+        &evidence.provenance,
+        edges,
+        pending,
+    ))
 }
 
 /// The `syntaxOnly` message of an answer, if any. An explicit producer never warns (D8).
@@ -1382,7 +1438,7 @@ pub fn warnings_v1(
         .semantic_producer_id
         .is_none()
         .then(|| UNSELECTED_MESSAGE.to_string());
-    warnings_with(syntax_only, coverage, provenance, edges)
+    warnings_with(syntax_only, coverage, provenance, edges, false)
 }
 
 fn warnings_with(
@@ -1390,15 +1446,20 @@ fn warnings_with(
     coverage: &[sem::Coverage],
     provenance: &[sem::Provenance],
     edges: &[GraphEdge],
+    pending: bool,
 ) -> Vec<Warning> {
     let mut keys: BTreeMap<(WarningCode, Option<String>), &str> = BTreeMap::new();
     if let Some(message) = syntax_only.as_deref() {
         keys.insert((WarningCode::SyntaxOnly, None), message);
     }
-    if selected_incomplete(coverage) {
+    if pending || selected_incomplete(coverage) {
         keys.insert(
             (WarningCode::CoverageIncomplete, None),
-            "Selected coverage is failed or partial for a returned document.",
+            if pending {
+                "Semantic evidence is catching up for an inspected document."
+            } else {
+                "Selected coverage is failed or partial for a returned document."
+            },
         );
     }
     for proof in provenance {

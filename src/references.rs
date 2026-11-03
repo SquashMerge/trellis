@@ -1,5 +1,5 @@
 //! View-time, source-witnessed module references. Structural mappings are not bindings.
-use crate::model::{IndexPin, SourceFile};
+use crate::model::{DocumentSemanticStatus, IndexPin, SourceFile};
 use crate::native_evidence::{Call, Declaration, DeclarationRole, DocumentKey};
 use crate::syntax_bounds::{self, DEPTH, VISITS};
 use anyhow::{Context, Result, ensure};
@@ -45,6 +45,8 @@ pub struct Snapshot {
 /// evidence is left out, so the document falls back to structural syntax evidence.
 #[derive(Debug, Default, Clone)]
 pub struct DocumentSemantic {
+    /// Availability at this native pin, independent of admitted binding freshness.
+    pub semantic_status: DocumentSemanticStatus,
     /// The selected producer, when the document has a usable coverage tuple.
     pub producer_id: Option<String>,
     /// The selected coverage tuple is complete, not partial.
@@ -117,6 +119,7 @@ pub struct ReferenceBase {
     /// Every snapshot document feeds resolution, so path selection does not narrow these.
     partial_files: Vec<syntax_bounds::PartialFile>,
     identities: Vec<Identity>,
+    document_semantics: Vec<crate::model::DocumentSemantic>,
     modules: Vec<Value>,
     /// The sources in `identities` order; a source outside the scan stays `None`.
     sources: Vec<Option<SourceReferences>>,
@@ -366,7 +369,8 @@ fn resolve(
             sid: root.syntax_id.clone(),
         };
         modules.push(json!({"identity":identity,"revisionId":root.revision_id,
-            "contentHash":doc.file.hash,"provenanceId":root.provenance_id}));
+            "contentHash":doc.file.hash,"provenanceId":root.provenance_id,
+            "semanticStatus":doc.semantic.semantic_status}));
         identities.push(identity);
         total_bytes = total_bytes
             .checked_add(doc.file.text.len())
@@ -649,6 +653,13 @@ fn resolve(
         pin: snapshot.pin,
         partial_files,
         identities,
+        document_semantics: docs
+            .iter()
+            .map(|doc| crate::model::DocumentSemantic {
+                document: doc.key.clone(),
+                semantic_status: doc.semantic.semantic_status.clone(),
+            })
+            .collect(),
         modules,
         sources,
         producers,
@@ -681,6 +692,15 @@ impl ReferenceBase {
         );
         let globs = path_globs(paths, check)?;
         let identities = &self.identities;
+        let mut semantic_documents = Vec::new();
+        let mut semantic_availability = crate::model::SemanticAvailabilityCounts::default();
+        for document in &self.document_semantics {
+            check()?;
+            if paths.is_empty() || globs.is_match(&document.document.path) {
+                semantic_availability.add(document.semantic_status.state);
+                semantic_documents.push(document);
+            }
+        }
         let mut emitted_modules = BTreeSet::new();
         let mut external_packages: BTreeMap<_, external::ExternalPackage> = BTreeMap::new();
         let mut coverage: BTreeMap<(String, bool), SiteCoverage> = BTreeMap::new();
@@ -769,6 +789,9 @@ impl ReferenceBase {
         } else {
             limitations.push("Semantic sites use fresh bindings of each language's selected producer: a site's final name or callee, measured calls and type references with an exact internal target in this snapshot. Bindings outside the checkout resolve a site without naming a package; stale, unselected or missing bindings fall back to structural evidence, and calls the producer did not bind are not counted.");
         }
+        if semantic_availability.catching_up > 0 {
+            limitations.push("Semantic enrichment is catching up for selected documents; missing semantic sites do not prove absence.");
+        }
         let semantic_producers: Vec<_> = self
             .producers
             .iter()
@@ -780,6 +803,8 @@ impl ReferenceBase {
                 "referencesVersion":"references:v2","indexGeneration":self.pin.index_generation.to_string(),
                 "indexRevision":self.pin.index_revision,"evidenceTier":if semantic_sites > 0 { "mixed" } else { "syntax" },"semanticComplete":false,
                 "semanticProducers":semantic_producers,
+                "semanticDocuments":semantic_documents,"semanticAvailability":semantic_availability,
+                "partial":semantic_availability.catching_up > 0 || !self.partial_files.is_empty(),
                 "modules":emitted_modules,"externalPackages":external_packages.into_values().collect::<Vec<_>>(),"production":production,"tests":tests,"unresolved":unresolved,
                 "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len(),"semanticSites":semantic_sites},
                 "partialFiles":self.partial_files,
@@ -1477,6 +1502,73 @@ mod parallel_tests {
             manifests: Vec::new(),
             evidence_gaps: Default::default(),
         }
+    }
+
+    #[test]
+    fn catching_up_zero_site_documents_have_scoped_availability_not_syntax_gaps() {
+        let mut snapshot = snapshot();
+        for doc in &mut snapshot.documents {
+            doc.semantic.semantic_status.state = crate::model::SemanticAvailability::Fresh;
+        }
+        let doc = snapshot
+            .documents
+            .iter_mut()
+            .find(|doc| doc.key.path == "src/provider.rs")
+            .unwrap();
+        assert!(doc.calls.is_empty());
+        doc.semantic.semantic_status = DocumentSemanticStatus {
+            state: crate::model::SemanticAvailability::CatchingUp,
+            producer_id: Some("selected".into()),
+            semantic_origin: Some(crate::model::SemanticOrigin {
+                pin: snapshot.pin,
+                revision_id: "retained-semantic-revision".into(),
+            }),
+            reason: Some("semantic_catching_up".into()),
+        };
+        let expected_status = json!(doc.semantic.semantic_status);
+        let base = resolve_all(&snapshot, &mut || Ok(())).unwrap();
+        let paths = ["src/provider.rs".to_owned()];
+        let projection = base.select(&paths, 5, &mut || Ok(())).unwrap();
+        assert_eq!(projection.data["counts"]["scannedDocuments"], 1);
+        assert_eq!(projection.data["production"], json!([]));
+        assert_eq!(projection.data["unresolved"], json!([]));
+        assert_eq!(projection.data["partialFiles"], json!([]));
+        assert_eq!(projection.data["semanticComplete"], false);
+        assert_eq!(projection.data["partial"], true);
+        assert_eq!(
+            projection.data["semanticAvailability"],
+            json!({"fresh":0,"catchingUp":1,"unavailable":0})
+        );
+        let documents = projection.data["semanticDocuments"].as_array().unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0]["document"]["path"], "src/provider.rs");
+        assert_eq!(documents[0]["semanticStatus"], expected_status);
+        assert_eq!(
+            projection.data["modules"][0]["semanticStatus"],
+            expected_status
+        );
+        let config = crate::rules::parse("version=1").unwrap();
+        let rules = crate::rules::evaluate(&config, &snapshot, &projection, &paths, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(
+            rules["semanticDocuments"],
+            projection.data["semanticDocuments"]
+        );
+        assert_eq!(
+            rules["semanticAvailability"],
+            projection.data["semanticAvailability"]
+        );
+        assert_eq!(rules["partialFiles"], json!([]));
+        assert_eq!(rules["semanticComplete"], false);
+        assert_eq!(rules["partial"], true);
+        let fresh = base
+            .select(&["provider.py".to_owned()], 5, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(fresh.data["partial"], false);
+        assert_eq!(
+            fresh.data["semanticAvailability"],
+            json!({"fresh":1,"catchingUp":0,"unavailable":0})
+        );
     }
 
     /// #556: a read selects from one whole-revision base instead of resolving its own paths.

@@ -85,26 +85,26 @@ fn document_claims(
     capture_id: i64,
     artifact_hash: &str,
     document: &DocumentKey,
+    cancel: &CancelFlag,
 ) -> Result<Vec<crate::scip_raw::RawProofIdentity>> {
-    tx.prepare_cached(
+    let mut statement = tx.prepare_cached(
         "SELECT proof_id,record_kind,fact_digest FROM semantic_raw_proofs
          WHERE capture_id=?1 AND language=?2 AND path=?3",
-    )?
-    .query_map(
-        params![capture_id, document.language, document.path],
-        |row| {
-            Ok(crate::scip_raw::RawProofIdentity {
-                proof_id: row.get(0)?,
-                record_kind: row.get(1)?,
-                fact_digest: row.get(2)?,
-                language: document.language.clone(),
-                path: document.path.clone(),
-                artifact_hash: artifact_hash.to_owned(),
-            })
-        },
-    )?
-    .collect::<rusqlite::Result<_>>()
-    .map_err(Into::into)
+    )?;
+    let mut rows = statement.query(params![capture_id, document.language, document.path])?;
+    let mut claims = Vec::new();
+    while let Some(row) = rows.next()? {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
+        claims.push(crate::scip_raw::RawProofIdentity {
+            proof_id: row.get(0)?,
+            record_kind: row.get(1)?,
+            fact_digest: row.get(2)?,
+            language: document.language.clone(),
+            path: document.path.clone(),
+            artifact_hash: artifact_hash.to_owned(),
+        });
+    }
+    Ok(claims)
 }
 
 /// Every symbol the admitted tuples declare.
@@ -113,6 +113,7 @@ fn witness_scope(
     original: &str,
     producer_id: &str,
     destination_manifest_hash: String,
+    cancel: &CancelFlag,
 ) -> Result<WitnessScope> {
     let mut scope = WitnessScope {
         internal_symbols: BTreeSet::new(),
@@ -128,6 +129,7 @@ fn witness_scope(
     )?;
     let mut rows = statement.query(params![original, producer_id])?;
     while let Some(row) = rows.next()? {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         scope.internal_symbols.insert(row.get(0)?);
     }
     Ok(scope)
@@ -203,13 +205,14 @@ fn document_witness(
     {
         return witness_unavailable("original_tuple_differs_from_capture");
     }
-    Ok(sem::WitnessedDocument::new(
+    sem::WitnessedDocument::new(
         source_hash.to_owned(),
         wire_digest,
         captured_version,
         current_version,
         selected,
-    ))
+        input.cancel,
+    )
 }
 
 /// Whether a proof of `dropped` claims the span of a proof of `fused`: its row was fused from
@@ -220,6 +223,7 @@ fn shares_a_span(
     position_encoding: sem::PositionEncoding,
     dropped: &BTreeSet<String>,
     fused: &BTreeSet<String>,
+    cancel: &CancelFlag,
 ) -> Result<bool> {
     let encoding = match position_encoding {
         sem::PositionEncoding::Utf8 => 1,
@@ -227,6 +231,7 @@ fn shares_a_span(
         sem::PositionEncoding::UnicodeScalar => 3,
     };
     let span = |proof: &String| {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         let bytes: Vec<u8> = tx
             .prepare_cached(
                 "SELECT canonical_bytes FROM semantic_raw_proofs
@@ -240,6 +245,7 @@ fn shares_a_span(
     };
     let fused = fused.iter().map(span).collect::<Result<BTreeSet<_>>>()?;
     for proof in dropped {
+        crate::semantic_import::check_semantic_cancel(cancel)?;
         if fused.contains(&span(proof)?) {
             return Ok(true);
         }
@@ -258,6 +264,7 @@ fn current_targets(
     absent: &mut BTreeSet<(DocumentKey, String)>,
 ) -> Result<()> {
     for key in keys {
+        crate::semantic_import::check_semantic_cancel(input.cancel)?;
         if targets.contains_key(&key) || absent.contains(&key) {
             continue;
         }
@@ -269,7 +276,7 @@ fn current_targets(
             Some(target) => {
                 validator
                     .target(&target)
-                    .map_err(|_| WitnessFallback("witness_validation_failed"))?;
+                    .map_err(witness_validation_failed)?;
                 targets.insert(key, target);
             }
             None => {
@@ -310,6 +317,7 @@ pub(super) fn publish_with_witness(
     #[cfg(feature = "test-support")] mut collected: Option<&mut sem::SemanticPublication>,
 ) -> Result<()> {
     use crate::native_ids;
+    crate::semantic_import::check_semantic_cancel(input.cancel)?;
     let WitnessedInput {
         tx,
         raw,
@@ -351,6 +359,7 @@ pub(super) fn publish_with_witness(
     let capture = &raw.captures[0];
     let mut basis = BTreeMap::new();
     for doc in &original_native.revision.documents {
+        crate::semantic_import::check_semantic_cancel(input.cancel)?;
         let language: sem::Language = serde_json::from_value(serde_json::json!(doc.key.language))?;
         if producer.languages.contains(&language) {
             basis.insert(
@@ -436,8 +445,9 @@ pub(super) fn publish_with_witness(
             source_manifest_hash: &raw.source_manifest_hash,
         },
         &attested,
+        input.cancel,
     )
-    .map_err(|error| witness_validation_failed(&error))?;
+    .map_err(witness_validation_failed)?;
     // The tuple writers' statements, each target table's included, stay prepared.
     tx.set_prepared_statement_cache_capacity(64);
     let mut scope = witness_scope(
@@ -445,8 +455,9 @@ pub(super) fn publish_with_witness(
         &original_key,
         &raw.producer_id,
         manifest_hash(&destination.revision),
+        input.cancel,
     )?;
-    let facts = input.changed.over_manifest(destination);
+    let facts = input.changed.over_manifest(destination, input.cancel)?;
     let captured_documents: BTreeMap<_, _> = original_native
         .revision
         .documents
@@ -462,11 +473,12 @@ pub(super) fn publish_with_witness(
     descriptor.requested_producers.clear();
     write_import_semantic(tx, input.key, &empty_publication(producer), &descriptor)?;
     for doc in &destination.revision.documents {
+        crate::semantic_import::check_semantic_cancel(input.cancel)?;
         let language: sem::Language = serde_json::from_value(serde_json::json!(doc.key.language))?;
         if !producer.languages.contains(&language) {
             continue;
         }
-        check_cancel(input.cancel)?;
+        crate::semantic_import::check_semantic_cancel(input.cancel)?;
         let excluded = raw
             .exclusions
             .iter()
@@ -479,7 +491,13 @@ pub(super) fn publish_with_witness(
             .filter(|(language, path)| *language == doc.key.language && *path == doc.key.path)
             .cloned()
             .collect();
-        let claims = document_claims(tx, capture.capture_id, &capture.artifact_hash, &doc.key)?;
+        let claims = document_claims(
+            tx,
+            capture.capture_id,
+            &capture.artifact_hash,
+            &doc.key,
+            input.cancel,
+        )?;
         let captured_doc = captured_documents.get(&doc.key).copied();
         let witness = if reusable.contains(&doc.key) {
             let captured_doc =
@@ -511,7 +529,9 @@ pub(super) fn publish_with_witness(
                     &inventory,
                     &raw.producer_id,
                     &doc.key,
-                ) else {
+                    input.cancel,
+                )?
+                else {
                     return witness_unavailable("original_associations_incomplete");
                 };
                 let gaps = original.coverage[0]
@@ -521,7 +541,7 @@ pub(super) fn publish_with_witness(
                 current_targets(
                     input,
                     &validator,
-                    required_original_targets(&reused),
+                    required_original_targets(&reused, input.cancel)?,
                     &mut scope,
                     &mut targets,
                     &mut absent,
@@ -533,6 +553,7 @@ pub(super) fn publish_with_witness(
         captured_header.revision.documents = captured_doc.cloned().into_iter().collect();
         destination_header.revision.documents = vec![doc.clone()];
         let Some(rejoined) = rejoin_document_with_witness(WitnessedRejoin {
+            cancel: input.cancel,
             document: &doc.key,
             inventory: &inventory,
             captured_native: &captured_header,
@@ -556,6 +577,7 @@ pub(super) fn publish_with_witness(
                 producer.position_encoding,
                 &rejoined.dropped,
                 &rejoined.fused,
+                input.cancel,
             )?
         {
             return witness_unavailable("fused_reference_target_lost");
@@ -572,7 +594,8 @@ pub(super) fn publish_with_witness(
         };
         validator
             .document(&doc.key, &publication, witness.as_ref(), &targets, &lookup)
-            .map_err(|error| witness_validation_failed(&error))?;
+            .map_err(witness_validation_failed)?;
+        crate::semantic_import::check_semantic_cancel(input.cancel)?;
         write_import_coverage(tx, input.key, &publication)?;
         semantic_document_written(tx)?;
         #[cfg(feature = "test-support")]
@@ -593,7 +616,28 @@ pub(super) fn publish_with_witness(
     Ok(())
 }
 
-fn witness_validation_failed(error: &anyhow::Error) -> anyhow::Error {
+fn witness_validation_failed(error: anyhow::Error) -> anyhow::Error {
+    if matches!(
+        error.downcast_ref::<crate::scip_raw::ScipCaptureError>(),
+        Some(crate::scip_raw::ScipCaptureError::Cancelled)
+    ) {
+        return error;
+    }
     tracing::debug!(%error, "witnessed semantic rejoin failed validation");
     WitnessFallback("witness_validation_failed").into()
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_never_becomes_witness_full_fallback() {
+        let error = witness_validation_failed(crate::scip_raw::ScipCaptureError::Cancelled.into());
+        assert!(matches!(
+            error.downcast_ref::<crate::scip_raw::ScipCaptureError>(),
+            Some(crate::scip_raw::ScipCaptureError::Cancelled)
+        ));
+        assert!(error.downcast_ref::<WitnessFallback>().is_none());
+    }
 }

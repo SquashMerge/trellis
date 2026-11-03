@@ -14,7 +14,7 @@ use trellis::{
         GraphIntegrity, GraphRequest, GraphResult, GraphSnapshot, GraphSource, HistoryFacts,
         SemanticDocument, Visit, WarningCode, evaluate, warnings_v1,
     },
-    model::IndexPin,
+    model::{DocumentSemanticStatus, IndexPin, SemanticAvailability},
     native_evidence::{self as native, DocumentKey},
     semantic_evidence::{self as sem, CoverageState, Dispatch, Freshness, Resolution, Target},
 };
@@ -161,6 +161,7 @@ impl World {
                     evidence_kind: sem::EvidenceKind::MeasuredSyntax,
                     ..provenance(&format!("native:{path}"), "native", &key, Freshness::Fresh)
                 },
+                semantic_status: DocumentSemanticStatus::default(),
                 semantic: (producer && in_scope).then(|| SemanticDocument {
                     coverage: coverage(PRODUCER, &key, REV, true, CoverageState::Complete),
                     provenance: BTreeMap::new(),
@@ -425,6 +426,132 @@ const A: u64 = 1;
 const B: u64 = 2;
 const C: u64 = 3;
 const D: u64 = 4;
+
+#[test]
+fn pending_document_without_tuple_marks_zero_call_root_incomplete() {
+    for depth in [0, 2] {
+        let mut w = world(true);
+        w.decl(A, "src/pending.rs");
+        let doc = w.doc("src/pending.rs");
+        doc.semantic = None;
+        doc.semantic_status = DocumentSemanticStatus {
+            state: SemanticAvailability::CatchingUp,
+            producer_id: Some(PRODUCER.into()),
+            ..DocumentSemanticStatus::default()
+        };
+        let status = doc.semantic_status.clone();
+        let mut facts = w.build();
+        let result = run(
+            &mut facts,
+            &GraphRequest {
+                depth,
+                max_calls: 0,
+                ..request(A, true)
+            },
+        );
+        assert_eq!(nodes(&result), [(A, 0)]);
+        assert!(result.edges.is_empty());
+        assert!(result.partial);
+        assert!(!result.truncated);
+        assert_eq!(
+            keys(&result.warnings),
+            [(WarningCode::CoverageIncomplete, None)]
+        );
+        assert_eq!(result.semantic_documents.len(), 1);
+        assert_eq!(
+            result.semantic_documents[0].document,
+            dkey("src/pending.rs")
+        );
+        assert_eq!(result.semantic_documents[0].semantic_status, status);
+        assert_eq!(result.coverage.len(), 1);
+        assert_eq!(result.provenance.len(), 1);
+    }
+}
+
+#[test]
+fn uninspected_pending_document_does_not_demote_zero_call_root() {
+    let mut w = world(true);
+    w.decl(A, "src/root.rs");
+    w.decl(B, "src/pending.rs");
+    let pending = w.doc("src/pending.rs");
+    pending.semantic = None;
+    pending.semantic_status.state = SemanticAvailability::CatchingUp;
+    let mut facts = w.build();
+    let result = run(&mut facts, &request(A, true));
+    assert!(!result.partial);
+    assert!(result.warnings.is_empty());
+    assert_eq!(result.semantic_documents.len(), 1);
+    assert_eq!(result.semantic_documents[0].document, dkey("src/root.rs"));
+}
+
+#[test]
+fn pending_status_keeps_safe_facts_and_nonfresh_proofs_stay_boundaries() {
+    let mut w = graph(&[(A, 10, B), (A, 11, C)], true);
+    let doc = w.doc("src/lib.rs");
+    doc.semantic_status.state = SemanticAvailability::CatchingUp;
+    let semantic = doc.semantic.as_mut().unwrap();
+    let stale = semantic.provenance.get_mut("pv:11").unwrap();
+    stale.freshness = Freshness::Stale;
+    stale.revision_id = "revision:v2:previous".into();
+    let old_proof = stale.clone();
+    let safe_binding = semantic.call_bindings[0].clone();
+    let mut facts = w.build();
+    let result = run(&mut facts, &request(A, true));
+    assert_eq!(nodes(&result), [(A, 0), (B, 1)]);
+    assert_eq!(
+        edges(&result),
+        [
+            (10, A, Some(B), Visit::New, BoundaryReason::None),
+            (11, A, None, Visit::Boundary, Stale),
+        ]
+    );
+    assert_eq!(result.edges[0].binding.as_ref(), Some(&safe_binding));
+    assert!(result.provenance.contains(&old_proof));
+    assert!(keys(&result.warnings).contains(&(WarningCode::CoverageIncomplete, None)));
+    assert!(result.partial);
+}
+
+#[test]
+fn pending_inspected_document_survives_byte_prefix_without_demoting_other_documents() {
+    let mut w = world(true);
+    w.decl(A, "src/root.rs");
+    w.decl(B, "src/pending.rs");
+    w.decl(C, "src/fresh.rs");
+    w.call(A, 10, 10);
+    w.bind(10, direct(B));
+    w.call(A, 11, 20);
+    w.bind(11, direct(C));
+    let pending = w.doc("src/pending.rs");
+    pending.semantic = None;
+    pending.semantic_status.state = SemanticAvailability::CatchingUp;
+    w.doc("src/root.rs").semantic_status.state = SemanticAvailability::Fresh;
+    w.doc("src/fresh.rs").semantic_status.state = SemanticAvailability::Fresh;
+    let mut facts = w.build();
+    let req = request(A, true);
+    let result = run(&mut facts, &req);
+    assert_eq!(nodes(&result), [(A, 0), (B, 1), (C, 1)]);
+    assert!(
+        result
+            .edges
+            .iter()
+            .all(|edge| edge.boundary_reason == BoundaryReason::None)
+    );
+    assert!(result.partial);
+    assert_eq!(
+        keys(&result.warnings),
+        [(WarningCode::CoverageIncomplete, None)]
+    );
+    let full_statuses = result.semantic_documents.clone();
+    let answer = graph_answer(req, result, facts);
+    let prefix = answer.prefix(0).unwrap();
+    assert_eq!(nodes(&prefix), [(A, 0)]);
+    assert_eq!(prefix.semantic_documents, full_statuses);
+    assert!(prefix.partial);
+    assert_eq!(
+        keys(&prefix.warnings),
+        [(WarningCode::CoverageIncomplete, None)]
+    );
+}
 
 /// #483: without an explicit producer, the source's per-language default selects each
 /// language's sole producer. A language that two producers cover is syntax only, and the

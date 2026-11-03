@@ -632,3 +632,49 @@ test("outline tree lists a binding only on the daemon's initializer evidence and
   const marked = h.run("window.TrellisFiles.outlineTree(marked)").map(entry => entry.item.symbol.id);
   assert.deepEqual(JSON.parse(JSON.stringify(marked)), ["handler", "a", "b"]);
 });
+
+
+test("Files and cached source disclose selected document state and origin independently of checkout progress", async () => {
+  for (const state of ["fresh", "catchingUp", "unavailable"]) {
+    const h = harness(), item = outline("Holder", "class");
+    const semanticStatus = {state, producerId:state === "unavailable" ? null : "java",semanticOrigin:state === "fresh" ? {pin:{...pin,indexRevision:0},revisionId:"semantic-origin"} : null,reason:state === "catchingUp" ? "semantic join pending" : state === "unavailable" ? "no producer" : null};
+    indexedNetwork(h, item, url => {
+      if (url.startsWith("/api/files?")) return response({revision:pin,items:[{path:"main.java",language:"java",methodCount:0,semanticStatus}],nextOffset:null});
+      if (url.startsWith("/api/source?")) return response({revision:pin,file:{path:"main.java",language:"java",text:"class Holder {}"},semanticStatus});
+      if (url.startsWith("/api/symbols?")) return response({revision:pin,path:"main.java",items:[],nextOffset:null,truncated:false,warnings:[],semanticStatus});
+    });
+    h.run("status.catchingUp=false");
+    await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');
+    const label = {fresh:"Semantic ready",catchingUp:"Semantic catching up",unavailable:"Semantic unavailable"}[state];
+    assert.match(h.get("source-path").textContent, new RegExp(label));
+    assert.match(text(h.get("file-tree")), new RegExp(label));
+    const pick = all(h.get("file-tree")).find(node => node.className === "file-pick");
+    assert.equal(pick.title, "main.java", "path tooltip stays the exact indexed path in the catalog and filter");
+    assert.equal(h.get("source-semantic-evidence").hidden, false);
+    const disclosed = JSON.parse(h.get("source-semantic-detail").textContent);
+    assert.deepEqual(disclosed, {nativePin:pin,semanticStatus});
+    assert.equal(h.get("source-semantic-evidence").open, false);
+    assert.doesNotMatch(h.get("source-path").textContent, /proof fresh/);
+    h.run("clearSource()");
+    assert.equal(h.get("source-semantic-evidence").hidden, true);
+    assert.equal(h.get("source-semantic-detail").textContent, "");
+  }
+});
+
+
+test("pending zero-call Files preview says partial and keeps origin status in evidence", async () => {
+  const h = harness(), item = outline("measured");
+  const semanticStatus = {state:"catchingUp",producerId:"java",semanticOrigin:null,reason:"semantic join pending"};
+  const data = {...view(item),semanticDocuments:[{document:{sourceSetId:"workspace",language:"java",path:"main.java"},semanticStatus}],partial:true,semantic:{tier:"syntax",reason:"no bindings"}};
+  indexedNetwork(h,item,url => url === "/api/sequence" ? response(data) : undefined);
+  await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
+  await h.run('selectFilesSymbol(item)');
+  const miniState = h.get("files-mini-state").textContent;
+  assert.match(miniState, /^Indexed revision [0-9a-f]{8}:1 · 0 incidental steps hidden · Semantic catching up · partial/);
+  assert.doesNotMatch(miniState, /semantic join pending|no bindings|measured syntax/);
+  const notes = h.get("files-mini-notes").children.length;
+  assert.ok(miniState.endsWith(`· ${notes} notes in ⓘ`), "the compact status counts its disclosed caveats and origins");
+  assert.match(text(h.get("files-mini-sequence")), /partial view does not prove absence/);
+  assert.match(text(h.get("files-mini-notes")), /semantic join pending/);
+  assert.equal(h.run("filesMini.truncated"), false);
+});

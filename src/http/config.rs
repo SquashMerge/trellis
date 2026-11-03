@@ -67,6 +67,6 @@ impl super::DaemonState {
         }
         *self.explicit_pending.lock().unwrap() = explicit;
         self.start_dependency_index_for(&published_config);
-        self.inbox.wake();
+        self.inbox.native_wake();
     }
 }

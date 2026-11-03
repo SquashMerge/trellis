@@ -198,6 +198,7 @@ pub struct McpSource {
     pub byte_end: usize,
     pub text: String,
     pub pin: IndexPin,
+    pub semantic_status: DocumentSemanticStatus,
 }
 
 fn mcp_lf_lines(bytes: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -341,6 +342,7 @@ impl EvidenceResponse {
             byte_end,
             text,
             pin: selected.pin,
+            semantic_status: self.document_semantic_status_at(path, Some(selected.pin))?,
         }))
     }
 }
@@ -352,6 +354,7 @@ pub struct McpDocumentVersion {
     pub revision_id: String,
     pub content_hash: String,
     pub provenance_id: String,
+    pub semantic_status: DocumentSemanticStatus,
 }
 
 /// Inclusive, 1-based LF-delimited source lines in a selected cached BLOB.
@@ -489,6 +492,8 @@ impl EvidenceResponse {
                 revision_id: declaration.revision_id.clone(),
                 content_hash: stored_hash,
                 provenance_id: declaration.provenance_id.clone(),
+                semantic_status: self
+                    .document_semantic_status_at(&declaration.document.path, Some(selected.pin))?,
             },
             lines: McpSelectedLines::new(bytes),
         })
@@ -681,6 +686,7 @@ pub struct McpFindSymbolWithLines {
 pub struct McpFindWithLines {
     pub symbols: Vec<McpFindSymbolWithLines>,
     pub scope: [[u64; 5]; 4],
+    pub scope_semantic: [SemanticAvailabilityCounts; 4],
     pub provenance: Vec<crate::native_evidence::Provenance>,
     pub has_more: bool,
     pub pin: IndexPin,
@@ -976,6 +982,7 @@ impl EvidenceResponse {
         Ok(McpFindWithLines {
             symbols,
             scope: found.scope,
+            scope_semantic: self.semantic_availability_at(Some(found.pin))?,
             provenance: found.provenance,
             has_more: found.has_more,
             pin: found.pin,
@@ -1142,6 +1149,7 @@ pub struct McpOutgoingCandidate {
     pub declaration: crate::native_evidence::Declaration,
     pub coverage: crate::native_evidence::Coverage,
     pub provenance: crate::native_evidence::Provenance,
+    pub semantic_status: DocumentSemanticStatus,
 }
 
 pub struct McpOutgoing {
@@ -1339,6 +1347,7 @@ impl EvidenceResponse {
                 Vec<crate::native_evidence::Declaration>,
                 crate::native_evidence::Coverage,
                 String,
+                DocumentSemanticStatus,
             ),
         >::new();
         for (item_index, item) in calls.iter_mut().enumerate() {
@@ -1555,9 +1564,18 @@ impl EvidenceResponse {
                         if progress.expired() {
                             return Ok(None);
                         }
-                        verified_versions.insert(version.clone(), (declarations, coverage, hash));
+                        let semantic_status =
+                            self.document_semantic_status_at(&key.path, Some(selected.pin))?;
+                        if progress.expired() {
+                            return Ok(None);
+                        }
+                        verified_versions.insert(
+                            version.clone(),
+                            (declarations, coverage, hash, semantic_status),
+                        );
                     }
-                    let (declarations, coverage, hash) = &verified_versions[&version];
+                    let (declarations, coverage, hash, semantic_status) =
+                        &verified_versions[&version];
                     let declaration = declarations
                         .iter()
                         .find(|row| row.syntax_id == id)
@@ -1613,6 +1631,7 @@ impl EvidenceResponse {
                         declaration: declaration.clone(),
                         coverage: coverage.clone(),
                         provenance,
+                        semantic_status: semantic_status.clone(),
                     }))
                 })();
                 let candidate = match candidate {
@@ -1732,6 +1751,7 @@ impl EvidenceResponse {
                         revision_id: candidate.provenance.revision_id.clone(),
                         content_hash: candidate.provenance.content_hash.clone(),
                         provenance_id: candidate.provenance.id.clone(),
+                        semantic_status: candidate.semantic_status.clone(),
                     })
                     .collect();
                 Ok(McpOutgoingCallWithLines {
@@ -1770,6 +1790,7 @@ pub struct McpIncomingWithLines {
     /// Per language (java, rust, python, javascript): selected, complete,
     /// partial, failed, unselected. Includes zero-hit scope documents.
     pub scope: [[u64; 5]; 4],
+    pub scope_semantic: [SemanticAvailabilityCounts; 4],
     pub has_more: bool,
 }
 
@@ -1798,6 +1819,9 @@ impl EvidenceResponse {
             "javascript" => 3,
             _ => return Err(self.corrupt_evidence("store_unavailable: invalid selected language")),
         };
+        let mut scope_semantic = [SemanticAvailabilityCounts::default(); 4];
+        scope_semantic[language_index] =
+            self.semantic_availability_at(Some(selected.pin))?[language_index];
         let keys = self.db.prepare(
             "SELECT path FROM revision_documents m JOIN native_source_sets s ON s.id=?2 WHERE m.revision_id=?1 AND m.language=?3 ORDER BY path"
         )?.query_map(params![selected.key, selected_key.source_set_id, selected_key.language], |r| r.get::<_, String>(0))?
@@ -2073,6 +2097,7 @@ impl EvidenceResponse {
             calls,
             same_name_declarations,
             scope: scope_counts,
+            scope_semantic,
             has_more,
         }))
     }
@@ -2114,7 +2139,8 @@ fn insert_mcp_candidate(
         std::collections::btree_map::Entry::Occupied(entry) => {
             if !(entry.get().declaration == candidate.declaration
                 && entry.get().coverage == candidate.coverage
-                && entry.get().provenance == candidate.provenance)
+                && entry.get().provenance == candidate.provenance
+                && entry.get().semantic_status == candidate.semantic_status)
             {
                 return Err(SelectedIntegrity(
                     "store_unavailable: conflicting duplicate native hint".into(),
@@ -2155,6 +2181,7 @@ mod outgoing_tests {
         .unwrap();
         let candidate = McpOutgoingCandidate {
             declaration: declaration.clone(),
+            semantic_status: DocumentSemanticStatus::default(),
             coverage: Coverage {
                 producer_id: "native:v1".into(),
                 language: "javascript".into(),

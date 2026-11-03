@@ -374,6 +374,7 @@ function stale(message) { staleMessage = message; $("stale").textContent = messa
 function clearSource() {
   sourceSerial++; sourceInspector = null; workspaceSource = null; window.TrellisNavigation?.reset(); $("source").replaceChildren();
   $("source-path").textContent = "Choose a call to read its cached source snapshot.";
+  $("source-semantic-evidence").hidden = true; $("source-semantic-detail").textContent = "";
   if (!$("source-dock")?.hidden) window.TrellisShell?.closeSource?.();
 }
 function changedCount(value) { return Array.isArray(value) ? value.length : Number(value || 0); }
@@ -458,12 +459,12 @@ async function refreshStatus(followup = false) {
   }
   if (serial !== statusSerial || session !== epoch || status !== data) return;
   const stats = status.stats || {};
-  $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
+  $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · ${window.TrellisSemanticStatus.summary(status.semanticAvailability)} · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
   $("diagnostics").textContent = describe(status.diagnostics || []);
   if (job && !activeJob(job)) showJob();
   staleMessage = ""; $("stale").hidden = true;
   if (!nextPin) stale("Index not ready. Retry status after this checkout finishes indexing.");
-  if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. Syntax remains source-only; imported SCIP is display metadata, never semantic proof.`);
+  if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. See each document's semantic state and captured evidence.`);
   renderIndexStatus();
   // The library catalog loads on demand (#527). A status refresh forgets a loaded catalog, so the
   // next in-context open reads it again, and revalidates a library that is open. A rejected
@@ -829,7 +830,10 @@ async function showSource(item, revision) {
 let workspaceSource = null;
 function paintCachedSource(data, range, current, startLine = range?.startLine || 1, metadata) {
   workspaceSource = {data, range};
-  $("source-path").textContent = `${data.file.path} · ${data.file.language} · ${data.file.text.split("\n").length} lines · revision ${IndexPin.label(data.revision)} · cached snapshot`;
+  $("source-path").textContent = `${data.file.path} · ${data.file.language} · ${data.file.text.split("\n").length} lines · revision ${IndexPin.label(data.revision)} · cached snapshot · ${window.TrellisSemanticStatus.label(data.semanticStatus)}`;
+  $("source-semantic-evidence").hidden = !data.semanticStatus;
+  $("source-semantic-detail").textContent = data.semanticStatus ? JSON.stringify({nativePin:data.revision, semanticStatus:data.semanticStatus}, null, 2) : "";
+  $("source-semantic-evidence").open = false;
   const fragment = document.createDocumentFragment();
   const lastLine = range && range.endLine > range.startLine && range.endColumn === 1 ? range.endLine - 1 : range?.endLine;
   const lines = data.file.text.split("\n"), syntax = section === "files" ? window.TrellisFiles?.lineClass : null;
@@ -859,6 +863,7 @@ async function showCachedSource(path, range, revision, callerCurrent = () => tru
   const key = `${IndexPin.key(revision)}:${path}`;
   window.TrellisNavigation?.reset(); workspaceSource = null;
   $("source-path").textContent = `Loading ${path}…`; $("source").replaceChildren();
+  $("source-semantic-evidence").hidden = true; $("source-semantic-detail").textContent = "";
   const cached = sourceCache.get(key);
   const data = cached || await api(`/api/source?path=${encodeURIComponent(path)}&${IndexPin.query(revision)}`, "GET", undefined, current);
   if (cached && current()) observePinnedHead();
@@ -1066,6 +1071,7 @@ function appendFilesOutline(li, file) {
   if (state.outlineLoading) list.append(element("li", "Loading symbols…", "detail"));
   else if (state.outlineError) list.append(button(`Retry symbols · ${state.outlineError}`, () => { if (current()) return loadFilesOutline(file, 0); }));
   else {
+    if (state.semanticStatus) list.append(element("li", window.TrellisSemanticStatus.label(state.semanticStatus), "detail"));
     // Types and callables; a container's members show when it is expanded (#526).
     state.outlineExpanded ||= new Set();
     // A newly selected member opens its containers once; the reader may close them again.
@@ -1101,6 +1107,7 @@ async function loadFilesOutline(file, offset = 0) {
     if (data.path !== file.path || data.items.some(item => item.symbol.path !== file.path)) throw new Error("Outline path mismatch. Nothing displayed.");
     state.outlineItems = offset ? [...(state.outlineItems || []), ...data.items] : data.items;
     state.outlineNext = data.nextOffset; state.outlineWarnings = data.warnings; state.outlineTruncated = data.truncated;
+    state.semanticStatus = data.semanticStatus;
   } catch (error) { if (active()) state.outlineError = error.message; filesFailure(error, "files-state", active); }
   finally { if (active()) { state.outlineLoading = false; renderFiles(); } }
 }
@@ -1220,8 +1227,16 @@ async function renderFilesMini(current) {
   const notes = [...(data.warnings || [])];
   if (data.truncated) notes.push("Truncated by sequence limits; Open full shows the same bounded steps.");
   if (outcome.status !== "rendered" && !empty) notes.push(`Pele fell back: ${outcome.reason}`);
+  notes.push(window.TrellisSequence.evidenceSummary(data));
   $("files-mini-notes").replaceChildren(...notes.map(note => element("li", note, "detail")));
-  $("files-mini-state").textContent = `Indexed revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps" : ""}${notes.length ? ` · ${notes.length} ${notes.length === 1 ? "note" : "notes"} in ⓘ` : ""}`;
+  if (data.semanticDocuments?.length) {
+    const evidence = element("li");
+    evidence.append(element("pre", JSON.stringify({nativePin:revision, semanticDocuments:data.semanticDocuments}, null, 2)));
+    $("files-mini-notes").append(evidence);
+  }
+  const semanticPartial = window.TrellisSemanticStatus.pending(data).length ? " · Semantic catching up · partial" : data.partial ? " · Semantic partial" : "";
+  const noteCount = notes.length + (data.semanticDocuments?.length ? 1 : 0);
+  $("files-mini-state").textContent = `Indexed revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${semanticPartial}${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps" : ""}${noteCount ? ` · ${noteCount} ${noteCount === 1 ? "note" : "notes"} in ⓘ` : ""}`;
   fitFilesMini();
   $("files-open-full").disabled = false;
 }
@@ -1291,6 +1306,7 @@ function updateFilesBasis() {
   $("files-git-state").textContent = available ? "" : `Working tree unavailable · ${selectedGit?.reason || "Git status unavailable"}`;
   $("files-basis-note").textContent = status?.revision ? working ? `Uncommitted vs HEAD · Not indexed. Navigation and diagrams use indexed revision ${IndexPin.label(status.revision)}.` : `Cached source · indexed revision ${IndexPin.label(status.revision)}. Navigation and diagrams use this basis.` : "Select an indexed checkout to read cached source.";
   $("files-diff").hidden = !working; $("source").hidden = working;
+  $("source-semantic-evidence").hidden = working || !workspaceSource?.data.semanticStatus;
   if ($("files-empty")) $("files-empty").hidden = !!filesFile || !!workspaceSource;
 }
 async function setFilesBasis(basis) {
@@ -1481,7 +1497,10 @@ function renderFiles() {
     const fileCurrent = browseGuard(), fileSurface = sectionSerial;
     const selection = {scope:"file", path:file.path};
     const pick = button(`${state?.open ? "▾" : "▸"} ${parts.at(-1)}${section === "files" ? "" : " · " + file.methodCount}`, () => { if (!fileCurrent() || fileSurface !== sectionSerial) return; if (section === "files") return selectFilesFile(file); inspectTreeSelection(selection); return toggleFile(file); });
-    pick.className = "file-pick"; pick.title = file.path;
+    pick.className = "file-pick";
+    const semanticStatus = file.semanticStatus;
+    pick.title = file.path;
+    if (semanticStatus) pick.append(element("span", " · " + window.TrellisSemanticStatus.label(semanticStatus), "detail"));
     appendGitMarker(pick, file.path, changes);
     if (section !== "files") attachClassMenu(pick, {path:file.path});
     pick.setAttribute("aria-expanded", String(section === "files" ? !!state?.outlineOpen : !!state?.open));
@@ -1606,10 +1625,15 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
       window.TrellisSequence.render(diagram, data, readSource, expanded, options);
     }
     if (empty) window.TrellisSequence.renderEmpty(diagram, empty, () => { if (options.isCurrent()) { $("all-steps").checked = true; void loadSequence(); } }, !onlyEmpty);
-    if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
+    if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length + (data.semanticDocuments?.length ? 1 : 0));
     renderIncidentalToggle(data);
     $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
+    if (data.semanticDocuments?.length) {
+      const evidence = element("li");
+      evidence.append(element("pre", JSON.stringify({nativePin:revision, semanticDocuments:data.semanticDocuments}, null, 2)));
+      $("sequence-warnings").append(evidence);
+    }
     published = true;
   }, current, "sequence-state");
 }

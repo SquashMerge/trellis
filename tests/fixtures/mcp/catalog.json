@@ -308,6 +308,9 @@
                       "type": "null"
                     }
                   ]
+                },
+                "semanticAvailability": {
+                  "$ref": "#/$defs/SemanticAvailabilityCounts"
                 }
               },
               "required": [
@@ -316,7 +319,8 @@
                 "freshness",
                 "coverage",
                 "note",
-                "partialReasons"
+                "partialReasons",
+                "semanticAvailability"
               ],
               "type": "object"
             }
@@ -837,6 +841,91 @@
             "config_file",
             "environment"
           ]
+        },
+        "SemanticOrigin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "pin",
+            "revisionId"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "enum": [
+                "fresh",
+                "catchingUp",
+                "unavailable"
+              ]
+            },
+            "producerId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "semanticOrigin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "producerId",
+            "semanticOrigin",
+            "reason"
+          ]
+        },
+        "SemanticAvailabilityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh": {
+              "$ref": "#/$defs/UInt"
+            },
+            "catchingUp": {
+              "$ref": "#/$defs/UInt"
+            },
+            "unavailable": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "fresh",
+            "catchingUp",
+            "unavailable"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -898,7 +987,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 6
+                  "const": 7
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -2021,6 +2110,9 @@
                       "type": "null"
                     }
                   ]
+                },
+                "semanticAvailability": {
+                  "$ref": "#/$defs/SemanticAvailabilityCounts"
                 }
               },
               "required": [
@@ -2028,7 +2120,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "semanticAvailability"
               ],
               "type": "object"
             }
@@ -2075,6 +2168,9 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
             }
           },
           "required": [
@@ -2082,7 +2178,8 @@
             "document",
             "revisionId",
             "contentHash",
-            "provenanceId"
+            "provenanceId",
+            "semanticStatus"
           ]
         },
         "ArgumentFailure": {
@@ -2143,6 +2240,107 @@
               "minimum": -9007199254740991,
               "type": "integer"
             }
+          ]
+        },
+        "SemanticOrigin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "pin",
+            "revisionId"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "enum": [
+                "fresh",
+                "catchingUp",
+                "unavailable"
+              ]
+            },
+            "producerId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "semanticOrigin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "producerId",
+            "semanticOrigin",
+            "reason"
+          ]
+        },
+        "SemanticAvailabilityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh": {
+              "$ref": "#/$defs/UInt"
+            },
+            "catchingUp": {
+              "$ref": "#/$defs/UInt"
+            },
+            "unavailable": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "fresh",
+            "catchingUp",
+            "unavailable"
+          ]
+        },
+        "DocumentSemantic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
+            }
+          },
+          "required": [
+            "document",
+            "semanticStatus"
           ]
         }
       },
@@ -3281,6 +3479,9 @@
                       "type": "null"
                     }
                   ]
+                },
+                "semanticAvailability": {
+                  "$ref": "#/$defs/SemanticAvailabilityCounts"
                 }
               },
               "required": [
@@ -3288,7 +3489,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "semanticAvailability"
               ],
               "type": "object"
             }
@@ -3335,6 +3537,9 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
             }
           },
           "required": [
@@ -3342,7 +3547,8 @@
             "document",
             "revisionId",
             "contentHash",
-            "provenanceId"
+            "provenanceId",
+            "semanticStatus"
           ]
         },
         "ArgumentFailure": {
@@ -3609,6 +3815,107 @@
             "embedded",
             "lexical",
             "unavailableReason"
+          ]
+        },
+        "SemanticOrigin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "pin",
+            "revisionId"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "enum": [
+                "fresh",
+                "catchingUp",
+                "unavailable"
+              ]
+            },
+            "producerId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "semanticOrigin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "producerId",
+            "semanticOrigin",
+            "reason"
+          ]
+        },
+        "SemanticAvailabilityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh": {
+              "$ref": "#/$defs/UInt"
+            },
+            "catchingUp": {
+              "$ref": "#/$defs/UInt"
+            },
+            "unavailable": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "fresh",
+            "catchingUp",
+            "unavailable"
+          ]
+        },
+        "DocumentSemantic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
+            }
+          },
+          "required": [
+            "document",
+            "semanticStatus"
           ]
         }
       },
@@ -4848,6 +5155,9 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
             }
           },
           "required": [
@@ -4855,7 +5165,8 @@
             "document",
             "revisionId",
             "contentHash",
-            "provenanceId"
+            "provenanceId",
+            "semanticStatus"
           ]
         },
         "FailureCode": {
@@ -5133,6 +5444,9 @@
                       "type": "null"
                     }
                   ]
+                },
+                "semanticAvailability": {
+                  "$ref": "#/$defs/SemanticAvailabilityCounts"
                 }
               },
               "required": [
@@ -5140,7 +5454,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "semanticAvailability"
               ],
               "type": "object"
             }
@@ -5152,6 +5467,107 @@
             "semantic"
           ],
           "type": "object"
+        },
+        "SemanticOrigin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "pin",
+            "revisionId"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "enum": [
+                "fresh",
+                "catchingUp",
+                "unavailable"
+              ]
+            },
+            "producerId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "semanticOrigin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "producerId",
+            "semanticOrigin",
+            "reason"
+          ]
+        },
+        "SemanticAvailabilityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh": {
+              "$ref": "#/$defs/UInt"
+            },
+            "catchingUp": {
+              "$ref": "#/$defs/UInt"
+            },
+            "unavailable": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "fresh",
+            "catchingUp",
+            "unavailable"
+          ]
+        },
+        "DocumentSemantic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
+            }
+          },
+          "required": [
+            "document",
+            "semanticStatus"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6640,6 +7056,9 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
             }
           },
           "required": [
@@ -6647,7 +7066,8 @@
             "document",
             "revisionId",
             "contentHash",
-            "provenanceId"
+            "provenanceId",
+            "semanticStatus"
           ]
         },
         "FailureCode": {
@@ -7005,6 +7425,9 @@
                       "type": "null"
                     }
                   ]
+                },
+                "semanticAvailability": {
+                  "$ref": "#/$defs/SemanticAvailabilityCounts"
                 }
               },
               "required": [
@@ -7012,7 +7435,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "semanticAvailability"
               ],
               "type": "object"
             }
@@ -7174,6 +7598,107 @@
             "lookupDependencies"
           ],
           "type": "object"
+        },
+        "SemanticOrigin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "pin",
+            "revisionId"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "enum": [
+                "fresh",
+                "catchingUp",
+                "unavailable"
+              ]
+            },
+            "producerId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "semanticOrigin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "producerId",
+            "semanticOrigin",
+            "reason"
+          ]
+        },
+        "SemanticAvailabilityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh": {
+              "$ref": "#/$defs/UInt"
+            },
+            "catchingUp": {
+              "$ref": "#/$defs/UInt"
+            },
+            "unavailable": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "fresh",
+            "catchingUp",
+            "unavailable"
+          ]
+        },
+        "DocumentSemantic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
+            }
+          },
+          "required": [
+            "document",
+            "semanticStatus"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -8204,6 +8729,9 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
             }
           },
           "required": [
@@ -8211,7 +8739,8 @@
             "document",
             "revisionId",
             "contentHash",
-            "provenanceId"
+            "provenanceId",
+            "semanticStatus"
           ]
         },
         "FailureCode": {
@@ -8562,6 +9091,9 @@
                       "type": "null"
                     }
                   ]
+                },
+                "semanticAvailability": {
+                  "$ref": "#/$defs/SemanticAvailabilityCounts"
                 }
               },
               "required": [
@@ -8569,7 +9101,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "semanticAvailability"
               ],
               "type": "object"
             }
@@ -9153,6 +9686,107 @@
             "lookupDependencies"
           ],
           "type": "object"
+        },
+        "SemanticOrigin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "pin",
+            "revisionId"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "enum": [
+                "fresh",
+                "catchingUp",
+                "unavailable"
+              ]
+            },
+            "producerId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "semanticOrigin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "producerId",
+            "semanticOrigin",
+            "reason"
+          ]
+        },
+        "SemanticAvailabilityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh": {
+              "$ref": "#/$defs/UInt"
+            },
+            "catchingUp": {
+              "$ref": "#/$defs/UInt"
+            },
+            "unavailable": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "fresh",
+            "catchingUp",
+            "unavailable"
+          ]
+        },
+        "DocumentSemantic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
+            }
+          },
+          "required": [
+            "document",
+            "semanticStatus"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -10011,6 +10645,91 @@
               "type": "integer"
             }
           ]
+        },
+        "SemanticOrigin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "pin",
+            "revisionId"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "enum": [
+                "fresh",
+                "catchingUp",
+                "unavailable"
+              ]
+            },
+            "producerId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "semanticOrigin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "producerId",
+            "semanticOrigin",
+            "reason"
+          ]
+        },
+        "SemanticAvailabilityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh": {
+              "$ref": "#/$defs/UInt"
+            },
+            "catchingUp": {
+              "$ref": "#/$defs/UInt"
+            },
+            "unavailable": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "fresh",
+            "catchingUp",
+            "unavailable"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -10041,6 +10760,9 @@
                 },
                 "text": {
                   "type": "string"
+                },
+                "semanticStatus": {
+                  "$ref": "#/$defs/DocumentSemanticStatus"
                 }
               },
               "required": [
@@ -10050,7 +10772,8 @@
                 "endLine",
                 "byteRange",
                 "text",
-                "evidence"
+                "evidence",
+                "semanticStatus"
               ],
               "type": "object"
             },
@@ -11893,6 +12616,12 @@
                 ]
               },
               "uniqueItems": true
+            },
+            "semanticDocuments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/DocumentSemantic"
+              }
             }
           },
           "required": [
@@ -11907,7 +12636,8 @@
             "truncated",
             "warnings",
             "omitted",
-            "hints"
+            "hints",
+            "semanticDocuments"
           ],
           "type": "object"
         },
@@ -12123,6 +12853,9 @@
                       "type": "null"
                     }
                   ]
+                },
+                "semanticAvailability": {
+                  "$ref": "#/$defs/SemanticAvailabilityCounts"
                 }
               },
               "required": [
@@ -12130,7 +12863,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "semanticAvailability"
               ],
               "type": "object"
             }
@@ -12161,6 +12895,9 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
             }
           },
           "required": [
@@ -12168,7 +12905,109 @@
             "document",
             "revisionId",
             "contentHash",
-            "provenanceId"
+            "provenanceId",
+            "semanticStatus"
+          ]
+        },
+        "SemanticOrigin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "pin",
+            "revisionId"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "enum": [
+                "fresh",
+                "catchingUp",
+                "unavailable"
+              ]
+            },
+            "producerId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "semanticOrigin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "producerId",
+            "semanticOrigin",
+            "reason"
+          ]
+        },
+        "SemanticAvailabilityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh": {
+              "$ref": "#/$defs/UInt"
+            },
+            "catchingUp": {
+              "$ref": "#/$defs/UInt"
+            },
+            "unavailable": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "fresh",
+            "catchingUp",
+            "unavailable"
+          ]
+        },
+        "DocumentSemantic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
+            }
+          },
+          "required": [
+            "document",
+            "semanticStatus"
           ]
         }
       },
@@ -12466,6 +13305,45 @@
     "name": "trellis_references",
     "outputSchema": {
       "$defs": {
+        "PartialFile": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "reason": {
+              "enum": [
+                "syntax_error",
+                "depth_limit",
+                "visit_limit",
+                "evidence_budget",
+                "oversized",
+                "not_utf8"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "subtrees": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path",
+            "reason",
+            "range",
+            "subtrees"
+          ]
+        },
         "Basis": {
           "additionalProperties": false,
           "properties": {
@@ -13136,13 +14014,17 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
             }
           },
           "required": [
             "identity",
             "revisionId",
             "contentHash",
-            "provenanceId"
+            "provenanceId",
+            "semanticStatus"
           ]
         },
         "Edge": {
@@ -13760,8 +14642,12 @@
         "CatalogEvidence": {
           "oneOf": [
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "rust-standard-library:v1"
                 },
@@ -13771,21 +14657,21 @@
                     "core",
                     "alloc"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "java-standard-library:v2"
                 },
@@ -13794,21 +14680,21 @@
                     "java",
                     "javax"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "python-standard-library:v2"
                 },
@@ -14115,21 +15001,21 @@
                     "zlib",
                     "zoneinfo"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "node-standard-library:v1"
                 },
@@ -14138,17 +15024,13 @@
                     "fs",
                     "path"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             }
           ]
         },
@@ -14190,43 +15072,105 @@
             "evidence"
           ]
         },
-        "PartialFile": {
+        "SemanticOrigin": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "sourceSetId": {
+            "pin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "revisionId": {
               "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "$ref": "#/$defs/Path"
-            },
-            "reason": {
+            }
+          },
+          "required": [
+            "pin",
+            "revisionId"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
               "enum": [
-                "syntax_error",
-                "depth_limit",
-                "visit_limit",
-                "evidence_budget",
-                "oversized",
-                "not_utf8"
+                "fresh",
+                "catchingUp",
+                "unavailable"
               ]
             },
-            "range": {
-              "$ref": "#/$defs/Range"
+            "producerId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
-            "subtrees": {
+            "semanticOrigin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "producerId",
+            "semanticOrigin",
+            "reason"
+          ]
+        },
+        "SemanticAvailabilityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh": {
+              "$ref": "#/$defs/UInt"
+            },
+            "catchingUp": {
+              "$ref": "#/$defs/UInt"
+            },
+            "unavailable": {
               "$ref": "#/$defs/UInt"
             }
           },
           "required": [
-            "sourceSetId",
-            "language",
-            "path",
-            "reason",
-            "range",
-            "subtrees"
+            "fresh",
+            "catchingUp",
+            "unavailable"
+          ]
+        },
+        "DocumentSemantic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
+            }
+          },
+          "required": [
+            "document",
+            "semanticStatus"
           ]
         }
       },
@@ -14305,6 +15249,12 @@
                     "semanticSites"
                   ]
                 },
+                "partialFiles": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/PartialFile"
+                  }
+                },
                 "limitations": {
                   "type": "array",
                   "items": {
@@ -14363,11 +15313,17 @@
                     ]
                   }
                 },
-                "partialFiles": {
+                "semanticDocuments": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/$defs/PartialFile"
+                    "$ref": "#/$defs/DocumentSemantic"
                   }
+                },
+                "semanticAvailability": {
+                  "$ref": "#/$defs/SemanticAvailabilityCounts"
+                },
+                "partial": {
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -14385,7 +15341,10 @@
                 "partialFiles",
                 "limitations",
                 "externalPackages",
-                "page"
+                "page",
+                "semanticDocuments",
+                "semanticAvailability",
+                "partial"
               ]
             },
             "evidenceBasis": {
@@ -14545,6 +15504,45 @@
     "name": "trellis_rules_check",
     "outputSchema": {
       "$defs": {
+        "PartialFile": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "reason": {
+              "enum": [
+                "syntax_error",
+                "depth_limit",
+                "visit_limit",
+                "evidence_budget",
+                "oversized",
+                "not_utf8"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "subtrees": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path",
+            "reason",
+            "range",
+            "subtrees"
+          ]
+        },
         "Basis": {
           "additionalProperties": false,
           "properties": {
@@ -15215,13 +16213,17 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
             }
           },
           "required": [
             "identity",
             "revisionId",
             "contentHash",
-            "provenanceId"
+            "provenanceId",
+            "semanticStatus"
           ]
         },
         "Edge": {
@@ -15914,8 +16916,12 @@
         "CatalogEvidence": {
           "oneOf": [
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "rust-standard-library:v1"
                 },
@@ -15925,21 +16931,21 @@
                     "core",
                     "alloc"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "java-standard-library:v2"
                 },
@@ -15948,21 +16954,21 @@
                     "java",
                     "javax"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "python-standard-library:v2"
                 },
@@ -16269,21 +17275,21 @@
                     "zlib",
                     "zoneinfo"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "node-standard-library:v1"
                 },
@@ -16292,17 +17298,13 @@
                     "fs",
                     "path"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             }
           ]
         },
@@ -16344,43 +17346,105 @@
             "evidence"
           ]
         },
-        "PartialFile": {
+        "SemanticOrigin": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "sourceSetId": {
+            "pin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "revisionId": {
               "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "$ref": "#/$defs/Path"
-            },
-            "reason": {
+            }
+          },
+          "required": [
+            "pin",
+            "revisionId"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
               "enum": [
-                "syntax_error",
-                "depth_limit",
-                "visit_limit",
-                "evidence_budget",
-                "oversized",
-                "not_utf8"
+                "fresh",
+                "catchingUp",
+                "unavailable"
               ]
             },
-            "range": {
-              "$ref": "#/$defs/Range"
+            "producerId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
-            "subtrees": {
+            "semanticOrigin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "producerId",
+            "semanticOrigin",
+            "reason"
+          ]
+        },
+        "SemanticAvailabilityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh": {
+              "$ref": "#/$defs/UInt"
+            },
+            "catchingUp": {
+              "$ref": "#/$defs/UInt"
+            },
+            "unavailable": {
               "$ref": "#/$defs/UInt"
             }
           },
           "required": [
-            "sourceSetId",
-            "language",
-            "path",
-            "reason",
-            "range",
-            "subtrees"
+            "fresh",
+            "catchingUp",
+            "unavailable"
+          ]
+        },
+        "DocumentSemantic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
+            }
+          },
+          "required": [
+            "document",
+            "semanticStatus"
           ]
         }
       },
@@ -16432,6 +17496,12 @@
                     "$ref": "#/$defs/Destination"
                   }
                 },
+                "partialFiles": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/PartialFile"
+                  }
+                },
                 "limitations": {
                   "type": "array",
                   "items": {
@@ -16471,11 +17541,20 @@
                     "total"
                   ]
                 },
-                "partialFiles": {
+                "semanticDocuments": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/$defs/PartialFile"
+                    "$ref": "#/$defs/DocumentSemantic"
                   }
+                },
+                "semanticAvailability": {
+                  "$ref": "#/$defs/SemanticAvailabilityCounts"
+                },
+                "partial": {
+                  "type": "boolean"
+                },
+                "semanticComplete": {
+                  "const": false
                 }
               },
               "required": [
@@ -16492,7 +17571,11 @@
                 "partialFiles",
                 "limitations",
                 "externalPackages",
-                "page"
+                "page",
+                "semanticDocuments",
+                "semanticAvailability",
+                "partial",
+                "semanticComplete"
               ]
             },
             "evidenceBasis": {
@@ -16923,6 +18006,45 @@
     "name": "trellis_rules_explain",
     "outputSchema": {
       "$defs": {
+        "PartialFile": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "reason": {
+              "enum": [
+                "syntax_error",
+                "depth_limit",
+                "visit_limit",
+                "evidence_budget",
+                "oversized",
+                "not_utf8"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "subtrees": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path",
+            "reason",
+            "range",
+            "subtrees"
+          ]
+        },
         "Basis": {
           "additionalProperties": false,
           "properties": {
@@ -17593,13 +18715,17 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
             }
           },
           "required": [
             "identity",
             "revisionId",
             "contentHash",
-            "provenanceId"
+            "provenanceId",
+            "semanticStatus"
           ]
         },
         "Edge": {
@@ -18292,8 +19418,12 @@
         "CatalogEvidence": {
           "oneOf": [
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "rust-standard-library:v1"
                 },
@@ -18303,21 +19433,21 @@
                     "core",
                     "alloc"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "java-standard-library:v2"
                 },
@@ -18326,21 +19456,21 @@
                     "java",
                     "javax"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "python-standard-library:v2"
                 },
@@ -18647,21 +19777,21 @@
                     "zlib",
                     "zoneinfo"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "node-standard-library:v1"
                 },
@@ -18670,17 +19800,13 @@
                     "fs",
                     "path"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             }
           ]
         },
@@ -18722,43 +19848,105 @@
             "evidence"
           ]
         },
-        "PartialFile": {
+        "SemanticOrigin": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "sourceSetId": {
+            "pin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "revisionId": {
               "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "$ref": "#/$defs/Path"
-            },
-            "reason": {
+            }
+          },
+          "required": [
+            "pin",
+            "revisionId"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
               "enum": [
-                "syntax_error",
-                "depth_limit",
-                "visit_limit",
-                "evidence_budget",
-                "oversized",
-                "not_utf8"
+                "fresh",
+                "catchingUp",
+                "unavailable"
               ]
             },
-            "range": {
-              "$ref": "#/$defs/Range"
+            "producerId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
-            "subtrees": {
+            "semanticOrigin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "producerId",
+            "semanticOrigin",
+            "reason"
+          ]
+        },
+        "SemanticAvailabilityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh": {
+              "$ref": "#/$defs/UInt"
+            },
+            "catchingUp": {
+              "$ref": "#/$defs/UInt"
+            },
+            "unavailable": {
               "$ref": "#/$defs/UInt"
             }
           },
           "required": [
-            "sourceSetId",
-            "language",
-            "path",
-            "reason",
-            "range",
-            "subtrees"
+            "fresh",
+            "catchingUp",
+            "unavailable"
+          ]
+        },
+        "DocumentSemantic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "semanticStatus": {
+              "$ref": "#/$defs/DocumentSemanticStatus"
+            }
+          },
+          "required": [
+            "document",
+            "semanticStatus"
           ]
         }
       },
@@ -18810,6 +19998,12 @@
                     "$ref": "#/$defs/Destination"
                   }
                 },
+                "partialFiles": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/PartialFile"
+                  }
+                },
                 "limitations": {
                   "type": "array",
                   "items": {
@@ -18849,11 +20043,20 @@
                     "total"
                   ]
                 },
-                "partialFiles": {
+                "semanticDocuments": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/$defs/PartialFile"
+                    "$ref": "#/$defs/DocumentSemantic"
                   }
+                },
+                "semanticAvailability": {
+                  "$ref": "#/$defs/SemanticAvailabilityCounts"
+                },
+                "partial": {
+                  "type": "boolean"
+                },
+                "semanticComplete": {
+                  "const": false
                 }
               },
               "required": [
@@ -18870,7 +20073,11 @@
                 "partialFiles",
                 "limitations",
                 "externalPackages",
-                "page"
+                "page",
+                "semanticDocuments",
+                "semanticAvailability",
+                "partial",
+                "semanticComplete"
               ]
             },
             "evidenceBasis": {

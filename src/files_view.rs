@@ -254,6 +254,7 @@ fn type_name(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
 pub struct Outline {
     pub revision: IndexPin,
     pub path: String,
+    pub semantic_status: crate::model::DocumentSemanticStatus,
     pub items: Vec<OutlineItem>,
     pub next_offset: Option<usize>,
     pub truncated: bool,

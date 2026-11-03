@@ -3,6 +3,16 @@ use serde_json::{Value, json};
 
 /// Build refs from precisely the items that survive the wire byte budget.
 type DocumentKey = (u8, String, String, String);
+
+#[cfg(test)]
+fn unavailable_status() -> crate::model::DocumentSemanticStatus {
+    crate::model::DocumentSemanticStatus {
+        state: crate::model::SemanticAvailability::Unavailable,
+        producer_id: None,
+        semantic_origin: None,
+        reason: Some("No selected semantic producer".into()),
+    }
+}
 fn document_key(version: &crate::store::mcp_read::McpDocumentVersion) -> DocumentKey {
     let language = match version.document.language.as_str() {
         "java" => 0,
@@ -36,10 +46,23 @@ fn document_table<'a>(
         refs.insert(key, index);
         documents.push(json!({"ref":index,"document":version.document,
             "revisionId":version.revision_id,"contentHash":version.content_hash,
-            "provenanceId":version.provenance_id}));
+            "provenanceId":version.provenance_id,"semanticStatus":version.semantic_status}));
     }
     Ok((documents, refs))
 }
+fn selected_semantic_status(
+    version: &mut crate::store::mcp_read::McpDocumentVersion,
+    semantic: &crate::store::McpSemantic,
+) {
+    if let Some(document) = semantic
+        .documents
+        .iter()
+        .find(|row| row.document == version.document)
+    {
+        version.semantic_status = document.semantic_status.clone();
+    }
+}
+
 fn document_ref(
     refs: &std::collections::BTreeMap<DocumentKey, usize>,
     version: &crate::store::mcp_read::McpDocumentVersion,
@@ -72,9 +95,25 @@ fn language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
             json!({"language":language,"nativeCoverageTier":"syntax","coverage":counts(row),
             "semantic":{"available":tier.semantic(),"producerId":tier.producer_id,
                 "freshness":if tier.freshness.is_empty() {"unavailable"} else {tier.freshness},
-                "coverage":counts(&tier.counts),"note":tier.note}})
+                "coverage":counts(&tier.counts),"note":tier.note,"semanticAvailability":tier.semantic_availability}})
         })
         .collect()
+}
+
+fn scoped_language_status(
+    rows: &[[u64; 5]; 4],
+    tiers: &Tiers,
+    availability: &[crate::model::SemanticAvailabilityCounts; 4],
+) -> Vec<Value> {
+    let mut statuses = language_status(rows, tiers);
+    for (status, counts) in statuses.iter_mut().zip(availability) {
+        status["semantic"]["semanticAvailability"] = json!(counts);
+    }
+    statuses
+}
+
+fn catching_up_warning() -> Value {
+    json!({"code":"coverageIncomplete","message":"Semantic catching up for selected documents; missing results do not prove absence","provenanceId":null})
 }
 
 /// Describe's `LanguageStatus` rows: each semantic block also says why its partial tuples
@@ -131,25 +170,75 @@ pub fn describe(
         rows.iter()
             .chain(tiers.iter().map(|tier| &tier.counts))
             .any(|row| row[2] != 0 || row[3] != 0)
+            || tiers
+                .iter()
+                .any(|tier| tier.semantic_availability.catching_up != 0)
     });
     let languages: Vec<Value> = counts.as_ref().map_or_else(Vec::new, |(rows, tiers)| {
         describe_language_status(rows, tiers)
     });
+    let warnings: Vec<Value> = counts
+        .as_ref()
+        .filter(|(_, tiers)| {
+            tiers
+                .iter()
+                .any(|tier| tier.semantic_availability.catching_up != 0)
+        })
+        .map(|_| vec![catching_up_warning()])
+        .unwrap_or_default();
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":6,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":7,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
         "maxLimit":50,"pageBytes":super::architecture::PAGE_BYTES,"calleeTextBytes":1024,
         "hintWorkMs":1000,"deadlineMs":deadline_ms,"concurrency":super::MAX_CONNECTION_CALLS}},
-      "warnings":[],"partial":partial,"truncated":false,"truncationReason":null})
+      "warnings":warnings,"partial":partial,"truncated":false,"truncationReason":null})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn document_status_keeps_native_revision_and_semantic_origin_separate() {
+        let origin = crate::model::SemanticOrigin {
+            pin: crate::model::IndexPin {
+                index_generation: uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000")
+                    .unwrap(),
+                index_revision: 1,
+            },
+            revision_id: "revision:v2:semantic-origin".into(),
+        };
+        let version = crate::store::mcp_read::McpDocumentVersion {
+            document: crate::native_evidence::DocumentKey {
+                source_set_id: "source-set:v1:test".into(),
+                language: "rust".into(),
+                path: "src/lib.rs".into(),
+            },
+            revision_id: "revision:v2:native".into(),
+            content_hash: "a".repeat(64),
+            provenance_id: "native:doc".into(),
+            semantic_status: crate::model::DocumentSemanticStatus {
+                state: crate::model::SemanticAvailability::Fresh,
+                producer_id: Some("rust-analyzer".into()),
+                semantic_origin: Some(origin),
+                reason: None,
+            },
+        };
+        let (rows, _) = document_table([&version]).unwrap();
+        assert_eq!(rows[0]["revisionId"], "revision:v2:native");
+        assert_eq!(
+            rows[0]["semanticStatus"]["semanticOrigin"]["revisionId"],
+            "revision:v2:semantic-origin"
+        );
+        assert_eq!(
+            rows[0]["semanticStatus"]["semanticOrigin"]["pin"]["indexRevision"],
+            1
+        );
+    }
+
     #[test]
     fn describe_closed_ready_and_missing_head() {
         let empty = describe(&json!(1), "project", "reconciling", None, None, None, false);
@@ -170,7 +259,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 6);
+        assert_eq!(ready["data"]["toolVersion"], 7);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -185,6 +274,31 @@ mod tests {
             assert_eq!(language["semantic"]["producerId"], Value::Null);
             assert_eq!(language["semantic"]["freshness"], "unavailable");
         }
+    }
+
+    #[test]
+    fn describe_pending_counts_are_independent_of_tuple_freshness() {
+        let mut tiers = Tiers::default();
+        tiers[1].semantic_availability.catching_up = 1;
+        let described = describe(
+            &json!(1),
+            "project",
+            "ready",
+            None,
+            Some(([[0; 5]; 4], tiers)),
+            None,
+            false,
+        );
+        assert_eq!(
+            described["data"]["languages"][1]["semantic"]["semanticAvailability"]["catchingUp"],
+            1
+        );
+        assert_eq!(
+            described["data"]["languages"][1]["semantic"]["freshness"],
+            "unavailable"
+        );
+        assert_eq!(described["partial"], true);
+        assert_eq!(described["warnings"][0]["code"], "coverageIncomplete");
     }
 
     /// Rust selects a `rust-analyzer` import; the other languages have no producer.
@@ -311,7 +425,7 @@ mod tests {
             rust["semantic"],
             json!({"available":true,"producerId":"rust-analyzer","freshness":"fresh","note":null,
                 "coverage":{"selected":355,"complete":300,"partial":55,"failed":0,"unselected":0},
-                "partialReasons":null})
+                "partialReasons":null,"semanticAvailability":{"fresh":0,"catchingUp":0,"unavailable":0}})
         );
         assert_eq!(
             fresh["data"]["languages"][0]["semantic"]["available"],
@@ -381,6 +495,9 @@ pub fn declaration(
     let mut warnings = Vec::new();
     if incomplete {
         warnings.push(json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}));
+    }
+    if source.document.semantic_status.state == crate::model::SemanticAvailability::CatchingUp {
+        warnings.push(catching_up_warning());
     }
     warnings.extend(syntax_only(
         tiers,
@@ -539,6 +656,13 @@ fn symbols(
         if incomplete {
             warnings.push(json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}));
         }
+        if result
+            .scope_semantic
+            .iter()
+            .any(|counts| counts.catching_up != 0)
+        {
+            warnings.push(catching_up_warning());
+        }
         let languages: Vec<&str> = if n == 0 {
             scope_languages.clone()
         } else {
@@ -550,7 +674,7 @@ fn symbols(
         warnings.extend(syntax_only(tiers, languages));
         warnings
     };
-    let scope = language_status(&result.scope, tiers);
+    let scope = scoped_language_status(&result.scope, tiers, &result.scope_semantic);
     let basis = json!({"indexGeneration":result.pin.index_generation.to_string(),
         "indexRevision":result.pin.index_revision});
     let language_order = |language: &str| match language {
@@ -752,6 +876,10 @@ mod find_tests {
             });
         }
         McpFindWithLines {
+            scope_semantic: scope.map(|row| crate::model::SemanticAvailabilityCounts {
+                unavailable: row[0] + row[4],
+                ..Default::default()
+            }),
             symbols: symbols
                 .into_iter()
                 .map(|symbol| {
@@ -763,6 +891,7 @@ mod find_tests {
                         source: McpItemSource {
                             stable_lookup_key: None,
                             document: McpDocumentVersion {
+                                semantic_status: unavailable_status(),
                                 document: symbol.declaration.document.clone(),
                                 revision_id: symbol.declaration.revision_id.clone(),
                                 content_hash: symbol.content_hash.clone(),
@@ -805,10 +934,15 @@ mod find_tests {
             String::new()
         };
         let items = if count == 1 { "symbol" } else { "symbols" };
+        let partial = if envelope["partial"] == true {
+            ", partial"
+        } else {
+            ""
+        };
         assert_eq!(
             result["content"][0]["text"],
             format!(
-                "trellis_find_symbols: {count} {items}{truncated}; full result in structuredContent."
+                "trellis_find_symbols: {count} {items}{partial}{truncated}; full result in structuredContent."
             )
         );
         assert_eq!(result.get("resultType").is_some(), modern);
@@ -938,10 +1072,10 @@ mod find_tests {
             assert_eq!(
                 data["scopeCoverage"],
                 json!([
-                    {"language":"java","nativeCoverageTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
-                    {"language":"rust","nativeCoverageTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
-                    {"language":"python","nativeCoverageTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
-                    {"language":"javascript","nativeCoverageTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}}
+                    {"language":"java","nativeCoverageTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"semanticAvailability":{"fresh":0,"catchingUp":0,"unavailable":4}}},
+                    {"language":"rust","nativeCoverageTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"semanticAvailability":{"fresh":0,"catchingUp":0,"unavailable":117}}},
+                    {"language":"python","nativeCoverageTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"semanticAvailability":{"fresh":0,"catchingUp":0,"unavailable":9}}},
+                    {"language":"javascript","nativeCoverageTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"semanticAvailability":{"fresh":0,"catchingUp":0,"unavailable":140}}}
                 ])
             );
             // Incomplete selected scope: partial, one aggregate warning first.
@@ -1068,6 +1202,7 @@ mod find_tests {
     #[test]
     fn document_refs_order_revisions_and_full_keys() {
         let version = |source_set: &str, revision: &str| McpDocumentVersion {
+            semantic_status: unavailable_status(),
             document: DocumentKey {
                 source_set_id: source_set.into(),
                 language: "javascript".into(),
@@ -1700,7 +1835,7 @@ fn call_warnings<'a>(
 /// Calls have priority over optional hints in the complete structured-plus-summary wire budget.
 pub fn outgoing(
     id: &Value,
-    result: crate::store::mcp_read::McpOutgoingWithLines,
+    mut result: crate::store::mcp_read::McpOutgoingWithLines,
     semantic: &crate::store::McpSemantic,
     compact: bool,
     root: &std::path::Path,
@@ -1708,7 +1843,16 @@ pub fn outgoing(
     modern: bool,
 ) -> Result<Option<Value>, &'static str> {
     use std::collections::BTreeMap;
+    selected_semantic_status(&mut result.owner.source.document, semantic);
+    for item in &mut result.calls {
+        selected_semantic_status(&mut item.source.document, semantic);
+        for version in &mut item.candidate_documents {
+            selected_semantic_status(version, semantic);
+        }
+    }
     let owner_display = display_key(&result.owner.selected.declaration);
+    let semantic_pending = result.owner.source.document.semantic_status.state
+        == crate::model::SemanticAvailability::CatchingUp;
     let basis = json!({"indexGeneration":result.owner.selected.pin.index_generation.to_string(),
         "indexRevision":result.owner.selected.pin.index_revision});
     let fits = |envelope: &Value| -> bool {
@@ -1724,7 +1868,8 @@ pub fn outgoing(
                 std::iter::once(&item.source.document)
                     .chain(item.candidate_documents[..shown[index]].iter())
             });
-        let (documents, refs) = document_table(versions)?;
+        let (documents, refs) =
+            document_table(std::iter::once(&result.owner.source.document).chain(versions))?;
         let mut coverage = BTreeMap::new();
         let mut provenance = BTreeMap::new();
         for row in &result.owner.selected.coverage {
@@ -1858,11 +2003,14 @@ pub fn outgoing(
         } else {
             None
         };
-        let warnings = call_warnings(
+        let mut warnings = call_warnings(
             incomplete,
             semantic,
             (0..count).filter_map(|index| semantic.call(index)),
         );
+        if semantic_pending {
+            warnings.push(catching_up_warning());
+        }
         let (bases, provenance) = intern_bases(&mut calls, provenance.into_values())?;
         let mut data = json!({"symbolId":result.owner.selected.declaration.syntax_id,
             "stableLookupKey":result.owner.source.stable_lookup_key,"displayKey":owner_display,"calls":calls,"documents":documents,
@@ -1873,7 +2021,7 @@ pub fn outgoing(
         Ok(
             json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
             "evidenceBasis":basis,"data":data,
-            "warnings":warnings,"partial":incomplete || truncated || boundary,
+            "warnings":warnings,"partial":incomplete || truncated || boundary || semantic_pending,
             "truncated":truncated,"truncationReason":reason}),
         )
     };
@@ -1997,7 +2145,7 @@ fn fit_call_graph(
 #[allow(clippy::too_many_arguments)]
 pub fn incoming(
     id: &Value,
-    result: crate::store::mcp_read::McpIncomingWithLines,
+    mut result: crate::store::mcp_read::McpIncomingWithLines,
     semantic: &crate::store::McpSemantic,
     tiers: &Tiers,
     compact: bool,
@@ -2006,15 +2154,27 @@ pub fn incoming(
     modern: bool,
 ) -> Result<Option<Value>, &'static str> {
     use std::collections::BTreeMap;
+    selected_semantic_status(&mut result.selected.source.document, semantic);
+    for item in &mut result.calls {
+        selected_semantic_status(&mut item.source.document, semantic);
+    }
     let owner = &result.selected.selected;
     let basis = json!({"indexGeneration":owner.pin.index_generation.to_string(),
         "indexRevision":owner.pin.index_revision});
     let incomplete = result.scope.iter().any(|row| row[2] != 0 || row[3] != 0);
+    let semantic_pending = result
+        .scope_semantic
+        .iter()
+        .any(|counts| counts.catching_up != 0)
+        || result.selected.source.document.semantic_status.state
+            == crate::model::SemanticAvailability::CatchingUp;
     let build = |count: usize| -> Result<Value, &'static str> {
         let (documents, refs) = document_table(
-            result.calls[..count]
-                .iter()
-                .map(|item| &item.source.document),
+            std::iter::once(&result.selected.source.document).chain(
+                result.calls[..count]
+                    .iter()
+                    .map(|item| &item.source.document),
+            ),
         )?;
         let mut coverage = BTreeMap::new();
         let mut provenance = BTreeMap::new();
@@ -2132,11 +2292,14 @@ pub fn incoming(
         } else {
             None
         };
-        let warnings = call_warnings(
+        let mut warnings = call_warnings(
             incomplete,
             semantic,
             (0..count).filter_map(|index| semantic.call(index)),
         );
+        if semantic_pending {
+            warnings.push(catching_up_warning());
+        }
         let incomplete = warnings
             .first()
             .is_some_and(|warning| warning["code"] == "coverageIncomplete");
@@ -2148,7 +2311,7 @@ pub fn incoming(
                 "limitations":["aliases","functionValues","reExports","dynamicDispatch",
                     "opaqueMacros","sameNameDeclarations"]},
             "callers":callers,"documents":documents,"semanticBases":bases,"coverage":coverage,
-            "scopeCoverage":language_status(&result.scope, tiers),
+            "scopeCoverage":scoped_language_status(&result.scope, tiers, &result.scope_semantic),
             "provenance":provenance});
         if compact {
             compact_data(&mut data, "callers");
@@ -2156,7 +2319,7 @@ pub fn incoming(
         Ok(
             json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
             "evidenceBasis":basis,"data":data,
-            "warnings":warnings,"partial":incomplete || truncated || boundary,
+            "warnings":warnings,"partial":incomplete || truncated || boundary || semantic_pending,
             "truncated":truncated,"truncationReason":reason}),
         )
     };
@@ -2190,6 +2353,7 @@ mod outgoing_tests {
 
     pub(super) fn with_lines(result: McpOutgoing) -> McpOutgoingWithLines {
         let owner_doc = McpDocumentVersion {
+            semantic_status: unavailable_status(),
             document: result.owner.declaration.document.clone(),
             revision_id: result.owner.declaration.revision_id.clone(),
             content_hash: result.owner.content_hash.clone(),
@@ -2203,6 +2367,7 @@ mod outgoing_tests {
                     .candidates
                     .iter()
                     .map(|candidate| McpDocumentVersion {
+                        semantic_status: candidate.semantic_status.clone(),
                         document: candidate.declaration.document.clone(),
                         revision_id: candidate.declaration.revision_id.clone(),
                         content_hash: candidate.provenance.content_hash.clone(),
@@ -2319,6 +2484,7 @@ mod outgoing_tests {
             target.provenance[0].id = target.declaration.provenance_id.clone();
             let mut call = required_call(false);
             call.candidates.push(McpOutgoingCandidate {
+                semantic_status: unavailable_status(),
                 declaration: target.declaration,
                 coverage: target.coverage.remove(0),
                 provenance: target.provenance.remove(0),
@@ -2360,6 +2526,51 @@ mod outgoing_tests {
     }
 
     #[test]
+    fn zero_call_pending_owner_uses_selected_producer_in_both_modes() {
+        for compact in [false, true] {
+            let mut selected = owner();
+            selected.coverage[0].state = "complete".into();
+            let document = selected.declaration.document.clone();
+            let mut semantic = syntax_only();
+            semantic.documents.push(crate::model::DocumentSemantic {
+                document,
+                semantic_status: crate::model::DocumentSemanticStatus {
+                    state: crate::model::SemanticAvailability::CatchingUp,
+                    producer_id: Some("explicit-producer".into()),
+                    semantic_origin: None,
+                    reason: Some("Semantic rejoin pending".into()),
+                },
+            });
+            let result = outgoing(
+                &json!(1),
+                with_lines(McpOutgoing {
+                    owner: selected,
+                    calls: vec![],
+                    has_more: false,
+                }),
+                &semantic,
+                compact,
+                std::path::Path::new("/workspace"),
+                false,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(result["partial"], true);
+            assert_eq!(result["truncated"], false);
+            assert_eq!(result["data"]["calls"], json!([]));
+            assert_eq!(
+                result["data"]["documents"][0]["semanticStatus"]["state"],
+                "catchingUp"
+            );
+            assert_eq!(
+                result["data"]["documents"][0]["semanticStatus"]["producerId"],
+                "explicit-producer"
+            );
+        }
+    }
+
+    #[test]
     fn outgoing_empty_complete_vs_incomplete_coverage_and_unresolved_boundary() {
         let root = std::path::Path::new("/workspace");
         let incomplete = outgoing_fixture(
@@ -2375,7 +2586,7 @@ mod outgoing_tests {
         )
         .unwrap();
         assert_eq!(incomplete["data"]["calls"], json!([]));
-        assert_eq!(incomplete["data"]["documents"], json!([]));
+        assert_eq!(incomplete["data"]["documents"].as_array().unwrap().len(), 1);
         assert_eq!(incomplete["data"]["coverage"].as_array().unwrap().len(), 1);
         assert_eq!(
             incomplete["data"]["provenance"].as_array().unwrap().len(),
@@ -2549,6 +2760,7 @@ mod outgoing_tests {
             candidate.provenance[0].revision_id = "revision:v2:excluded".into();
             candidate.provenance[0].id = "native-proof:v1:excluded".into();
             calls[49].candidates.push(McpOutgoingCandidate {
+                semantic_status: unavailable_status(),
                 declaration: candidate.declaration,
                 coverage: candidate.coverage.remove(0),
                 provenance: candidate.provenance.remove(0),
@@ -2651,7 +2863,7 @@ pub fn source(
         "data":{"path":result.path,"contentHash":result.content_hash,
             "startLine":result.start_line,"endLine":result.end_line,
             "byteRange":{"start":result.byte_start,"end":result.byte_end},
-            "text":result.text,
+            "text":result.text,"semanticStatus":result.semantic_status,
             "evidence":{"evidenceTier":"syntax","semanticBasis":null,
                 "freshness":"fresh","staleBecause":[]}},
         "warnings":[{"code":"syntaxOnly","message":"This answer is syntax-derived",
@@ -2697,6 +2909,7 @@ mod incoming_tests {
             })
             .collect();
         McpIncomingWithLines {
+            scope_semantic: Default::default(),
             selected,
             calls,
             same_name_declarations: 3,
@@ -2718,6 +2931,41 @@ mod incoming_tests {
         .unwrap()
     }
     #[test]
+    fn zero_hit_pending_scope_is_partial_in_full_and_compact_modes() {
+        for compact in [false, true] {
+            let mut selected = fixture(0, false, 0);
+            selected.scope_semantic[3].catching_up = 1;
+            let result = incoming(
+                &json!(1),
+                selected,
+                &crate::store::McpSemantic::syntax_only(crate::store::NO_PRODUCER_NOTE, 0),
+                &Default::default(),
+                compact,
+                std::path::Path::new("/workspace"),
+                false,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(result["partial"], true);
+            assert_eq!(result["truncated"], false);
+            assert_eq!(result["data"]["callers"], json!([]));
+            assert_eq!(
+                result["data"]["scopeCoverage"][3]["semantic"]["semanticAvailability"]["catchingUp"],
+                1
+            );
+            assert!(
+                result["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["code"] == "coverageIncomplete"
+                        && row["message"].as_str().unwrap().contains("catching up"))
+            );
+        }
+    }
+
+    #[test]
     fn incoming_empty_and_required_item_closed_shape() {
         for modern in [false, true] {
             let empty = project(fixture(0, false, 0), modern).unwrap();
@@ -2725,7 +2973,7 @@ mod incoming_tests {
             assert_eq!(data.as_object().unwrap().len(), 10);
             assert!(data.get("stableLookupKey").is_some_and(Value::is_null));
             assert_eq!(data["semanticBases"], json!([]));
-            assert_eq!(data["documents"], json!([]));
+            assert_eq!(data["documents"].as_array().unwrap().len(), 1);
             assert_eq!(data["coverage"].as_array().unwrap().len(), 1);
             assert_eq!(data["provenance"].as_array().unwrap().len(), 1);
             assert_eq!(
@@ -2847,6 +3095,7 @@ mod source_tests {
             "indexRevision":1}))
         .unwrap();
         let item = |text: String| McpSource {
+            semantic_status: unavailable_status(),
             path: "a.js".into(),
             content_hash: "a".repeat(64),
             start_line: 1,
@@ -2857,15 +3106,19 @@ mod source_tests {
             pin,
         };
         for modern in [true, false] {
+            let mut pending = item("hello\r\n".into());
+            pending.semantic_status.state = crate::model::SemanticAvailability::CatchingUp;
+            pending.semantic_status.reason = Some("Semantic rejoin pending".into());
             let envelope = source(
                 &json!(1),
-                item("hello\r\n".into()),
+                pending,
                 std::path::Path::new("/root"),
                 false,
                 modern,
             )
             .unwrap();
             assert_eq!(envelope["data"]["text"], "hello\r\n");
+            assert_eq!(envelope["data"]["semanticStatus"]["state"], "catchingUp");
             assert_eq!(envelope["data"]["byteRange"], json!({"start":0,"end":7}));
             assert_eq!(envelope["partial"], false);
             assert_eq!(envelope["truncated"], false);
@@ -2964,6 +3217,7 @@ mod call_graph_tests {
             })
             .collect::<Vec<_>>();
         let document = DocumentFacts {
+            semantic_status: unavailable_status(),
             key: key.clone(),
             declarations: BTreeMap::from([(sid(1), declaration)]),
             calls: BTreeMap::from([(sid(1), owned)]),
@@ -3236,6 +3490,7 @@ mod size_tests {
 
     fn version(path: &str, file: usize) -> McpDocumentVersion {
         McpDocumentVersion {
+            semantic_status: unavailable_status(),
             document: serde_json::from_value(document(path)).unwrap(),
             revision_id: REVISION.into(),
             content_hash: hex(file + 7, 64),
@@ -3328,6 +3583,7 @@ mod size_tests {
         }
         (
             McpIncomingWithLines {
+                scope_semantic: Default::default(),
                 selected,
                 calls,
                 same_name_declarations: 1,
@@ -3335,6 +3591,7 @@ mod size_tests {
                 has_more: true,
             },
             crate::store::McpSemantic {
+                documents: Vec::new(),
                 producer_id: Some("rust-analyzer".into()),
                 note: None,
                 calls: semantic,
@@ -3412,34 +3669,55 @@ mod size_tests {
     }
 
     #[test]
-    fn the_basis_table_cuts_a_full_caller_page_by_over_30_percent() {
-        // Before #528 each caller and proof repeated the whole basis: re-inline it to
-        // compare against the same emitted prefix (the old shape would not even fit it).
+    fn the_basis_table_preserves_closure_and_accounts_for_saved_bytes() {
         let page = project(20, false);
+        let bases = page["data"]["semanticBases"].as_array().unwrap();
+        assert_eq!(bases.len(), 1);
+        let origin_basis = |index: usize| {
+            let mut restored = bases[index].clone();
+            assert_eq!(restored["ref"], index);
+            restored.as_object_mut().unwrap().remove("ref");
+            assert_eq!(restored, basis());
+            restored
+        };
         let mut inlined = page.clone();
-        let basis = basis();
+        let mut repeated_bytes = 0isize;
+        let row_bytes = |row: &Value| serde_json::to_vec(row).unwrap().len();
         for caller in inlined["data"]["callers"].as_array_mut().unwrap() {
+            let before = row_bytes(caller);
+            let reference = caller["semanticBasisRef"].as_u64().unwrap() as usize;
+            let origin_basis = origin_basis(reference);
             let fields = caller.as_object_mut().unwrap();
             fields.remove("semanticBasisRef");
-            fields.insert("semanticBasis".into(), basis.clone());
+            fields.insert("semanticBasis".into(), origin_basis.clone());
+            repeated_bytes += row_bytes(caller) as isize - before as isize;
         }
         for proof in inlined["data"]["provenance"].as_array_mut().unwrap() {
+            let before = row_bytes(proof);
             let fields = proof.as_object_mut().unwrap();
-            let semantic = fields.remove("basisRef").unwrap() != Value::Null;
-            fields.insert(
-                "basis".into(),
-                if semantic { basis.clone() } else { Value::Null },
-            );
+            let reference = fields.remove("basisRef").unwrap();
+            let basis = reference
+                .as_u64()
+                .map_or(Value::Null, |index| origin_basis(index as usize));
+            fields.insert("basis".into(), basis);
+            repeated_bytes += row_bytes(proof) as isize - before as isize;
         }
         inlined["data"]
             .as_object_mut()
             .unwrap()
             .remove("semanticBases");
+        let table_bytes =
+            row_bytes(&page["data"]["semanticBases"]) + "\"semanticBases\":".len() + 1;
         let (now, before) = (frame_bytes(&page), frame_bytes(&inlined));
-        assert!(before > 50 * 1024, "the old shape is {before} bytes");
+        assert!(now < super::super::wire::RESPONSE_BYTES);
         assert!(
-            now * 10 < before * 7,
-            "{now} bytes is not much below {before}"
+            repeated_bytes > table_bytes as isize,
+            "interning must save bytes"
+        );
+        assert_eq!(
+            before as isize - now as isize,
+            repeated_bytes - table_bytes as isize,
+            "all savings must come from the shared basis table, not dropped evidence"
         );
     }
 

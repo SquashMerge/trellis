@@ -106,6 +106,14 @@ says why, `semanticState` is `unavailable` and the counts stay syntax-only.
 `GET /api/methods` and `trellis symbols` mark each symbol's `provenance.semantic` with its
 document language's producer state.
 
+### Draft amendment #620: per-document semantic catch-up
+
+**DRAFT FOR OWNER CONFIRMATION IN THE PR.** [Owner ruling 2026-11-02](https://github.com/SquashMerge/trellis/issues/620#issuecomment-6586506796) authorizes implementation without another approval gate. The [topology amendment](local-topology.md#draft-amendment-620--native-first-semantic-publication) governs this daemon's native-first mode, overriding the older language-wide-only presentation above. Native capture publishes a readable validated head first; complete validated semantic rejoin publishes separately with a new paired index pin and the same native revision identity. A pin's selections and pending state never change in place.
+
+Document projections expose `semanticStatus:{state:"fresh"|"catchingUp"|"unavailable",producerId:Text|null,semanticOrigin:{pin:{indexGeneration,indexRevision},revisionId:Text}|null,reason:Text|null}`; all fields are present. Index and per-language status add `semanticAvailability:{fresh:UInt,catchingUp:UInt,unavailable:UInt}` document counts. Existing language/global proof freshness is not the document availability state. Usable unchanged documents retain direct origin-qualified facts after source-version/context and current-target eligibility checks; proof IDs, revision, basis and actual freshness remain authentic. Changed documents, including restores, are catching up until separately validated semantic publication. Invalidated target-dependent facts are withheld while safe independent evidence remains.
+
+Availability `fresh` does not relabel `possiblyStale` evidence or grant expansion permission. Web, MCP and CLI show document state from their admitted immutable snapshot, not only global advisory `catchingUp`. Sequence/call graph results carry `semanticDocuments:[{document,semanticStatus}]`. References and rules propagate pending scope as partial/unknown, including zero-hit results; no pending document proves absence or a passing negative rule. Existing pinned browser views do not jump to a later publication. Native indexing request completion means readable native commit; semantic imports retain their own durable outcomes. Failures remain typed and never roll back a previously committed native head.
+
 **Coverage reasons (#520).** A language with a selected producer also has `coverage`: that
 producer's tuples at the head revision as `{complete, partial, failed, unselected,
 partialReasons, summary}`. `partialReasons` counts the partial documents with each reason,

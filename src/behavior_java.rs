@@ -564,7 +564,7 @@ pub(crate) fn build(
             None => break,
         }
     }
-    let mut b = Builder { file, seed, calls, count: 0, visits: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
+    let mut b = Builder { file, seed, calls, count: 0, visits: 0, view: SequenceView { semantic_documents: vec![], partial: false, semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
         revision, seed: seed.clone(), participants: vec![Participant { declaration: None, column: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Java types, overloads, virtual dispatch, annotations/Lombok, reflection, generated methods and implicit initialization are not resolved. Calls/operations may throw; implicit exception paths are not expanded.".into()], hidden_steps: 0, truncated: false, truncated_by: vec![],
     }};

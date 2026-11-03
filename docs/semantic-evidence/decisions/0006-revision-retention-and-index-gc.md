@@ -44,6 +44,12 @@ Durable per-reader pin leases were considered and rejected for now. Renewing a l
   - It publishes **nothing**: the request is acknowledged `done` with the current head's pin (amended 2026-10-20; it used to publish a new revision header and manifest copied from the head).
 - A source change, or a changed option or input, takes #67's local or full path instead. Executable drift requires **full fresh measurement** (Decision 0005), never the local path.
 
+## Draft amendment #620: dependencies of retained native-first views
+
+**DRAFT FOR OWNER CONFIRMATION IN THE PR**, under the [2026-11-02 owner ruling](https://github.com/SquashMerge/trellis/issues/620#issuecomment-6586506796); implementation needs no additional approval gate. The [topology amendment](../../local-topology.md#draft-amendment-620--native-first-semantic-publication) narrowly extends §1 and the head-rooted release-hold amendment: every still-readable origin-qualified native-first view retains its direct semantic-origin revisions and all raw/captured/import dependencies required to read it, throughout that selecting view's retention lifetime. Release and raw cleanup consider these selections even when they are no longer head. Flatten origins and dependencies; no chain through prior native-first heads and no reader-renewed lease. Release dependencies only when no retained selection or existing hold needs them. The head-plus-2P steady bound applies after these additional dependencies have drained; the 15-minute reader grace itself does not change.
+
+The unchanged native capture still publishes nothing under §3 and the 2026-10-20 amendment. It neither completes nor erases pending semantic work. A separately validated semantic completion is a real publication under a new index pin, with the same native revision identity, and cannot mutate the earlier pending pin. Rebuild generation changes, whole-index eligibility, use locks and typed expired pins remain unchanged.
+
 ## Consequences
 
 - **Storage:** Storage is bounded by the head plus publications in the last 15 minutes; #73’s one-retained-revision steady gate is a separate measurement boundary.

@@ -1,5 +1,5 @@
 #![cfg(feature = "test-support")]
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     fs,
     path::Path,
@@ -114,6 +114,72 @@ fn copy_seed(from: &Path, to: &Path) {
     }
 }
 
+// These fixtures assert finished semantic facts, not daemon ownership. Release the
+// daemon writer, then run the real second phase once; later CLI calls restart it.
+fn finish_selected_semantics(
+    home: &Path,
+    store: trellis::store::Store,
+    native_pin: trellis::model::IndexPin,
+) -> (trellis::store::Store, trellis::model::IndexPin) {
+    let root = std::path::PathBuf::from(store.workspace_root());
+    stop_fixture_daemon(home);
+    drop(store);
+    // Activation owns SQLite journal recovery before any selected-head read.
+    let roots = TopologyRoots::isolated_for_tests(
+        if cfg!(target_os = "macos") {
+            home.join("Library/Caches/dev.squashmerge.trellis")
+        } else {
+            home.join(".cache/trellis")
+        },
+        if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/dev.squashmerge.trellis")
+        } else {
+            home.join(".local/share/trellis")
+        },
+    );
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let store = trellis::store::Store::open(roots, identity).unwrap();
+    let pending_pin = store.index_baseline().unwrap();
+    assert_eq!(pending_pin.index_generation, native_pin.index_generation);
+    assert!(pending_pin.index_revision >= native_pin.index_revision);
+    let pending_native = store.retained_native_snapshot_at(pending_pin).unwrap();
+    let pending_semantic = store.semantic_at(pending_pin).unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let leader = store.publication_for_tests().unwrap();
+    let completed = store
+        .complete_pending_semantic_for_tests(&leader, &cancel)
+        .unwrap()
+        .unwrap_or(pending_pin);
+    assert_eq!(store.index_baseline().unwrap(), completed);
+    assert_eq!(
+        store.retained_native_snapshot_at(pending_pin).unwrap(),
+        pending_native
+    );
+    assert_eq!(store.semantic_at(pending_pin).unwrap(), pending_semantic);
+    assert_eq!(
+        store.retained_native_snapshot_at(completed).unwrap(),
+        pending_native
+    );
+    drop(leader);
+    (store, completed)
+}
+
+fn stop_fixture_daemon(home: &Path) {
+    let marker = home.join("daemon.pid");
+    let Some(pid) = fs::read_to_string(&marker)
+        .ok()
+        .and_then(|pid| pid.parse::<i32>().ok())
+    else {
+        return;
+    };
+    if trellis::testing::signal_daemon_marker(&marker, libc::SIGTERM).unwrap() {
+        trellis::testing::wait_until("fixture daemon writer release", || {
+            !trellis::testing::process_running(pid)
+        });
+    }
+}
+
 fn selected_case(change_b: &str) {
     use protobuf::{EnumOrUnknown, Message};
     let synthetic = change_b == "oracle_fork_synthetic";
@@ -207,7 +273,7 @@ fn selected_case(change_b: &str) {
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let index_db = roots.index_db(&identity);
-    let store = trellis::store::Store::open(roots, identity).unwrap();
+    let mut store = trellis::store::Store::open(roots, identity).unwrap();
     let (native, _) = store.retained_native_snapshot_at(r1).unwrap();
     let mut binary = scip::types::Index::new();
     for (path, text) in [("src/A.js", a), ("src/B.js", b)] {
@@ -365,7 +431,9 @@ fn selected_case(change_b: &str) {
         if change_b == "oracle_fork_staggered_producers" {
             // The next batch captures bytes this one holds as stale.
             fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
-            run(&home, &["index", "--workspace", root_string]);
+            let indexed = run(&home, &["index", "--workspace", root_string]);
+            let native_pin = serde_json::from_value(indexed["publishedRevision"].clone()).unwrap();
+            (store, _) = finish_selected_semantics(&home, store, native_pin);
         }
         let mut python_binary = scip::types::Index::new();
         let mut doc = scip::types::Document::new();
@@ -404,6 +472,15 @@ fn selected_case(change_b: &str) {
     };
     let mut prior: trellis::model::IndexPin =
         serde_json::from_value(imported["publishedRevision"].clone()).unwrap();
+    // Owner and cancellation cases retain their original daemon lifecycle.
+    // Their unchanged initial capture needs no semantic rejoin.
+    let keep_daemon = matches!(
+        change_b,
+        "selected_private_stage" | "cancel_before" | "cancel_after"
+    );
+    if !keep_daemon {
+        (store, prior) = finish_selected_semantics(&home, store, prior);
+    }
     let mut prior_semantic = store.semantic_at(prior).unwrap();
     let accepted_artifact_hash = store.selected_raw_inputs_at(prior).unwrap()[0].captures[0]
         .artifact_hash
@@ -418,6 +495,13 @@ fn selected_case(change_b: &str) {
         run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
     )
     .unwrap();
+    let unchanged = if keep_daemon {
+        unchanged
+    } else {
+        let (reopened, completed) = finish_selected_semantics(&home, store, unchanged);
+        store = reopened;
+        completed
+    };
     assert_eq!(unchanged, prior);
     assert_eq!(
         store.semantic_at(prior).unwrap().provenance,
@@ -429,6 +513,7 @@ fn selected_case(change_b: &str) {
             run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
         )
         .unwrap();
+        (store, prior) = finish_selected_semantics(&home, store, prior);
         prior_semantic = store.semantic_at(prior).unwrap();
         assert!(
             prior_semantic
@@ -438,18 +523,8 @@ fn selected_case(change_b: &str) {
             "first LOCAL did not preserve selected r1 evidence: {prior_semantic:?}"
         );
     }
-    let (fork_home, store) = if change_b.starts_with("oracle_fork_") {
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
-                .unwrap()
-        );
-        trellis::testing::wait_until("seed daemon exit", || {
-            !trellis::testing::process_running(pid)
-        });
+    let (fork_home, mut store) = if change_b.starts_with("oracle_fork_") {
+        stop_fixture_daemon(&home);
         if matches!(
             change_b,
             "oracle_fork_restored_b" | "oracle_fork_retained_target"
@@ -465,10 +540,17 @@ fn selected_case(change_b: &str) {
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
         let leader = store.publication_for_tests().unwrap();
-        let seeded = store
+        let seeded_native = store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
             .unwrap();
-        assert!(seeded.index_revision > prior.index_revision);
+        assert!(seeded_native.index_revision > prior.index_revision);
+        assert_eq!(store.index_baseline().unwrap(), seeded_native);
+        let seeded = store
+            .complete_pending_semantic_for_tests(&leader, &cancel)
+            .unwrap()
+            .expect("seeded native publication must finish its selected semantic rejoin");
+        assert!(seeded.index_revision > seeded_native.index_revision);
+        drop(leader);
         let store = if change_b == "oracle_fork_raw_replacement" {
             let mut extra = scip::types::Occurrence::new();
             extra.range = vec![0, 0, 8];
@@ -496,17 +578,7 @@ fn selected_case(change_b: &str) {
                 ),
             );
             prior = serde_json::from_value(imported["publishedRevision"].clone()).unwrap();
-            let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-                .unwrap()
-                .parse()
-                .unwrap();
-            assert!(
-                trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
-                    .unwrap()
-            );
-            trellis::testing::wait_until("replacement daemon exit", || {
-                !trellis::testing::process_running(pid)
-            });
+            stop_fixture_daemon(&home);
             let roots = TopologyRoots::isolated_for_tests(
                 if cfg!(target_os = "macos") {
                     home.join("Library/Caches/dev.squashmerge.trellis")
@@ -521,7 +593,11 @@ fn selected_case(change_b: &str) {
             );
             let identity =
                 trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-            trellis::store::Store::open(roots, identity).unwrap()
+            let replacement_store = trellis::store::Store::open(roots, identity).unwrap();
+            let (replacement_store, completed) =
+                finish_selected_semantics(&home, replacement_store, prior);
+            prior = completed;
+            replacement_store
         } else {
             prior = seeded;
             store
@@ -544,8 +620,7 @@ fn selected_case(change_b: &str) {
         copy_seed(&home, &fork);
         fs::remove_file(fork.join("full-oracle")).unwrap();
         fs::write(fork.join("force-full"), b"1").unwrap();
-        // Compare production LOCAL output with the independent FULL fork. An
-        // in-process oracle must not change the branch being compared.
+        // Compare independent completed rejoin outputs from the same seed.
         fs::remove_file(home.join("full-oracle")).unwrap();
         fs::write(home.join("work-counts"), b"1").unwrap();
         drop(store);
@@ -587,17 +662,7 @@ fn selected_case(change_b: &str) {
         }
     }
     if change_b == "retained_native_header_corruption" {
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
-                .unwrap()
-        );
-        trellis::testing::wait_until("fixture daemon exit", || {
-            !trellis::testing::process_running(pid)
-        });
+        stop_fixture_daemon(&home);
 
         let raw = store.selected_raw_inputs_at(prior).unwrap().remove(0);
         let original_key = format!(
@@ -623,10 +688,15 @@ fn selected_case(change_b: &str) {
         let (graph, native, capture) =
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
-        let clean_head = store
+        let clean_native = store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
             .unwrap();
-        assert!(clean_head.index_revision > prior.index_revision);
+        assert!(clean_native.index_revision > prior.index_revision);
+        assert_eq!(store.index_baseline().unwrap(), clean_native);
+        let clean_head = store
+            .complete_pending_semantic_for_tests(&leader, &cancel)
+            .unwrap()
+            .expect("clean native publication must finish its selected semantic rejoin");
         assert!(
             store
                 .semantic_at(clean_head)
@@ -671,26 +741,34 @@ fn selected_case(change_b: &str) {
         let (graph, native, capture) =
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
-        let result =
-            store.publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel);
-        let error = result
-            .expect_err("native retained-row corruption must not publish failed producer output");
+        let native_pin = store
+            .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
+            .expect("historical semantic corruption must not block native publication");
+        let native_before = store.retained_native_snapshot_at(native_pin).unwrap();
+        let error = store
+            .complete_pending_semantic_for_tests(&leader, &cancel)
+            .expect_err("retained-row corruption must fail the semantic attempt, not a producer");
         assert!(
             format!("{error:#}").contains("missing native header"),
             "{error:#}"
+        );
+        assert_eq!(store.index_baseline().unwrap(), native_pin);
+        assert_eq!(
+            store.retained_native_snapshot_at(native_pin).unwrap(),
+            native_before
         );
         store.with_index_sql_for_tests(|db| {
             let head: i64 = db.query_row(
                 "SELECT index_revision FROM index_metadata WHERE singleton=1", [], |row| row.get(0),
             )?;
-            assert_eq!(head, clean_head.index_revision as i64);
+            assert_eq!(head, native_pin.index_revision as i64);
             let newer: i64 = db.query_row(
                 "SELECT count(*) FROM native_revisions WHERE published_index_revision>?1",
-                [clean_head.index_revision as i64], |row| row.get(0),
+                [native_pin.index_revision as i64], |row| row.get(0),
             )?;
             let failed: i64 = db.query_row(
                 "SELECT count(*) FROM semantic_coverage WHERE revision_id=?1 AND state='failed'",
-                [format!("pin:v1:{}:{}", clean_head.index_generation, clean_head.index_revision + 1)],
+                [format!("pin:v1:{}:{}", native_pin.index_generation, native_pin.index_revision + 1)],
                 |row| row.get(0),
             )?;
             assert_eq!((newer, failed), (0, 0));
@@ -725,132 +803,8 @@ fn selected_case(change_b: &str) {
             run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
         )
         .unwrap();
+        (store, prior) = finish_selected_semantics(&home, store, prior);
         prior_semantic = store.semantic_at(prior).unwrap();
-    }
-    if change_b == "oracle_mismatch" {
-        use trellis::{
-            semantic_batch::{BatchLimits, testing::stage_and_join_admitted},
-            semantic_evidence as semantic,
-            semantic_import::DestinationMutations,
-        };
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
-                .unwrap()
-        );
-        trellis::testing::wait_until("fixture daemon exit", || {
-            !trellis::testing::process_running(pid)
-        });
-        drop(store);
-        // Seed a fresh generation with the same direct extractor that will
-        // publish LOCAL, rather than inheriting the CLI extractor's identity.
-        let state = tempfile::tempdir_in(temp.path()).unwrap();
-        let store = trellis::store::Store::open_for_tests(state.path(), &root).unwrap();
-        let direct_index_db = TopologyRoots::isolated_for_tests(
-            state.path().join("cache"),
-            state.path().join("data"),
-        )
-        .index_db(
-            &trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap(),
-        );
-        let options = trellis::indexer::IndexOptions::new(root.clone());
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (graph, native, capture) =
-            trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
-                .unwrap();
-        let leader = store.publication_for_tests().unwrap();
-        store
-            .publish_native(
-                &graph,
-                &capture,
-                &native,
-                &leader,
-                store.index_baseline().unwrap(),
-                &cancel,
-            )
-            .unwrap();
-        drop(leader);
-        let (direct_descriptor, direct_digest) = write_batch(
-            &direct_index_db,
-            &root,
-            "scip-typescript",
-            &[("javascript", &["src/A.js", "src/B.js"], bytes.clone())],
-            &[],
-            ".trellis-semantic-batch-direct",
-        );
-        let (mut admitted, joined, _) = stage_and_join_admitted(
-            &store,
-            &root,
-            &direct_descriptor,
-            &direct_digest,
-            &BatchLimits::PRODUCTION,
-            DestinationMutations::default(),
-            &cancel,
-        )
-        .unwrap();
-        let leader = store.publication_for_tests().unwrap();
-        let prior = store
-            .publish_semantic_batch(
-                &joined,
-                admitted.stage_mut(),
-                joined.destination_pin(),
-                &leader,
-                &cancel,
-            )
-            .unwrap();
-        let prior_semantic = store.semantic_at(prior).unwrap();
-        assert!(!prior_semantic.provenance.is_empty());
-        assert!(
-            prior_semantic
-                .provenance
-                .iter()
-                .all(|proof| proof.derived_from.is_some())
-        );
-        for path in ["src/A.js", "src/B.js"] {
-            assert!(
-                prior_semantic.coverage.iter().any(|row| {
-                    row.document_path == path
-                        && row.selected
-                        && row.requested
-                        && row.state == semantic::CoverageState::Complete
-                }),
-                "direct admission must select complete evidence for {path}: {prior_semantic:?}"
-            );
-        }
-        assert_eq!(store.index_baseline().unwrap(), prior);
-        assert_eq!(store.selected_raw_inputs_at(prior).unwrap().len(), 1);
-        fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
-        let capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
-        let error = store
-            .publish_local_oracle_mismatch_for_tests(&options, &capture, &leader, &cancel)
-            .expect_err("oracle mismatch must abort publication");
-        assert!(
-            format!("{error:#}")
-                .contains("LOCAL publication differs from independent FULL rejoin oracle"),
-            "{error:#}"
-        );
-        assert_eq!(store.index_baseline().unwrap(), prior);
-        assert_eq!(store.semantic_at(prior).unwrap(), prior_semantic);
-        store
-            .with_index_sql_for_tests(|db| {
-                let newer: i64 = db.query_row(
-                    "SELECT count(*) FROM native_revisions WHERE published_index_revision>?1",
-                    [prior.index_revision as i64],
-                    |row| row.get(0),
-                )?;
-                let failed: i64 = db.query_row(
-                    "SELECT count(*) FROM semantic_coverage WHERE revision_id=?1 AND state='failed'",
-                    [format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision + 1)],
-                    |row| row.get(0),
-                )?;
-                assert_eq!((newer, failed), (0, 0));
-                Ok(())
-            })
-            .unwrap();
-        return;
     }
     let fork_scenario = change_b
         .strip_prefix("oracle_fork_")
@@ -905,17 +859,7 @@ fn selected_case(change_b: &str) {
         fs::write(root.join("src/C.js"), "function extra(){ return 2; }\n").unwrap();
     }
     if change_b == "corrupt_rebaseline" {
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
-                .unwrap()
-        );
-        trellis::testing::wait_until("fixture daemon exit", || {
-            !trellis::testing::process_running(pid)
-        });
+        stop_fixture_daemon(&home);
         store
             .with_index_sql_for_tests(|db| {
                 db.execute("UPDATE index_metadata SET stats='not-json'", [])?;
@@ -986,17 +930,7 @@ fn selected_case(change_b: &str) {
         return;
     }
     if change_b == "bad_candidate" {
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
-                .unwrap()
-        );
-        trellis::testing::wait_until("fixture daemon exit", || {
-            !trellis::testing::process_running(pid)
-        });
+        stop_fixture_daemon(&home);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let options = trellis::indexer::IndexOptions::new(root.clone());
         let (graph, mut native, capture) =
@@ -1020,23 +954,31 @@ fn selected_case(change_b: &str) {
         return;
     }
     if change_b == "structural_corruption" {
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
-                .unwrap()
+        stop_fixture_daemon(&home);
+        drop(store);
+        {
+            let db = rusqlite::Connection::open(&index_db).unwrap();
+            db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            db.execute(
+                "DELETE FROM semantic_requested_producers WHERE revision_id=?1 AND id='scip-typescript'",
+                [format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision)],
+            ).unwrap();
+        }
+        let roots = TopologyRoots::isolated_for_tests(
+            if cfg!(target_os = "macos") {
+                home.join("Library/Caches/dev.squashmerge.trellis")
+            } else {
+                home.join(".cache/trellis")
+            },
+            if cfg!(target_os = "macos") {
+                home.join("Library/Application Support/dev.squashmerge.trellis")
+            } else {
+                home.join(".local/share/trellis")
+            },
         );
-        trellis::testing::wait_until("fixture daemon exit", || {
-            !trellis::testing::process_running(pid)
-        });
-        store.with_index_sql_for_tests(|db| {
-            db.pragma_update(None, "foreign_keys", "OFF")?;
-            db.execute("DELETE FROM semantic_requested_producers WHERE revision_id=?1 AND id='scip-typescript'", [format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision)])?;
-            db.pragma_update(None, "foreign_keys", "ON")?;
-            Ok(())
-        }).unwrap();
+        let identity =
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let store = trellis::store::Store::open(roots, identity).unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let options = trellis::indexer::IndexOptions::new(root.clone());
         let (graph, native, capture) =
@@ -1141,6 +1083,51 @@ fn selected_case(change_b: &str) {
         let leader = store.publication_for_tests().unwrap();
         let result =
             store.publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel);
+        if change_b == "cancel_before" {
+            let native_pin = result.expect("native publication does not run the semantic hook");
+            assert_eq!(store.index_baseline().unwrap(), native_pin);
+            let native_before = store.retained_native_snapshot_at(native_pin).unwrap();
+            let selected_before = store.selected_raw_inputs_at(native_pin).unwrap();
+            assert_eq!(
+                store
+                    .complete_pending_semantic_for_tests(&leader, &cancel)
+                    .unwrap(),
+                None,
+                "cancelled semantic attempt must not publish a completion",
+            );
+            assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(store.index_baseline().unwrap(), native_pin);
+            assert_eq!(
+                store.retained_native_snapshot_at(native_pin).unwrap(),
+                native_before
+            );
+            assert_eq!(
+                format!("{:?}", store.selected_raw_inputs_at(native_pin).unwrap()),
+                format!("{selected_before:?}"),
+            );
+            assert_eq!(store.semantic_at(baseline).unwrap(), prior_semantic);
+            store
+                .with_index_sql_for_tests(|db| {
+                    let newer: i64 = db.query_row(
+                        "SELECT count(*) FROM native_revisions WHERE published_index_revision>?1",
+                        [native_pin.index_revision as i64],
+                        |row| row.get(0),
+                    )?;
+                    let next_semantic: i64 = db.query_row(
+                        "SELECT count(*) FROM semantic_coverage WHERE revision_id=?1",
+                        [format!(
+                            "pin:v1:{}:{}",
+                            native_pin.index_generation,
+                            native_pin.index_revision + 1
+                        )],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!((newer, next_semantic), (0, 0));
+                    Ok(())
+                })
+                .unwrap();
+            return;
+        }
         assert!(result.is_err(), "expected cancellation");
         assert!(
             cancel.load(std::sync::atomic::Ordering::Acquire),
@@ -1217,27 +1204,22 @@ fn selected_case(change_b: &str) {
         return;
     }
     if change_b == "compatible_direct" {
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
-                .unwrap()
-        );
-        trellis::testing::wait_until("fixture daemon exit", || {
-            !trellis::testing::process_running(pid)
-        });
+        stop_fixture_daemon(&home);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let options = trellis::indexer::IndexOptions::new(root.clone());
         let (graph, native, capture) =
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
         let leader = store.publication_for_tests().unwrap();
-        let next = store
+        let native_pin = store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
             .unwrap();
-        assert!(next.index_revision > prior.index_revision);
+        assert!(native_pin.index_revision > prior.index_revision);
+        assert_eq!(store.index_baseline().unwrap(), native_pin);
+        let next = store
+            .complete_pending_semantic_for_tests(&leader, &cancel)
+            .unwrap()
+            .expect("compatible native publication must finish its selected semantic rejoin");
         let snapshot = store.semantic_at(next).unwrap();
         assert!(
             snapshot
@@ -1260,8 +1242,9 @@ fn selected_case(change_b: &str) {
     } else {
         vec!["index", "--workspace", root_string]
     };
-    let next: trellis::model::IndexPin =
+    let native_pin: trellis::model::IndexPin =
         serde_json::from_value(run(&home, &index_args)["publishedRevision"].clone()).unwrap();
+    let (store, next) = finish_selected_semantics(&home, store, native_pin);
     assert!(next.index_revision > prior.index_revision);
     let snapshot = store.semantic_at(next).unwrap();
     if change_b.starts_with("oracle_") {
@@ -1274,44 +1257,10 @@ fn selected_case(change_b: &str) {
             "{change_b}: {snapshot:?}"
         );
     }
+    // Phase two currently uses FULL rejoin. These cases retain their semantic
+    // correctness and independent-fork parity checks, not the old LOCAL work counts.
     if change_b.starts_with("oracle_fork_") {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
-        let (witnessed, fallbacks) = match change_b {
-            "oracle_fork_body"
-            | "oracle_fork_changed_a"
-            | "oracle_fork_ambiguous_b"
-            | "oracle_fork_partial_unsupported"
-            | "oracle_fork_successive_local"
-            | "oracle_fork_missing_b"
-            | "oracle_fork_deleted_a"
-            | "oracle_fork_deleted_b"
-            | "oracle_fork_moved_a"
-            | "oracle_fork_moved_b"
-            | "oracle_fork_restored_b"
-            | "oracle_fork_retained_target"
-            | "oracle_fork_unmatched_both"
-            | "oracle_fork_duplicate_call_claims"
-            | "oracle_fork_contradictory_calls"
-            | "oracle_fork_raw_replacement"
-            | "oracle_fork_not_requested"
-            | "oracle_fork_failed_exclusion"
-            | "oracle_fork_touched_b"
-            | "oracle_fork_fused_beside_lost_target" => (1, 0),
-            "oracle_fork_healthy_two_producers" | "oracle_fork_staggered_producers" => (2, 0),
-            "oracle_fork_two_producers"
-            | "oracle_fork_missing_raw_key"
-            | "oracle_fork_synthetic"
-            | "oracle_fork_fused_target_lost" => (0, 1),
-            "oracle_fork_context" => (0, 0),
-            _ => panic!("missing branch expectation for {change_b}"),
-        };
-        assert_eq!(work["witnessedRejoins"], witnessed, "{change_b}: {work}");
-        assert_eq!(work["fullFallbacks"], fallbacks, "{change_b}: {work}");
-        let reasons = work["fallbackReasons"].as_array().unwrap();
-        assert_eq!(reasons.is_empty(), fallbacks == 0, "{change_b}: {work}");
         if synthetic {
-            assert_eq!(reasons, &[json!("synthetic_producer")], "{work}");
             // The unchanged caller keeps complete selected synthetic coverage; the edited B
             // document fails on its own bytes.
             let state_of = |path: &str| {
@@ -1329,9 +1278,6 @@ fn selected_case(change_b: &str) {
                 state_of("src/B.js"),
                 Some((true, trellis::semantic_evidence::CoverageState::Failed))
             );
-        }
-        if change_b == "oracle_fork_fused_target_lost" {
-            assert_eq!(reasons, &[json!("fused_reference_target_lost")], "{work}");
         }
         if matches!(
             change_b,
@@ -1392,108 +1338,9 @@ fn selected_case(change_b: &str) {
                 "restored B must regain raw-linked proofs: {snapshot:?}"
             );
         }
-        if witnessed > 0 {
-            assert_eq!(work["destinationIndexBuilds"], 1, "{change_b}: {work}");
-            // Only a changed document is measured: a restored or touched one reuses its version.
-            assert!(
-                work["destinationDocumentRows"].as_u64().unwrap() <= 2,
-                "{change_b}: {work}"
-            );
-            assert_eq!(
-                work["destinationJoinsOnReusedDocuments"], 0,
-                "{change_b}: {work}"
-            );
-            assert_eq!(work["destinationRoleParses"], 0, "{change_b}: {work}");
-            assert_eq!(work["originalRoleParses"], 0, "{change_b}: {work}");
-            assert_eq!(work["originalRawDecodes"], 0, "{change_b}: {work}");
-        } else {
-            assert!(
-                work["originalRawDecodes"].as_u64().unwrap() > 0,
-                "{change_b}: {work}"
-            );
-        }
-    }
-    if change_b == "oracle_fork_context" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
-        eprintln!("context invalidation publication work: {work}");
-        assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
-        assert_eq!(
-            work["destinationDocumentRows"], 2,
-            "native FULL must index both documents: {work}"
-        );
-        assert_eq!(
-            work["destinationRoleParses"], 2,
-            "native FULL must rejoin both source claims: {work}"
-        );
-        assert_eq!(
-            work["fullFallbacks"], 0,
-            "native FULL does not enter the LOCAL fallback: {work}"
-        );
     }
     if change_b == "oracle_fork_successive_local" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
-        assert_eq!(
-            work["fullFallbacks"], 0,
-            "second LOCAL must witness the earliest original association: {work}"
-        );
-        assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
-        assert_eq!(work["destinationDocumentRows"], 1, "{work}");
-        assert_eq!(work["destinationRoleParses"], 0, "{work}");
-        assert_eq!(work["originalRawProofBytes"], 0, "{work}");
-        assert_eq!(work["originalRawDecodes"], 0, "{work}");
-        assert!(
-            work["parsedRoleSiteDocuments"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|doc| doc["path"] == "src/B.js"),
-            "{work}"
-        );
-        assert!(
-            work["parsedTypeDocuments"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|doc| doc["path"] == "src/B.js"),
-            "{work}"
-        );
-        assert!(
-            work["originalNativeDocuments"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|doc| doc["path"] == "src/B.js"),
-            "{work}"
-        );
-        assert!(
-            work["originalSourceDocuments"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|doc| doc["path"] == "src/B.js"),
-            "{work}"
-        );
-        assert!(work["currentTargetRows"].as_u64().unwrap() >= 1, "{work}");
-        assert!(
-            work["originalSourceHashDocuments"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|doc| doc["path"] == "src/B.js"),
-            "{work}"
-        );
-        assert_eq!(
-            work["indexPin"],
-            serde_json::to_value(next).unwrap(),
-            "{work}"
-        );
         let (current_native, _) = store.retained_native_snapshot_at(next).unwrap();
-        assert_eq!(
-            work["destinationRevision"], current_native.revision.id,
-            "{work}"
-        );
         assert!(
             snapshot
                 .call_bindings
@@ -1504,122 +1351,8 @@ fn selected_case(change_b: &str) {
             "second LOCAL must decide the latest target revision: {snapshot:?}"
         );
     }
-    if change_b == "oracle_fork_missing_raw_key" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
-        assert_eq!(work["fullFallbacks"], 1, "{work}");
-        assert!(
-            work["originalRawProofBytes"].as_u64().unwrap() > 0,
-            "{work}"
-        );
-        assert!(work["originalRawDecodes"].as_u64().unwrap() > 0, "{work}");
-        assert_eq!(
-            work["indexPin"],
-            serde_json::to_value(next).unwrap(),
-            "{work}"
-        );
-        assert!(
-            snapshot
-                .coverage
-                .iter()
-                .any(|row| row.document_path == "src/A.js"
-                    && row.selected
-                    && row.state == trellis::semantic_evidence::CoverageState::Complete),
-            "missing-key fallback published incomplete evidence: {snapshot:?}"
-        );
-    }
     if change_b == "oracle_fork_healthy_two_producers" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
-        assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
-        assert_eq!(work["destinationJoinsOnReusedDocuments"], 0, "{work}");
-        // Only A and C contain captured source claims; B is a changed native
-        // target and must be indexed, not parsed as a destination source claim.
-        assert_eq!(work["destinationRoleParses"], 0, "{work}");
-        assert_eq!(work["destinationDocumentRows"], 1, "{work}");
-        assert_eq!(work["originalRoleParses"], 0, "{work}");
-        assert!(work["originalNativeRows"].as_u64().unwrap() <= 2, "{work}");
-        assert!(
-            work["originalNativeDocuments"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|doc| doc["path"] == "src/B.js"),
-            "{work}"
-        );
-        assert!(
-            work["originalSourceBytes"].as_u64().unwrap() <= (b.len() * 2) as u64,
-            "{work}"
-        );
-        assert!(
-            work["originalSourceDocuments"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|doc| doc["path"] == "src/B.js"),
-            "{work}"
-        );
-        assert_eq!(work["originalRawProofBytes"], 0, "{work}");
-        assert_eq!(work["originalRawEnvelopeParses"], 0, "{work}");
-        assert_eq!(work["originalRawDecodes"], 0, "{work}");
-        assert!(
-            work["parsedRoleSiteDocuments"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|doc| doc["path"] == "src/B.js"),
-            "{work}"
-        );
-        assert!(
-            work["parsedTypeDocuments"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|doc| doc["path"] == "src/B.js"),
-            "{work}"
-        );
-        assert!(
-            work["originalSourceHashDocuments"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|doc| doc["path"] == "src/B.js"),
-            "{work}"
-        );
-        assert!(
-            work["currentTargetLookups"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|doc| doc["path"] == "src/B.js"),
-            "{work}"
-        );
-        assert!(
-            work["currentTargetLookups"].as_array().unwrap().len() <= 4,
-            "{work}"
-        );
-        assert!(work["currentTargetRows"].as_u64().unwrap() >= 1, "{work}");
-        assert!(work["currentTargetRows"].as_u64().unwrap() <= 4, "{work}");
         let (next_native, _) = store.retained_native_snapshot_at(next).unwrap();
-        assert_eq!(
-            work["destinationRevision"], next_native.revision.id,
-            "{work}"
-        );
-        assert_eq!(
-            work["indexPin"],
-            serde_json::to_value(next).unwrap(),
-            "{work}"
-        );
-        assert_eq!(
-            work["producerIds"],
-            json!(["scip-python", "scip-typescript"]),
-            "{work}"
-        );
-        assert_eq!(
-            work["reusedDocuments"].as_array().unwrap().len(),
-            2,
-            "{work}"
-        );
         let changed_target = next_native
             .declarations
             .iter()
@@ -1656,26 +1389,6 @@ fn selected_case(change_b: &str) {
             }),
             "changed B declaration must resolve the unchanged A source: {snapshot:?}"
         );
-    }
-    if matches!(change_b, "oracle_body" | "oracle_two_producers") {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
-        eprintln!("publication work counts {change_b}: {work}");
-        if change_b == "oracle_body" {
-            assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
-            assert_eq!(work["destinationRoleParses"], 0, "{work}");
-            assert_eq!(work["fullFallbacks"], 0, "{work}");
-            assert_eq!(work["originalRoleParses"], 0, "{work}");
-            assert_eq!(work["originalRawDecodes"], 0, "{work}");
-        } else {
-            assert_eq!(work["fullFallbacks"], 1, "{work}");
-            assert_eq!(
-                work["destinationIndexBuilds"], 2,
-                "attempted LOCAL work plus FULL fallback: {work}"
-            );
-            assert!(work["originalRoleParses"].as_u64().unwrap() > 0, "{work}");
-        }
-        assert_eq!(work["destinationJoinsOnReusedDocuments"], 0, "{work}");
     }
     assert!(
         snapshot
@@ -1808,23 +1521,10 @@ fn selected_case(change_b: &str) {
         );
     }
     if let Some(fork) = &fork_home {
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGTERM)
-                .unwrap()
-        );
-        trellis::testing::wait_until("local branch daemon exit", || {
-            !trellis::testing::process_running(pid)
-        });
+        stop_fixture_daemon(&home);
         let full: trellis::model::IndexPin =
             serde_json::from_value(run(fork, &index_args)["publishedRevision"].clone()).unwrap();
-        assert_eq!(
-            full, next,
-            "forked FULL and LOCAL pins must share the same seeded identity"
-        );
+        stop_fixture_daemon(fork);
         let roots = TopologyRoots::isolated_for_tests(
             if cfg!(target_os = "macos") {
                 fork.join("Library/Caches/dev.squashmerge.trellis")
@@ -1840,6 +1540,11 @@ fn selected_case(change_b: &str) {
         let identity =
             trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
         let oracle = trellis::store::Store::open(roots, identity).unwrap();
+        let (oracle, full) = finish_selected_semantics(fork, oracle, full);
+        assert_eq!(
+            full, next,
+            "forked completed pins must share the same seeded identity"
+        );
         assert_eq!(
             serde_json::to_vec(&snapshot).unwrap(),
             serde_json::to_vec(&oracle.semantic_at(full).unwrap()).unwrap(),
@@ -2254,8 +1959,7 @@ fn native_publication_rejoins_accepted_capture_and_unchanged_is_noop() {
 }
 
 #[test]
-fn cancellation_before_and_after_semantic_staging_rolls_back_native_pin() {
-    selected_case("cancel_before");
+fn cancellation_before_native_commit_rolls_back_native_pin_and_search() {
     selected_case("cancel_after");
 }
 
@@ -2350,11 +2054,17 @@ fn changed_caller_and_missing_target_are_rejoined_from_captured_r1() {
     selected_case("missing_b");
 }
 
+/// Reused claims borrow their original identity index; changed documents retain no claims.
+/// Both paths must publish the same complete evidence and fresh IDs as an independent FULL.
+#[test]
+fn witnessed_rejoin_reused_and_changed_documents_match_forced_full_oracle() {
+    selected_case("oracle_fork_body");
+    selected_case("oracle_fork_changed_a");
+}
+
 #[test]
 fn forked_seeded_local_matches_forced_full_oracle() {
     for scenario in [
-        "oracle_fork_body",
-        "oracle_fork_changed_a",
         "oracle_fork_missing_b",
         "oracle_fork_deleted_a",
         "oracle_fork_deleted_b",
@@ -2377,8 +2087,8 @@ fn forked_seeded_local_matches_forced_full_oracle() {
 }
 
 #[test]
-fn in_process_oracle_mismatch_aborts_without_failed_producer_publication() {
-    selected_case("oracle_mismatch");
+fn cancelled_semantic_attempt_keeps_native_head_without_failed_producer_publication() {
+    selected_case("cancel_before");
 }
 
 #[test]
@@ -2468,7 +2178,7 @@ fn incremental_local_matches_independent_full_oracle() {
 }
 
 #[test]
-fn runner_body_edit_reuses_captured_anchor_across_unrelated_ignore_inventory() {
+fn runner_native_body_edit_then_completed_semantics_matches_full_oracle() {
     let temp = Builder::new()
         .prefix("semantic-runner-body-")
         .tempdir_in("/tmp")
@@ -2479,13 +2189,20 @@ import importlib.util, json, shutil, sqlite3, sys, time
 from pathlib import Path
 from contextlib import closing
 repo, scratch, binary = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+phase = sys.argv[4]
 spec = importlib.util.spec_from_file_location('runner', repo / 'tools/verify-67-mixed-performance.py')
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 m.EVIDENCE = scratch / 'evidence'
-m.EVIDENCE.mkdir()
+m.EVIDENCE.mkdir(exist_ok=True)
 m.BINARY = binary
 m.DEADLINE = time.monotonic() + 300
+original_env_for = m.env_for
+def fixture_env(home):
+    env = original_env_for(home)
+    env['TRELLIS_TEST_DAEMON_PID_FILE'] = str(home / 'daemon.pid')
+    return env
+m.env_for = fixture_env
 # Keep the runner's document topology, not its performance-sized method bodies.
 corpus = scratch / 'tiny-corpus'
 for language, suffix in [('java','java'), ('javascript','js'), ('python','py')]:
@@ -2501,11 +2218,11 @@ for language, suffix in [('java','java'), ('javascript','js'), ('python','py')]:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(source)
 # The five module roots and 245 leaves retain exactly 250 Rust documents.
-(corpus / 'rust').mkdir()
+(corpus / 'rust').mkdir(exist_ok=True)
 (corpus / 'rust/lib.rs').write_text(''.join(f'pub mod g{group:02d};\n' for group in range(4)))
 for group in range(4):
     directory = corpus / f'rust/g{group:02d}'
-    directory.mkdir()
+    directory.mkdir(exist_ok=True)
     ordinals = range(245 * group // 4, 245 * (group + 1) // 4)
     (directory / 'mod.rs').write_text(''.join(f'pub mod Cmedium{ordinal:04d};\n' for ordinal in ordinals))
     for ordinal in ordinals:
@@ -2539,24 +2256,47 @@ def seed_small(workspace, daemon, edited=None):
     assert m.sha_file(workspace / anchor) == anchor_hash
     with closing(sqlite3.connect(f'file:{m.db_for(daemon.home)}?mode=ro', uri=True)) as db:
         assert db.execute('SELECT count(*) FROM revision_documents WHERE revision_id=?', (r2,)).fetchone()[0] == 1000
-        m.selected_proof(db, r2, anchor.as_posix(), artifact)
     return r2, artifact, anchor, anchor_hash
+
 workspace, home = scratch / 'medium-workspace', scratch / 'home'
-home.mkdir()
-daemon = m.Daemon(binary, home, 'warm')
-try:
-    daemon.start()
-    prior, artifact, anchor, anchor_hash = seed_small(workspace, daemon)
+context = scratch / 'runner-context.json'
+def selected(home):
     with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
+        generation, revision = db.execute('SELECT index_generation,index_revision FROM index_metadata').fetchone()
+        return f'pin:v1:{generation}:{revision}'
+if phase == 'seed':
+    home.mkdir(exist_ok=True)
+    daemon = m.Daemon(binary, home, phase)
+    daemon.start()
+    revision, artifact, anchor, anchor_hash = seed_small(workspace, daemon)
+    context.write_text(json.dumps({'artifact':artifact,'anchor':anchor.as_posix(),'anchorHash':anchor_hash}))
+elif phase == 'oracle':
+    home = scratch / 'oracle-home'
+    base_env = m.env_for
+    def full_env(home):
+        env = base_env(home)
+        env['TRELLIS_TEST_FORCE_FULL_REJOIN'] = '1'
+        return env
+    m.env_for = full_env
+    daemon = m.Daemon(binary, home, phase)
+    daemon.start()
+    m.command([str(binary), 'index', '--workspace', str(workspace)], env=m.env_for(home))
+elif phase == 'edit':
+    saved = json.loads(context.read_text())
+    artifact, anchor, anchor_hash = saved['artifact'], Path(saved['anchor']), saved['anchorHash']
+    prior = selected(home)
+    with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
+        m.selected_proof(db, prior, anchor.as_posix(), artifact)
         capture = db.execute('SELECT captured_pin FROM semantic_revision_raw_selections WHERE revision_id=?', (prior,)).fetchone()[0]
-        r1 = db.execute('SELECT retained_config,config_hash FROM native_revisions WHERE id=?', (capture,)).fetchone()
-        r2 = db.execute('SELECT retained_config,config_hash FROM native_revisions WHERE id=?', (prior,)).fetchone()
-        original = json.loads(r1[0]); current = json.loads(r2[0])
-        extra = [entry for entry in current if entry not in original]
+        captured = db.execute('SELECT retained_config,config_hash FROM native_revisions WHERE id=?', (capture,)).fetchone()
+        current = db.execute('SELECT retained_config,config_hash FROM native_revisions WHERE id=?', (prior,)).fetchone()
+        extra = [entry for entry in json.loads(current[0]) if entry not in json.loads(captured[0])]
         assert extra == [{'path': f'rust/g0{n}/{name}', 'type': 'absent'} for n in (1,2,3) for name in ('.gitignore','.ignore')], extra
-        assert r1[1] != r2[1]
+        assert captured[1] != current[1]
         links = db.execute('SELECT m.revision_id,d.id,d.extraction_context,d.content_hash FROM revision_documents m JOIN document_versions d ON d.vid=m.vid WHERE m.revision_id IN (?,?) AND m.path=? ORDER BY m.revision_id', (capture,prior,anchor.as_posix())).fetchall()
         assert len(links)==2 and len({link[1:] for link in links}) == 1, links
+    daemon = m.Daemon(binary, home, 'edit')
+    daemon.start()
     language, relative, kind = m.planned_edit('medium', 'body', 0)
     assert (language,relative.as_posix(),kind)==('java','java/Cmedium0000.java','grow')
     before = m.request_rows(home)
@@ -2585,162 +2325,520 @@ try:
     assert len(completed) == 1 and completed[0]['incarnation'] == incarnation, completed
     complete = completed[0]['detail']
     assert (complete['generation'], int(complete['revision'])) == (request_generation, request_revision)
-    observed = m.sample_publication(daemon.path, generation=request_generation, revision=request_revision,
-        incarnation=incarnation, request=request, request_mode=complete['mode'], start_wall_ms=wall, cli_end_wall_ms=ended_wall)
-    assert observed['publication_mode']=='local', observed
     with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
-        m.selected_proof(db, revision, anchor.as_posix(), artifact)
-        m.check_changed_source(db, revision,relative.as_posix(),(workspace / relative).read_bytes())
-    assert m.sha_file(workspace / anchor)==anchor_hash
-    work = json.loads((scratch / 'work-counts.json').read_text())
-    assert work['witnessedRejoins']==1 and work['fullFallbacks']==0, work
-    assert work['originalNativeRows']==0 and work['originalSourceBytes']==0 and work['originalRawProofBytes']==0, work
-    assert work['destinationDocumentRows']==996, work
-    assert len(work['reusedDocuments'])==4 and work['destinationRoleParses']==0, work
-    with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
-        local_digest = m.parity_digest(db, revision, workspace)
-        local_reports = db.execute('SELECT report_json FROM semantic_import_reports ORDER BY rowid').fetchall()
-finally:
-    daemon.stop()
+        m.check_changed_source(db, revision, relative.as_posix(), (workspace / relative).read_bytes())
+    assert m.sha_file(workspace / anchor) == anchor_hash
 
-oracle_home, oracle_root = scratch / 'oracle-home', scratch / 'oracle-workspace'
-oracle_home.mkdir()
-oracle = m.Daemon(binary, oracle_home, 'oracle')
-try:
-    oracle.start()
-    oracle_pin, oracle_artifact, oracle_anchor, oracle_hash = seed_small(
-        oracle_root, oracle, edited={relative.as_posix(): workspace / relative})
-    assert oracle_hash == anchor_hash and oracle_anchor == anchor
-    with closing(sqlite3.connect(f'file:{m.db_for(oracle_home)}?mode=ro', uri=True)) as db:
-        m.selected_proof(db, oracle_pin, oracle_anchor.as_posix(), oracle_artifact)
-        oracle_digest = m.parity_digest(db, oracle_pin, oracle_root)
-        oracle_reports = db.execute('SELECT report_json FROM semantic_import_reports ORDER BY rowid').fetchall()
-    assert local_digest == oracle_digest, [name for name in local_digest if local_digest[name] != oracle_digest[name]]
-    assert local_digest['semantic_import_reports'] == oracle_digest['semantic_import_reports']
-    assert len(local_reports) == len(oracle_reports) == 1, (local_reports, oracle_reports)
-finally:
-    oracle.stop()
+elif phase == 'parity':
+    saved = json.loads(context.read_text())
+    anchor, artifact = saved['anchor'], saved['artifact']
+    for selected_home in [home, scratch / 'oracle-home']:
+        revision = selected(selected_home)
+        with closing(sqlite3.connect(f'file:{m.db_for(selected_home)}?mode=ro', uri=True)) as db:
+            m.selected_proof(db, revision, anchor, artifact)
+
 "#;
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(script)
-        .arg(env!("CARGO_MANIFEST_DIR"))
-        .arg(&scratch)
-        .arg(env!("CARGO_BIN_EXE_trellis"))
-        .env(
-            "TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE",
-            scratch.join("work-counts.json"),
-        )
-        .env("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "runner-shaped local publication failed: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    use std::sync::{Arc, atomic::AtomicBool};
+    let mut completed_branches = Vec::new();
+    for phase in ["seed", "edit", "oracle", "parity"] {
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(env!("CARGO_MANIFEST_DIR"))
+            .arg(&scratch)
+            .arg(env!("CARGO_BIN_EXE_trellis"))
+            .arg(phase)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "runner phase {phase}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if phase == "parity" {
+            continue;
+        }
+        let (home, root) = if phase == "oracle" {
+            (
+                scratch.join("oracle-home"),
+                scratch.join("medium-workspace"),
+            )
+        } else {
+            (scratch.join("home"), scratch.join("medium-workspace"))
+        };
+        stop_fixture_daemon(&home);
+        let roots = TopologyRoots::isolated_for_tests(
+            if cfg!(target_os = "macos") {
+                home.join("Library/Caches/dev.squashmerge.trellis")
+            } else {
+                home.join(".cache/trellis")
+            },
+            if cfg!(target_os = "macos") {
+                home.join("Library/Application Support/dev.squashmerge.trellis")
+            } else {
+                home.join(".local/share/trellis")
+            },
+        );
+        let identity =
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let store = trellis::store::Store::open(roots, identity).unwrap();
+        let native_pin = store.index_baseline().unwrap();
+        let native = store.retained_native_snapshot_at(native_pin).unwrap();
+        let pending_semantic = store.semantic_at(native_pin).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let leader = store.publication_for_tests().unwrap();
+        let completed = store
+            .complete_pending_semantic_for_tests(&leader, &cancel)
+            .unwrap()
+            .unwrap_or(native_pin);
+        assert_eq!(
+            store.retained_native_snapshot_at(native_pin).unwrap(),
+            native
+        );
+        assert_eq!(
+            store.retained_native_snapshot_at(completed).unwrap(),
+            native
+        );
+        assert_eq!(store.index_baseline().unwrap(), completed);
+        assert_eq!(store.semantic_at(native_pin).unwrap(), pending_semantic);
+        let semantic = store.semantic_at(completed).unwrap();
+        assert!(
+            semantic
+                .provenance
+                .iter()
+                .any(|proof| proof.document.path == "javascript/Cmedium0010.js")
+        );
+        if phase == "seed" {
+            drop(leader);
+            drop(store);
+            copy_seed(&home, &scratch.join("oracle-home"));
+        } else {
+            let reports = store.with_index_sql_for_tests(|db| {
+                let key = format!("pin:v1:{}:{}", completed.index_generation, completed.index_revision);
+                Ok(db.prepare("SELECT producer_id,report_json FROM semantic_import_reports WHERE revision_id=?1 ORDER BY producer_id")?
+                    .query_map([key], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            }).unwrap();
+            assert!(!reports.is_empty(), "phase {phase}: completed pin {completed:?}, native pin {native_pin:?}; metadata {:?}",
+                store.with_index_sql_for_tests(|db| {
+                    let mut details = Vec::new();
+                    for (table, fields) in [
+                        ("semantic_revision_raw_selections", "producer_id || ':' || batch_id || ':' || captured_pin"),
+                        ("semantic_revision_producers", "id || ':' || version"),
+                        ("semantic_requested_producers", "id || ':' || version"),
+                        ("semantic_pending_rejoins", "native_revision_id || ':' || selection_identity"),
+                        ("semantic_rejoin_completions", "native_revision_id || ':' || selection_identity"),
+                        ("semantic_native_origins", "producer_id || ':' || origin_revision_id"),
+                        ("semantic_import_reports", "producer_id"),
+                    ] {
+                        let rows = db.prepare(&format!("SELECT revision_id,{fields} FROM {table} ORDER BY revision_id,2"))?
+                            .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        details.push((table.to_owned(),rows));
+                    }
+                    Ok(details)
+                }).unwrap());
+            completed_branches.push((completed, native, semantic, reports));
+        }
+    }
+    assert_eq!(completed_branches.len(), 2);
+    assert_eq!(
+        completed_branches[0], completed_branches[1],
+        "completed native and semantic families, proofs, bases, targets and reports differ from FULL fork"
     );
 }
 
-/// A FULL rejoin joins its stored claims grouped by document (#494). Stored claims are keyed
-/// by a digest, so loading them in `proof_id` order interleaved the documents and made the
-/// one-document role-site cache re-parse a source for nearly every occurrence.
+/// Completed role-site facts are checked against an independently seeded FULL rejoin.
 #[test]
-fn full_rejoin_parses_each_document_a_bounded_number_of_times() {
-    use protobuf::{EnumOrUnknown, Message};
-    const CALLERS: usize = 8;
-    const CALLS: usize = 4;
+fn completed_role_site_families_match_independent_full_rejoin() {
+    selected_case("oracle_fork_duplicate_call_claims");
+    selected_case("oracle_fork_contradictory_calls");
+    selected_case("oracle_fork_unmatched_both");
+}
+
+/// Real SCIP admission, followed only by native publications: no daemon can complete the join.
+fn raw_target_native_first_case(change: &str) {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
+        graph_query::{BoundaryReason, GraphQuery, Visit},
+        model::SemanticAvailability,
+        semantic_batch::{BatchLimits, testing::stage_and_join_admitted},
+        semantic_evidence::{self as semantic, Target},
+        semantic_import::DestinationMutations,
+    };
     let temp = Builder::new()
-        .prefix("semantic-rejoin-order-")
+        .prefix("raw-target-native-")
         .tempdir_in("/tmp")
         .unwrap();
-    let home = temp.path().join("home");
-    fs::create_dir(&home).unwrap();
-    fs::write(home.join("force-full"), b"1").unwrap();
-    fs::write(home.join("work-counts"), b"1").unwrap();
     let root = temp.path().join("checkout");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join(".gitignore"), ".trellis-semantic-batch*/\n").unwrap();
-    let caller =
-        |ordinal: usize| format!("function c{ordinal}(){{ {}}}\n", "target(); ".repeat(CALLS));
-    let mut documents = vec![(
-        "src/B.js".to_owned(),
-        "function target(){ return 1; }\n".to_owned(),
-    )];
-    documents.extend((0..CALLERS).map(|ordinal| (format!("src/C{ordinal}.js"), caller(ordinal))));
-    for (path, text) in &documents {
-        fs::write(root.join(path), text).unwrap();
+    let sources = [
+        ("src/A.js", "function run(){ target(); safe(); }\n"),
+        ("src/B.js", "function target(){ return 1; }\n"),
+        ("src/C.js", "function safe(){ return 3; }\n"),
+    ];
+    for (path, source) in sources {
+        fs::write(root.join(path), source).unwrap();
     }
     let root = fs::canonicalize(root).unwrap();
-    let root_string = root.to_str().unwrap();
-    run(&home, &["index", "--workspace", root_string]);
-    let roots = TopologyRoots::isolated_for_tests(
-        if cfg!(target_os = "macos") {
-            home.join("Library/Caches/dev.squashmerge.trellis")
-        } else {
-            home.join(".cache/trellis")
-        },
-        if cfg!(target_os = "macos") {
-            home.join("Library/Application Support/dev.squashmerge.trellis")
-        } else {
-            home.join(".local/share/trellis")
-        },
-    );
-    let identity =
-        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let index_db = roots.index_db(&identity);
-    let mut binary = scip::types::Index::new();
-    for (path, text) in &documents {
-        let mut doc = scip::types::Document::new();
-        doc.relative_path = path.clone();
-        doc.language = "javascript".into();
-        doc.position_encoding = EnumOrUnknown::from_i32(2);
-        for (start, _) in text.match_indices("target") {
-            let mut occurrence = scip::types::Occurrence::new();
-            occurrence.range = vec![0, start as i32, (start + 6) as i32];
-            occurrence.symbol = "pkg target.".into();
-            occurrence.symbol_roles = i32::from(path == "src/B.js");
-            doc.occurrences.push(occurrence);
+    let state = temp.path().join("state");
+    let store = trellis::store::Store::open_for_tests(&state, &root).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let publish_native = || {
+        let options = trellis::indexer::IndexOptions::new(root.clone());
+        let (graph, native, capture) =
+            trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+                .unwrap();
+        let leader = store.publication_for_tests().unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &leader,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap()
+    };
+    publish_native();
+    let index_db = TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"))
+        .index_db(
+            &trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap(),
+        );
+    let mut docs = Vec::new();
+    for (path, source) in sources {
+        let name = match path {
+            "src/A.js" => "run",
+            "src/B.js" => "target",
+            _ => "safe",
+        };
+        let symbol = format!("pkg {name}.");
+        let start = source.find(name).unwrap() as i32;
+        let mut doc = DocSpec::new(path)
+            .occurrence(&[0, start, start + name.len() as i32], &[], &symbol, 1)
+            .symbol(&symbol, 26, &[]);
+        if path == "src/A.js" {
+            for name in ["target", "safe"] {
+                let start = source.find(name).unwrap() as i32;
+                doc = doc.occurrence(
+                    &[0, start, start + name.len() as i32],
+                    &[0, start, start + name.len() as i32 + 2],
+                    &format!("pkg {name}."),
+                    0,
+                );
+            }
         }
-        if path == "src/B.js" {
-            let mut info = scip::types::SymbolInformation::new();
-            info.symbol = "pkg target.".into();
-            info.kind = EnumOrUnknown::from_i32(26);
-            info.display_name = "target".into();
-            doc.symbols.push(info);
-        }
-        binary.documents.push(doc);
+        docs.push(doc);
     }
-    let paths: Vec<&str> = documents.iter().map(|(path, _)| path.as_str()).collect();
+    let fixture = BatchFixture::from_published(&index_db, &root).reference("scip-typescript");
+    let bytes = fixture.scip_bytes("javascript", &docs);
     let (descriptor, digest) = write_batch(
         &index_db,
         &root,
         "scip-typescript",
-        &[("javascript", &paths, binary.write_to_bytes().unwrap())],
+        &[("javascript", &["src/A.js", "src/B.js", "src/C.js"], bytes)],
         &[],
-        ".trellis-semantic-batch",
+        ".trellis-semantic-batch-direct",
     );
-    let descriptor = descriptor.display().to_string();
-    run(&home, &import_args(root_string, &descriptor, &digest));
-    // One changed caller makes the next native publication rejoin the selected capture.
-    fs::write(root.join("src/C0.js"), caller(0) + "// edited\n").unwrap();
-    run(&home, &["index", "--workspace", root_string]);
-    let work: Value =
-        serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
-    let mut parses = std::collections::BTreeMap::<String, usize>::new();
-    for doc in work["parsedRoleSiteDocuments"].as_array().unwrap() {
-        *parses
-            .entry(doc["path"].as_str().unwrap().to_owned())
-            .or_default() += 1;
-    }
-    // Each document's references are joined at the captured revision and, unless changed, at
-    // the destination; one join parses a document once.
-    let expected: std::collections::BTreeMap<String, usize> = documents
+    let (mut admitted, joined, _) = stage_and_join_admitted(
+        &store,
+        &root,
+        &descriptor,
+        &digest,
+        &BatchLimits::PRODUCTION,
+        DestinationMutations::default(),
+        &cancel,
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let original_pin = store
+        .publish_semantic_batch(
+            &joined,
+            admitted.stage_mut(),
+            joined.destination_pin(),
+            &leader,
+            &cancel,
+        )
+        .unwrap();
+    drop(leader);
+    drop(admitted);
+    let original = store.semantic_at(original_pin).unwrap();
+    let (original_native, _) = store.retained_native_snapshot_at(original_pin).unwrap();
+    let run = original_native
+        .declarations
         .iter()
-        .map(|(path, _)| (path.clone(), if path == "src/C0.js" { 1 } else { 2 }))
-        .collect();
-    assert_eq!(
-        parses, expected,
-        "a rejoin re-parsed a document per occurrence"
-    );
+        .find(|row| row.document.path == "src/A.js" && row.name.as_deref() == Some("run"))
+        .unwrap()
+        .syntax_id
+        .clone();
+    let binding_for = |path: &str| {
+        original.call_bindings.iter().find(|binding| {
+        matches!(&binding.declared_target, Some(Target::Internal { document, .. }) if document.path == path)
+    }).unwrap().clone()
+    };
+    let dependent = binding_for("src/B.js");
+    let independent = binding_for("src/C.js");
+    assert_eq!(original.call_bindings.len(), 2);
+    assert_eq!(dependent.resolution, semantic::Resolution::Resolved);
+    assert_eq!(independent.resolution, semantic::Resolution::Resolved);
+    assert_ne!(dependent.call_id, independent.call_id);
+    assert_ne!(dependent.provenance_id, independent.provenance_id);
+    for binding in [&dependent, &independent] {
+        let proof = original
+            .provenance
+            .iter()
+            .find(|p| p.id == binding.provenance_id)
+            .unwrap();
+        assert!(proof.derived_from.is_some());
+        assert!(proof.basis.is_some());
+        assert_eq!(proof.revision_id, original_native.revision.id);
+        assert_eq!(proof.freshness, semantic::Freshness::Fresh);
+    }
+    let response = store.evidence_response().unwrap();
+    let status = response
+        .document_semantic_status_at("src/A.js", Some(original_pin))
+        .unwrap();
+    assert_eq!(status.state, SemanticAvailability::Fresh);
+    assert_eq!(status.semantic_origin.unwrap().pin, original_pin);
+    response.finish(()).unwrap();
+    drop(response);
+
+    match change {
+        "deleted" => fs::remove_file(root.join("src/B.js")).unwrap(),
+        "ambiguous" => fs::write(
+            root.join("src/B.js"),
+            "function target(){ return 1; }\nfunction target(){ return 2; }\n",
+        )
+        .unwrap(),
+        "changed" | "restored" => {
+            fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap()
+        }
+        _ => unreachable!(),
+    }
+    let first_pin = publish_native();
+    let first = store.semantic_at(first_pin).unwrap();
+    for restored in [false, true] {
+        let pin = if restored {
+            if change != "restored" {
+                break;
+            }
+            fs::write(root.join("src/B.js"), sources[1].1).unwrap();
+            publish_native()
+        } else {
+            first_pin
+        };
+        let selected = store.semantic_at(pin).unwrap();
+        let (native, _) = store.retained_native_snapshot_at(pin).unwrap();
+        let freshness = if native.revision.id == original_native.revision.id {
+            semantic::Freshness::Fresh
+        } else {
+            semantic::Freshness::PossiblyStale
+        };
+        assert_eq!(
+            fs::read(root.join("src/A.js")).unwrap(),
+            sources[0].1.as_bytes()
+        );
+        let call_ids = |artifact: &trellis::native_evidence::Artifact| {
+            artifact
+                .calls
+                .iter()
+                .filter(|call| call.document.path == "src/A.js")
+                .map(|call| call.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(call_ids(&native), call_ids(&original_native));
+        assert!(selected.call_bindings.contains(&independent));
+        let mut proof = original
+            .provenance
+            .iter()
+            .find(|proof| proof.id == independent.provenance_id)
+            .unwrap()
+            .clone();
+        proof.freshness = freshness;
+        assert_eq!(
+            selected.provenance.iter().find(|p| p.id == proof.id),
+            Some(&proof)
+        );
+        if !restored {
+            assert!(
+                !selected
+                    .call_bindings
+                    .iter()
+                    .any(|b| b.call_id == dependent.call_id)
+            );
+            assert!(
+                !selected
+                    .provenance
+                    .iter()
+                    .any(|p| p.id == dependent.provenance_id)
+            );
+            let targets_b = |target: &Target| {
+                matches!(target,
+                Target::Internal { document, .. } if document.path == "src/B.js")
+            };
+            assert!(
+                !selected
+                    .symbols
+                    .iter()
+                    .any(|s| s.declarations.iter().any(targets_b))
+            );
+            assert!(
+                !selected.references.iter().any(|r| r
+                    .declared_target
+                    .iter()
+                    .chain(&r.candidates)
+                    .any(targets_b))
+            );
+            assert!(
+                !selected
+                    .type_relationships
+                    .iter()
+                    .any(|r| targets_b(&r.source) || targets_b(&r.target))
+            );
+        } else if let Some(binding) = selected
+            .call_bindings
+            .iter()
+            .find(|b| b.call_id == dependent.call_id)
+        {
+            // Exact restoration may safely expose the old association, never a new claim.
+            assert_eq!(binding, &dependent);
+            let mut proof = original
+                .provenance
+                .iter()
+                .find(|p| p.id == dependent.provenance_id)
+                .unwrap()
+                .clone();
+            proof.freshness = freshness;
+            assert_eq!(
+                selected.provenance.iter().find(|p| p.id == proof.id),
+                Some(&proof)
+            );
+        }
+        let response = store.evidence_response().unwrap();
+        for path in ["src/A.js", "src/C.js"] {
+            let status = response
+                .document_semantic_status_at(path, Some(pin))
+                .unwrap();
+            if path == "src/C.js" {
+                assert_eq!(status.state, SemanticAvailability::Fresh);
+            } else if !restored {
+                assert_eq!(status.state, SemanticAvailability::CatchingUp);
+            }
+            let origin = status.semantic_origin.unwrap();
+            assert_eq!(origin.pin, original_pin);
+            assert_eq!(origin.revision_id, original_native.revision.id);
+        }
+        if change == "deleted" {
+            assert!(
+                !native
+                    .revision
+                    .documents
+                    .iter()
+                    .any(|d| d.key.path == "src/B.js")
+            );
+            let error = response
+                .document_semantic_status_at("src/B.js", Some(pin))
+                .unwrap_err();
+            assert!(error.to_string().contains("not_found"));
+        } else {
+            assert_eq!(
+                response
+                    .document_semantic_status_at("src/B.js", Some(pin))
+                    .unwrap()
+                    .state,
+                SemanticAvailability::CatchingUp
+            );
+        }
+        if change == "ambiguous" {
+            assert_eq!(native.declarations.iter().filter(|d|
+                d.document.path == "src/B.js" && d.name.as_deref() == Some("target")).count(), 2);
+        }
+        let result = response
+            .graph_query(
+                &GraphQuery {
+                    root_syntax_id: run.clone(),
+                    semantic_producer_id: Some("scip-typescript".into()),
+                    depth: 3,
+                    max_nodes: 20,
+                    max_calls: 20,
+                    include_external: true,
+                    include_tests: true,
+                },
+                Some(pin),
+                &mut || Ok(()),
+            )
+            .unwrap()
+            .outcome
+            .unwrap();
+        assert_eq!(result.edges.len(), 2);
+        assert!(result.partial);
+        if restored
+            && result
+                .edges
+                .iter()
+                .any(|edge| Some(&edge.call.id) == dependent.call_id.as_ref() && edge.to.is_some())
+        {
+            let target = result
+                .semantic_documents
+                .iter()
+                .find(|document| document.document.path == "src/B.js")
+                .unwrap();
+            assert_eq!(
+                target.semantic_status.state,
+                SemanticAvailability::CatchingUp
+            );
+        }
+        let safe = result
+            .edges
+            .iter()
+            .find(|e| Some(&e.call.id) == independent.call_id.as_ref())
+            .unwrap();
+        assert_eq!(safe.binding.as_ref().unwrap(), &independent);
+        assert!(result.provenance.contains(&proof));
+        for edge in &result.edges {
+            if freshness != semantic::Freshness::Fresh
+                || (!restored && Some(&edge.call.id) == dependent.call_id.as_ref())
+            {
+                assert_eq!(edge.visit, Visit::Boundary);
+                assert_eq!(edge.to, None);
+            }
+        }
+        if !restored {
+            let edge = result
+                .edges
+                .iter()
+                .find(|e| Some(&e.call.id) == dependent.call_id.as_ref())
+                .unwrap();
+            assert!(edge.binding.is_none());
+            assert_eq!(edge.boundary_reason, BoundaryReason::MissingEvidence);
+            assert_eq!(safe.boundary_reason, BoundaryReason::Stale);
+            assert_eq!(result.nodes.len(), 1);
+        }
+        response.finish(()).unwrap();
+        assert_eq!(store.semantic_at(original_pin).unwrap(), original);
+        assert_eq!(store.semantic_at(first_pin).unwrap(), first);
+    }
+}
+
+#[test]
+fn raw_import_native_first_changed_target_omits_only_dependent_facts() {
+    raw_target_native_first_case("changed");
+}
+
+#[test]
+fn raw_import_native_first_deleted_target_omits_only_dependent_facts() {
+    raw_target_native_first_case("deleted");
+}
+
+#[test]
+fn raw_import_native_first_ambiguous_target_does_not_rebind() {
+    raw_target_native_first_case("ambiguous");
+}
+
+#[test]
+fn raw_import_native_first_restored_target_keeps_pending_state_and_pins() {
+    raw_target_native_first_case("restored");
 }

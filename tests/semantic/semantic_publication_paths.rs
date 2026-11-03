@@ -820,7 +820,7 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
 }
 
 #[test]
-fn streamed_new_native_revision_omits_old_facts_and_keeps_producers_separate() {
+fn streamed_native_first_withholds_old_facts_and_keeps_producers_separate() {
     let (_state, root, store, cancel, options) = setup();
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
@@ -891,10 +891,28 @@ fn streamed_new_native_revision_omits_old_facts_and_keeps_producers_separate() {
     let current = store.semantic_at(native_only).unwrap();
     assert!(current.references.is_empty());
     assert!(current.call_bindings.is_empty());
-    assert_eq!(current.coverage.len(), 2);
-    assert_eq!(current.coverage[0].state, s::CoverageState::Omitted);
-    assert_eq!(current.coverage[1].state, s::CoverageState::NotRequested);
-    assert_ne!(current.coverage[0].revision_id, native.revision.id);
+    assert!(current.coverage.is_empty());
+    let mut expected_producers = semantic.producers.clone();
+    expected_producers.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(current.producers, expected_producers);
+    let response = store.evidence_response().unwrap();
+    for producer in &semantic.producers {
+        let counts = response
+            .semantic_availability_for_producer_at(Some(native_only), Some(&producer.id))
+            .unwrap();
+        assert_eq!(counts.iter().map(|c| c.unavailable).sum::<u64>(), 1);
+        assert_eq!(
+            counts.iter().map(|c| c.fresh + c.catching_up).sum::<u64>(),
+            0
+        );
+    }
+    drop(response);
+    assert!(
+        store
+            .complete_pending_semantic_for_tests(&leader, &cancel)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         store.semantic_at(first).unwrap().references,
         semantic.references
@@ -929,13 +947,26 @@ fn descriptor_languages_cover_new_documents_without_prior_language_tuples() {
         .publish_native(&graph, &capture, &next, &leader, first, &cancel)
         .unwrap();
     let snapshot = store.semantic_at(second).unwrap();
-    let python = snapshot
-        .coverage
-        .iter()
-        .find(|row| row.language == s::Language::Python && row.document_path == "added.py")
+    assert!(
+        !snapshot
+            .coverage
+            .iter()
+            .any(|row| row.document_path == "added.py")
+    );
+    let response = store.evidence_response().unwrap();
+    let python = response
+        .document_semantic_status_at("added.py", Some(second))
         .unwrap();
-    assert_eq!(python.state, s::CoverageState::NotRequested);
-    assert!(!python.requested && !python.selected);
+    assert_eq!(
+        python.state,
+        trellis::model::SemanticAvailability::Unavailable
+    );
+    assert_eq!(
+        python.producer_id.as_deref(),
+        Some(semantic.producers[0].id.as_str())
+    );
+    assert!(python.semantic_origin.is_none());
+    drop(response);
     assert_eq!(snapshot.producers, semantic.producers);
     assert_eq!(
         store.semantic_at(first).unwrap().coverage,
@@ -979,7 +1010,9 @@ fn explicit_producer_without_applicable_documents_survives_pins_and_supplied_ref
     );
     store.set_retention_clock_for_tests(1_001, 1);
     let second = store
-        .publish_native(&graph, &capture, &native, &leader, first, &cancel)
+        .publish_native_semantic(
+            &graph, &capture, &native, &semantic, &captured, &leader, first, &cancel,
+        )
         .unwrap();
     assert_eq!(
         store.semantic_at(second).unwrap().producers,

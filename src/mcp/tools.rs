@@ -486,6 +486,20 @@ pub fn resolved_root_changed(
         modern,
     )
 }
+/// Inspect only immutable semantic availability fields, never the checkout advisory flag.
+fn semantic_catching_up(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => fields.iter().any(|(key, value)| {
+            (key == "semanticStatus" && value["state"] == "catchingUp")
+                || (key == "semanticAvailability"
+                    && value["catchingUp"].as_u64().is_some_and(|count| count > 0))
+                || semantic_catching_up(value)
+        }),
+        Value::Array(values) => values.iter().any(semantic_catching_up),
+        _ => false,
+    }
+}
+
 /// Keep the full, schema-valid envelope in structuredContent. Text is only a
 /// bounded display summary, not a second JSON representation of the evidence.
 pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
@@ -592,7 +606,27 @@ pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
         } else {
             items
         };
-        format!("{name}: {count} {items}{truncation}; full result in structuredContent.")
+        let semantic = if semantic_catching_up(&envelope["data"]) {
+            ", semantic catching up"
+        } else {
+            ""
+        };
+        let partial = if envelope["partial"] == true {
+            ", partial"
+        } else {
+            ""
+        };
+        let unknown = if envelope["data"]["counts"]["unknown"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+        {
+            ", unknown outcomes"
+        } else {
+            ""
+        };
+        format!(
+            "{name}: {count} {items}{semantic}{partial}{unknown}{truncation}; full result in structuredContent."
+        )
     };
     assert!(text.len() <= 512, "tool summary exceeds 512 UTF-8 bytes");
     let mut value = json!({"isError":error,"structuredContent":envelope,
@@ -1042,7 +1076,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":6,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":7,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
@@ -1058,7 +1092,9 @@ mod tests {
                     assert_eq!(
                         result["content"][0]["text"],
                         if name == "trellis_workspace_describe" {
-                            format!("{name}: 1 workspace; full result in structuredContent.")
+                            format!(
+                                "{name}: 1 workspace, partial; full result in structuredContent."
+                            )
                         } else {
                             format!("{name} failed: index_not_ready: Index is not ready")
                         }
@@ -1417,6 +1453,34 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn summary_distinguishes_pinned_semantic_pending_from_checkout_advisory() {
+        for modern in [false, true] {
+            let pending = json!({"data":{"callers":[],"scopeCoverage":[{"semantic":{
+                "semanticAvailability":{"fresh":1,"catchingUp":1,"unavailable":0}}}]},
+                "catchingUp":false,"partial":true,"truncated":false});
+            let text = result("trellis_incoming_calls", pending, modern)["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(text.contains("0 calls, semantic catching up, partial"));
+            let advisory = json!({"data":{"callers":[]},"catchingUp":true,
+                "partial":false,"truncated":false});
+            let text = result("trellis_incoming_calls", advisory, modern)["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(!text.contains("catching up"));
+            let unknown = json!({"data":{"instances":[],"counts":{"unknown":1}},
+                "partial":true,"truncated":false});
+            let text = result("trellis_rules_check", unknown, modern)["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(text.contains("0 instances, partial, unknown outcomes"));
+        }
+    }
+
     #[test]
     fn architecture_inputs_are_closed_and_prompt_is_private() {
         let identity = json!({"sourceSetId":"app","language":"rust","path":"src/a.rs","sid":sid()});

@@ -115,6 +115,9 @@
       const target = get("architecture-notice-content"); target.replaceChildren();
       paragraph(target, `Code ${window.TrellisIndexPin.label(view)} · rules ${view.rulesFile.contentHash} · ${aggregate} · ${population()}.`);
       const references = view.references;
+      const semanticSummary = window.TrellisSemanticStatus.documentsSummary(view);
+      if (semanticSummary) paragraph(target, semanticSummary);
+      if (view.semanticDocuments?.length) disclosure(target, "Document semantic states and origins", {nativePin:{indexGeneration:view.indexGeneration, indexRevision:view.indexRevision}, semanticDocuments:view.semanticDocuments});
       paragraph(target, `${references?.counts?.mappedSites ?? 0} mapped reference sites · ${references?.counts?.semanticSites ?? 0} bound by semantic evidence · ${references?.counts?.unresolvedSites ?? 0} unresolved. Missing sites do not prove absence.`);
       if (ruleCounts(view)) paragraph(target, ruleCounts(view));
       for (const limitation of references?.limitations || []) paragraph(target, limitation);
@@ -412,6 +415,7 @@
       const sites = rows.reduce((sum, row) => sum + row.sites, 0), mapped = rows.reduce((sum, row) => sum + row.mappedSites, 0);
       const parts = [`${mapped.toLocaleString("en-US")} of ${sites.toLocaleString("en-US")} reference sites mapped to a module (${percent(mapped, sites)})`];
       if (rows.some(row => row.unresolvedSites > 0)) parts.push("≥ counts are lower bounds");
+      if (window.TrellisSemanticStatus.pending(payload).length) parts.push("Semantic catching up · partial");
       return parts.join(" · ");
     }
     function ruleCounts(payload) {
@@ -623,9 +627,10 @@
     }
     // Evidence wording follows what the selection rests on (#523); never semantically complete.
     function evidenceSummary(payload) {
-      return payload.evidenceTier === "mixed"
-        ? "Syntax evidence and fresh semantic bindings · not semantically complete"
+      const evidence = payload.evidenceTier === "mixed"
+        ? "Syntax evidence and captured semantic bindings · not semantically complete"
         : "Syntax evidence · not compiler-resolved calls";
+      return window.TrellisSemanticStatus.pending(payload).length ? `Semantic catching up · partial · ${evidence}` : evidence;
     }
     function edgeSites(edge) {
       if (edge.evidenceTier === "semantic") return "reference sites, all bound by semantic evidence";
@@ -636,7 +641,7 @@
       const semantic = (row.evidence || []).concat(...(row.constraints || []).map(c => c.evidence || []))
         .some(item => item.kind === "semanticBinding" || item.kind === "typeRelationship");
       return semantic
-        ? "Semantic evidence names a fresh producer binding and its proof; structural spelling and source-owner identities remain syntax evidence."
+        ? "Semantic evidence names a captured producer binding and its proof; structural spelling and source-owner identities remain syntax evidence."
         : "Captured spelling and source-owner identities are syntax evidence, not destination symbol bindings.";
     }
     function inspect(kind, record) {
@@ -653,6 +658,10 @@
         paragraph(target, `Layer: ${record.layer ?? "Unassigned / unknown"} · ${record.physicalLines} physical file lines · ${record.declarationCount} ${callables()}.`);
         paragraph(target, `${aggregate} · metrics:v1 · ${population()}. Callable-range LOC may overlap; it is not physical file lines.`);
         disclosure(target, "Native file-module identity and captured source", {identity:record.identity, revisionId:record.revisionId, contentHash:record.contentHash, provenanceId:record.provenanceId});
+        if (record.semanticStatus) {
+          paragraph(target, window.TrellisSemanticStatus.label(record.semanticStatus));
+          disclosure(target, "Semantic state and origin", {nativePin:c.pin, semanticStatus:record.semanticStatus});
+        }
         if (record.excludedReason) paragraph(target, `Excluded from heat: ${record.excludedReason} · ${exclusions([record])}`);
         else if (record.declarationCount === 0) paragraph(target, `No ${callables()}. Numeric aggregates are unavailable, not zero.`);
         values(target, record.metrics);

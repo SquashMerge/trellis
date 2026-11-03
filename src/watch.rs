@@ -152,6 +152,29 @@ impl WatcherHealth {
 /// wake can coalesce but never carries state the worker would not re-read.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
+/// A clone of the existing ingress fence, usable without retaining the watcher owner lock.
+#[derive(Clone)]
+pub(crate) struct WatchFence {
+    generation: Arc<AtomicU64>,
+    live: Arc<std::sync::Mutex<bool>>,
+    admitted: u64,
+}
+
+impl WatchFence {
+    pub(crate) fn unchanged(&self) -> bool {
+        self.generation.load(Ordering::SeqCst) == self.admitted
+    }
+
+    pub(crate) fn lock(&self) -> anyhow::Result<std::sync::MutexGuard<'_, bool>> {
+        let live = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        anyhow::ensure!(self.unchanged(), "semantic rejoin superseded");
+        Ok(live)
+    }
+}
+
 /// A generation can be cleared only after the corresponding capture was verified and published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirtyBatch {
@@ -622,6 +645,14 @@ impl WatchSignals {
     /// compares it with the acknowledged generation without taking a lock.
     pub fn generation_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.generation)
+    }
+
+    pub(crate) fn publication_fence(&self) -> WatchFence {
+        WatchFence {
+            generation: self.generation.clone(),
+            live: self.live.clone(),
+            admitted: self.generation.load(Ordering::SeqCst),
+        }
     }
 
     /// Keep native and synthetic accepted ingress behind the final queue gate

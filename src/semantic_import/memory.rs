@@ -7,7 +7,7 @@ use super::{
         JoinIndex, JoinSink, JoinStore, MethodSummary, NativeFacts, OccurrenceRow, ProofIdentities,
         ProofRef, PublicationSink, RelationshipRow, RowReserve,
     },
-    source_role_sites,
+    source_role_sites_reserved,
 };
 use crate::{
     native_evidence as native,
@@ -36,6 +36,7 @@ impl<'a> std::ops::Deref for RawIndex<'a> {
 }
 
 pub(super) struct MemoryJoinStore<'a> {
+    cancel: Option<&'a crate::model::CancelFlag>,
     raw: RawIndex<'a>,
     coordinates: &'a CoordinateMaps,
     measured: &'a MeasuredFacts<'a>,
@@ -45,6 +46,19 @@ pub(super) struct MemoryJoinStore<'a> {
 }
 
 impl<'a> MemoryJoinStore<'a> {
+    pub(super) fn new_cancellable(
+        raw: &'a InventoryIndex<'a>,
+        coordinates: &'a CoordinateMaps,
+        measured: &'a MeasuredFacts<'a>,
+        sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
+        cancel: &'a crate::model::CancelFlag,
+    ) -> Self {
+        Self {
+            cancel: Some(cancel),
+            ..Self::new(raw, coordinates, measured, sources)
+        }
+    }
+
     pub(super) fn new(
         raw: &'a InventoryIndex<'a>,
         coordinates: &'a CoordinateMaps,
@@ -52,6 +66,7 @@ impl<'a> MemoryJoinStore<'a> {
         sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
     ) -> Self {
         Self {
+            cancel: None,
             raw: RawIndex::Borrowed(raw),
             coordinates,
             measured,
@@ -108,14 +123,14 @@ impl NativeFacts for MemoryJoinStore<'_> {
 impl JoinFacts for MemoryJoinStore<'_> {
     type Operation = ();
     fn operation(&self) -> Result<()> {
-        Ok(())
+        self.charge(0)
     }
     fn reserve_operation(
         &self,
         _operation: &mut (),
         _bytes: impl FnOnce() -> Result<u64>,
     ) -> Result<()> {
-        Ok(())
+        self.charge(0)
     }
     fn revision_id(&self) -> &str {
         &self.measured.native.revision.id
@@ -297,7 +312,10 @@ impl<'a> JoinStore for MemoryJoinStore<'a> {
     }
 
     fn claims(&self) -> Box<dyn Iterator<Item = Result<Cow<'_, CapturedClaim>>> + '_> {
-        Box::new(self.raw.claims.iter().map(|claim| Ok(Cow::Borrowed(claim))))
+        Box::new(self.raw.claims.iter().map(|claim| {
+            self.charge(0)?;
+            Ok(Cow::Borrowed(claim))
+        }))
     }
 
     fn lookup_proof(&self, proof: &str, kind: &str, digest: &str) -> Result<()> {
@@ -337,10 +355,15 @@ impl<'a> JoinStore for MemoryJoinStore<'a> {
             .capability_reports
             .iter()
             .find(|report| &report.document == document);
-        source_role_sites(document.language.as_str(), source, report)
+        source_role_sites_reserved(document.language.as_str(), source, report, &mut |_| {
+            self.charge(1)
+        })
     }
 
     fn charge(&self, _units: usize) -> Result<()> {
+        if let Some(cancel) = self.cancel {
+            super::check_semantic_cancel(cancel)?;
+        }
         Ok(())
     }
 }
@@ -352,7 +375,11 @@ impl<'a> IndexedJoinStore for MemoryJoinStore<'a> {
         Self: 'i;
     fn restrict<'i>(&'i self, claims: &'i CapturedScipInventory) -> Result<MemoryJoinStore<'i>> {
         Ok(MemoryJoinStore {
-            raw: RawIndex::Owned(InventoryIndex::new(claims)?),
+            cancel: self.cancel,
+            raw: RawIndex::Owned(match self.cancel {
+                Some(cancel) => InventoryIndex::new_cancellable(claims, cancel)?,
+                None => InventoryIndex::new(claims)?,
+            }),
             coordinates: self.coordinates,
             measured: self.measured,
             sources: self.sources,

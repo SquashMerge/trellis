@@ -15,6 +15,23 @@ use trellis::{
 use crate::semantic_batch_support;
 use semantic_batch_support::{BatchFixture, DocSpec};
 
+fn assert_unavailable_origin(
+    store: &Store,
+    pin: trellis::model::IndexPin,
+    path: &str,
+    origin: trellis::model::IndexPin,
+) {
+    let response = store.evidence_response().unwrap();
+    let status = response
+        .document_semantic_status_at(path, Some(pin))
+        .unwrap();
+    assert_eq!(
+        status.state,
+        trellis::model::SemanticAvailability::Unavailable
+    );
+    assert_eq!(status.semantic_origin.unwrap().pin, origin);
+}
+
 fn native_components(
     root: &std::path::Path,
     executable_hash: &str,
@@ -344,7 +361,7 @@ fn direct_semantic_publication_reads_typed_rows_at_owning_pin() {
 }
 
 #[test]
-fn native_only_next_revision_omits_requested_semantics_without_rebinding() {
+fn native_only_next_revision_withholds_unavailable_semantics_without_rebinding() {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     fs::write(
@@ -394,12 +411,15 @@ fn native_only_next_revision_omits_requested_semantics_without_rebinding() {
     assert!(current.references.is_empty());
     assert!(current.call_bindings.is_empty());
     assert!(current.type_relationships.is_empty());
-    assert_eq!(current.coverage[0].state, s::CoverageState::Omitted);
-    assert_eq!(
-        current.coverage[0].diagnostic.as_deref(),
-        Some("semantic producer not run for this revision")
+    assert!(current.coverage.is_empty());
+    assert_eq!(current.producers, semantic.producers);
+    assert_unavailable_origin(&store, second, "hello.rs", first);
+    assert!(
+        store
+            .complete_pending_semantic_for_tests(&leader, &cancel)
+            .unwrap()
+            .is_none()
     );
-    assert_eq!(current.coverage[0].revision_id, next.revision.id);
 }
 
 #[test]
@@ -475,7 +495,9 @@ fn released_semantic_pin_drops_rows_but_retains_head() {
         .unwrap();
     store.set_retention_clock_for_tests(1_001, 1);
     let second = store
-        .publish_native(&graph, &capture, &native, &leader, first, &cancel)
+        .publish_native_semantic(
+            &graph, &capture, &native, &semantic, &captured, &leader, first, &cancel,
+        )
         .unwrap();
     assert_eq!(
         store.semantic_at(first).unwrap().references,
@@ -1148,27 +1170,32 @@ fn typed_next_revision_fills_unsupplied_producer_new_document() {
         "unchanged document reused native vid"
     );
     let final_sem = store.semantic_at(third).unwrap();
-    assert_eq!(final_sem.coverage.len(), 6);
-    assert!(
-        final_sem
-            .coverage
-            .iter()
-            .any(|c| c.producer_id == "semantic.synthetic"
-                && c.document_path == "hello.rs"
-                && c.state == s::CoverageState::Omitted)
+    assert_eq!(final_sem.coverage, vec![supplied.coverage[0].clone()]);
+    assert_eq!(final_sem.references, supplied.references);
+    let mut expected_proofs = supplied.provenance.clone();
+    for proof in &mut expected_proofs {
+        proof.freshness = s::Freshness::PossiblyStale;
+    }
+    assert_eq!(final_sem.provenance, expected_proofs);
+    assert_eq!(
+        final_sem.declaration_bindings,
+        supplied.declaration_bindings
     );
-    assert!(final_sem.coverage.iter().any(|c| c.producer_id == other.id
-        && c.document_path == "zz.rs"
-        && c.state == s::CoverageState::NotRequested));
-    assert!(
-        final_sem
-            .coverage
-            .iter()
-            .any(|c| c.producer_id == requested.id
-                && c.document_path == "zz.rs"
-                && c.state == s::CoverageState::NotRequested)
-    );
-    assert!(final_sem.references.is_empty());
+    assert_eq!(final_sem.symbols, supplied.symbols);
+    assert_eq!(final_sem.call_bindings, supplied.call_bindings);
+    assert_eq!(final_sem.type_relationships, supplied.type_relationships);
+    let response = store.evidence_response().unwrap();
+    for producer in [&other.id, &requested.id] {
+        let counts = response
+            .semantic_availability_for_producer_at(Some(third), Some(producer))
+            .unwrap();
+        assert_eq!(counts.iter().map(|c| c.unavailable).sum::<u64>(), 2);
+        assert_eq!(
+            counts.iter().map(|c| c.fresh + c.catching_up).sum::<u64>(),
+            0
+        );
+    }
+    drop(response);
     assert_eq!(
         store.semantic_at(second).unwrap().references,
         supplied.references
@@ -1537,7 +1564,9 @@ fn bounded_semantic_children_release_preserves_same_native_id_survivors() {
         .unwrap();
     store.set_retention_clock_for_tests(1_001, 1);
     let second = store
-        .publish_native(&graph, &capture, &native, &leader, first, &cancel)
+        .publish_native_semantic(
+            &graph, &capture, &native, &semantic, &captured, &leader, first, &cancel,
+        )
         .unwrap();
     assert_ne!(first, second);
     assert_eq!(
@@ -1673,7 +1702,8 @@ fn full_stream_unchanged_capture_keeps_typed_semantic_pin() {
         .unwrap();
     assert_ne!(advanced, pin);
     let current = store.semantic_at(advanced).unwrap();
-    assert_eq!(current.coverage[0].state, s::CoverageState::Omitted);
+    assert!(current.coverage.is_empty());
+    assert_unavailable_origin(&store, advanced, "hello.rs", pin);
     assert!(current.references.is_empty());
     assert!(current.symbols.is_empty());
     assert_eq!(
@@ -1815,11 +1845,15 @@ fn native_only_selective_recovery_keeps_requested_heads_without_old_facts() {
         )
         .unwrap();
     let selected = store.semantic_at(next).unwrap();
-    assert_eq!(selected.coverage.len(), 1);
-    assert!(selected.coverage[0].requested);
-    assert!(!selected.coverage[0].selected);
-    assert_eq!(selected.coverage[0].state, s::CoverageState::Omitted);
-    assert_eq!(selected.coverage[0].revision_id, changed_native.revision.id);
+    assert!(selected.coverage.is_empty());
+    assert_eq!(selected.producers, semantic.producers);
+    assert_unavailable_origin(&store, next, "hello.rs", prior);
+    assert!(
+        store
+            .complete_pending_semantic_for_tests(&leader, &cancel)
+            .unwrap()
+            .is_none()
+    );
     assert!(selected.provenance.is_empty());
     assert!(selected.references.is_empty());
     assert_eq!(
@@ -1907,7 +1941,7 @@ fn native_only_selective_recovery_replaces_semantics_after_private_stage() {
 }
 
 #[test]
-fn metadata_only_native_change_omits_semantics_with_reused_document_version() {
+fn metadata_only_native_change_withholds_semantics_with_reused_document_version() {
     use trellis::index_coordinator::IndexJobCoordinator;
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -1948,8 +1982,9 @@ fn metadata_only_native_change_omits_semantics_with_reused_document_version() {
         .unwrap();
     assert_ne!(next, first);
     let current = store.semantic_at(next).unwrap();
-    assert_eq!(current.coverage[0].state, s::CoverageState::Omitted);
-    assert_eq!(current.coverage[0].revision_id, m_native.revision.id);
+    assert!(current.coverage.is_empty());
+    assert_eq!(current.producers, semantic.producers);
+    assert_unavailable_origin(&store, next, "hello.rs", first);
     assert!(current.provenance.is_empty());
     assert!(current.references.is_empty());
     assert_eq!(

@@ -62,7 +62,7 @@ test("the eleven-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 6);
+  assert.equal(describe.toolVersion.const, 7);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
@@ -119,10 +119,14 @@ test("native coverage labels do not claim the selected semantic tier", () => {
       $ref: "#/$defs/LanguageStatus" });
     const coverage = { selected: 2, complete: 1, partial: 1, failed: 0, unselected: 0 };
     const semantic = { available: true, producerId: "rust-analyzer", freshness: "fresh",
-      coverage, note: null };
+      coverage, note: null, semanticAvailability: { fresh: 2, catchingUp: 0, unavailable: 0 } };
     if (tool.name === "trellis_workspace_describe") semantic.partialReasons = null;
     const status = { language: "rust", nativeCoverageTier: "syntax", coverage, semantic };
     assert.ok(validate(status), `${tool.name}: ${JSON.stringify(validate.errors)}`);
+    const { semanticAvailability, ...withoutAvailability } = semantic;
+    assert.equal(validate({ ...status, semantic: withoutAvailability }), false, tool.name);
+    assert.equal(validate({ ...status, semantic: { ...semantic,
+      semanticAvailability: { ...semanticAvailability, catchingUp: -1 } } }), false, tool.name);
     assert.equal(validate({ ...status, nativeCoverageTier: "semantic" }), false, tool.name);
     const { nativeCoverageTier, ...legacy } = status;
     assert.equal(validate({ ...legacy, evidenceTier: "syntax" }), false, tool.name);

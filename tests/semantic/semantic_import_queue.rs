@@ -794,6 +794,13 @@ fn two_document_case(change_b: &str) {
         }
         let before = store.index_baseline().unwrap();
         assert_eq!(before, advanced_pin);
+        let prior_report = store
+            .semantic_batch_report_at(advanced_pin, &digest)
+            .unwrap();
+        assert!(
+            prior_report.is_some(),
+            "native-first pin retains the selected input report"
+        );
         if change_b == "cutoff" {
             fs::write(
                 root.join("src/A.js"),
@@ -822,11 +829,12 @@ fn two_document_case(change_b: &str) {
             committed.index_revision >= advanced_pin.index_revision + 2,
             "native reconciliation must precede semantic publication"
         );
-        assert!(
+        assert_eq!(
             store
                 .semantic_batch_report_at(advanced_pin, &digest)
-                .unwrap()
-                .is_none()
+                .unwrap(),
+            prior_report,
+            "later import must not mutate the native-first pin's retained report"
         );
         response
     } else if matches!(change_b, "ambiguous" | "ambiguous_a" | "missing_a") {
