@@ -5,6 +5,9 @@ use crate::{
 };
 use std::sync::mpsc::{self, Receiver, Sender};
 
+#[path = "../../tests/core/search_fill_vector_model.rs"]
+mod vector_model_tests;
+
 #[derive(Clone)]
 struct Gate {
     entered: Sender<()>,
