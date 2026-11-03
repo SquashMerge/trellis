@@ -1100,7 +1100,10 @@ fn each_batch_limit_fails_limit_exceeded_before_expansion() {
     let ordinary: Fault = |world| world.write_unwatched(&paged_fixture(world));
     // `document_occurrences` is not here: over it a document is admitted partially (#394),
     // which `real_rust_analyzer_capped_document_stays_partial_through_import_and_rejoin` covers.
-    let cases: [Case; 22] = [
+    // Nor is `document_symbols`: over it, or any other per-document wire cap, a document is
+    // admitted with no claims (#634), which `capped_document_through_import_and_rejoin` covers.
+    // `signature_occurrences` still fails the batch on an external symbol.
+    let cases: [Case; 21] = [
         (r#"{"source_documents":4}"#, "source documents", ordinary),
         (r#"{"descriptor_bytes":64}"#, "descriptor bytes", ordinary),
         (r#"{"page_bytes":50}"#, "page bytes", ordinary),
@@ -1117,7 +1120,6 @@ fn each_batch_limit_fails_limit_exceeded_before_expansion() {
         (r#"{"candidates":1}"#, "candidate facts", ordinary),
         (r#"{"wire_fields":3}"#, "wire fields", ordinary),
         (r#"{"unit_expansion_bytes":8}"#, "unit expansion", ordinary),
-        (r#"{"document_symbols":0}"#, "document entries", ordinary),
         (r#"{"message_depth":0}"#, "message depth", ordinary),
         (r#"{"staged_rows":1}"#, "staged rows", ordinary),
         (r#"{"output_bytes":0}"#, "output bytes", ordinary),
@@ -1140,10 +1142,11 @@ fn each_batch_limit_fails_limit_exceeded_before_expansion() {
             "signature occurrences",
             |world| {
                 batch_with_artifact_edit(world, "java", |index| {
-                    let signature = &mut index.documents[0].symbols[0].signature_documentation;
+                    let mut external = scip::types::SymbolInformation::new();
                     let mut document = scip::types::Signature::new();
                     document.occurrences.push(scip::types::Occurrence::new());
-                    *signature = Some(document).into();
+                    external.signature_documentation = Some(document).into();
+                    index.external_symbols.push(external);
                 })
             },
         ),
@@ -1804,22 +1807,44 @@ fn head_coverage(world: &World, path: &str) -> (String, Option<String>) {
 /// the reason kept, whichever rejoin path it takes.
 #[test]
 fn real_rust_analyzer_capped_document_stays_partial_through_import_and_rejoin() {
-    capped_document_through_import_and_rejoin(false);
+    capped_document_through_import_and_rejoin(false, OCCURRENCE_CAP);
 }
 
 /// The same, with the rejoin forced onto the FULL path, which re-decodes the stored original.
 #[test]
 fn real_rust_analyzer_capped_document_stays_partial_through_full_rejoin() {
-    capped_document_through_import_and_rejoin(true);
+    capped_document_through_import_and_rejoin(true, OCCURRENCE_CAP);
 }
 
-fn capped_document_through_import_and_rejoin(force_full: bool) {
+/// Owner ruling 2026-11-02 (#634): the same with the per-document symbol cap shrunk below
+/// src/lib.rs's 12 symbols (src/util.rs has 8). src/lib.rs is admitted with no claims under
+/// `document_cap_exceeded`, src/util.rs imports, and both rejoin paths keep the reason.
+#[test]
+fn real_rust_analyzer_symbol_capped_document_stays_partial_through_import_and_rejoin() {
+    capped_document_through_import_and_rejoin(false, SYMBOL_CAP);
+}
+
+#[test]
+fn real_rust_analyzer_symbol_capped_document_stays_partial_through_full_rejoin() {
+    capped_document_through_import_and_rejoin(true, SYMBOL_CAP);
+}
+
+/// The limits override, the capped document's diagnostic and its stored `capped` value.
+type DocumentCapCase = (&'static str, &'static str, i64);
+const OCCURRENCE_CAP: DocumentCapCase = (
+    r#"{"document_occurrences":20}"#,
+    "occurrence_cap_exceeded",
+    1,
+);
+const SYMBOL_CAP: DocumentCapCase = (r#"{"document_symbols":10}"#, "document_cap_exceeded", 2);
+
+fn capped_document_through_import_and_rejoin(
+    force_full: bool,
+    (limits, diagnostic, code): DocumentCapCase,
+) {
     use protobuf::Message;
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scip-rust-analyzer");
-    let mut env = vec![(
-        "TRELLIS_TEST_SEMANTIC_LIMITS",
-        Path::new(r#"{"document_occurrences":20}"#),
-    )];
+    let mut env = vec![("TRELLIS_TEST_SEMANTIC_LIMITS", Path::new(limits))];
     if force_full {
         env.push(("TRELLIS_TEST_FORCE_FULL_REJOIN", Path::new("1")));
     }
@@ -1843,15 +1868,18 @@ fn capped_document_through_import_and_rejoin(force_full: bool) {
     let (descriptor, sha) = world.write(&fixture);
     let imported = succeeded(&world.import(&descriptor, &sha));
     assert_eq!(imported["report"]["languages"][0]["partial"], json!(1));
-    let capped = (
-        "partial".to_owned(),
-        Some("occurrence_cap_exceeded".to_owned()),
-    );
+    let capped = ("partial".to_owned(), Some(diagnostic.to_owned()));
     assert_eq!(head_coverage(&world, "src/lib.rs"), capped);
     let util = head_coverage(&world, "src/util.rs");
-    assert_ne!(util.1.as_deref(), Some("occurrence_cap_exceeded"));
+    assert_ne!(util.1.as_deref(), Some(diagnostic));
     assert_eq!(
-        world.count("SELECT COUNT(*) FROM semantic_raw_documents WHERE capped=1"),
+        world.count(&format!(
+            "SELECT COUNT(*) FROM semantic_raw_documents WHERE capped={code} AND path='src/lib.rs'"
+        )),
+        1
+    );
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_raw_documents WHERE capped<>0"),
         1
     );
     let before = world.head();

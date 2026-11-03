@@ -271,7 +271,7 @@ mod tests {
                 "capturedDiagnostics":0,"unrecorded":0,
                 "unsupportedOccurrences":{"macroInvocation":900,"attributeItem":40,
                     "macroDefinition":0,"other":0},
-                "summary":"partial: 55 · native gaps 54, occurrence cap 2"})
+                "summary":"partial: 55 · native gaps 54, document cap 2"})
         );
         assert_eq!(
             described["data"]["languages"][0]["semantic"]["partialReasons"],

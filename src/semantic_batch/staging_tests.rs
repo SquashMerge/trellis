@@ -44,7 +44,7 @@ fn unit(path: &str) -> UnitDocument<'_> {
         path,
         language: "java",
         wire_digest: "w",
-        occurrence_cap_exceeded: false,
+        cap: None,
     }
 }
 

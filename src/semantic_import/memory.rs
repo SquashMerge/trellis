@@ -40,7 +40,7 @@ pub(super) struct MemoryJoinStore<'a> {
     coordinates: &'a CoordinateMaps,
     measured: &'a MeasuredFacts<'a>,
     sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
-    /// [`JoinStore::has_unread_source`] by language, once computed.
+    /// [`JoinStore::has_unclaimed_source`] by language, once computed.
     unread: std::cell::RefCell<BTreeMap<String, bool>>,
 }
 
@@ -281,17 +281,18 @@ impl ProofIdentities for MemoryJoinStore<'_> {
 }
 
 impl<'a> JoinStore for MemoryJoinStore<'a> {
-    fn has_unread_source(&self, language: &str) -> Result<bool> {
+    fn has_unclaimed_source(&self, language: &str) -> Result<bool> {
         if let Some(&unread) = self.unread.borrow().get(language) {
             return Ok(unread);
         }
         let hashes = crate::skipped_source::placeholder_hashes(language);
-        let unread = self
-            .measured
-            .source_documents()
-            .filter(|key| key.language == language)
-            .filter_map(|key| self.measured.document(key))
-            .any(|document| hashes.contains(&document.content_hash));
+        let unread = self.raw.excluded_languages.contains(language)
+            || self
+                .measured
+                .source_documents()
+                .filter(|key| key.language == language)
+                .filter_map(|key| self.measured.document(key))
+                .any(|document| hashes.contains(&document.content_hash));
         self.unread.borrow_mut().insert(language.to_owned(), unread);
         Ok(unread)
     }

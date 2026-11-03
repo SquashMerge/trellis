@@ -379,10 +379,15 @@ fn read_inventories(
             .collect();
         let capped_documents = conn
             .prepare(
-                "SELECT s.language, s.path FROM documents d JOIN sources s ON s.ord=d.source_ord \
-                 WHERE d.artifact=?1 AND d.capped=1",
+                "SELECT s.language, s.path, d.capped FROM documents d JOIN sources s ON s.ord=d.source_ord \
+                 WHERE d.artifact=?1 AND d.capped<>0",
             )?
-            .query_map([artifact.ordinal], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map([artifact.ordinal], |row| {
+                let code = row.get(2)?;
+                let cap = crate::scip_raw::DocumentCap::from_code(code)
+                    .ok_or(rusqlite::Error::IntegralValueOutOfRange(2, code))?;
+                Ok(((row.get(0)?, row.get(1)?), cap))
+            })?
             .collect::<rusqlite::Result<_>>()?;
         inventories.push(CapturedScipInventory {
             artifact_hashes: vec![artifact.sha256.clone()],
