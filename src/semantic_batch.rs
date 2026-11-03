@@ -1,6 +1,6 @@
 //! Bounded streamed semantic batch import: resource policy and the high-water counters that prove it.
 use crate::{model::IndexPin, scip_admission::PinnedProducer, scip_raw::ScipCaptureError};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use descriptor::Descriptor;
 use rusqlite::Connection;
 use staging::Stage;
@@ -176,6 +176,7 @@ pub struct AdmittedBatch {
     descriptor_sha256: String,
     producer: PinnedProducer,
     captured: IndexPin,
+    reimport_destination: Option<String>,
 }
 
 impl AdmittedBatch {
@@ -192,6 +193,7 @@ impl AdmittedBatch {
             descriptor_sha256,
             producer,
             captured,
+            reimport_destination: None,
         }
     }
 
@@ -227,6 +229,11 @@ impl AdmittedBatch {
         destination: IndexPin,
         cancel: &crate::model::CancelFlag,
     ) -> Result<String> {
+        self.reimport_destination = None;
+        let (captured_header, (captured_toolchain, captured_config, captured_dependencies)) = store
+            .with_native_reader(self.captured, |reader| {
+                Ok((reader.header()?, reader.retained_components()?))
+            })?;
         store.with_native_reader(destination, |reader| {
             let header = reader.header()?;
             let mismatch = || anyhow::anyhow!("stale_basis: retained source pages no longer match");
@@ -258,6 +265,26 @@ impl AdmittedBatch {
             if inventory.next_document()?.is_some() {
                 return Err(mismatch());
             }
+            let (toolchain, config, dependencies) = reader.retained_components()?;
+            let toolchain_matches = reimport_toolchain_matches(
+                captured_toolchain,
+                &captured_header.revision.toolchain_hash,
+                toolchain,
+                &header.revision.toolchain_hash,
+            )?;
+            let captured_producer = &captured_header.producer;
+            let producer = &header.producer;
+            if toolchain_matches
+                && captured_config == config
+                && captured_dependencies == dependencies
+                && captured_producer.id == producer.id
+                && captured_producer.version == producer.version
+                && captured_producer.kind == producer.kind
+                && captured_producer.position_encoding == producer.position_encoding
+                && captured_producer.languages == producer.languages
+            {
+                self.reimport_destination = Some(header.revision.id.clone());
+            }
             Ok(header.revision.id)
         })
     }
@@ -270,6 +297,7 @@ impl AdmittedBatch {
             descriptor: &self.descriptor,
             descriptor_sha256: &self.descriptor_sha256,
             producer: &self.producer,
+            reimport_destination: self.reimport_destination.as_deref(),
         })
     }
 }
@@ -279,11 +307,70 @@ pub(crate) struct JoinParts<'a> {
     pub descriptor: &'a Descriptor,
     pub descriptor_sha256: &'a str,
     pub producer: &'a PinnedProducer,
+    pub reimport_destination: Option<&'a str>,
+}
+
+/// Only Trellis's own executable identity is exempt during validated retained admission.
+fn reimport_toolchain_matches(
+    mut captured: serde_json::Value,
+    captured_hash: &str,
+    mut destination: serde_json::Value,
+    destination_hash: &str,
+) -> Result<bool> {
+    for (component, expected) in [(&captured, captured_hash), (&destination, destination_hash)] {
+        anyhow::ensure!(
+            crate::native_ids::digest(b"", &crate::native_ids::canonical(component)) == expected,
+            "incompatible_index: retained toolchain hash mismatch"
+        );
+    }
+    captured
+        .as_object_mut()
+        .context("invalid captured toolchain")?
+        .remove("nativeExecutable");
+    destination
+        .as_object_mut()
+        .context("invalid destination toolchain")?
+        .remove("nativeExecutable");
+    Ok(captured == destination)
 }
 
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn retained_toolchain_exempts_only_native_executable_after_hash_validation() {
+        let captured = serde_json::json!({"nativeExecutable":"binary-a", "rootRustToolchainToml":null, "futureContext":"same"});
+        let hash = |value: &serde_json::Value| {
+            crate::native_ids::digest(b"", &crate::native_ids::canonical(value))
+        };
+        let mut destination = captured.clone();
+        destination["nativeExecutable"] = serde_json::json!("binary-b");
+        let matches = |destination: &serde_json::Value| {
+            reimport_toolchain_matches(
+                captured.clone(),
+                &hash(&captured),
+                destination.clone(),
+                &hash(destination),
+            )
+            .unwrap()
+        };
+        assert!(matches(&destination));
+        destination["rootRustToolchainToml"] = serde_json::json!({"hash":"changed-selector"});
+        assert!(!matches(&destination));
+        destination = captured.clone();
+        destination["futureContext"] = serde_json::json!("changed");
+        assert!(!matches(&destination));
+        assert!(
+            reimport_toolchain_matches(
+                captured.clone(),
+                &"0".repeat(64),
+                destination.clone(),
+                &hash(&destination)
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn lookup_budget_fails_typed_once_the_limit_is_passed() {

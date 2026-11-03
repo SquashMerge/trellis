@@ -24,6 +24,7 @@ struct World {
     marker: PathBuf,
     index: PathBuf,
     requests: PathBuf,
+    language: &'static str,
 }
 
 fn reply(operation: &str, output: Output) -> Value {
@@ -45,20 +46,36 @@ impl World {
     }
 
     fn with_named_hook(name: &str, hook: Option<&Path>) -> Self {
+        Self::for_language("javascript", name, hook)
+    }
+
+    fn for_language(language: &'static str, name: &str, hook: Option<&Path>) -> Self {
         let stub = tempfile::tempdir().unwrap();
         let marker = stub.path().join("invocations");
         let mut env = support::stub_env(stub.path(), &json!({"marker":marker}));
+        env.push((
+            "TRELLIS_TEST_PRODUCER_STUB_LANGUAGE".into(),
+            language.into(),
+        ));
         if let Some(hook) = hook {
             env.push((name.into(), hook.to_string_lossy().into_owned()));
         }
         let checkout = start_checkout(
             |root| {
-                uniform_workspace(root, &["javascript"], 1);
-                fs::write(
-                    root.join("javascript/u00000.js"),
-                    "function u00000() { g(); }\nfunction g() {}\n",
-                )
-                .unwrap();
+                uniform_workspace(root, &[language], 1);
+                let (path, source) = if language == "rust" {
+                    ("rust/u00000.rs", "fn u00000() { g(); }\nfn g() {}\n")
+                } else {
+                    (
+                        "javascript/u00000.js",
+                        "function u00000() { g(); }\nfunction g() {}\n",
+                    )
+                };
+                fs::write(root.join(path), source).unwrap();
+                if name == "multi-producer" && language == "javascript" {
+                    fs::write(root.join("other.rs"), "fn other() {}\n").unwrap();
+                    fs::create_dir(root.join(".trellis-semantic-batch-2")).unwrap();
+                }
             },
             &env,
         );
@@ -73,6 +90,7 @@ impl World {
             marker,
             index,
             requests,
+            language,
         }
     }
 
@@ -83,19 +101,24 @@ impl World {
     fn spawn_run_variant(&self, variant: u32) -> Child {
         let mut fixture =
             BatchFixture::from_published(&self.index, &self.checkout.root).synthetic();
+        let (definition, call, target) = if self.language == "rust" {
+            ([0, 3, 9], [0, 14, 15], [1, 3, 4])
+        } else {
+            ([0, 9, 15], [0, 20, 21], [1, 9, 10])
+        };
         let docs = fixture
-            .paths("javascript")
+            .paths(self.language)
             .into_iter()
             .map(|doc| {
-                doc.occurrence(&[0, 9, 15], &[], "pkg u00000().", 1)
-                    .occurrence(&[0, 20, 21], &[], "pkg g().", 0)
-                    .occurrence(&[1, 9, 10], &[], "pkg g().", 1)
+                doc.occurrence(&definition, &[], "pkg u00000().", 1)
+                    .occurrence(&call, &[], "pkg g().", 0)
+                    .occurrence(&target, &[], "pkg g().", 1)
                     .symbol("pkg u00000().", 17, &[])
                     .symbol("pkg g().", 17, &[])
             })
             .collect::<Vec<_>>();
-        fixture.artifact("javascript", docs.clone());
-        let bytes = edit_scip(&fixture.scip_bytes("javascript", &docs), |index| {
+        fixture.artifact(self.language, docs.clone());
+        let bytes = edit_scip(&fixture.scip_bytes(self.language, &docs), |index| {
             let metadata = index.metadata.as_mut().unwrap();
             metadata.project_root = String::new();
             metadata
@@ -215,6 +238,97 @@ impl World {
         fs::read_to_string(&self.marker).map_or(0, |text| text.lines().count())
     }
 
+    fn assert_semantic_sequence(&self, status: &Value, original: &Value) {
+        use axum::{
+            body::{Body, to_bytes},
+            http::Request,
+        };
+        use tower::ServiceExt;
+
+        let roots = TopologyRoots::isolated_for_tests(
+            cache_dir(&self.checkout.home),
+            data_dir(&self.checkout.home),
+        );
+        let identity =
+            WorkspaceIdentity::discover(Some(&self.checkout.root), &self.checkout.root).unwrap();
+        let store = trellis::store::Store::open(roots, identity).unwrap();
+        let pin = serde_json::from_value(status["revision"].clone()).unwrap();
+        let (seed, target) = store
+            .with_native_reader(pin, |reader| {
+                let mut inventory = reader.inventory()?;
+                let document = loop {
+                    let document = inventory.next_document()?.unwrap();
+                    if document.key.language == self.language {
+                        break document;
+                    }
+                };
+                let rows = reader.document(&document)?;
+                Ok((
+                    rows.declarations
+                        .iter()
+                        .find(|d| d.name.as_deref() == Some("u00000"))
+                        .unwrap()
+                        .syntax_id
+                        .clone(),
+                    rows.declarations
+                        .iter()
+                        .find(|d| d.name.as_deref() == Some("g"))
+                        .unwrap()
+                        .syntax_id
+                        .clone(),
+                ))
+            })
+            .unwrap();
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let app = trellis::http::router(
+            trellis::http::new(
+                store,
+                trellis::indexer::IndexOptions::new(self.checkout.root.clone()),
+                token.into(),
+                "127.0.0.1:7331".parse().unwrap(),
+            )
+            .unwrap(),
+        );
+        let view: Value = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/sequence")
+                        .header("host", "127.0.0.1:7331")
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"seed":seed,"expectedRevision":pin,"showAll":true}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap()
+        });
+        assert_eq!(view["revision"], status["revision"]);
+        assert_eq!(view["semantic"]["tier"], "semantic", "{view}");
+        assert_eq!(view["semantic"]["producerId"], PRODUCER);
+        let step = view["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["target"] == target)
+            .unwrap();
+        assert_eq!(step["callEvidence"]["freshness"], "fresh");
+        assert_eq!(step["callEvidence"]["boundaryReason"], "none");
+        let basis = &step["callEvidence"]["semanticBasis"];
+        assert_eq!(basis["revisionId"], original["sourceRevision"]);
+        assert_eq!(
+            basis["toolchainHash"],
+            original["components"]["toolchainHash"]
+        );
+        assert_eq!(basis["artifactHash"], original["artifacts"][0]["sha256"]);
+    }
+
     fn assert_recovered_basis(&self, status: &Value, original: &Value) {
         let js = status["semanticLanguages"]
             .as_array()
@@ -230,7 +344,7 @@ impl World {
             js["internal"].as_u64().unwrap() > 0,
             "recovered semantic call target must remain usable"
         );
-        // Same source bytes with a different captured revision retain conservative freshness.
+        // This existing race also changes maxFileBytes, so it remains conservative.
         assert_eq!(js["semanticState"], "stale");
         let key = format!(
             "pin:v1:{}:{}",
@@ -257,6 +371,244 @@ impl World {
             vec![original["sourceRevision"].as_str().unwrap().to_owned()]
         );
     }
+}
+
+#[test]
+fn binary_only_retained_recovery_is_fresh_at_head() {
+    binary_only_recovery("javascript");
+}
+
+#[test]
+fn rust_binary_only_retained_recovery_is_fresh_at_head() {
+    binary_only_recovery("rust");
+}
+
+#[test]
+fn recovered_freshness_does_not_survive_real_context_changes() {
+    for (path, bytes) in [
+        ("Cargo.lock", "version = 4\n"),
+        ("rust-toolchain.toml", "[toolchain]\nchannel = \"stable\"\n"),
+        (".gitignore", "ignored-directory/\n"),
+    ] {
+        binary_only_recovery_with_drift("javascript", Some((path, bytes)));
+    }
+}
+
+fn binary_only_recovery(language: &'static str) {
+    binary_only_recovery_with_drift(language, None);
+}
+
+fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, &str)>) {
+    use std::io::Write;
+    let world = World::for_language(language, "multi-producer", None);
+    let (_, original, options) = world.run_once();
+    let descriptor: Value = serde_json::from_slice(&original).unwrap();
+    let old = world.status()["revision"].clone();
+    let read_context = || {
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.query_row("SELECT n.retained_toolchain,n.retained_config,n.retained_dependencies FROM native_revisions n JOIN index_metadata m ON n.id='pin:v1:'||m.index_generation||':'||m.index_revision", [], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?))).unwrap()
+    };
+    let original_context = read_context();
+    let original_key = format!(
+        "pin:v1:{}:{}",
+        old["indexGeneration"].as_str().unwrap(),
+        old["indexRevision"].as_u64().unwrap()
+    );
+    let original_proofs = || {
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.prepare("SELECT p.provenance_id,p.freshness,p.derived_from_provenance_id,p.derived_from_fact_digest FROM semantic_provenance p JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.selected=1 ORDER BY p.provenance_id")
+            .unwrap().query_map([&original_key], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,Option<String>>(2)?,row.get::<_,Option<String>>(3)?)))
+            .unwrap().map(Result::unwrap).collect::<Vec<_>>()
+    };
+    let captured_proofs = original_proofs();
+    assert!(!captured_proofs.is_empty());
+    let run_dir = Path::new(options["descriptor"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let pages = descriptor["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|page| {
+            let path = run_dir.join(page["relativePath"].as_str().unwrap());
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    support::stop_daemon(&world.checkout.home);
+    let binary = world._stub.path().join("trellis-freshness");
+    fs::copy(env!("CARGO_BIN_EXE_trellis"), &binary).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&binary)
+        .unwrap()
+        .write_all(b"TRELLIS-RETAINED-FRESHNESS")
+        .unwrap();
+    let rebuilt_cli = || {
+        let mut cli = trellis::testing::owned(std::process::Command::new(&binary));
+        cli.env("HOME", &world.checkout.home)
+            .env(
+                "TRELLIS_TEST_DAEMON_PID_FILE",
+                world.checkout.home.join("daemon.pid"),
+            )
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("XDG_DATA_HOME");
+        cli
+    };
+    reply(
+        "binary-only index",
+        rebuilt_cli()
+            .args(["index", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    trellis::testing::wait_until("binary-only retained input completes", || {
+        let rows = world.generated_rows();
+        rows.len() == 2 && matches!(rows[1].0.as_str(), "done" | "failed")
+    });
+    let rows = world.generated_rows();
+    assert_eq!(rows[1].0, "done", "{rows:?}");
+    assert_eq!(rows[1].2, options);
+    let status = reply(
+        "binary-only status",
+        rebuilt_cli()
+            .args(["status", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        status["revision"]["indexGeneration"],
+        old["indexGeneration"]
+    );
+    let recovered_context = read_context();
+    let without_binary = |text: &str| {
+        let mut value: Value = serde_json::from_str(text).unwrap();
+        value.as_object_mut().unwrap().remove("nativeExecutable");
+        value
+    };
+    assert_eq!(
+        without_binary(&original_context.0),
+        without_binary(&recovered_context.0)
+    );
+    assert_eq!(original_context.1, recovered_context.1);
+    assert_eq!(original_context.2, recovered_context.2);
+    world.assert_semantic_sequence(&status, &descriptor);
+    let language_row = status["semanticLanguages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["language"] == language)
+        .unwrap();
+    assert_eq!(language_row["semanticState"], "fresh");
+    if language == "javascript" && drift.is_none() {
+        let mut fixture = BatchFixture::from_published(&world.index, &world.checkout.root)
+            .reference("rust-analyzer");
+        let docs = fixture
+            .paths("rust")
+            .into_iter()
+            .map(|doc| {
+                doc.occurrence(
+                    &[0, 3, 8],
+                    &[],
+                    "rust-analyzer cargo fixture 0.1.0 other().",
+                    1,
+                )
+                .symbol("rust-analyzer cargo fixture 0.1.0 other().", 17, &[])
+            })
+            .collect::<Vec<_>>();
+        fixture.artifact("rust", docs);
+        let (batch, sha) = fixture.write(&world.checkout.root.join(".trellis-semantic-batch-2"));
+        reply(
+            "second producer staged publication",
+            rebuilt_cli()
+                .args(["semantic", "import", "--workspace"])
+                .arg(&world.checkout.root)
+                .arg("--batch")
+                .arg(batch)
+                .args(["--batch-sha256", &sha])
+                .output()
+                .unwrap(),
+        );
+        let later = reply(
+            "later semantic-only status",
+            rebuilt_cli()
+                .args(["status", "--workspace"])
+                .arg(&world.checkout.root)
+                .output()
+                .unwrap(),
+        );
+        assert!(
+            later["revision"]["indexRevision"].as_u64().unwrap()
+                > status["revision"]["indexRevision"].as_u64().unwrap()
+        );
+        world.assert_semantic_sequence(&later, &descriptor);
+        let js = later["semanticLanguages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["language"] == "javascript")
+            .unwrap();
+        assert_eq!(js["semanticState"], "fresh");
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let selected: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_coverage c JOIN index_metadata m ON c.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE c.selected=1 AND c.producer_id='rust-analyzer' AND c.language='rust')", [], |row| row.get(0)).unwrap();
+        assert!(selected);
+    }
+    assert_eq!(
+        original_proofs(),
+        captured_proofs,
+        "historical proofs must remain immutable"
+    );
+    for (path, bytes) in pages {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    if let Some((path, bytes)) = drift {
+        fs::write(world.checkout.root.join(path), bytes).unwrap();
+        reply(
+            "context drift index",
+            rebuilt_cli()
+                .args(["index", "--workspace"])
+                .arg(&world.checkout.root)
+                .output()
+                .unwrap(),
+        );
+        let changed = reply(
+            "context drift status",
+            rebuilt_cli()
+                .args(["status", "--workspace"])
+                .arg(&world.checkout.root)
+                .output()
+                .unwrap(),
+        );
+        let language_row = changed["semanticLanguages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["language"] == language)
+            .unwrap();
+        assert_ne!(language_row["semanticState"], "fresh", "{path}: {changed}");
+        assert_eq!(
+            original_proofs(),
+            captured_proofs,
+            "historical proofs changed after {path}"
+        );
+    }
+    assert_eq!(world.invocation_count(), 1);
+    assert_eq!(
+        fs::read(options["descriptor"].as_str().unwrap()).unwrap(),
+        original
+    );
+    assert_eq!(descriptor["sourceRevision"].as_str().unwrap(), {
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.query_row("SELECT b.captured_native_revision_id FROM semantic_basis b JOIN semantic_coverage c USING(tuple_id) JOIN index_metadata m ON c.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE c.selected=1 AND c.producer_id='trellis-synthetic-scip' LIMIT 1", [], |row| row.get::<_, String>(0)).unwrap()
+    });
 }
 
 #[test]

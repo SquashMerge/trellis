@@ -1456,6 +1456,7 @@ struct StagedJoin<'a> {
     destination: StagedSide<'a>,
     filtered: StagedSide<'a>,
     destination_header: &'a NativeHeader,
+    reimport_context_matches: bool,
     validator: EmissionValidator<'a>,
     basis: StagedBasis<'a>,
     emitted: Cell<[i64; 7]>,
@@ -2597,6 +2598,8 @@ pub fn join_staged(
                     true,
                 ),
                 destination_header: &destination_header,
+                reimport_context_matches: parts.reimport_destination
+                    == Some(destination_header.revision.id.as_str()),
                 validator: EmissionValidator::new(EmissionHeader {
                     producer: &producer,
                     captured_revision: captured_header.revision.clone(),
