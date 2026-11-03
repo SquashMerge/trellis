@@ -74,8 +74,8 @@ fn obsolete(world: Inproc) -> Inproc {
     let version: u32 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 35);
-    db.pragma_update(None, "user_version", 34).unwrap();
+    assert_eq!(version, 36);
+    db.pragma_update(None, "user_version", version - 1).unwrap();
     drop(db);
     let store = Store::open_for_tests(_state.path(), &root).unwrap();
     assert!(store.recovery_pending_for_tests());
