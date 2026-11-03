@@ -664,3 +664,244 @@ fn documents_missing_from_the_artifact_are_rejected_at_the_end() {
         Err(ScipCaptureError::InvalidArtifact(reason)) if reason == "missing artifact document"
     ));
 }
+
+// Differential fixtures deliberately construct raw SCIP fields independently of the decoder.
+// Proof IDs include the artifact hash, so only envelopes and fact digests can be equal across
+// the two artifacts; each side's proof is checked against its own authenticated artifact hash.
+#[derive(Default, Debug, PartialEq)]
+struct DifferentialSink {
+    caps: BTreeMap<String, Option<DocumentCap>>,
+    claims: BTreeMap<String, Vec<CapturedClaim>>,
+    current: String,
+}
+
+impl ClaimSink for DifferentialSink {
+    fn begin_document(&mut self, doc: &UnitDocument<'_>) -> Result<(), ScipCaptureError> {
+        self.current = doc.path.to_owned();
+        assert!(self.caps.insert(self.current.clone(), doc.cap).is_none());
+        Ok(())
+    }
+    fn claim(&mut self, claim: CapturedClaim) -> Result<(), ScipCaptureError> {
+        assert_eq!(self.current, claim.envelope.relative_path);
+        self.claims
+            .entry(self.current.clone())
+            .or_default()
+            .push(claim);
+        Ok(())
+    }
+    fn end_document(&mut self) -> Result<(), ScipCaptureError> {
+        self.current.clear();
+        Ok(())
+    }
+}
+
+fn differential_document(path: &str, count: usize) -> Vec<u8> {
+    let mut body = [message(1, path.as_bytes()), message(4, b"javascript")].concat();
+    // Both occurrences and symbols must be discarded in the over-cap document.
+    body.extend(message(
+        2,
+        &[
+            message(1, &[0, 9, 10]),
+            message(2, b"local#"),
+            vec![0x18, 1],
+        ]
+        .concat(),
+    ));
+    for i in 0..count {
+        body.extend(message(
+            3,
+            &[message(1, format!("symbol{i}#").as_bytes()), vec![0x28, 17]].concat(),
+        ));
+    }
+    body.extend([0x30, 1]);
+    message(2, &body)
+}
+
+fn differential_decode(
+    bytes: &[u8],
+    documents: usize,
+    limits: &BatchLimits,
+) -> (DifferentialSink, BatchCounters, u64) {
+    let hash = sha(bytes);
+    let roots = ModuleRoots::default();
+    let targets = CargoTargets::default();
+    let artifact = AuthenticatedArtifact {
+        artifact_hash: &hash,
+        producer_id: "scip-test",
+        producer_version: "1.0.0",
+        source_set_id: "app",
+        source_revision: "r1",
+        position_encoding: 1,
+        protocol_version: 0,
+        text_document_encoding: 1,
+        project_root_uri: "file:///synthetic",
+        module_roots: &roots,
+        cargo_targets: &targets,
+        assigned_documents: documents as u64,
+    };
+    let mut sink = DifferentialSink::default();
+    let mut counters = BatchCounters::default();
+    let (result, _, peak) = crate::test_alloc::measure_peak(|| {
+        decode_streaming(
+            bytes,
+            bytes.len() as u64,
+            &artifact,
+            &mut |_: &str, _: &str| {
+                Ok(DocumentSource {
+                    language: "javascript".into(),
+                    bytes: Cow::Borrowed(SOURCE),
+                    content_hash: sha(SOURCE),
+                })
+            },
+            &mut counters,
+            limits,
+            &mut sink,
+            &flag(),
+        )
+    });
+    assert_eq!(result.unwrap().documents, documents as u64);
+    assert_eq!(counters.live_unit_buffers, 0);
+    assert_eq!(counters.live_unit_buffers_high_water, 1);
+    assert!(counters.unit_buffer_high_water_bytes <= limits.unit_expansion_bytes);
+    assert!(counters.unit_reservation_high_water_bytes <= limits.unit_expansion_bytes);
+    (sink, counters, peak)
+}
+
+fn check_proofs(sink: &DifferentialSink, hash: &str) {
+    for (path, claims) in &sink.claims {
+        for claim in claims {
+            assert_eq!(claim.artifact_hash, hash);
+            assert_eq!(
+                claim.fact_digest,
+                digest(b"trellis.semantic-fact.v1\0", &claim.canonical_bytes)
+            );
+            // Fixture paths contain no escapable characters; keys are in canonical order.
+            let tuple = format!(
+                "{{\"artifactHash\":\"{hash}\",\"factDigest\":\"{}\",\"language\":\"javascript\",\"producerId\":\"scip-test\",\"relativePath\":\"{path}\",\"sourceRevision\":\"r1\",\"sourceSetId\":\"app\"}}",
+                claim.fact_digest
+            );
+            assert_eq!(
+                claim.captured_proof_id,
+                digest(b"trellis.capture-proof.v1\0", tuple.as_bytes())
+            );
+        }
+    }
+}
+
+fn differential_case(cap: usize, counts: &[usize], position: usize, excess: usize) -> (u64, u64) {
+    let limits = BatchLimits {
+        document_symbols: cap as u64,
+        ..BatchLimits::PRODUCTION
+    };
+    let docs: Vec<_> = counts
+        .iter()
+        .enumerate()
+        .map(|(i, &count)| differential_document(&format!("src/d{i}.js"), count))
+        .collect();
+    let base = docs.concat();
+    let excluded_path = "src/excluded.js";
+    let excluded = differential_document(excluded_path, cap + excess);
+    let mut with = docs.clone();
+    with.insert(position, excluded);
+    let largest_unit = with
+        .iter()
+        .map(|doc| next_field(doc, 0).unwrap().2.len() as u64)
+        .max()
+        .unwrap();
+    let with = with.concat();
+    let (baseline, base_counters, _) = differential_decode(&base, counts.len(), &limits);
+    let (actual, counters, peak) = differential_decode(&with, counts.len() + 1, &limits);
+    assert_eq!(
+        baseline,
+        differential_decode(&base, counts.len(), &limits).0
+    );
+    assert_eq!(
+        actual,
+        differential_decode(&with, counts.len() + 1, &limits).0
+    );
+    assert_eq!(
+        actual.caps.get(excluded_path),
+        Some(&Some(DocumentCap::Document))
+    );
+    assert_eq!(DocumentCap::Document.diagnostic(), "document_cap_exceeded");
+    assert!(!actual.claims.contains_key(excluded_path));
+    assert_eq!(actual.caps.len(), counts.len() + 1);
+    check_proofs(&baseline, &sha(&base));
+    check_proofs(&actual, &sha(&with));
+    for (i, count) in counts.iter().enumerate() {
+        let path = format!("src/d{i}.js");
+        assert_eq!(actual.caps.get(&path), Some(&None));
+        let expected = &baseline.claims[&path];
+        let observed = &actual.claims[&path];
+        assert_eq!(expected.len(), count + 1, "positive control {path}");
+        assert_eq!(observed.len(), expected.len());
+        for (a, b) in expected.iter().zip(observed) {
+            assert_eq!(
+                (&a.canonical_bytes, &a.fact_digest),
+                (&b.canonical_bytes, &b.fact_digest),
+                "{path}"
+            );
+        }
+    }
+    // Whole wire unit + reader + fixed allocation overhead; does not represent all process RSS.
+    assert!(
+        peak <= (with.len() as u64) * 4 + 1_048_576,
+        "peak={peak}, bytes={}",
+        with.len()
+    );
+    assert!(counters.candidates > base_counters.candidates);
+    assert_eq!(counters.unit_buffer_high_water_bytes, largest_unit);
+    (peak, counters.unit_buffer_high_water_bytes)
+}
+
+#[test]
+fn generated_symbol_cap_document_isolation() {
+    let cases: usize = std::env::var("TRELLIS_CAP_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
+    let mut rng = 20261102u64;
+    let mut sample = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut max_peak = 0;
+    let mut max_unit = 0;
+    let mut positions = [0usize; 3];
+    for case in 0..cases {
+        let cap = 1 + sample() as usize % 6;
+        let n = 2 + sample() as usize % 4;
+        let mut counts: Vec<_> = (0..n).map(|_| sample() as usize % (cap + 1)).collect();
+        // Every generated case deliberately covers both at-cap and below-cap documents.
+        counts[0] = cap;
+        counts[1] = cap - 1;
+        let position = sample() as usize % (n + 1);
+        let excess = 1 + sample() as usize % 4;
+        positions[if position == 0 {
+            0
+        } else if position == n {
+            2
+        } else {
+            1
+        }] += 1;
+        let (peak, unit) = std::panic::catch_unwind(|| differential_case(cap, &counts, position, excess))
+            .unwrap_or_else(|_| panic!("seed=20261102 case={case} cap={cap} counts={counts:?} position={position} excess={excess}"));
+        max_peak = max_peak.max(peak);
+        max_unit = max_unit.max(unit);
+    }
+    eprintln!(
+        "seed=20261102 cases={cases} first/middle/last={positions:?} max_peak={max_peak} max_unit={max_unit}"
+    );
+}
+
+#[test]
+fn production_symbol_cap_document_isolation() {
+    let cap = BatchLimits::PRODUCTION.document_symbols as usize;
+    let (peak, unit) = differential_case(cap, &[1, 2], 1, 1);
+    eprintln!(
+        "production cap={cap} excluded={} peak={peak} unit={unit}",
+        cap + 1
+    );
+}
