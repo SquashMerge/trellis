@@ -304,28 +304,32 @@ contract meaning changes, and the server response is the same.
   call to the return. They mark only that the following steps are the caller's again, as the
   DTO's order already says: not an observed return, value, timing or runtime activation.
 - **Folding.** Every other shown step folds with its whole subtree: branches, loops, effects,
-  boundaries, same-column calls and calls without an exact target. Consecutive folded steps
-  of one column form one run, drawn as one badge on that column, "▸ +N internal steps". A run
-  ends at an arrow and at the edge of a frame that holds one, so it never mixes the arms of a
-  branch. N counts the run's shown DTO steps, nested ones included (a collapsed chain's
-  members too); hidden incidental steps are not counted, as they are not shown. The badge
-  adds:
+  boundaries, same-column calls and calls without an exact target. Owner ruling on #638: in
+  each column, every folded step between two arrows (or before the first, or after the last)
+  forms one run, drawn as one badge on that column, "▸ +N internal steps". A run never spans
+  an arrow; it does span the edges of the frames that hold arrows. N counts the run's shown
+  DTO steps, nested ones included (a collapsed chain's members too); hidden incidental steps
+  are not counted, as they are not shown. The badge adds, as a summary of its steps:
   - " · M without a target" for the measured calls among them that have no verified exact
     target (unresolved, ambiguous, dispatch, external, stale or unbound): the DTO does not
     say which column they reach, so none is counted as staying;
-  - the run's scope (" · in loop" or " · conditional", below);
+  - " · in loop" or " · conditional" when all its steps are in that scope (below), and
+    " · some in loop" or " · some conditional" when only some are;
   - " · may exit early" when a step in it carries the calls-first early-exit mark (a frame
     holding a `return`, `throw` or `exit`, or a call with a folded `?`), so later arrows are
     not read as unconditional. A plain final `return` is not an early exit.
 
   A badge is a disclosure: it expands in place to exactly those steps (compact labels, as
-  calls-first draws them, with the run's scope) and folds again. Each revealed step selects
+  calls-first draws them) and folds again. Expanded, its steps draw inside the branch, loop
+  and try frames that hold them, which are drawn again with their headers, so their structure
+  is intact; the extra header rows renumber the arrows after them. Each revealed step selects
   the original DTO step, as before.
 - **Enclosing frames.** A branch, loop, try, chain or same-column call that encloses an arrow
-  draws no row or frame in Interactions; its steps draw in its place, and it is in no badge.
-  An arrow or run inside a loop is marked " · in loop"; one inside another branch (other than
-  an "only if the preceding path continues normally" guard) or inside a try's handlers
-  (`alternate`) is marked " · conditional". A loop's mark wins over a branch inside it. Show
+  draws no row or frame in Interactions while no badge inside it is expanded; its steps draw
+  in its place, and it is in no badge. An arrow or folded step inside a loop is in scope
+  " · in loop"; one inside another branch (other than an "only if the preceding path
+  continues normally" guard) or inside a try's handlers (`alternate`) is " · conditional".
+  A loop's scope wins over a branch inside it. An arrow carries its scope in its label. Show
   all steps keeps every frame.
 - **Inspector.** Selecting an arrow, or a step revealed by a badge, shows the same step and
   evidence as the step view. A badge itself only expands and folds.

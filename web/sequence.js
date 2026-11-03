@@ -233,8 +233,9 @@ function sequenceBadgeDetail(badge) {
 // - every other shown step folds, with its subtree, into the run of its own column between two
 //   arrows: one badge per run, which expands in place to exactly those steps;
 // - a frame, chain or same-column call that encloses an arrow is `through`: it draws no row and
-//   its members draw in its place. An arrow inside a loop, or a branch or try other than a
-//   continuation guard, says so (" · in loop", " · conditional"); Show all steps has the frames.
+//   its members draw in its place, until a badge with steps inside it expands. An arrow inside a
+//   loop, or a branch or try handler other than a continuation guard, says so (" · in loop",
+//   " · conditional"); a badge says so for all or some of its steps.
 function sequenceInteractions(view, options, earlyReturn) {
   const visible = new Set(), through = new Set(), badges = new Map(), returns = new Set(), holds = new Set(), scopes = new Map();
   const expanded = options.expandedBadges || new Set();
@@ -269,33 +270,41 @@ function sequenceInteractions(view, options, earlyReturn) {
   const continuation = step => step.kind === "branch" && step.label === "only if the preceding path continues normally";
   const within = (step, scope, handlers) => scope === LOOP || step.kind === "loop" ? LOOP
     : step.kind === "branch" && !continuation(step) || step.kind === "try" && handlers ? CONDITIONAL : scope;
+  // One run per column between two arrows (owner, #638): it never spans an arrow, but it does
+  // span the edges of the frames that hold them. Its qualifiers summarize its steps' scopes.
+  // Expanded, it draws its steps inside those frames (branch, loop, try), so their structure
+  // is intact; chains and same-column calls stay `through`.
   let run = null;
-  // A run never crosses an arrow, nor the edge of a frame that holds one.
-  const place = (steps, scope) => {
-    run = null;
+  const place = (steps, scope, frames) => {
     for (const step of steps || []) {
       if (step.hidden) continue;
       if (returns.has(step)) {
         run = null; visible.add(step); if (scope) scopes.set(step, scope);
-        place(step.children, scope); place(step.alternate, scope);
+        place(step.children, scope, frames); place(step.alternate, scope, frames);
         run = null; continue;
       }
       if (holds.has(step)) {
         through.add(step);
-        place(step.children, within(step, scope, false)); place(step.alternate, within(step, scope, true));
-        run = null; continue;
+        const inner = ["call", "group"].includes(step.kind) ? frames : [...frames, step];
+        place(step.children, within(step, scope, false), inner); place(step.alternate, within(step, scope, true), inner);
+        continue;
       }
       const column = sequenceStepColumn(view, step).id;
       if (!run || run.column !== column) {
-        run = {id:step.id, column, first:step, steps:[], count:0, untargeted:0, exits:false, scope, expanded:expanded.has(step.id)};
+        run = {id:step.id, column, first:step, steps:[], frames:new Set(), count:0, untargeted:0, exits:false, loop:0, conditional:0, expanded:expanded.has(step.id)};
         badges.set(step, run);
       }
-      if (scope) scopes.set(step, scope);
       run.steps.push(step); tally(step, run);
+      if (scope === LOOP) run.loop++; else if (scope === CONDITIONAL) run.conditional++;
+      for (const frame of frames) run.frames.add(frame);
     }
-    run = null;
   };
-  place(view?.steps, "");
+  place(view?.steps, "", []);
+  for (const badge of badges.values()) {
+    const qualifier = (count, word) => !count ? "" : count === badge.steps.length ? ` · ${word}` : ` · some ${word}`;
+    badge.scope = qualifier(badge.loop, "in loop") + qualifier(badge.conditional, "conditional");
+    if (badge.expanded) for (const frame of badge.frames) { through.delete(frame); visible.add(frame); }
+  }
   for (const badge of badges.values()) {
     badge.label = sequenceBadgeLabel(badge);
     badge.ariaLabel = `${badge.expanded ? "Fold" : "Show"} ${badge.count} internal ${badge.count === 1 ? "step" : "steps"}${sequenceBadgeDetail(badge)}`;

@@ -71,10 +71,10 @@ const INTERACTIONS = {interactions:true};
 const ARROWS = ["c-open", "c-start", "c-refresh", "c-deliver", "c-deliver>show", "c-helper>run"];
 const LABELS = ["[001] open", "[002] start", "[003] refresh · conditional", "[004] deliver", "[005] show", "[006] run"];
 const RETURNS = ["c-open", "c-start", "c-refresh", "c-deliver>show", "c-deliver", "c-helper>run"];
-// A run stops at an arrow and at the edge of a frame that holds one: the branch's two arms
-// are two runs, each marked conditional. A run that may exit says so.
+// One badge per column between two arrows (#638): the rest of the branch's then-arm and its
+// else-arm are one run, marked conditional. A run that may exit says so.
 const BADGES = [["e1", "▸ +4 internal steps · 1 without a target · may exit early"], ["loop4", "▸ +3 internal steps · 1 without a target"],
-  ["e6", "▸ +1 internal step · conditional"], ["u3", "▸ +1 internal step · 1 without a target · conditional"],
+  ["e6", "▸ +2 internal steps · 1 without a target · conditional"],
   ["d1", "▸ +1 internal step"], ["d3", "▸ +1 internal step · 1 without a target"], ["e9", "▸ +2 internal steps · 1 without a target"]];
 
 async function render(view, options = INTERACTIONS) {
@@ -85,12 +85,12 @@ async function render(view, options = INTERACTIONS) {
     return {status:result.status, reason:result.reason};
   }, {view, options});
 }
-function legacy(view, options = INTERACTIONS) {
-  return page.evaluate(({view, options}) => {
+function legacy(view, options = INTERACTIONS, expanded = []) {
+  return page.evaluate(({view, options, expanded}) => {
     const container = document.getElementById("sequence-diagram");
     window.view = view; window.picks = [];
-    TrellisSequence.render(container, view, null, new Set(), {...options, onSelect:step => window.picks.push(step)});
-  }, {view, options});
+    TrellisSequence.render(container, view, null, new Set(), {...options, expandedBadges:new Set(expanded), onSelect:step => window.picks.push(step)});
+  }, {view, options, expanded});
 }
 const ids = (selector, attribute) => page.locator(selector).evaluateAll((nodes, attribute) => nodes.map(node => node.getAttribute(attribute)), attribute);
 const badgeTexts = () => page.locator("#sequence-diagram [data-trellis-badge-id]").evaluateAll(nodes => nodes.map(node => [node.getAttribute("data-trellis-badge-id"), node.textContent]));
@@ -159,6 +159,27 @@ test("a Pele badge expands in place to its exact steps and folds again", async (
   await page.waitForFunction(() => document.querySelector('[data-trellis-badge-id="e1"]')?.getAttribute("aria-expanded") === "false");
   assert.deepEqual(await ids("#sequence-diagram .pele-note[data-trellis-step-id]", "data-trellis-step-id"), []);
   assert.deepEqual(await badgeTexts(), BADGES);
+});
+
+test("a badge that spans a frame's edge expands inside that frame, and the summary says some", async () => {
+  const view = coordinateView();
+  assert.equal((await render(view)).status, "rendered");
+  await page.locator('#sequence-diagram [data-trellis-badge-id="e6"]').click();
+  await page.waitForFunction(() => document.querySelector('[data-trellis-badge-id="e6"]')?.getAttribute("aria-expanded") === "true");
+  // The branch is drawn again, with both arms: its header row renumbers the arrows after it.
+  assert.deepEqual(await ids("#sequence-diagram .pele-note[data-trellis-step-id]", "data-trellis-step-id"), ["if6", "e6", "u3"]);
+  assert.deepEqual(await page.locator("#sequence-diagram .pele-frame-alt").count(), 1);
+  assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(),
+    ["[001] open", "[002] start", "[004] refresh · conditional", "[007] deliver", "[008] show", "[009] run"]);
+  await legacy(view, INTERACTIONS, ["e6"]);
+  assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ["c-open", "c-start", "if6", "c-refresh", "e6", "u3", "c-deliver", "c-deliver>show", "c-helper>run"]);
+  // A run of which only part sits in a loop says so.
+  const mixed = coordinateView(), [e1, , , loop] = mixed.steps;
+  loop.children.push({...structuredClone(mixed.steps[2]), id:"c-loop-open", callId:"callid:c-loop-open"});
+  mixed.steps = [e1, loop];
+  assert.equal((await render(mixed)).status, "rendered");
+  assert.deepEqual(await badgeTexts(), [["e1", "▸ +3 internal steps · 1 without a target · some in loop"]]);
+  assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(), ["[001] open · in loop"]);
 });
 
 test("selecting an arrow hands the inspector the original step and evidence", async () => {
