@@ -47,7 +47,13 @@ impl Target {
             Self::Real(producer) => {
                 crate::scip_admission::producer_language(producer.as_str()).unwrap_or("javascript")
             }
-            Self::Stub => "javascript",
+            Self::Stub => {
+                #[cfg(feature = "test-support")]
+                if std::env::var("TRELLIS_TEST_PRODUCER_STUB_LANGUAGE").as_deref() == Ok("rust") {
+                    return "rust";
+                }
+                "javascript"
+            }
         }
     }
 

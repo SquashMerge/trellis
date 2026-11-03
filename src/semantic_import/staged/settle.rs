@@ -911,9 +911,9 @@ impl StagedJoin<'_> {
         let header = &self.destination_header.revision;
         let freshness = if captured_hash.is_none_or(|hash| hash != destination.content_hash) {
             semantic::Freshness::Stale
-        } else if basis.revision_id != header.id
+        } else if (!self.reimport_context_matches
+            && (basis.revision_id != header.id || basis.toolchain_hash != header.toolchain_hash))
             || basis.source_manifest_hash != destination_manifest_hash
-            || basis.toolchain_hash != header.toolchain_hash
             || basis.config_hash != header.config_hash
             || basis.dependency_hash != header.dependency_hash
             || basis.producer_version != self.producer.version
