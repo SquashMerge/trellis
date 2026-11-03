@@ -30,34 +30,56 @@ pub(super) struct WitnessedInput<'a> {
     pub cancel: &'a CancelFlag,
 }
 
-/// The revision that took the selected batch's original import.
-fn original_import_key(tx: &Connection, raw: &SelectedRawBatch) -> Result<Option<String>> {
-    tx.query_row(
-        "SELECT s.revision_id FROM semantic_revision_raw_selections s
+/// The original admission's source. A complete batch cache is independent of retained public
+/// tuples, but never fills holes in a public revision that is already being released.
+enum OriginalSource {
+    Revision(String),
+    Batch(i64),
+}
+
+pub(super) fn has_original(tx: &Connection, raw: &SelectedRawBatch) -> Result<bool> {
+    Ok(original_import_key(tx, raw)?.is_some())
+}
+
+/// Prefer the revision that took the selected batch's original import; otherwise use only a
+/// completed capture-side cache.
+fn original_import_key(tx: &Connection, raw: &SelectedRawBatch) -> Result<Option<OriginalSource>> {
+    let revision: Option<String> = tx
+        .query_row(
+            "SELECT s.revision_id FROM semantic_revision_raw_selections s
          JOIN native_revisions r ON r.id=s.revision_id
          WHERE s.batch_id=?1 AND s.producer_id=?2 AND s.captured_pin=?3
            AND r.native_revision_id=?4 AND r.source_set_id=?5
          ORDER BY r.published_index_revision LIMIT 1",
-        params![
-            raw.batch_id,
-            raw.producer_id,
-            semantic_pin_key(raw.captured_pin),
-            raw.captured_revision,
-            raw.source_set_id
-        ],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
+            params![
+                raw.batch_id,
+                raw.producer_id,
+                semantic_pin_key(raw.captured_pin),
+                raw.captured_revision,
+                raw.source_set_id
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(revision) = revision {
+        return Ok(Some(OriginalSource::Revision(revision)));
+    }
+    Ok(captured_witness::exists(tx, raw.batch_id)?.then_some(OriginalSource::Batch(raw.batch_id)))
 }
 
 /// The admitted tuple of `document`, or `None` when it has none.
 fn original_document_tuple(
     tx: &Connection,
-    original: &str,
+    original: &OriginalSource,
     producer_id: &str,
     document: &DocumentKey,
 ) -> Result<Option<sem::SemanticSnapshot>> {
+    let original = match original {
+        OriginalSource::Revision(revision) => revision,
+        OriginalSource::Batch(batch_id) => {
+            return captured_witness::document(tx, *batch_id, document);
+        }
+    };
     let tuple: Option<i64> = tx
         .prepare_cached(
             "SELECT tuple_id FROM semantic_coverage
@@ -110,7 +132,7 @@ fn document_claims(
 /// Every symbol the admitted tuples declare.
 fn witness_scope(
     tx: &Connection,
-    original: &str,
+    original: &OriginalSource,
     producer_id: &str,
     destination_manifest_hash: String,
 ) -> Result<WitnessScope> {
@@ -118,6 +140,13 @@ fn witness_scope(
         internal_symbols: BTreeSet::new(),
         declarations: BTreeSet::new(),
         destination_manifest_hash,
+    };
+    let original = match original {
+        OriginalSource::Revision(revision) => revision,
+        OriginalSource::Batch(batch_id) => {
+            scope.internal_symbols = captured_witness::internal_symbols(tx, *batch_id)?;
+            return Ok(scope);
+        }
     };
     let mut statement = tx.prepare(
         "SELECT DISTINCT s.symbol
@@ -137,7 +166,7 @@ fn witness_scope(
 /// requirement.
 fn document_witness(
     input: &WitnessedInput<'_>,
-    original_key: &str,
+    original_key: &OriginalSource,
     document: &DocumentKey,
     captured: &crate::native_evidence::Document,
     current: &crate::native_evidence::Document,

@@ -27,7 +27,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 37
+SCHEMA_VERSION = 38
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -655,7 +655,7 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# schema-37 tables, immutable surrogate keys, and current pin normalization.
+# schema-38 tables, immutable surrogate keys, and current pin normalization.
 # Match tests/daemon/cli.rs: check FTS shadow inventory, compare logical corpus cells.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
@@ -682,6 +682,8 @@ semantic_raw_batches semantic_raw_captures semantic_raw_exclusions semantic_revi
 semantic_raw_proofs semantic_raw_documents semantic_import_reports semantic_reimport
 """.split())
 CONTROL_TABLES = {"native_revision_supersessions", "native_binding_epoch", "revision_producer_bindings"}
+# Witness caches depend on prior work, not published evidence; check their schema only.
+DERIVED_CACHE_TABLES = {"semantic_batch_witnesses", "semantic_batch_witness_documents"}
 FTS_SHADOW_TABLES = {"head_search_fts_config", "head_search_fts_content", "head_search_fts_data",
                      "head_search_fts_docsize", "head_search_fts_idx"}
 DEBT_TABLES = {"native_revision_release_debt", "native_release_candidate_versions",
@@ -771,13 +773,13 @@ def parity_digest(db, revision, physical_root):
     require(db.execute("PRAGMA foreign_key_check").fetchone() is None, "retained evidence foreign-key violation")
     tables = {row[0] for row in db.execute("""SELECT name FROM sqlite_master WHERE type='table'
         AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' AND name NOT LIKE '%trigrams%'""")}
-    expected_tables = REQUIRED_TABLES | CONTROL_TABLES | FTS_SHADOW_TABLES
+    expected_tables = REQUIRED_TABLES | CONTROL_TABLES | FTS_SHADOW_TABLES | DERIVED_CACHE_TABLES
     require(tables == expected_tables,
             f"schema{SCHEMA_VERSION} selected inventory mismatch: missing={expected_tables-tables}, "
             f"extra={tables-expected_tables}")
     output = {}
     # FTS shadow segment bytes depend on publication history, not selected output.
-    for table in sorted(tables - CONTROL_TABLES - DEBT_TABLES - FTS_SHADOW_TABLES):
+    for table in sorted(tables - CONTROL_TABLES - DEBT_TABLES - FTS_SHADOW_TABLES - DERIVED_CACHE_TABLES):
         where = selected_where(table)
         columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
         require(columns, f"empty table schema: {table}")
@@ -1060,7 +1062,7 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
 
 
 class SelectedView:
-    """Closed schema-37 view retaining all selected columns plus input-closure digests."""
+    """Closed schema-38 view retaining all selected columns plus input-closure digests."""
     def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
         self.physical_root = physical_root.resolve(strict=True)

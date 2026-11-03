@@ -69,7 +69,7 @@ pub(crate) struct Passes<'a> {
     pub native_config: &'a [serde_json::Value],
 }
 
-fn check_cancel(cancel: &CancelFlag) -> std::result::Result<(), ScipCaptureError> {
+pub(crate) fn check_cancel(cancel: &CancelFlag) -> std::result::Result<(), ScipCaptureError> {
     if cancel.load(Ordering::Relaxed) {
         Err(ScipCaptureError::Cancelled)
     } else {
@@ -97,6 +97,41 @@ fn read_page<R: DeserializeOwned>(
 
 fn key(language: &str, path: &str) -> (usize, Vec<u8>) {
     (order(language), path.as_bytes().to_vec())
+}
+
+/// Keeps staged-file I/O failures typed even though the SCIP decoder reports read failures
+/// as invalid artifacts. Malformed bytes without an underlying I/O error keep that result.
+fn with_artifact_reader<R: Read, T>(
+    reader: R,
+    decode: impl FnOnce(&mut dyn Read) -> std::result::Result<T, ScipCaptureError>,
+) -> Result<T> {
+    struct FaultReader<'a, R> {
+        reader: R,
+        fault: &'a mut Option<std::io::Error>,
+    }
+    impl<R: Read> Read for FaultReader<'_, R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            match self.reader.read(buffer) {
+                Err(error) if error.kind() != std::io::ErrorKind::Interrupted => {
+                    let kind = error.kind();
+                    if self.fault.is_none() {
+                        *self.fault = Some(error);
+                    }
+                    Err(std::io::Error::from(kind))
+                }
+                result => result,
+            }
+        }
+    }
+    let mut fault = None;
+    let decoded = decode(&mut FaultReader {
+        reader,
+        fault: &mut fault,
+    });
+    if let Some(error) = fault {
+        return Err(error.into());
+    }
+    Ok(decoded?)
 }
 
 impl Passes<'_> {
@@ -134,7 +169,6 @@ impl Passes<'_> {
     ) -> Result<scip_raw::CargoTargets> {
         let descriptor = self.descriptor;
         let mut cargo = scip_raw::CargoTargetsBuilder::from_native_config(self.native_config);
-        let rust = self.producer.languages.iter().any(|l| l == "rust") && !cargo.is_empty();
         let mut rows_order = RowOrder::source();
         let mut hasher = SourceManifestHasher::new(&descriptor.source_set.id);
         let mut ord = 0i64;
@@ -171,26 +205,7 @@ impl Passes<'_> {
                 if let Some(detail) = mismatch {
                     return Err(admission(detail).into());
                 }
-                let bytes = native.source_bytes(&retained)?;
-                if bytes.len() as u64 != row.byte_length
-                    || scip_raw::sha(&bytes) != row.content_hash
-                {
-                    return Err(admission("captured source hash").into());
-                }
-                if rust && row.language == "rust" {
-                    cargo.add_document(&row.relative_path, &bytes);
-                }
-                hasher.push(&row.language, &row.relative_path, &row.content_hash);
-                conn.prepare_cached(
-                    "INSERT INTO sources(ord, language, path, content_hash, byte_length) VALUES(?1,?2,?3,?4,?5)",
-                )?
-                .execute(params![
-                    ord,
-                    row.language,
-                    row.relative_path,
-                    row.content_hash,
-                    row.byte_length as i64
-                ])?;
+                self.stage_source(conn, native, &retained, ord, &mut cargo, &mut hasher)?;
                 ord += 1;
             }
             conn.execute_batch("COMMIT")?;
@@ -203,6 +218,45 @@ impl Passes<'_> {
             return Err(admission("source manifest hash").into());
         }
         Ok(cargo.finish())
+    }
+
+    /// Authenticates and stages one captured inventory entry for either admission source.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_source(
+        &self,
+        conn: &Connection,
+        native: &mut dyn NativeSource,
+        document: &native::Document,
+        ord: i64,
+        cargo: &mut scip_raw::CargoTargetsBuilder,
+        hasher: &mut SourceManifestHasher,
+    ) -> Result<()> {
+        let bytes = native.source_bytes(document)?;
+        if bytes.len() != document.byte_length || scip_raw::sha(&bytes) != document.content_hash {
+            return Err(admission("captured source hash").into());
+        }
+        if !cargo.is_empty()
+            && self.producer.languages.iter().any(|l| l == "rust")
+            && document.key.language == "rust"
+        {
+            cargo.add_document(&document.key.path, &bytes);
+        }
+        hasher.push(
+            &document.key.language,
+            &document.key.path,
+            &document.content_hash,
+        );
+        conn.prepare_cached(
+            "INSERT INTO sources(ord, language, path, content_hash, byte_length) VALUES(?1,?2,?3,?4,?5)",
+        )?
+        .execute(params![
+            ord,
+            document.key.language,
+            document.key.path,
+            document.content_hash,
+            document.byte_length as i64
+        ])?;
+        Ok(())
     }
 
     /// Coverage pages: strictly ordered rows, each bound to a staged source and either an
@@ -335,7 +389,7 @@ impl Passes<'_> {
         Ok(())
     }
 
-    fn decode(
+    pub(crate) fn decode(
         &self,
         entry: &ArtifactEntry,
         staged: &Path,
@@ -408,18 +462,20 @@ impl Passes<'_> {
             }
         };
         let file = std::fs::File::open(staged).context("staged artifact")?;
-        let decoded = decode_streaming(
-            file,
-            entry.byte_length,
-            &context,
-            &mut resolve,
-            counters,
-            self.limits,
-            &mut sink,
-            self.cancel,
-        );
+        let decoded = with_artifact_reader(file, |reader| {
+            decode_streaming(
+                reader,
+                entry.byte_length,
+                &context,
+                &mut resolve,
+                counters,
+                self.limits,
+                &mut sink,
+                self.cancel,
+            )
+        });
         if let Err(error) = decoded {
-            return Err(sink.take_fault().or(fault).unwrap_or_else(|| error.into()));
+            return Err(sink.take_fault().or(fault).unwrap_or(error));
         }
         sink.finish()?;
         Ok(())
@@ -630,4 +686,87 @@ pub fn stage_batch(
         producer,
         captured,
     ))
+}
+
+#[cfg(test)]
+mod artifact_reader_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    struct FailingReader {
+        prefix: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.prefix.read(buffer)?;
+            if read == 0 {
+                Err(std::io::Error::from_raw_os_error(5))
+            } else {
+                Ok(read)
+            }
+        }
+    }
+
+    fn decode(reader: &mut dyn Read, length: u64) -> Result<()> {
+        let module_roots = scip_raw::ModuleRoots::from_native_config(&[]);
+        let cargo_targets = scip_raw::CargoTargetsBuilder::from_native_config(&[]).finish();
+        let artifact = AuthenticatedArtifact {
+            artifact_hash: "",
+            producer_id: "",
+            producer_version: "",
+            source_set_id: "",
+            source_revision: "",
+            position_encoding: 1,
+            protocol_version: 0,
+            text_document_encoding: 1,
+            project_root_uri: "",
+            module_roots: &module_roots,
+            cargo_targets: &cargo_targets,
+            assigned_documents: 0,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        with_artifact_reader(reader, |reader| {
+            decode_streaming(
+                reader,
+                length,
+                &artifact,
+                &mut |_, _| Err(admission("unexpected document")),
+                &mut BatchCounters::default(),
+                &BatchLimits::PRODUCTION,
+                &mut scip_raw::VecSink::default(),
+                &cancel,
+            )
+            .map(|_| ())
+        })
+    }
+
+    #[test]
+    fn staged_artifact_reads_preserve_io_errors_without_reclassifying_invalid_bytes() {
+        // Fail the tag read, then the metadata unit read after its tag and length.
+        for prefix in [vec![], vec![0x0a, 0x01]] {
+            let error = decode(
+                &mut FailingReader {
+                    prefix: std::io::Cursor::new(prefix),
+                },
+                3,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(5)
+            );
+        }
+        for bytes in [vec![], vec![0xff]] {
+            let error = decode(&mut std::io::Cursor::new(bytes), 1).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<ScipCaptureError>(),
+                Some(ScipCaptureError::InvalidArtifact(_))
+            ));
+            assert!(error.downcast_ref::<std::io::Error>().is_none());
+        }
+    }
 }

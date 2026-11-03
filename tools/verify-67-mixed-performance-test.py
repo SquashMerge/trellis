@@ -205,7 +205,8 @@ class Rusage(unittest.TestCase):
 
 
 class SchemaParity(unittest.TestCase):
-    EXCLUDED = RUNNER.CONTROL_TABLES | RUNNER.DEBT_TABLES | RUNNER.FTS_SHADOW_TABLES
+    EXCLUDED = (RUNNER.CONTROL_TABLES | RUNNER.DEBT_TABLES | RUNNER.FTS_SHADOW_TABLES
+                | RUNNER.DERIVED_CACHE_TABLES)
 
     def schema_db(self):
         source = (RUNNER.REPO / "src/store.rs").read_text()
@@ -227,7 +228,8 @@ class SchemaParity(unittest.TestCase):
 
     def test_schema_text_table_set_matches_required_tables(self):
         self.assertEqual(self.tables(self.schema_db()),
-                         RUNNER.REQUIRED_TABLES | RUNNER.CONTROL_TABLES | RUNNER.FTS_SHADOW_TABLES)
+                         RUNNER.REQUIRED_TABLES | RUNNER.CONTROL_TABLES | RUNNER.FTS_SHADOW_TABLES
+                         | RUNNER.DERIVED_CACHE_TABLES)
 
     def test_every_schema_table_has_a_selected_scope(self):
         for table in sorted(self.tables(self.schema_db()) - self.EXCLUDED):
@@ -315,7 +317,7 @@ class SchemaParity(unittest.TestCase):
         self.assertEqual(len(rows["semantic_reimport"]), 1)
         return rows
 
-    def test_selected_view_normalizes_a_schema_37_batch_selection_identically_across_roots(self):
+    def test_selected_view_normalizes_a_schema_38_batch_selection_identically_across_roots(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             self.assertEqual(self.normalized_rows(first), self.normalized_rows(second))
 

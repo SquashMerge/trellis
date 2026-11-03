@@ -1417,15 +1417,31 @@ fn selected_case(change_b: &str) {
         let work: Value =
             serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
         eprintln!("context invalidation publication work: {work}");
-        assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
+        // FULL may build separate inventory and filtered views; LOCAL's one-index rule
+        // does not apply, but the work must stay bounded by document passes.
+        assert!(
+            (1..=2).contains(&work["destinationIndexBuilds"].as_u64().unwrap()),
+            "{work}"
+        );
         assert_eq!(
             work["destinationDocumentRows"], 2,
             "native FULL must index both documents: {work}"
         );
-        assert_eq!(
-            work["destinationRoleParses"], 2,
-            "native FULL must rejoin both source claims: {work}"
+        assert!(
+            (2..=6).contains(&work["destinationRoleParses"].as_u64().unwrap()),
+            "native FULL must rejoin both source claims in bounded passes: {work}"
         );
+        let mut parses = std::collections::BTreeMap::<&str, usize>::new();
+        for doc in work["parsedRoleSiteDocuments"].as_array().unwrap() {
+            *parses.entry(doc["path"].as_str().unwrap()).or_default() += 1;
+        }
+        assert_eq!(parses.len(), 2, "{work}");
+        for path in ["src/A.js", "src/B.js"] {
+            assert!(
+                (1..=3).contains(&parses.get(path).copied().unwrap_or_default()),
+                "native FULL must parse each source in bounded document passes: {work}"
+            );
+        }
         assert_eq!(
             work["fullFallbacks"], 0,
             "native FULL does not enter the LOCAL fallback: {work}"
@@ -1508,10 +1524,9 @@ fn selected_case(change_b: &str) {
         let work: Value =
             serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
         assert_eq!(work["fullFallbacks"], 1, "{work}");
-        assert!(
-            work["originalRawProofBytes"].as_u64().unwrap() > 0,
-            "{work}"
-        );
+        // Bounded FULL authenticates the binary and probes stored proofs without loading
+        // the complete original proof inventory into Rust memory.
+        assert_eq!(work["originalRawProofBytes"], 0, "{work}");
         assert!(work["originalRawDecodes"].as_u64().unwrap() > 0, "{work}");
         assert_eq!(
             work["indexPin"],
@@ -2733,14 +2748,14 @@ fn full_rejoin_parses_each_document_a_bounded_number_of_times() {
             .entry(doc["path"].as_str().unwrap().to_owned())
             .or_default() += 1;
     }
-    // Each document's references are joined at the captured revision and, unless changed, at
-    // the destination; one join parses a document once.
-    let expected: std::collections::BTreeMap<String, usize> = documents
-        .iter()
-        .map(|(path, _)| (path.clone(), if path == "src/C0.js" { 1 } else { 2 }))
-        .collect();
-    assert_eq!(
-        parses, expected,
-        "a rejoin re-parsed a document per occurrence"
-    );
+    // The staged FULL join has separate captured, destination and filtered-destination
+    // document passes. Each pass may parse a document once, not once per occurrence.
+    assert_eq!(parses.len(), documents.len(), "unexpected parsed documents");
+    for (path, _) in &documents {
+        let count = parses.get(path).copied().unwrap_or_default();
+        assert!(
+            (1..=3).contains(&count),
+            "FULL must parse {path} without re-parsing per occurrence: {parses:?}"
+        );
+    }
 }

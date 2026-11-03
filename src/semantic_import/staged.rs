@@ -2531,6 +2531,66 @@ pub fn join_staged(
     cancel: &CancelFlag,
 ) -> Result<JoinedBatch> {
     let captured_pin = admitted.captured_pin();
+    join_staged_using(
+        admitted,
+        destination,
+        limits,
+        budget,
+        counters,
+        mutations,
+        cancel,
+        |body| {
+            if captured_pin == destination {
+                store.with_native_reader(captured_pin, |reader| body(reader, reader))
+            } else {
+                store.with_native_reader(captured_pin, |captured| {
+                    store.with_native_reader(destination, |reader| body(captured, reader))
+                })
+            }
+        },
+    )
+}
+
+/// Joins with caller-owned readers, including a destination in an unpublished writer
+/// transaction. The caller supplies readers for the admitted captured pin and `destination`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn join_staged_with_readers(
+    admitted: &mut AdmittedBatch,
+    captured: &NativeReader<'_>,
+    destination_reader: &NativeReader<'_>,
+    destination: IndexPin,
+    limits: &BatchLimits,
+    budget: &mut LookupBudget,
+    counters: &mut BatchCounters,
+    mutations: DestinationMutations,
+    cancel: &CancelFlag,
+) -> Result<JoinedBatch> {
+    join_staged_using(
+        admitted,
+        destination,
+        limits,
+        budget,
+        counters,
+        mutations,
+        cancel,
+        |body| body(captured, destination_reader),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join_staged_using(
+    admitted: &mut AdmittedBatch,
+    destination: IndexPin,
+    limits: &BatchLimits,
+    budget: &mut LookupBudget,
+    counters: &mut BatchCounters,
+    mutations: DestinationMutations,
+    cancel: &CancelFlag,
+    with_readers: impl FnOnce(
+        &dyn Fn(&NativeReader<'_>, &NativeReader<'_>) -> Result<JoinedBatch>,
+    ) -> Result<JoinedBatch>,
+) -> Result<JoinedBatch> {
+    let captured_pin = admitted.captured_pin();
     let shared = captured_pin == destination;
     let parts = admitted.join_parts()?;
     let ctx = JoinCtx {
@@ -2637,13 +2697,7 @@ pub fn join_staged(
     let result = reset_for_destination(ctx.conn, destination).and_then(|attempt| {
         ctx.reserve_rows(RETAINED_SEED, retained_rows(ctx.conn)?)?;
         ctx.check_output()?;
-        if shared {
-            store.with_native_reader(captured_pin, |reader| body(attempt, reader, reader))
-        } else {
-            store.with_native_reader(captured_pin, |captured| {
-                store.with_native_reader(destination, |reader| body(attempt, captured, reader))
-            })
-        }
+        with_readers(&|captured, destination_reader| body(attempt, captured, destination_reader))
     });
     *budget = ctx.budget.into_inner();
     {

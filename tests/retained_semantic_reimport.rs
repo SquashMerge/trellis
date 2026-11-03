@@ -211,7 +211,7 @@ impl World {
         let version: u32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
         db.pragma_update(None, "user_version", version - 1).unwrap();
         drop(db);
         // The real daemon establishes the new native head and owns retained FIFO work.

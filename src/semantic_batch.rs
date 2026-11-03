@@ -8,6 +8,7 @@ use staging::Stage;
 pub mod admit;
 pub mod descriptor;
 pub mod limits;
+pub(crate) mod retained;
 pub mod staging;
 #[cfg(feature = "test-support")]
 pub mod testing;
