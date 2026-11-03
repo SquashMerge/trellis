@@ -15708,6 +15708,9 @@ fn call_graph_cancel_child() {
 }
 
 // #593: exercise the wire contract against real indexed Rust declarations, not hand-made IDs.
+#[path = "stable_mcp_model.rs"]
+mod stable_mcp_model;
+
 const LOOKUP_ROOT_TOOLS: [&str; 4] = [
     "trellis_declaration",
     "trellis_outgoing_calls",
