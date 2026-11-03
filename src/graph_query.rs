@@ -52,6 +52,7 @@ pub enum BoundaryReason {
     Stale,
     NodeLimit,
     MissingEvidence,
+    CatchingUp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +289,12 @@ pub struct GraphEdge {
     pub to: Option<String>,
     #[serde(deserialize_with = "nullable")]
     pub binding: Option<CallBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<crate::model::SemanticProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_freshness: Option<Freshness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_freshness: Option<Freshness>,
     pub visit: Visit,
     pub boundary_reason: BoundaryReason,
 }
@@ -334,6 +341,8 @@ pub struct GraphResult {
     pub frontier: Vec<Frontier>,
     pub coverage: Vec<sem::Coverage>,
     pub provenance: Vec<sem::Provenance>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projected_provenance: Vec<sem::ProjectedEvidence<sem::Provenance>>,
     pub partial: bool,
     pub truncated: bool,
     pub warnings: Vec<Warning>,
@@ -342,6 +351,10 @@ pub struct GraphResult {
     /// Evaluation-only filter hints by owner, retained for frozen prefix projection.
     #[serde(skip)]
     pub filtered_hints: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_projections: Vec<crate::model::SemanticProjection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_documents: Vec<crate::model::DocumentSemanticStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,6 +366,7 @@ pub struct GraphSnapshot {
 /// Semantic evidence of one in-scope document for the selected producer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticDocument {
+    pub projection: Option<crate::model::SemanticProjection>,
     pub coverage: sem::Coverage,
     pub provenance: BTreeMap<String, sem::Provenance>,
     pub call_bindings: Vec<CallBinding>,
@@ -363,6 +377,7 @@ pub struct SemanticDocument {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentFacts {
+    pub projection: Option<crate::model::SemanticProjection>,
     pub key: DocumentKey,
     pub declarations: BTreeMap<String, native::Declaration>,
     /// Calls grouped by owner syntax ID.
@@ -391,6 +406,21 @@ pub trait GraphSource {
         Ok(None)
     }
     fn locate(&mut self, syntax_id: &str) -> Result<Option<DocumentKey>>;
+    /// Checks the recorded basis at every historical semantic hop, not by name.
+    fn projection_endpoint(
+        &mut self,
+        projection: &crate::model::SemanticProjection,
+        producer: &str,
+        document: &DocumentKey,
+    ) -> Result<bool> {
+        let target = self.document(document)?;
+        Ok(target.projection.as_ref().is_some_and(|other| {
+            other.semantic_status == crate::model::SemanticStatus::OlderBasis
+                && other.semantic_basis_pin == projection.semantic_basis_pin
+        }) && target.semantic.as_ref().is_some_and(|semantic| {
+            semantic.coverage.producer_id == producer
+        }))
+    }
     fn document(&mut self, key: &DocumentKey) -> Result<Arc<DocumentFacts>>;
     /// The role of an exactly located declaration, without requiring its whole document.
     fn declaration_role(
@@ -428,6 +458,7 @@ pub struct GraphFacts {
     pub locations: BTreeMap<String, Option<DocumentKey>>,
     pub documents: BTreeMap<DocumentKey, Arc<DocumentFacts>>,
     pub history: BTreeMap<(DocumentKey, String), Option<Arc<HistoryFacts>>>,
+    pub projection_endpoints: BTreeMap<(String, DocumentKey, String), bool>,
 }
 
 impl GraphFacts {
@@ -440,6 +471,7 @@ impl GraphFacts {
             locations: BTreeMap::new(),
             documents: BTreeMap::new(),
             history: BTreeMap::new(),
+            projection_endpoints: BTreeMap::new(),
         }
     }
 
@@ -484,6 +516,17 @@ impl GraphSource for &GraphFacts {
             .ok_or_else(|| anyhow!(FACTS_MISS))
     }
 
+    fn projection_endpoint(
+        &mut self, projection: &crate::model::SemanticProjection, producer: &str, document: &DocumentKey,
+    ) -> Result<bool> {
+        let key = (producer.to_owned(), document.clone(), serde_json::to_string(&projection.semantic_basis_pin)?);
+        if let Some(eligible) = self.projection_endpoints.get(&key) { return Ok(*eligible); }
+        if self.memo { return Err(anyhow!(FACTS_MISS)); }
+        Ok(self.documents.get(document).is_some_and(|doc| doc.projection.as_ref().is_some_and(|other| {
+            other.semantic_status == crate::model::SemanticStatus::OlderBasis && other.semantic_basis_pin == projection.semantic_basis_pin
+        })))
+    }
+
     fn history(&mut self, key: &DocumentKey, syntax_id: &str) -> Result<Option<Arc<HistoryFacts>>> {
         match self.history.get(&(key.clone(), syntax_id.to_string())) {
             Some(history) => Ok(history.clone()),
@@ -512,6 +555,11 @@ impl GraphSource for GraphFacts {
     }
     fn document(&mut self, key: &DocumentKey) -> Result<Arc<DocumentFacts>> {
         (&*self).document(key)
+    }
+    fn projection_endpoint(
+        &mut self, projection: &crate::model::SemanticProjection, producer: &str, document: &DocumentKey,
+    ) -> Result<bool> {
+        (&*self).projection_endpoint(projection, producer, document)
     }
     fn history(&mut self, key: &DocumentKey, id: &str) -> Result<Option<Arc<HistoryFacts>>> {
         (&*self).history(key, id)
@@ -640,6 +688,9 @@ pub(crate) fn semantic<'a>(
     }
     match &doc.semantic {
         Some(semantic) => Ok(Some(semantic)),
+        None if doc.projection.as_ref().is_some_and(|projection| {
+            projection.semantic_status == crate::model::SemanticStatus::CatchingUp
+        }) => Ok(None),
         None => Err(integrity("missing producer coverage tuple")),
     }
 }
@@ -713,9 +764,40 @@ pub(crate) fn call_disposition<'a>(
     source: &mut dyn GraphSource,
 ) -> Result<CallDisposition<'a>> {
     let selected = select_binding(semantic, call)?;
+    let projection = semantic.and_then(|semantic| semantic.projection.as_ref());
     let mut reason = selected.map_or(BoundaryReason::MissingEvidence, |(b, p)| {
-        boundary_reason(b, p)
+        if projection.is_some() && p.freshness != Freshness::Stale && b.stale_target != Some(true) {
+            if b.resolution == Resolution::Ambiguous {
+                BoundaryReason::Ambiguous
+            } else if b.resolution == Resolution::Unresolved {
+                BoundaryReason::Unresolved
+            } else if b.resolution == Resolution::External {
+                BoundaryReason::External
+            } else if !matches!(b.dispatch, Dispatch::Direct | Dispatch::Constructor) {
+                BoundaryReason::Dispatch
+            } else {
+                BoundaryReason::None
+            }
+        } else {
+            boundary_reason(b, p)
+        }
     });
+    if let (Some(projection), Some((binding, proof))) = (projection, selected) {
+        let mut eligible = projection.semantic_status == crate::model::SemanticStatus::OlderBasis
+            && source.projection_endpoint(projection, &proof.producer_id, &call.document)?;
+        for target in binding.declared_target.iter()
+            .chain(&binding.candidates)
+            .chain(&binding.possible_dispatch)
+        {
+            if let Target::Internal { document, revision_id, .. } = target {
+                eligible &= revision_id == &projection.basis_native_revision_id
+                    && source.projection_endpoint(projection, &proof.producer_id, document)?;
+            }
+        }
+        if !eligible {
+            reason = BoundaryReason::CatchingUp;
+        }
+    }
     let target = selected.and_then(|(binding, _)| {
         if binding.resolution != Resolution::Resolved {
             return None;
@@ -730,7 +812,7 @@ pub(crate) fn call_disposition<'a>(
         }
     });
     let exact_target = match target {
-        Some((id, key)) if source.locate(id)?.as_ref() == Some(key) => Some((id, key)),
+        Some((id, key)) if reason != BoundaryReason::CatchingUp && source.locate(id)?.as_ref() == Some(key) => Some((id, key)),
         _ => None,
     };
     if reason == BoundaryReason::None && exact_target.is_none() {
@@ -740,29 +822,6 @@ pub(crate) fn call_disposition<'a>(
         selected,
         boundary_reason: reason,
         exact_target,
-    })
-}
-
-/// The same pre-grouping eligibility used by rooted expansion, for line navigation.
-pub(crate) fn resolved_call_target<'a>(
-    semantic: Option<&'a SemanticDocument>,
-    call: &native::Call,
-) -> Result<Option<(&'a str, &'a DocumentKey)>> {
-    let Some((binding, proof)) = select_binding(semantic, call)? else {
-        return Ok(None);
-    };
-    if boundary_reason(binding, proof) != BoundaryReason::None
-        || binding.resolution != Resolution::Resolved
-    {
-        return Ok(None);
-    }
-    Ok(match &binding.declared_target {
-        Some(Target::Internal {
-            syntax_id,
-            document,
-            ..
-        }) => Some((syntax_id.as_str(), document)),
-        _ => None,
     })
 }
 
@@ -876,7 +935,9 @@ pub fn evaluate(
                 source.check_work()?;
                 let disposition = call_disposition(semantic, call, source)?;
                 let selected = disposition.selected;
-                let reason = disposition.boundary_reason;
+                let reason = if semantic.is_none() && doc.projection.as_ref().is_some_and(|projection| projection.semantic_status == crate::model::SemanticStatus::CatchingUp) {
+                    BoundaryReason::CatchingUp
+                } else { disposition.boundary_reason };
                 let exact_target = disposition.exact_target;
                 let external = selected.is_some_and(|(b, _)| b.resolution == Resolution::External);
                 let target_role = exact_target
@@ -948,6 +1009,11 @@ pub fn evaluate(
                         from: node_id.clone(),
                         to: None,
                         binding: selected.map(|(b, _)| b.clone()),
+                        projection: semantic.and_then(|s| s.projection.clone()),
+                        historical_freshness: selected.map(|(_, p)| p.freshness),
+                        effective_freshness: selected.map(|(_, p)| semantic
+                            .and_then(|s| s.projection.as_ref())
+                            .map_or(p.freshness, |projection| projection.effective_freshness(p.freshness))),
                         visit: Visit::Boundary,
                         boundary_reason: reason,
                     },
@@ -1173,16 +1239,51 @@ fn finish(
     {
         hints.insert("rootSyntaxId".to_string());
     }
-    let (coverage, provenance) = select_evidence(source, scope, &nodes, &edges)?;
+    let (coverage, all_provenance) = select_evidence(source, scope, &nodes, &edges)?;
+    let mut provenance = Vec::new();
+    let mut projected_provenance = Vec::new();
+    for proof in all_provenance {
+        let document = source.document(&proof.document)?;
+        if let Some(projection) = &document.projection
+            && proof.producer_id != document.native_provenance.producer_id
+        {
+            let historical = proof.freshness;
+            projected_provenance.push(sem::ProjectedEvidence::new(proof, projection.clone(), historical));
+        } else {
+            provenance.push(proof);
+        }
+    }
     let truncated = frontier
         .iter()
         .any(|f| f.reason != FrontierReason::Filtered);
-    let partial = truncated
+    let mut semantic_projections = Vec::new();
+    let mut semantic_documents = Vec::new();
+    let documents: BTreeSet<_> = nodes.iter().map(|node| node.declaration.document.clone())
+        .chain(edges.iter().map(|edge| edge.call.document.clone())).collect();
+    for key in documents {
+        let document = source.document(&key)?;
+        if let Some(projection) = &document.projection {
+            if !semantic_projections.contains(projection) { semantic_projections.push(projection.clone()); }
+            let producer_id = document.semantic.as_ref().map(|semantic| semantic.coverage.producer_id.clone())
+                .or_else(|| request.semantic_producer_id.clone())
+                .or_else(|| defaults.and_then(|defaults| defaults.producer(&key.language)).map(str::to_owned))
+                .ok_or_else(|| integrity("projected document has no selected producer"))?;
+            semantic_documents.push(crate::model::DocumentSemanticStatus {
+                producer_id,language:key.language,path:key.path,projection:projection.clone(),
+            });
+        }
+    }
+    let partial = !semantic_projections.is_empty()
+        || truncated
         || omitted.filtered > 0
         || selected_incomplete(&coverage)
         || edges.iter().any(|edge| edge.visit == Visit::Boundary);
     let syntax_only = syntax_only(request, defaults, &nodes, &edges);
-    let warnings = warnings_with(syntax_only, &coverage, &provenance, &edges);
+    let mut warnings = warnings_with(syntax_only, &coverage, &provenance, &edges);
+    if !projected_provenance.is_empty() {
+        warnings.push(Warning { code: WarningCode::StaleEvidence,
+            message: "Historical semantic basis overlay; effective freshness is not fresh and no current semantic absence is implied.".into(), provenance_id: None });
+    }
     Ok(GraphResult {
         request: request.clone(),
         resolved_revision_id: request.revision_id.clone(),
@@ -1191,12 +1292,15 @@ fn finish(
         frontier,
         coverage,
         provenance,
+        projected_provenance,
         partial,
         truncated,
         warnings,
         omitted,
         hints: hints.into_iter().collect(),
         filtered_hints,
+        semantic_projections,
+        semantic_documents,
     })
 }
 

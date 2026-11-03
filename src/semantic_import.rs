@@ -19,6 +19,7 @@ use memory::{MemoryJoinSink, MemoryJoinStore};
 #[cfg(feature = "test-support")]
 pub(crate) use staged::cursor_sql as staged_cursor_sql;
 pub use staged::join_staged;
+pub(crate) use staged::JoinContinuation;
 pub(crate) use staged::join_staged_with_readers;
 pub(crate) use staged::publication::read_documents as read_staged_documents;
 #[cfg(feature = "test-support")]

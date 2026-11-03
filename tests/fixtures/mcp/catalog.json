@@ -331,6 +331,12 @@
                       "type": "null"
                     }
                   ]
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentSemanticStatus"
+                  }
                 }
               },
               "required": [
@@ -340,7 +346,8 @@
                 "coverage",
                 "note",
                 "partialReasons",
-                "reimport"
+                "reimport",
+                "documents"
               ],
               "type": "object"
             }
@@ -860,6 +867,58 @@
             "default",
             "config_file",
             "environment"
+          ]
+        },
+        "SemanticProjection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "currentPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "semanticBasisPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "basisNativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "enum": [
+                "olderBasis",
+                "catchingUp"
+              ]
+            }
+          },
+          "required": [
+            "currentPin",
+            "semanticBasisPin",
+            "basisNativeRevisionId",
+            "semanticStatus"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "path",
+            "projection"
           ]
         }
       },
@@ -2068,6 +2127,12 @@
                       "type": "null"
                     }
                   ]
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentSemanticStatus"
+                  }
                 }
               },
               "required": [
@@ -2076,7 +2141,8 @@
                 "freshness",
                 "coverage",
                 "note",
-                "reimport"
+                "reimport",
+                "documents"
               ],
               "type": "object"
             }
@@ -2191,6 +2257,58 @@
               "minimum": -9007199254740991,
               "type": "integer"
             }
+          ]
+        },
+        "SemanticProjection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "currentPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "semanticBasisPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "basisNativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "enum": [
+                "olderBasis",
+                "catchingUp"
+              ]
+            }
+          },
+          "required": [
+            "currentPin",
+            "semanticBasisPin",
+            "basisNativeRevisionId",
+            "semanticStatus"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "path",
+            "projection"
           ]
         }
       },
@@ -3352,6 +3470,12 @@
                       "type": "null"
                     }
                   ]
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentSemanticStatus"
+                  }
                 }
               },
               "required": [
@@ -3360,7 +3484,8 @@
                 "freshness",
                 "coverage",
                 "note",
-                "reimport"
+                "reimport",
+                "documents"
               ],
               "type": "object"
             }
@@ -3681,6 +3806,58 @@
             "embedded",
             "lexical",
             "unavailableReason"
+          ]
+        },
+        "SemanticProjection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "currentPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "semanticBasisPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "basisNativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "enum": [
+                "olderBasis",
+                "catchingUp"
+              ]
+            }
+          },
+          "required": [
+            "currentPin",
+            "semanticBasisPin",
+            "basisNativeRevisionId",
+            "semanticStatus"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "path",
+            "projection"
           ]
         }
       },
@@ -5228,6 +5405,12 @@
                       "type": "null"
                     }
                   ]
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentSemanticStatus"
+                  }
                 }
               },
               "required": [
@@ -5236,7 +5419,8 @@
                 "freshness",
                 "coverage",
                 "note",
-                "reimport"
+                "reimport",
+                "documents"
               ],
               "type": "object"
             }
@@ -5248,6 +5432,58 @@
             "semantic"
           ],
           "type": "object"
+        },
+        "SemanticProjection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "currentPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "semanticBasisPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "basisNativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "enum": [
+                "olderBasis",
+                "catchingUp"
+              ]
+            }
+          },
+          "required": [
+            "currentPin",
+            "semanticBasisPin",
+            "basisNativeRevisionId",
+            "semanticStatus"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "path",
+            "projection"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5739,7 +5975,8 @@
                 "dispatch",
                 "stale",
                 "nodeLimit",
-                "missingEvidence"
+                "missingEvidence",
+                "catchingUp"
               ]
             },
             "callId": {
@@ -5845,6 +6082,24 @@
                   "type": "null"
                 }
               ]
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                null
+              ]
             }
           },
           "required": [
@@ -5864,7 +6119,9 @@
             "freshness",
             "staleBecause",
             "doc",
-            "lines"
+            "lines",
+            "projection",
+            "historicalFreshness"
           ],
           "type": "object"
         },
@@ -6281,6 +6538,30 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "effectiveFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
               ]
             }
           },
@@ -7124,6 +7405,12 @@
                       "type": "null"
                     }
                   ]
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentSemanticStatus"
+                  }
                 }
               },
               "required": [
@@ -7132,7 +7419,8 @@
                 "freshness",
                 "coverage",
                 "note",
-                "reimport"
+                "reimport",
+                "documents"
               ],
               "type": "object"
             }
@@ -7294,6 +7582,58 @@
             "lookupDependencies"
           ],
           "type": "object"
+        },
+        "SemanticProjection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "currentPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "semanticBasisPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "basisNativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "enum": [
+                "olderBasis",
+                "catchingUp"
+              ]
+            }
+          },
+          "required": [
+            "currentPin",
+            "semanticBasisPin",
+            "basisNativeRevisionId",
+            "semanticStatus"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "path",
+            "projection"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7350,6 +7690,12 @@
                       "type": "null"
                     }
                   ]
+                },
+                "semanticDocuments": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentSemanticStatus"
+                  }
                 }
               },
               "required": [
@@ -7357,7 +7703,8 @@
                 "displayKey",
                 "calls",
                 "documents",
-                "stableLookupKey"
+                "stableLookupKey",
+                "semanticDocuments"
               ],
               "type": "object"
             },
@@ -7948,6 +8295,30 @@
                   "type": "null"
                 }
               ]
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "effectiveFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
             }
           },
           "required": [
@@ -8532,7 +8903,8 @@
                 "dispatch",
                 "stale",
                 "nodeLimit",
-                "missingEvidence"
+                "missingEvidence",
+                "catchingUp"
               ]
             },
             "evidenceTier": {
@@ -8562,6 +8934,24 @@
                   "type": "null"
                 }
               ]
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                null
+              ]
             }
           },
           "required": [
@@ -8580,7 +8970,9 @@
             "boundaryReason",
             "evidenceTier",
             "freshness",
-            "staleBecause"
+            "staleBecause",
+            "projection",
+            "historicalFreshness"
           ],
           "type": "object"
         },
@@ -8705,6 +9097,12 @@
                       "type": "null"
                     }
                   ]
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentSemanticStatus"
+                  }
                 }
               },
               "required": [
@@ -8713,7 +9111,8 @@
                 "freshness",
                 "coverage",
                 "note",
-                "reimport"
+                "reimport",
+                "documents"
               ],
               "type": "object"
             }
@@ -9297,6 +9696,58 @@
             "lookupDependencies"
           ],
           "type": "object"
+        },
+        "SemanticProjection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "currentPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "semanticBasisPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "basisNativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "enum": [
+                "olderBasis",
+                "catchingUp"
+              ]
+            }
+          },
+          "required": [
+            "currentPin",
+            "semanticBasisPin",
+            "basisNativeRevisionId",
+            "semanticStatus"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "path",
+            "projection"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -9364,6 +9815,12 @@
                       "type": "null"
                     }
                   ]
+                },
+                "semanticDocuments": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentSemanticStatus"
+                  }
                 }
               },
               "required": [
@@ -9373,7 +9830,8 @@
                 "callers",
                 "documents",
                 "scopeCoverage",
-                "stableLookupKey"
+                "stableLookupKey",
+                "semanticDocuments"
               ],
               "type": "object"
             },
@@ -10154,6 +10612,66 @@
               "minimum": -9007199254740991,
               "type": "integer"
             }
+          ]
+        },
+        "SemanticProjection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "currentPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "semanticBasisPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "basisNativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "enum": [
+                "olderBasis",
+                "catchingUp"
+              ]
+            }
+          },
+          "required": [
+            "currentPin",
+            "semanticBasisPin",
+            "basisNativeRevisionId",
+            "semanticStatus"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "path",
+            "projection"
+          ]
+        },
+        "Language": {
+          "enum": [
+            "java",
+            "rust",
+            "python",
+            "javascript"
           ]
         }
       },
@@ -11870,13 +12388,40 @@
                 "dispatch",
                 "stale",
                 "nodeLimit",
-                "missingEvidence"
+                "missingEvidence",
+                "catchingUp"
               ]
             },
             "callSiteCount": {
               "type": "integer",
               "minimum": 1,
               "maximum": 9007199254740991
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                null
+              ]
+            },
+            "effectiveFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                null
+              ]
             }
           },
           "required": [
@@ -12037,6 +12582,24 @@
                 ]
               },
               "uniqueItems": true
+            },
+            "semanticProjections": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SemanticProjection"
+              }
+            },
+            "projectedProvenance": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ProjectedProvenance"
+              }
+            },
+            "semanticDocuments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/DocumentSemanticStatus"
+              }
             }
           },
           "required": [
@@ -12290,6 +12853,12 @@
                       "type": "null"
                     }
                   ]
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentSemanticStatus"
+                  }
                 }
               },
               "required": [
@@ -12298,7 +12867,8 @@
                 "freshness",
                 "coverage",
                 "note",
-                "reimport"
+                "reimport",
+                "documents"
               ],
               "type": "object"
             }
@@ -12337,6 +12907,90 @@
             "revisionId",
             "contentHash",
             "provenanceId"
+          ]
+        },
+        "SemanticProjection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "currentPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "semanticBasisPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "basisNativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "enum": [
+                "olderBasis",
+                "catchingUp"
+              ]
+            }
+          },
+          "required": [
+            "currentPin",
+            "semanticBasisPin",
+            "basisNativeRevisionId",
+            "semanticStatus"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "path",
+            "projection"
+          ]
+        },
+        "ProjectedProvenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "evidence": {
+              "$ref": "#/$defs/Provenance"
+            },
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "effectiveFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            }
+          },
+          "required": [
+            "evidence",
+            "projection",
+            "historicalFreshness",
+            "effectiveFreshness"
           ]
         }
       },
@@ -12634,6 +13288,45 @@
     "name": "trellis_references",
     "outputSchema": {
       "$defs": {
+        "PartialFile": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "reason": {
+              "enum": [
+                "syntax_error",
+                "depth_limit",
+                "visit_limit",
+                "evidence_budget",
+                "oversized",
+                "not_utf8"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "subtrees": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path",
+            "reason",
+            "range",
+            "subtrees"
+          ]
+        },
         "Basis": {
           "additionalProperties": false,
           "properties": {
@@ -13275,6 +13968,231 @@
                   "type": "null"
                 }
               ]
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                null
+              ]
+            },
+            "historicalContentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "captureId": {
+              "$ref": "#/$defs/Text"
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "internal",
+                      "external"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "syntaxId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "revisionId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "language",
+                  "path",
+                  "syntaxId",
+                  "revisionId"
+                ]
+              }
+            },
+            "semanticBoundary": {
+              "type": "boolean"
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "historicalResolution": {
+              "enum": [
+                "resolved",
+                "external",
+                "ambiguous",
+                "unresolved"
+              ]
+            },
+            "historicalExternalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "scheme": {
+                    "type": "string"
+                  },
+                  "symbol": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "enum": [
+                      "global",
+                      "document"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "scheme",
+                  "symbol",
+                  "scope",
+                  "language",
+                  "path"
+                ]
+              }
+            },
+            "historicalDispatch": {
+              "enum": [
+                "direct",
+                "constructor",
+                "virtual",
+                "interface",
+                "dynamic",
+                "unknown"
+              ]
+            },
+            "historicalJoin": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "language": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "revisionId": {
+                  "type": "string"
+                },
+                "range": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "start": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "end": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "start",
+                    "end"
+                  ]
+                }
+              },
+              "required": [
+                "status",
+                "kind",
+                "language",
+                "path",
+                "revisionId",
+                "range"
+              ]
             }
           },
           "required": [
@@ -13344,6 +14262,16 @@
             },
             "semanticSites": {
               "$ref": "#/$defs/UInt"
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -13441,6 +14369,231 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                null
+              ]
+            },
+            "historicalContentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "captureId": {
+              "$ref": "#/$defs/Text"
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "internal",
+                      "external"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "syntaxId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "revisionId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "language",
+                  "path",
+                  "syntaxId",
+                  "revisionId"
+                ]
+              }
+            },
+            "semanticBoundary": {
+              "type": "boolean"
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "historicalResolution": {
+              "enum": [
+                "resolved",
+                "external",
+                "ambiguous",
+                "unresolved"
+              ]
+            },
+            "historicalExternalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "scheme": {
+                    "type": "string"
+                  },
+                  "symbol": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "enum": [
+                      "global",
+                      "document"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "scheme",
+                  "symbol",
+                  "scope",
+                  "language",
+                  "path"
+                ]
+              }
+            },
+            "historicalDispatch": {
+              "enum": [
+                "direct",
+                "constructor",
+                "virtual",
+                "interface",
+                "dynamic",
+                "unknown"
+              ]
+            },
+            "historicalJoin": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "language": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "revisionId": {
+                  "type": "string"
+                },
+                "range": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "start": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "end": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "start",
+                    "end"
+                  ]
+                }
+              },
+              "required": [
+                "status",
+                "kind",
+                "language",
+                "path",
+                "revisionId",
+                "range"
+              ]
             }
           },
           "required": [
@@ -13491,6 +14644,16 @@
               "items": {
                 "$ref": "#/$defs/Text"
               }
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -13582,6 +14745,16 @@
             },
             "referenceCount": {
               "$ref": "#/$defs/UInt"
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -13928,8 +15101,12 @@
         "CatalogEvidence": {
           "oneOf": [
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "rust-standard-library:v1"
                 },
@@ -13939,21 +15116,21 @@
                     "core",
                     "alloc"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "java-standard-library:v2"
                 },
@@ -13962,21 +15139,21 @@
                     "java",
                     "javax"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "python-standard-library:v2"
                 },
@@ -14283,21 +15460,21 @@
                     "zlib",
                     "zoneinfo"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "node-standard-library:v1"
                 },
@@ -14306,17 +15483,13 @@
                     "fs",
                     "path"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             }
           ]
         },
@@ -14358,44 +15531,160 @@
             "evidence"
           ]
         },
-        "PartialFile": {
+        "SemanticProjection": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "sourceSetId": {
+            "currentPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "semanticBasisPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "basisNativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "enum": [
+                "olderBasis",
+                "catchingUp"
+              ]
+            }
+          },
+          "required": [
+            "currentPin",
+            "semanticBasisPin",
+            "basisNativeRevisionId",
+            "semanticStatus"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "producerId": {
               "$ref": "#/$defs/Text"
             },
             "language": {
               "$ref": "#/$defs/Language"
             },
             "path": {
-              "$ref": "#/$defs/Path"
+              "type": "string",
+              "minLength": 1
             },
-            "reason": {
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            },
+            "coverageState": {
+              "type": [
+                "string",
+                "null"
+              ],
               "enum": [
-                "syntax_error",
-                "depth_limit",
-                "visit_limit",
-                "evidence_budget",
-                "oversized",
-                "not_utf8"
+                "notRequested",
+                "omitted",
+                "unsupported",
+                "failed",
+                "partial",
+                "complete",
+                null
               ]
             },
-            "range": {
-              "$ref": "#/$defs/Range"
-            },
-            "subtrees": {
-              "$ref": "#/$defs/UInt"
+            "boundary": {
+              "type": "boolean"
             }
           },
           "required": [
-            "sourceSetId",
+            "producerId",
             "language",
             "path",
-            "reason",
-            "range",
-            "subtrees"
+            "projection",
+            "coverageState",
+            "boundary"
           ]
+        },
+        "SemanticBasis": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "lookupDependencies": {
+              "items": {
+                "$ref": "#/$defs/Text"
+              },
+              "type": "array"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            }
+          },
+          "required": [
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "type": "object"
+        },
+        "DerivedFrom": {
+          "additionalProperties": false,
+          "properties": {
+            "factDigest": {
+              "$ref": "#/$defs/Hash"
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            },
+            "recordKind": {
+              "enum": [
+                "occurrence",
+                "symbolInformation",
+                "relationship"
+              ]
+            }
+          },
+          "required": [
+            "provenanceId",
+            "recordKind",
+            "factDigest"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -14473,6 +15762,12 @@
                     "semanticSites"
                   ]
                 },
+                "partialFiles": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/PartialFile"
+                  }
+                },
                 "limitations": {
                   "type": "array",
                   "items": {
@@ -14531,11 +15826,14 @@
                     ]
                   }
                 },
-                "partialFiles": {
+                "semanticDocuments": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/$defs/PartialFile"
+                    "$ref": "#/$defs/DocumentSemanticStatus"
                   }
+                },
+                "partial": {
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -14713,6 +16011,45 @@
     "name": "trellis_rules_check",
     "outputSchema": {
       "$defs": {
+        "PartialFile": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "reason": {
+              "enum": [
+                "syntax_error",
+                "depth_limit",
+                "visit_limit",
+                "evidence_budget",
+                "oversized",
+                "not_utf8"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "subtrees": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path",
+            "reason",
+            "range",
+            "subtrees"
+          ]
+        },
         "Basis": {
           "additionalProperties": false,
           "properties": {
@@ -15354,6 +16691,231 @@
                   "type": "null"
                 }
               ]
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                null
+              ]
+            },
+            "historicalContentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "captureId": {
+              "$ref": "#/$defs/Text"
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "internal",
+                      "external"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "syntaxId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "revisionId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "language",
+                  "path",
+                  "syntaxId",
+                  "revisionId"
+                ]
+              }
+            },
+            "semanticBoundary": {
+              "type": "boolean"
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "historicalResolution": {
+              "enum": [
+                "resolved",
+                "external",
+                "ambiguous",
+                "unresolved"
+              ]
+            },
+            "historicalExternalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "scheme": {
+                    "type": "string"
+                  },
+                  "symbol": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "enum": [
+                      "global",
+                      "document"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "scheme",
+                  "symbol",
+                  "scope",
+                  "language",
+                  "path"
+                ]
+              }
+            },
+            "historicalDispatch": {
+              "enum": [
+                "direct",
+                "constructor",
+                "virtual",
+                "interface",
+                "dynamic",
+                "unknown"
+              ]
+            },
+            "historicalJoin": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "language": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "revisionId": {
+                  "type": "string"
+                },
+                "range": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "start": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "end": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "start",
+                    "end"
+                  ]
+                }
+              },
+              "required": [
+                "status",
+                "kind",
+                "language",
+                "path",
+                "revisionId",
+                "range"
+              ]
             }
           },
           "required": [
@@ -15423,6 +16985,16 @@
             },
             "semanticSites": {
               "$ref": "#/$defs/UInt"
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -15520,6 +17092,231 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                null
+              ]
+            },
+            "historicalContentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "captureId": {
+              "$ref": "#/$defs/Text"
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "internal",
+                      "external"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "syntaxId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "revisionId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "language",
+                  "path",
+                  "syntaxId",
+                  "revisionId"
+                ]
+              }
+            },
+            "semanticBoundary": {
+              "type": "boolean"
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "historicalResolution": {
+              "enum": [
+                "resolved",
+                "external",
+                "ambiguous",
+                "unresolved"
+              ]
+            },
+            "historicalExternalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "scheme": {
+                    "type": "string"
+                  },
+                  "symbol": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "enum": [
+                      "global",
+                      "document"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "scheme",
+                  "symbol",
+                  "scope",
+                  "language",
+                  "path"
+                ]
+              }
+            },
+            "historicalDispatch": {
+              "enum": [
+                "direct",
+                "constructor",
+                "virtual",
+                "interface",
+                "dynamic",
+                "unknown"
+              ]
+            },
+            "historicalJoin": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "language": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "revisionId": {
+                  "type": "string"
+                },
+                "range": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "start": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "end": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "start",
+                    "end"
+                  ]
+                }
+              },
+              "required": [
+                "status",
+                "kind",
+                "language",
+                "path",
+                "revisionId",
+                "range"
+              ]
             }
           },
           "required": [
@@ -15570,6 +17367,16 @@
               "items": {
                 "$ref": "#/$defs/Text"
               }
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -15664,6 +17471,16 @@
             },
             "omittedEvidence": {
               "$ref": "#/$defs/UInt"
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -16082,8 +17899,12 @@
         "CatalogEvidence": {
           "oneOf": [
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "rust-standard-library:v1"
                 },
@@ -16093,21 +17914,21 @@
                     "core",
                     "alloc"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "java-standard-library:v2"
                 },
@@ -16116,21 +17937,21 @@
                     "java",
                     "javax"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "python-standard-library:v2"
                 },
@@ -16437,21 +18258,21 @@
                     "zlib",
                     "zoneinfo"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "node-standard-library:v1"
                 },
@@ -16460,17 +18281,13 @@
                     "fs",
                     "path"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             }
           ]
         },
@@ -16512,44 +18329,160 @@
             "evidence"
           ]
         },
-        "PartialFile": {
+        "SemanticProjection": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "sourceSetId": {
+            "currentPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "semanticBasisPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "basisNativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "enum": [
+                "olderBasis",
+                "catchingUp"
+              ]
+            }
+          },
+          "required": [
+            "currentPin",
+            "semanticBasisPin",
+            "basisNativeRevisionId",
+            "semanticStatus"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "producerId": {
               "$ref": "#/$defs/Text"
             },
             "language": {
               "$ref": "#/$defs/Language"
             },
             "path": {
-              "$ref": "#/$defs/Path"
+              "type": "string",
+              "minLength": 1
             },
-            "reason": {
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            },
+            "coverageState": {
+              "type": [
+                "string",
+                "null"
+              ],
               "enum": [
-                "syntax_error",
-                "depth_limit",
-                "visit_limit",
-                "evidence_budget",
-                "oversized",
-                "not_utf8"
+                "notRequested",
+                "omitted",
+                "unsupported",
+                "failed",
+                "partial",
+                "complete",
+                null
               ]
             },
-            "range": {
-              "$ref": "#/$defs/Range"
-            },
-            "subtrees": {
-              "$ref": "#/$defs/UInt"
+            "boundary": {
+              "type": "boolean"
             }
           },
           "required": [
-            "sourceSetId",
+            "producerId",
             "language",
             "path",
-            "reason",
-            "range",
-            "subtrees"
+            "projection",
+            "coverageState",
+            "boundary"
           ]
+        },
+        "SemanticBasis": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "lookupDependencies": {
+              "items": {
+                "$ref": "#/$defs/Text"
+              },
+              "type": "array"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            }
+          },
+          "required": [
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "type": "object"
+        },
+        "DerivedFrom": {
+          "additionalProperties": false,
+          "properties": {
+            "factDigest": {
+              "$ref": "#/$defs/Hash"
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            },
+            "recordKind": {
+              "enum": [
+                "occurrence",
+                "symbolInformation",
+                "relationship"
+              ]
+            }
+          },
+          "required": [
+            "provenanceId",
+            "recordKind",
+            "factDigest"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -16600,6 +18533,12 @@
                     "$ref": "#/$defs/Destination"
                   }
                 },
+                "partialFiles": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/PartialFile"
+                  }
+                },
                 "limitations": {
                   "type": "array",
                   "items": {
@@ -16639,11 +18578,14 @@
                     "total"
                   ]
                 },
-                "partialFiles": {
+                "semanticDocuments": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/$defs/PartialFile"
+                    "$ref": "#/$defs/DocumentSemanticStatus"
                   }
+                },
+                "partial": {
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -17091,6 +19033,45 @@
     "name": "trellis_rules_explain",
     "outputSchema": {
       "$defs": {
+        "PartialFile": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "reason": {
+              "enum": [
+                "syntax_error",
+                "depth_limit",
+                "visit_limit",
+                "evidence_budget",
+                "oversized",
+                "not_utf8"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "subtrees": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path",
+            "reason",
+            "range",
+            "subtrees"
+          ]
+        },
         "Basis": {
           "additionalProperties": false,
           "properties": {
@@ -17732,6 +19713,231 @@
                   "type": "null"
                 }
               ]
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                null
+              ]
+            },
+            "historicalContentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "captureId": {
+              "$ref": "#/$defs/Text"
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "internal",
+                      "external"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "syntaxId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "revisionId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "language",
+                  "path",
+                  "syntaxId",
+                  "revisionId"
+                ]
+              }
+            },
+            "semanticBoundary": {
+              "type": "boolean"
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "historicalResolution": {
+              "enum": [
+                "resolved",
+                "external",
+                "ambiguous",
+                "unresolved"
+              ]
+            },
+            "historicalExternalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "scheme": {
+                    "type": "string"
+                  },
+                  "symbol": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "enum": [
+                      "global",
+                      "document"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "scheme",
+                  "symbol",
+                  "scope",
+                  "language",
+                  "path"
+                ]
+              }
+            },
+            "historicalDispatch": {
+              "enum": [
+                "direct",
+                "constructor",
+                "virtual",
+                "interface",
+                "dynamic",
+                "unknown"
+              ]
+            },
+            "historicalJoin": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "language": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "revisionId": {
+                  "type": "string"
+                },
+                "range": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "start": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "end": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "start",
+                    "end"
+                  ]
+                }
+              },
+              "required": [
+                "status",
+                "kind",
+                "language",
+                "path",
+                "revisionId",
+                "range"
+              ]
             }
           },
           "required": [
@@ -17801,6 +20007,16 @@
             },
             "semanticSites": {
               "$ref": "#/$defs/UInt"
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -17898,6 +20114,231 @@
             },
             "provenanceId": {
               "$ref": "#/$defs/Text"
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalFreshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                null
+              ]
+            },
+            "historicalContentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "captureId": {
+              "$ref": "#/$defs/Text"
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "historicalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "internal",
+                      "external"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "syntaxId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "revisionId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "language",
+                  "path",
+                  "syntaxId",
+                  "revisionId"
+                ]
+              }
+            },
+            "semanticBoundary": {
+              "type": "boolean"
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "historicalResolution": {
+              "enum": [
+                "resolved",
+                "external",
+                "ambiguous",
+                "unresolved"
+              ]
+            },
+            "historicalExternalTargets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "scheme": {
+                    "type": "string"
+                  },
+                  "symbol": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "enum": [
+                      "global",
+                      "document"
+                    ]
+                  },
+                  "language": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "declared",
+                      "candidate",
+                      "dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "scheme",
+                  "symbol",
+                  "scope",
+                  "language",
+                  "path"
+                ]
+              }
+            },
+            "historicalDispatch": {
+              "enum": [
+                "direct",
+                "constructor",
+                "virtual",
+                "interface",
+                "dynamic",
+                "unknown"
+              ]
+            },
+            "historicalJoin": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "language": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "revisionId": {
+                  "type": "string"
+                },
+                "range": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "start": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "end": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "start",
+                    "end"
+                  ]
+                }
+              },
+              "required": [
+                "status",
+                "kind",
+                "language",
+                "path",
+                "revisionId",
+                "range"
+              ]
             }
           },
           "required": [
@@ -17948,6 +20389,16 @@
               "items": {
                 "$ref": "#/$defs/Text"
               }
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -18042,6 +20493,16 @@
             },
             "omittedEvidence": {
               "$ref": "#/$defs/UInt"
+            },
+            "projection": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -18460,8 +20921,12 @@
         "CatalogEvidence": {
           "oneOf": [
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "rust-standard-library:v1"
                 },
@@ -18471,21 +20936,21 @@
                     "core",
                     "alloc"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "java-standard-library:v2"
                 },
@@ -18494,21 +20959,21 @@
                     "java",
                     "javax"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "python-standard-library:v2"
                 },
@@ -18815,21 +21280,21 @@
                     "zlib",
                     "zoneinfo"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             },
             {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                },
                 "catalog": {
                   "const": "node-standard-library:v1"
                 },
@@ -18838,17 +21303,13 @@
                     "fs",
                     "path"
                   ]
-                },
-                "kind": {
-                  "const": "standardLibraryCatalog"
                 }
               },
               "required": [
                 "kind",
                 "catalog",
                 "entry"
-              ],
-              "type": "object"
+              ]
             }
           ]
         },
@@ -18890,44 +21351,160 @@
             "evidence"
           ]
         },
-        "PartialFile": {
+        "SemanticProjection": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "sourceSetId": {
+            "currentPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "semanticBasisPin": {
+              "$ref": "#/$defs/Basis"
+            },
+            "basisNativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "semanticStatus": {
+              "enum": [
+                "olderBasis",
+                "catchingUp"
+              ]
+            }
+          },
+          "required": [
+            "currentPin",
+            "semanticBasisPin",
+            "basisNativeRevisionId",
+            "semanticStatus"
+          ]
+        },
+        "DocumentSemanticStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "producerId": {
               "$ref": "#/$defs/Text"
             },
             "language": {
               "$ref": "#/$defs/Language"
             },
             "path": {
-              "$ref": "#/$defs/Path"
+              "type": "string",
+              "minLength": 1
             },
-            "reason": {
+            "projection": {
+              "$ref": "#/$defs/SemanticProjection"
+            },
+            "coverageState": {
+              "type": [
+                "string",
+                "null"
+              ],
               "enum": [
-                "syntax_error",
-                "depth_limit",
-                "visit_limit",
-                "evidence_budget",
-                "oversized",
-                "not_utf8"
+                "notRequested",
+                "omitted",
+                "unsupported",
+                "failed",
+                "partial",
+                "complete",
+                null
               ]
             },
-            "range": {
-              "$ref": "#/$defs/Range"
-            },
-            "subtrees": {
-              "$ref": "#/$defs/UInt"
+            "boundary": {
+              "type": "boolean"
             }
           },
           "required": [
-            "sourceSetId",
+            "producerId",
             "language",
             "path",
-            "reason",
-            "range",
-            "subtrees"
+            "projection",
+            "coverageState",
+            "boundary"
           ]
+        },
+        "SemanticBasis": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "lookupDependencies": {
+              "items": {
+                "$ref": "#/$defs/Text"
+              },
+              "type": "array"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            }
+          },
+          "required": [
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "type": "object"
+        },
+        "DerivedFrom": {
+          "additionalProperties": false,
+          "properties": {
+            "factDigest": {
+              "$ref": "#/$defs/Hash"
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            },
+            "recordKind": {
+              "enum": [
+                "occurrence",
+                "symbolInformation",
+                "relationship"
+              ]
+            }
+          },
+          "required": [
+            "provenanceId",
+            "recordKind",
+            "factDigest"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -18978,6 +21555,12 @@
                     "$ref": "#/$defs/Destination"
                   }
                 },
+                "partialFiles": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/PartialFile"
+                  }
+                },
                 "limitations": {
                   "type": "array",
                   "items": {
@@ -19017,11 +21600,14 @@
                     "total"
                   ]
                 },
-                "partialFiles": {
+                "semanticDocuments": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/$defs/PartialFile"
+                    "$ref": "#/$defs/DocumentSemanticStatus"
                   }
+                },
+                "partial": {
+                  "type": "boolean"
                 }
               },
               "required": [

@@ -16,6 +16,7 @@ use std::sync::atomic::Ordering;
 pub mod cargo_targets;
 pub mod module_roots;
 pub use cargo_targets::{CargoTarget, CargoTargets, CargoTargetsBuilder};
+pub(crate) use cargo_targets::CargoTargetsContinuation;
 pub use module_roots::ModuleRoots;
 
 pub const DECODER_VERSION: &str = "scip-0.10.0/CapturedScipFactV1/2";
@@ -1148,16 +1149,24 @@ impl ClaimSink for VecSink {
 struct ArtifactReader<R> {
     reader: BufReader<R>,
     remaining: u64,
+    fault: Option<std::io::Error>,
 }
 impl<R: Read> ArtifactReader<R> {
+    fn read_exact(&mut self, bytes: &mut [u8]) -> Result<(), ScipCaptureError> {
+        self.reader.read_exact(bytes).map_err(|error| {
+            if error.kind() != std::io::ErrorKind::UnexpectedEof {
+                self.fault = Some(error);
+            }
+            invalid("artifact read")
+        })
+    }
+
     fn byte(&mut self, truncated: &str) -> Result<u8, ScipCaptureError> {
         if self.remaining == 0 {
             return Err(invalid(truncated));
         }
         let mut byte = [0u8];
-        self.reader
-            .read_exact(&mut byte)
-            .map_err(|_| invalid("artifact read"))?;
+        self.read_exact(&mut byte)?;
         self.remaining -= 1;
         Ok(byte[0])
     }
@@ -1591,29 +1600,97 @@ pub fn decode_streaming<'s, R: Read>(
     cancel: &CancelFlag,
 ) -> Result<ArtifactSummary, ScipCaptureError> {
     cancelled(cancel)?;
-    if byte_length > limits.artifact_bytes {
-        return Err(limit("artifact bytes"));
+    let mut continuation = ScipDecodeContinuation::new(reader, byte_length, limits)?;
+    loop {
+        if let Some(summary) = continuation.advance(artifact, resolve, counters, limits, sink, cancel)? {
+            return Ok(summary);
+        }
     }
-    let capacity = byte_length.clamp(1, 1 << 20) as usize;
-    let mut input = ArtifactReader {
-        reader: BufReader::with_capacity(capacity, reader),
-        remaining: byte_length,
-    };
-    let mut budget = WireBudget::new(limits);
-    budget.fields = counters.wire_fields;
-    budget.candidates = counters.candidates;
-    let max_unit = usize::try_from(limits.unit_expansion_bytes).unwrap_or(usize::MAX);
-    let mut metadata: Option<types::Metadata> = None;
-    let mut documents = 0u64;
-    let mut external_symbols = 0u64;
-    let mut traversed = 0usize;
-    while input.remaining > 0 {
+}
+
+/// Owns the original wire cursor and budgets; each advance consumes exactly one top-level
+/// metadata, document or external-symbol unit. No unit bytes survive an advance.
+pub(crate) struct ScipDecodeContinuation<R> {
+    input: ArtifactReader<R>,
+    metadata: Option<types::Metadata>,
+    documents: u64,
+    external_symbols: u64,
+    relationships: u64,
+    traversed: usize,
+}
+
+impl<R: Read> ScipDecodeContinuation<R> {
+    pub(crate) fn take_read_fault(&mut self) -> Option<std::io::Error> {
+        self.input.fault.take()
+    }
+
+    pub(crate) fn new(reader: R, byte_length: u64, limits: &BatchLimits) -> Result<Self, ScipCaptureError> {
+        if byte_length > limits.artifact_bytes {
+            return Err(limit("artifact bytes"));
+        }
+        Ok(Self {
+            input: ArtifactReader {
+                reader: BufReader::with_capacity(byte_length.clamp(1, 1 << 20) as usize, reader),
+                remaining: byte_length,
+                fault: None,
+            },
+            metadata: None,
+            documents: 0,
+            external_symbols: 0,
+            relationships: 0,
+            traversed: 0,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn advance<'s>(
+        &mut self,
+        artifact: &AuthenticatedArtifact<'_>,
+        resolve: &mut dyn FnMut(&str, &str) -> Result<DocumentSource<'s>, ScipCaptureError>,
+        counters: &mut BatchCounters,
+        limits: &BatchLimits,
+        sink: &mut dyn ClaimSink,
+        cancel: &CancelFlag,
+    ) -> Result<Option<ArtifactSummary>, ScipCaptureError> {
+        cancelled(cancel)?;
+        if self.input.remaining == 0 {
+            if let Some(meta) = self.metadata.as_ref() {
+                unknown(&meta.special_fields)?;
+                if known(meta.version)? != artifact.protocol_version
+                    || known(meta.text_document_encoding)? != artifact.text_document_encoding
+                    || !meta.project_root.is_empty() && meta.project_root != artifact.project_root_uri
+                {
+                    return Err(invalid("metadata binding"));
+                }
+                if let Some(tool) = meta.tool_info.as_ref() {
+                    unknown(&tool.special_fields)?;
+                    if !tool.name.is_empty() && tool.name != artifact.producer_id
+                        || !tool.version.is_empty() && tool.version != artifact.producer_version
+                    {
+                        return Err(invalid("tool binding"));
+                    }
+                }
+            }
+            if self.documents != artifact.assigned_documents {
+                return Err(invalid("missing artifact document"));
+            }
+            return Ok(Some(ArtifactSummary {
+                documents: self.documents,
+                external_symbols: self.external_symbols,
+                relationships: self.relationships,
+            }));
+        }
+        let mut budget = WireBudget::new(limits);
+        budget.fields = counters.wire_fields;
+        budget.candidates = counters.candidates;
+        budget.relationships = self.relationships;
+        let max_unit = usize::try_from(limits.unit_expansion_bytes).unwrap_or(usize::MAX);
         cancelled(cancel)?;
         budget.fields += 1;
         if budget.fields > limits.wire_fields {
             return Err(limit("wire fields"));
         }
-        let tag = input.varint()?;
+        let tag = self.input.varint()?;
         let number = tag >> 3;
         if !matches!(number, 1..=3) {
             return Err(invalid("unknown field"));
@@ -1621,26 +1698,23 @@ pub fn decode_streaming<'s, R: Read>(
         if tag & 7 != 2 {
             return Err(invalid("field wire type"));
         }
-        let len = input.varint()?;
-        if len > input.remaining {
+        let len = self.input.varint()?;
+        if len > self.input.remaining {
             return Err(invalid("protobuf parse"));
         }
         if len > limits.unit_expansion_bytes {
             return Err(limit("unit expansion"));
         }
         if number == 3 {
-            external_symbols += 1;
-            if external_symbols > limits.external_symbols {
+            self.external_symbols += 1;
+            if self.external_symbols > limits.external_symbols {
                 return Err(limit("index entries"));
             }
         }
         let len = usize::try_from(len).map_err(|_| limit("unit expansion"))?;
         let mut unit = UnitBuffer::new(counters, len);
-        input
-            .reader
-            .read_exact(&mut unit.bytes)
-            .map_err(|_| invalid("artifact read"))?;
-        input.remaining -= len as u64;
+        self.input.read_exact(&mut unit.bytes)?;
+        self.input.remaining -= len as u64;
         let node = match number {
             1 => Node::Metadata,
             2 => Node::Document,
@@ -1654,22 +1728,22 @@ pub fn decode_streaming<'s, R: Read>(
         unit.counters.candidates = budget.candidates;
         walked?;
         match number {
-            1 => metadata
+            1 => self.metadata
                 .get_or_insert_with(types::Metadata::new)
                 .merge_from_bytes(&unit.bytes)
                 .map_err(|_| invalid("protobuf parse"))?,
             3 => {
                 let s = types::SymbolInformation::parse_from_bytes(&unit.bytes)
                     .map_err(|_| invalid("protobuf parse"))?;
-                traversed += 1;
-                if traversed.is_multiple_of(1024) {
+                self.traversed += 1;
+                if self.traversed.is_multiple_of(1024) {
                     cancelled(cancel)?;
                 }
                 let _ = symbol(
                     &s,
                     artifact.position_encoding,
                     cancel,
-                    &mut traversed,
+                    &mut self.traversed,
                     false,
                 )?;
             }
@@ -1704,7 +1778,7 @@ pub fn decode_streaming<'s, R: Read>(
                         text,
                         over,
                         limits,
-                        &mut traversed,
+                        &mut self.traversed,
                         cancel,
                     )?);
                     let d = types::Document::parse_from_bytes(&unit.bytes)
@@ -1787,8 +1861,8 @@ pub fn decode_streaming<'s, R: Read>(
                 let mut positions = Vec::with_capacity(d.occurrences.len() * 4);
                 let mut unresolved_markers = Vec::new();
                 for o in &d.occurrences {
-                    traversed += 1;
-                    if traversed.is_multiple_of(1024) {
+                    self.traversed += 1;
+                    if self.traversed.is_multiple_of(1024) {
                         cancelled(cancel)?;
                     }
                     let first = positions.len();
@@ -1816,12 +1890,12 @@ pub fn decode_streaming<'s, R: Read>(
                     )?;
                 }
                 for s in &d.symbols {
-                    traversed += 1;
-                    if traversed.is_multiple_of(1024) {
+                    self.traversed += 1;
+                    if self.traversed.is_multiple_of(1024) {
                         cancelled(cancel)?;
                     }
                     let (info, rels) =
-                        symbol(s, artifact.position_encoding, cancel, &mut traversed, true)?;
+                        symbol(s, artifact.position_encoding, cancel, &mut self.traversed, true)?;
                     if !read {
                         continue;
                     }
@@ -1833,8 +1907,8 @@ pub fn decode_streaming<'s, R: Read>(
                         info,
                     ))?;
                     for r in rels {
-                        traversed += 1;
-                        if traversed.is_multiple_of(1024) {
+                        self.traversed += 1;
+                        if self.traversed.is_multiple_of(1024) {
                             cancelled(cancel)?;
                         }
                         sink.claim(make_claim(
@@ -1847,35 +1921,12 @@ pub fn decode_streaming<'s, R: Read>(
                     }
                 }
                 sink.end_document()?;
-                documents += 1;
+                self.documents += 1;
             }
         }
+        self.relationships = budget.relationships;
+        Ok(None)
     }
-    if let Some(meta) = metadata.as_ref() {
-        unknown(&meta.special_fields)?;
-        if known(meta.version)? != artifact.protocol_version
-            || known(meta.text_document_encoding)? != artifact.text_document_encoding
-            || !meta.project_root.is_empty() && meta.project_root != artifact.project_root_uri
-        {
-            return Err(invalid("metadata binding"));
-        }
-        if let Some(tool) = meta.tool_info.as_ref() {
-            unknown(&tool.special_fields)?;
-            if !tool.name.is_empty() && tool.name != artifact.producer_id
-                || !tool.version.is_empty() && tool.version != artifact.producer_version
-            {
-                return Err(invalid("tool binding"));
-            }
-        }
-    }
-    if documents != artifact.assigned_documents {
-        return Err(invalid("missing artifact document"));
-    }
-    Ok(ArtifactSummary {
-        documents,
-        external_symbols,
-        relationships: budget.relationships,
-    })
 }
 
 /// Whole-artifact decoder over an in-memory artifact: the streaming decoder into a `VecSink`.
@@ -4048,5 +4099,70 @@ mod tests {
             decode_two(&two_documents(&repeated, &[]), &symbols_capped_at(2)).unwrap_err(),
             limit("repeated field")
         );
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn cursor_yields_for_every_original_wire_unit_and_preserves_claims() {
+        let documents = tests::vector_documents(tests::FULL);
+        let wire = [tests::message(1, &[0x20, 1]), hex::decode(tests::EXTERNAL).unwrap()].concat();
+        let input = tests::vector_input(&wire, documents);
+        let roots = ModuleRoots::default();
+        let cargo = CargoTargets::default();
+        let artifact = AuthenticatedArtifact {
+            artifact_hash: &input.artifact_hash, producer_id: &input.producer_id,
+            producer_version: &input.producer_version, source_set_id: &input.source_set_id,
+            source_revision: &input.source_revision, position_encoding: input.position_encoding,
+            protocol_version: input.protocol_version, text_document_encoding: input.text_document_encoding,
+            project_root_uri: &input.project_root_uri, module_roots: &roots, cargo_targets: &cargo,
+            assigned_documents: 2,
+        };
+        let flag = Arc::new(AtomicBool::new(false));
+        let limits = BatchLimits::PRODUCTION;
+        let mut counters = BatchCounters::default();
+        let mut sink = VecSink::default();
+        let mut cursor = ScipDecodeContinuation::new(wire.as_slice(), wire.len() as u64, &limits).unwrap();
+        let mut resolve = |path: &str, _: &str| {
+            let doc = input.documents.iter().find(|doc| doc.relative_path == path).unwrap();
+            Ok(DocumentSource { language: doc.language.clone(), bytes: Cow::Borrowed(doc.source_bytes), content_hash: doc.content_hash.clone() })
+        };
+        for expected_documents in [0, 1, 2, 2] {
+            assert!(cursor.advance(&artifact, &mut resolve, &mut counters, &limits, &mut sink, &flag).unwrap().is_none());
+            assert_eq!(cursor.documents, expected_documents);
+            assert_eq!(counters.live_unit_buffers, 0);
+        }
+        let summary = cursor.advance(&artifact, &mut resolve, &mut counters, &limits, &mut sink, &flag).unwrap().unwrap();
+        assert_eq!(summary.documents, 2);
+        assert_eq!(summary.external_symbols, 1);
+        assert_eq!(sink.finish().unwrap(), decode_authenticated(&input, &flag).unwrap().claims);
+        assert_eq!(counters.live_unit_buffers_high_water, 1);
+    }
+
+    #[test]
+    fn cursor_retains_global_wire_budget_and_cancellation_does_not_advance() {
+        let wire = [tests::message(1, &[]), tests::message(1, &[])].concat();
+        let roots = ModuleRoots::default();
+        let cargo = CargoTargets::default();
+        let artifact = AuthenticatedArtifact { artifact_hash: "", producer_id: "", producer_version: "",
+            source_set_id: "", source_revision: "", position_encoding: 1, protocol_version: 0,
+            text_document_encoding: 1, project_root_uri: "", module_roots: &roots, cargo_targets: &cargo,
+            assigned_documents: 0 };
+        let mut limits = BatchLimits::PRODUCTION;
+        limits.wire_fields = 1;
+        let flag = Arc::new(AtomicBool::new(true));
+        let mut counters = BatchCounters::default();
+        let mut sink = VecSink::default();
+        let mut cursor = ScipDecodeContinuation::new(wire.as_slice(), wire.len() as u64, &limits).unwrap();
+        let mut resolve = |_: &str, _: &str| Err(invalid("unexpected document"));
+        assert_eq!(cursor.advance(&artifact, &mut resolve, &mut counters, &limits, &mut sink, &flag).unwrap_err(), ScipCaptureError::Cancelled);
+        assert_eq!(cursor.input.remaining, wire.len() as u64);
+        flag.store(false, Ordering::Relaxed);
+        assert!(cursor.advance(&artifact, &mut resolve, &mut counters, &limits, &mut sink, &flag).unwrap().is_none());
+        assert_eq!(cursor.advance(&artifact, &mut resolve, &mut counters, &limits, &mut sink, &flag).unwrap_err(), limit("wire fields"));
     }
 }

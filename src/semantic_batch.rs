@@ -15,6 +15,7 @@ pub mod testing;
 
 pub use admit::{StageInput, StageOwner, stage_batch};
 pub use limits::BatchLimits;
+pub(crate) use retained::RetainedStageContinuation;
 
 #[cfg(test)]
 mod descriptor_tests;
@@ -27,6 +28,10 @@ mod staging_tests;
 /// AC5 test seam; `wire_fields` and `candidates` are the batch-shared decoder walk budget.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BatchCounters {
+    /// Work per resumable retained-admission unit; no producer-sized decode is hidden here.
+    pub retained_admission_units: u64,
+    pub retained_admission_rows_high_water: u64,
+    pub retained_admission_bytes_high_water: u64,
     pub wire_fields: u64,
     pub candidates: u64,
     pub page_buffer_high_water_bytes: u64,

@@ -219,6 +219,7 @@ fn node(id: &str) -> Symbol {
         parent: None,
         accessor: false,
         provenance: Provenance {
+            projection: None,
             source: "syntax".into(),
             semantic: SemanticState::Unavailable,
         },

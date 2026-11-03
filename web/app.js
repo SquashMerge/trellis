@@ -459,7 +459,11 @@ async function refreshStatus(followup = false) {
   if (serial !== statusSerial || session !== epoch || status !== data) return;
   const stats = status.stats || {};
   const semantic = (status.semanticLanguages || []).map(row => {
-    const evidence = `${row.language}: semantic evidence ${row.semanticState}`;
+    const documents = row.documents || [];
+    const pending = documents.filter(item => item.projection?.semanticStatus === "catchingUp").length;
+    const older = documents.filter(item => item.projection?.semanticStatus === "olderBasis").length;
+    const availability = [pending && `${pending} catching up`, older && `${older} older basis`].filter(Boolean).join(", ");
+    const evidence = `${row.language}: semantic evidence ${availability || row.semanticState}`;
     return row.reimport?.state === "needsReimport"
       ? `${evidence}; needs re-import — ${row.reimport.reason}. Re-import a current artifact.` : evidence;
   }).join(" · ") || `Semantic evidence ${stats.semanticState || "unavailable"}`;
@@ -615,6 +619,13 @@ function selectedIndexStatus() {
     return {state:"stale", text:"Viewing retained revision · reload at head"};
   }
   if (staleMessage) return {state:"stale", text:"Stale evidence · see Diagnostics"};
+  const projections = (status.semanticLanguages || []).flatMap(row => row.documents || []).map(row => row.projection);
+  if (projections.some(projection => projection?.semanticStatus === "catchingUp")) {
+    return {state:"catching-up", text:`Semantic catching up · native rev ${IndexPin.label(pin)}`};
+  }
+  if (projections.some(projection => projection?.semanticStatus === "olderBasis")) {
+    return {state:"stale", text:`Older semantic basis · native rev ${IndexPin.label(pin)}`};
+  }
   return base;
 }
 // The visible label follows every poll; the live region speaks only when the leading state words change.

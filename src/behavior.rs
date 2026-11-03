@@ -54,6 +54,8 @@ impl SequenceView {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SequenceSemantic {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<crate::model::DocumentSemanticStatus>,
     pub tier: EvidenceTier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer_id: Option<String>,
@@ -68,6 +70,7 @@ impl Default for SequenceSemantic {
 impl SequenceSemantic {
     pub fn syntax(reason: Option<String>) -> Self {
         Self {
+            documents: vec![],
             tier: EvidenceTier::Syntax,
             producer_id: None,
             reason,
@@ -154,6 +157,10 @@ pub enum IncidentalReason {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CallEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<crate::model::SemanticProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_freshness: Option<crate::semantic_evidence::Freshness>,
     pub boundary_reason: crate::graph_query::BoundaryReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<crate::semantic_evidence::Resolution>,

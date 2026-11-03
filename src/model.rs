@@ -26,6 +26,48 @@ pub struct IndexPin {
     pub index_revision: u64,
 }
 
+/// Availability of an explicitly selected older semantic basis beside the current native pin.
+/// This is not proof freshness and never asserts current semantic absence.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SemanticStatus {
+    OlderBasis,
+    CatchingUp,
+}
+
+/// One selected document's availability, independent of coverage and proof freshness.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DocumentSemanticStatus {
+    pub producer_id: String,
+    pub language: String,
+    pub path: String,
+    pub projection: SemanticProjection,
+}
+
+/// An authorized native-N result with historical semantic evidence from P.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SemanticProjection {
+    pub current_pin: IndexPin,
+    pub semantic_basis_pin: IndexPin,
+    pub basis_native_revision_id: String,
+    pub semantic_status: SemanticStatus,
+}
+impl SemanticProjection {
+    /// A projection cannot inherit an exact-native fresh grant from its basis.
+    pub fn effective_freshness(
+        &self,
+        historical: crate::semantic_evidence::Freshness,
+    ) -> crate::semantic_evidence::Freshness {
+        use crate::semantic_evidence::Freshness;
+        match historical {
+            Freshness::Stale => Freshness::Stale,
+            Freshness::Fresh | Freshness::PossiblyStale => Freshness::PossiblyStale,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UncheckedIndexPin {
@@ -103,6 +145,8 @@ pub enum SemanticState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Provenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<SemanticProjection>,
     pub source: String,
     pub semantic: SemanticState,
 }
@@ -315,6 +359,8 @@ pub struct IndexStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LanguageSemantic {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<DocumentSemanticStatus>,
     pub language: String,
     /// The sole published producer whose profile covers the language.
     pub semantic_producer_id: Option<String>,
@@ -412,6 +458,29 @@ impl SemanticCoverageSummary {
         Some(format!("partial: {} · {detail}", self.partial))
     }
 }
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    #[test]
+    fn projection_never_inherits_freshness() {
+        use crate::semantic_evidence::Freshness;
+        let generation = uuid::Uuid::new_v4();
+        let projection = SemanticProjection {
+            current_pin: IndexPin { index_generation: generation, index_revision: 2 },
+            semantic_basis_pin: IndexPin { index_generation: generation, index_revision: 1 },
+            basis_native_revision_id: "basis-native".into(),
+            semantic_status: SemanticStatus::OlderBasis,
+        };
+        assert_eq!(projection.effective_freshness(Freshness::Fresh), Freshness::PossiblyStale);
+        assert_eq!(projection.effective_freshness(Freshness::PossiblyStale), Freshness::PossiblyStale);
+        assert_eq!(projection.effective_freshness(Freshness::Stale), Freshness::Stale);
+        let value = serde_json::to_value(&projection).unwrap();
+        assert_eq!(value["semanticStatus"], "olderBasis");
+        assert_eq!(value["basisNativeRevisionId"], "basis-native");
+        assert_ne!(value["currentPin"], value["semanticBasisPin"]);
+    }
+}
+
 /// Bytes allowed in a requested semantic producer ID.
 pub const SEMANTIC_PRODUCER_ID_BYTES: usize = 512;
 /// A requested producer ID has 1..=512 bytes and no NUL. Publication is checked at read.
@@ -498,11 +567,17 @@ pub struct ViewSemantic {
     pub note: Option<String>,
     /// The selected binding of each returned call that has one, in call order.
     pub bindings: Vec<ViewCallBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<DocumentSemanticStatus>,
 }
 /// One measured call's selected semantic binding.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewCallBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<SemanticProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_freshness: Option<crate::semantic_evidence::Freshness>,
     pub call_id: String,
     /// The call-graph engine's boundary reason: `none` when the graph traverses the call.
     pub boundary_reason: crate::graph_query::BoundaryReason,

@@ -424,7 +424,7 @@ impl DaemonState {
 pub(super) struct WorkerInbox {
     wake: std::sync::Mutex<bool>,
     changed: std::sync::Condvar,
-    shutdown: AtomicBool,
+    shutdown: Arc<AtomicBool>,
     /// While the worker is blocked with no wake pending: its deadline.
     #[cfg(feature = "test-support")]
     asleep: std::sync::Mutex<Option<Option<Instant>>>,
@@ -1065,6 +1065,7 @@ fn worker_loop_with_wait(
     inbox: Arc<WorkerInbox>,
     mut wait: impl FnMut(Option<Instant>),
 ) {
+    let mut semantic = semantic::SemanticMaintenance::default();
     let mut deadline = weak.upgrade().map(|state| state.worker_now());
     loop {
         wait(deadline);
@@ -1078,16 +1079,24 @@ fn worker_loop_with_wait(
         if matches!(*state.runtime.lock().unwrap(), RuntimeState::Retired) {
             return;
         }
+        semantic.before_foreground(&state);
         let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.worker_step()));
         if step.is_err() {
             state.publish_fifo_pending();
         }
         deadline = match step {
             Ok(Ok(())) => {
-                if state.maintenance_ready() {
+                let semantic_due = if state.maintenance_ready() {
                     state.run_maintenance_unit();
+                    // A retention unit is a real selection boundary too.
+                    Some(state.worker_now())
+                } else {
+                    semantic.run_unit(&state, &inbox.shutdown)
+                };
+                match (state.next_wake(), semantic_due) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (left, right) => left.or(right),
                 }
-                state.next_wake()
             }
             Ok(Err(error)) => {
                 super::best_effort_queue_stderr(
@@ -1106,6 +1115,8 @@ fn worker_loop_with_wait(
         };
     }
 }
+
+mod semantic;
 
 #[cfg(test)]
 mod recovery_tests;

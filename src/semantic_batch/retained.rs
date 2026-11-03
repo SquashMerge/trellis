@@ -1,4 +1,7 @@
 //! Re-admits retained raw rows through the bounded stage and the original SCIP decoder.
+#[path = "retained_continuation.rs"]
+mod continuation;
+pub(crate) use continuation::RetainedStageContinuation;
 use super::{
     AdmittedBatch, BatchCounters, BatchLimits,
     admit::{NativeSource, Passes, ReaderSource, StageOwner, check_cancel},

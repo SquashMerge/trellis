@@ -1506,7 +1506,7 @@ fn drain_requests_observed_with_cancel(
                 // A changed pin might be our committed import or an unrelated
                 // native publication. Read the selected overlay for integrity,
                 // but never infer a terminal result from the pin alone.
-                let _ = store.semantic_at(selected)?;
+                store.validate_semantic_read_at(selected)?;
                 let job = request.semantic_job()?;
                 let _ = store.semantic_batch_report_at(selected, job.descriptor_sha256())?;
             }
@@ -2124,6 +2124,41 @@ pub fn cooperative_maintenance_unit(
     store
         .maintenance_step(writer, &permit, &probe, priority)
         .map_err(|error| store.report_index_failure(error))
+}
+
+/// One lowest-priority semantic unit. The checkout worker owns selection;
+/// this probe also accounts for FIFO accepted through another Store/process.
+/// An unreadable or contended queue permits deferral, never completion. The
+/// admitted bounded unit is nonpreemptible; final S publication is a separate
+/// unit, selected only after the worker rechecks foreground priority again.
+pub(crate) fn cooperative_semantic_unit(
+    store: &Store,
+    session: &Arc<WriterSession>,
+    continuation: &mut Option<crate::store::SemanticContinuation>,
+    cancel: &CancelFlag,
+    mut priority: impl FnMut() -> bool,
+) -> Result<crate::store::SemanticUnitOutcome> {
+    use crate::store::{MaintenanceQueueState, SemanticUnitOutcome};
+    if !priority() || cancel.load(Ordering::Acquire) {
+        return Ok(SemanticUnitOutcome::Deferred);
+    }
+    store.verify_writer_session(session)?;
+    let probe = match store.open_maintenance_queue_probe() {
+        Ok(probe) => probe,
+        Err(error) if crate::store::transient_storage_contention(&error) => {
+            return Ok(SemanticUnitOutcome::Deferred);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut admitted = || {
+        priority()
+            && !cancel.load(Ordering::Acquire)
+            && probe.check() == MaintenanceQueueState::Clear
+    };
+    if !admitted() {
+        return Ok(SemanticUnitOutcome::Deferred);
+    }
+    store.semantic_maintenance_unit(session, continuation, cancel)
 }
 
 /// A checkout's daemon-local writer confirms old-root queue settlement, then

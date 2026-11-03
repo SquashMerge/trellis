@@ -46,6 +46,8 @@ use std::{
 };
 
 mod claim_size;
+mod continuation;
+pub(crate) use continuation::JoinContinuation;
 pub(crate) mod codec;
 pub(super) mod group_size;
 pub(super) mod heap;

@@ -4189,6 +4189,7 @@ async fn selected_evidence<T: Send + 'static>(
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response()?;
+        let catching_up = catching_up || response.semantic_catching_up()?;
         if let Some(hook) = &hook {
             hook("before_work");
         }
@@ -4219,6 +4220,7 @@ async fn selected_catalog_read<T: Send + 'static>(
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response().map_err(ApiError::from)?;
+        let catching_up = catching_up || response.semantic_catching_up().map_err(ApiError::from)?;
         if let Some(hook) = &hook {
             hook("before_work");
         }
@@ -5148,7 +5150,8 @@ async fn provisioned_core_answer(
             let (status, catching_up) = tokio::task::spawn_blocking(move || {
                 let (response, catching_up) = runtime.evidence_response()?;
                 let mut status = response.status()?;
-                status.catching_up = catching_up;
+                let catching_up = catching_up || response.semantic_catching_up()?;
+                status.catching_up |= catching_up;
                 if let Some(hook) = hook {
                     hook("before_read_finish");
                 }
@@ -5351,6 +5354,7 @@ async fn provisioned_core_answer(
             let runtime = runtime.clone();
             let (file, catching_up) = tokio::task::spawn_blocking(move || {
                 let (response, catching_up) = runtime.evidence_response()?;
+                let catching_up = catching_up || response.semantic_catching_up()?;
                 let file = response.source_at(&q.path, pin)?;
                 Ok::<_, anyhow::Error>((response.finish(file)?, catching_up))
             })

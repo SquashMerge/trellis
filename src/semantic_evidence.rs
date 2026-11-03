@@ -165,6 +165,23 @@ record!(SemanticHead {
     requested: bool
 });
 record!(SemanticSnapshot { producers: Vec<Producer>, coverage: Vec<Coverage>, provenance: Vec<Provenance>, symbols: Vec<Symbol>, declaration_bindings: Vec<DeclarationBinding>, references: Vec<Reference>, call_bindings: Vec<CallBinding>, type_relationships: Vec<TypeRelationship> });
+/// A read projection of one proof. The stored proof and its basis remain historical;
+/// effective freshness belongs to the native-N view, never to a new publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectedEvidence<T> {
+    pub evidence: T,
+    pub projection: crate::model::SemanticProjection,
+    pub historical_freshness: Freshness,
+    pub effective_freshness: Freshness,
+}
+impl<T> ProjectedEvidence<T> {
+    pub fn new(evidence: T, projection: crate::model::SemanticProjection, historical_freshness: Freshness) -> Self {
+        let effective_freshness = projection.effective_freshness(historical_freshness);
+        Self { evidence, projection, historical_freshness, effective_freshness }
+    }
+}
+
 /// Exact captured bytes for the synthetic boundary, never a raw producer envelope.
 #[derive(Debug, Clone)]
 pub struct CapturedComponents {

@@ -200,6 +200,7 @@ mod tests {
             parent: parent.map(str::to_owned),
             accessor: false,
             provenance: Provenance {
+                projection: None,
                 source: "test".into(),
                 semantic: SemanticState::Unavailable,
             },

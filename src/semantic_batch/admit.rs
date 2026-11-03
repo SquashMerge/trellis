@@ -16,7 +16,7 @@ use crate::{
     model::{CancelFlag, IndexPin},
     native_evidence as native,
     scip_admission::{PinnedProducer, admission, file_uri, order},
-    scip_raw::{self, AuthenticatedArtifact, DocumentSource, ScipCaptureError, decode_streaming},
+    scip_raw::{self, AuthenticatedArtifact, DocumentSource, ScipCaptureError},
     store::{InventoryStream, NativeReader, Store},
 };
 use anyhow::{Context, Result};
@@ -101,6 +101,7 @@ fn key(language: &str, path: &str) -> (usize, Vec<u8>) {
 
 /// Keeps staged-file I/O failures typed even though the SCIP decoder reports read failures
 /// as invalid artifacts. Malformed bytes without an underlying I/O error keep that result.
+#[cfg(test)]
 fn with_artifact_reader<R: Read, T>(
     reader: R,
     decode: impl FnOnce(&mut dyn Read) -> std::result::Result<T, ScipCaptureError>,
@@ -398,12 +399,32 @@ impl Passes<'_> {
         cargo_targets: &scip_raw::CargoTargets,
         counters: &mut BatchCounters,
     ) -> Result<()> {
-        let descriptor = self.descriptor;
-        let assigned: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM coverage WHERE artifact=?1",
-            [entry.ordinal],
-            |r| r.get(0),
+        let mut decoder = scip_raw::ScipDecodeContinuation::new(
+            std::fs::File::open(staged).context("staged artifact")?,
+            entry.byte_length,
+            self.limits,
         )?;
+        let assigned: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coverage WHERE artifact=?1", [entry.ordinal], |row| row.get(0),
+        )?;
+        let assigned = u64::try_from(assigned).map_err(|_| admission("invalid assigned document count"))?;
+        while !self.decode_advance(entry, &mut decoder, conn, native, cargo_targets, counters, assigned)? {}
+        Ok(())
+    }
+
+    /// Decode one original top-level wire unit and commit only that unit to the private stage.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_advance(
+        &self,
+        entry: &ArtifactEntry,
+        decoder: &mut scip_raw::ScipDecodeContinuation<std::fs::File>,
+        conn: &Connection,
+        native: &mut dyn NativeSource,
+        cargo_targets: &scip_raw::CargoTargets,
+        counters: &mut BatchCounters,
+        assigned_documents: u64,
+    ) -> Result<bool> {
+        let descriptor = self.descriptor;
         let context = AuthenticatedArtifact {
             artifact_hash: &entry.sha256,
             producer_id: &self.producer.name,
@@ -416,7 +437,7 @@ impl Passes<'_> {
             project_root_uri: &descriptor.metadata.project_root,
             module_roots: self.module_roots,
             cargo_targets,
-            assigned_documents: assigned as u64,
+            assigned_documents,
         };
         let mut sink = StageClaimSink::new(conn, &self.budget, entry.ordinal, &entry.language);
         let mut fault: Option<anyhow::Error> = None;
@@ -461,24 +482,26 @@ impl Passes<'_> {
                 }
             }
         };
-        let file = std::fs::File::open(staged).context("staged artifact")?;
-        let decoded = with_artifact_reader(file, |reader| {
-            decode_streaming(
-                reader,
-                entry.byte_length,
-                &context,
-                &mut resolve,
-                counters,
-                self.limits,
-                &mut sink,
-                self.cancel,
-            )
-        });
-        if let Err(error) = decoded {
-            return Err(sink.take_fault().or(fault).unwrap_or(error));
-        }
-        sink.finish()?;
-        Ok(())
+        let previous: (i64, i64) = conn.query_row(
+            "SELECT documents,claims FROM artifacts WHERE ordinal=?1",
+            [entry.ordinal], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let decoded = decoder.advance(
+            &context, &mut resolve, counters, self.limits, &mut sink, self.cancel,
+        );
+        let complete = match decoded {
+            Ok(summary) => summary.is_some(),
+            Err(error) => return Err(sink.take_fault().or(fault)
+                .or_else(|| decoder.take_read_fault().map(Into::into))
+                .unwrap_or_else(|| error.into())),
+        };
+        let totals = sink.finish()?;
+        conn.execute(
+            "UPDATE artifacts SET documents=?2,claims=?3 WHERE ordinal=?1",
+            params![entry.ordinal, previous.0 + totals.documents as i64, previous.1 + totals.claims as i64],
+        )?;
+        self.budget.check()?;
+        Ok(complete)
     }
 }
 
@@ -691,6 +714,7 @@ pub fn stage_batch(
 #[cfg(test)]
 mod artifact_reader_tests {
     use super::*;
+    use crate::scip_raw::decode_streaming;
     use std::sync::{Arc, atomic::AtomicBool};
 
     struct FailingReader {

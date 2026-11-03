@@ -1478,7 +1478,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         };
                         let semantic = match response.mcp_call_semantics(
                             producer,
-                            &found.owner.selected.declaration.document.language,
+                            &found.owner.selected.declaration.document,
                             found.calls.iter().map(|call| &call.selected.call),
                         ) {
                             Err(error) if error.is::<crate::store::ProducerNotPublished>() => {
@@ -1529,7 +1529,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         };
                         let semantic = match response.mcp_call_semantics(
                             producer,
-                            &found.selected.selected.declaration.document.language,
+                            &found.selected.selected.declaration.document,
                             found.calls.iter().map(|call| &call.call),
                         ) {
                             Err(error) if error.is::<crate::store::ProducerNotPublished>() => {
