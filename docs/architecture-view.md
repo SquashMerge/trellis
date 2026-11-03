@@ -58,14 +58,15 @@ no arrow segment crosses a band or a module chip: an arrow leaves and reaches a 
 its border. Arrows between adjacent rows cross one gutter (straight where the bands overlap),
 peer arrows dip into the gutter under their row, and arrows to or from the nearest shared box
 run along a gutter to its side. A **long upward** arrow (one that skips a band row) runs in a
-side channel left of the stack; a long downward arrow, or one to a farther shared box, runs in
-a channel right of the stack (and a strip under the drawing to reach the box). Each count tag
+side channel left of the stack; a long downward arrow, or one to or from a farther shared box,
+runs in a channel right of the stack (and a strip under the drawing to reach the box). Each count tag
 sits in a gutter's tag rows on its own arrow, clear of bands, chips and other tags, never on a
 band border. Arrow **width** grows with the arrow's reference-site count on a log scale, from
-1.5 px at one site to 7 px at 1,000 or more, so one large edge does not swamp the rest; colour
-keeps its meaning, the tag and the inspector keep the exact count, and the arrow key under the
-drawing shows the width at 1, 10, 100 and ≥1000 sites. The channels count toward the fitted
-width. This is layout only: records, counts and identities are unchanged. When the panel width changes (window resize, inspector shown or hidden), the drawing
+1.5 drawing units at one site to 7 at 1,000 or more, so one large edge does not swamp the
+rest; colour keeps its meaning, the tag and the inspector keep the exact count, and the arrow
+key under the drawing shows the width at 1, 10, 100 and ≥1000 sites. The channels count
+toward the fitted width. This is layout only: records, counts and identities are unchanged.
+When the panel width changes (window resize, inspector shown or hidden), the drawing
 is laid out again after a short quiet period (150 ms), from the same response with no new
 read, keeping the size cap, the inspector, the selected node and keyboard focus. The hidden-layer note
 (`N hidden layers · M files · E production edges`, with its toggle) is laid out inside the

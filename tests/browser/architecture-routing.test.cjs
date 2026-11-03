@@ -72,6 +72,7 @@ function assertRouted(geometry, label, longUpward = 2) {
   assert.ok(geometry.bands >= 6 && geometry.arrows > 0, `${label}: drew ${geometry.bands} bands and ${geometry.arrows} arrows`);
   assert.deepEqual(geometry.crossings, [], `${label}: no arrow segment enters a band or a module box`);
   assert.deepEqual(geometry.tagHits, [], `${label}: count tags overlap no band, chip or other tag`);
+  assert.deepEqual(geometry.detached, [], `${label}: every arrow starts on its source band and ends on its target band`);
   const long = geometry.upward.filter(arrow => arrow.long);
   assert.ok(long.length >= longUpward, `${label}: the fixture has long upward arrows: ${JSON.stringify(geometry.upward)}`);
   assert.deepEqual(long.filter(arrow => !arrow.channel).map(arrow => arrow.name), [], `${label}: every long upward arrow runs in the side channel`);
@@ -125,4 +126,22 @@ test("#637 routes peers, adjacent rows, two shared boxes and shared-to-shared ar
     assert.equal(geometry.arrows, view.edges.length);
     assertRouted(geometry, `synthetic ${width}px`, 1);
   }
+}));
+
+test("#637 the summary display admits Pele's boxes only and refuses any connector Pele draws", {timeout:120000}, async () => withPage(async page => {
+  const result = await page.evaluate(view => {
+    const A = window.TrellisArchitecturePele;
+    const p = A.project(view, {display:{layers:new Set(view.layers.filter(layer => layer.display !== "hidden").map(layer => layer.name)), expanded:() => false, edge:() => true, entries:() => [], summary:() => [], unassigned:null}});
+    const raw = window.pele.render(p.source, {fontSize:14, padding:8, responsive:false, links:false, images:false}).svg;
+    const [first] = p.edges.values();
+    const connector = `<g class="pele-edges" fill="none" stroke="var(--_l)"><g class="pele-edge" data-id="1-${first.from}-${first.to}"><path d="M0,0L9,9"/><path class="pele-marker" d="M9,9L6,6L6,9Z" fill="var(--_l)" stroke="none"/></g></g>`;
+    const admitted = A.validatedSvg(raw, p).controls.size;
+    let refused = null;
+    try { A.validatedSvg(raw.replace("</svg>", `${connector}</svg>`), p); } catch (error) { refused = error.message; }
+    return {edges:p.edges.size, admitted, nodes:p.nodes.size, refused, source:p.source.includes("-->")};
+  }, summary);
+  assert.ok(result.edges > 0);
+  assert.equal(result.source, false, "the summary source gives Pele no edges");
+  assert.equal(result.admitted, result.nodes + result.edges, "Pele's boxes and the adapter's own arrows are all controls");
+  assert.equal(result.refused, "Missing or unexpected Architecture edge");
 }));

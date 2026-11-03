@@ -1215,6 +1215,7 @@ function assertLayout(bounds, label) {
   // #637: no arrow segment enters a band or module box; tags sit clear of bands and each other.
   assert.deepEqual(bounds.arrows.crossings, [], `${label}: no arrow crosses a band or a module box`);
   assert.deepEqual(bounds.arrows.tagHits, [], `${label}: no count tag sits on a band, a chip or another tag`);
+  assert.deepEqual(bounds.arrows.detached, [], `${label}: every arrow starts on its source band and ends on its target band`);
   assert.deepEqual(bounds.arrows.upward.filter(arrow => arrow.long && !arrow.channel).map(arrow => arrow.name), [], `${label}: long upward arrows use the side channel`);
   assert.deepEqual(bounds.overlaps, [], `${label}: count tags and header chips never overlap text, chips or each other`);
   assert.deepEqual(bounds.strays, [], `${label}: every count tag stays beside its own arrow`);

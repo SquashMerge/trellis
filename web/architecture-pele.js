@@ -546,7 +546,8 @@
       if (rowOfHost.has(owner)) shift(control.node, LW, below(rowOfHost.get(owner)));
       else if (sharedOf.has(owner)) {
         shift(control.node, LW + RW, 0);
-        if (id === owner) { const rect = control.node.querySelector(":scope > rect"); rect.setAttribute("height", String(round(num(rect,"height") + total))); }
+        // A shared box spans the whole grown stack, so every gutter's track meets its side.
+        if (id === owner) { const rect = control.node.querySelector(":scope > rect"); rect.setAttribute("height", String(round(Math.max(num(rect,"height") + total, stack.y + stack.h + total - num(rect,"y"))))); }
       } else if (owner && owner === layout.unassigned) {
         shift(control.node, LW, total + stripH);
         if (id === owner) { const rect = control.node.querySelector(":scope > rect"); rect.setAttribute("width", String(round(num(rect,"width") + RW))); }
@@ -705,7 +706,7 @@
           const color = tone === "deviation" ? "#FF8E9A" : tone === "allowed" ? "#777A8E" : "#B8BAC8";
           for (const p of path.querySelectorAll("path")) {
             p.setAttribute("stroke",color);
-            if (p.classList.contains("pele-marker")) p.setAttribute("fill",color); else if (tone === "deviation") p.setAttribute("stroke-width","2");
+            if (p.classList.contains("pele-marker")) p.setAttribute("fill",color);
           }
           const rect = node.querySelector("rect"); rect?.setAttribute("stroke",color); rect?.setAttribute("fill","#14151D"); label.setAttribute("fill",color);
           if (tone === "allowed") { path.setAttribute("opacity","0.45"); node.setAttribute("opacity","0.75"); }

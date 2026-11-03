@@ -8,7 +8,9 @@
 // - `tagHits`: a count tag overlapping a band, a chip or another tag;
 // - `upward`: each upward arrow that skips a band row, and whether it runs in the left channel
 //   (a vertical run left of every band);
-// - `widths`: each arrow's reference-site count and drawn stroke width.
+// - `widths`: each arrow's reference-site count and drawn stroke width;
+// - `detached`: an arrow that does not start on its source band's border or whose arrowhead
+//   tip is not on its target band's border.
 function arrowGeometry(selector) {
   const svg = document.querySelector(selector);
   if (!svg) return {error:`no drawing at ${selector}`};
@@ -46,7 +48,10 @@ function arrowGeometry(selector) {
     return out;
   }
   const labels = new Map([...svg.querySelectorAll(".pele-edge-label")].map(node => [node.getAttribute("data-id"), node]));
-  const crossings = [], widths = [], upward = [], tags = [];
+  const crossings = [], widths = [], upward = [], tags = [], detached = [];
+  // A point lies on a box's border: within a pixel of one side, and within the box's extent.
+  const onBorder = ([x, y], r) => x >= r.x - 1 && x <= r.x + r.w + 1 && y >= r.y - 1 && y <= r.y + r.h + 1
+    && (Math.abs(x - r.x) <= 1 || Math.abs(x - r.x - r.w) <= 1 || Math.abs(y - r.y) <= 1 || Math.abs(y - r.y - r.h) <= 1);
   const layerRect = new Map(bands.filter(b => b.kind === "band").map(b => [b.name, b]));
   const left = Math.min(...[...layerRect.values()].map(b => b.x));
   for (const edge of svg.querySelectorAll(".pele-edge")) {
@@ -64,6 +69,12 @@ function arrowGeometry(selector) {
       upward.push({name, long:between > 0, channel});
     }
     if (label) tags.push({name, ...box(label.querySelector("rect"))});
+    if (id) {
+      const [source, destination] = JSON.parse(id), s = layerRect.get(source), t = layerRect.get(destination);
+      const marker = edge.querySelector("path.pele-marker"), m = marker.getScreenCTM(), tip = /^M(-?[\d.]+),(-?[\d.]+)/.exec(marker.getAttribute("d") || "");
+      const end = tip ? [m.a * Number(tip[1]) + m.c * Number(tip[2]) + m.e, m.b * Number(tip[1]) + m.d * Number(tip[2]) + m.f] : null;
+      if (!s || !t || !onBorder(pts[0], s) || !end || !onBorder(end, t)) detached.push(name);
+    }
   }
   const hit = (a, b) => a.x < b.x + b.w - 0.5 && b.x < a.x + a.w - 0.5 && a.y < b.y + b.h - 0.5 && b.y < a.y + a.h - 0.5;
   const tagHits = [];
@@ -71,6 +82,6 @@ function arrowGeometry(selector) {
     for (const r of obstacles) if (hit(tag, r)) tagHits.push(`${tag.name} × ${r.kind}:${r.name}`);
     for (const other of tags.slice(i + 1)) if (hit(tag, other)) tagHits.push(`${tag.name} × tag:${other.name}`);
   });
-  return {bands:bands.length, chips:chips.length, arrows:widths.length, crossings, tagHits, upward, widths};
+  return {bands:bands.length, chips:chips.length, arrows:widths.length, crossings, tagHits, upward, widths, detached};
 }
 module.exports = {arrowGeometry};
