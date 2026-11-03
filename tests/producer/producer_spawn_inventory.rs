@@ -494,7 +494,7 @@ fn download_clients_are_confined_to_explicit_model_management() {
 }
 
 #[test]
-fn store_and_import_never_depend_on_producer_module() {
+fn store_and_import_reach_only_nonexecuting_producer_retention() {
     let files = production(
         |f| {
             f == "src/store.rs"
@@ -505,12 +505,64 @@ fn store_and_import_never_depend_on_producer_module() {
         false,
     );
     assert!(files.len() > 5);
+    let module_list = production(|f| f == "src/producer/mod.rs", false);
+    let siblings: Vec<String> = module_list[0]
+        .1
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line
+                .strip_prefix("pub mod ")
+                .or_else(|| line.strip_prefix("mod "))?;
+            Some(rest.trim_end_matches(';').trim().to_owned())
+        })
+        .collect();
     for (file, text) in files {
-        assert_eq!(
-            producer_paths(&text),
-            0,
-            "{file} reaches into the producer module"
+        // #632 publication owns retention metadata, never producer execution.
+        let allowed = if file == "src/store.rs" {
+            &["retention"][..]
+        } else if file == "src/store/semantic_retention.rs" {
+            &["retention", "state"][..]
+        } else {
+            &[][..]
+        };
+        // Here super:: names store or semantic_batch, not producer siblings.
+        let reached = sibling_references(&text.replace("super::", ""), &siblings);
+        assert!(
+            reached.iter().all(|name| allowed.contains(&name.as_str())),
+            "{file} reaches non-retention producer modules: {reached:?}"
         );
+        if allowed.is_empty() {
+            assert_eq!(producer_paths(&text), 0, "{file} reaches producer state");
+        }
+        for word in [
+            "spawn_producer",
+            "start_run",
+            "ProducerOwner",
+            "PickupOwner",
+        ] {
+            assert_eq!(whole_words(&text, word), 0, "{file} names {word}");
+        }
+    }
+    for (file, text) in production(
+        |f| matches!(f, "src/producer/retention.rs" | "src/producer/state.rs"),
+        false,
+    ) {
+        let reached = sibling_references(&text, &siblings);
+        assert!(
+            reached
+                .iter()
+                .all(|name| matches!(name.as_str(), "retention" | "state" | "process_info")),
+            "{file} reaches execution: {reached:?}"
+        );
+        for word in [
+            "spawn_producer",
+            "start_run",
+            "ProducerOwner",
+            "PickupOwner",
+        ] {
+            assert_eq!(whole_words(&text, word), 0, "{file} names {word}");
+        }
     }
 }
 

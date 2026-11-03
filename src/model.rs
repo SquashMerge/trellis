@@ -321,6 +321,9 @@ pub struct LanguageSemantic {
     /// Why the language shows syntax only, when it does.
     pub semantic_note: Option<String>,
     pub semantic_state: SemanticState,
+    /// Recovery needed for a retained producer input; not proof freshness or selection.
+    #[serde(default)]
+    pub reimport: Option<SemanticReimport>,
     /// Measured calls in the language's documents.
     pub calls: usize,
     pub internal: usize,
@@ -332,6 +335,13 @@ pub struct LanguageSemantic {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage: Option<SemanticCoverageSummary>,
 }
+/// A producer input still needs successful validated admission after a rebuild.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "camelCase", deny_unknown_fields)]
+pub enum SemanticReimport {
+    NeedsReimport { reason: String },
+}
+
 /// One language's semantic coverage tuples at a revision, by state (#520).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

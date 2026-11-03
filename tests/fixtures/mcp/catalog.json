@@ -308,6 +308,29 @@
                       "type": "null"
                     }
                   ]
+                },
+                "reimport": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "state": {
+                          "const": "needsReimport"
+                        },
+                        "reason": {
+                          "$ref": "#/$defs/Text"
+                        }
+                      },
+                      "required": [
+                        "state",
+                        "reason"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -316,7 +339,8 @@
                 "freshness",
                 "coverage",
                 "note",
-                "partialReasons"
+                "partialReasons",
+                "reimport"
               ],
               "type": "object"
             }
@@ -898,7 +922,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 6
+                  "const": 7
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -2021,6 +2045,29 @@
                       "type": "null"
                     }
                   ]
+                },
+                "reimport": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "state": {
+                          "const": "needsReimport"
+                        },
+                        "reason": {
+                          "$ref": "#/$defs/Text"
+                        }
+                      },
+                      "required": [
+                        "state",
+                        "reason"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -2028,7 +2075,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "reimport"
               ],
               "type": "object"
             }
@@ -3281,6 +3329,29 @@
                       "type": "null"
                     }
                   ]
+                },
+                "reimport": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "state": {
+                          "const": "needsReimport"
+                        },
+                        "reason": {
+                          "$ref": "#/$defs/Text"
+                        }
+                      },
+                      "required": [
+                        "state",
+                        "reason"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -3288,7 +3359,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "reimport"
               ],
               "type": "object"
             }
@@ -5133,6 +5205,29 @@
                       "type": "null"
                     }
                   ]
+                },
+                "reimport": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "state": {
+                          "const": "needsReimport"
+                        },
+                        "reason": {
+                          "$ref": "#/$defs/Text"
+                        }
+                      },
+                      "required": [
+                        "state",
+                        "reason"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -5140,7 +5235,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "reimport"
               ],
               "type": "object"
             }
@@ -7005,6 +7101,29 @@
                       "type": "null"
                     }
                   ]
+                },
+                "reimport": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "state": {
+                          "const": "needsReimport"
+                        },
+                        "reason": {
+                          "$ref": "#/$defs/Text"
+                        }
+                      },
+                      "required": [
+                        "state",
+                        "reason"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -7012,7 +7131,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "reimport"
               ],
               "type": "object"
             }
@@ -8562,6 +8682,29 @@
                       "type": "null"
                     }
                   ]
+                },
+                "reimport": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "state": {
+                          "const": "needsReimport"
+                        },
+                        "reason": {
+                          "$ref": "#/$defs/Text"
+                        }
+                      },
+                      "required": [
+                        "state",
+                        "reason"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -8569,7 +8712,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "reimport"
               ],
               "type": "object"
             }
@@ -12123,6 +12267,29 @@
                       "type": "null"
                     }
                   ]
+                },
+                "reimport": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "state": {
+                          "const": "needsReimport"
+                        },
+                        "reason": {
+                          "$ref": "#/$defs/Text"
+                        }
+                      },
+                      "required": [
+                        "state",
+                        "reason"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -12130,7 +12297,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "reimport"
               ],
               "type": "object"
             }

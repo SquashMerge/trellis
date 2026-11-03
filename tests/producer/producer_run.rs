@@ -641,10 +641,14 @@ fn run_dir_cleaned_and_record_retained() {
     world.emitting_variant(1);
     let second = reply_of(&world.run(&["--trust", "trusted"]));
     assert_eq!(world.run_ids().len(), 2);
-    for reply in [&first, &second] {
-        let id = reply["runId"].as_str().unwrap();
-        // Only the record survives a finished, imported run.
-        assert!(only_record_remains(&world.runs_dir().join(id)), "{id}");
+    let first_id = first["runId"].as_str().unwrap();
+    let second_id = second["runId"].as_str().unwrap();
+    assert!(only_record_remains(&world.runs_dir().join(first_id)));
+    assert_eq!(
+        entries(&world.runs_dir().join(second_id)),
+        ["batch", "out", "run.json"]
+    );
+    for id in [first_id, second_id] {
         assert_eq!(world.record(id)["outcome"], "imported");
     }
 
@@ -654,6 +658,10 @@ fn run_dir_cleaned_and_record_retained() {
     let id = failed["runId"].as_str().unwrap();
     assert!(only_record_remains(&world.runs_dir().join(id)));
     assert_eq!(world.run_ids().len(), 3);
+    assert_eq!(
+        entries(&world.runs_dir().join(second_id)),
+        ["batch", "out", "run.json"]
+    );
 }
 
 #[test]
@@ -844,7 +852,8 @@ fn unknown_group_imports_the_frozen_snapshot_despite_a_later_rewrite() {
     assert_eq!(record["groupStatus"], "unknown");
     assert_eq!(record["diagnostics"]["groupStatus"], "unknown");
     assert_eq!(world.stub_entry()["lastRun"]["groupStatus"], "unknown");
-    assert!(only_record_remains(&dir));
+    assert_eq!(entries(&dir), import_inputs(&record));
+    assert_eq!(fs::read(dir.join("snapshot/index.scip")).unwrap(), emitted);
     assert!(stage_residue(&world).is_empty());
 }
 
@@ -956,7 +965,7 @@ fn import_inputs_survive_until_the_request_is_terminal() {
     world.release_hook("enqueued.sock");
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(only_record_remains(&dir));
+    assert_eq!(entries(&dir), ["batch", "out", "run.json"]);
 }
 
 #[test]
@@ -982,7 +991,7 @@ fn unwritable_importing_record_does_not_fail_the_accepted_import() {
     let record = world.record(&run_id);
     assert_eq!(record["state"], "done");
     assert_eq!(record["requestId"], reply["import"]["requestId"]);
-    assert!(only_record_remains(&dir));
+    assert_eq!(entries(&dir), ["batch", "out", "run.json"]);
 }
 
 #[test]
