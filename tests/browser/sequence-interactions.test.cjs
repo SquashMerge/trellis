@@ -2,6 +2,8 @@
 // #636: the Interactions view. Real Pele, real CSS and real geometry in Chromium, over a DTO
 // shaped like `coordinate` (src/mcp/mod.rs): most steps stay in the seed's own column and only a
 // few calls cross to another type, one of them through a nested chain (Inbox → FrameWindow).
+// Owner review on #638: the view shows only interactions between entities. Internal steps draw
+// nothing (one count in the status line); a loop around arrows is a UML loop frame.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {readFileSync} = require("node:fs");
@@ -27,8 +29,9 @@ test.before(async () => {
 });
 test.after(async () => { await browser?.close(); await new Promise(done => server?.close(done)); });
 
-// The seed `coordinate` in column `mcp`. Cross-column calls: open, start, refresh, deliver (whose
-// expanded body calls FrameWindow.show) and, inside the same-column helper's body, tools.run.
+// The seed `coordinate` in column `mcp`. Cross-column calls: open; open and start again inside a
+// loop that may exit early; start; refresh inside a branch; deliver, whose expanded body calls
+// FrameWindow.show; and, inside the same-column helper's body, tools.run.
 function coordinateView() {
   const view = JSON.parse(readFileSync(join(ROOT, "tests/fixtures/sequence-pele/rust.json")));
   const template = view.steps[0], seed = view.seed;
@@ -54,7 +57,9 @@ function coordinateView() {
     effect("e1"),
     step("if2", "branch", "if ready", {children:[unresolved("u1"), step("ret2", "return", "return Err(x)")]}),
     call("c-open", "open"),
-    step("loop4", "loop", "for_expression: possible iterations, not unrolled; exit/termination unknown", {children:[unresolved("u2"), call("c-helper-in-loop", "helper")]}),
+    step("loop4", "loop", "for_expression: possible iterations, not unrolled; exit/termination unknown", {children:[
+      unresolved("u2"), call("c-loop-open", "open"), step("if-loop", "branch", "if done", {children:[step("ret-loop", "return", "return Ok(())")]}),
+      call("c-loop-start", "start"), call("c-helper-in-loop", "helper")]}),
     call("c-start", "start"),
     step("if6", "branch", "if refresh", {children:[call("c-refresh", "refresh"), effect("e6")], alternate:[unresolved("u3")]}),
     call("c-deliver", "deliver", {children:[effect("d1", {lane:"deliver"}), call("c-deliver>show", "show", {lane:"deliver"}), unresolved("d3", {lane:"deliver"})]}),
@@ -66,39 +71,36 @@ function coordinateView() {
   return view;
 }
 const INTERACTIONS = {interactions:true};
-// The same-column helper folds; its body's call to tools still leaves mcp. The branch around
-// `refresh` draws no frame: its arrow says it is conditional, and its run spans both arms.
-const ARROWS = ["c-open", "c-start", "c-refresh", "c-deliver", "c-deliver>show", "c-helper>run"];
-const LABELS = ["[001] open", "[002] start", "[003] refresh · conditional", "[004] deliver", "[005] show", "[006] run"];
-const RETURNS = ["c-open", "c-start", "c-refresh", "c-deliver>show", "c-deliver", "c-helper>run"];
-// One badge per column between two arrows (#638): the rest of the branch's then-arm and its
-// else-arm are one run, marked conditional. A run that may exit says so.
-const BADGES = [["e1", "▸ +4 internal steps · 1 without a target · may exit early"], ["loop4", "▸ +3 internal steps · 1 without a target"],
-  ["e6", "▸ +2 internal steps · 1 without a target · conditional"],
-  ["d1", "▸ +1 internal step"], ["d3", "▸ +1 internal step · 1 without a target"], ["e9", "▸ +2 internal steps · 1 without a target"]];
+// Source order; the branch and the same-column helper draw nothing, so their arrows carry no mark.
+const ARROWS = ["c-open", "c-loop-open", "c-loop-start", "c-start", "c-refresh", "c-deliver", "c-deliver>show", "c-helper>run"];
+const LABELS = ["[001] open", "[002] open", "[003] start", "[004] start", "[005] refresh", "[006] deliver", "[007] show", "[008] run"];
+const RETURNS = ["c-open", "c-loop-open", "c-loop-start", "c-start", "c-refresh", "c-deliver>show", "c-deliver", "c-helper>run"];
+// e1 if2 u1 ret2 · u2 if-loop ret-loop c-helper-in-loop · if6 e6 u3 · d1 d3 · c-helper · e9 u5.
+const HIDDEN = 16;
 
 async function render(view, options = INTERACTIONS) {
   return page.evaluate(async ({view, options}) => {
     const container = document.getElementById("sequence-diagram");
-    window.view = view; window.picks = []; window.expandedBadges = new Set();
-    const result = await TrellisPeleSequence.render(container, view, null, new Set(), {...options, expandedBadges:window.expandedBadges, onSelect:step => window.picks.push(step)});
+    window.view = view; window.picks = [];
+    const result = await TrellisPeleSequence.render(container, view, null, new Set(), {...options, onSelect:step => window.picks.push(step)});
     return {status:result.status, reason:result.reason};
   }, {view, options});
 }
-function legacy(view, options = INTERACTIONS, expanded = []) {
-  return page.evaluate(({view, options, expanded}) => {
+function legacy(view, options = INTERACTIONS) {
+  return page.evaluate(({view, options}) => {
     const container = document.getElementById("sequence-diagram");
     window.view = view; window.picks = [];
-    TrellisSequence.render(container, view, null, new Set(), {...options, expandedBadges:new Set(expanded), onSelect:step => window.picks.push(step)});
-  }, {view, options, expanded});
+    TrellisSequence.render(container, view, null, new Set(), {...options, onSelect:step => window.picks.push(step)});
+  }, {view, options});
 }
 const ids = (selector, attribute) => page.locator(selector).evaluateAll((nodes, attribute) => nodes.map(node => node.getAttribute(attribute)), attribute);
-const badgeTexts = () => page.locator("#sequence-diagram [data-trellis-badge-id]").evaluateAll(nodes => nodes.map(node => [node.getAttribute("data-trellis-badge-id"), node.textContent]));
-const center = locator => locator.evaluate(node => { const box = node.getBoundingClientRect(); return {x:box.left + box.width / 2, y:box.top + box.height / 2, top:box.top, bottom:box.bottom, left:box.left, right:box.right}; });
+const box = locator => locator.evaluate(node => { const box = node.getBoundingClientRect(); return {x:box.left + box.width / 2, y:box.top + box.height / 2, top:box.top, bottom:box.bottom, left:box.left, right:box.right}; });
 const actor = name => page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").filter({hasText:new RegExp(`^${name}$`)});
+const label = id => page.locator(`#sequence-diagram .pele-edge-label[data-trellis-step-id="${id}"]`);
 
-test("Pele draws only cross-column calls, with returns, in source order", async () => {
-  const result = await render(coordinateView());
+test("Pele draws only cross-column calls, with returns, in source order, and nothing else", async () => {
+  const view = coordinateView();
+  const result = await render(view);
   assert.equal(result.status, "rendered", result.reason);
   assert.deepEqual(await page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").allTextContents(), ["mcp", "OpenedWorkspace", "Session", "Inbox", "FrameWindow", "tools"]);
   assert.deepEqual(await ids("#sequence-diagram .pele-edge-label", "data-trellis-step-id"), ARROWS);
@@ -106,127 +108,105 @@ test("Pele draws only cross-column calls, with returns, in source order", async 
   assert.deepEqual(await ids("#sequence-diagram .pele-message[data-trellis-return-step-id]", "data-trellis-return-step-id"), RETURNS);
   assert.equal(await page.locator("#sequence-diagram .pele-message").count(), ARROWS.length + RETURNS.length);
   assert.equal(await page.locator("#sequence-diagram .pele-activation").count(), RETURNS.length);
-  // No other row: everything else is folded into a badge.
-  assert.deepEqual(await ids("#sequence-diagram .pele-note[data-trellis-step-id]", "data-trellis-step-id"), []);
-  assert.equal(await page.locator("#sequence-diagram .pele-frame, #sequence-diagram .pele-rect").count(), 0);
-  assert.deepEqual(await badgeTexts(), BADGES);
+  // No internal-step row, badge or note: only the intro note.
+  assert.equal(await page.locator("#sequence-diagram .pele-note").count(), 1);
+  assert.equal(await page.locator("#sequence-diagram [data-trellis-badge-id]").count(), 0);
+  assert.equal(await page.evaluate(view => TrellisSequence.display(view, {interactions:true}).hiddenSteps, view), HIDDEN);
   // Arrows run top to bottom in source order.
   const tops = [];
-  for (const id of ARROWS) tops.push((await center(page.locator(`#sequence-diagram .pele-edge-label[data-trellis-step-id="${id}"]`))).y);
+  for (const id of ARROWS) tops.push((await box(label(id))).y);
   assert.deepEqual(tops, [...tops].sort((a, b) => a - b), JSON.stringify(tops));
+});
+
+test("a loop around arrows is one labelled UML frame around exactly them, with no row number", async () => {
+  assert.equal((await render(coordinateView())).status, "rendered");
+  const frames = page.locator("#sequence-diagram .pele-frame-loop");
+  assert.equal(await frames.count(), 1);
+  assert.equal(await frames.locator(".pele-frame-kind").textContent(), "loop");
+  assert.equal((await frames.locator(".pele-frame-label").textContent()).replace(/\s+/g, " "), "[loop · may exit early]");
+  const frame = await box(frames.locator("rect, path").first());
+  for (const id of ["c-loop-open", "c-loop-start"]) {
+    const arrow = await box(label(id));
+    assert.ok(frame.top < arrow.y && arrow.y < frame.bottom, `${id} inside: ${JSON.stringify({frame, arrow})}`);
+  }
+  for (const id of ["c-open", "c-start"]) {
+    const arrow = await box(label(id));
+    assert.ok(arrow.y < frame.top || arrow.y > frame.bottom, `${id} outside: ${JSON.stringify({frame, arrow})}`);
+  }
+  // Without an exit in it, the frame says only "loop"; with a folded `?`, it may exit early.
+  const plain = coordinateView(), loop = plain.steps[3];
+  loop.children = loop.children.filter(step => step.id !== "if-loop");
+  assert.equal((await render(plain)).status, "rendered");
+  assert.equal((await page.locator("#sequence-diagram .pele-frame-loop .pele-frame-label").textContent()).trim(), "[loop]");
+  loop.children[1].folded = [{...structuredClone(loop.children[0]), id:"q", kind:"branch", label:"?: continue only on success; otherwise early return", callId:null}];
+  assert.equal(await page.evaluate(view => { const d = TrellisSequence.display(view, {interactions:true}); return d.loopLabel(view.steps[3]); }, plain), "loop · may exit early");
 });
 
 test("a nested chain starts on its callee's column and returns before its caller does", async () => {
   assert.equal((await render(coordinateView())).status, "rendered");
-  const inbox = await center(actor("Inbox")), frame = await center(actor("FrameWindow")), mcp = await center(actor("mcp"));
-  const show = await center(page.locator('#sequence-diagram .pele-message[data-trellis-step-id="c-deliver>show"] path').first());
+  const inbox = await box(actor("Inbox")), frame = await box(actor("FrameWindow")), mcp = await box(actor("mcp"));
+  const show = await box(page.locator('#sequence-diagram .pele-message[data-trellis-step-id="c-deliver>show"] path').first());
   // An arrow leaves the edge of its caller's activation bar (10 px wide) and its head (7 px)
   // touches the callee's.
   assert.ok(Math.abs(show.left - inbox.x) <= 6 && Math.abs(show.right - frame.x) <= 13, `Inbox → FrameWindow: ${JSON.stringify({show, inbox, frame})}`);
-  const back = await center(page.locator('#sequence-diagram .pele-message[data-trellis-return-step-id="c-deliver"] path').first());
+  const back = await box(page.locator('#sequence-diagram .pele-message[data-trellis-return-step-id="c-deliver"] path').first());
   assert.ok(Math.abs(back.right - inbox.x) <= 6 && Math.abs(back.left - mcp.x) <= 8, `deliver returns to mcp: ${JSON.stringify({back, inbox, mcp})}`);
-  const showBack = await center(page.locator('#sequence-diagram .pele-message[data-trellis-return-step-id="c-deliver>show"] path').first());
+  const showBack = await box(page.locator('#sequence-diagram .pele-message[data-trellis-return-step-id="c-deliver>show"] path').first());
   assert.ok(show.y < showBack.y && showBack.y < back.y);
-  // Badges sit on their own column: Inbox's two runs on Inbox's lifeline, around the nested call.
-  const first = await center(page.locator('#sequence-diagram [data-trellis-badge-id="d1"] rect'));
-  const last = await center(page.locator('#sequence-diagram [data-trellis-badge-id="d3"] rect'));
-  assert.ok(Math.abs(first.x - inbox.x) < 2 && Math.abs(last.x - inbox.x) < 2, JSON.stringify({first, last, inbox}));
-  assert.ok(first.y < show.y && show.y < last.y);
-  assert.ok(Math.abs((await center(page.locator('#sequence-diagram [data-trellis-badge-id="e1"] rect'))).x - mcp.x) < 2);
 });
 
-test("a Pele badge expands in place to its exact steps and folds again", async () => {
-  const view = coordinateView();
+test("a nested callable draws no row; a cross-column call in its body is an arrow from its column", async () => {
+  const view = coordinateView(), [open] = [view.steps[2]];
+  const closure = (id, children) => ({...structuredClone(view.steps[0]), id, kind:"boundary", label:"Nested callable boundary: body does not execute at definition; captures are not expanded.", children});
+  view.steps = [closure("closure-empty", []), closure("closure-call", [{...structuredClone(open), id:"closure>open", callId:"callid:closure>open"}])];
   assert.equal((await render(view)).status, "rendered");
-  const badge = page.locator('#sequence-diagram [data-trellis-badge-id="e1"]');
-  assert.equal(await badge.getAttribute("aria-expanded"), "false");
-  assert.equal(await badge.getAttribute("aria-label"), "Show 4 internal steps · 1 without a target · may exit early");
-  await badge.click();
-  await page.waitForFunction(() => document.querySelector('[data-trellis-badge-id="e1"]')?.getAttribute("aria-expanded") === "true");
-  const opened = page.locator('#sequence-diagram [data-trellis-badge-id="e1"]');
-  assert.equal(await opened.textContent(), "▾ 4 internal steps · 1 without a target · may exit early");
-  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("data-trellis-badge-id")), "e1", "focus stays on the badge");
-  assert.deepEqual(await ids("#sequence-diagram .pele-note[data-trellis-step-id]", "data-trellis-step-id"), ["e1", "if2", "u1", "ret2"]);
-  assert.deepEqual(await ids("#sequence-diagram .pele-edge-label", "data-trellis-step-id"), ARROWS, "the arrows do not change");
-  // In place: the run's rows sit between the badge and the first arrow.
-  const below = (await center(opened.locator("rect"))).y, row = (await center(page.locator('#sequence-diagram .pele-note[data-trellis-step-id="u1"]'))).y;
-  const open = (await center(page.locator('#sequence-diagram .pele-edge-label[data-trellis-step-id="c-open"]'))).y;
-  assert.ok(below < row && row < open, JSON.stringify({below, row, open}));
-  // A revealed step selects the original DTO step.
-  await page.locator('#sequence-diagram .pele-note[data-trellis-step-id="u1"]').click();
-  assert.deepEqual(await page.evaluate(() => window.picks.at(-1)), view.steps[1].children[0]);
-  await opened.focus(); await page.keyboard.press("Enter");
-  await page.waitForFunction(() => document.querySelector('[data-trellis-badge-id="e1"]')?.getAttribute("aria-expanded") === "false");
-  assert.deepEqual(await ids("#sequence-diagram .pele-note[data-trellis-step-id]", "data-trellis-step-id"), []);
-  assert.deepEqual(await badgeTexts(), BADGES);
-});
-
-test("a badge that spans a frame's edge expands inside that frame, and the summary says some", async () => {
-  const view = coordinateView();
-  assert.equal((await render(view)).status, "rendered");
-  await page.locator('#sequence-diagram [data-trellis-badge-id="e6"]').click();
-  await page.waitForFunction(() => document.querySelector('[data-trellis-badge-id="e6"]')?.getAttribute("aria-expanded") === "true");
-  // The branch is drawn again, with both arms: its header row renumbers the arrows after it.
-  assert.deepEqual(await ids("#sequence-diagram .pele-note[data-trellis-step-id]", "data-trellis-step-id"), ["if6", "e6", "u3"]);
-  assert.deepEqual(await page.locator("#sequence-diagram .pele-frame-alt").count(), 1);
-  assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(),
-    ["[001] open", "[002] start", "[004] refresh · conditional", "[007] deliver", "[008] show", "[009] run"]);
-  await legacy(view, INTERACTIONS, ["e6"]);
-  assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ["c-open", "c-start", "if6", "c-refresh", "e6", "u3", "c-deliver", "c-deliver>show", "c-helper>run"]);
-  // A run of which only part sits in a loop says so.
-  const mixed = coordinateView(), [e1, , , loop] = mixed.steps;
-  loop.children.push({...structuredClone(mixed.steps[2]), id:"c-loop-open", callId:"callid:c-loop-open"});
-  mixed.steps = [e1, loop];
-  assert.equal((await render(mixed)).status, "rendered");
-  assert.deepEqual(await badgeTexts(), [["e1", "▸ +3 internal steps · 1 without a target · some in loop"]]);
-  assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(), ["[001] open · in loop"]);
+  assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(), ["[001] open"]);
+  assert.equal(await page.locator("#sequence-diagram .pele-note").count(), 1, "only the intro note");
+  assert.equal(await page.evaluate(view => TrellisSequence.display(view, {interactions:true}).hiddenSteps, view), 2);
 });
 
 test("selecting an arrow hands the inspector the original step and evidence", async () => {
   const view = coordinateView();
   assert.equal((await render(view)).status, "rendered");
-  const label = page.locator('#sequence-diagram .pele-edge-label[data-trellis-step-id="c-deliver>show"]');
   assert.equal(await page.locator('#sequence-diagram .pele-message[data-trellis-step-id="c-deliver>show"]').getAttribute("data-trellis-target-id"), "show");
-  await label.click();
+  await label("c-deliver>show").click();
   assert.deepEqual(await page.evaluate(() => window.picks[0]), view.steps[6].children[1]);
-  assert.match(await label.getAttribute("aria-label"), /self\.show_spelling/);
+  assert.match(await label("c-deliver>show").getAttribute("aria-label"), /self\.show_spelling/);
   assert.equal(await page.evaluate(() => TrellisSequence.evidenceLabel(window.view.steps[6].children[1], window.view)), "Resolved declaration");
+  await label("c-loop-start").click();
+  assert.deepEqual(await page.evaluate(() => window.picks[1]), view.steps[3].children[3]);
 });
 
-test("the legacy renderer draws the same arrows, returns and badges, and expands in place", async () => {
+test("the legacy renderer draws the same arrows, returns and loop frame, and nothing else", async () => {
   const view = coordinateView();
   assert.equal((await render(view)).status, "rendered");
   const pele = await page.locator("#sequence-diagram .pele-edge-label").allTextContents();
   await legacy(view);
   assert.deepEqual(await page.locator("#sequence-diagram .sequence-participant-label").evaluateAll(nodes => nodes.map(node => node.firstChild.textContent)), ["mcp", "OpenedWorkspace", "Session", "Inbox", "FrameWindow", "tools"]);
   assert.deepEqual(await ids("#sequence-diagram .sequence-arrow[data-trellis-call-id]", "data-trellis-call-id"), ARROWS.map(id => `callid:${id}`));
-  const rows = await page.locator("#sequence-diagram .sequence-source").evaluateAll((nodes, arrows) => nodes.filter(node => arrows.includes(node.dataset.sourceStepId)).map(node => node.querySelector("text:not(.sequence-fragment-operator)").firstChild.textContent), ARROWS);
+  assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ARROWS, "no other row");
+  const rows = await page.locator("#sequence-diagram .sequence-source").evaluateAll(nodes => nodes.map(node => node.querySelector("text").firstChild.textContent));
   assert.deepEqual(rows, pele, "the same arrow labels in both renderers");
   assert.deepEqual(await ids("#sequence-diagram .sequence-return[data-trellis-return-step-id]", "data-trellis-return-step-id"), RETURNS);
   assert.equal(await page.locator("#sequence-diagram .sequence-activation").count(), RETURNS.length);
-  assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ARROWS);
-  assert.deepEqual(rows, LABELS);
-  assert.deepEqual(await badgeTexts(), BADGES);
-  // Geometry: the nested call leaves Inbox's lifeline and the badge sits on it.
+  const loop = page.locator('#sequence-diagram [data-presentation="interaction-loop"]');
+  assert.equal(await loop.count(), 1);
+  assert.equal(await loop.locator(".sequence-fragment-operator").textContent(), "loop · may exit early");
+  const frame = await box(loop.locator(".sequence-fragment"));
+  for (const id of ["c-loop-open", "c-loop-start"]) {
+    const arrow = await box(page.locator(`#sequence-diagram [data-source-step-id="${id}"]`));
+    assert.ok(frame.top < arrow.y && arrow.y < frame.bottom, `${id} inside the frame`);
+  }
+  // Geometry: the nested call leaves Inbox's lifeline.
   const inbox = await page.locator("#sequence-diagram .sequence-participant-label").evaluateAll(nodes => nodes.find(node => node.firstChild.textContent === "Inbox").getAttribute("x"));
   assert.match(await page.locator('#sequence-diagram .sequence-arrow[data-trellis-call-id="callid:c-deliver>show"]').getAttribute("d"), new RegExp(`^M ${inbox} `));
-  assert.equal(await page.locator('#sequence-diagram [data-trellis-badge-id="d1"] text').getAttribute("x"), inbox);
-  const badge = page.locator('#sequence-diagram [data-trellis-badge-id="loop4"]');
-  await badge.click();
-  assert.equal(await page.locator('#sequence-diagram [data-trellis-badge-id="loop4"]').getAttribute("aria-expanded"), "true");
-  assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ["c-open", "loop4", "u2", "c-helper-in-loop", "c-start", "c-refresh", "c-deliver", "c-deliver>show", "c-helper>run"]);
-  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("data-trellis-badge-id")), "loop4");
-  await page.locator('#sequence-diagram [data-source-step-id="u2"]').click();
-  assert.deepEqual(await page.evaluate(() => window.picks.at(-1)), view.steps[3].children[0]);
-  await page.keyboard.press("Tab"); // Away and back by keyboard: the badge is a real control.
-  await page.locator('#sequence-diagram [data-trellis-badge-id="loop4"]').focus(); await page.keyboard.press("Enter");
-  assert.equal(await page.locator('#sequence-diagram [data-trellis-badge-id="loop4"]').getAttribute("aria-expanded"), "false");
-  assert.deepEqual(await badgeTexts(), BADGES);
+  await page.locator('#sequence-diagram [data-source-step-id="c-refresh"]').click();
+  assert.deepEqual(await page.evaluate(() => window.picks.at(-1)), view.steps[5].children[0]);
 });
 
 test("a seed with no arrow says why; a view with no call, Show all steps and syntax views are unchanged", async () => {
   const view = coordinateView();
-  for (const step of [view.steps[2], view.steps[4], view.steps[6], view.steps[5].children[0]]) { step.target = "helper"; step.children = []; }
+  for (const step of [view.steps[2], view.steps[4], view.steps[6], view.steps[5].children[0], view.steps[3].children[1], view.steps[3].children[3]]) { step.target = "helper"; step.children = []; }
   view.steps[7].children = [];
   const summary = view => page.evaluate(view => {
     const options = {interactions:true};
@@ -253,36 +233,23 @@ test("a seed with no arrow says why; a view with no call, Show all steps and syn
   assert.equal(await page.evaluate(view => TrellisSequence.display(view, {interactions:true}).interactions, syntax), undefined);
 });
 
-test("an arrow inside a call chain draws without the chain; its other members fold", async () => {
+test("an arrow inside a call chain draws without the chain; its other members draw nothing", async () => {
   const view = coordinateView(), [open, start] = [view.steps[2], view.steps[4]];
   const chain = {...structuredClone(open), id:"chain", kind:"group", label:"a.open().start()", callId:null, target:undefined, callEvidence:undefined,
     children:[{...structuredClone(view.steps[9]), id:"chain:u", callId:"callid:chain:u"}, {...structuredClone(start), id:"chain:start", callId:"callid:chain:start"}]};
   view.steps = [chain];
   assert.equal((await render(view)).status, "rendered");
   assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(), ["[001] start"]);
-  assert.deepEqual(await badgeTexts(), [["chain:u", "▸ +1 internal step · 1 without a target"]]);
+  assert.equal(await page.locator("#sequence-diagram .pele-note").count(), 1);
   assert.equal(await page.locator("#sequence-diagram .sequence-group-control").count(), 0, "the chain draws no row of its own");
   await legacy(view);
   assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ["chain:start"]);
-  assert.deepEqual(await badgeTexts(), [["chain:u", "▸ +1 internal step · 1 without a target"]]);
-});
-
-test("a final return is not an early exit; a branch that returns is", async () => {
-  const view = coordinateView(), [effect, branch, open] = view.steps, finish = {...structuredClone(branch.children[1]), id:"ret-final"};
-  open.children = [{...structuredClone(finish), id:"ret-callee", lane:"open"}];
-  view.steps = [open, effect, finish];
-  assert.equal((await render(view)).status, "rendered");
-  assert.deepEqual(await badgeTexts(), [["ret-callee", "▸ +1 internal step"], ["e1", "▸ +2 internal steps"]]);
-  view.steps = [branch, open];
-  assert.equal((await render(view)).status, "rendered");
-  assert.deepEqual(await badgeTexts(), [["if2", "▸ +3 internal steps · 1 without a target · may exit early"], ["ret-callee", "▸ +1 internal step"]]);
 });
 
 test("a large interactions diagram keeps readable text and the panel scrolls", async () => {
   const view = coordinateView();
   // Many cross-column calls make a tall diagram; each must stay at its own size.
-  const calls = view.steps.filter(step => step.id === "c-open");
-  for (let n = 0; n < 40; n++) view.steps.push({...structuredClone(calls[0]), id:`c-open-${n}`, callId:`callid:c-open-${n}`});
+  for (let n = 0; n < 40; n++) view.steps.push({...structuredClone(view.steps[2]), id:`c-open-${n}`, callId:`callid:c-open-${n}`});
   assert.equal((await render(view)).status, "rendered");
   const measured = await page.evaluate(() => {
     const box = document.getElementById("sequence-diagram"), svg = box.querySelector("svg"), scale = svg.getScreenCTM().a;

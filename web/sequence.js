@@ -219,26 +219,17 @@ function sequenceStepColumn(view, step) {
   const owner = step?.lane != null && participants.find(p => p.id === step.lane);
   return sequenceColumn(owner || participants.find(p => p.id === view?.seed?.id) || {id:view?.seed?.id, label:view?.seed?.name});
 }
-// The badge text of a run of folded steps (#636): counts of original DTO steps, never inferred.
-function sequenceBadgeLabel(badge) {
-  const steps = `${badge.count} internal ${badge.count === 1 ? "step" : "steps"}${sequenceBadgeDetail(badge)}`;
-  return badge.expanded ? `▾ ${steps}` : `▸ +${steps}`;
-}
-function sequenceBadgeDetail(badge) {
-  return `${badge.untargeted ? ` · ${badge.untargeted} without a target` : ""}${badge.scope}${badge.exits ? " · may exit early" : ""}`;
-}
-// Interactions (#636) are a display projection of the same admitted DTO, as calls-first is:
+// Interactions (#636, owner review on #638) are a display projection of the same admitted DTO,
+// as calls-first is. They show only interactions between entities:
 // - an arrow is a measured call whose exact target is drawn in another column than its own; it
 //   keeps source order, its callee's body (nested cross-column chains) and a return after it;
-// - every other shown step folds, with its subtree, into the run of its own column between two
-//   arrows: one badge per run, which expands in place to exactly those steps;
-// - a frame, chain or same-column call that encloses an arrow is `through`: it draws no row and
-//   its members draw in its place, until a badge with steps inside it expands. An arrow inside a
-//   loop, or a branch or try handler other than a continuation guard, says so (" · in loop",
-//   " · conditional"); a badge says so for all or some of its steps.
+// - a loop that encloses an arrow is a UML loop frame around its arrows, with no row of its own
+//   and no row number; it says " · may exit early" when its own frame draws an exit;
+// - every other step draws nothing: internal steps, nested callables, calls without a target and
+//   any branch, try, chain or same-column call around an arrow (`through`: its arrows draw in
+//   its place). `hiddenSteps` counts the shown DTO steps that draw nothing; Show all has them.
 function sequenceInteractions(view, options, earlyReturn) {
-  const visible = new Set(), through = new Set(), badges = new Map(), returns = new Set(), holds = new Set(), scopes = new Map();
-  const expanded = options.expandedBadges || new Set();
+  const visible = new Set(), through = new Set(), loops = new Set(), returns = new Set(), holds = new Set();
   const nested = step => [...(step.children || []), ...(step.alternate || [])];
   const crosses = step => {
     if (step.kind !== "call") return false;
@@ -254,62 +245,24 @@ function sequenceInteractions(view, options, earlyReturn) {
     return any;
   };
   for (const step of view?.steps || []) scan(step);
-  const tally = (step, badge) => {
-    if (step.hidden) return;
-    badge.count++;
-    if (step.callId && ["call", "boundary"].includes(step.kind) && !sequenceTarget(view, step)) badge.untargeted++;
-    // The calls-first mark: a frame holding an exit, or a call with a folded `?`. A final
-    // `return` is not an early exit.
-    if (earlyReturn(step)) badge.exits = true;
-    if (badge.expanded) visible.add(step);
-    for (const child of nested(step)) tally(child, badge);
-  };
-  // An arrow, or a run, inside a loop says so; inside a branch or a try's handlers, that it
-  // is conditional. Loop wins. A continuation guard only restates the path so far.
-  const LOOP = " · in loop", CONDITIONAL = " · conditional";
-  const continuation = step => step.kind === "branch" && step.label === "only if the preceding path continues normally";
-  const within = (step, scope, handlers) => scope === LOOP || step.kind === "loop" ? LOOP
-    : step.kind === "branch" && !continuation(step) || step.kind === "try" && handlers ? CONDITIONAL : scope;
-  // One run per column between two arrows (owner, #638): it never spans an arrow, but it does
-  // span the edges of the frames that hold them. Its qualifiers summarize its steps' scopes.
-  // Expanded, it draws its steps inside those frames (branch, loop, try), so their structure
-  // is intact; chains and same-column calls stay `through`.
-  let run = null;
-  const place = (steps, scope, frames) => {
+  let hiddenSteps = 0;
+  const fold = step => { if (step.hidden) return; hiddenSteps++; for (const child of nested(step)) fold(child); };
+  const place = steps => {
     for (const step of steps || []) {
       if (step.hidden) continue;
-      if (returns.has(step)) {
-        run = null; visible.add(step); if (scope) scopes.set(step, scope);
-        place(step.children, scope, frames); place(step.alternate, scope, frames);
-        run = null; continue;
-      }
-      if (holds.has(step)) {
-        through.add(step);
-        const inner = ["call", "group"].includes(step.kind) ? frames : [...frames, step];
-        place(step.children, within(step, scope, false), inner); place(step.alternate, within(step, scope, true), inner);
-        continue;
-      }
-      const column = sequenceStepColumn(view, step).id;
-      if (!run || run.column !== column) {
-        run = {id:step.id, column, first:step, steps:[], frames:new Set(), count:0, untargeted:0, exits:false, loop:0, conditional:0, expanded:expanded.has(step.id)};
-        badges.set(step, run);
-      }
-      run.steps.push(step); tally(step, run);
-      if (scope === LOOP) run.loop++; else if (scope === CONDITIONAL) run.conditional++;
-      for (const frame of frames) run.frames.add(frame);
+      if (returns.has(step)) visible.add(step);
+      else if (step.kind === "loop" && holds.has(step)) { visible.add(step); loops.add(step); }
+      else if (holds.has(step)) { through.add(step); hiddenSteps++; }
+      else { fold(step); continue; }
+      place(step.children); place(step.alternate);
     }
   };
-  place(view?.steps, "", []);
-  for (const badge of badges.values()) {
-    const qualifier = (count, word) => !count ? "" : count === badge.steps.length ? ` · ${word}` : ` · some ${word}`;
-    badge.scope = qualifier(badge.loop, "in loop") + qualifier(badge.conditional, "conditional");
-    if (badge.expanded) for (const frame of badge.frames) { through.delete(frame); visible.add(frame); }
-  }
-  for (const badge of badges.values()) {
-    badge.label = sequenceBadgeLabel(badge);
-    badge.ariaLabel = `${badge.expanded ? "Fold" : "Show"} ${badge.count} internal ${badge.count === 1 ? "step" : "steps"}${sequenceBadgeDetail(badge)}`;
-  }
-  return {interactions:true, visible, through, badges, returns, earlyReturn:step => (scopes.get(step) || "") + earlyReturn(step)};
+  place(view?.steps);
+  // A loop may exit early when its frame draws an exit (calls-first's mark) or a step in it
+  // carries a folded `?` or guard (#542, #558).
+  const exits = step => !step.hidden && (!!sequenceEarlyReturn(step) || nested(step).some(exits));
+  const loopLabel = step => `loop${earlyReturn(step) || exits(step) ? " · may exit early" : ""}`;
+  return {interactions:true, visible, through, loops, returns, hiddenSteps, loopLabel, earlyReturn};
 }
 // What to say when the admitted view has no displayed calls (#594).
 // Counts come from the server; the reasons are the steps' own.
@@ -359,7 +312,7 @@ function beginSequenceRender(container) {
 }
 function drawSequence(container, view, readSource, expandedGroups, options, selection) {
   const current = options.isCurrent, active = beginSequenceRender(container);
-  options = {...options, isCurrent:() => active() && (!current || current()), expandedBadges:options.expandedBadges || new Set()};
+  options = {...options, isCurrent:() => active() && (!current || current())};
   const groupControls = new Map(), rowControls = [], displayProjection = sequenceDisplay(view, options);
   const ns = "http://www.w3.org/2000/svg";
   const make = (tag, attrs = {}, text) => {
@@ -465,7 +418,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   const quietGuard = step => !options.showDetails && step.kind === "branch" &&
     step.label === "only if the preceding path continues normally" && !step.alternate?.length;
   if (!options.showDetails) svg.append(make("text", {x:24, y:73, class:"sequence-meta"}, displayProjection.interactions
-    ? "Interactions between columns · badges fold the rest · select for details" : "Compact labels · select for details"));
+    ? "Interactions between columns · select for details" : "Compact labels · select for details"));
   let y = options.showDetails ? 78 : 98;
   let rows = 0; // Each row's number, as Pele counts them.
   function sourceControl(group, step, x, top, display = step, evidence = step, operator = null) {
@@ -546,25 +499,6 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     group.append(control);
     return extra + (target && columnX(target.id) === laneX(evidence) ? 20 : 0);
   }
-  // A badge sits on its run's column and expands in place to the run's own steps (#636).
-  function drawBadge(parent, badge) {
-    const x = positions.get(badge.column) ?? origin, width = Math.max(120, badge.label.length * 7.6 + 24);
-    const control = make("g", {class:"sequence-badge", role:"button", tabindex:0, "data-trellis-badge-id":badge.id, "aria-expanded":String(badge.expanded),
-      "aria-label":badge.ariaLabel});
-    control.append(make("rect", {x:x-width/2, y:y-15, width, height:22, rx:11, class:"sequence-badge-pill"}));
-    control.append(make("text", {x, y:y+1, "text-anchor":"middle", class:"sequence-badge-label"}, badge.label));
-    const toggle = () => {
-      if (!options.isCurrent()) return;
-      const top = container.scrollTop, left = container.scrollLeft, set = options.expandedBadges;
-      if (set.has(badge.id)) set.delete(badge.id); else set.add(badge.id);
-      drawSequence(container, view, readSource, expandedGroups, {...options, isCurrent:current}, selection);
-      [...container.querySelectorAll("[data-trellis-badge-id]")].find(node => node.getAttribute("data-trellis-badge-id") === badge.id)?.focus?.({preventScroll:true});
-      container.scrollTop = top; container.scrollLeft = left;
-    };
-    control.addEventListener("click", toggle);
-    control.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(); } });
-    parent.append(control); y += 30;
-  }
   // The return of a cross-column call, after its expanded body: presentation, not an observed return.
   function drawReturn(group, step) {
     const target = sequenceTarget(view, step), from = target && columnX(target.id), to = laneX(step), top = arrowTops.get(step);
@@ -578,13 +512,24 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   }
   function draw(steps, parent, depth) {
     for (const step of steps || []) {
-      const badge = displayProjection.badges?.get(step);
-      if (badge) drawBadge(parent, badge);
       if (!displayProjection.visible.has(step)) {
         if (displayProjection.through?.has(step)) { draw(step.children, parent, depth); draw(step.alternate, parent, depth); }
         continue;
       }
       const group = make("g", {"data-kind":step.kind, "data-step-id":step.id}); parent.append(group);
+      if (displayProjection.loops?.has(step)) {
+        // Interactions (#636): a UML loop frame around its arrows. It is not a row: no number.
+        const start = y, x = 18 + depth * 10, label = displayProjection.loopLabel(step);
+        group.setAttribute("data-presentation", "interaction-loop");
+        const box = make("rect", {x, y:start-19, width:width-x-18, height:34, class:"sequence-fragment"}); group.append(box);
+        const tabWidth = Math.max(80, label.length * 8 + 28);
+        group.append(make("path", {d:`M ${x} ${start-19} H ${x+tabWidth} V ${start+1} L ${x+tabWidth-10} ${start+11} H ${x} Z`, class:"sequence-fragment-tab"}));
+        group.append(make("text", {x:x+12, y:start, class:"sequence-fragment-operator"}, label));
+        y += 34;
+        draw(step.children, group, depth+1); draw(step.alternate, group, depth+1);
+        y += 4; box.setAttribute("height", y-start+8); y += 14;
+        continue;
+      }
       if (step.kind === "group") {
         const start = y, x = 18 + depth * 10, expanded = expandedGroups.has(step.id);
         const box = make("rect", {x, y:y-19, width:width-x-18, height:34, class:"sequence-fragment"}); group.append(box);

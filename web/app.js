@@ -1579,7 +1579,7 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     diagramSequence = data;
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
     // Interactions are the default for an enriched view (#636); Show all steps is unchanged.
-    const options = {showDetails: !!$("all-steps").checked, interactions:true, expandedBadges:new Set(), isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
+    const options = {showDetails: !!$("all-steps").checked, interactions:true, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
     options.onOpenTarget = sequenceTargetAction(data, options.isCurrent);
     // A later group redraw can fail after the initial load succeeded. Preserve
     // the whole pinned DTO rather than leaving an inert, silently folded group.
@@ -1611,7 +1611,9 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     if (empty) window.TrellisSequence.renderEmpty(diagram, empty, () => { if (options.isCurrent()) { $("all-steps").checked = true; void loadSequence(); } }, !onlyEmpty);
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
     renderIncidentalToggle(data, options);
-    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
+    // Interactions (#636) draw no internal step; the one count of them is in the status line.
+    const interactions = window.TrellisSequence.display(data, options);
+    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${interactions.interactions ? ` · Interactions · ${interactions.hiddenSteps} internal steps hidden` : ""}${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
     published = true;
   }, current, "sequence-state");

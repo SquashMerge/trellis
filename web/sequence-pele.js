@@ -29,10 +29,10 @@
     const columnOf = participant => window.TrellisSequence.column(participant);
     const seed = view.participants.find(p => p.id === view.seed.id);
     const lanes = [{alias:"S", id:columnOf(seed).id ?? view.seed.id, label:seed?.column ? columnOf(seed).label : view.seed.name || view.seed.id, targets:new Map([[view.seed.id, {participant:seed, proof:null}]])}];
-    // Each statement's meta, if any, receives its Pele statement ID: a row, a return or a badge.
+    // Each statement's meta, if any, receives its Pele statement ID: a row or a return.
     const lines = ["sequenceDiagram", `Note over S: ${intro}`], metas = [null, null];
     const emit = (line, meta = null) => { lines.push(line); metas.push(meta); };
-    const messageOrder = [], badges = [];
+    const messageOrder = [];
     let separators = 1, activations = 0;
     const targetFor = step => window.TrellisSequence?.target(view, step);
     const laneFor = (target, proof) => {
@@ -93,13 +93,8 @@
       if (!owner) unsupported("Unknown sequence lane");
       return owner;
     }
-    // Interactions (#636): a badge is a note over its run's column; a return closes the
-    // activation its cross-column call opened. Neither is a row: they take no row number.
-    const addBadge = badge => {
-      const entry = {badge, display:badge.label, owner:ownerOf(badge.first)};
-      emit(`Note over ${entry.owner.alias}: ${encode(entry.display)}`, entry);
-      badges.push(entry); noteOrder.push(entry);
-    };
+    // Interactions (#636): a return closes the activation its cross-column call opened. It is
+    // not a row: it takes no row number.
     const addReturn = row => {
       const entry = {returnOf:row};
       emit(`${row.lane.alias}-->>${row.owner.alias}: `, entry);
@@ -113,8 +108,6 @@
             !Array.isArray(step.children) || !Array.isArray(step.alternate) || typeof step.hidden !== "boolean" || !witness(step)) unsupported("Unsupported sequence step");
         if (seen.has(step.id)) unsupported("Duplicate sequence identity");
         seen.add(step.id);
-        const badge = displayProjection.badges?.get(step);
-        if (badge) addBadge(badge);
         if (!displayProjection.visible.has(step)) {
           if (displayProjection.through?.has(step)) { visit(step.children, depth + 1); visit(step.alternate, depth + 1); }
           continue;
@@ -132,21 +125,23 @@
         else if (step.kind === "loop") frame = "loop";
         // A cross-column call's body is its activation (#636), not a frame.
         else if (step.kind === "try" || (step.kind !== "group" && (children.length || alternate.length) && !displayProjection.returns?.has(step))) frame = "rect";
-        const heading = options.showDetails ? step.label : shortened(window.TrellisSequence.compactLabel(step));
+        // Interactions (#636): a loop around arrows is a frame only, labelled, with no row.
+        const loopFrame = !!displayProjection.loops?.has(step);
+        const heading = loopFrame ? displayProjection.loopLabel(step) : options.showDetails ? step.label : shortened(window.TrellisSequence.compactLabel(step));
         const header = frame && frame !== "rect" ? {kind:frame, header:`[${heading}]`, alternate:frame === "alt" ? "[alternate path]" : null} : null;
         if (frame) {
           emit(frame === "rect" ? "rect" : `${frame} ${encode(heading)}`);
           frames.push(frame);
           if (header) frameHeaders.push(header);
         }
-        const row = add(step, preview);
-        const returns = displayProjection.returns?.has(step) && row.type === "message";
+        const row = loopFrame ? null : add(step, preview);
+        const returns = displayProjection.returns?.has(step) && row?.type === "message";
         if (returns) { emit(`activate ${row.lane.alias}`); activations++; }
         if (!collapsed) {
           visit(children, depth + 1);
           if (alternate.length) {
             if (frame === "alt") emit("else alternate path");
-            else { emit("Note over S: handlers / cleanup (see guards)"); separators++; noteOrder.push(null); }
+            else if (!loopFrame) { emit("Note over S: handlers / cleanup (see guards)"); separators++; noteOrder.push(null); }
             visit(alternate, depth + 1);
           }
         }
@@ -187,7 +182,7 @@
       if (line.startsWith("Note ")) noteIds.push(id);
       if (/^(?:S|P[0-9]+)--?>>/.test(line)) messageIds.push(id);
     }
-    return {source, rows, lanes, intro, frames, frameHeaders, closeFrames, closeHeaders, noteIds, messageIds, separators, noteOrder, messageOrder, badges, activations};
+    return {source, rows, lanes, intro, frames, frameHeaders, closeFrames, closeHeaders, noteIds, messageIds, separators, noteOrder, messageOrder, activations};
   }
 
   function validatedSvg(raw, projection) {
@@ -254,8 +249,6 @@
     return {root, notes, messages, messageLabels, actors};
   }
   async function render(container, view, readSource, expandedGroups = new Set(), options = {}) {
-    const expandedBadges = options.expandedBadges || new Set();
-    options = {...options, expandedBadges};
     const current = () => !options.isCurrent || options.isCurrent();
     if (!current()) return {status:"stale"};
     const renderCurrent = window.TrellisSequence.beginRender(container);
@@ -304,7 +297,7 @@
         const select = () => {
           if (!active() || !witness(step) || row.id !== step.id || row.callId !== step.callId || row.path !== step.path || row.range !== step.range || projection.rows[i] !== row) return;
           selected.id = row.id;
-          for (const n of rowNodes) if (!n.hasAttribute("data-trellis-badge-id")) n.setAttribute("aria-pressed", String(n.getAttribute("data-trellis-step-id") === row.id));
+          for (const n of rowNodes) n.setAttribute("aria-pressed", String(n.getAttribute("data-trellis-step-id") === row.id));
           if (options.onSelect) options.onSelect(step); else if (readSource) readSource(step);
         };
         note.addEventListener("click", select);
@@ -354,32 +347,12 @@
           controls.set(row.id, toggle);
         }
       }
-      // Interactions (#636): a return names its call; a badge expands its run in place.
+      // Interactions (#636): a return names its call.
       for (const entry of projection.messageOrder) {
         if (!entry.returnOf) continue;
         const arrow = messages.find(node => node.getAttribute("data-id") === entry.statementId);
         arrow.setAttribute("data-trellis-return-step-id", entry.returnOf.id);
         arrow.setAttribute("data-trellis-target-id", entry.returnOf.target.id);
-      }
-      for (const entry of projection.badges) {
-        const {badge} = entry, note = notes.find(node => node.getAttribute("data-id") === entry.statementId);
-        note.setAttribute("data-trellis-badge-id", badge.id);
-        note.setAttribute("role", "button"); note.setAttribute("tabindex", "0");
-        note.setAttribute("aria-expanded", String(badge.expanded));
-        note.setAttribute("aria-label", badge.ariaLabel);
-        const toggle = async () => {
-          if (!active()) return;
-          const top = container.scrollTop, left = container.scrollLeft;
-          if (expandedBadges.has(badge.id)) expandedBadges.delete(badge.id); else expandedBadges.add(badge.id);
-          const outcome = await render(container, view, readSource, expandedGroups, {...options, selectedId:selected.id});
-          if (!current()) return;
-          if (outcome.status === "unsupported") { options.onUnsupported?.(outcome.reason); return; }
-          if (outcome.status !== "rendered") return;
-          [...container.querySelectorAll("[data-trellis-badge-id]")].find(node => node.getAttribute("data-trellis-badge-id") === badge.id)?.focus({preventScroll:true});
-          container.scrollTop = top; container.scrollLeft = left;
-        };
-        note.addEventListener("click", toggle);
-        note.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); void toggle(); } });
       }
       if (!current()) return {status:"stale"};
       if (controls.size) {
