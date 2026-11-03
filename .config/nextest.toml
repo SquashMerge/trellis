@@ -18,3 +18,9 @@ test-group = 'real-workers'
 [[profile.default.overrides]]
 filter = 'binary_id(trellis::producer) & test(/^producer_e2e(_java|_rust)?::/)'
 test-group = 'producer-e2e'
+
+# The nightly runs 256 stateful histories in one test; keep the default
+# five-minute timeout everywhere else while still bounding a stalled run.
+[[profile.nightly.overrides]]
+filter = 'binary_id(=trellis::semantic) & test(=semantic_batch_store::proptest_retention::decision_0006_multi_slot_histories)'
+slow-timeout = { period = "60s", terminate-after = 15 }
