@@ -1263,11 +1263,18 @@ fn occurrence_roles(bytes: &[u8]) -> Result<u64, ScipCaptureError> {
 /// pending position list stays bounded however many occurrences the document has.
 const CAPPED_POSITION_BATCH: usize = 1 << 16;
 
+/// Elements of capacity charged per wire field of an entry: a generated `Vec` grows to at least
+/// four slots, then by doubling, so its capacity is at most four times its length.
+const ENTRY_CAPACITY_FACTOR: u64 = 4;
+
 /// Fails `limit_exceeded: unit expansion` unless one entry of a capped document fits the batch
 /// live budget once parsed. Inside an excluded document an entry's own repeated fields may be
-/// over their counts (#634), so the generated parse is bounded here, before it allocates: every
-/// field the walk counts becomes at most one generated message, string or scalar element, plus
-/// the entry's bytes.
+/// over their counts (#634), so the generated parse is bounded here, before it allocates. Every
+/// field the walk counts becomes at most one element of a generated `Vec` (a message, string or
+/// scalar) or one boxed message, sized at most `per_field`. A growing `Vec` holds at most four
+/// times its length in capacity (at least four slots, then doubling), so each field is charged
+/// [`ENTRY_CAPACITY_FACTOR`] elements. String and byte contents are charged twice the entry's
+/// bytes. The bound is of allocated capacity, not of element counts (#635 review).
 fn entry_within_budget(
     bytes: &[u8],
     node: Node,
@@ -1292,7 +1299,8 @@ fn entry_within_budget(
     let bound = budget
         .fields
         .saturating_mul(per_field)
-        .saturating_add(bytes.len() as u64);
+        .saturating_mul(ENTRY_CAPACITY_FACTOR)
+        .saturating_add((bytes.len() as u64).saturating_mul(2));
     if bound > limits.unit_expansion_bytes {
         return Err(limit("unit expansion"));
     }
@@ -3640,6 +3648,94 @@ mod tests {
                 .as_ref()
                 .map(|inventory| (&inventory.capped_documents, inventory.claims.len()))
         );
+    }
+
+    /// #635 re-review reproductions (Prime): the parse's real allocation is its `Vec` capacity,
+    /// which outgrows the element count. Each case's generated parse allocates past the budget,
+    /// and the decoder refuses the entry typed before parsing it.
+    #[test]
+    fn review635_fix_diagnostic_capacity_obeys_budget() {
+        let count = 1025;
+        let payload = [
+            message(1, &[0, 9, 10]),
+            message(2, b"H#"),
+            vec![0x18, 1],
+            message(6, b"").repeat(count),
+        ]
+        .concat();
+        let limits = BatchLimits {
+            unit_expansion_bytes: 240000,
+            ..BatchLimits::PRODUCTION
+        };
+        let parsed = types::Occurrence::parse_from_bytes(&payload).unwrap();
+        let vector_bytes = parsed.diagnostics.capacity() * std::mem::size_of::<types::Diagnostic>();
+        assert!(vector_bytes > limits.unit_expansion_bytes as usize);
+        drop(parsed);
+        let bytes = two_documents(&[message(2, &payload)], &[]);
+        let actual = decode_two(&bytes, &limits);
+        assert_eq!(
+            actual.as_ref().err(),
+            Some(&limit("unit expansion")),
+            "actual={actual:?}"
+        );
+    }
+
+    #[test]
+    fn review635_fix_signature_capacity_obeys_budget() {
+        let count = 10001;
+        let payload = [
+            message(1, b"H#"),
+            message(7, &message(2, b"").repeat(count)),
+        ]
+        .concat();
+        let limits = BatchLimits {
+            unit_expansion_bytes: 3 * 1024 * 1024,
+            ..BatchLimits::PRODUCTION
+        };
+        let parsed = types::SymbolInformation::parse_from_bytes(&payload).unwrap();
+        let occurrences = &parsed.signature_documentation.as_ref().unwrap().occurrences;
+        let vector_bytes = occurrences.capacity() * std::mem::size_of::<types::Occurrence>();
+        assert!(vector_bytes > limits.unit_expansion_bytes as usize);
+        drop(parsed);
+        let bytes = two_documents(&[message(3, &payload)], &[]);
+        let actual = decode_two(&bytes, &limits);
+        assert_eq!(
+            actual.as_ref().err(),
+            Some(&limit("unit expansion")),
+            "actual={actual:?}"
+        );
+    }
+
+    /// The bound covers what the generated parse allocates across shapes: for entries the
+    /// decoder admits, the charged bound is at least the parsed vectors' capacity in bytes.
+    #[test]
+    fn entry_bound_covers_parsed_capacity() {
+        use std::mem::size_of;
+        let flag = Arc::new(AtomicBool::new(false));
+        for count in [0usize, 1, 2, 3, 5, 17, 1025] {
+            let payload = [
+                message(1, &[0, 9, 10]),
+                message(2, b"H#"),
+                message(6, b"").repeat(count),
+            ]
+            .concat();
+            let parsed = types::Occurrence::parse_from_bytes(&payload).unwrap();
+            let allocated = parsed.diagnostics.capacity() * size_of::<types::Diagnostic>()
+                + parsed.range.capacity() * size_of::<i32>();
+            let fits = |budget| {
+                entry_within_budget(
+                    &payload,
+                    Node::Occurrence,
+                    &BatchLimits {
+                        unit_expansion_bytes: budget,
+                        ..BatchLimits::PRODUCTION
+                    },
+                    &flag,
+                )
+                .is_ok()
+            };
+            assert!(!fits(allocated as u64 - 1), "{count}: under-charged");
+        }
     }
 
     /// Caps outside a document, aggregate caps and a repeated singular field still refuse the
