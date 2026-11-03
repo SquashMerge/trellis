@@ -20,6 +20,7 @@ mod dependency_http;
 mod file_tree_http;
 mod files_view_http;
 mod http;
+mod input_properties;
 mod java_python_http;
 mod metrics_http;
 mod navigation_http;
