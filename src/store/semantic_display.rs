@@ -326,8 +326,9 @@ pub(super) fn status_semantics(
 ) -> Result<()> {
     let key = semantic_pin_key(status.revision);
     let defaults = default_producers(db, &key)?;
+    let reimports = super::semantic_retention::semantic_reimport_at(db, &key)?;
     status.semantic_languages.clear();
-    if !defaults.published {
+    if !defaults.published && reimports.is_empty() {
         status.semantic_producer_id = None;
         status.semantic_note = Some(NO_PRODUCER_NOTE.into());
         status.stats.semantic_state = SemanticState::Unavailable;
@@ -343,13 +344,22 @@ pub(super) fn status_semantics(
         .query_map([&key], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+    let mut languages = languages;
+    for language in reimports.keys() {
+        languages.entry(language.clone()).or_insert(0);
+    }
     let mut selected = BTreeSet::new();
     let mut notes: Vec<String> = Vec::new();
     for (language, calls) in languages {
         let producer = defaults.producer(&language).map(str::to_owned);
+        let reimport = reimports.get(&language).cloned();
         let mut row = crate::model::LanguageSemantic {
-            semantic_note: defaults.note(&language),
+            semantic_note: reimport
+                .as_ref()
+                .map(reimport_note)
+                .or_else(|| defaults.note(&language)),
+            reimport,
             language,
             semantic_producer_id: producer.clone(),
             semantic_state: SemanticState::Unavailable,
@@ -403,6 +413,14 @@ pub(super) fn status_semantics(
         .calls
         .saturating_sub(stats.internal + stats.external + stats.ambiguous);
     Ok(())
+}
+
+fn reimport_note(reimport: &crate::model::SemanticReimport) -> String {
+    match reimport {
+        crate::model::SemanticReimport::NeedsReimport { reason } => {
+            format!("semantic evidence needs re-import: {reason}")
+        }
+    }
 }
 
 /// One language's selected bindings and state under its producer.
@@ -738,6 +756,8 @@ impl McpSemantic {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LanguageTier {
     pub producer_id: Option<String>,
+    /// Retained input still awaiting validated publication, independent of proof freshness.
+    pub reimport: Option<crate::model::SemanticReimport>,
     /// Why the language shows syntax only, when no producer is selected.
     pub note: Option<String>,
     /// Tuple counts `[selected, complete, partial, failed, unselected]`, as native ones.
@@ -767,10 +787,16 @@ impl EvidenceResponse {
     pub fn mcp_language_tiers(&self) -> Result<[LanguageTier; 4]> {
         let selected = self.selected(None)?;
         let defaults = default_producers(&self.db, &selected.key)?;
+        let reimports = super::semantic_retention::semantic_reimport_at(&self.db, &selected.key)?;
         let mut tiers: [LanguageTier; 4] = Default::default();
         for (tier, language) in tiers.iter_mut().zip(MCP_LANGUAGES) {
             tier.freshness = "unavailable";
-            tier.note = defaults.note(language);
+            tier.reimport = reimports.get(language).cloned();
+            tier.note = tier
+                .reimport
+                .as_ref()
+                .map(reimport_note)
+                .or_else(|| defaults.note(language));
             let Some(producer) = defaults.producer(language) else {
                 continue;
             };
@@ -1169,4 +1195,86 @@ pub(super) fn architecture_semantic(
         semantic.relationships = found;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reimport_tests {
+    use super::*;
+
+    #[test]
+    fn no_history_keeps_plain_unavailable_status_without_reimport() {
+        let (_state, _root, store) = crate::store::selected_read_once_tests::published_store(1);
+        let response = store.evidence_response().unwrap();
+        let status = response.status().unwrap();
+        assert!(status.semantic_languages.is_empty());
+        assert_eq!(status.semantic_producer_id, None);
+        assert_eq!(status.semantic_note.as_deref(), Some(NO_PRODUCER_NOTE));
+        assert_eq!(status.stats.semantic_state, SemanticState::Unavailable);
+        for tier in response.mcp_language_tiers().unwrap() {
+            assert!(tier.reimport.is_none());
+            assert!(!tier.semantic());
+            assert_eq!(tier.freshness, "unavailable");
+        }
+    }
+
+    #[test]
+    fn retained_language_absent_from_native_is_reported_without_a_published_producer() {
+        let (_state, _root, store) = crate::store::selected_read_once_tests::published_store(1);
+        let pin = store.index_baseline().unwrap();
+        let key = semantic_pin_key(pin);
+        {
+            let db = store.cache_write().unwrap();
+            for (producer, reason) in [
+                (
+                    "z-producer",
+                    "retained artifact no longer matches captured inputs",
+                ),
+                ("a-producer", "producer profile pin changed"),
+            ] {
+                db.execute(
+                    "INSERT INTO semantic_reimport VALUES(?1,?2,'rust',?3)",
+                    params![key, producer, reason],
+                )
+                .unwrap();
+            }
+        }
+        let response = store.evidence_response().unwrap();
+        let status = response.status().unwrap();
+        assert_eq!(status.revision, pin);
+        assert_eq!(status.semantic_producer_id, None);
+        assert_eq!(status.stats.semantic_state, SemanticState::Unavailable);
+        assert_eq!(
+            status.stats.internal + status.stats.external + status.stats.ambiguous,
+            0
+        );
+        assert_eq!(
+            status
+                .semantic_languages
+                .iter()
+                .map(|row| row.language.as_str())
+                .collect::<Vec<_>>(),
+            ["javascript", "rust"]
+        );
+        let javascript = &status.semantic_languages[0];
+        assert!(javascript.reimport.is_none());
+        assert_eq!(javascript.calls, 1);
+        let rust = &status.semantic_languages[1];
+        let expected = Some(crate::model::SemanticReimport::NeedsReimport {
+            reason:
+                "producer profile pin changed; retained artifact no longer matches captured inputs"
+                    .into(),
+        });
+        assert_eq!(rust.reimport, expected);
+        assert_eq!(rust.calls, 0);
+        assert_eq!(rust.semantic_producer_id, None);
+        assert_eq!(rust.semantic_state, SemanticState::Unavailable);
+        assert!(rust.coverage.is_none());
+        let tiers = response.mcp_language_tiers().unwrap();
+        assert_eq!(tiers[1].reimport, expected);
+        assert!(!tiers[1].semantic());
+        assert_eq!(tiers[1].producer_id, None);
+        assert_eq!(tiers[1].freshness, "unavailable");
+        assert_eq!(tiers[1].counts, [0; 5]);
+        assert!(tiers[3].reimport.is_none());
+    }
 }

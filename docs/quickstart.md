@@ -290,6 +290,14 @@ trellis producer pickup --producer rust-analyzer --artifact ~/trellis-scip/rust.
 
 The file must come from `rust-analyzer` 1.98.1: another version fails with `invalid_artifact: tool binding`. To stop watching, run `trellis producer pickup --producer rust-analyzer --clear`.
 
+### Upgrading Trellis
+
+An upgrade can rebuild the native index when its schema or extractor changes. Trellis keeps the last successfully imported `producer run` input directory for each producer, in its original private location. After a rebuild it tries that batch again through normal validation, joining and publication. This does not run the producer.
+
+If the inputs are missing or no longer match, status, the web app and MCP show **semantic evidence needs re-import**, with a per-language reason. Run the producer again using the commands above, or refresh your configured pickup artifact. A queued import does not clear the warning; successful validated publication does. A retained batch alone never means evidence is fresh.
+
+The first upgrade onto this retention behavior also needs re-import: older versions deleted successful run inputs. Trellis does not migrate old index layouts to recover them. Retained inputs are disposable and GC may remove them; keep any artifact you need to archive outside Trellis. Configured pickup keeps its existing artifact-watch behavior.
+
 ## 6. Architecture rules
 
 Rules live in one reviewed file, `.trellis/rules.toml`, in your repository. Trellis never writes it unless you confirm a change in the web app. A small example:

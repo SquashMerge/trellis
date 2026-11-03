@@ -10,6 +10,7 @@ pub mod requests;
 mod search;
 mod search_startup;
 mod semantic_display;
+mod semantic_retention;
 mod witness_rejoin;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
@@ -799,6 +800,7 @@ CREATE INDEX semantic_raw_selections_batch ON semantic_revision_raw_selections(b
 CREATE INDEX semantic_raw_selections_captured_pin ON semantic_revision_raw_selections(captured_pin);
 CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id),proof_id TEXT NOT NULL,record_kind TEXT NOT NULL CHECK(record_kind IN ('occurrence','symbolInformation','relationship')),fact_digest TEXT NOT NULL CHECK(length(fact_digest)=64),language TEXT NOT NULL,path TEXT NOT NULL,canonical_bytes BLOB NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest));
 CREATE TABLE semantic_raw_documents(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id) ON DELETE CASCADE,language TEXT NOT NULL,path TEXT NOT NULL,source_hash TEXT NOT NULL CHECK(length(source_hash)=64),wire_digest TEXT NOT NULL CHECK(length(wire_digest)=64),capped INTEGER NOT NULL CHECK(capped IN (0,1,2)),PRIMARY KEY(capture_id,language,path));
+CREATE TABLE semantic_reimport(revision_id TEXT NOT NULL REFERENCES native_revisions(id) ON DELETE CASCADE,producer TEXT NOT NULL,language TEXT NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(revision_id,producer,language));
 CREATE TABLE semantic_import_reports(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,report_json TEXT NOT NULL CHECK(json_valid(report_json)),PRIMARY KEY(revision_id,producer_id));
 CREATE TABLE semantic_provenance(tuple_id INTEGER NOT NULL,provenance_id TEXT NOT NULL,content_hash TEXT NOT NULL,evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('measuredSyntax','declarationBinding','semanticReference','typeRelationship')),freshness TEXT NOT NULL CHECK(freshness IN ('fresh','possiblyStale','stale')),basis_id INTEGER NOT NULL,capture_id INTEGER,derived_from_provenance_id TEXT,derived_from_record_kind TEXT CHECK(derived_from_record_kind IN ('occurrence','symbolInformation','relationship')),derived_from_fact_digest TEXT CHECK(length(derived_from_fact_digest)=64),CHECK((capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL) OR (capture_id IS NOT NULL AND derived_from_provenance_id IS NOT NULL AND derived_from_record_kind IS NOT NULL AND derived_from_fact_digest IS NOT NULL)),PRIMARY KEY(tuple_id,provenance_id),FOREIGN KEY(tuple_id) REFERENCES semantic_coverage(tuple_id),FOREIGN KEY(tuple_id,basis_id) REFERENCES semantic_basis(tuple_id,basis_id),FOREIGN KEY(capture_id,derived_from_provenance_id) REFERENCES semantic_raw_proofs(capture_id,proof_id));
 CREATE INDEX semantic_provenance_derived ON semantic_provenance(capture_id,derived_from_provenance_id) WHERE capture_id IS NOT NULL;
@@ -15396,6 +15398,7 @@ impl Store {
         ))?;
         storage_result(db.execute("ATTACH DATABASE ?1 AS stage", [&stage_uri]))?;
         let attachment = StageAttachment(db);
+        let retained_state = self.attach_retention(db)?;
         storage_result(db.pragma_update(
             Some("stage"),
             "cache_size",
@@ -15512,6 +15515,11 @@ impl Store {
         )?;
         tx.execute("INSERT INTO semantic_import_reports(revision_id,producer_id,report_json) VALUES(?1,?2,?3)",params![next_key,producer.id,report_json])?;
         tx.execute("INSERT INTO semantic_import_reports SELECT ?1,producer_id,report_json FROM semantic_import_reports WHERE revision_id=?2 AND producer_id<>?3",params![next_key,old_key,producer.id])?;
+        semantic_retention::copy(&tx, &old_key, &next_key, Some(&producer.id))?;
+        for language in &descriptor.producer.languages {
+            tx.execute("DELETE FROM semantic_reimport WHERE revision_id=?1 AND producer='' AND language=?2",params![next_key,language])?;
+        }
+        crate::producer::retention::publish_run(&tx, &retained_state, &descriptor, &header_sha)?;
         search::publish_head(&tx, &next_key)?;
         let published_at = self.retention_time()?;
         stamp_predecessor(&tx, &old_key, published_at.as_secs() as i64)?;
@@ -17348,6 +17356,7 @@ impl Store {
             params![revision_key, selected.key],
         )?;
         copy_semantic_rows(&tx, &selected.key, &revision_key, false)?;
+        semantic_retention::copy(&tx, &selected.key, &revision_key, None)?;
         let (bound_hash, binding_sha) = revision_producer_binding(&tx, &revision_key)?;
         selected_ensure!(
             bound_hash == executing_hash,
@@ -18601,6 +18610,16 @@ impl Store {
                     PublicationConnection::Stage(db)
                 }
             };
+            // Retention is disposable. An unavailable catalog cannot block native recovery.
+            let retained_state = match self.attach_retention(&db) {
+                Ok(state) => Some(state),
+                Err(error) if crate::producer::retention::unavailable_catalog(&error) => {
+                    let _ = db.execute_batch("DETACH DATABASE retained");
+                    None
+                }
+                Err(error) => return Err(typed_storage_full(error)),
+            };
+            let recovering_semantics = self.needs_rebuild() || self.is_recreate_pending();
             // Keep this exact SQLite connection open across preflight. data_version
             // values from different connections cannot fence a concurrent SQL rewrite.
             let admitted_version: i64 =
@@ -19114,6 +19133,15 @@ impl Store {
                     )?;
                 }
             }
+            if let Some(prior) = old_pin.filter(|pin| !rebaseline && pin.index_revision > 0) {
+                semantic_retention::copy(&tx, &semantic_pin_key(prior), &revision_key, None)?;
+            }
+            self.materialize_reimport(
+                &tx,
+                &revision_key,
+                retained_state.as_ref(),
+                recovering_semantics,
+            )?;
             search::publish_head(&tx, &revision_key)?;
             let publication_time = self.retention_time()?;
             ensure!(
@@ -20836,12 +20864,15 @@ impl Store {
     pub fn retained_native_pin_for(&self, revision: &str, source_set: &str) -> Result<IndexPin> {
         let generation = self.index_baseline()?.index_generation;
         self.with_evidence(|db| {
-            let revision: i64 = db.query_row(
+            let revision: Option<i64> = db.query_row(
                 "SELECT published_index_revision FROM native_revisions r WHERE native_revision_id=?1 AND source_set_id=?2 AND NOT EXISTS(SELECT 1 FROM revision_capture_inputs WHERE revision_id=r.id AND input_key IN ('__released:v1','__pending_release:v1')) ORDER BY published_index_revision DESC LIMIT 1",
                 rusqlite::params![revision,source_set], |row|row.get(0),
-            ).context("capture_unavailable: retained native revision missing")?;
-            Ok(IndexPin { index_generation:generation, index_revision:u64::try_from(revision)? })
-        })
+            ).optional()?;
+            Ok(revision)
+        })?
+        .map(|revision| -> Result<IndexPin> { Ok(IndexPin { index_generation:generation, index_revision:u64::try_from(revision)? }) })
+        .transpose()?
+        .context("capture_unavailable: retained native revision missing")
     }
 
     /// The original canonical native root inputs retained with the selected revision.

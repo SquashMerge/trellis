@@ -82,6 +82,30 @@ const response = data => ({ok:true,status:200,json:async()=>data});
 function descendants(node) { return [node, ...node.children.flatMap(descendants)]; }
 function text(node) { return descendants(node).map(n=>n.textContent).join(" "); }
 
+test("status reports per-language re-import reasons without inventing fresh evidence", async () => {
+  const h = harness();
+  const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+  const reason = "producer profile pin changed <script>not markup</script>";
+  let languages = [
+    {language:"rust",semanticState:"unavailable",semanticProducerId:null,reimport:{state:"needsReimport",reason}},
+    {language:"javascript",semanticState:"fresh",semanticProducerId:"scip-typescript",reimport:null},
+  ];
+  h.context.fetch = async route => {
+    assert.equal(route, "/api/status");
+    return response({revision:pin,stats:{files:2,calls:3,semanticState:"fresh"},semanticLanguages:languages});
+  };
+  await h.run("refreshStatus()");
+  assert.match(h.get("status").textContent, /rust: semantic evidence unavailable; needs re-import/);
+  assert.ok(h.get("status").textContent.includes(reason));
+  assert.match(h.get("status").textContent, /javascript: semantic evidence fresh/);
+  assert.doesNotMatch(h.get("status").textContent, /Semantic proof unavailable|SCIP.*display only/);
+  assert.equal(h.get("status").children.length, 0);
+  languages = languages.map(row => ({...row,reimport:null}));
+  await h.run("refreshStatus()");
+  assert.doesNotMatch(h.get("status").textContent, /needs re-import|not markup/);
+  assert.match(h.get("status").textContent, /rust: semantic evidence unavailable/);
+});
+
 test("file tree expands methods inline, backend flags filter conservatively, pagination and whole-catalog path filter", async () => {
   const h = harness(), paths = [];
   h.context.fetch = async (path) => {
