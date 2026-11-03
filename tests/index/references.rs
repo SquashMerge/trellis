@@ -7,6 +7,9 @@ use trellis::{
     references::{self, DocumentInput, Projection, Snapshot},
 };
 
+#[path = "reference_resolution_properties.rs"]
+mod reference_resolution_properties;
+
 fn snapshot(files: &[(&str, &str)]) -> Snapshot {
     let files: Vec<_> = files
         .iter()
