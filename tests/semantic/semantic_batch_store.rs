@@ -8613,15 +8613,29 @@ fn invalid_range_655_rejects_atomically_through_publication() {
 /// #655 review: an empty enclosing range on a non-marker occurrence excludes its document in
 /// the decoder, staging, the join and publication alike (#652).
 fn review655_empty_enclosing_excludes_its_document() {
-    let world = world(|root| write_files(root, &[("src/a.js", "x;\n")]));
+    let world = world(|root| {
+        write_files(
+            root,
+            &[("src/a.js", "x;\n"), ("src/B.js", "function run() {}\n")],
+        )
+    });
+    let healthy = DocSpec::new("src/B.js")
+        .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
+        .symbol("pkg run.", 17, &[]);
+    let baseline = one_artifact_per_language(&world, vec![("javascript", vec![healthy.clone()])]);
+    let (baseline_pin, _, _) = world.publish(&baseline).unwrap();
+    let baseline_snapshot = world.store.semantic_at(baseline_pin).unwrap();
     let doc = DocSpec::new("src/a.js").occurrence(&[0, 0, 1], &[0, 1, 1], "s", 0);
     let mut fixture = world.fixture();
-    let ordinal = fixture.artifact("javascript", vec![doc.clone()]);
+    let docs = vec![doc, healthy];
+    let ordinal = fixture.artifact("javascript", docs.clone());
     // Preserve the exact occurrence wire bytes of the standalone decoder witness,
     // including the explicitly encoded role 0 (the protobuf writer omits it).
     let mut index =
-        scip::types::Index::parse_from_bytes(&fixture.scip_bytes("javascript", &[doc])).unwrap();
-    index.documents.clear();
+        scip::types::Index::parse_from_bytes(&fixture.scip_bytes("javascript", &docs)).unwrap();
+    index
+        .documents
+        .retain(|document| document.relative_path != "src/a.js");
     let mut artifact = index.write_to_bytes().unwrap();
     let field = |tag: u8, payload: &[u8]| {
         assert!(payload.len() < 128);
@@ -8638,7 +8652,14 @@ fn review655_empty_enclosing_excludes_its_document() {
     fixture.override_artifact_raw(ordinal, artifact);
     let descriptor = world.write(&fixture);
     let admission = world.memory_admission(&descriptor);
-    assert!(admission.merged.claims.is_empty());
+    assert_eq!(admission.merged.claims.len(), 2);
+    assert!(
+        admission
+            .merged
+            .claims
+            .iter()
+            .all(|claim| claim.envelope.relative_path == "src/B.js")
+    );
     assert_eq!(
         admission
             .merged
@@ -8677,6 +8698,43 @@ fn review655_empty_enclosing_excludes_its_document() {
         .find(|row| row.document_path == "src/a.js")
         .unwrap();
     assert_eq!(row.diagnostic.as_deref(), Some("invalid_range"));
+    assert!(row.selected && row.state == trellis::semantic_evidence::CoverageState::Partial);
+    assert!(row.reasons.as_ref().unwrap().capped);
+    let healthy_row = published
+        .coverage
+        .iter()
+        .find(|row| row.document_path == "src/B.js")
+        .unwrap();
+    assert!(
+        healthy_row.selected
+            && healthy_row.state == trellis::semantic_evidence::CoverageState::Complete
+    );
+    assert_eq!(
+        healthy_row,
+        baseline_snapshot
+            .coverage
+            .iter()
+            .find(|row| row.document_path == "src/B.js")
+            .unwrap()
+    );
+    let bindings = |snapshot: &trellis::semantic_evidence::SemanticSnapshot| {
+        let mut rows = snapshot.declaration_bindings.clone();
+        for row in &mut rows {
+            row.provenance_id.clear();
+        }
+        rows
+    };
+    assert_eq!(bindings(&published).len(), 1);
+    assert_eq!(bindings(&published), bindings(&baseline_snapshot));
+    let symbols = |snapshot: &trellis::semantic_evidence::SemanticSnapshot| {
+        let mut rows = snapshot.symbols.clone();
+        for row in &mut rows {
+            row.provenance_id.clear();
+        }
+        rows
+    };
+    assert_eq!(symbols(&published).len(), 1);
+    assert_eq!(symbols(&published), symbols(&baseline_snapshot));
     assert!(world.stage_dirs().is_empty());
 }
 
