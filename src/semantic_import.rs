@@ -684,57 +684,21 @@ pub(crate) fn stored_occurrence_endpoints(
 }
 
 /// Recognize the pinned producers' raw file/module markers, not a measured name anchor.
+/// Admission decoded this claim and rejected any empty marker that does not name its document
+/// under the authenticated package or project root (owner ruling 2026-10-29, #443), so the
+/// marker shape suffices here.
 fn module_definition(claim: &CapturedClaim) -> bool {
-    use scip::types::descriptor::Suffix;
-    if claim.envelope.record_kind != "occurrence"
-        || !claim.envelope.raw["symbolRoles"]
+    claim.envelope.record_kind == "occurrence"
+        && claim.envelope.raw["symbolRoles"]
             .as_u64()
             .is_some_and(|roles| roles & 1 != 0)
-    {
-        return false;
-    }
-    let Some(symbol) = claim.envelope.raw["symbol"].as_str() else {
-        return false;
-    };
-    let Ok(symbol) = scip::symbol::parse_symbol(symbol) else {
-        return false;
-    };
-    let package = |descriptor: &scip::types::Descriptor| {
-        descriptor.suffix.enum_value() == Ok(Suffix::Package)
-    };
-    match (claim.language.as_str(), symbol.scheme.as_str()) {
-        // Admission decoded this claim and rejected any empty marker that does not name its
-        // document under the authenticated package or project root (owner ruling 2026-10-29,
-        // #443), so the marker shape suffices here.
-        ("javascript", "scip-typescript") => {
-            crate::scip_raw::module_roots::typescript_module_path(&symbol).is_some()
-        }
-        ("python", "scip-python") => {
-            symbol
-                .descriptors
-                .split_last()
-                .is_some_and(|(last, prefix)| {
-                    last.suffix.enum_value() == Ok(Suffix::Meta)
-                        && last.name == "__init__"
-                        && !prefix.is_empty()
-                        && prefix.iter().all(package)
-                        && claim
-                            .envelope
-                            .relative_path
-                            .strip_suffix("/__init__.py")
-                            .or_else(|| claim.envelope.relative_path.strip_suffix(".py"))
-                            .is_some_and(|path| {
-                                prefix
-                                    .iter()
-                                    .map(|descriptor| descriptor.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(".")
-                                    == path.replace('/', ".")
-                            })
-                })
-        }
-        _ => false,
-    }
+        && claim.envelope.raw["symbol"].as_str().is_some_and(|symbol| {
+            crate::scip_raw::module_marker_shape(
+                &claim.language,
+                &claim.envelope.relative_path,
+                symbol,
+            )
+        })
 }
 
 fn mapped_range(
@@ -876,7 +840,7 @@ impl<'a> InventoryIndex<'a> {
             excluded_languages: inventory
                 .capped_documents
                 .iter()
-                .filter(|(_, cap)| **cap == crate::scip_raw::DocumentCap::Document)
+                .filter(|(_, cap)| cap.excludes())
                 .map(|((language, _), _)| language.clone())
                 .collect(),
         };

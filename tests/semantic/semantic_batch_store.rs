@@ -3871,10 +3871,12 @@ fn real_python_empty_module_markers_publish_and_rejoin_without_measured_anchors(
     real_module_marker_batch("python");
 }
 
+/// Owner ruling 2026-11-03 (#652): an empty non-marker or reversed occurrence range, an empty
+/// marker that does not name its document included, no longer rejects the artifact. The
+/// document is admitted with no claims under `invalid_range`.
 #[test]
-fn invalid_empty_or_reversed_occurrences_reject_typed_without_partial_publication() {
+fn invalid_empty_or_reversed_occurrences_exclude_their_document() {
     let world = world(|root| write_files(root, &[("src/a.js", "function greet() {}\n")]));
-    let head = world.store.index_baseline().unwrap();
     for (range, symbol, roles, kind) in [
         (vec![0, 0, 0], "pkg greet().", 1, 17),
         (vec![0, 0, 0], "pkg greet().", 0, 17),
@@ -3897,15 +3899,18 @@ fn invalid_empty_or_reversed_occurrences_reject_typed_without_partial_publicatio
             .occurrence(&range, &[], symbol, roles)
             .symbol(symbol, kind, &[]);
         let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![doc])]);
-        let error = world.publish(&descriptor).map(|_| ()).unwrap_err();
-        assert!(
-            matches!(
-                error.downcast_ref::<ScipCaptureError>(),
-                Some(ScipCaptureError::InvalidArtifact(_))
-            ),
-            "{range:?}, {symbol}, roles {roles}: {error:#}"
-        );
-        assert_nothing_published(&world, head);
+        let case = format!("{range:?}, {symbol}, roles {roles}");
+        let (pin, _, _) = world
+            .publish(&descriptor)
+            .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+        let published = world.store.semantic_at(pin).unwrap();
+        let row = published
+            .coverage
+            .iter()
+            .find(|row| row.document_path == "src/a.js")
+            .unwrap();
+        assert_eq!(row.diagnostic.as_deref(), Some("invalid_range"), "{case}");
+        assert!(row.observed_roles.is_empty(), "{case}");
         assert!(world.stage_dirs().is_empty());
     }
 }
@@ -5842,8 +5847,10 @@ fn real_typescript_markers_reject_without_their_authenticated_package_root() {
     }
 }
 
+/// A reversed marker range excludes only its document (#652), as
+/// `invalid_empty_or_reversed_occurrences_exclude_their_document` shows.
 #[test]
-fn real_typescript_markers_reject_wrong_paths_other_documents_and_reversed_ranges() {
+fn real_typescript_markers_reject_wrong_paths_and_other_documents() {
     let world = module_roots_world(|_| {});
     let original = module_roots_artifact(&world);
     let edit_marker = |path: &str, edit: &dyn Fn(&mut scip::types::Occurrence)| {
@@ -5882,11 +5889,6 @@ fn real_typescript_markers_reject_wrong_paths_other_documents_and_reversed_range
             &|marker: &mut scip::types::Occurrence| {
                 marker.symbol = "scip-typescript npm . . src/`b.js`/".into()
             },
-        ),
-        (
-            "reversed range",
-            "tools/x/lib/c.js",
-            &|marker: &mut scip::types::Occurrence| marker.range = vec![0, 1, 0],
         ),
     ] {
         let descriptor = module_roots_batch(&world, edit_marker(path, edit));
@@ -8414,6 +8416,147 @@ fn over_symbol_cap_document_is_excluded_and_proves_no_absence() {
         assert_eq!(
             world.count("SELECT COUNT(*) FROM semantic_raw_documents WHERE capped=0"),
             1
+        );
+    }
+}
+
+/// Owner ruling 2026-11-03 (#652): a document with a malformed occurrence range, here one
+/// reversed and one empty non-marker range, is admitted with no claims under `invalid_range`
+/// while the other document imports, both join paths agree, and publication stores the row and
+/// the raw capture's mark. Each malformation alone excludes it the same way.
+#[test]
+fn malformed_range_document_is_excluded_and_the_rest_imports() {
+    use trellis::semantic_evidence::CoverageState;
+    let a = DocSpec::new("src/A.js")
+        .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
+        .symbol("pkg run.", 17, &[]);
+    let b = || {
+        DocSpec::new("src/B.js")
+            .occurrence(&[0, 0, 3], &[], "pkg run.", 0)
+            .symbol("pkg b.", 17, &[])
+    };
+    for (case, bad) in [
+        (
+            "reversed and empty",
+            b().occurrence(&[1, 10, 1, 9], &[], "pkg b.", 1).occurrence(
+                &[1, 9, 9],
+                &[],
+                "local 0",
+                1,
+            ),
+        ),
+        ("reversed", b().occurrence(&[1, 10, 1, 9], &[], "pkg b.", 1)),
+        ("empty", b().occurrence(&[1, 9, 9], &[], "local 0", 1)),
+        (
+            "reversed enclosing",
+            b().occurrence(&[1, 9, 10], &[1, 14, 1, 0], "pkg b.", 1),
+        ),
+    ] {
+        let world = world(|root| {
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("src/A.js"), "function run() {}\n").unwrap();
+            fs::write(root.join("src/B.js"), "run();\nfunction b() {}\n").unwrap();
+        });
+        let descriptor =
+            one_artifact_per_language(&world, vec![("javascript", vec![a.clone(), bad])]);
+        let limits = BatchLimits::PRODUCTION;
+        let (mut admitted, joined, _) = world
+            .join_with(&descriptor, &limits, DestinationMutations::default())
+            .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        let memory = world
+            .memory_rejoin_with(&descriptor, DestinationMutations::default(), &limits)
+            .unwrap()
+            .publication;
+        assert_same_publication(&staged, &memory, case);
+        let excluded = coverage_of(&staged, "src/B.js");
+        assert_eq!(excluded.state, CoverageState::Partial, "{case}");
+        assert_eq!(
+            excluded.diagnostic.as_deref(),
+            Some("invalid_range"),
+            "{case}"
+        );
+        assert!(excluded.selected && excluded.observed_roles.is_empty());
+        assert_eq!(
+            coverage_of(&staged, "src/A.js").state,
+            CoverageState::Complete,
+            "{case}"
+        );
+        let in_doc = |path: &str| {
+            staged
+                .declaration_bindings
+                .iter()
+                .filter(|binding| binding.join.anchor.document.path == path)
+                .count()
+        };
+        assert_eq!(in_doc("src/A.js"), 1, "{case}: the other document imports");
+        assert_eq!(in_doc("src/B.js"), 0, "{case}: the excluded one has none");
+        let leader = world.store.publication_for_tests().unwrap();
+        let pin = world
+            .store
+            .publish_semantic_batch(
+                &joined,
+                admitted.stage_mut(),
+                joined.destination_pin(),
+                &leader,
+                &world.cancel,
+            )
+            .unwrap();
+        drop(leader);
+        let published = world.store.semantic_at(pin).unwrap();
+        let stored = published
+            .coverage
+            .iter()
+            .find(|row| row.document_path == "src/B.js")
+            .unwrap();
+        assert_eq!(
+            (stored.state, &stored.diagnostic),
+            (excluded.state, &excluded.diagnostic)
+        );
+        assert_eq!(
+            world.count(
+                "SELECT COUNT(*) FROM semantic_raw_documents WHERE capped=3 AND path='src/B.js'"
+            ),
+            1,
+            "{case}"
+        );
+    }
+}
+
+/// Every other malformation of an occurrence in that document still rejects the artifact
+/// (#652): a range outside the source, unknown symbol roles.
+#[test]
+fn malformed_range_document_still_rejects_other_malformations() {
+    for (case, other, roles) in [
+        ("range outside source", [5, 0, 1], 1),
+        ("symbol roles", [1, 9, 10], 0x80),
+    ] {
+        let world = world(|root| {
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("src/A.js"), "function run() {}\n").unwrap();
+            fs::write(root.join("src/B.js"), "run();\nfunction b() {}\n").unwrap();
+        });
+        let bad = DocSpec::new("src/B.js")
+            .occurrence(&[1, 10, 1, 9], &[], "pkg b.", 1)
+            .occurrence(&other, &[], "pkg c.", roles);
+        let descriptor = one_artifact_per_language(
+            &world,
+            vec![("javascript", vec![DocSpec::new("src/A.js"), bad])],
+        );
+        let error = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{case}: admitted"));
+        assert!(
+            matches!(
+                error.downcast_ref::<ScipCaptureError>(),
+                Some(ScipCaptureError::InvalidArtifact(_))
+            ),
+            "{case}: {error:#}"
         );
     }
 }

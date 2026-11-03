@@ -66,7 +66,6 @@ fn profile_commands_are_closed_table() {
             "/nodes/real/node",
             "/opt/launcher",
             "index",
-            "--infer-tsconfig",
             "--output",
             &out,
             "--no-progress-bar"

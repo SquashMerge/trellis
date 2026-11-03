@@ -597,6 +597,7 @@ fn range(
     o: &types::Occurrence,
     enclosing: bool,
     positions: &mut Vec<(i32, i32)>,
+    lenient: bool,
 ) -> Result<Value, ScipCaptureError> {
     let legacy = if enclosing {
         &o.enclosing_range
@@ -654,7 +655,8 @@ fn range(
     } else {
         (values[0], values[1], values[2], values[3])
     };
-    if (sl, sc) > (el, ec) {
+    // A reversed range excludes its document (#652); `range_problem` found it first.
+    if (sl, sc) > (el, ec) && !lenient {
         return Err(invalid("reversed range"));
     }
     positions.push((sl, sc));
@@ -791,9 +793,12 @@ fn check_position(text: &str, line: i32, column: i32, enc: u8) -> Result<(), Sci
     )
 }
 
+/// Validates one occurrence and pushes its range endpoints. `lenient` admits a reversed range,
+/// for a document already excluded under [`DocumentCap::InvalidRange`].
 fn occurrence(
     o: &types::Occurrence,
     positions: &mut Vec<(i32, i32)>,
+    lenient: bool,
 ) -> Result<Value, ScipCaptureError> {
     unknown(&o.special_fields)?;
     let syntax = known(o.syntax_kind)?;
@@ -827,7 +832,7 @@ fn occurrence(
         }
     }
     Ok(
-        json!({"range":range(o,false,positions)?,"enclosingRange":range(o,true,positions)?,"symbol":o.symbol,"symbolRoles":o.symbol_roles,"syntaxKind":syntax}),
+        json!({"range":range(o,false,positions,lenient)?,"enclosingRange":range(o,true,positions,lenient)?,"symbol":o.symbol,"symbolRoles":o.symbol_roles,"syntaxKind":syntax}),
     )
 }
 // Conservative envelope expansion bound for one document unit, before any relationship JSON or
@@ -904,7 +909,7 @@ fn symbol(
             if (*traversed).is_multiple_of(1024) {
                 cancelled(flag)?;
             }
-            occurrence(o, &mut positions)?;
+            occurrence(o, &mut positions, false)?;
         }
         validate_positions(&sig.text, enc, &mut positions, flag)?;
     }
@@ -1006,6 +1011,12 @@ pub const OCCURRENCE_CAP_EXCEEDED: &str = "occurrence_cap_exceeded";
 /// artifact as below the cap; the rest of the artifact imports. Aggregate caps still reject it.
 pub const DOCUMENT_CAP_EXCEEDED: &str = "document_cap_exceeded";
 
+/// Coverage diagnostic of a document admitted with no claims because one of its occurrences has
+/// a reversed range, or an empty primary range that is not a module marker (owner ruling
+/// 2026-11-03, #652). Every occurrence and symbol is still fully validated, so any other
+/// malformation rejects the artifact; the rest of the artifact imports.
+pub const INVALID_RANGE: &str = "invalid_range";
+
 /// The per-document cap a document was admitted under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DocumentCap {
@@ -1013,6 +1024,8 @@ pub enum DocumentCap {
     Occurrences,
     /// [`DOCUMENT_CAP_EXCEEDED`]: the document keeps no claim.
     Document,
+    /// [`INVALID_RANGE`]: the document keeps no claim.
+    InvalidRange,
 }
 impl DocumentCap {
     /// The coverage diagnostic of a document admitted under this cap.
@@ -1020,14 +1033,20 @@ impl DocumentCap {
         match self {
             Self::Occurrences => OCCURRENCE_CAP_EXCEEDED,
             Self::Document => DOCUMENT_CAP_EXCEEDED,
+            Self::InvalidRange => INVALID_RANGE,
         }
     }
-    /// The stored `capped` value: 0 for none, 1 and 2 for these caps.
+    /// Whether the document is admitted with no claims, so it proves nothing absent.
+    pub fn excludes(self) -> bool {
+        self != Self::Occurrences
+    }
+    /// The stored `capped` value: 0 for none, 1 to 3 for these caps.
     pub fn code(cap: Option<Self>) -> i64 {
         match cap {
             None => 0,
             Some(Self::Occurrences) => 1,
             Some(Self::Document) => 2,
+            Some(Self::InvalidRange) => 3,
         }
     }
     /// The cap of a stored `capped` value.
@@ -1035,6 +1054,7 @@ impl DocumentCap {
         match code {
             1 => Some(Self::Occurrences),
             2 => Some(Self::Document),
+            3 => Some(Self::InvalidRange),
             _ => None,
         }
     }
@@ -1199,6 +1219,120 @@ fn unresolved_module_marker(
         && !artifact.module_roots.names_document(&symbol, path)
 }
 
+/// Whether a definition occurrence of `symbol` has the shape of a pinned producer's raw
+/// file/module marker for the document at `path`: the only occurrence whose range may be empty.
+/// A scip-typescript marker must also name its document under its authenticated root
+/// ([`unresolved_module_marker`]); that binding is checked separately.
+pub(crate) fn module_marker_shape(language: &str, path: &str, symbol: &str) -> bool {
+    use types::descriptor::Suffix;
+    let Ok(symbol) = scip::symbol::parse_symbol(symbol) else {
+        return false;
+    };
+    let package =
+        |descriptor: &types::Descriptor| descriptor.suffix.enum_value() == Ok(Suffix::Package);
+    match (language, symbol.scheme.as_str()) {
+        ("javascript", "scip-typescript") => {
+            module_roots::typescript_module_path(&symbol).is_some()
+        }
+        ("python", "scip-python") => {
+            symbol
+                .descriptors
+                .split_last()
+                .is_some_and(|(last, prefix)| {
+                    last.suffix.enum_value() == Ok(Suffix::Meta)
+                        && last.name == "__init__"
+                        && !prefix.is_empty()
+                        && prefix.iter().all(package)
+                        && path
+                            .strip_suffix("/__init__.py")
+                            .or_else(|| path.strip_suffix(".py"))
+                            .is_some_and(|path| {
+                                prefix
+                                    .iter()
+                                    .map(|descriptor| descriptor.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(".")
+                                    == path.replace('/', ".")
+                            })
+                })
+        }
+        _ => false,
+    }
+}
+
+/// The raw values of an occurrence's primary or enclosing range, when they have a valid shape.
+/// A malformed shape is left to [`occurrence`], which rejects it.
+fn raw_range_values(o: &types::Occurrence, enclosing: bool) -> Option<[i32; 4]> {
+    let (legacy, typed) = if enclosing {
+        let typed = match &o.typed_enclosing_range {
+            Some(occurrence::Typed_enclosing_range::SingleLineEnclosingRange(v)) => {
+                Some(vec![v.line, v.start_character, v.end_character])
+            }
+            Some(occurrence::Typed_enclosing_range::MultiLineEnclosingRange(v)) => Some(vec![
+                v.start_line,
+                v.start_character,
+                v.end_line,
+                v.end_character,
+            ]),
+            _ => None,
+        };
+        (&o.enclosing_range, typed)
+    } else {
+        let typed = match &o.typed_range {
+            Some(occurrence::Typed_range::SingleLineRange(v)) => {
+                Some(vec![v.line, v.start_character, v.end_character])
+            }
+            Some(occurrence::Typed_range::MultiLineRange(v)) => Some(vec![
+                v.start_line,
+                v.start_character,
+                v.end_line,
+                v.end_character,
+            ]),
+            _ => None,
+        };
+        (&o.range, typed)
+    };
+    let values = if legacy.is_empty() {
+        typed?
+    } else {
+        legacy.clone()
+    };
+    match values[..] {
+        [line, start, end] => Some([line, start, line, end]),
+        [start_line, start, end_line, end] => Some([start_line, start, end_line, end]),
+        _ => None,
+    }
+}
+
+/// The first range that makes an occurrence's document [`DocumentCap::InvalidRange`] (owner
+/// ruling 2026-11-03, #652): a reversed primary or enclosing range, or an empty primary range
+/// on an occurrence that is not a module marker by shape. An empty marker that does not name
+/// its document stays an artifact error (#443, `check_module_markers`).
+fn range_problem(o: &types::Occurrence, language: &str, path: &str) -> Option<[i32; 4]> {
+    let reversed = |values: [i32; 4]| (values[0], values[1]) > (values[2], values[3]);
+    if let Some(values) = raw_range_values(o, false) {
+        let empty = (values[0], values[1]) == (values[2], values[3]);
+        if reversed(values)
+            || empty && !(o.symbol_roles & 1 != 0 && module_marker_shape(language, path, &o.symbol))
+        {
+            return Some(values);
+        }
+    }
+    raw_range_values(o, true).filter(|values| reversed(*values))
+}
+
+/// Opt-in (`TRELLIS_INDEX_DIAGNOSTICS=1`), best-effort: names the document an invalid range
+/// excluded and its first such occurrence. The request row never carries it (#445).
+fn report_invalid_range(language: &str, path: &str, ordinal: usize, values: [i32; 4]) {
+    if std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "index-phase semantic_invalid_range language={language} path={path:?} occurrence={ordinal} range={values:?}"
+        );
+    }
+}
+
 type FieldSpan = (u64, std::ops::Range<usize>, std::ops::Range<usize>);
 
 /// The first top-level field of a message already accepted by `wire`: its number, the
@@ -1311,8 +1445,9 @@ fn entry_within_budget(
 /// as an admitted one is validated, then keeps every other field and only the definition
 /// occurrences (none if they alone exceed the cap), in wire order. Under
 /// [`DocumentCap::Document`] it also validates every symbol, one at a time, and keeps no
-/// occurrence and no symbol. No occurrence becomes a claim here; the caller decodes the kept
-/// unit as usual.
+/// occurrence and no symbol. A document with an invalid range ([`range_problem`]) is admitted
+/// that way under [`DocumentCap::InvalidRange`] whatever its cap, which it returns. No
+/// occurrence becomes a claim here; the caller decodes the kept unit as usual.
 #[allow(clippy::too_many_arguments)]
 fn cap_document(
     bytes: &mut Vec<u8>,
@@ -1324,8 +1459,27 @@ fn cap_document(
     limits: &BatchLimits,
     traversed: &mut usize,
     cancel: &CancelFlag,
-) -> Result<(), ScipCaptureError> {
-    let excluded = cap == DocumentCap::Document;
+) -> Result<DocumentCap, ScipCaptureError> {
+    let mut cap = cap;
+    let mut at = 0;
+    let mut ordinal = 0;
+    while cap != DocumentCap::InvalidRange && at < bytes.len() {
+        let (number, span, payload) = next_field(bytes, at)?;
+        at = span.end;
+        if number != 2 {
+            continue;
+        }
+        entry_within_budget(&bytes[payload.clone()], Node::Occurrence, limits, cancel)?;
+        let o = types::Occurrence::parse_from_bytes(&bytes[payload])
+            .map_err(|_| invalid("protobuf parse"))?;
+        if let Some(values) = range_problem(&o, language, path) {
+            report_invalid_range(language, path, ordinal, values);
+            cap = DocumentCap::InvalidRange;
+        }
+        ordinal += 1;
+    }
+    let lenient = cap == DocumentCap::InvalidRange;
+    let excluded = cap.excludes();
     let occurrence_cap = limits.document_occurrences;
     let mut definitions = 0u64;
     let mut at = 0;
@@ -1352,7 +1506,7 @@ fn cap_document(
             let o = types::Occurrence::parse_from_bytes(&bytes[payload])
                 .map_err(|_| invalid("protobuf parse"))?;
             let first = positions.len();
-            occurrence(&o, &mut positions)?;
+            occurrence(&o, &mut positions, lenient)?;
             if unresolved_module_marker(artifact, language, path, &o) {
                 unresolved_markers.push((positions[first], positions[first + 1]));
             }
@@ -1393,7 +1547,7 @@ fn cap_document(
         )?;
     }
     bytes.truncate(write);
-    Ok(())
+    Ok(cap)
 }
 
 /// The start and end positions of an occurrence range.
@@ -1523,14 +1677,14 @@ pub fn decode_streaming<'s, R: Read>(
             }
             _ => {
                 let wire_digest = sha(&unit.bytes);
-                let cap = if budget.document_cap_exceeded {
+                let mut cap = if budget.document_cap_exceeded {
                     Some(DocumentCap::Document)
                 } else if budget.document_occurrences > limits.document_occurrences {
                     Some(DocumentCap::Occurrences)
                 } else {
                     None
                 };
-                let (d, source) = if let Some(cap) = cap {
+                let (d, source) = if let Some(over) = cap {
                     let (path, language) = document_identity(&unit.bytes)?;
                     if !valid_path(&path) {
                         return Err(invalid("unlisted document"));
@@ -1544,29 +1698,60 @@ pub fn decode_streaming<'s, R: Read>(
                                 .map_err(|_| invalid("non-UTF8 source"))?,
                         )
                     };
-                    cap_document(
+                    cap = Some(cap_document(
                         &mut unit.bytes,
                         artifact,
                         &source.language,
                         &path,
                         text,
-                        cap,
+                        over,
                         limits,
                         &mut traversed,
                         cancel,
-                    )?;
+                    )?);
                     let d = types::Document::parse_from_bytes(&unit.bytes)
                         .map_err(|_| invalid("protobuf parse"))?;
                     unknown(&d.special_fields)?;
                     (d, source)
                 } else {
-                    let d = types::Document::parse_from_bytes(&unit.bytes)
+                    let mut d = types::Document::parse_from_bytes(&unit.bytes)
                         .map_err(|_| invalid("protobuf parse"))?;
                     unknown(&d.special_fields)?;
                     if !valid_path(&d.relative_path) {
                         return Err(invalid("unlisted document"));
                     }
                     let source = resolve(&d.relative_path, &d.language)?;
+                    let problem = d.occurrences.iter().enumerate().find_map(|(ordinal, o)| {
+                        range_problem(o, &source.language, &d.relative_path)
+                            .map(|values| (ordinal, values))
+                    });
+                    if let Some((ordinal, values)) = problem {
+                        // Owner ruling 2026-11-03 (#652): the document keeps no claim; the rest
+                        // of the artifact imports.
+                        report_invalid_range(&source.language, &d.relative_path, ordinal, values);
+                        let text = if unread(&source) {
+                            None
+                        } else {
+                            Some(
+                                std::str::from_utf8(&source.bytes)
+                                    .map_err(|_| invalid("non-UTF8 source"))?,
+                            )
+                        };
+                        let path = d.relative_path.clone();
+                        cap = Some(cap_document(
+                            &mut unit.bytes,
+                            artifact,
+                            &source.language,
+                            &path,
+                            text,
+                            DocumentCap::InvalidRange,
+                            limits,
+                            &mut traversed,
+                            cancel,
+                        )?);
+                        d = types::Document::parse_from_bytes(&unit.bytes)
+                            .map_err(|_| invalid("protobuf parse"))?;
+                    }
                     (d, source)
                 };
                 // An unread source (#576) is admitted with no claims: the producer read the real
@@ -1609,7 +1794,7 @@ pub fn decode_streaming<'s, R: Read>(
                         cancelled(cancel)?;
                     }
                     let first = positions.len();
-                    let raw = occurrence(o, &mut positions)?;
+                    let raw = occurrence(o, &mut positions, false)?;
                     if unresolved_module_marker(artifact, &source.language, &d.relative_path, o) {
                         unresolved_markers.push((positions[first], positions[first + 1]));
                     }
@@ -2225,7 +2410,7 @@ mod tests {
             let occurrence = &generated.documents[0].occurrences[0];
             let mut positions = Vec::new();
             assert!(matches!(
-                range(occurrence, false, &mut positions),
+                range(occurrence, false, &mut positions, false),
                 Err(ScipCaptureError::InvalidArtifact(reason)) if reason == "range components"
             ));
             assert!(matches!(
@@ -3470,6 +3655,69 @@ mod tests {
             capped
         });
         assert!(claims_of(&both, "src/B.js").is_empty());
+    }
+
+    /// Owner ruling 2026-11-03 (#652): a document with a reversed range and an empty
+    /// non-marker range is admitted with no claims under `invalid_range`; the other document's
+    /// claims are unchanged. Over the symbol cap too, the range reason wins.
+    #[test]
+    fn invalid_range_document_is_excluded_and_the_rest_imports() {
+        let reversed = message(
+            2,
+            &[message(1, &[0, 10, 0, 9]), message(2, b"H#"), vec![0x18, 1]].concat(),
+        );
+        let empty = occ([0, 9, 9], "local 0", 1);
+        let full = decode_two(&two_documents(&b_fields(), &[]), &BatchLimits::PRODUCTION).unwrap();
+        let bad = [b_fields(), vec![reversed, empty]].concat();
+        let bytes = two_documents(&bad, &[]);
+        let excluded = decode_two(&bytes, &BatchLimits::PRODUCTION).unwrap();
+        let invalid_b = BTreeMap::from([(
+            ("javascript".to_owned(), "src/B.js".to_owned()),
+            DocumentCap::InvalidRange,
+        )]);
+        assert_eq!(excluded.capped_documents, invalid_b);
+        assert!(claims_of(&excluded, "src/B.js").is_empty());
+        // The artifact bytes differ, so compare the facts, not their artifact-bound digests.
+        let envelopes = |inventory: &CapturedScipInventory| {
+            claims_of(inventory, "src/A.js")
+                .into_iter()
+                .map(|claim| claim.envelope.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            envelopes(&excluded),
+            envelopes(&full),
+            "the other document's claims are unchanged"
+        );
+        assert_eq!(DocumentCap::InvalidRange.diagnostic(), INVALID_RANGE);
+        assert_eq!(
+            decode_two(&bytes, &symbols_capped_at(2))
+                .unwrap()
+                .capped_documents,
+            invalid_b
+        );
+    }
+
+    /// An excluded document's occurrences are still validated: any other malformation next
+    /// to its reversed range rejects the artifact (#652).
+    #[test]
+    fn invalid_range_document_still_validates_other_malformations() {
+        let reversed = message(
+            2,
+            &[message(1, &[0, 10, 0, 9]), message(2, b"H#"), vec![0x18, 1]].concat(),
+        );
+        for (case, other) in [
+            ("range outside source", occ([3, 0, 1], "D#", 0)),
+            ("split column", occ([0, 30, 31], "D#", 0)),
+            ("symbol roles", occ([0, 9, 10], "D#", 0x80)),
+        ] {
+            let bytes = two_documents(&[b_fields(), vec![reversed.clone(), other]].concat(), &[]);
+            let error = decode_two(&bytes, &BatchLimits::PRODUCTION).unwrap_err();
+            assert!(
+                matches!(error, ScipCaptureError::InvalidArtifact(_)),
+                "{case}: {error:?}"
+            );
+        }
     }
 
     /// The other per-document counts of the decoder table exclude the document the same way:

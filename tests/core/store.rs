@@ -52,7 +52,7 @@ fn private_stage_build_is_unpublished_and_cleans_only_its_own_inode() {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!((version, metadata_version), (36, 36));
+        assert_eq!((version, metadata_version), (37, 37));
         for name in [
             "document_versions",
             "revision_documents",

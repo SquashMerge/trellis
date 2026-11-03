@@ -13,7 +13,8 @@ pub const STAGE_PREFIX: &str = "semantic-stage-";
 const STAGE_DB: &str = "stage.db";
 
 /// `documents.capped` is `scip_raw::DocumentCap::code` of the per-document cap a document was
-/// admitted under: 0 for none, 1 for `OCCURRENCE_CAP_EXCEEDED`, 2 for `DOCUMENT_CAP_EXCEEDED`.
+/// admitted under: 0 for none, 1 for `OCCURRENCE_CAP_EXCEEDED`, 2 for `DOCUMENT_CAP_EXCEEDED`,
+/// 3 for `INVALID_RANGE`.
 ///
 /// `claims.symbol`/`presence` index each admitted claim's symbol presence: a symbol-information
 /// claim's symbol (`PRESENCE_INFORMATION`) and a definition occurrence's (`PRESENCE_DECLARED`),
@@ -43,7 +44,7 @@ CREATE TABLE sources(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT 
 CREATE TABLE coverage(source_ord INTEGER PRIMARY KEY REFERENCES sources(ord), artifact INTEGER, exclusion TEXT, CHECK((artifact IS NULL)<>(exclusion IS NULL)));
 CREATE INDEX coverage_artifact ON coverage(artifact, source_ord);
 CREATE TABLE artifacts(ordinal INTEGER PRIMARY KEY, path TEXT NOT NULL, language TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE, byte_length INTEGER NOT NULL, documents INTEGER NOT NULL DEFAULT 0, claims INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, path TEXT NOT NULL, wire_digest TEXT NOT NULL, capped INTEGER NOT NULL CHECK(capped IN (0,1,2)), UNIQUE(artifact,path));
+CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, path TEXT NOT NULL, wire_digest TEXT NOT NULL, capped INTEGER NOT NULL CHECK(capped IN (0,1,2,3)), UNIQUE(artifact,path));
 CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL, symbol TEXT, presence INTEGER NOT NULL, target_root INTEGER, target_lib INTEGER NOT NULL DEFAULT 0, target_package TEXT, target_version TEXT, UNIQUE(artifact,fact_digest));
 CREATE INDEX claims_order ON claims(source_ord, canonical_bytes);
 CREATE UNIQUE INDEX claims_proof ON claims(proof_id);

@@ -210,7 +210,6 @@ pub fn command(
                 node.unwrap_or_default(),
                 launcher,
                 "index".into(),
-                "--infer-tsconfig".into(),
                 "--output".into(),
                 out,
                 "--no-progress-bar".into(),
@@ -311,7 +310,19 @@ pub fn command(
 pub struct Generated {
     pub path: String,
     pub bytes: Vec<u8>,
+    /// A default under `worktree/`: written only when the retained revision has no root input
+    /// at that worktree path, which then wins.
+    pub default_only: bool,
 }
+
+/// The scip-typescript project config when the checkout has no root `tsconfig.json` (owner
+/// ruling 2026-11-03, #652). `--infer-tsconfig` would write `{"compilerOptions":{"allowJs":true}}`,
+/// whose ES5 default target cannot parse ES2015+ identifiers (an escaped astral name gave a
+/// zero-width definition); this keeps its defaults but targets ES2022. With the ES2015+
+/// target, `module` defaults to ES2015 and classic resolution, so `commonjs` keeps the
+/// node10 resolution `--infer-tsconfig` had.
+pub const SCIP_TYPESCRIPT_TSCONFIG: &[u8] =
+    br#"{"compilerOptions":{"allowJs":true,"target":"es2022","module":"commonjs"}}"#;
 
 /// A captured root input the row leaves out of the worktree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,6 +350,7 @@ pub fn rules(row: &Row) -> Rules {
             generated: vec![Generated {
                 path: "worktree/lsif-java.json".into(),
                 bytes: br#"{"dependencies":[]}"#.to_vec(),
+                default_only: false,
             }],
         },
         (Target::Real(ProducerName::ScipPython), TrustProfile::Restricted) => Rules {
@@ -349,6 +361,15 @@ pub fn rules(row: &Row) -> Rules {
             generated: vec![Generated {
                 path: "producer-config/environment.json".into(),
                 bytes: b"[]".to_vec(),
+                default_only: false,
+            }],
+        },
+        (Target::Real(ProducerName::ScipTypescript), _) => Rules {
+            omit: Vec::new(),
+            generated: vec![Generated {
+                path: "worktree/tsconfig.json".into(),
+                bytes: SCIP_TYPESCRIPT_TSCONFIG.to_vec(),
+                default_only: true,
             }],
         },
         _ => Rules::default(),

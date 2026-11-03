@@ -182,6 +182,12 @@ proptest! {
         let end_byte = if same {end.1} else {a.len()+sep.len()+end.1};
         prop_assert!(source.is_char_boundary(start.1) && source.is_char_boundary(end_byte));
         let four = [0,start.0,el,end.0];
+        if (0, start.0) == (el, end.0) {
+            // An empty non-marker range excludes its document with no claims (#652).
+            let (claims, capped, _) = decode(&document(&[occurrence(legacy(&four,0), "s", 0)], &[]), &source, enc, &BatchLimits::default()).unwrap();
+            prop_assert!(claims.is_empty() && capped);
+            return Ok(());
+        }
         let l4 = one(legacy(&four,0), &source, enc);
         prop_assert_eq!(endpoints(&l4.envelope.raw["range"]), expected);
         for mode in 1..=2 { let alt=one(legacy(&four,mode), &source, enc); prop_assert_eq!(&alt.canonical_bytes,&l4.canonical_bytes); prop_assert_eq!(&alt.fact_digest,&l4.fact_digest); }

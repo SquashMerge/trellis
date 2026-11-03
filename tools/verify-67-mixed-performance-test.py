@@ -315,7 +315,7 @@ class SchemaParity(unittest.TestCase):
         self.assertEqual(len(rows["semantic_reimport"]), 1)
         return rows
 
-    def test_selected_view_normalizes_a_schema_36_batch_selection_identically_across_roots(self):
+    def test_selected_view_normalizes_a_schema_37_batch_selection_identically_across_roots(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             self.assertEqual(self.normalized_rows(first), self.normalized_rows(second))
 

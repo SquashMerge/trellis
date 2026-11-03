@@ -1143,9 +1143,12 @@ impl<'a> JoinStore for StagedSide<'a> {
             &[&self.rev, &language, &oversized, &not_utf8],
         )? || exists(
             self.ctx.conn,
-            "SELECT 1 FROM documents d JOIN sources s ON s.ord=d.source_ord WHERE d.capped=?1 AND s.language=?2 LIMIT 1",
+            "SELECT 1 FROM documents d JOIN sources s ON s.ord=d.source_ord WHERE d.capped IN (?1,?2) AND s.language=?3 LIMIT 1",
             &[
                 &crate::scip_raw::DocumentCap::code(Some(crate::scip_raw::DocumentCap::Document)),
+                &crate::scip_raw::DocumentCap::code(Some(
+                    crate::scip_raw::DocumentCap::InvalidRange,
+                )),
                 &language,
             ],
         )?;

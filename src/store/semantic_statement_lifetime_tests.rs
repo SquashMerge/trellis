@@ -4,7 +4,7 @@ use super::*;
 fn semantic_fact_children_reuse_statement_without_reprepare_per_symbol() {
     let db = Connection::open_in_memory().unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-    db.execute_batch(CACHE_SCHEMA_V36).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V37).unwrap();
     for id in 10_i64..14 {
         db.execute(
             "INSERT INTO semantic_symbols VALUES(?1,1,?2,'scip',?3,'global',NULL,NULL,NULL,'proof')",

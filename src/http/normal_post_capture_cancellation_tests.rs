@@ -39,7 +39,7 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
     assert_eq!(
         tables.len(),
         77,
-        "compare exact schema-36 derived evidence inventory"
+        "compare exact schema-37 derived evidence inventory"
     );
     let expected = vec![
         "class_projections",
@@ -123,7 +123,7 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
         expected,
-        "exact schema-36 table names: complete paired native, semantic and search evidence"
+        "exact schema-37 table names: complete paired native, semantic and search evidence"
     );
     for required in [
         "document_versions",

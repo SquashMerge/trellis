@@ -1298,7 +1298,9 @@ fn validate_coverage_reasons(row: &Coverage, reasons: &CoverageReasons) -> Resul
         match row.diagnostic.as_deref() {
             Some("unsupported_native_gap") => gaps > 0,
             Some(
-                crate::scip_raw::OCCURRENCE_CAP_EXCEEDED | crate::scip_raw::DOCUMENT_CAP_EXCEEDED,
+                crate::scip_raw::OCCURRENCE_CAP_EXCEEDED
+                | crate::scip_raw::DOCUMENT_CAP_EXCEEDED
+                | crate::scip_raw::INVALID_RANGE,
             ) => {
                 gaps == 0 && reasons.capped
             }
