@@ -525,6 +525,9 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
 #sequence-columns { position: relative; flex: none; height: 0; z-index: 2; pointer-events: none; }
 #sequence-columns span { position: absolute; top: 4px; transform: translateX(-50%); padding: 2px 8px; white-space: nowrap; font-size: 13px; color: var(--ink); background: var(--node); border: 1px solid var(--line-strong); border-radius: 4px; }
 .sequence-empty { margin: 12px 10px; color: var(--secondary); font-size: 14px; }
+/* Interactions (#636): dashed returns and activation bars. */
+.sequence-return { stroke-dasharray: 4 4; }
+.sequence-activation { fill: var(--node); stroke: var(--line-strong); }
 
 /* Selection owns its nested labels too, including package metadata and badges. */
 button:is(.selected, [aria-pressed="true"]),

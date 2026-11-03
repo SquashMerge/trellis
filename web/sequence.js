@@ -203,7 +203,67 @@ function sequenceDisplay(view, options = {}) {
     return {shows, transfers};
   };
   visit(view?.steps);
-  return {visible, earlyReturn:step => sequenceEarlyReturn(step) || (!options.showDetails && exits.has(step) ? " · may exit early" : "")};
+  const earlyReturn = step => sequenceEarlyReturn(step) || (!options.showDetails && exits.has(step) ? " · may exit early" : "");
+  // A view with no shown call keeps calls-first: its context markers and empty state (#594).
+  const calls = [...visible].some(step => step.kind === "call" || step.callId);
+  return calls && sequenceInteractive(view, options) ? sequenceInteractions(view, options, earlyReturn) : {visible, earlyReturn};
+}
+// The Interactions view (#636) is the default for an enriched view. A syntax-only view has
+// no columns (#558), so it keeps the calls-first display, as does Show all steps.
+function sequenceInteractive(view, options = {}) {
+  return !!options.interactions && !options.showDetails && view?.semantic?.tier === "semantic";
+}
+// The column a step runs in: its lane's, or the seed's for the seed's own steps.
+function sequenceStepColumn(view, step) {
+  const participants = view?.participants || [];
+  const owner = step?.lane != null && participants.find(p => p.id === step.lane);
+  return sequenceColumn(owner || participants.find(p => p.id === view?.seed?.id) || {id:view?.seed?.id, label:view?.seed?.name});
+}
+// Interactions (#636, owner review on #638) are a display projection of the same admitted DTO,
+// as calls-first is. They show only interactions between entities:
+// - an arrow is a measured call whose exact target is drawn in another column than its own; it
+//   keeps source order, its callee's body (nested cross-column chains) and a return after it;
+// - a loop that encloses an arrow is a UML loop frame around its arrows, with no row of its own
+//   and no row number; it says " · may exit early" when its own frame draws an exit;
+// - every other step draws nothing: internal steps, nested callables, calls without a target and
+//   any branch, try, chain or same-column call around an arrow (`through`: its arrows draw in
+//   its place). `hiddenSteps` counts the shown DTO steps that draw nothing; Show all has them.
+function sequenceInteractions(view, options, earlyReturn) {
+  const visible = new Set(), through = new Set(), loops = new Set(), returns = new Set(), holds = new Set();
+  const nested = step => [...(step.children || []), ...(step.alternate || [])];
+  const crosses = step => {
+    if (step.kind !== "call") return false;
+    const target = sequenceTarget(view, step);
+    return !!target && sequenceColumn(target).id !== sequenceStepColumn(view, step).id;
+  };
+  const scan = step => {
+    if (step.hidden) return false;
+    let any = crosses(step);
+    if (any) returns.add(step);
+    for (const child of nested(step)) any = scan(child) || any;
+    if (any) holds.add(step);
+    return any;
+  };
+  for (const step of view?.steps || []) scan(step);
+  let hiddenSteps = 0;
+  const fold = step => { if (step.hidden) return; hiddenSteps++; for (const child of nested(step)) fold(child); };
+  const place = steps => {
+    for (const step of steps || []) {
+      if (step.hidden) continue;
+      if (returns.has(step)) visible.add(step);
+      else if (step.kind === "loop" && holds.has(step)) { visible.add(step); loops.add(step); }
+      else if (holds.has(step)) { through.add(step); hiddenSteps++; }
+      else { fold(step); continue; }
+      place(step.children); place(step.alternate);
+    }
+  };
+  place(view?.steps);
+  // A loop may exit early when its frame draws an exit (calls-first's mark) or a step in it
+  // carries a folded `?` or guard (#542, #558).
+  const exits = step => !step.hidden && (!!sequenceEarlyReturn(step) || nested(step).some(exits));
+  // The frame's tag says "loop"; its guard says only what qualifies it, if anything.
+  const loopLabel = step => earlyReturn(step) || exits(step) ? "may exit early" : "";
+  return {interactions:true, visible, through, loops, returns, hiddenSteps, loopLabel, earlyReturn};
 }
 // What to say when the admitted view has no displayed calls (#594).
 // Counts come from the server; the reasons are the steps' own.
@@ -211,8 +271,17 @@ function sequenceEmptySummary(view, options = {}) {
   const steps = view?.steps || [];
   if (options.showDetails) return "";
   const display = sequenceDisplay(view, options);
-  if ([...display.visible].some(step => step.kind === "call" || step.callId)) return "";
-  if (steps.some(step => !step.hidden)) return "No measured calls in the admitted steps. Non-call behavior may be hidden; use Show all steps to inspect it.";
+  if (display.interactions) {
+    // Interactions (#636): no call crosses a column. A call without an exact target proves
+    // nothing about where it goes, so it is counted, never said to stay.
+    if (display.returns.size) return "";
+    const calls = [...sequenceDisplay(view, {...options, interactions:false}).visible].filter(step => step.kind === "call" || step.callId);
+    const untargeted = calls.filter(step => !sequenceTarget(view, step)).length, column = sequenceStepColumn(view, null).label;
+    if (!untargeted) return `All calls stay within ${column}.`;
+    if (untargeted === calls.length) return `${untargeted === 1 ? "The one call has no exact target" : `None of the ${untargeted} calls has an exact target`}, so no arrow is drawn between columns.`;
+    return `All resolved calls stay within ${column}; ${untargeted} ${untargeted === 1 ? "call has" : "calls have"} no exact target.`;
+  } else if ([...display.visible].some(step => step.kind === "call" || step.callId)) return "";
+  else if (steps.some(step => !step.hidden)) return "No measured calls in the admitted steps. Non-call behavior may be hidden; use Show all steps to inspect it.";
   if (!steps.length) return "No measured calls in the admitted steps. This does not mean no behavior; inspect source or Show all steps.";
   const hidden = [];
   const walk = items => { for (const step of items) { if (step.incidental) hidden.push(step); walk(step.children || []); walk(step.alternate || []); } };
@@ -262,9 +331,13 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   const visibleTargets = new Set([view.seed.id]), targetProofs = new Map();
   const pending = (view.steps || []).map(step => ({step, depth:0})).reverse();
   let visibleDepth = 0;
+  const nestedPending = (step, depth) => [...(step.alternate || []).slice().reverse(), ...(step.children || []).slice().reverse()].map(step => ({step, depth}));
   while (pending.length) {
     const {step, depth} = pending.pop();
-    if (!displayProjection.visible.has(step)) continue;
+    if (!displayProjection.visible.has(step)) {
+      if (displayProjection.through?.has(step)) pending.push(...nestedPending(step, depth));
+      continue;
+    }
     visibleDepth = Math.max(visibleDepth, depth);
     if (step.kind === "group" && !expandedGroups.has(step.id)) {
       const entry = entryCall(step);
@@ -274,7 +347,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     }
     const target = sequenceTarget(view, step);
     if (target) { visibleTargets.add(target.id); targetProofs.set(target.id, step); }
-    pending.push(...[...(step.alternate || []).slice().reverse(), ...(step.children || []).slice().reverse()].map(step => ({step, depth:depth+1})));
+    pending.push(...nestedPending(step, depth + 1));
   }
   // Hidden chain members and replaced candidate hints must not leave ghost lanes.
   // One column per type or module (#558). A column with one method keeps its open action.
@@ -298,6 +371,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   // steps carry no lane.
   const laneX = step => (step?.lane != null && columnX(step.lane)) || origin;
   const lines = make("g", {class:"sequence-lifelines"}); svg.append(lines);
+  // Interactions (#636): an activation spans a cross-column call's arrow to its return.
+  const activations = make("g", {class:"sequence-activations"}); svg.append(activations);
+  const arrowTops = new Map();
   const kindLabels = {externalCandidate:"External type · candidate", unresolvedReceiver:"Receiver · type unresolved", unresolvedCallee:"Callee · unresolved", boundary:"Unknown target", builtin:"Built-in name", import:"Imported binding", receiver:"Receiver hint", internal:"Indexed target", method:"Selected method"};
   const compactKinds = {externalCandidate:"candidate", unresolvedReceiver:"unresolved", unresolvedCallee:"unresolved", boundary:"unknown", builtin:"source hint", import:"source hint", receiver:"source hint", internal:"indexed", method:"selected"};
   const shorten = (text, limit) => text.length > limit ? `${text.slice(0, limit-1)}…` : text;
@@ -342,7 +418,8 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   };
   const quietGuard = step => !options.showDetails && step.kind === "branch" &&
     step.label === "only if the preceding path continues normally" && !step.alternate?.length;
-  if (!options.showDetails) svg.append(make("text", {x:24, y:73, class:"sequence-meta"}, "Compact labels · select for details"));
+  if (!options.showDetails) svg.append(make("text", {x:24, y:73, class:"sequence-meta"}, displayProjection.interactions
+    ? "Interactions between columns · select for details" : "Compact labels · select for details"));
   let y = options.showDetails ? 78 : 98;
   let rows = 0; // Each row's number, as Pele counts them.
   function sourceControl(group, step, x, top, display = step, evidence = step, operator = null) {
@@ -414,6 +491,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     }
     if (arrow) {
       const end = columnX(target.id), arrowY = top + extra + 10, from = laneX(evidence);
+      arrowTops.set(step, arrowY);
       const d = end === from ? `M ${from} ${arrowY} h 48 v 18 h -48` : `M ${from} ${arrowY} H ${end}`;
       group.append(make("path", {d, class:"sequence-arrow", fill:"none", "data-trellis-call-id":evidence.callId, "data-trellis-target-id":target.id}));
       const direction = end === from ? -1 : end > from ? 1 : -1, headY = arrowY + (end === from ? 18 : 0);
@@ -422,10 +500,38 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     group.append(control);
     return extra + (target && columnX(target.id) === laneX(evidence) ? 20 : 0);
   }
+  // The return of a cross-column call, after its expanded body: presentation, not an observed return.
+  function drawReturn(group, step) {
+    const target = sequenceTarget(view, step), from = target && columnX(target.id), to = laneX(step), top = arrowTops.get(step);
+    if (from == null || top == null) return;
+    const returnY = y - 6;
+    activations.append(make("rect", {x:from-5, y:top, width:10, height:Math.max(8, returnY-top), rx:2, class:"sequence-activation", "data-trellis-target-id":target.id}));
+    group.append(make("path", {d:`M ${from} ${returnY} H ${to}`, class:"sequence-arrow sequence-return", fill:"none", "data-trellis-return-step-id":step.id}));
+    const direction = to > from ? 1 : -1;
+    group.append(make("path", {d:`M ${to-direction*7} ${returnY-4} L ${to} ${returnY} L ${to-direction*7} ${returnY+4}`, class:"sequence-arrow sequence-return", fill:"none"}));
+    y += 18;
+  }
   function draw(steps, parent, depth) {
     for (const step of steps || []) {
-      if (!displayProjection.visible.has(step)) continue;
+      if (!displayProjection.visible.has(step)) {
+        if (displayProjection.through?.has(step)) { draw(step.children, parent, depth); draw(step.alternate, parent, depth); }
+        continue;
+      }
       const group = make("g", {"data-kind":step.kind, "data-step-id":step.id}); parent.append(group);
+      if (displayProjection.loops?.has(step)) {
+        // Interactions (#636): a UML loop frame around its arrows. It is not a row: no number.
+        const start = y, x = 18 + depth * 10, label = displayProjection.loopLabel(step);
+        group.setAttribute("data-presentation", "interaction-loop");
+        const box = make("rect", {x, y:start-19, width:width-x-18, height:34, class:"sequence-fragment"}); group.append(box);
+        const tabWidth = 80;
+        group.append(make("path", {d:`M ${x} ${start-19} H ${x+tabWidth} V ${start+1} L ${x+tabWidth-10} ${start+11} H ${x} Z`, class:"sequence-fragment-tab"}));
+        group.append(make("text", {x:x+12, y:start, class:"sequence-fragment-operator"}, "loop"));
+        if (label) group.append(make("text", {x:x+tabWidth+12, y:start, class:"sequence-control-label"}, `[${label}]`));
+        y += 34;
+        draw(step.children, group, depth+1); draw(step.alternate, group, depth+1);
+        y += 4; box.setAttribute("height", y-start+8); y += 14;
+        continue;
+      }
       if (step.kind === "group") {
         const start = y, x = 18 + depth * 10, expanded = expandedGroups.has(step.id);
         const box = make("rect", {x, y:y-19, width:width-x-18, height:34, class:"sequence-fragment"}); group.append(box);
@@ -455,7 +561,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
         box.setAttribute("height", y-start+8); y += 8;
         continue;
       }
-      const fragment = ["branch", "loop", "try"].includes(step.kind) || step.children?.length || step.alternate?.length;
+      // A cross-column call's body is its activation (#636), not a frame.
+      const returns = displayProjection.returns?.has(step);
+      const fragment = !returns && (["branch", "loop", "try"].includes(step.kind) || step.children?.length || step.alternate?.length);
       if (quietGuard(step)) {
         // One rail per original generated guard. The rail encloses only that
         // guard's children and ends before its next sibling. No flattening.
@@ -488,6 +596,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
         const extra = sourceControl(group, step, labelX, y); y += extra;
         if (box) box.setAttribute("height", 24+extra);
         y += 28;
+        if (returns) { draw(step.children, group, depth+1); draw(step.alternate, group, depth+1); drawReturn(group, step); }
       }
     }
   }
@@ -499,4 +608,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty, stepColumn:sequenceStepColumn};

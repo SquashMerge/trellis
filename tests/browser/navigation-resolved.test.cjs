@@ -130,6 +130,15 @@ for (const mode of ["sole", "constructor", "zero", "multiple", "unresolved", "am
         const empty = page.locator("#sequence-diagram .sequence-empty");
         await empty.waitFor();
         assert.equal(await empty.textContent(), "Only external calls (2 hidden). Show all steps");
+      } else if (["unresolved", "ambiguous", "dispatch"].includes(mode)) {
+        // #636: no call has an exact target, so Interactions draws no arrow and says why, without
+        // claiming where the calls go; Show all steps draws them with their evidence.
+        const empty = page.locator("#sequence-diagram .sequence-empty");
+        await empty.waitFor();
+        assert.equal(await empty.textContent(), "None of the 2 calls has an exact target, so no arrow is drawn between columns. Show all steps");
+        assert.equal(await page.locator("#sequence-diagram svg").count(), 0);
+        await empty.locator("button").click();
+        await page.waitForFunction(() => document.querySelector("#all-steps")?.checked && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
       } else {
         await page.locator("#sequence-diagram svg.pele").waitFor();
         assert.match(await page.locator("#sequence-state").textContent(), /Pele rendered/);
@@ -229,10 +238,10 @@ for (const mode of ["sole", "constructor", "zero", "multiple", "unresolved", "am
             assert.equal(await toggle.textContent(), "Show all steps");
             assert.equal(await toggle.getAttribute("aria-pressed"), "false");
             await toggle.click();
-            await page.waitForFunction(() => document.querySelector("#sequence-incidental")?.textContent === "Show calls" && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
+            await page.waitForFunction(() => document.querySelector("#sequence-incidental")?.textContent === "Show interactions" && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
             assert.equal(await page.locator("#all-steps").isChecked(), true);
             assert.equal(await toggle.getAttribute("aria-pressed"), "true");
-          } else assert.equal(await page.locator("#sequence-incidental").textContent(), "Show all steps");
+          } else assert.equal(await page.locator("#sequence-incidental").textContent(), "Show interactions");
           const visible = await page.locator("#sequence-diagram").innerText();
           const label = {missing:/missing|unavailable|no semantic/i, stale:/stale/i, dispatch:/dispatch/i, external:/external/i, ambiguous:/ambiguous/i, unresolved:/unresolved|unbound/i}[mode];
           assert.match(visible, label);
@@ -323,8 +332,12 @@ test("sequence draws resolved participants, expands direct callees and hides std
     // a column of two methods offers no one target. Were they three types, the callee's
     // call to `inner` would leave the callee's lane, not the seed's.
     assert.deepEqual(dto.participants.map(row => row.column.label), ["flow", "target", "target"]);
-    assert.equal(await page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").count(), 2);
-    assert.equal(await page.locator("#sequence-diagram .pele-actor[data-trellis-target-id]").count(), 0);
+    // #636: Interactions draw only the call that leaves `flow`. The callee's own call to `inner`
+    // stays in its column, so it draws nothing; the status line counts what is not drawn.
+    const innerLabel = page.locator(`#sequence-diagram .pele-edge-label[data-trellis-call-id="${fixture.calleeCalls[0]}"]`);
+    assert.equal(await innerLabel.count(), 0);
+    assert.equal(await page.locator("#sequence-diagram .pele-edge-label").count(), 1);
+    assert.match(await page.locator("#sequence-state").textContent(), / · Interactions · \d+ internal steps hidden/);
     const columns = await page.evaluate(view => window.TrellisPeleSequence.project(view).source, dto);
     assert.match(columns, /^S->>P1: /m);
     assert.match(columns, /^P1->>P1: /m);
@@ -332,21 +345,25 @@ test("sequence draws resolved participants, expands direct callees and hides std
     const source = await page.evaluate(view => window.TrellisPeleSequence.project(view).source, lanes);
     assert.match(source, /^S->>P1: /m);
     assert.match(source, /^P1->>P2: /m);
-    assert.equal(await page.locator(`#sequence-diagram .pele-message[data-trellis-call-id="${fixture.calleeCalls[0]}"]`).getAttribute("data-trellis-target-id"), fixture.inner);
     // Std calls are hidden until the toggle shows them.
     for (const id of [fixture.calls[0], fixture.calleeCalls[1]]) assert.equal(await page.locator(`#sequence-diagram [data-trellis-call-id="${id}"]`).count(), 0);
     const toggle = page.locator("#sequence-incidental");
     assert.equal(await toggle.textContent(), "Show all steps");
+    await toggle.click();
+    await page.waitForFunction(() => document.querySelector("#sequence-incidental")?.textContent === "Show interactions" && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
+    for (const id of [fixture.calls[0], fixture.calleeCalls[1]]) assert.ok(await page.locator(`#sequence-diagram [data-trellis-call-id="${id}"]`).count() > 0, id);
+    assert.match(await page.locator("#sequence-state").textContent(), / · 0 incidental steps hidden/);
+    assert.doesNotMatch(await page.locator("#sequence-state").textContent(), /Interactions/);
+    // One column of two methods (#558) offers no one target; the call to `inner` is a self arrow.
+    assert.equal(await page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").count(), 2);
+    assert.equal(await page.locator("#sequence-diagram .pele-actor[data-trellis-target-id]").count(), 0);
+    assert.equal(await page.locator(`#sequence-diagram .pele-message[data-trellis-call-id="${fixture.calleeCalls[0]}"]`).getAttribute("data-trellis-target-id"), fixture.inner);
     await page.screenshot({path: process.env.TRELLIS_522_SHOTS ? `${process.env.TRELLIS_522_SHOTS}/fixture-expanded.png` : join(paths.temp, "shot.png")});
     // The inspector keeps the evidence and its captured basis.
-    await page.locator(`#sequence-diagram .pele-edge-label[data-trellis-call-id="${fixture.calleeCalls[0]}"]`).click();
+    await innerLabel.first().click();
     await page.waitForFunction(() => /basis semantic\.synthetic/.test(document.querySelector("#inspector-evidence")?.textContent || ""));
     assert.match(await page.locator("#inspector-evidence").textContent(), /^Resolved declaration · direct · fresh · /);
     assert.match(await page.locator("#inspector-detail").textContent(), /"semanticBasis"/);
-    await toggle.click();
-    await page.waitForFunction(() => document.querySelector("#sequence-incidental")?.textContent === "Show calls" && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
-    for (const id of [fixture.calls[0], fixture.calleeCalls[1]]) assert.ok(await page.locator(`#sequence-diagram [data-trellis-call-id="${id}"]`).count() > 0, id);
-    assert.match(await page.locator("#sequence-state").textContent(), / · 0 incidental steps hidden/);
     // The SVG fallback draws the same lanes: the arrow to `inner` starts on the callee lane.
     const arrow = await page.evaluate(([view, id]) => {
       const box = document.createElement("div"); document.body.append(box);

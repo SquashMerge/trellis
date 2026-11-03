@@ -283,9 +283,50 @@ and #542's "any other guard is unchanged".
   excess hints share the unknown-operations lane and stay measured calls, so a view with
   many hints is neither truncated nor loses its arrows once enrichment resolves them.
 
+### Interactions view (#636)
+
+Owner issue #636 (2026-11-02), with the owner review on #638 (2026-11-02: the view shows only
+interactions between entities). It amends the #594 calls-first default above for the Sequence
+view of an enriched view only. It is presentation: no DTO field, evidence, bound or contract
+meaning changes, and the server response is the same.
+
+- **When.** The Sequence panel opens an enriched view (`semantic.tier=semantic`) that shows
+  at least one measured call in Interactions. A syntax-only view has no columns, and a view
+  with no shown call has nothing to place, so both keep calls-first with its context markers
+  and empty states; so does the Files preview. Options → Show all steps, and its shortcut,
+  draw exactly what they drew before.
+- **Arrows.** An arrow is a measured call with a verified exact target whose column differs
+  from the column the call runs in (its `lane`'s column, or the seed's). Arrows keep source
+  order and their #558 labels and row numbers; only arrows are numbered rows. A cross-column
+  call's expanded body is drawn under it, so a nested chain (`Inbox → FrameWindow`) leaves its
+  callee's column. A cross-column call in a nested callable's (closure's) body is an arrow from
+  the column that encloses it, like any other.
+- **Returns and activations.** After a cross-column call's body, a dashed, unlabeled return
+  goes back to the caller's column, and an activation bar spans the callee column from the
+  call to the return. They mark only that the following steps are the caller's again, as the
+  DTO's order already says: not an observed return, value, timing or runtime activation.
+- **Loops.** A loop that encloses an arrow is drawn as a UML loop frame around its arrows,
+  tagged "loop", with the guard "[may exit early]" only when its frame draws an exit (calls-first's
+  mark: a `return`, `throw` or `exit` in it) or a step in it carries a folded `?` or guard
+  (#542, #558). The frame is not a row and takes no row number. Nested loops nest frames.
+- **Everything else draws nothing.** Internal steps (branches, effects, boundaries, loops
+  without an arrow), same-column calls, nested callables and calls without an exact target
+  draw no row, badge or note. A branch, try, chain or same-column call that encloses an arrow
+  draws no frame; its arrows draw in its place. The status line gives one count, "Interactions
+  · N internal steps hidden": the shown DTO steps that draw nothing. Show all steps draws them.
+- **Inspector.** Selecting an arrow shows the same step and evidence as the step view.
+- **Empty.** An enriched view whose shown calls draw no arrow draws no diagram and says why,
+  with "Show all steps": "All calls stay within <seed column>." when every shown call has an
+  exact target; "All resolved calls stay within <seed column>; N calls have no exact
+  target." when some do not; "None of the N calls has an exact target, so no arrow is drawn
+  between columns." (or "The one call has no exact target, …") when none does.
+- **Renderers.** Both renderers draw the same arrows, returns, activations and loop frames.
+  Pele validates the returns, activation count and frames it draws, as it validates rows.
+
 The browser draws an expanded step's arrows and notes from its `lane`, shows the tier and
-reason in the sequence status line, and offers a "Show all steps" / "Show calls" shortcut
-(the same `showAll` setting as Options → Show all steps, not a separate incidental toggle).
+reason in the sequence status line, and offers a "Show all steps" / "Show interactions"
+(or "Show calls" for a syntax-only view) shortcut (the same `showAll` setting as Options →
+Show all steps, not a separate incidental toggle).
 
 Typed integrity, busy and pin failures abort the entire response, never returning a
 partially enriched view. Lanes/arrows prove static declaration targets only: no runtime

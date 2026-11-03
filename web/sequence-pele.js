@@ -29,8 +29,11 @@
     const columnOf = participant => window.TrellisSequence.column(participant);
     const seed = view.participants.find(p => p.id === view.seed.id);
     const lanes = [{alias:"S", id:columnOf(seed).id ?? view.seed.id, label:seed?.column ? columnOf(seed).label : view.seed.name || view.seed.id, targets:new Map([[view.seed.id, {participant:seed, proof:null}]])}];
-    const lines = ["sequenceDiagram", `Note over S: ${intro}`];
-    let separators = 1;
+    // Each statement's meta, if any, receives its Pele statement ID: a row or a return.
+    const lines = ["sequenceDiagram", `Note over S: ${intro}`], metas = [null, null];
+    const emit = (line, meta = null) => { lines.push(line); metas.push(meta); };
+    const messageOrder = [];
+    let separators = 1, activations = 0;
     const targetFor = step => window.TrellisSequence?.target(view, step);
     const laneFor = (target, proof) => {
       const column = columnOf(target);
@@ -77,13 +80,26 @@
       const display = message && !options.showDetails
         ? window.TrellisSequence.arrowLabel(ordinal, target, preview ? step.children.length - 1 : 0, early)
         : `${marker} ${options.showDetails ? `${step.kind} ` : ""}${displayLabel}${early}`;
-      // An expanded callee body runs on the callee's lane, opened by the call before it (#522).
+      const owner = ownerOf(step);
+      const row = {ordinal, marker, display, step, id:step.id, callId:step.callId, path:step.path, range:step.range, revision:view.revision, previewEntryCallId:preview?.callId, preview, evidence, target, type, owner, lane};
+      emit(message ? `${owner.alias}->>${lane.alias}: ${encode(display)}` : `Note right of ${owner.alias}: ${encode(display)}`, row);
+      rows.push(row); if (message) messageOrder.push(row); else noteOrder.push(row);
+      return row;
+    };
+    // An expanded callee body runs on the callee's lane, opened by the call before it (#522).
+    function ownerOf(step) {
       const ownerId = step.lane == null ? null : columnOf(view.participants.find(p => p.id === step.lane)).id;
       const owner = step.lane == null ? lanes[0] : lanes.find(item => item.id === ownerId);
       if (!owner) unsupported("Unknown sequence lane");
-      lines.push(message ? `${owner.alias}->>${lane.alias}: ${encode(display)}` : `Note right of ${owner.alias}: ${encode(display)}`);
-      const row = {ordinal, marker, display, step, id:step.id, callId:step.callId, path:step.path, range:step.range, revision:view.revision, previewEntryCallId:preview?.callId, preview, evidence, target, type};
-      rows.push(row); if (!message) noteOrder.push(row);
+      return owner;
+    }
+    // Interactions (#636): a return closes the activation its cross-column call opened. It is
+    // not a row: it takes no row number.
+    const addReturn = row => {
+      const entry = {returnOf:row};
+      emit(`${row.lane.alias}-->>${row.owner.alias}: `, entry);
+      emit(`deactivate ${row.lane.alias}`);
+      messageOrder.push(entry);
     };
     const visit = (steps, depth) => {
       if (!Array.isArray(steps) || depth > 24) unsupported("Unsupported sequence depth");
@@ -92,7 +108,10 @@
             !Array.isArray(step.children) || !Array.isArray(step.alternate) || typeof step.hidden !== "boolean" || !witness(step)) unsupported("Unsupported sequence step");
         if (seen.has(step.id)) unsupported("Duplicate sequence identity");
         seen.add(step.id);
-        if (!displayProjection.visible.has(step)) continue;
+        if (!displayProjection.visible.has(step)) {
+          if (displayProjection.through?.has(step)) { visit(step.children, depth + 1); visit(step.alternate, depth + 1); }
+          continue;
+        }
         const children = step.children, alternate = step.alternate;
         const collapsed = step.kind === "group" && !expanded.has(step.id);
         const preview = collapsed && !alternate.length && children.length && children.every(child => child.kind === "call" && !child.hidden && !child.children?.length && !child.alternate?.length && witness(child) && child.path === step.path) ? children[0] : null;
@@ -104,25 +123,32 @@
         let frame = null;
         if (step.kind === "branch") frame = alternate.length ? "alt" : "opt";
         else if (step.kind === "loop") frame = "loop";
-        else if (step.kind === "try" || (step.kind !== "group" && (children.length || alternate.length))) frame = "rect";
-        const heading = options.showDetails ? step.label : shortened(window.TrellisSequence.compactLabel(step));
-        const header = frame && frame !== "rect" ? {kind:frame, header:`[${heading}]`, alternate:frame === "alt" ? "[alternate path]" : null} : null;
+        // A cross-column call's body is its activation (#636), not a frame.
+        else if (step.kind === "try" || (step.kind !== "group" && (children.length || alternate.length) && !displayProjection.returns?.has(step))) frame = "rect";
+        // Interactions (#636): a loop around arrows is a frame only, labelled, with no row.
+        const loopFrame = !!displayProjection.loops?.has(step);
+        const heading = loopFrame ? displayProjection.loopLabel(step) : options.showDetails ? step.label : shortened(window.TrellisSequence.compactLabel(step));
+        // An unqualified Interactions loop has a tag and no guard: Pele then draws no label.
+        const header = frame && frame !== "rect" ? {kind:frame, header:heading ? `[${heading}]` : null, alternate:frame === "alt" ? "[alternate path]" : null} : null;
         if (frame) {
-          lines.push(frame === "rect" ? "rect" : `${frame} ${encode(heading)}`);
+          emit(frame === "rect" ? "rect" : heading ? `${frame} ${encode(heading)}` : frame);
           frames.push(frame);
           if (header) frameHeaders.push(header);
         }
-        add(step, preview);
+        const row = loopFrame ? null : add(step, preview);
+        const returns = displayProjection.returns?.has(step) && row?.type === "message";
+        if (returns) { emit(`activate ${row.lane.alias}`); activations++; }
         if (!collapsed) {
           visit(children, depth + 1);
           if (alternate.length) {
-            if (frame === "alt") lines.push("else alternate path");
-            else { lines.push("Note over S: handlers / cleanup (see guards)"); separators++; noteOrder.push(null); }
+            if (frame === "alt") emit("else alternate path");
+            else if (!loopFrame) { emit("Note over S: handlers / cleanup (see guards)"); separators++; noteOrder.push(null); }
             visit(alternate, depth + 1);
           }
         }
+        if (returns) addReturn(row);
         if (frame) {
-          lines.push("end");
+          emit("end");
           // Pele appends completed frames to SVG after their nested frames.
           // Identity remains in the numbered header note, never frame geometry.
           if (header) { closeFrames.push(frame); closeHeaders.push(header); }
@@ -143,22 +169,21 @@
       if (Array.isArray(step?.alternate)) pending.push(...step.alternate);
     }
     visit(view.steps, 0);
-    lines.splice(1, 0, ...lanes.map(lane => `participant ${lane.alias} as ${encode(lane.label)}`));
-    const source = lines.join("\n") + "\n";
+    const participants = lanes.map(lane => `participant ${lane.alias} as ${encode(lane.label)}`);
+    const source = [lines[0], ...participants, ...lines.slice(1)].join("\n") + "\n";
     if (new TextEncoder().encode(source).length > 512 * 1024) unsupported("Mermaid source too large");
-    // Participants do not consume Pele statement IDs. Every note, message,
+    // Participants do not consume Pele statement IDs. Every note, message, activation,
     // operator, separator and end does, including statements without a row.
-    let statement = 0, rowIndex = 0;
+    let statement = 0;
     const noteIds = [], messageIds = [];
-    for (const line of lines) {
-      if (line === "sequenceDiagram" || line.startsWith("participant ")) continue;
+    for (const [i, line] of lines.entries()) {
+      if (i === 0) continue;
       const id = `i${statement++}`;
-      const message = /^(?:S|P[0-9]+)->>/.test(line), row = message || /^Note right of (?:S|P[0-9]+):/.test(line);
+      if (metas[i]) metas[i].statementId = id;
       if (line.startsWith("Note ")) noteIds.push(id);
-      if (message) messageIds.push(id);
-      if (row) rows[rowIndex++].statementId = id;
+      if (/^(?:S|P[0-9]+)--?>>/.test(line)) messageIds.push(id);
     }
-    return {source, rows, lanes, intro, frames, frameHeaders, closeFrames, closeHeaders, noteIds, messageIds, separators, noteOrder};
+    return {source, rows, lanes, intro, frames, frameHeaders, closeFrames, closeHeaders, noteIds, messageIds, separators, noteOrder, messageOrder, activations};
   }
 
   function validatedSvg(raw, projection) {
@@ -193,12 +218,17 @@
       if (note.textContent !== expected) unsupported("Changed Pele note text");
     }
     const messages = [...root.querySelectorAll(".pele-message")], messageLabels = [...root.querySelectorAll(".pele-edge-label")];
+    // A return (#636) is an unlabeled message: it draws an arrow and no label.
     const messageRows = projection.rows.filter(row => row.type === "message");
-    if (messages.length !== messageRows.length || messageLabels.length !== messageRows.length) unsupported("Missing Pele message");
-    for (const [i, row] of messageRows.entries()) {
-      if (messages[i].getAttribute("data-id") !== row.statementId || messageLabels[i].getAttribute("data-id") !== row.statementId ||
-          messageLabels[i].textContent !== row.display) unsupported("Changed Pele message identity or text");
+    if (messages.length !== projection.messageOrder.length || messageLabels.length !== messageRows.length) unsupported("Missing Pele message");
+    for (const [i, entry] of projection.messageOrder.entries()) {
+      if (messages[i].getAttribute("data-id") !== entry.statementId) unsupported("Changed Pele message identity or text");
     }
+    for (const [i, row] of messageRows.entries()) {
+      if (messageLabels[i].getAttribute("data-id") !== row.statementId || messageLabels[i].textContent !== row.display) unsupported("Changed Pele message identity or text");
+    }
+    const activations = [...root.querySelectorAll(".pele-activation")];
+    if (activations.length !== projection.activations) unsupported("Changed Pele activations");
     const actors = [...root.querySelectorAll(".pele-actor")], lifelines = [...root.querySelectorAll(".pele-lifeline")];
     if (actors.length !== projection.lanes.length * 2 || lifelines.length !== projection.lanes.length) unsupported("Changed Pele participants");
     for (const lane of projection.lanes) {
@@ -213,7 +243,7 @@
       if (frame.hasAttribute("data-id") || frame.querySelector("[data-id]")) unsupported("Unexpected Pele frame identity");
       if (frame.querySelector(".pele-frame-kind")?.textContent !== expected.kind) unsupported("Changed Pele frame kind");
       const labels = [...frame.querySelectorAll(".pele-frame-label")].map(n => n.textContent.replace(/\s+/g, ""));
-      const wanted = (expected.alternate ? [expected.alternate, expected.header] : [expected.header]).map(n => n.replace(/\s+/g, ""));
+      const wanted = [expected.alternate, expected.header].filter(Boolean).map(n => n.replace(/\s+/g, ""));
       if (labels.join("|") !== wanted.join("|")) unsupported("Changed Pele frame header");
     }
     // The alt frame has no native ID; its original header is the numbered note.
@@ -317,6 +347,13 @@
           foreign.append(toggle); note.append(foreign);
           controls.set(row.id, toggle);
         }
+      }
+      // Interactions (#636): a return names its call.
+      for (const entry of projection.messageOrder) {
+        if (!entry.returnOf) continue;
+        const arrow = messages.find(node => node.getAttribute("data-id") === entry.statementId);
+        arrow.setAttribute("data-trellis-return-step-id", entry.returnOf.id);
+        arrow.setAttribute("data-trellis-target-id", entry.returnOf.target.id);
       }
       if (!current()) return {status:"stale"};
       if (controls.size) {
