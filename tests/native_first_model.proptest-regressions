@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7e38e8329e8e1a86dfce88d1ccc4b74a656f7e00a7c65eabdf545a681f76e5e6 # shrinks to kinds = [(0, 3, false)], changed = 1, claims = 6
+cc ed74b54a9e65eb24eb3662a215f224c6bf04661b454e31b026e643e88c6bfa3d # shrinks to ops = [Set((1, 0), Record { outcome: Empty, freshness: Fresh, edges: [Edge { kind: Consumes, target: (0, 0), mapped: false, context: None, external: true }] }), Delete(0), Publish, Import(true)]
+cc c15b74d08eeb1b2455b9c7498ef488aa1265322aef589dff501674546dd83211 # shrinks to ops = [Import(false)]
