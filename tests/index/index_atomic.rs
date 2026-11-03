@@ -2,6 +2,10 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path, sync::mpsc};
 use tempfile::TempDir;
 use trellis::store::Store;
 
+#[cfg(feature = "test-support")]
+#[path = "proptest_native_incremental.rs"]
+mod proptest_native_incremental;
+
 fn fixture() -> (TempDir, TempDir) {
     let state = tempfile::tempdir().unwrap();
     fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700)).unwrap();
