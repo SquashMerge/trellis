@@ -16,6 +16,70 @@ pub(crate) const DEPTH: usize = 128;
 /// Syntax nodes one walk visits.
 pub(crate) const VISITS: usize = 1_000_000;
 
+// A projection owns this test context; workers enter it only for the duration of
+// that request's jobs. Other requests and ordinary builds retain the fixed bound.
+#[cfg(feature = "test-support")]
+pub(crate) mod visit_test {
+    use std::{
+        cell::RefCell,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Observation {
+        pub kind: &'static str,
+        pub start: usize,
+        pub end: usize,
+        pub visits: usize,
+    }
+    #[derive(Debug)]
+    pub struct Context {
+        pub limit: usize,
+        pub observations: Mutex<Vec<Observation>>,
+    }
+    thread_local! {
+        static CURRENT: RefCell<Option<Arc<Context>>> = const { RefCell::new(None) };
+    }
+    pub struct Guard(Option<Arc<Context>>);
+    pub fn enter(context: Option<Arc<Context>>) -> Guard {
+        Guard(CURRENT.with(|current| current.replace(context)))
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CURRENT.with(|current| {
+                current.replace(self.0.take());
+            });
+        }
+    }
+    pub fn limit() -> usize {
+        CURRENT.with(|current| current.borrow().as_ref().map_or(super::VISITS, |c| c.limit))
+    }
+    pub fn record(kind: &'static str, root: tree_sitter::Node<'_>, visits: usize) {
+        CURRENT.with(|current| {
+            if let Some(context) = current.borrow().as_ref() {
+                context.observations.lock().unwrap().push(Observation {
+                    kind,
+                    start: root.start_byte(),
+                    end: root.end_byte(),
+                    visits,
+                });
+            }
+        });
+    }
+}
+
+#[inline]
+pub(crate) fn visit_limit() -> usize {
+    #[cfg(feature = "test-support")]
+    {
+        visit_test::limit()
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        VISITS
+    }
+}
+
 /// What one document's syntax lost.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SyntaxGap {
@@ -110,7 +174,9 @@ pub(crate) fn scan(
             continue;
         }
         visits += 1;
-        if visits > VISITS {
+        if visits > visit_limit() {
+            #[cfg(feature = "test-support")]
+            visit_test::record("scan", root, visits);
             return Ok(Some(SyntaxGap {
                 reason: "visit_limit",
                 range: first.unwrap_or_else(|| range(node)),
@@ -121,6 +187,8 @@ pub(crate) fn scan(
         let children: Vec<_> = node.children(&mut cursor).collect();
         stack.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
     }
+    #[cfg(feature = "test-support")]
+    visit_test::record("scan", root, visits);
     Ok(first.map(|range| SyntaxGap {
         reason: "depth_limit",
         range,
@@ -137,7 +205,7 @@ fn syntax_errors(root: Node<'_>, check: &mut impl FnMut() -> Result<()>) -> Resu
     while let Some(node) = stack.pop() {
         check()?;
         visits += 1;
-        if visits > VISITS {
+        if visits > visit_limit() {
             break;
         }
         if node.is_error() || node.is_missing() {

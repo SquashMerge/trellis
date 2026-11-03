@@ -1166,7 +1166,7 @@ fn pattern_names(
     while let Some((node, depth)) = pending.pop() {
         check()?;
         visits += 1;
-        if visits > VISITS || depth > DEPTH {
+        if visits > syntax_bounds::visit_limit() || depth > DEPTH {
             continue;
         }
         if matches!(
@@ -1201,6 +1201,8 @@ fn pattern_names(
             }
         }
     }
+    #[cfg(feature = "test-support")]
+    syntax_bounds::visit_test::record("javascript_pattern", pattern, visits);
     Ok(names)
 }
 

@@ -7,6 +7,10 @@ use trellis::{
     references::{self, DocumentInput, Projection, Snapshot},
 };
 
+#[cfg(feature = "test-support")]
+#[path = "visit_budget_properties.rs"]
+mod visit_budget_properties;
+
 fn snapshot(files: &[(&str, &str)]) -> Snapshot {
     let files: Vec<_> = files
         .iter()

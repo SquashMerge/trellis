@@ -1323,7 +1323,7 @@ fn scan(
     while let Some((node, module_scope, conditional, decorated, depth)) = pending.pop() {
         check()?;
         visits += 1;
-        if visits > VISITS || depth > DEPTH {
+        if visits > syntax_bounds::visit_limit() || depth > DEPTH {
             continue;
         }
         let kind = node.kind();

@@ -1,7 +1,7 @@
 //! View-time, source-witnessed module references. Structural mappings are not bindings.
 use crate::model::{IndexPin, SourceFile};
 use crate::native_evidence::{Call, Declaration, DeclarationRole, DocumentKey};
-use crate::syntax_bounds::{self, DEPTH, VISITS};
+use crate::syntax_bounds::{self, DEPTH};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -237,6 +237,40 @@ pub fn project_with_workers(
     project_configured(snapshot, paths, sample_limit, workers, check)
         .map(|(projection, _)| projection)
 }
+
+/// Request-scoped syntax-walk instrumentation for reference property tests.
+#[cfg(feature = "test-support")]
+pub fn project_with_visit_budget(
+    snapshot: &Snapshot,
+    paths: &[String],
+    sample_limit: usize,
+    workers: usize,
+    limit: usize,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<(Projection, Vec<VisitObservation>)> {
+    use std::sync::{Arc, Mutex};
+    let visits = Arc::new(syntax_bounds::visit_test::Context {
+        limit,
+        observations: Mutex::new(Vec::new()),
+    });
+    let mut request = parallel_check::RequestCheck::new(check);
+    request.visits = Some(Arc::clone(&visits));
+    let _guard = request.enter_visits();
+    let result = resolve(
+        snapshot,
+        paths,
+        sample_limit,
+        workers.clamp(1, crate::parallel::MAX_WORKERS),
+        &request,
+    )
+    .and_then(|base| base.select_inner(paths, sample_limit, &mut request.worker()));
+    let projection = request.result(result)?;
+    let observations = visits.observations.lock().unwrap().clone();
+    Ok((projection, observations))
+}
+
+#[cfg(feature = "test-support")]
+pub use crate::syntax_bounds::visit_test::Observation as VisitObservation;
 
 #[cfg(feature = "test-support")]
 static TEST_SITE_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(SITES);
@@ -1035,8 +1069,11 @@ fn map_batch<T: Sync, R: Send>(
     prepare: impl Fn(&T) -> Result<R> + Sync,
 ) -> Result<Vec<R>> {
     request.check()?;
-    let results =
-        crate::parallel::map_ordered(items, workers, &request.stopped, |_, item| prepare(item));
+    let results = crate::parallel::map_ordered(items, workers, &request.stopped, |_, item| {
+        #[cfg(feature = "test-support")]
+        let _guard = request.enter_visits();
+        prepare(item)
+    });
     results
         .into_iter()
         .map(|slot| slot.context("reference request stopped")?)
@@ -1071,6 +1108,8 @@ fn map_all_hooked<T: Sync, R: Send>(
     // slot always follows an actual error in input order.
     let first_failure = AtomicUsize::new(usize::MAX);
     let results = crate::parallel::map_ordered(items, workers, &request.stopped, |index, item| {
+        #[cfg(feature = "test-support")]
+        let _guard = request.enter_visits();
         entered(index);
         if index > first_failure.load(Ordering::Acquire) {
             return None;
@@ -1132,7 +1171,7 @@ pub(crate) fn walk<'a, C: FnMut() -> Result<()>>(
     while let Some((node, depth)) = stack.pop() {
         check()?;
         visits += 1;
-        if visits > VISITS {
+        if visits > syntax_bounds::visit_limit() {
             break;
         }
         if depth > DEPTH || node.is_error() {
@@ -1146,6 +1185,8 @@ pub(crate) fn walk<'a, C: FnMut() -> Result<()>>(
             }
         }
     }
+    #[cfg(feature = "test-support")]
+    syntax_bounds::visit_test::record("walk", root, visits);
     Ok(())
 }
 fn text<'a>(doc: &'a DocumentInput, node: Node<'_>) -> &'a str {
