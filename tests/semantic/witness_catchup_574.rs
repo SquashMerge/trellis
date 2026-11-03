@@ -127,8 +127,17 @@ fn assert_selected(world: &World, captured: IndexPin, descriptor: &(PathBuf, Str
 // Work counters are diagnostics for this scenario, not a promise about which
 // backend a later implementation uses or whether it exposes this test hook.
 fn below_head_edit(world: &World, text: &str, counts: &Path) -> Option<Value> {
+    edit_with_optional_counts(world, "src/C.js", text, counts)
+}
+
+fn edit_with_optional_counts(
+    world: &World,
+    path: &str,
+    text: &str,
+    counts: &Path,
+) -> Option<Value> {
     let _ = fs::remove_file(counts);
-    write_files(&world.root, &[("src/C.js", text)]);
+    write_files(&world.root, &[(path, text)]);
     let options = IndexOptions::new(world.root.clone());
     let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
     let leader = world.store.publication_for_tests().unwrap();
@@ -297,6 +306,213 @@ fn child_captured_below_head_then_two_edits() {
         }
     }
     assert_ne!(world.store.index_baseline().unwrap(), imported);
+}
+
+const RUST_MANIFEST: &str = "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n";
+const RUST_MANIFEST_MOVED: &str =
+    "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[lib]\npath = \"src/alt.rs\"\n";
+const RUST_LIB: &str = "mod b;\nfn run() { b::target(); }\n";
+const RUST_B: &str = "pub fn target() {}\n";
+const RUST_TARGET: &str = "rust-analyzer cargo fixture 0.1.0 b/target().";
+
+fn owners_at(world: &World, pin: IndexPin) -> trellis::scip_raw::CargoTargets {
+    let (_, config, _) = world.store.retained_native_components_at(pin).unwrap();
+    let (_, sources) = world.store.retained_native_snapshot_at(pin).unwrap();
+    let mut builder = trellis::scip_raw::CargoTargetsBuilder::from_native_config(&config);
+    assert!(!builder.is_empty(), "Cargo.toml must be captured");
+    for (document, bytes) in sources {
+        if document.language == "rust" {
+            builder.add_document(&document.path, &bytes);
+        }
+    }
+    builder.finish()
+}
+
+fn assert_rust_selection(world: &World, captured: IndexPin, descriptor: &(PathBuf, String)) {
+    let head = world.store.index_baseline().unwrap();
+    let selected = world.store.selected_raw_inputs_at(head).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].captured_pin, captured);
+    let (native, _) = world.store.retained_native_snapshot_at(head).unwrap();
+    assert!(
+        native
+            .declarations
+            .iter()
+            .any(|d| d.document.path == "src/b.rs" && d.name.as_deref() == Some("target"))
+    );
+    assert!(
+        native
+            .references
+            .iter()
+            .any(|r| r.document.path == "src/lib.rs" && r.spelling == "target")
+    );
+    assert!(native.calls.iter().any(|c| c.document.path == "src/lib.rs"
+        && c.spelling.as_deref().is_some_and(|s| s.contains("target"))));
+    let snapshot = world.store.semantic_at(head).unwrap();
+    let scopes: Vec<_> = snapshot
+        .symbols
+        .iter()
+        .filter(|s| s.key.symbol == RUST_TARGET)
+        .map(|s| {
+            (
+                format!("{:?}", s.key.scope),
+                s.key.document.as_ref().map(|d| d.path.clone()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        scopes,
+        [("Target".to_string(), Some("src/lib.rs".to_string()))]
+    );
+    assert!(
+        snapshot
+            .coverage
+            .iter()
+            .any(|c| c.document_path == "src/lib.rs"
+                && c.selected
+                && c.state == CoverageState::Complete)
+    );
+    assert!(
+        snapshot
+            .coverage
+            .iter()
+            .any(|c| c.document_path == "src/b.rs"
+                && c.selected
+                && c.state == CoverageState::Complete)
+    );
+    assert!(snapshot.call_bindings.iter().any(|call| call.join.anchor.document.path == "src/lib.rs" && matches!(&call.declared_target, Some(Target::Internal { revision_id, document, .. }) if revision_id == &native.revision.id && document.path == "src/b.rs")));
+    assert!(snapshot.references.iter().any(|r| r.document.path == "src/lib.rs" && r.spelling == "target" && r.resolution == Resolution::Resolved && matches!(&r.declared_target, Some(Target::Internal { document, .. }) if document.path == "src/b.rs")));
+    assert!(!snapshot.provenance.is_empty());
+    let expected = world.memory_publication(descriptor, DestinationMutations::default());
+    assert_eq!(
+        canonical(&snapshot.producers),
+        canonical(&expected.producers)
+    );
+    assert_published_matches_staged(&snapshot, &expected);
+}
+
+#[test]
+fn rust_cargo_owner_change_below_head_and_two_edits() {
+    isolated(
+        "semantic_batch_store::witness_catchup_574::child_rust_cargo_owner_change_below_head_and_two_edits",
+        None,
+    );
+}
+
+#[test]
+#[ignore = "isolated child; invoked by rust_cargo_owner_change_below_head_and_two_edits"]
+fn child_rust_cargo_owner_change_below_head_and_two_edits() {
+    let counts = counts_file();
+    let world = world_with(
+        |root| {
+            write_files(
+                root,
+                &[
+                    ("Cargo.toml", RUST_MANIFEST),
+                    ("src/lib.rs", RUST_LIB),
+                    ("src/b.rs", RUST_B),
+                    ("src/alt.rs", "mod b;\n"),
+                    ("src/c.rs", "fn extra() {}\n"),
+                ],
+            )
+        },
+        true,
+    );
+    let captured = world.store.index_baseline().unwrap();
+    let captured_owners = owners_at(&world, captured);
+    for path in ["src/lib.rs", "src/b.rs"] {
+        let owner = captured_owners.target_of(path).expect("captured lib owner");
+        assert_eq!(
+            (
+                owner.kind.as_str(),
+                owner.root.as_str(),
+                owner.package.as_str(),
+                owner.version.as_deref()
+            ),
+            ("lib", "src/lib.rs", "fixture", Some("0.1.0"))
+        );
+    }
+    assert!(captured_owners.target_of("src/alt.rs").is_none());
+    let run = "rust-analyzer cargo fixture 0.1.0 run().";
+    let lib = occ_at(
+        DocSpec::new("src/lib.rs"),
+        RUST_LIB,
+        ("run", 0),
+        None,
+        run,
+        1,
+    );
+    let lib = occ_at(lib, RUST_LIB, ("target", 0), Some(8), RUST_TARGET, 0).symbol(run, 17, &[]);
+    let b = occ_at(
+        DocSpec::new("src/b.rs"),
+        RUST_B,
+        ("target", 0),
+        None,
+        RUST_TARGET,
+        1,
+    )
+    .symbol(RUST_TARGET, 17, &[]);
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![DocSpec::new("src/alt.rs"), b, DocSpec::new("src/c.rs"), lib],
+    );
+    let descriptor = world.write(&fixture);
+    let _ = edit_with_optional_counts(&world, "src/c.rs", "fn extra() { let _ = 0; }\n", &counts);
+    let advanced = world.store.index_baseline().unwrap();
+    assert_ne!(advanced, captured);
+    let (imported, _, joined) = world.publish(&descriptor).unwrap();
+    assert_eq!(joined.captured_pin(), captured);
+    assert_eq!(joined.destination_pin(), advanced);
+    assert_rust_selection(&world, captured, &descriptor);
+
+    write_files(&world.root, &[("Cargo.toml", RUST_MANIFEST_MOVED)]);
+    let phases = std::sync::Mutex::new(Vec::new());
+    let (full, session) = trellis::index_coordinator::reconcile_workspace(
+        &world.store,
+        &IndexOptions::new(world.root.clone()),
+        &world.cancel,
+        |p| phases.lock().unwrap().push(p.phase),
+    )
+    .unwrap();
+    drop(session);
+    assert_ne!(full, imported);
+    assert!(phases.lock().unwrap().iter().any(|p| p == "mode:full"));
+    let destination_owners = owners_at(&world, full);
+    assert!(destination_owners.target_of("src/lib.rs").is_none());
+    for path in ["src/alt.rs", "src/b.rs"] {
+        let owner = destination_owners
+            .target_of(path)
+            .expect("destination lib owner");
+        assert_eq!(
+            (
+                owner.kind.as_str(),
+                owner.root.as_str(),
+                owner.package.as_str()
+            ),
+            ("lib", "src/alt.rs", "fixture")
+        );
+    }
+    assert_rust_selection(&world, captured, &descriptor);
+    for text in ["fn extra() { let _ = 1; }\n", "fn extra() { let _ = 2; }\n"] {
+        let old = world.store.index_baseline().unwrap();
+        let previous = world.store.semantic_at(old).unwrap();
+        let work = edit_with_optional_counts(&world, "src/c.rs", text, &counts);
+        if let Some(work) = work {
+            eprintln!(
+                "Rust below-head edit: fullFallbacks={}, witnessedRejoins={}, reasons={}, rawDecodes={}",
+                work["fullFallbacks"],
+                work["witnessedRejoins"],
+                work["fallbackReasons"],
+                work["originalRawDecodes"]
+            );
+        } else {
+            eprintln!("Rust below-head edit: publication counters unavailable");
+        }
+        assert_ne!(world.store.index_baseline().unwrap(), old);
+        assert_eq!(world.store.semantic_at(old).unwrap(), previous);
+        assert_rust_selection(&world, captured, &descriptor);
+    }
 }
 
 #[test]
