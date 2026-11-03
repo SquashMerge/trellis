@@ -50,6 +50,10 @@ impl World {
     }
 
     fn for_language(language: &'static str, name: &str, hook: Option<&Path>) -> Self {
+        Self::for_workspace(language, name, hook, false)
+    }
+
+    fn for_workspace(language: &'static str, name: &str, hook: Option<&Path>, git: bool) -> Self {
         let stub = tempfile::tempdir().unwrap();
         let marker = stub.path().join("invocations");
         let mut env = support::stub_env(stub.path(), &json!({"marker":marker}));
@@ -62,6 +66,14 @@ impl World {
         }
         let checkout = start_checkout(
             |root| {
+                if git {
+                    let output = std::process::Command::new("git")
+                        .args(["init", "--quiet"])
+                        .arg(root)
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "git init failed: {output:?}");
+                }
                 uniform_workspace(root, &[language], 1);
                 let (path, source) = if language == "rust" {
                     ("rust/u00000.rs", "fn u00000() { g(); }\nfn g() {}\n")
@@ -615,7 +627,9 @@ fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, 
 fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
     use std::io::Write;
 
-    let world = World::new();
+    let world = World::for_workspace("javascript", "git-status", None, true);
+    let workspace_marker = world.checkout.root.join(".git/trellis/workspace-id");
+    let original_marker = fs::read(&workspace_marker).unwrap();
     let (_, original, options) = world.run_once();
     let descriptor: Value = serde_json::from_slice(&original).unwrap();
     let run_dir = Path::new(options["descriptor"].as_str().unwrap())
@@ -681,8 +695,13 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
         trellis::native_ids::digest(b"", &fs::read(env!("CARGO_BIN_EXE_trellis")).unwrap())
     );
     let socket = world._stub.path().join("after-startup.sock");
+    let claim_socket = world._stub.path().join("after-claim.sock");
     let index = rebuilt_cli()
         .env("TRELLIS_TEST_RETAINED_AFTER_STARTUP_SOCKET", &socket)
+        .env(
+            "TRELLIS_TEST_SEMANTIC_CRASH_AFTER_CLAIM_SOCKET",
+            &claim_socket,
+        )
         .args(["index", "--workspace"])
         .arg(&world.checkout.root)
         .args(["--max-file-bytes", "1048576"])
@@ -695,6 +714,24 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
     });
     let startup_native = native_identity();
     assert_ne!(startup_native, old_native);
+    let pending = reply(
+        "Git checkout status before retained admission",
+        rebuilt_cli()
+            .args(["status", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        pending["workspaceRoot"],
+        world.checkout.root.to_str().unwrap()
+    );
+    assert_eq!(
+        pending["revision"]["indexGeneration"],
+        old["indexGeneration"]
+    );
+    assert_eq!(pending["catchingUp"], true);
+    assert_eq!(fs::read(&workspace_marker).unwrap(), original_marker);
     trellis::testing::wait_until(
         "post-start index accepted ahead of retained recovery",
         || {
@@ -718,6 +755,27 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
         startup_native,
         "own post-start native capture must supersede startup before retained import"
     );
+    trellis::testing::wait_until("retained import claimed", || claim_socket.exists());
+    let claimed = reply(
+        "Git checkout status during retained admission",
+        rebuilt_cli()
+            .args(["status", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        claimed["workspaceRoot"],
+        world.checkout.root.to_str().unwrap()
+    );
+    assert_eq!(
+        claimed["revision"]["indexGeneration"],
+        old["indexGeneration"]
+    );
+    assert_eq!(claimed["catchingUp"], true);
+    assert_eq!(fs::read(&workspace_marker).unwrap(), original_marker);
+    fs::write(claim_socket.with_extension("done"), []).unwrap();
+    std::os::unix::net::UnixStream::connect(&claim_socket).unwrap();
     trellis::testing::wait_until(
         "new native capture identity readmits retained input",
         || {
@@ -754,6 +812,11 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
         "retained recovery failed after own post-start capture: {rows:?}"
     );
     assert_eq!(js["reimport"], Value::Null);
+    assert_eq!(
+        status["workspaceRoot"],
+        world.checkout.root.to_str().unwrap()
+    );
+    assert_eq!(fs::read(&workspace_marker).unwrap(), original_marker);
     world.assert_recovered_basis(&status, &descriptor);
     assert_eq!(
         fs::read(options["descriptor"].as_str().unwrap()).unwrap(),
