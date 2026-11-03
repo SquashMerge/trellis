@@ -219,6 +219,49 @@ impl AdmittedBatch {
         self.captured
     }
 
+    /// Compare the fully admitted original source pages with a retained-recovery destination.
+    /// The descriptor, captured pin and captured native context remain unchanged.
+    pub(crate) fn validate_reimport_destination(
+        &mut self,
+        store: &crate::store::Store,
+        destination: IndexPin,
+        cancel: &crate::model::CancelFlag,
+    ) -> Result<String> {
+        store.with_native_reader(destination, |reader| {
+            let header = reader.header()?;
+            let mismatch = || anyhow::anyhow!("stale_basis: retained source pages no longer match");
+            if header.source_set.id != self.descriptor.source_set.id
+                || header.source_set.root_id != self.descriptor.source_set.root_id
+                || header.source_set.languages != self.descriptor.source_set.languages
+                || header.source_set.dependencies != self.descriptor.source_set.dependencies
+            {
+                return Err(mismatch());
+            }
+            let mut inventory = reader.inventory()?;
+            let mut statement = self.stage.conn()?.prepare(
+                "SELECT language,path,content_hash,byte_length FROM sources ORDER BY ord",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    anyhow::bail!("index publication cancelled");
+                }
+                let document = inventory.next_document()?.ok_or_else(mismatch)?;
+                if document.key.language != row.get::<_, String>(0)?
+                    || document.key.path != row.get::<_, String>(1)?
+                    || document.content_hash != row.get::<_, String>(2)?
+                    || document.byte_length as i64 != row.get::<_, i64>(3)?
+                {
+                    return Err(mismatch());
+                }
+            }
+            if inventory.next_document()?.is_some() {
+                return Err(mismatch());
+            }
+            Ok(header.revision.id)
+        })
+    }
+
     /// The stage connection together with the admitted batch's read-only parts.
     pub(crate) fn join_parts(&mut self) -> Result<JoinParts<'_>> {
         let conn = self.stage.conn()?;

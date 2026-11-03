@@ -1447,6 +1447,15 @@ impl DaemonState {
         if let Some(ref session) = retained
             && session.verify().is_ok()
         {
+            #[cfg(all(feature = "test-support", unix))]
+            if let Some(path) = std::env::var_os("TRELLIS_TEST_RETAINED_AFTER_STARTUP_SOCKET") {
+                let path = std::path::PathBuf::from(path);
+                if !path.exists() {
+                    let listener = std::os::unix::net::UnixListener::bind(&path)?;
+                    std::fs::write(path.with_extension("ready"), [])?;
+                    let (_stream, _) = listener.accept()?;
+                }
+            }
             self.store.enqueue_retained_runs()?;
             #[cfg(test)]
             self.test_queue_current_phase.store(2, Ordering::Release);

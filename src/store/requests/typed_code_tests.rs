@@ -22,6 +22,10 @@ fn semantic_import_keeps_its_closed_codes_and_listed_reasons() {
             "stale_basis: head revision changed",
             "stale_basis: head revision changed",
         ),
+        (
+            "stale_basis: retained source pages no longer match",
+            "stale_basis: retained source pages no longer match",
+        ),
         ("capture_unavailable", "capture_unavailable"),
         ("root_changed", "root_changed"),
         ("index_failed", "index_failed: internal error"),

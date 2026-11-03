@@ -1869,6 +1869,20 @@ fn run_semantic_batch_request(
         .recorded_index_options()?
         .unwrap_or_else(|| IndexOptions::new(root.to_owned()));
     native_options.workspace_root = root.to_owned();
+    // The original successful run is the authority, not merely a trellisRun origin. Bind
+    // recovery once, after the worker's preclaim gate, to a fully source-validated head.
+    // Later native movement still fails the generated cutoff; the publication CAS is unchanged.
+    let admission_pin = store.index_baseline()?;
+    let generated_basis = if let SemanticImportJob::Generated(options) = &job {
+        let producer = admitted.producer().producer();
+        if store.is_retained_reimport(options, &producer.id, admission_pin)? {
+            Some(admitted.validate_reimport_destination(store, admission_pin, cancel)?)
+        } else {
+            Some(admitted.descriptor().source_revision.clone())
+        }
+    } else {
+        None
+    };
     for _ in 0..8 {
         store.verify_writer_session(session)?;
         let destination_pin = store.index_baseline()?;
@@ -1928,11 +1942,11 @@ fn run_semantic_batch_request(
         if store.index_baseline()? != destination_pin {
             continue;
         }
-        // A generated batch is bound to the revision its generator read, so a head that moved
-        // before or at the cutoff is terminal. Repeated on every revision-conflict retry.
-        if matches!(job, SemanticImportJob::Generated(_))
+        // Fresh generated batches keep their original basis. Retained recovery keeps its
+        // once-validated destination basis. Neither may follow later native movement.
+        if let Some(basis) = &generated_basis
             && store.with_native_reader(destination_pin, |reader| {
-                Ok(reader.header()?.revision.id != admitted.descriptor().source_revision)
+                Ok(reader.header()?.revision.id != *basis)
             })?
         {
             anyhow::bail!("stale_basis: head revision changed");

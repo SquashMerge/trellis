@@ -109,6 +109,7 @@ const REASONS: &[&str] = &[
     "relationships",
     "reordered page",
     "repeated field",
+    "retained source pages no longer match",
     "reversed range",
     "role outside root",
     "selected role absent",
