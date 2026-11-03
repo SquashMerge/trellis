@@ -381,7 +381,16 @@ fn sweep_never_signals_a_recorded_group_and_reports_it_unknown() {
 fn sweep_records_a_vanished_group_empty_and_keeps_an_established_status() {
     let fixture = fixture();
     let state = state(&fixture);
-    let child = orphan_group();
+    // This case needs a group whose every member can be reaped by this test.
+    // The shell fixture has a background child that can outlive its leader's wait.
+    let child = Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
     abandoned_run(&state, 1, &child, 0);
     kill_group(child);
     state.create_run_dir(&run_id(2)).unwrap();
