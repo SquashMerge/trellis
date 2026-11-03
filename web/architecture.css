@@ -75,6 +75,12 @@
 /* Summary chips are display only: a click falls through to their band header toggle. */
 #architecture-diagram [data-trellis-summary-chip] { pointer-events: none; }
 .architecture-key-line[data-tone="neutral"] { border-top-color: #B8BAC8; }
+/* #637: arrow width by reference-site count, the adapter's edgeWidth() at 1, 10, 100 and ≥1000 sites. */
+.architecture-key-widths .architecture-key-line { width: 22px; margin-left: 4px; }
+.architecture-key-line[data-width="1"] { border-top-width: 1.5px; }
+.architecture-key-line[data-width="10"] { border-top-width: 3.33px; }
+.architecture-key-line[data-width="100"] { border-top-width: 5.17px; }
+.architecture-key-line[data-width="1000"] { border-top-width: 7px; }
 
 /* #525: only the drawing sits above the key. The ready status line is empty (its counts
    are behind the ⓘ); the heat legend joins the arrow key under the drawing; the

@@ -7,6 +7,7 @@ const {createInterface} = require("node:readline");
 const {dirname, join} = require("node:path");
 const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
+const {arrowGeometry} = require("./architecture-geometry.cjs");
 
 const hostileLayer = '<img src=x onerror="globalThis.architectureExecuted=true">';
 const lowSource = `pub fn low() { crate::top::target(); external::unknown(); }
@@ -1150,9 +1151,9 @@ test("Architecture opens an external package reference in the library catalog, w
   assert.ok(!requests.some(row => /\/(sequence|navigation)$/.test(row.url.pathname)), "library candidates never seed workspace sequences");
 }, libraryFiles));
 
-// #525: layout bounds of the drawn diagram, in page pixels. Count tags may cross
-// connector strokes and band borders, but never text, a stat chip, a chip or another tag.
-function layoutBounds() {
+// #525: layout bounds of the drawn diagram, in page pixels. Count tags never sit on text,
+// a stat chip, a chip or another tag; #637's arrowGeometry adds bands and arrow segments.
+function layoutBounds(geometry) {
   const canvas = document.querySelector("#architecture-diagram"), svg = canvas.querySelector("svg");
   const box = node => { const r = node.getBoundingClientRect(); return {x:r.x, y:r.y, w:r.width, h:r.height}; };
   const hit = (a, b) => a.x < b.x + b.w - 0.5 && b.x < a.x + a.w - 0.5 && a.y < b.y + b.h - 0.5 && b.y < a.y + a.h - 0.5;
@@ -1190,7 +1191,7 @@ function layoutBounds() {
     }
   }
   const legend = document.querySelector("#architecture-legend").getBoundingClientRect(), drawn = canvas.getBoundingClientRect();
-  return {overlaps, strays, clipped, spills, svgWidth:svg.getBoundingClientRect().width, inner, pageFits:document.documentElement.scrollWidth <= innerWidth,
+  return {overlaps, strays, clipped, spills, arrows:geometry, svgWidth:svg.getBoundingClientRect().width, inner, pageFits:document.documentElement.scrollWidth <= innerWidth,
     legendBelow:legend.top >= drawn.bottom - 0.5, stateShown:!!document.querySelector("#architecture-state").offsetParent};
 }
 async function laidOutAt(page, width) {
@@ -1211,6 +1212,11 @@ async function quiet(page) {
   });
 }
 function assertLayout(bounds, label) {
+  // #637: no arrow segment enters a band or module box; tags sit clear of bands and each other.
+  assert.deepEqual(bounds.arrows.crossings, [], `${label}: no arrow crosses a band or a module box`);
+  assert.deepEqual(bounds.arrows.tagHits, [], `${label}: no count tag sits on a band, a chip or another tag`);
+  assert.deepEqual(bounds.arrows.detached, [], `${label}: every arrow starts on its source band and ends on its target band`);
+  assert.deepEqual(bounds.arrows.upward.filter(arrow => arrow.long && !arrow.channel).map(arrow => arrow.name), [], `${label}: long upward arrows use the side channel`);
   assert.deepEqual(bounds.overlaps, [], `${label}: count tags and header chips never overlap text, chips or each other`);
   assert.deepEqual(bounds.strays, [], `${label}: every count tag stays beside its own arrow`);
   assert.deepEqual(bounds.clipped, [], `${label}: no title, chip or tag is cut short`);
@@ -1230,8 +1236,9 @@ test("Architecture lays out tags, titles and chips without collisions or truncat
   for (const width of [1440, 900]) {
     await laidOutAt(page, width);
     await ready(page);
-    const bounds = await page.evaluate(layoutBounds);
+    const bounds = await page.evaluate(layoutBounds, await page.evaluate(arrowGeometry, "#architecture-diagram svg"));
     assertLayout(bounds, `${width}px`);
+    assert.ok(bounds.arrows.upward.some(arrow => arrow.long && arrow.channel), `${width}px: low → top runs in the side channel: ${JSON.stringify(bounds.arrows.upward)}`);
     assert.equal(bounds.legendBelow, true, `${width}px: the heat legend sits with the arrow key under the drawing`);
     assert.equal(bounds.stateShown, false, `${width}px: no status or count line above the drawing`);
     // Long names wrap at separators instead of clipping; the whole name is drawn.
@@ -1247,6 +1254,12 @@ test("Architecture lays out tags, titles and chips without collisions or truncat
     });
     assert.deepEqual(note, {inside:"architecture-diagram", below:true, visible:true});
   }
+  // #637: the arrow key's width samples are the drawing's own widths at 1, 10, 100 and 1000 sites
+  // (within a pixel: the browser snaps border widths to device pixels).
+  const key = await page.evaluate(() => [...document.querySelectorAll(".architecture-key-widths .architecture-key-line")]
+    .map(line => [Number(line.dataset.width), parseFloat(getComputedStyle(line).borderTopWidth), window.TrellisArchitecturePele.edgeWidth(Number(line.dataset.width))]));
+  assert.equal(key.length, 4);
+  for (const [count, drawn, expected] of key) assert.ok(Math.abs(drawn - expected) < 1, `width key at ${count} sites: ${drawn}px, arrows ${expected}px`);
   // The coverage sentence is said once; the counts are behind the ⓘ.
   const coverage = (await page.locator("#architecture-coverage").textContent()).split(" · ")[0];
   assert.match(coverage, /^\d+ of \d+ reference sites mapped to a module/);
@@ -1275,7 +1288,7 @@ test("Architecture re-lays out on a panel width change, keeping the selection an
   assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("data-trellis-edge-id")), edgeId, "keyboard focus returns to the same arrow");
   const narrow = await widthOf();
   assert.ok(narrow < wide, `the drawing narrows with the window (${narrow} < ${wide})`);
-  assertLayout(await page.evaluate(layoutBounds), "1100px");
+  assertLayout(await page.evaluate(layoutBounds, await page.evaluate(arrowGeometry, "#architecture-diagram svg")), "1100px");
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), title, "the inspection survives the re-layout");
   const pressed = await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll((nodes, id) => nodes.filter(node => node.getAttribute("data-trellis-edge-id") === id).map(node => node.getAttribute("aria-pressed")), edgeId);
   assert.deepEqual(pressed, ["true"], "the selected arrow stays selected");
@@ -1286,7 +1299,7 @@ test("Architecture re-lays out on a panel width change, keeping the selection an
   await page.waitForFunction(() => { const svg = document.querySelector("#architecture-diagram svg"); return svg && !svg.__old; });
   await quiet(page);
   assert.ok(await widthOf() > narrow, "the drawing widens when the inspector is hidden");
-  assertLayout(await page.evaluate(layoutBounds), "inspector hidden");
+  assertLayout(await page.evaluate(layoutBounds, await page.evaluate(arrowGeometry, "#architecture-diagram svg")), "inspector hidden");
 }, layoutFiles));
 
 // #524: developer tooling is not runtime architecture. An authored display="hidden" on the
