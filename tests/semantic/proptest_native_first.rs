@@ -277,6 +277,10 @@ struct Model {
     basis_snapshot: SemanticSnapshot,
     basis_native: String,
     producer: String,
+    /// Documents with a P tuple, and those whose P tuple omitted an association (#669 H1
+    /// excludes the latter from copying). Read as stored facts of the validated basis.
+    basis_tuples: BTreeSet<String>,
+    basis_omitted: BTreeSet<String>,
     /// An N published since P whose S has not run (superseded or still outstanding).
     outstanding: Option<IndexPin>,
 }
@@ -348,6 +352,29 @@ impl Model {
             .first()
             .map(|p| p.id.clone())
             .ok_or("basis has no producer")?;
+        let key = pin_key(basis);
+        let (basis_tuples, basis_omitted) = world
+            .store
+            .with_index_read_for_tests(|db| {
+                let mut statement = db.prepare(
+                    "SELECT c.path, COALESCE(r.omitted,0) FROM semantic_coverage c \
+                     LEFT JOIN semantic_coverage_reasons r ON r.tuple_id=c.tuple_id \
+                     WHERE c.revision_id=?1 AND c.producer_id=?2",
+                )?;
+                let rows = statement
+                    .query_map(rusqlite::params![key, producer], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((
+                    rows.iter().map(|(p, _)| p.clone()).collect(),
+                    rows.iter()
+                        .filter(|(_, o)| *o)
+                        .map(|(p, _)| p.clone())
+                        .collect(),
+                ))
+            })
+            .map_err(|e| format!("basis coverage facts failed: {e:#}"))?;
         Ok(Self {
             basis,
             basis_files: world.files(),
@@ -355,6 +382,8 @@ impl Model {
             basis_native: native_id(world, basis)?,
             basis_snapshot: snapshot,
             producer,
+            basis_tuples,
+            basis_omitted,
             outstanding: None,
         })
     }
@@ -403,6 +432,208 @@ fn snapshot_ids(snapshot: &SemanticSnapshot, path: Option<&str>) -> BTreeSet<Str
 /// A later pin of the same generation.
 fn advances(next: IndexPin, prior: IndexPin) -> bool {
     next.index_generation == prior.index_generation && next.index_revision > prior.index_revision
+}
+
+fn pin_key(pin: IndexPin) -> String {
+    format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
+}
+
+/// The test-support work counts S wrote for `pin`, if any.
+fn work_counts(pin: IndexPin) -> Result<Option<serde_json::Value>, String> {
+    let Some(file) = std::env::var_os("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE") else {
+        return Ok(None);
+    };
+    let Ok(bytes) = fs::read(file) else {
+        return Ok(None);
+    };
+    let work: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("work counts unreadable: {e}"))?;
+    if work["indexPin"] != serde_json::to_value(pin).unwrap() {
+        return Ok(None);
+    }
+    Ok(Some(work))
+}
+
+fn clear_work_counts() {
+    if let Some(file) = std::env::var_os("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE") {
+        let _ = fs::remove_file(file);
+    }
+}
+
+fn copied_paths(work: &serde_json::Value) -> BTreeSet<String> {
+    work["copiedDocuments"]
+        .as_array()
+        .map(|docs| {
+            docs.iter()
+                .filter_map(|d| d["path"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Replace, everywhere except inside a historical `basis`, the old native revision and
+/// mapped provenance IDs: the re-keying the copy ruling allows, expressed independently.
+fn rekeyed(
+    value: &serde_json::Value,
+    old: &str,
+    new: &str,
+    ids: &BTreeMap<String, String>,
+) -> serde_json::Value {
+    use serde_json::Value as V;
+    match value {
+        V::String(text) if text == old => V::String(new.to_owned()),
+        V::String(text) => V::String(ids.get(text).cloned().unwrap_or_else(|| text.clone())),
+        V::Array(items) => V::Array(items.iter().map(|v| rekeyed(v, old, new, ids)).collect()),
+        V::Object(map) => V::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let v = if k == "basis" {
+                        v.clone()
+                    } else {
+                        rekeyed(v, old, new, ids)
+                    };
+                    (k.clone(), v)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Canonical rows of one document in a snapshot (every row kind, owner by provenance).
+fn document_rows(snapshot: &SemanticSnapshot, path: &str) -> Vec<String> {
+    let ids: BTreeSet<&str> = snapshot
+        .provenance
+        .iter()
+        .filter(|p| p.document.path == path)
+        .map(|p| p.id.as_str())
+        .collect();
+    let mut rows = vec![];
+    let mut push = |kind: &str, owner: &str, row: serde_json::Value| {
+        if ids.contains(owner) {
+            rows.push(format!("{kind}:{row}"));
+        }
+    };
+    for r in &snapshot.symbols {
+        push("symbol", &r.provenance_id, serde_json::to_value(r).unwrap());
+    }
+    for r in &snapshot.declaration_bindings {
+        push(
+            "declaration",
+            &r.provenance_id,
+            serde_json::to_value(r).unwrap(),
+        );
+    }
+    for r in &snapshot.references {
+        push(
+            "reference",
+            &r.provenance_id,
+            serde_json::to_value(r).unwrap(),
+        );
+    }
+    for r in &snapshot.call_bindings {
+        push("call", &r.provenance_id, serde_json::to_value(r).unwrap());
+    }
+    for r in &snapshot.type_relationships {
+        push("type", &r.provenance_id, serde_json::to_value(r).unwrap());
+    }
+    for c in &snapshot.coverage {
+        if c.document_path == path {
+            rows.push(format!("coverage:{}", serde_json::to_value(c).unwrap()));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// #669 H1: a copied document's S rows are exactly P's rows re-keyed to N: native
+/// revision, rejoined provenance IDs, and the freshness rule (never `stale`; never
+/// `fresh` when the recorded basis revision is not N's).
+fn check_rekeyed(
+    basis: &SemanticSnapshot,
+    published: &SemanticSnapshot,
+    path: &str,
+    new: &str,
+) -> Result<(), String> {
+    let old = basis
+        .coverage
+        .iter()
+        .find(|c| c.document_path == path)
+        .map(|c| c.revision_id.clone())
+        .ok_or_else(|| format!("copied {path} had no P coverage"))?;
+    let before: Vec<_> = basis
+        .provenance
+        .iter()
+        .filter(|p| p.document.path == path)
+        .collect();
+    let after: Vec<_> = published
+        .provenance
+        .iter()
+        .filter(|p| p.document.path == path)
+        .collect();
+    if before.len() != after.len() {
+        return Err(format!(
+            "copied {path}: {} P proofs, {} S proofs",
+            before.len(),
+            after.len()
+        ));
+    }
+    let mut ids = BTreeMap::new();
+    for p in &before {
+        let derived = serde_json::to_value(&p.derived_from).unwrap();
+        let q = after
+            .iter()
+            .find(|q| {
+                serde_json::to_value(&q.derived_from).unwrap() == derived
+                    && q.evidence_kind == p.evidence_kind
+            })
+            .ok_or_else(|| format!("copied {path}: no S proof derived like P proof {}", p.id))?;
+        if old != new && q.id == p.id {
+            return Err(format!("copied {path}: provenance {} not re-keyed", p.id));
+        }
+        if std::env::var_os("TRELLIS_PROPTEST_TRACE").is_some() {
+            eprintln!(
+                "copied {path}: P freshness {:?} S freshness {:?} basis revision {:?} N {new}",
+                p.freshness,
+                q.freshness,
+                q.basis.as_ref().map(|b| &b.revision_id)
+            );
+        }
+        if q.freshness == Freshness::Stale {
+            return Err(format!("copied {path}: copied proof is stale"));
+        }
+        if q.basis.as_ref().is_some_and(|b| b.revision_id != new) && q.freshness == Freshness::Fresh
+        {
+            return Err(format!("copied {path}: older-basis proof copied as fresh"));
+        }
+        if ids.insert(p.id.clone(), q.id.clone()).is_some() {
+            return Err(format!("copied {path}: duplicate P proof {}", p.id));
+        }
+        let mut expected = rekeyed(&serde_json::to_value(p).unwrap(), &old, new, &ids);
+        expected["freshness"] = serde_json::to_value(q.freshness).unwrap();
+        if expected != serde_json::to_value(q).unwrap() {
+            return Err(format!(
+                "copied {path}: proof differs from re-keyed P\nexpected {expected}\nactual {}",
+                serde_json::to_value(q).unwrap()
+            ));
+        }
+    }
+    let mut expected: Vec<String> = document_rows(basis, path)
+        .into_iter()
+        .map(|row| {
+            let (kind, json) = row.split_once(':').unwrap();
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            format!("{kind}:{}", rekeyed(&value, &old, new, &ids))
+        })
+        .collect();
+    expected.sort();
+    let actual = document_rows(published, path);
+    if expected != actual {
+        return Err(format!(
+            "copied {path}: rows differ from re-keyed P\nexpected {expected:#?}\nactual {actual:#?}"
+        ));
+    }
+    Ok(())
 }
 
 fn native_id(world: &World, pin: IndexPin) -> Result<String, String> {
@@ -569,6 +800,16 @@ enum Op {
     FailS,
     /// Drive S for whatever is outstanding now.
     CatchUp,
+    /// Corrupt a copy-eligible document's P rows, then run S (ends the history).
+    CorruptCopy {
+        pick: usize,
+    },
+    /// Capture a batch, remove one document, then import below the head.
+    DelayedReimport {
+        covered: [bool; 4],
+        flavor: u8,
+        remove: usize,
+    },
 }
 
 fn arb_op() -> impl Strategy<Value = Op> {
@@ -585,6 +826,9 @@ fn arb_op() -> impl Strategy<Value = Op> {
         2 => (any::<[bool; 4]>(), 0u8..16).prop_map(|(covered, flavor)| Op::Reimport { covered, flavor }),
         2 => Just(Op::FailS),
         1 => Just(Op::CatchUp),
+        1 => (0..4usize).prop_map(|pick| Op::CorruptCopy { pick }),
+        2 => (any::<[bool; 4]>(), 0u8..16, 0..4usize)
+            .prop_map(|(covered, flavor, remove)| Op::DelayedReimport { covered, flavor, remove }),
     ]
 }
 
@@ -607,6 +851,12 @@ struct Stats {
     reimports: usize,
     reimports_refused: usize,
     same_native: usize,
+    copied_docs: usize,
+    missed_copies: usize,
+    excluded_omitted: usize,
+    excluded_captured: usize,
+    corruptions_typed: usize,
+    corruptions_unreached: usize,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -621,6 +871,10 @@ struct Harness<'w> {
     retained: Vec<(IndexPin, PinnedView)>,
     stats: Stats,
     nonce: u8,
+    /// Source bytes the selected import captured (the copy's captured-version condition).
+    captured: BTreeMap<String, String>,
+    /// Basis rows were corrupted on purpose: the history ends at the typed failure.
+    dead: bool,
 }
 
 fn err<E: std::fmt::Display>(label: &str) -> impl Fn(E) -> String + '_ {
@@ -645,19 +899,39 @@ impl<'w> Harness<'w> {
                     .map_err(err("initial"))?,
                 basis_native: String::new(),
                 producer: String::new(),
+                basis_tuples: BTreeSet::new(),
+                basis_omitted: BTreeSet::new(),
                 outstanding: None,
             },
             retained: vec![],
             stats: Stats::default(),
             nonce: 0,
+            captured: BTreeMap::new(),
+            dead: false,
         };
         harness.reimport("setup", &[true, true, true, true], 0)?;
         Ok(harness)
     }
 
     fn reimport(&mut self, label: &str, covered: &[bool; 4], flavor: u8) -> Result<(), String> {
+        self.import(label, covered, flavor, None)
+    }
+
+    /// Import a batch. With `delayed`, capture first, then remove that document and publish
+    /// N and S before the import lands below the head: the import then omits associations
+    /// whose internal target is gone (the #669 H1 copy exclusion).
+    fn import(
+        &mut self,
+        label: &str,
+        covered: &[bool; 4],
+        flavor: u8,
+        delayed: Option<usize>,
+    ) -> Result<(), String> {
         self.nonce = self.nonce.wrapping_add(1);
         let world = self.world;
+        if delayed.is_some() {
+            self.catch_up(label)?;
+        }
         let mut fixture = BatchFixture::from_published(&world.index_db, &world.root)
             .synthetic()
             .reference("scip-typescript");
@@ -687,6 +961,14 @@ impl<'w> Harness<'w> {
         world.batches.set(number + 1);
         let descriptor =
             fixture.write(&world.root.join(format!(".trellis-semantic-batch-{number}")));
+        let captured_at = world.files();
+        if let Some(remove) = delayed
+            && world.read(PATHS[remove]).is_some()
+            && captured_at.len() > 1
+        {
+            fs::remove_file(world.root.join(PATHS[remove])).map_err(err(label))?;
+            self.publish_native(label, false)?;
+        }
         let joined = testing::stage_and_join_admitted(
             &world.store,
             &world.root,
@@ -697,6 +979,7 @@ impl<'w> Harness<'w> {
             &world.cancel,
         );
         let head = world.store.index_baseline().unwrap();
+        let captured = captured_at;
         let published = joined.and_then(|(mut admitted, joined, _)| {
             world.store.publish_semantic_batch(
                 &joined,
@@ -714,6 +997,7 @@ impl<'w> Harness<'w> {
                     ));
                 }
                 self.stats.reimports += 1;
+                self.captured = captured;
                 // An explicit import is a validated publication: it is the new basis.
                 let outstanding = self.model.outstanding.take();
                 self.model = Model::at(world, pin)?;
@@ -1099,6 +1383,9 @@ impl<'w> Harness<'w> {
             return Ok(());
         };
         let world = self.world;
+        let eligible = self.copy_eligible();
+        let n_native = native_id(world, n)?;
+        clear_work_counts();
         let completed = world
             .store
             .complete_pending_semantic_for_tests(n, &self.session, &world.cancel)
@@ -1130,9 +1417,144 @@ impl<'w> Harness<'w> {
                 "{label}: S still projects an older basis: {after:#?}"
             ));
         }
+        // #669 H1: only eligible documents are copied, and exactly as re-keyed P rows.
+        let published = world
+            .store
+            .semantic_at(s)
+            .map_err(|e| format!("{label}: S semantic read failed: {e:#}"))?;
+        if let Some(work) = work_counts(s)? {
+            let copied = copied_paths(&work);
+            if std::env::var_os("TRELLIS_PROPTEST_TRACE").is_some() {
+                eprintln!(
+                    "{label}: S {s:?} eligible {eligible:?} copied {copied:?} P omitted {:?} reused {}",
+                    self.model.basis_omitted, work["reusedDocuments"]
+                );
+            }
+            if let Some(path) = copied.iter().find(|p| !eligible.contains(*p)) {
+                return Err(format!(
+                    "{label}: S copied excluded document {path} (eligible {eligible:?}, P omitted {:?}, captured {:?}, current {:?})",
+                    self.model.basis_omitted,
+                    self.captured.get(path),
+                    world.read(path)
+                ));
+            }
+            for path in &copied {
+                check_rekeyed(&self.model.basis_snapshot, &published, path, &n_native)
+                    .map_err(|e| format!("{label}: {e}"))?;
+            }
+            self.stats.copied_docs += copied.len();
+            self.stats.missed_copies += eligible.difference(&copied).count();
+        }
         self.model = Model::at(world, s)?;
         self.retain(s)?;
         self.check_retained(label)
+    }
+
+    /// The model's copy eligibility at the outstanding N: not pending, P published a tuple
+    /// that omitted nothing, and captured bytes equal current bytes.
+    fn copy_eligible(&mut self) -> BTreeSet<String> {
+        let files = self.world.files();
+        let pending = self.model.pending(&files);
+        let mut eligible = BTreeSet::new();
+        for (path, content) in &files {
+            if pending.contains(path) || !self.model.basis_tuples.contains(path) {
+                continue;
+            }
+            if self.model.basis_omitted.contains(path) {
+                self.stats.excluded_omitted += 1;
+            } else if self.captured.get(path) != Some(content) {
+                self.stats.excluded_captured += 1;
+            } else {
+                eligible.insert(path.clone());
+            }
+        }
+        eligible
+    }
+
+    /// #669 H1: corruption in a basis row S reads while copying is a typed integrity
+    /// failure that schedules a re-index; S publishes nothing.
+    fn corrupt_copy(&mut self, label: &str, pick: usize) -> Result<(), String> {
+        let world = self.world;
+        if self.model.outstanding.is_none()
+            && let Some(content) = choose(world, pick % 4, pick)
+        {
+            world.write(PATHS[pick % 4], content);
+            self.publish_native(label, true)?;
+        }
+        let Some(n) = self.model.outstanding else {
+            return Ok(());
+        };
+        let eligible: Vec<String> = self.copy_eligible().into_iter().collect();
+        if eligible.is_empty() {
+            return Ok(());
+        }
+        let path = eligible[pick % eligible.len()].clone();
+        let key = pin_key(self.model.basis);
+        let corrupted = world
+            .store
+            .with_index_sql_for_tests(|db| {
+                db.execute_batch("PRAGMA ignore_check_constraints=ON")?;
+                let changed = db.execute(
+                    "UPDATE semantic_symbols SET key_scope='bogus' WHERE tuple_id IN \
+                     (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path=?2)",
+                    rusqlite::params![key, path],
+                )?;
+                db.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
+                Ok(changed)
+            })
+            .map_err(|e| format!("{label}: corruption failed: {e:#}"))?;
+        if corrupted == 0 {
+            return Ok(());
+        }
+        self.dead = true;
+        // The product path, not the test oracle (which also reads the basis), must fail.
+        let oracle = std::env::var_os("TRELLIS_TEST_LOCAL_FULL_ORACLE");
+        // SAFETY: the isolated child runs one test on one thread.
+        unsafe { std::env::remove_var("TRELLIS_TEST_LOCAL_FULL_ORACLE") };
+        clear_work_counts();
+        let result =
+            world
+                .store
+                .complete_pending_semantic_for_tests(n, &self.session, &world.cancel);
+        if let Some(oracle) = oracle {
+            // SAFETY: as above.
+            unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", oracle) };
+        }
+        match result {
+            Err(error) => {
+                let text = format!("{error:#}");
+                if !(text.contains("incompatible_index") || text.contains("invalid semantic")) {
+                    return Err(format!(
+                        "{label}: corrupt copy of {path} failed untyped: {text}"
+                    ));
+                }
+                if !world.store.recovery_pending_for_tests() {
+                    return Err(format!(
+                        "{label}: corrupt copy of {path} did not schedule a re-index: {text}"
+                    ));
+                }
+                if world.store.index_baseline().unwrap() != n || !world.stage_dirs().is_empty() {
+                    return Err(format!(
+                        "{label}: corrupt copy of {path} left a partial S or stage"
+                    ));
+                }
+                self.stats.corruptions_typed += 1;
+                Ok(())
+            }
+            Ok(Some(s)) => {
+                let copied = work_counts(s)?
+                    .map(|w| copied_paths(&w))
+                    .unwrap_or_default();
+                if copied.contains(&path) {
+                    return Err(format!(
+                        "{label}: S published from corrupt basis rows of {path}"
+                    ));
+                }
+                self.stats.corruptions_unreached += 1;
+                Ok(())
+            }
+            Ok(None) => Err(format!("{label}: outstanding {n:?} had no target")),
+        }
     }
 
     /// Property 6: a failed S is typed and leaves N and its target as they were.
@@ -1245,6 +1667,12 @@ impl<'w> Harness<'w> {
             Op::Reimport { covered, flavor } => self.reimport(&label, covered, *flavor)?,
             Op::FailS => self.fail_s(&label)?,
             Op::CatchUp => self.catch_up(&label)?,
+            Op::CorruptCopy { pick } => self.corrupt_copy(&label, *pick)?,
+            Op::DelayedReimport {
+                covered,
+                flavor,
+                remove,
+            } => self.import(&label, covered, *flavor, Some(*remove))?,
         }
         Ok(())
     }
@@ -1267,6 +1695,9 @@ fn run_history(history: &[Op]) -> Result<Stats, String> {
     let mut harness = Harness::new(&world)?;
     for (index, op) in history.iter().enumerate() {
         harness.apply(index, op)?;
+        if harness.dead {
+            return Ok(harness.stats);
+        }
     }
     // Property 4/5: every history ends caught up, whatever was superseded on the way.
     harness.catch_up("final catch-up")?;
@@ -1292,10 +1723,15 @@ fn isolated(test: &str) -> bool {
         return true;
     }
     let dir = tempfile::tempdir().unwrap();
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    // Calibration only: check that the harness's own copy checks catch a mutation that
+    // the in-S FULL oracle would otherwise catch first.
+    if std::env::var_os("TRELLIS_PROPTEST_NATIVE_FIRST_NO_ORACLE").is_none() {
+        command.env("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+    }
+    let output = command
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(CHILD, "1")
-        .env("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1")
         .env(
             "TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE",
             dir.path().join("counts.json"),
@@ -1357,6 +1793,40 @@ fn native_first_control_history() {
     assert!(stats.failed_s > 0 && stats.catch_ups > 0, "{stats:?}");
 }
 
+/// #669 H1 controls: a below-head import that lost B omits A's association to `target`,
+/// so a later unrelated edit must not copy A; corrupt copied rows fail typed.
+#[test]
+fn native_first_copy_controls() {
+    if !isolated("proptest_native_first::native_first_copy_controls") {
+        return;
+    }
+    let omitted = run_history(&[
+        Op::DelayedReimport {
+            covered: [true, true, true, true],
+            flavor: 0,
+            remove: 1,
+        },
+        Op::Edit {
+            path: 2,
+            choice: 1,
+            defer: false,
+        },
+        // The first S after a below-head import witnesses nothing; this one reuses A.
+        Op::Edit {
+            path: 2,
+            choice: 2,
+            defer: false,
+        },
+    ])
+    .unwrap();
+    eprintln!("omitted control stats: {omitted:?}");
+    assert!(omitted.excluded_omitted > 0, "{omitted:?}");
+    assert!(omitted.copied_docs > 0, "{omitted:?}");
+    let corrupt = run_history(&[Op::CorruptCopy { pick: 2 }]).unwrap();
+    eprintln!("corruption control stats: {corrupt:?}");
+    assert_eq!(corrupt.corruptions_typed, 1, "{corrupt:?}");
+}
+
 #[test]
 fn native_first_generated_histories() {
     let name = "proptest_native_first::native_first_generated_histories";
@@ -1391,6 +1861,12 @@ fn native_first_generated_histories() {
                     t.reimports += stats.reimports;
                     t.reimports_refused += stats.reimports_refused;
                     t.same_native += stats.same_native;
+                    t.copied_docs += stats.copied_docs;
+                    t.missed_copies += stats.missed_copies;
+                    t.excluded_omitted += stats.excluded_omitted;
+                    t.excluded_captured += stats.excluded_captured;
+                    t.corruptions_typed += stats.corruptions_typed;
+                    t.corruptions_unreached += stats.corruptions_unreached;
                 }
                 Err(error) => prop_assert!(false, "{error}"),
             }
