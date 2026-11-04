@@ -1118,10 +1118,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         };
                         match runtime.architecture_tool(response, kind, &arguments, &mut check) {
                             Ok(mut payload) => {
+                                let semantic = architecture::uses_semantic_evidence(&payload);
                                 if let Some(limit) = evidence_limit {
                                     architecture::sample_evidence(&mut payload, limit);
                                 }
-                                Ok(architecture::envelope(id, payload))
+                                Ok(architecture::envelope_with(id, payload, semantic))
                             }
                             // Time is left for the owner: wait for it outside this read.
                             Err(error)

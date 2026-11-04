@@ -1258,6 +1258,36 @@ fn first_upgrade_reports_no_reimport_for_languages_without_producer_history() {
     );
     assert!(world.generated_rows().is_empty());
     assert_eq!(world.invocation_count(), 0);
+    // A legacy row an earlier version wrote for a never-configured language is dropped at
+    // the next publication.
+    support::stop_daemon(&world.checkout.home);
+    let catalog = Connection::open(state_dir(&world.checkout).join("retention.sqlite")).unwrap();
+    catalog
+        .execute("INSERT INTO legacy_languages VALUES('python')", [])
+        .unwrap();
+    drop(catalog);
+    fs::write(
+        world.checkout.root.join("tool.py"),
+        "def tool():\n    return 1\n",
+    )
+    .unwrap();
+    reply(
+        "index after an earlier legacy row",
+        world
+            .checkout
+            .cli()
+            .args(["index", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    let status = world.status();
+    assert!(
+        !status
+            .to_string()
+            .contains("not retained before this upgrade"),
+        "{status}"
+    );
 }
 
 /// #664: a language whose producer published evidence before its inputs were retained

@@ -58,7 +58,7 @@ Every language has syntax evidence only until you [import semantic evidence](qui
 
 An index rebuild does not make retained producer evidence fresh by itself. Trellis tries the last successful `producer run` batch again through normal validated import. Missing inputs, a changed native capture or incompatible producer pins leave a typed **semantic evidence needs re-import** reason in status, the web app and MCP. Trellis never runs the producer automatically.
 
-The first upgrade onto this behavior needs re-import because previous versions deleted successful run inputs. There is no old-index migration. Only one successful run's inputs are retained per producer, in place, and GC may remove them. This is not an artifact archive. See [upgrade recovery](quickstart.md#upgrading-trellis).
+The first upgrade onto this behavior needs re-import because previous versions deleted successful run inputs. This applies only to languages a producer covered (a successful `producer run` or a configured pickup); a language that never had a producer stays not configured. There is no old-index migration. Only one successful run's inputs are retained per producer, in place, and GC may remove them. This is not an artifact archive. See [upgrade recovery](quickstart.md#upgrading-trellis).
 
 ### Stale evidence after edits
 

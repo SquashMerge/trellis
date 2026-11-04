@@ -160,15 +160,17 @@
         const label = labels[index] + suffix;
         const run = callback => () => { if (current()) { serial++; return callback(symbol, revision); } };
         if (target.reason === "declaration" && typeof owner.openSource === "function")
-          actions.push({label: `Read declaration source · syntax · ${label}`, run: run(owner.openSource)});
+          actions.push({label: `Read declaration source · measured declaration · ${label}`, run: run(owner.openSource)});
         if (callable(symbol) && typeof owner.selectMethod === "function") {
-          const prefix = target.reason === "enclosing" ? "Sequence · enclosing · syntax" : target.reason === "call" ? "Sequence of callee · resolved" : "Sequence · syntax";
+          // The target is a measured declaration (#664): the sequence it opens may be enriched,
+          // so the action names the target's identity, not an evidence tier.
+          const prefix = target.reason === "enclosing" ? "Sequence · enclosing · measured declaration" : target.reason === "call" ? "Sequence of callee · resolved" : "Sequence · measured declaration";
           actions.push({label: `${prefix} · ${label}`, run: run(owner.selectMethod)});
         }
         if (symbol.kind === "class" && target.action === "class" && /\.(?:java|py|js|mjs|cjs|rs)$/i.test(symbol.path) && typeof owner.openClass === "function")
           actions.push({label: `Class diagram · syntax · ${label}`, run: run(owner.openClass)});
         if (["declaration", "enclosing"].includes(target.reason) && typeof owner.inspectSymbol === "function")
-          actions.push({label: `Inspect${target.reason === "enclosing" ? " enclosing declaration" : ""} · syntax · ${label}`, run: run(owner.inspectSymbol)});
+          actions.push({label: `Inspect${target.reason === "enclosing" ? " enclosing declaration" : ""} · measured declaration · ${label}`, run: run(owner.inspectSymbol)});
       }
       if (!actions.length) actions.push(notice("No measured declaration or resolved callee on this line. Candidate type and call targets cannot be opened as navigation."));
       actions.push(notice("Call graph · not available yet"));

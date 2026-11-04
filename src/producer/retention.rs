@@ -235,6 +235,35 @@ pub(crate) fn publish_run(
     Ok(())
 }
 
+/// The languages a producer covered in this checkout's durable producer state (#664): a
+/// retained run, a successful `producer run` record or a configured pickup. Only these can
+/// have had semantic evidence lost to an upgrade. Unreadable run or pickup state names no
+/// language: it cannot prove that evidence existed.
+pub(crate) fn configured_languages(state: &StateDir, slots: &[RetainedRun]) -> BTreeSet<String> {
+    use super::state::RunState;
+    let mut languages: BTreeSet<String> = slots
+        .iter()
+        .flat_map(|slot| slot.languages.iter().cloned())
+        .collect();
+    let runs = state.runs().unwrap_or_default();
+    let done = runs
+        .iter()
+        .filter(|run| run.state == RunState::Done)
+        .map(|run| run.producer.clone());
+    let pickup = state
+        .read_pickup_config()
+        .ok()
+        .flatten()
+        .map(|config| config.entries)
+        .unwrap_or_default();
+    for producer in done.chain(pickup.into_iter().map(|entry| entry.producer)) {
+        if let Some(language) = crate::scip_admission::run_language(&producer) {
+            languages.insert(language.to_owned());
+        }
+    }
+    languages
+}
+
 pub(crate) struct RetainedRun {
     pub producer: String,
     pub languages: Vec<String>,

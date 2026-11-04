@@ -302,7 +302,7 @@ An upgrade can rebuild the native index when its schema or extractor changes. Tr
 
 If the inputs are missing or no longer match, status, the web app and MCP show **semantic evidence needs re-import**, with a per-language reason. Run the producer again using the commands above, or refresh your configured pickup artifact. A queued import does not clear the warning; successful validated publication does. A retained batch alone never means evidence is fresh.
 
-The first upgrade onto this retention behavior also needs re-import: older versions deleted successful run inputs. Trellis does not migrate old index layouts to recover them. Retained inputs are disposable and GC may remove them; keep any artifact you need to archive outside Trellis. Configured pickup keeps its existing artifact-watch behavior.
+The first upgrade onto this retention behavior also needs re-import for languages a producer covered (a successful `producer run` or a configured pickup): older versions deleted successful run inputs. A language that never had a producer is reported as not configured. Trellis does not migrate old index layouts to recover them. Retained inputs are disposable and GC may remove them; keep any artifact you need to archive outside Trellis. Configured pickup keeps its existing artifact-watch behavior.
 
 ## 6. Architecture rules
 
