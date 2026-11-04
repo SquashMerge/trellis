@@ -4579,6 +4579,15 @@ fn below_head_import_witnesses_successive_local_edits() {
         assert_delayed_import_matches_full(&world, &descriptor);
         if value > 3 {
             assert_delayed_import_witnessed(&work);
+            // #669 H1: A and B depend on nothing that changed, so S copies their published
+            // rows; the FULL oracle above still holds for the copied publication.
+            let copied: Vec<_> = work["copiedDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|doc| doc["path"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(copied, ["src/A.js", "src/B.js"], "{work}");
         }
     }
 }
@@ -4661,6 +4670,98 @@ fn below_head_import_recovers_dependent_rows_when_target_returns() {
     );
     assert_delayed_import_witnessed(&work);
     assert_delayed_import_matches_full(&world, &descriptor);
+}
+
+/// #669 H1: S copies an unchanged document's published rows. Corruption read while copying
+/// fails typed and schedules a re-index, as a read of those rows would.
+#[test]
+fn corruption_read_while_copying_schedules_a_rebuild() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let descriptor = world.write(&fixture);
+    world.publish(&descriptor).unwrap();
+    let import = world.head_key();
+    let db = rusqlite::Connection::open(&world.index_db).unwrap();
+    db.execute_batch("PRAGMA ignore_check_constraints=ON")
+        .unwrap();
+    let corrupted = db
+        .execute(
+            "UPDATE semantic_symbols SET key_scope='bogus' WHERE tuple_id IN \
+             (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
+            [&import],
+        )
+        .unwrap();
+    drop(db);
+    assert!(corrupted > 0);
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let error = world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid semantic enum"),
+        "{error:#}"
+    );
+    assert!(world.store.recovery_pending_for_tests());
+}
+
+/// A corrupt copied basis is first consumed by the publisher's capture lookup.
+#[test]
+fn corruption_found_while_writing_copied_rows_schedules_a_rebuild() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let descriptor = world.write(&fixture);
+    world.publish(&descriptor).unwrap();
+    let import = world.head_key();
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let native = world.store.index_baseline().unwrap();
+    let db = rusqlite::Connection::open(&world.index_db).unwrap();
+    let corrupted = db
+        .execute(
+            "UPDATE semantic_basis SET artifact_hash=?2 WHERE tuple_id IN \
+             (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
+            rusqlite::params![import, "0".repeat(64)],
+        )
+        .unwrap();
+    drop(db);
+    assert!(corrupted > 0);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_raw_captures WHERE artifact_hash='0000000000000000000000000000000000000000000000000000000000000000'"),
+        0
+    );
+    let error = world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::QueryReturnedNoRows)
+        ),
+        "{error:#}"
+    );
+    assert_eq!(world.store.index_baseline().unwrap(), native);
+    assert!(world.store.recovery_pending_for_tests(), "{error:#}");
 }
 
 /// Runs the due revision maintenance until nothing is left to do.

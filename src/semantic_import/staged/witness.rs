@@ -85,8 +85,12 @@ pub(super) fn document_flags(
     let claims: i64 = join
         .conn()
         .prepare_cached(
-            "SELECT COUNT(*) FROM proof_identities p JOIN sources s ON s.ord=p.source_ord \
-        WHERE s.language=?1 AND s.path=?2 AND p.record_kind<>'symbolInformation'",
+            // Each arm of `proof_identities` by its own source index: SQLite cannot push the
+            // source join into the compound view and scanned every staged proof per document.
+            "SELECT (SELECT COUNT(*) FROM sources s JOIN claims c ON c.source_ord=s.ord \
+             WHERE s.language=?1 AND s.path=?2 AND c.record_kind<>'symbolInformation') + \
+             (SELECT COUNT(*) FROM sources s JOIN witness_proofs w ON w.source_ord=s.ord \
+             WHERE s.language=?1 AND s.path=?2 AND w.record_kind<>'symbolInformation')",
         )?
         .query_row(params![doc.language, doc.path], |r| r.get(0))?;
     let mut flags = DocFlags {
@@ -500,10 +504,11 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 && raw.artifact_hash == basis.artifact_hash,
             "original proof document differs"
         );
-        let capture: Option<i64> = join
-            .conn()
-            .prepare_cached("SELECT capture_id FROM proof_identities WHERE proof_id=?1")?
-            .query_row([&derived.provenance_id], |row| row.get(0))?;
+        let capture = join
+            .ctx
+            .proof_row(&derived.provenance_id)?
+            .context("original proof has no staged identity")?
+            .capture_id;
         anyhow::ensure!(
             capture == Some(p.capture_id),
             "original proof capture differs"
@@ -593,10 +598,11 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         {
             return fallback("original fused proof authority differs");
         }
-        let capture: Option<i64> = join
-            .conn()
-            .prepare_cached("SELECT capture_id FROM proof_identities WHERE proof_id=?1")?
-            .query_row([&derived.provenance_id], |row| row.get(0))?;
+        let capture = join
+            .ctx
+            .proof_row(&derived.provenance_id)?
+            .context("original proof has no staged identity")?
+            .capture_id;
         anyhow::ensure!(
             capture == Some(p.capture_id),
             "original fused proof capture differs"
@@ -637,12 +643,24 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
     })
 }
 
-/// Whether `doc`'s source association is reused unchanged from the original import.
+/// Whether `doc` is copied from its published basis (#669 H1): the join neither settles it
+/// nor checks its closure; the publisher copies its basis tuple.
+pub(super) fn copied(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Result<bool> {
+    exists(
+        join.conn(),
+        "SELECT 1 FROM source_witnesses w JOIN sources s ON s.ord=w.source_ord \
+         WHERE s.language=?1 AND s.path=?2 AND w.decision='copied' AND w.complete=1",
+        &[&doc.language, &doc.path],
+    )
+}
+
+/// Whether `doc`'s source association is reused unchanged from the original import, copied
+/// or re-settled.
 fn reused_source(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Result<bool> {
     exists(
         join.conn(),
         "SELECT 1 FROM source_witnesses w JOIN sources s ON s.ord=w.source_ord \
-         WHERE s.language=?1 AND s.path=?2 AND w.decision='reused' AND w.complete=1",
+         WHERE s.language=?1 AND s.path=?2 AND w.decision IN ('reused','copied') AND w.complete=1",
         &[&doc.language, &doc.path],
     )
 }

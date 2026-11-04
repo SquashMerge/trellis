@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc b747b43621db02484e3b50b6dc199869be579206713277272156758441f4af69 # shrinks to [Edit { path: 0, content: 0 }]
+cc a935ed7b750d6f1416a0c7621b6dfba2096a363c9d291a069b6ea554c4a1fa77 # shrinks to [Add { path: 3 }, Rename { from: 1, to: 0 }, MultiEdit { mask: 9, choices: [0, 0, 0, 0] }]

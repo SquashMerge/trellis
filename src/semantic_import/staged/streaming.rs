@@ -2177,7 +2177,46 @@ mod reservation_tests {
             mutations: DestinationMutations::default(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             unread: Default::default(),
+            proofs: Default::default(),
         }
+    }
+
+    #[test]
+    fn proof_identity_memo_retains_a_live_reservation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sources(ord INTEGER PRIMARY KEY,language TEXT,path TEXT);
+             CREATE TABLE artifacts(ordinal INTEGER PRIMARY KEY,sha256 TEXT);
+             CREATE TABLE proof_identities(proof_id TEXT PRIMARY KEY,source_ord INTEGER,
+                 artifact INTEGER,record_kind TEXT,fact_digest TEXT,claim_id INTEGER,
+                 capture_id INTEGER);
+             INSERT INTO sources VALUES(0,'rust','src/lib.rs');",
+        )
+        .unwrap();
+        let proof_id = "a".repeat(64);
+        conn.execute("INSERT INTO artifacts VALUES(0,?1)", ["b".repeat(64)])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO proof_identities VALUES(?1,0,0,'occurrence',?2,-1,1)",
+            params![proof_id, "c".repeat(64)],
+        )
+        .unwrap();
+        let mut limits = BatchLimits::PRODUCTION;
+        limits.unit_expansion_bytes = 4096;
+        let ctx = row_context(&conn, limits);
+        assert_eq!(ctx.live.high_water(), 0);
+        let proof = ctx.proof_row(&proof_id).unwrap().unwrap();
+        assert_eq!(proof.path, "src/lib.rs");
+        drop(proof);
+        assert_eq!(ctx.proofs.borrow().len(), 1);
+        assert!(
+            ctx.live.high_water() > 0,
+            "the retained proof strings, Rc and HashMap storage need a live reservation"
+        );
+        assert!(
+            ctx.live.reserve(ctx.limits.unit_expansion_bytes).is_err(),
+            "dropping the caller must not release storage still owned by the memo"
+        );
     }
 
     #[test]
@@ -2404,6 +2443,7 @@ mod reservation_tests {
             mutations: DestinationMutations::default(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             unread: Default::default(),
+            proofs: Default::default(),
         };
         let global = CompletedGlobal {
             ctx: &ctx,

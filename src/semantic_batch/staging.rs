@@ -62,11 +62,13 @@ CREATE INDEX claims_order ON claims(source_ord, canonical_bytes);
 CREATE UNIQUE INDEX claims_proof ON claims(proof_id);
 CREATE INDEX claims_symbol ON claims(symbol, presence, target_root) WHERE symbol IS NOT NULL;
 CREATE TABLE witness_proofs(identity_id INTEGER PRIMARY KEY CHECK(identity_id<0), artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL UNIQUE, capture_id INTEGER NOT NULL, UNIQUE(artifact,fact_digest));
+CREATE INDEX witness_proofs_source ON witness_proofs(source_ord, record_kind);
 CREATE VIEW proof_identities AS SELECT claim_id AS identity_id, claim_id, artifact, source_ord, record_kind, fact_digest, proof_id, NULL AS capture_id FROM claims c UNION ALL SELECT identity_id, identity_id AS claim_id, artifact, source_ord, record_kind, fact_digest, proof_id, capture_id FROM witness_proofs w;
 CREATE TABLE witness_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), internal_symbols_complete INTEGER NOT NULL DEFAULT 0 CHECK(internal_symbols_complete IN (0,1)), staged_rows INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE source_witnesses(source_ord INTEGER PRIMARY KEY, decision TEXT NOT NULL CHECK(decision IN ('reused','changedBytes','newDocument')), body TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0,1)));
+CREATE TABLE source_witnesses(source_ord INTEGER PRIMARY KEY, decision TEXT NOT NULL CHECK(decision IN ('reused','copied','changedBytes','newDocument')), body TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0,1)));
 CREATE TABLE original_associations(source_ord INTEGER NOT NULL, ordinal INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, PRIMARY KEY(source_ord,ordinal)) WITHOUT ROWID;
 CREATE TABLE witness_internal_symbols(scope INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(scope,language,path,symbol)) WITHOUT ROWID;
+CREATE INDEX witness_internal_symbols_symbol ON witness_internal_symbols(symbol);
 CREATE TABLE join_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation TEXT NOT NULL, revision INTEGER NOT NULL, attempt INTEGER NOT NULL);
 CREATE TABLE nat_done(rev INTEGER PRIMARY KEY);
 CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, reserve INTEGER, PRIMARY KEY(rev, ord), UNIQUE(rev, language, path)) WITHOUT ROWID;
@@ -151,6 +153,21 @@ pub struct StageBudget {
 }
 
 impl StageBudget {
+    /// Charges `reserved` staged bytes and measures the stage once [`WITNESS_CHECK_BYTES`]
+    /// (or an eighth of the staging limit, if smaller) have accumulated in `unchecked`.
+    pub(crate) fn charge(
+        &self,
+        unchecked: &mut u64,
+        reserved: u64,
+    ) -> std::result::Result<(), ScipCaptureError> {
+        *unchecked = unchecked.saturating_add(reserved);
+        if *unchecked >= WITNESS_CHECK_BYTES.min(self.staging_bytes / 8) {
+            *unchecked = 0;
+            self.check()?;
+        }
+        Ok(())
+    }
+
     pub fn check(&self) -> std::result::Result<(), ScipCaptureError> {
         let staged = tree_bytes(&self.dir);
         if staged > self.staging_bytes {
@@ -172,11 +189,28 @@ pub struct Stage {
     index_dir: PathBuf,
     baseline: u64,
     conn: Option<Connection>,
+    /// Statements run in one stage transaction until [`Stage::commit_batch`] or a release.
+    batched: bool,
 }
+
+/// A unit's own stage transaction. It is a savepoint so it nests inside a batch
+/// ([`Stage::begin_batch`]); outside one it begins and commits like `BEGIN`/`COMMIT`.
+pub const UNIT_BEGIN: &str = "SAVEPOINT stage_unit";
+/// Ends a unit transaction begun with [`UNIT_BEGIN`].
+pub const UNIT_COMMIT: &str = "RELEASE stage_unit";
+/// Abandons a unit transaction begun with [`UNIT_BEGIN`].
+pub const UNIT_ROLLBACK: &str = "ROLLBACK TO stage_unit; RELEASE stage_unit";
 
 fn open_connection(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("stage open")?;
     conn.set_prepared_statement_cache_capacity(128);
+    // Stage statements are cached and rebound per row; a plan fixed at prepare time avoids
+    // re-preparing them whenever a bound LIMIT or small integer changes.
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
+        true,
+    )
+    .context("stage pragmas")?;
     conn.execute_batch(&format!(
         "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE; PRAGMA cache_size=-{STAGE_CACHE_KIB};"
     ))
@@ -195,6 +229,7 @@ impl Stage {
             index_dir: index_dir.to_owned(),
             baseline,
             conn: None,
+            batched: false,
         };
         let conn = open_connection(&stage.db_path())?;
         conn.execute_batch(STAGE_SCHEMA).context("stage schema")?;
@@ -219,11 +254,62 @@ impl Stage {
         if self.conn.is_none() {
             self.conn = Some(open_connection(&self.db_path())?);
         }
-        Ok(self.conn.as_ref().expect("stage connection just opened"))
+        let conn = self.conn.as_ref().expect("stage connection just opened");
+        if self.batched && conn.is_autocommit() {
+            conn.execute_batch("BEGIN")?;
+        }
+        Ok(conn)
+    }
+
+    /// Runs every later statement in one stage transaction until [`Self::commit_batch`] or
+    /// [`Self::release_connection`]. The stage has no journal: this saves a lock, page write
+    /// and unlock per row, and a commit keeps every statement executed, as autocommit would.
+    pub fn begin_batch(&mut self) {
+        self.batched = true;
+    }
+
+    /// Commits the batch transaction, if one is open, and ends batching.
+    pub fn commit_batch(&mut self) -> rusqlite::Result<()> {
+        self.batched = false;
+        match self.conn.as_ref() {
+            Some(conn) if !conn.is_autocommit() => conn.execute_batch("COMMIT"),
+            _ => Ok(()),
+        }
+    }
+
+    /// Measures the stage against its limits after writing an open batch's dirty pages to
+    /// the file: inside a batch the file lengths do not yet include them. The batch goes on;
+    /// the next statement begins a new one.
+    pub fn check_flushed(&mut self, limits: &BatchLimits) -> Result<()> {
+        if let Some(conn) = self.conn.as_ref()
+            && !conn.is_autocommit()
+        {
+            conn.execute_batch("COMMIT")?;
+        }
+        self.budget(limits).check()?;
+        Ok(())
+    }
+
+    /// [`StageBudget::charge`] for this stage, measuring it with [`Self::check_flushed`].
+    pub fn charge_flushed(
+        &mut self,
+        limits: &BatchLimits,
+        unchecked: &mut u64,
+        reserved: u64,
+    ) -> Result<()> {
+        *unchecked = unchecked.saturating_add(reserved);
+        if *unchecked >= WITNESS_CHECK_BYTES.min(limits.staging_bytes / 8) {
+            *unchecked = 0;
+            self.check_flushed(limits)?;
+        }
+        Ok(())
     }
 
     /// Drops the connection. The publishing writer attaches `stage.db` only after this.
+    /// An open batch is committed first; its error is the owner's to read from
+    /// [`Self::commit_batch`], which a slice owner calls before releasing.
     pub fn release_connection(&mut self) {
+        let _ = self.commit_batch();
         self.conn = None;
     }
 
@@ -335,6 +421,40 @@ fn serialized_len(value: &impl serde::Serialize, limit: u64) -> Result<u64> {
     Ok(counter.bytes)
 }
 
+/// Serializes `value` into a buffer that may grow only to `limit` bytes; past it the payload
+/// is `unit expansion bytes`, as [`serialized_len`] would have charged it.
+fn serialized_bounded(value: &impl serde::Serialize, limit: u64) -> Result<String> {
+    struct Bounded {
+        bytes: Vec<u8>,
+        limit: u64,
+        exceeded: bool,
+    }
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if (self.bytes.len() as u64).saturating_add(bytes.len() as u64) > self.limit {
+                self.exceeded = true;
+                return Err(std::io::Error::other("witness serialization limit"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Bounded {
+        bytes: Vec::new(),
+        limit,
+        exceeded: false,
+    };
+    let result = serde_json::to_writer(&mut buffer, value);
+    if buffer.exceeded {
+        return Err(ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into());
+    }
+    result?;
+    Ok(String::from_utf8(buffer.bytes)?)
+}
+
 pub(crate) fn charge_witness_row(conn: &Connection, limits: &BatchLimits) -> Result<()> {
     let changed = conn
         .prepare_cached(
@@ -356,12 +476,14 @@ pub(crate) struct WitnessStageWriter<'a> {
     changes_before: u64,
     /// Reserved bytes staged since the last directory-size check.
     unchecked: u64,
+    /// The reused source this writer has seen open; its later rows skip the probe.
+    open_source: Option<i64>,
 }
 
 /// Rows re-measure the stage directory after this many reserved bytes (or an eighth of the
 /// staging limit, if smaller); each writer and every completion measures it too. Walking
 /// the directory per row cost more than staging the row.
-const WITNESS_CHECK_BYTES: u64 = 1 << 20;
+pub(crate) const WITNESS_CHECK_BYTES: u64 = 1 << 20;
 
 impl<'a> WitnessStageWriter<'a> {
     pub(crate) fn new(
@@ -379,27 +501,23 @@ impl<'a> WitnessStageWriter<'a> {
             counters,
             changes_before: conn.total_changes(),
             unchecked: 0,
+            open_source: None,
         })
     }
 
     fn row_check(&mut self, reserved: u64) -> Result<()> {
-        self.unchecked = self.unchecked.saturating_add(reserved);
-        if self.unchecked >= WITNESS_CHECK_BYTES.min(self.budget.staging_bytes / 8) {
-            self.budget.check()?;
-            self.unchecked = 0;
-        }
+        self.budget.charge(&mut self.unchecked, reserved)?;
         Ok(())
     }
 
     fn payload(&mut self, value: &impl serde::Serialize) -> Result<(String, u64)> {
-        let length = serialized_len(value, self.limits.unit_expansion_bytes)?;
+        // One serialization: the buffer may grow only to the largest payload whose doubled
+        // reservation still fits the unit expansion limit.
+        let body = serialized_bounded(value, self.limits.unit_expansion_bytes / 2)?;
+        let length = body.len() as u64;
         let reservation = length.saturating_mul(2);
-        if reservation > self.limits.unit_expansion_bytes {
-            return Err(ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into());
-        }
         charge_witness_row(self.conn, self.limits)?;
         self.row_check(reservation)?;
-        let body = serde_json::to_string(value)?;
         self.counters.retained_admission_bytes_high_water = self
             .counters
             .retained_admission_bytes_high_water
@@ -417,6 +535,21 @@ impl<'a> WitnessStageWriter<'a> {
             "witness source version mismatch"
         );
         self.header(source_ord, "reused", witness)
+    }
+
+    /// A reused source whose published rows S copies (#669 H1): no original rows are staged
+    /// and the join does not settle it; the publisher copies its basis tuple.
+    pub(crate) fn stage_copied_source(
+        &mut self,
+        source_ord: i64,
+        witness: &crate::store::native_first::witness::OriginalSourceWitness,
+    ) -> Result<()> {
+        ensure!(
+            witness.captured_version == witness.current_version,
+            "witness source version mismatch"
+        );
+        self.header(source_ord, "copied", witness)?;
+        self.finish_source_witness(source_ord)
     }
 
     pub(crate) fn stage_witness_coverage(
@@ -453,10 +586,13 @@ impl<'a> WitnessStageWriter<'a> {
         ordinal: i64,
         row: &crate::store::native_first::witness::OriginalRow,
     ) -> Result<()> {
-        let open: bool = self.conn.prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM source_witnesses WHERE source_ord=?1 AND decision='reused' AND complete=0)",
-        )?.query_row([source_ord], |row| row.get(0))?;
+        // Only this writer completes a source, so one probe per source and writer holds.
+        let open = self.open_source == Some(source_ord)
+            || self.conn.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM source_witnesses WHERE source_ord=?1 AND decision='reused' AND complete=0)",
+            )?.query_row([source_ord], |row| row.get(0))?;
         ensure!(open && ordinal >= 0, "witness association source not open");
+        self.open_source = Some(source_ord);
         let (body, bytes) = self.payload(row)?;
         self.conn
             .prepare_cached("INSERT INTO original_associations VALUES(?1,?2,?3,?4)")?
@@ -473,6 +609,7 @@ impl<'a> WitnessStageWriter<'a> {
             )? == 1,
             "witness source completion"
         );
+        self.open_source = None;
         self.budget.check()?;
         Ok(())
     }
@@ -727,7 +864,7 @@ impl ClaimSink for StageClaimSink<'_> {
         &mut self,
         doc: &UnitDocument<'_>,
     ) -> std::result::Result<(), ScipCaptureError> {
-        let begun = self.conn.execute_batch("BEGIN");
+        let begun = self.conn.execute_batch(UNIT_BEGIN);
         self.record(begun)?;
         let found = lookup_assigned(self.conn, self.artifact, &self.language, doc.path);
         self.current = self.record(found)?.map(|assigned| assigned.ord);
@@ -811,7 +948,7 @@ impl ClaimSink for StageClaimSink<'_> {
     }
 
     fn end_document(&mut self) -> std::result::Result<(), ScipCaptureError> {
-        let committed = self.conn.execute_batch("COMMIT");
+        let committed = self.conn.execute_batch(UNIT_COMMIT);
         self.record(committed)?;
         self.current = None;
         self.totals.documents += 1;

@@ -39,6 +39,33 @@ CREATE TABLE local_target_documents(pin TEXT NOT NULL,source_set TEXT NOT NULL,l
 CREATE TABLE local_target_declarations(pin TEXT NOT NULL,source_set TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,present INTEGER NOT NULL,kind TEXT,name TEXT,name_start INTEGER,name_end INTEGER,callable INTEGER,PRIMARY KEY(pin,source_set,language,path,syntax_id)) WITHOUT ROWID;
 ";
 
+/// Fixed stage bytes charged for one cached lookup row, beyond its text and blob fields.
+const LOOKUP_STAGE_BYTES: u64 = 512;
+
+/// The stage bytes one cached lookup row may take: the fixed row cost plus twice its variable
+/// fields (record and index copies of the key, the declaration's kind and name).
+fn lookup_stage_bytes(
+    pin: IndexPin,
+    key: &DocumentKey,
+    sid: &[u8],
+    declaration: Option<&CurrentDeclaration>,
+) -> u64 {
+    let fields = [
+        semantic_pin_key(pin).len(),
+        key.source_set_id.len(),
+        key.language.len(),
+        key.path.len(),
+        sid.len(),
+        declaration.map_or(0, |d| d.kind.len()),
+        declaration
+            .and_then(|d| d.name.as_ref())
+            .map_or(0, String::len),
+    ]
+    .iter()
+    .fold(0u64, |total, len| total.saturating_add(*len as u64));
+    LOOKUP_STAGE_BYTES.saturating_add(fields.saturating_mul(2))
+}
+
 fn corrupt(message: &str) -> anyhow::Error {
     SelectedIntegrity(format!("incompatible_index: {message}")).into()
 }
@@ -89,10 +116,8 @@ fn account(conn: &Connection, limits: &BatchLimits) -> Result<()> {
     if rows < 0 || rows as u64 >= limits.staged_rows {
         return Err(limit("staged rows"));
     }
-    conn.execute(
-        "UPDATE local_target_owner SET rows=rows+1 WHERE singleton=1",
-        [],
-    )?;
+    conn.prepare_cached("UPDATE local_target_owner SET rows=rows+1 WHERE singleton=1")?
+        .execute([])?;
     Ok(())
 }
 
@@ -141,7 +166,7 @@ pub(crate) fn advance(
         if limits.page_rows == 0 {
             return Err(limit("page rows"));
         }
-        let mut stmt = db.prepare("SELECT syntax_id,kind,name,name_start,name_end,start_byte,end_byte FROM native_version_declarations WHERE vid=?1 AND syntax_id>?2 ORDER BY syntax_id LIMIT ?3")?;
+        let mut stmt = db.prepare_cached("SELECT syntax_id,kind,name,name_start,name_end,start_byte,end_byte FROM native_version_declarations WHERE vid=?1 AND syntax_id>?2 ORDER BY syntax_id LIMIT ?3")?;
         let mut rows = stmt.query(params![
             version.vid,
             after.as_slice(),
@@ -180,7 +205,7 @@ pub(crate) fn advance(
             .as_ref()
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .unwrap_or(("", ""));
-        let mut stmt = db.prepare("SELECT language,path FROM revision_documents WHERE revision_id=?1 AND (language,path)>(?2,?3) ORDER BY language,path LIMIT 1")?;
+        let mut stmt = db.prepare_cached("SELECT language,path FROM revision_documents WHERE revision_id=?1 AND (language,path)>(?2,?3) ORDER BY language,path LIMIT 1")?;
         let mut rows = stmt.query(params![
             semantic_pin_key(target.pin),
             after_language,
@@ -291,12 +316,16 @@ fn put(
         ),
         None => (None, None, None, None, None),
     };
-    conn.execute("INSERT INTO local_target_declarations(pin,source_set,language,path,vid,syntax_id,present,kind,name,name_start,name_end,callable) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(pin,source_set,language,path,syntax_id) DO UPDATE SET vid=excluded.vid,present=excluded.present,kind=excluded.kind,name=excluded.name,name_start=excluded.name_start,name_end=excluded.name_end,callable=excluded.callable",params![pin,key.source_set_id,key.language,key.path,vid,sid,declaration.is_some(),kind,name,start,end,callable])?;
+    conn.prepare_cached("INSERT INTO local_target_declarations(pin,source_set,language,path,vid,syntax_id,present,kind,name,name_start,name_end,callable) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(pin,source_set,language,path,syntax_id) DO UPDATE SET vid=excluded.vid,present=excluded.present,kind=excluded.kind,name=excluded.name,name_start=excluded.name_start,name_end=excluded.name_end,callable=excluded.callable")?.execute(params![pin,key.source_set_id,key.language,key.path,vid,sid,declaration.is_some(),kind,name,start,end,callable])?;
     Ok(())
 }
 
 /// Exact selected normalized lookup. Both hits and absence are cached under the
 /// requested pin and selected vid; only fully indexed documents prove absence.
+///
+/// A cache miss stages one row; the stage directory is measured once `unchecked` (the
+/// caller's running estimate) reaches a MiB, not on every lookup.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lookup(
     db: &Connection,
     pin: IndexPin,
@@ -304,6 +333,7 @@ pub(crate) fn lookup(
     syntax_id: &str,
     stage: &mut Stage,
     limits: &BatchLimits,
+    unchecked: &mut u64,
     cancel: &CancelFlag,
 ) -> Result<TargetLookup> {
     check_cancel(cancel)?;
@@ -318,7 +348,7 @@ pub(crate) fn lookup(
     let version = witness::selected_version(db, pin, key)?;
     let vid = version.as_ref().map_or(0, |v| v.vid);
     let conn = stage.conn()?;
-    let mut stmt = conn.prepare("SELECT vid,present,kind,name,name_start,name_end,callable FROM local_target_declarations WHERE pin=?1 AND source_set=?2 AND language=?3 AND path=?4 AND syntax_id=?5")?;
+    let mut stmt = conn.prepare_cached("SELECT vid,present,kind,name,name_start,name_end,callable FROM local_target_declarations WHERE pin=?1 AND source_set=?2 AND language=?3 AND path=?4 AND syntax_id=?5")?;
     let mut cached = stmt.query(params![
         semantic_pin_key(pin),
         key.source_set_id,
@@ -371,7 +401,8 @@ pub(crate) fn lookup(
     };
     let rows = declaration.is_some() as usize;
     put(conn, pin, key, vid, &encoded, declaration.as_ref(), limits)?;
-    stage.budget(limits).check()?;
+    let charge = lookup_stage_bytes(pin, key, &encoded, declaration.as_ref());
+    stage.charge_flushed(limits, unchecked, charge)?;
     Ok(TargetLookup {
         declaration,
         rows,
@@ -482,6 +513,86 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
     }
 
     #[test]
+    fn local_target_lookup_charges_variable_payload_and_checks_stage_limit() {
+        let (db, _target, _dir, mut stage) = fixture();
+        let cancel = Arc::new(AtomicBool::new(false));
+        initialize(&mut stage, pin(2)).unwrap();
+        let name = "a".repeat(256 * 1024);
+        db.execute(
+            "UPDATE document_versions SET byte_length=?1 WHERE vid=1",
+            [name.len() as i64 + 2],
+        )
+        .unwrap();
+        db.execute("UPDATE native_version_declarations SET name=?1,name_start=1,name_end=?2,end_byte=?3 WHERE vid=1", params![name,name.len() as i64 + 1,name.len() as i64 + 2]).unwrap();
+        let limits = BatchLimits {
+            staging_bytes: stage.bytes() + 64 * 1024,
+            unit_expansion_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        let sid = format!("sid:v1:{}", "1".repeat(32));
+        let result = lookup(
+            &db,
+            pin(1),
+            &key(),
+            &sid,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        );
+        assert!(
+            result.is_err(),
+            "lookup wrote {} stage bytes past {} limit without checking",
+            stage.bytes(),
+            limits.staging_bytes
+        );
+    }
+
+    #[test]
+    fn batched_local_target_completion_size_probe() {
+        let (db, _target, _dir, mut stage) = fixture();
+        let cancel = Arc::new(AtomicBool::new(false));
+        initialize(&mut stage, pin(2)).unwrap();
+        let name = "a".repeat(256 * 1024);
+        db.execute(
+            "UPDATE document_versions SET byte_length=?1 WHERE vid=1",
+            [name.len() as i64 + 2],
+        )
+        .unwrap();
+        db.execute("UPDATE native_version_declarations SET name=?1,name_start=1,name_end=?2,end_byte=?3 WHERE vid=1", params![name,name.len() as i64 + 1,name.len() as i64 + 2]).unwrap();
+        let limits = BatchLimits {
+            staging_bytes: stage.bytes() + 64 * 1024,
+            unit_expansion_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        stage.begin_batch();
+        let before = stage.bytes();
+        let sid = format!("sid:v1:{}", "1".repeat(32));
+        let result = lookup(
+            &db,
+            pin(1),
+            &key(),
+            &sid,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        );
+        let completion = result.and_then(|_| stage.budget(&limits).check().map_err(Into::into));
+        let checked_bytes = stage.bytes();
+        stage.commit_batch().unwrap();
+        let committed_bytes = stage.bytes();
+        eprintln!(
+            "before={before} checked={checked_bytes} committed={committed_bytes} cap={} completion={completion:?}",
+            limits.staging_bytes
+        );
+        assert!(
+            completion.is_err() || committed_bytes <= limits.staging_bytes,
+            "the final check accepted a batched LOCAL target stage that committed past its cap"
+        );
+    }
+
+    #[test]
     fn local_target_pages_are_shared_and_exact_lookups_are_pin_scoped() {
         let (db, target, _dir, mut stage) = fixture();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -512,17 +623,46 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
         assert!(cursor.done);
         assert_eq!((builds, documents, rows), (1, 1, 2));
         let sid = format!("sid:v1:{}", "1".repeat(32));
-        let now = lookup(&db, pin(2), &key(), &sid, &mut stage, &limits, &cancel).unwrap();
+        let now = lookup(
+            &db,
+            pin(2),
+            &key(),
+            &sid,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        )
+        .unwrap();
         assert_eq!(now.declaration.unwrap().name.as_deref(), Some("new"));
         assert!(!now.read);
-        let old = lookup(&db, pin(1), &key(), &sid, &mut stage, &limits, &cancel).unwrap();
+        let old = lookup(
+            &db,
+            pin(1),
+            &key(),
+            &sid,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        )
+        .unwrap();
         assert_eq!(old.declaration.unwrap().name.as_deref(), Some("old"));
         assert!(old.read);
         assert_eq!(old.rows, 1);
         assert!(
-            !lookup(&db, pin(1), &key(), &sid, &mut stage, &limits, &cancel)
-                .unwrap()
-                .read
+            !lookup(
+                &db,
+                pin(1),
+                &key(),
+                &sid,
+                &mut stage,
+                &limits,
+                &mut 0,
+                &cancel
+            )
+            .unwrap()
+            .read
         );
         let mut second = TargetIndexCursor::default();
         for _ in 0..3 {
@@ -560,9 +700,18 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
             ..Default::default()
         };
         let sid = format!("sid:v1:{}", "1".repeat(32));
-        let error = lookup(&db, pin(2), &key(), &sid, &mut stage, &limits, &cancel)
-            .err()
-            .unwrap();
+        let error = lookup(
+            &db,
+            pin(2),
+            &key(),
+            &sid,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        )
+        .err()
+        .unwrap();
         assert!(error.downcast_ref::<ScipCaptureError>().is_some());
         let count: i64 = stage
             .conn()
@@ -580,18 +729,59 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
         let cancel = Arc::new(AtomicBool::new(false));
         let limits = BatchLimits::default();
         let missing = format!("sid:v1:{}", "3".repeat(32));
-        let absent = lookup(&db, pin(2), &key(), &missing, &mut stage, &limits, &cancel).unwrap();
+        let absent = lookup(
+            &db,
+            pin(2),
+            &key(),
+            &missing,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        )
+        .unwrap();
         assert!(absent.declaration.is_none() && absent.read && absent.rows == 0);
         assert!(
-            !lookup(&db, pin(2), &key(), &missing, &mut stage, &limits, &cancel)
-                .unwrap()
-                .read
+            !lookup(
+                &db,
+                pin(2),
+                &key(),
+                &missing,
+                &mut stage,
+                &limits,
+                &mut 0,
+                &cancel
+            )
+            .unwrap()
+            .read
         );
         let unnamed = format!("sid:v1:{}", "2".repeat(32));
-        let present = lookup(&db, pin(2), &key(), &unnamed, &mut stage, &limits, &cancel).unwrap();
+        let present = lookup(
+            &db,
+            pin(2),
+            &key(),
+            &unnamed,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        )
+        .unwrap();
         assert!(present.declaration.unwrap().name.is_none());
         assert_eq!(present.rows, 1);
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(lookup(&db, pin(2), &key(), &unnamed, &mut stage, &limits, &cancel).is_err());
+        assert!(
+            lookup(
+                &db,
+                pin(2),
+                &key(),
+                &unnamed,
+                &mut stage,
+                &limits,
+                &mut 0,
+                &cancel
+            )
+            .is_err()
+        );
     }
 }

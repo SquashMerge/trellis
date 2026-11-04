@@ -2,6 +2,7 @@
 use super::*;
 pub(super) mod context;
 mod continuation;
+pub(crate) mod copy;
 mod local_targets;
 #[cfg(feature = "test-support")]
 mod oracle;
@@ -190,7 +191,8 @@ pub(super) fn write_pending(
 }
 
 fn pending_target(db: &Connection) -> Result<Option<PendingSemanticTarget>> {
-    let marker: Option<(String,String,String)> = db.query_row("SELECT revision_id,native_revision_id,root_id FROM semantic_pending_target WHERE singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    // Every S step re-reads the marker; its statements stay prepared.
+    let marker: Option<(String,String,String)> = db.prepare_cached("SELECT revision_id,native_revision_id,root_id FROM semantic_pending_target WHERE singleton=1")?.query_row([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let Some((key, native_revision_id, root_id)) = marker else {
         let missing: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_pending_selections s JOIN index_metadata m ON m.singleton=1 AND s.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision)",[],|r|r.get(0))?;
         selected_ensure!(
@@ -200,14 +202,14 @@ fn pending_target(db: &Connection) -> Result<Option<PendingSemanticTarget>> {
         return Ok(None);
     };
     let pin = parse_pin(&key)?;
-    let head: (String,i64,String) = db.query_row("SELECT m.index_generation,m.index_revision,r.native_revision_id FROM index_metadata m JOIN native_revisions r ON r.id=?1 WHERE m.singleton=1", [&key], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let head: (String,i64,String) = db.prepare_cached("SELECT m.index_generation,m.index_revision,r.native_revision_id FROM index_metadata m JOIN native_revisions r ON r.id=?1 WHERE m.singleton=1")?.query_row([&key], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     selected_ensure!(
         head.0 == pin.index_generation.to_string()
             && head.1 == pin.index_revision as i64
             && head.2 == native_revision_id,
         "incompatible_index: pending semantic target differs from head"
     );
-    let mut statement = db.prepare("SELECT producer_id,batch_id,captured_pin,basis_pin FROM semantic_pending_selections WHERE revision_id=?1 ORDER BY producer_id")?;
+    let mut statement = db.prepare_cached("SELECT producer_id,batch_id,captured_pin,basis_pin FROM semantic_pending_selections WHERE revision_id=?1 ORDER BY producer_id")?;
     let rows = statement.query_map([&key], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -226,18 +228,18 @@ fn pending_target(db: &Connection) -> Result<Option<PendingSemanticTarget>> {
             basis_pin: parse_pin(&basis)?,
         });
     }
-    let malformed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_pending_selections s LEFT JOIN semantic_revision_raw_selections r ON r.revision_id=s.revision_id AND r.producer_id=s.producer_id LEFT JOIN semantic_projection_origins o ON o.revision_id=s.revision_id AND o.producer_id=s.producer_id WHERE s.revision_id=?1 AND (r.batch_id IS NOT s.batch_id OR r.captured_pin IS NOT s.captured_pin OR o.basis_pin IS NOT s.basis_pin))", [&key], |r|r.get(0))?;
+    let malformed: bool = db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_pending_selections s LEFT JOIN semantic_revision_raw_selections r ON r.revision_id=s.revision_id AND r.producer_id=s.producer_id LEFT JOIN semantic_projection_origins o ON o.revision_id=s.revision_id AND o.producer_id=s.producer_id WHERE s.revision_id=?1 AND (r.batch_id IS NOT s.batch_id OR r.captured_pin IS NOT s.captured_pin OR o.basis_pin IS NOT s.basis_pin))")?.query_row([&key], |r|r.get(0))?;
     selected_ensure!(
         !malformed,
         "incompatible_index: pending raw selection differs"
     );
-    let count: i64 = db.query_row(
-        "SELECT count(*) FROM semantic_revision_raw_selections r
+    let count: i64 = db
+        .prepare_cached(
+            "SELECT count(*) FROM semantic_revision_raw_selections r
          JOIN semantic_projection_origins o ON o.revision_id=r.revision_id
             AND o.producer_id=r.producer_id WHERE r.revision_id=?1",
-        [&key],
-        |r| r.get(0),
-    )?;
+        )?
+        .query_row([&key], |r| r.get(0))?;
     selected_ensure!(
         !selections.is_empty() && count == selections.len() as i64,
         "incompatible_index: pending semantic selection missing"
@@ -449,6 +451,13 @@ impl Store {
         read: impl FnOnce(&Connection, &ReadRevision) -> Result<T>,
     ) -> Result<Option<T>> {
         self.native_at_reconcile(target.pin, |db, selected| {
+            // S binds new keys to the same cached statements row after row. Without the
+            // query planner stability guarantee SQLite re-prepares a statement whenever a
+            // value it planned around (a LIMIT, a small-integer comparison) is rebound.
+            storage_result(db.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
+                true,
+            ))?;
             if pending_target(db)?.as_ref() != Some(target) {
                 return Ok(None);
             }
@@ -590,6 +599,8 @@ impl Store {
         if let Some(observer) = observer.as_mut() {
             observer(crate::store::SemanticPublicationStage::BeforeSemantic, &tx);
         }
+        // Read once, for the documents a witnessed stage copies from its basis (#669 H1).
+        let mut destination = None;
         for output in prepared.iter_mut() {
             check_cancel(cancel)?;
             match &mut output.output {
@@ -598,24 +609,71 @@ impl Store {
                     if let Some(batch) = output.capture_witness {
                         super::captured_witness::publish_staged(&tx, parts.conn, batch)?;
                     }
+                    let mut copied: std::collections::VecDeque<_> =
+                        copy::copied_documents(parts.conn, &parts.descriptor.source_set.id)?.into();
+                    if !copied.is_empty() && destination.is_none() {
+                        destination = Some(copy::CopyDestination::read(self, &tx, target)?);
+                    }
+                    let producer = &output.producer;
+                    // Copied and staged documents are written in canonical key order, as one
+                    // settlement of every document would have written them.
+                    let mut write = |document: &crate::semantic_evidence::SemanticPublication| {
+                        check_cancel(cancel)?;
+                        write_import_coverage(&tx, &key, document)?;
+                        blocked.check(&tx);
+                        #[cfg(feature = "test-support")]
+                        if let Some(observer) = observer.as_mut() {
+                            observer(crate::store::SemanticPublicationStage::AfterDocument, &tx);
+                        }
+                        anyhow::Ok(())
+                    };
+                    // Corruption read or written while copying is reported, so it schedules a
+                    // re-index as a read would; the publication transaction is not committed.
+                    let copy_one = |document: &crate::native_evidence::DocumentKey| {
+                        (|| {
+                            let (basis, tuple) =
+                                copy::copy_source(&tx, target, &producer.id, document)?.context(
+                                    SelectedIntegrity(
+                                        "incompatible_index: copied document lost its basis".into(),
+                                    ),
+                                )?;
+                            copy::copied_document(
+                                &tx,
+                                &basis,
+                                tuple,
+                                producer,
+                                destination.as_ref().context("copy destination")?,
+                            )
+                        })()
+                        .map_err(|error| self.report_index_failure(error))
+                    };
                     crate::semantic_import::read_staged_documents(
                         parts.conn,
                         "",
-                        &output.producer,
+                        producer,
                         &mut |document| {
-                            check_cancel(cancel)?;
-                            write_import_coverage(&tx, &key, &document)?;
-                            blocked.check(&tx);
-                            #[cfg(feature = "test-support")]
-                            if let Some(observer) = observer.as_mut() {
-                                observer(
-                                    crate::store::SemanticPublicationStage::AfterDocument,
-                                    &tx,
+                            if let [coverage] = document.coverage.as_slice() {
+                                let staged = (
+                                    semantic_variant(&coverage.language)?,
+                                    coverage.document_path.clone(),
                                 );
+                                while copied.front().is_some_and(|doc| {
+                                    (doc.language.as_str(), doc.path.as_str())
+                                        < (staged.0.as_str(), staged.1.as_str())
+                                }) {
+                                    let doc = copied.pop_front().expect("front checked");
+                                    // Writing a copied row can be where its corruption is found.
+                                    write(&copy_one(&doc)?)
+                                        .map_err(|error| self.report_index_failure(error))?;
+                                }
                             }
-                            Ok(())
+                            write(&document)
                         },
                     )?;
+                    while let Some(doc) = copied.pop_front() {
+                        write(&copy_one(&doc)?)
+                            .map_err(|error| self.report_index_failure(error))?;
+                    }
                     context::publish(
                         self,
                         &tx,

@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 /// expansion byte reservation; one row per step spent most of the step on fixed overhead.
 const PAGE_ROWS: usize = 256;
 const INVENTORY_PAGE: usize = 64;
+/// Required targets looked up per preparation step.
+const TARGET_PAGE: i64 = 64;
 
 #[derive(Default)]
 pub(super) struct WitnessPreparation {
@@ -23,6 +25,8 @@ pub(super) struct WitnessPreparation {
     target_after: i64,
     targets_done: bool,
     target_count: u64,
+    /// Estimated LOCAL target stage bytes since that stage was last measured.
+    lookup_unchecked: u64,
 }
 struct SourcePreparation {
     ord: i64,
@@ -105,6 +109,22 @@ impl WitnessPreparation {
                 .query_row(params![document.language, document.path], |r| r.get(0))
                 .optional()?;
             match (ord, decision) {
+                (Some(ord), WitnessEligibility::Witness(witness))
+                    if (super::copy::CopyFilter {
+                        target: target.clone(),
+                        captured_pin: authority.captured_pin,
+                        producer: authority.producer.id.clone(),
+                    })
+                    .copies(db, &document)? =>
+                {
+                    #[cfg(feature = "test-support")]
+                    {
+                        crate::semantic_import::note_reused_document(&witness.document);
+                        crate::semantic_import::note_copied_document(&witness.document);
+                    }
+                    WitnessStageWriter::new(admitted.stage_mut(), limits, counters)?
+                        .stage_copied_source(ord, witness.as_ref())?;
+                }
                 (Some(ord), WitnessEligibility::Witness(witness)) => {
                     #[cfg(feature = "test-support")]
                     crate::semantic_import::note_reused_document(&witness.document);
@@ -162,9 +182,14 @@ impl WitnessPreparation {
             return Ok(false);
         }
         if !self.targets_done {
-            let next: Option<(i64, String, String, String)> = conn.prepare_cached("SELECT id,language,path,syntax_id FROM witness_required_targets WHERE id>?1 ORDER BY id LIMIT 1")?.query_row(
-                [self.target_after], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-            if let Some((id, language, path, syntax_id)) = next {
+            // A page of required targets per step; each target is still one lookup step.
+            let page: Vec<(i64, String, String, String)> = conn.prepare_cached("SELECT id,language,path,syntax_id FROM witness_required_targets WHERE id>?1 ORDER BY id LIMIT ?2")?.query_map(
+                params![self.target_after, TARGET_PAGE], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+            let more = !page.is_empty();
+            for (index, (id, language, path, syntax_id)) in page.into_iter().enumerate() {
+                if index > 0 {
+                    lookup_budget.charge(1)?;
+                }
                 let key = DocumentKey {
                     source_set_id: authority.source_set_id.clone(),
                     language,
@@ -178,6 +203,7 @@ impl WitnessPreparation {
                         &syntax_id,
                         target_stage,
                         limits,
+                        &mut self.lookup_unchecked,
                         cancel,
                     )?;
                     #[cfg(feature = "test-support")]
@@ -192,21 +218,28 @@ impl WitnessPreparation {
                             .context("invalid witnessed target syntax ID")?;
                         let named = row.name_range.is_some();
                         crate::semantic_batch::staging::charge_witness_row(conn, limits)?;
-                        conn.execute(
+                        conn.prepare_cached(
                             "INSERT INTO witness_target_status VALUES(?1,?2,?3,?4,0,?5,?6,?7)",
-                            params![
-                                rev,
-                                key.language,
-                                key.path,
-                                encoded,
-                                named,
-                                named && row.name.is_some(),
-                                row.kind == "method"
-                            ],
-                        )?;
+                        )?
+                        .execute(params![
+                            rev,
+                            key.language,
+                            key.path,
+                            encoded,
+                            named,
+                            named && row.name.is_some(),
+                            row.kind == "method"
+                        ])?;
                     }
                 }
                 self.target_after = id;
+            }
+            // Lookups charge the LOCAL target stage per MiB; each page, the last one and the
+            // empty completion page also measure it, after writing the slice's open batch so
+            // the file lengths include its pages, as well as the admitted stage.
+            target_stage.check_flushed(limits)?;
+            self.lookup_unchecked = 0;
+            if more {
                 budget.check()?;
                 return Ok(false);
             }
@@ -285,10 +318,10 @@ fn stage_target(
             );
         }
         crate::semantic_batch::staging::charge_witness_row(conn, limits)?;
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO witness_required_targets(language,path,syntax_id) VALUES(?1,?2,?3)",
-            params![document.language, document.path, syntax_id],
-        )?;
+        )?
+        .execute(params![document.language, document.path, syntax_id])?;
         *count += 1;
     }
     Ok(())

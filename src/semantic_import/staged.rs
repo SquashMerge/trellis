@@ -40,7 +40,7 @@ use serde::Serialize;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     rc::{Rc, Weak},
     sync::atomic::Ordering,
 };
@@ -121,9 +121,111 @@ pub(super) struct JoinCtx<'a> {
     cancel: CancelFlag,
     /// Whether a source of a language was not read (#576), by revision side and language.
     unread: RefCell<BTreeMap<(u8, String), bool>>,
+    /// This unit's proof identities by proof ID ([`JoinCtx::proof_row`]).
+    proofs: RefCell<ProofMemo>,
 }
 
+/// Proof identities one join unit has read, and the live reservation that owns their storage.
+#[derive(Default)]
+pub(super) struct ProofMemo {
+    rows: HashMap<String, Option<Rc<ProofRow>>>,
+    owner: Option<Reservation>,
+}
+
+impl ProofMemo {
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The retained storage of one entry: its key, its row and strings, the `Rc` box, and two
+    /// table slots, since a hash table holds up to twice its entries' capacity.
+    fn entry_bytes(proof_id: &str, row: Option<&ProofRow>) -> Result<u64> {
+        let row = row.map_or(Ok(0), |row| {
+            sizes::sum(&[
+                std::mem::size_of::<ProofRow>() as u64 + 2 * std::mem::size_of::<usize>() as u64,
+                row.language.len() as u64,
+                row.path.len() as u64,
+                row.record_kind.len() as u64,
+                row.fact_digest.len() as u64,
+                row.artifact_hash.len() as u64,
+            ])
+        })?;
+        sizes::sum(&[
+            proof_id.len() as u64,
+            row,
+            sizes::map_entries::<String, Option<Rc<ProofRow>>>(2)?,
+        ])
+    }
+}
+
+/// One staged proof identity (`proof_identities`) with its source and artifact.
+pub(super) struct ProofRow {
+    pub(super) language: String,
+    pub(super) path: String,
+    pub(super) record_kind: String,
+    pub(super) fact_digest: String,
+    pub(super) artifact_hash: String,
+    pub(super) claim_id: i64,
+    pub(super) capture_id: Option<i64>,
+}
+
+/// Proof identities one unit keeps in [`JoinCtx::proofs`]; a fuller memo is cleared.
+const PROOF_MEMO_ENTRIES: usize = 16_384;
+
 impl JoinCtx<'_> {
+    /// The staged proof identity with `proof_id`, if any. Settling one document looks up each
+    /// of its proofs several times (provenance, check, validation, claim ID); the stage's
+    /// identities do not change during a join, so a unit reads each once. Proof IDs are unique
+    /// across `claims` and `witness_proofs` (`check_proof_identity_closure`).
+    fn proof_row(&self, proof_id: &str) -> Result<Option<Rc<ProofRow>>> {
+        if let Some(found) = self.proofs.borrow().rows.get(proof_id) {
+            return Ok(found.clone());
+        }
+        let found = self
+            .conn
+            .prepare_cached(
+                "SELECT s.language,s.path,p.record_kind,p.fact_digest,a.sha256,p.claim_id,p.capture_id \
+                 FROM proof_identities p JOIN sources s ON s.ord=p.source_ord \
+                 JOIN artifacts a ON a.ordinal=p.artifact WHERE p.proof_id=?1",
+            )?
+            .query_row([proof_id], |row| {
+                Ok(ProofRow {
+                    language: row.get(0)?,
+                    path: row.get(1)?,
+                    record_kind: row.get(2)?,
+                    fact_digest: row.get(3)?,
+                    artifact_hash: row.get(4)?,
+                    claim_id: row.get(5)?,
+                    capture_id: row.get(6)?,
+                })
+            })
+            .optional()?
+            .map(Rc::new);
+        let mut memo = self.proofs.borrow_mut();
+        if memo.rows.len() >= PROOF_MEMO_ENTRIES {
+            // A new table: clearing would keep the old capacity, which the release frees.
+            *memo = ProofMemo::default();
+        }
+        // The memo is optional: an identity it cannot admit under the unit's live budget is
+        // returned without being retained.
+        let bytes = ProofMemo::entry_bytes(proof_id, found.as_deref())?;
+        let admitted = match memo.owner.as_mut() {
+            Some(owner) => owner.grow(bytes).is_ok(),
+            None => match self.live.reserve(bytes) {
+                Ok(owner) => {
+                    memo.owner = Some(owner);
+                    true
+                }
+                Err(_) => false,
+            },
+        };
+        if admitted {
+            memo.rows.insert(proof_id.to_owned(), found.clone());
+        }
+        Ok(found)
+    }
+
     /// Cached groups also retain their unit reservation. On pressure, discard cache ownership;
     /// live callers keep the group and its charge until their last Rc drops.
     fn reserve_native(&self, bytes: u64) -> Result<Reservation> {
@@ -840,23 +942,18 @@ impl<'a> StagedSide<'a> {
         }
         let found = self
             .ctx
-            .conn
-            .prepare_cached(
-                "SELECT s.language,s.path,a.sha256,p.claim_id FROM proof_identities p \
-             JOIN sources s ON s.ord=p.source_ord JOIN artifacts a ON a.ordinal=p.artifact \
-             WHERE p.proof_id=?1 AND p.record_kind=?2 AND p.fact_digest=?3",
-            )?
-            .query_row(params![proof, kind, digest], |row| {
-                Ok((
+            .proof_row(proof)?
+            .filter(|row| row.record_kind == kind && row.fact_digest == digest)
+            .map(|row| {
+                (
                     RawClaimDocument {
-                        language: row.get(0)?,
-                        path: row.get(1)?,
-                        artifact_hash: row.get(2)?,
+                        language: row.language.clone(),
+                        path: row.path.clone(),
+                        artifact_hash: row.artifact_hash.clone(),
                     },
-                    row.get(3)?,
-                ))
-            })
-            .optional()?;
+                    row.claim_id,
+                )
+            });
         let (claim, id) = found.ok_or(ScipCaptureError::MissingProof)?;
         anyhow::ensure!(
             self.document
@@ -1143,25 +1240,34 @@ impl ProofIdentities for StagedSide<'_> {
                 }
             }));
         }
-        let sql = format!(
-            "SELECT s.language, s.path, c.record_kind, c.fact_digest, a.sha256 FROM proof_identities c \
-             JOIN sources s ON s.ord=c.source_ord JOIN artifacts a ON a.ordinal=c.artifact {} WHERE c.proof_id=?1",
-            self.proof_filter()
-        );
-        let proof = self
-            .ctx
-            .conn
-            .prepare_cached(&sql)?
-            .query_row([proof_id], |row| {
-                Ok(ProofRef {
-                    language: row.get(0)?,
-                    path: row.get(1)?,
-                    record_kind: row.get(2)?,
-                    fact_digest: row.get(3)?,
-                    artifact_hash: row.get(4)?,
+        let proof = if self.filtered {
+            let sql = format!(
+                "SELECT s.language, s.path, c.record_kind, c.fact_digest, a.sha256 FROM proof_identities c \
+                 JOIN sources s ON s.ord=c.source_ord JOIN artifacts a ON a.ordinal=c.artifact {} WHERE c.proof_id=?1",
+                self.proof_filter()
+            );
+            self.ctx
+                .conn
+                .prepare_cached(&sql)?
+                .query_row([proof_id], |row| {
+                    Ok(ProofRef {
+                        language: row.get(0)?,
+                        path: row.get(1)?,
+                        record_kind: row.get(2)?,
+                        fact_digest: row.get(3)?,
+                        artifact_hash: row.get(4)?,
+                    })
                 })
+                .optional()?
+        } else {
+            self.ctx.proof_row(proof_id)?.map(|row| ProofRef {
+                language: row.language.clone(),
+                path: row.path.clone(),
+                record_kind: row.record_kind.clone(),
+                fact_digest: row.fact_digest.clone(),
+                artifact_hash: row.artifact_hash.clone(),
             })
-            .optional()?;
+        };
         Ok(proof.filter(|proof| {
             self.document.as_ref().is_none_or(|document| {
                 document.language == proof.language && document.path == proof.path
@@ -1410,7 +1516,7 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
     for table in ["nat_docs", "nat_done"] {
         conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev])?;
     }
-    conn.execute_batch("BEGIN")?;
+    conn.execute_batch(crate::semantic_batch::staging::UNIT_BEGIN)?;
     let outcome = (|| -> Result<()> {
         let mut stream = reader.inventory()?;
         let mut ord = 0i64;
@@ -1433,11 +1539,11 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
     })();
     match outcome {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(crate::semantic_batch::staging::UNIT_COMMIT)?;
             Ok(())
         }
         Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(crate::semantic_batch::staging::UNIT_ROLLBACK);
             for table in ["nat_docs", "nat_done"] {
                 let _ = conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev]);
             }
@@ -1449,11 +1555,11 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
 /// Runs one pass in a single stage transaction. The stage has no journal, so a failed pass
 /// commits what it wrote rather than rolling back; the next attempt clears every join table.
 fn in_transaction<T>(conn: &Connection, pass: impl FnOnce() -> Result<T>) -> Result<T> {
-    conn.execute_batch("BEGIN")?;
+    conn.execute_batch(crate::semantic_batch::staging::UNIT_BEGIN)?;
     let result = pass();
-    let committed = conn.execute_batch("COMMIT");
-    if committed.is_err() && !conn.is_autocommit() {
-        let _ = conn.execute_batch("ROLLBACK");
+    let committed = conn.execute_batch(crate::semantic_batch::staging::UNIT_COMMIT);
+    if committed.is_err() {
+        let _ = conn.execute_batch(crate::semantic_batch::staging::UNIT_ROLLBACK);
     }
     let value = result?;
     committed?;
@@ -2644,6 +2750,7 @@ fn join_staged_using(
         },
         cancel: cancel.clone(),
         unread: RefCell::default(),
+        proofs: RefCell::default(),
     };
     let producer = parts.producer.producer();
     let body =

@@ -68,18 +68,41 @@ struct ProducerContinuation {
 }
 
 impl SemanticContinuation {
-    fn release_stage_connections(&mut self) {
-        if let Some(stage) = self.target_stage.as_mut() {
-            stage.release_connection();
+    fn stages(&mut self) -> impl Iterator<Item = &mut crate::semantic_batch::staging::Stage> {
+        let (admission, admitted) = match self.current.as_mut() {
+            Some(current) => (
+                current.admission.as_mut().and_then(|a| a.stage_mut()),
+                current.admitted.as_mut().map(|a| a.stage_mut()),
+            ),
+            None => (None, None),
+        };
+        self.target_stage
+            .as_mut()
+            .into_iter()
+            .chain(admission)
+            .chain(admitted)
+    }
+
+    /// Every private stage the slice starts with writes in one transaction per stage.
+    fn batch_stage_connections(&mut self) {
+        for stage in self.stages() {
+            stage.begin_batch();
         }
-        if let Some(current) = self.current.as_mut() {
-            if let Some(admission) = current.admission.as_mut() {
-                admission.release_connection();
-            }
-            if let Some(admitted) = current.admitted.as_mut() {
-                admitted.stage_mut().release_connection();
+    }
+
+    /// Commits each slice transaction. A failed commit is the slice's storage error. The
+    /// private connections stay open with their page caches across yields: no other
+    /// connection opens a stage while S owns it, and a joined stage is closed when it is
+    /// queued for publication, so the publishing writer attaches only closed stage files.
+    fn commit_stage_batches(&mut self) -> rusqlite::Result<()> {
+        let mut committed = Ok(());
+        for stage in self.stages() {
+            let result = stage.commit_batch();
+            if committed.is_ok() {
+                committed = result;
             }
         }
+        committed
     }
 }
 
@@ -115,9 +138,15 @@ impl Store {
             let wall_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis());
+            let (in_use, allocated) = crate::heap::bytes();
+            // SAFETY: reads SQLite's global memory counter; no connection is involved.
+            let sqlite = unsafe { rusqlite::ffi::sqlite3_memory_used() };
             let _ = writeln!(
                 std::io::stderr().lock(),
-                "semantic-s phase={phase} detail={detail} wall_ms={wall_ms}"
+                "semantic-s phase={phase} detail={detail} wall_ms={wall_ms} heap_in_use_mib={} heap_allocated_mib={} sqlite_mib={}",
+                in_use >> 20,
+                allocated >> 20,
+                sqlite >> 20
             );
         }
     }
@@ -203,6 +232,7 @@ impl Store {
             // One coherent snapshot serves several bounded steps; it never survives a return
             // to worker selection, and the slice keeps foreground work waiting briefly.
             let started = std::time::Instant::now();
+            state.batch_stage_connections();
             loop {
                 let step = (|| {
                     let captured_read = ReadRevision::new(
@@ -335,6 +365,11 @@ impl Store {
                                 &limits,
                                 cancel,
                             )?
+                            .copying(super::copy::CopyFilter {
+                                target: target.clone(),
+                                captured_pin: selection.captured_pin,
+                                producer: selection.producer_id.clone(),
+                            })
                         });
                         return Ok(None);
                     }
@@ -464,9 +499,8 @@ impl Store {
                     }
                     Ok(joined)
                 })();
-                // Private stage connections live for the slice: reopening one per step (schema
-                // load, pragmas) cost more than the step. They close before every return, so the
-                // publishing writer attaches only closed stage files.
+                // Private stage connections outlive the step and the slice: reopening one
+                // (schema load, pragmas, a cold page cache) cost more than the step.
                 let step = match step {
                     Ok(None) if started.elapsed() < step_slice() => match check_cancel(cancel) {
                         Ok(()) => continue,
@@ -474,8 +508,13 @@ impl Store {
                     },
                     step => step,
                 };
-                state.release_stage_connections();
-                return step;
+                // A failed stage commit wins over the step's own outcome, a fallback or content
+                // error included: it is a storage error, so the whole continuation and every
+                // stage it owns (the shared LOCAL target stage too) is discarded, never reused.
+                return match state.commit_stage_batches() {
+                    Ok(()) => step,
+                    Err(error) => Err(error.into()),
+                };
             }
         });
         match result {
@@ -484,7 +523,10 @@ impl Store {
                 Ok(SemanticUnitOutcome::Progress)
             }
             Ok(Some(Some(joined))) => {
-                let current = state.current.take().unwrap();
+                let mut current = state.current.take().unwrap();
+                let mut admitted = current.admitted.take().unwrap();
+                // A joined stage waits for publication closed; the publisher attaches it.
+                admitted.stage_mut().release_connection();
                 #[cfg(feature = "test-support")]
                 if !current.full {
                     crate::semantic_import::note_local_witness_outcome(None);
@@ -492,7 +534,7 @@ impl Store {
                 state.prepared.push(PreparedSemantic {
                     producer: current.producer,
                     output: PreparedOutput::Joined {
-                        admitted: Box::new(current.admitted.unwrap()),
+                        admitted: Box::new(admitted),
                         joined,
                     },
                     capture_witness: current.capture_witness.then_some(selection.batch_id),
