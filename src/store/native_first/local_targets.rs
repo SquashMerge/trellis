@@ -401,10 +401,8 @@ pub(crate) fn lookup(
     };
     let rows = declaration.is_some() as usize;
     put(conn, pin, key, vid, &encoded, declaration.as_ref(), limits)?;
-    stage.budget(limits).charge(
-        unchecked,
-        lookup_stage_bytes(pin, key, &encoded, declaration.as_ref()),
-    )?;
+    let charge = lookup_stage_bytes(pin, key, &encoded, declaration.as_ref());
+    stage.charge_flushed(limits, unchecked, charge)?;
     Ok(TargetLookup {
         declaration,
         rows,
@@ -547,6 +545,50 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
             "lookup wrote {} stage bytes past {} limit without checking",
             stage.bytes(),
             limits.staging_bytes
+        );
+    }
+
+    #[test]
+    fn batched_local_target_completion_size_probe() {
+        let (db, _target, _dir, mut stage) = fixture();
+        let cancel = Arc::new(AtomicBool::new(false));
+        initialize(&mut stage, pin(2)).unwrap();
+        let name = "a".repeat(256 * 1024);
+        db.execute(
+            "UPDATE document_versions SET byte_length=?1 WHERE vid=1",
+            [name.len() as i64 + 2],
+        )
+        .unwrap();
+        db.execute("UPDATE native_version_declarations SET name=?1,name_start=1,name_end=?2,end_byte=?3 WHERE vid=1", params![name,name.len() as i64 + 1,name.len() as i64 + 2]).unwrap();
+        let limits = BatchLimits {
+            staging_bytes: stage.bytes() + 64 * 1024,
+            unit_expansion_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        stage.begin_batch();
+        let before = stage.bytes();
+        let sid = format!("sid:v1:{}", "1".repeat(32));
+        let result = lookup(
+            &db,
+            pin(1),
+            &key(),
+            &sid,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        );
+        let completion = result.and_then(|_| stage.budget(&limits).check().map_err(Into::into));
+        let checked_bytes = stage.bytes();
+        stage.commit_batch().unwrap();
+        let committed_bytes = stage.bytes();
+        eprintln!(
+            "before={before} checked={checked_bytes} committed={committed_bytes} cap={} completion={completion:?}",
+            limits.staging_bytes
+        );
+        assert!(
+            completion.is_err() || committed_bytes <= limits.staging_bytes,
+            "the final check accepted a batched LOCAL target stage that committed past its cap"
         );
     }
 

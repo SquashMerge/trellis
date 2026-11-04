@@ -277,6 +277,34 @@ impl Stage {
         }
     }
 
+    /// Measures the stage against its limits after writing an open batch's dirty pages to
+    /// the file: inside a batch the file lengths do not yet include them. The batch goes on;
+    /// the next statement begins a new one.
+    pub fn check_flushed(&mut self, limits: &BatchLimits) -> Result<()> {
+        if let Some(conn) = self.conn.as_ref()
+            && !conn.is_autocommit()
+        {
+            conn.execute_batch("COMMIT")?;
+        }
+        self.budget(limits).check()?;
+        Ok(())
+    }
+
+    /// [`StageBudget::charge`] for this stage, measuring it with [`Self::check_flushed`].
+    pub fn charge_flushed(
+        &mut self,
+        limits: &BatchLimits,
+        unchecked: &mut u64,
+        reserved: u64,
+    ) -> Result<()> {
+        *unchecked = unchecked.saturating_add(reserved);
+        if *unchecked >= WITNESS_CHECK_BYTES.min(limits.staging_bytes / 8) {
+            *unchecked = 0;
+            self.check_flushed(limits)?;
+        }
+        Ok(())
+    }
+
     /// Drops the connection. The publishing writer attaches `stage.db` only after this.
     /// An open batch is committed first; its error is the owner's to read from
     /// [`Self::commit_batch`], which a slice owner calls before releasing.

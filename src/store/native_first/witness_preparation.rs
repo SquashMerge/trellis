@@ -218,9 +218,10 @@ impl WitnessPreparation {
                 }
                 self.target_after = id;
             }
-            // Lookups charge the LOCAL target stage per MiB; each page and the last one also
-            // measure it, as well as the admitted stage.
-            target_stage.budget(limits).check()?;
+            // Lookups charge the LOCAL target stage per MiB; each page, the last one and the
+            // empty completion page also measure it, after writing the slice's open batch so
+            // the file lengths include its pages, as well as the admitted stage.
+            target_stage.check_flushed(limits)?;
             self.lookup_unchecked = 0;
             if more {
                 budget.check()?;
