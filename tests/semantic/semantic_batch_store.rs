@@ -5123,7 +5123,17 @@ fn a_partly_released_import_revision_is_not_brought_back() {
         "function unrelated(){ return 2; }\n",
         &counts,
     );
-    assert_eq!(work["witnessedRejoins"], 0, "{work}");
+    // Bounded S decides per producer: the other producer's import is intact and witnessed;
+    // the released scip-typescript import is never brought back as witness authority.
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert!(
+        !work["reusedDocuments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|doc| doc["language"] == "javascript"),
+        "{work}"
+    );
     assert_eq!(
         work["fallbackReasons"],
         json!(["original_import_missing"]),
@@ -10671,6 +10681,12 @@ fn bounded_retained_binary_and_proof_corruption_publish_no_partial_facts_or_cach
                 Ok(())
             })
             .unwrap();
+        // A same-native republish copies the validated rows; an edit makes S re-admit the
+        // retained batch through bounded FULL, which authenticates it.
+        write_files(
+            &world.root,
+            &[("src/C.js", "function other(){ return 9; }\n")],
+        );
         world.republish_with_rejoin();
         let head = world.store.index_baseline().unwrap();
         let snapshot = world.store.semantic_at(head).unwrap();
@@ -10744,6 +10760,10 @@ fn bounded_retained_cancellation_after_streaming_rolls_back_publication_and_cach
                 cancel.store(true, Ordering::Release);
             }
         });
+    write_files(
+        &world.root,
+        &[("src/C.js", "function other(){ return 9; }\n")],
+    );
     let (graph, native, capture) = index_workspace_bundle(
         &IndexOptions::new(world.root.clone()),
         world.store.root_id(),
@@ -10752,22 +10772,23 @@ fn bounded_retained_cancellation_after_streaming_rolls_back_publication_and_cach
     )
     .unwrap();
     let leader = world.store.publication_for_tests().unwrap();
-    let result = world.store.publish_native_recovery_for_tests(
-        &graph,
-        &capture,
-        &native,
-        &leader,
-        &world.cancel,
-    );
+    // Native-first: N publishes; the FULL catch-up S stages the capture witness and is the
+    // transaction a late cancellation rolls back, cache and all.
+    let native_pin = world
+        .store
+        .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let result = world.store.catch_up_semantic_for_tests(&world.cancel);
     assert!(observed.load(Ordering::Acquire));
     let error = result.unwrap_err();
     assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
     world.cancel.store(false, Ordering::Release);
-    assert_eq!(world.store.index_baseline().unwrap(), prior);
+    assert_eq!(world.store.index_baseline().unwrap(), native_pin);
     assert_eq!(world.store.semantic_at(prior).unwrap(), snapshot);
     assert_eq!(
         world.count("SELECT COUNT(*) FROM native_revisions"),
-        revisions
+        revisions + 1
     );
     assert_eq!(
         world.count("SELECT COUNT(*) FROM semantic_batch_witnesses"),
@@ -10857,6 +10878,11 @@ fn rust_below_head_rejoin_is_local_unless_cargo_context_differs_from_capture() {
     )
     .unwrap();
     drop(session);
+    // Startup reconciliation completes at native N; its semantic S follows.
+    world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
     let (moved_native, _) = world.store.retained_native_snapshot_at(moved).unwrap();
     assert_ne!(
         original_native.revision.dependency_hash,

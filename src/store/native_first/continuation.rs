@@ -37,6 +37,9 @@ struct ProducerContinuation {
     target_index_done: bool,
     witness_preparation: super::witness_preparation::WitnessPreparation,
     witness_ready: bool,
+    /// FULL for a batch with no original import: first join it against its own capture.
+    capture_witness: bool,
+    capture_join: Option<JoinContinuation>,
 }
 
 impl Store {
@@ -175,6 +178,8 @@ impl Store {
                     target_index_done: false,
                     witness_preparation: super::witness_preparation::WitnessPreparation::default(),
                     witness_ready: false,
+                    capture_witness: false,
+                    capture_join: None,
                 });
             }
             let current = state.current.as_mut().unwrap();
@@ -192,10 +197,11 @@ impl Store {
                         current.authority = Some(authority)
                     }
                     super::witness::AuthorityStep::Ineligible => current.full = true,
-                    super::witness::AuthorityStep::Full(_reason) => {
+                    super::witness::AuthorityStep::Full(reason) => {
                         current.full = true;
+                        current.capture_witness = reason == "original_import_missing";
                         #[cfg(feature = "test-support")]
-                        crate::semantic_import::note_local_witness_outcome(Some(_reason));
+                        crate::semantic_import::note_local_witness_outcome(Some(reason));
                     }
                 }
                 return Ok(None);
@@ -275,6 +281,13 @@ impl Store {
                             limits.clone(),
                             DestinationMutations::default(),
                         ));
+                        if current.capture_witness {
+                            current.capture_join = Some(JoinContinuation::new(
+                                selection.captured_pin,
+                                limits.clone(),
+                                DestinationMutations::default(),
+                            ));
+                        }
                     }
                 }
                 return Ok(None);
@@ -309,6 +322,30 @@ impl Store {
                 if current.witness_ready {
                     current.join =
                         Some(JoinContinuation::new_witnessed(target.pin, limits.clone()));
+                }
+                return Ok(None);
+            }
+            if let Some(capture_join) = current.capture_join.as_mut() {
+                // The batch's own captured==captured rows, kept privately until the S commit.
+                let result = capture_join.advance(
+                    admitted,
+                    &captured,
+                    &captured,
+                    &mut current.budget,
+                    &mut current.counters,
+                    cancel,
+                );
+                let staged = result.and_then(|joined| {
+                    if joined.is_some() {
+                        let producer = admitted.producer().producer();
+                        let parts = admitted.join_parts()?;
+                        super::super::captured_witness::stage_documents(parts.conn, &producer)?;
+                    }
+                    Ok(joined.is_some())
+                });
+                admitted.stage_mut().release_connection();
+                if staged? {
+                    current.capture_join = None;
                 }
                 return Ok(None);
             }
@@ -370,6 +407,7 @@ impl Store {
                         admitted: Box::new(current.admitted.unwrap()),
                         joined,
                     },
+                    capture_witness: current.capture_witness.then_some(selection.batch_id),
                 });
                 state.next += 1;
                 Ok(SemanticUnitOutcome::Progress)
@@ -422,6 +460,7 @@ impl Store {
                 };
                 state.prepared.push(PreparedSemantic {
                     producer,
+                    capture_witness: None,
                     output: PreparedOutput::Unavailable {
                         diagnostic: format!("selected raw capture unavailable: {error:#}")
                             .chars()

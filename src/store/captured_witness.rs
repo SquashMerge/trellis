@@ -1,11 +1,83 @@
 //! Private, capture-side admission witnesses. The caller streams validated documents inside
 //! its publication savepoint and inserts the complete marker last. These rows never become
 //! public semantic answers or substitute for a partly released public import.
+//!
+//! Native-first S (#620): a FULL catch-up of a batch whose import landed below its capture
+//! first joins the batch against its own captured revision, keeps those per-document rows in
+//! its private stage, and publishes them with the S commit. Later witnessed catch-ups use them
+//! as the batch's original source associations.
 use super::*;
 use crate::native_evidence::DocumentKey;
 use crate::semantic_evidence as sem;
 
-pub(super) fn exists(tx: &Connection, batch_id: i64) -> Result<bool> {
+const STAGE_TABLE: &str = "CREATE TABLE IF NOT EXISTS capture_witness_documents(language TEXT NOT NULL,path TEXT NOT NULL,snapshot_json TEXT NOT NULL,PRIMARY KEY(language,path))";
+
+/// Keep a captured==captured staged join's documents in the producer's private stage.
+pub(crate) fn stage_documents(conn: &Connection, producer: &sem::Producer) -> Result<()> {
+    conn.execute_batch(STAGE_TABLE)?;
+    conn.execute("DELETE FROM capture_witness_documents", [])?;
+    let mut insert = conn.prepare(
+        "INSERT INTO capture_witness_documents(language,path,snapshot_json) VALUES(?1,?2,?3)",
+    )?;
+    crate::semantic_import::read_staged_documents(conn, "", producer, &mut |publication| {
+        let (language, path, json) = snapshot_row(publication)?;
+        insert.execute(params![language, path, json])?;
+        Ok(())
+    })
+}
+
+/// Publish a staged capture witness inside the S commit, unless one is already complete.
+pub(crate) fn publish_staged(tx: &Connection, stage: &Connection, batch_id: i64) -> Result<()> {
+    if exists(tx, batch_id)? {
+        return Ok(());
+    }
+    tx.execute(
+        "DELETE FROM semantic_batch_witness_documents WHERE batch_id=?1",
+        [batch_id],
+    )?;
+    let mut rows = stage.prepare(
+        "SELECT language,path,snapshot_json FROM capture_witness_documents ORDER BY language,path",
+    )?;
+    let mut rows = rows.query([])?;
+    let mut insert = tx.prepare_cached(
+        "INSERT INTO semantic_batch_witness_documents(batch_id,language,path,snapshot_json) VALUES(?1,?2,?3,?4)",
+    )?;
+    while let Some(row) = rows.next()? {
+        insert.execute(params![
+            batch_id,
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?
+        ])?;
+    }
+    complete(tx, batch_id)
+}
+
+/// The keyed snapshot row of one validated captured==captured document.
+fn snapshot_row(publication: sem::SemanticPublication) -> Result<(String, String, String)> {
+    let [coverage] = publication.coverage.as_slice() else {
+        anyhow::bail!("captured witness requires one coverage document");
+    };
+    let language = serde_json::to_value(coverage.language)?;
+    let language = language
+        .as_str()
+        .context("captured witness language")?
+        .to_owned();
+    let path = coverage.document_path.clone();
+    let snapshot = sem::SemanticSnapshot {
+        producers: publication.producers,
+        coverage: publication.coverage,
+        provenance: publication.provenance,
+        symbols: publication.symbols,
+        declaration_bindings: publication.declaration_bindings,
+        references: publication.references,
+        call_bindings: publication.call_bindings,
+        type_relationships: publication.type_relationships,
+    };
+    Ok((language, path, serde_json::to_string(&snapshot)?))
+}
+
+pub(crate) fn exists(tx: &Connection, batch_id: i64) -> Result<bool> {
     tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM semantic_batch_witnesses WHERE batch_id=?1)",
         [batch_id],
@@ -16,6 +88,7 @@ pub(super) fn exists(tx: &Connection, batch_id: i64) -> Result<bool> {
 
 /// Moves one already validated captured==captured publication into the existing snapshot
 /// representation. The caller owns validation, cancellation and rollback of the whole batch.
+#[cfg(test)]
 pub(super) fn write_document(
     tx: &Connection,
     batch_id: i64,
@@ -52,7 +125,7 @@ pub(super) fn write_document(
 }
 
 /// Publish only after every document has been validated and written in the same savepoint.
-pub(super) fn complete(tx: &Connection, batch_id: i64) -> Result<()> {
+pub(crate) fn complete(tx: &Connection, batch_id: i64) -> Result<()> {
     tx.execute(
         "INSERT INTO semantic_batch_witnesses(batch_id) VALUES(?1)",
         [batch_id],
@@ -60,7 +133,7 @@ pub(super) fn complete(tx: &Connection, batch_id: i64) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn document(
+pub(crate) fn document(
     tx: &Connection,
     batch_id: i64,
     document: &DocumentKey,

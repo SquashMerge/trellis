@@ -53,6 +53,12 @@ fn fixture() -> Connection {
     for (tuple, path) in [(1, "a.js"), (2, "b.js"), (3, "c.js")] {
         db.execute("INSERT INTO semantic_coverage VALUES(?1,?2,'producer','1','javascript',?3,1,1,'complete',NULL)",params![tuple,key,path]).unwrap();
     }
+    // A retained raw selection: bounded S will catch changed documents up.
+    db.execute(
+        "INSERT INTO semantic_revision_raw_selections VALUES(?1,'producer',1,?1)",
+        [&key],
+    )
+    .unwrap();
     db
 }
 fn header(db: &Connection, revision: u64, context: &str) {
@@ -62,6 +68,45 @@ fn projected(db: &Connection, revision: u64, path: &str) -> SemanticProjection {
     semantic_projection_for(db, pin(revision), "producer", "javascript", path)
         .unwrap()
         .unwrap()
+}
+
+/// Owner ruling #620 (A6): with no retained raw input nothing will catch a changed document
+/// up, so it and its dependents need re-import; unchanged evidence stays older-basis.
+#[test]
+fn changed_documents_without_retained_input_need_reimport() {
+    let db = fixture();
+    db.execute("DELETE FROM semantic_revision_raw_selections", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO semantic_projection_dependencies VALUES(2,'javascript','c.js')",
+        [],
+    )
+    .unwrap();
+    write_pending(
+        &db,
+        pin(1),
+        pin(2),
+        "root",
+        &[],
+        &[],
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    assert!(pending_target(&db).unwrap().is_none());
+    assert_eq!(
+        projected(&db, 2, "a.js").semantic_status,
+        SemanticStatus::OlderBasis
+    );
+    for path in ["b.js", "c.js"] {
+        assert_eq!(
+            projected(&db, 2, path).semantic_status,
+            SemanticStatus::NeedsReimport
+        );
+    }
+    assert_eq!(
+        endpoint_boundary(&db, pin(2), "producer", "javascript", "c.js", pin(1)).unwrap(),
+        Some(crate::graph_query::BoundaryReason::NeedsReimport)
+    );
 }
 
 #[test]
@@ -278,6 +323,11 @@ fn controlled_fixture() -> (Connection, Vec<serde_json::Value>) {
     }
     db.execute(
         "UPDATE semantic_requested_producer_languages SET id=?1,language='python'",
+        [&producer.id],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE semantic_revision_raw_selections SET producer_id=?1",
         [&producer.id],
     )
     .unwrap();

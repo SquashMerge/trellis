@@ -30,6 +30,8 @@ pub(crate) struct PendingSemanticTarget {
 pub(crate) struct PreparedSemantic {
     pub producer: crate::semantic_evidence::Producer,
     pub output: PreparedOutput,
+    /// A below-capture batch whose staged capture witness this S publishes.
+    pub capture_witness: Option<i64>,
 }
 
 pub(crate) enum PreparedOutput {
@@ -590,6 +592,9 @@ impl Store {
             match &mut output.output {
                 PreparedOutput::Joined { admitted, .. } => {
                     let parts = admitted.join_parts()?;
+                    if let Some(batch) = output.capture_witness {
+                        super::captured_witness::publish_staged(&tx, parts.conn, batch)?;
+                    }
                     crate::semantic_import::read_staged_documents(
                         parts.conn,
                         "",

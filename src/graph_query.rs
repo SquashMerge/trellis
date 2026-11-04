@@ -840,14 +840,13 @@ pub(crate) fn call_disposition<'a>(
                 revision_id,
                 ..
             } = target
+                && pending.is_none()
             {
-                if pending.is_none() {
-                    pending = if revision_id == &projection.basis_native_revision_id {
-                        source.projection_endpoint(projection, &proof.producer_id, document)?
-                    } else {
-                        Some(BoundaryReason::CatchingUp)
-                    };
-                }
+                pending = if revision_id == &projection.basis_native_revision_id {
+                    source.projection_endpoint(projection, &proof.producer_id, document)?
+                } else {
+                    Some(BoundaryReason::CatchingUp)
+                };
             }
         }
         if let Some(pending) = pending {

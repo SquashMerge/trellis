@@ -607,7 +607,7 @@ mod tests {
         let mut oracle_continuation = None;
         let rejected = store
             .with_local_oracle_mismatch_for_tests(|| -> anyhow::Result<()> {
-                for _ in 0..128 {
+                for _ in 0..10_000 {
                     let _owner = state.step_lock.lock().unwrap();
                     match store.semantic_maintenance_unit(
                         &session,

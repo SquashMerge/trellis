@@ -25,6 +25,8 @@ pub(crate) struct SourceAuthority {
     pub dependency_hash: String,
     pub descriptor: Descriptor,
     target: PendingSemanticTarget,
+    /// The original associations are the batch's complete capture witness, not an import.
+    pub cache: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -103,6 +105,8 @@ pub(crate) struct OriginalAssociationCursor {
     parent_blob: Vec<u8>,
     child_phase: u8,
     child_ordinal: i64,
+    /// Rows of one capture-witness document, decoded once and handed out in pages.
+    cached: Option<std::collections::VecDeque<OriginalRow>>,
 }
 
 #[derive(Default)]
@@ -329,6 +333,17 @@ pub(crate) fn original_document_page(
 ) -> Result<OriginalPage> {
     original_guard(db, authority)?;
     ensure!(limit > 0, "witness page limit must be positive");
+    if authority.cache {
+        if cursor.cached.is_none() {
+            cursor.cached = Some(cache_rows(db, authority, witness, reserve)?.into());
+        }
+        let rows = cursor.cached.as_mut().unwrap();
+        let page: Vec<_> = (0..limit).map_while(|_| rows.pop_front()).collect();
+        return Ok(OriginalPage {
+            done: rows.is_empty(),
+            rows: page,
+        });
+    }
     let mut result = Vec::new();
     // Transitions are units too: a document with empty families cannot hide an unbounded scan.
     for _ in 0..limit {
@@ -343,6 +358,246 @@ pub(crate) fn original_document_page(
         rows: result,
         done: cursor.phase >= 10,
     })
+}
+
+/// The same typed original rows as `association_unit`, from one capture-witness document.
+fn cache_rows(
+    db: &Connection,
+    a: &SourceAuthority,
+    w: &OriginalSourceWitness,
+    reserve: &mut Reserve<'_>,
+) -> Result<Vec<OriginalRow>> {
+    let snapshot = crate::store::captured_witness::document(db, a.batch_id, &w.document)?
+        .ok_or_else(|| corrupt("capture witness document missing"))?;
+    reserve(
+        (serde_json::to_vec(&snapshot)?.len() as u64)
+            .checked_mul(2)
+            .ok_or_else(|| corrupt("capture witness size"))?,
+    )?;
+    let [coverage] = snapshot.coverage.as_slice() else {
+        return Err(corrupt("capture witness document coverage"));
+    };
+    let mut rows = vec![OriginalRow::Coverage(sem::Coverage {
+        producer_id: a.producer.id.clone(),
+        language: semantic_enum(w.document.language.clone())?,
+        source_set_id: a.source_set_id.clone(),
+        document_path: w.document.path.clone(),
+        revision_id: a.captured_revision_id.clone(),
+        requested: w.requested,
+        selected: w.selected,
+        state: w.state,
+        supported_roles: Vec::new(),
+        observed_roles: Vec::new(),
+        diagnostic: w.diagnostic.clone(),
+        reasons: w.reasons.clone(),
+    })];
+    for (observed, roles) in [
+        (false, &coverage.supported_roles),
+        (true, &coverage.observed_roles),
+    ] {
+        for (ordinal, role) in roles.iter().enumerate() {
+            rows.push(OriginalRow::CoverageRole {
+                observed,
+                ordinal: ordinal as i64,
+                role: *role,
+            });
+        }
+    }
+    let mut bases: Vec<sem::SemanticBasis> = Vec::new();
+    let mut provenance = snapshot.provenance.clone();
+    provenance.sort_by(|x, y| x.id.cmp(&y.id));
+    let mut proofs = Vec::new();
+    for p in &provenance {
+        let (Some(basis), Some(derived)) = (&p.basis, &p.derived_from) else {
+            return Err(corrupt("capture witness proof missing derivation"));
+        };
+        selected_ensure!(
+            basis.producer_id == a.producer.id
+                && basis.producer_version == a.producer.version
+                && basis.producer_hash == a.producer.executable_hash
+                && basis.artifact_hash == a.artifact_hash
+                && basis.source_set_id == a.source_set_id
+                && basis.revision_id == a.captured_revision_id
+                && basis.source_manifest_hash == a.source_manifest_hash
+                && basis.toolchain_hash == a.toolchain_hash
+                && basis.config_hash == a.config_hash
+                && basis.dependency_hash == a.dependency_hash
+                && semantic_variant(&basis.language)? == w.document.language,
+            "original basis mismatch"
+        );
+        selected_ensure!(
+            p.content_hash == w.source_hash,
+            "original provenance source mismatch"
+        );
+        let kind = semantic_variant(&derived.record_kind)?;
+        let membership:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2 AND record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6)",params![a.capture_id,derived.provenance_id,kind,derived.fact_digest,w.document.language,w.document.path],|r|r.get(0))?;
+        selected_ensure!(membership, "original derivation identity mismatch");
+        let basis_id = match bases.iter().position(|b| b == basis) {
+            Some(index) => index,
+            None => {
+                bases.push(basis.clone());
+                bases.len() - 1
+            }
+        } as i64
+            + 1;
+        proofs.push(OriginalRow::Provenance(OriginalProvenance {
+            id: p.id.clone(),
+            content_hash: p.content_hash.clone(),
+            evidence_kind: p.evidence_kind,
+            freshness: p.freshness,
+            basis_id,
+            capture_id: a.capture_id,
+            derived_from: derived.clone(),
+        }));
+    }
+    for (index, basis) in bases.iter().enumerate() {
+        let basis_id = index as i64 + 1;
+        rows.push(OriginalRow::Basis(OriginalBasis {
+            basis_id,
+            producer_id: basis.producer_id.clone(),
+            producer_version: basis.producer_version.clone(),
+            producer_hash: basis.producer_hash.clone(),
+            artifact_hash: basis.artifact_hash.clone(),
+            language: basis.language,
+            source_set_id: basis.source_set_id.clone(),
+            revision_id: basis.revision_id.clone(),
+            source_manifest_hash: basis.source_manifest_hash.clone(),
+            toolchain_hash: basis.toolchain_hash.clone(),
+            config_hash: basis.config_hash.clone(),
+            dependency_hash: basis.dependency_hash.clone(),
+        }));
+        for (ordinal, key) in basis.lookup_dependencies.iter().enumerate() {
+            rows.push(OriginalRow::BasisLookupDependency {
+                basis_id,
+                ordinal: ordinal as i64,
+                key: key.clone(),
+            });
+        }
+    }
+    rows.extend(proofs);
+    let join = |join: &sem::Join| OriginalJoin {
+        document: join.anchor.document.clone(),
+        revision_id: join.anchor.revision_id.clone(),
+        content_hash: join.anchor.content_hash.clone(),
+        range: join.anchor.range.clone(),
+        kind: join.anchor.kind,
+        status: join.status,
+        diagnostic: join.diagnostic.clone(),
+    };
+    for (ordinal, symbol) in snapshot.symbols.iter().enumerate() {
+        let row_id = ordinal as i64 + 1;
+        rows.push(OriginalRow::Symbol(OriginalSymbol {
+            row_id,
+            ordinal: ordinal as i64,
+            key: symbol.key.clone(),
+            display_name: symbol.display_name.clone(),
+            provenance_id: symbol.provenance_id.clone(),
+        }));
+        for (child, target) in symbol.declarations.iter().enumerate() {
+            rows.push(OriginalRow::SymbolTarget {
+                row_id,
+                ordinal: child as i64,
+                target: target.clone(),
+            });
+        }
+    }
+    for (ordinal, binding) in snapshot.declaration_bindings.iter().enumerate() {
+        let row_id = ordinal as i64 + 1;
+        rows.push(OriginalRow::DeclarationBinding(OriginalDeclaration {
+            row_id,
+            ordinal: ordinal as i64,
+            syntax_id: binding.syntax_id.clone(),
+            provenance_id: binding.provenance_id.clone(),
+            join: join(&binding.join),
+        }));
+        for (child, key) in binding.symbols.iter().enumerate() {
+            rows.push(OriginalRow::DeclarationSymbol {
+                row_id,
+                ordinal: child as i64,
+                key: key.clone(),
+            });
+        }
+        for (child, id) in binding.join.candidate_ids.iter().enumerate() {
+            rows.push(OriginalRow::DeclarationCandidate {
+                row_id,
+                ordinal: child as i64,
+                id: id.clone(),
+            });
+        }
+    }
+    let mut references = snapshot.references.clone();
+    references.sort_by(|x, y| x.id.cmp(&y.id));
+    for reference in references {
+        rows.push(OriginalRow::Reference(OriginalReference {
+            id: reference.id.clone(),
+            ordinal: reference.ordinal as i64,
+            owner_syntax_id: reference.owner_syntax_id.clone(),
+            range: reference.range.clone(),
+            spelling: reference.spelling.clone(),
+            lookup_key: reference.lookup_key.clone(),
+            site: reference.site,
+            resolution: reference.resolution,
+            declared_target: reference.declared_target.clone(),
+            provenance_id: reference.provenance_id.clone(),
+        }));
+        for (child, role) in reference.roles.iter().enumerate() {
+            rows.push(OriginalRow::ReferenceRole {
+                reference_id: reference.id.clone(),
+                ordinal: child as i64,
+                role: *role,
+            });
+        }
+        for (child, target) in reference.candidates.iter().enumerate() {
+            rows.push(OriginalRow::ReferenceCandidate {
+                reference_id: reference.id.clone(),
+                ordinal: child as i64,
+                target: target.clone(),
+            });
+        }
+    }
+    for (ordinal, call) in snapshot.call_bindings.iter().enumerate() {
+        let row_id = ordinal as i64 + 1;
+        rows.push(OriginalRow::CallBinding(OriginalCall {
+            row_id,
+            ordinal: ordinal as i64,
+            call_id: call.call_id.clone(),
+            join: join(&call.join),
+            resolution: call.resolution,
+            declared_target: call.declared_target.clone(),
+            dispatch: call.dispatch,
+            possible_dispatch_complete: call.possible_dispatch_complete,
+            stale_target: call.stale_target,
+            provenance_id: call.provenance_id.clone(),
+        }));
+        for (child, id) in call.join.candidate_ids.iter().enumerate() {
+            rows.push(OriginalRow::CallJoinCandidate {
+                row_id,
+                ordinal: child as i64,
+                id: id.clone(),
+            });
+        }
+        for (child, target) in call.candidates.iter().enumerate() {
+            rows.push(OriginalRow::CallCandidate {
+                row_id,
+                ordinal: child as i64,
+                target: target.clone(),
+            });
+        }
+        for (child, target) in call.possible_dispatch.iter().enumerate() {
+            rows.push(OriginalRow::CallDispatch {
+                row_id,
+                ordinal: child as i64,
+                target: target.clone(),
+            });
+        }
+    }
+    for (ordinal, relationship) in snapshot.type_relationships.iter().enumerate() {
+        rows.push(OriginalRow::TypeRelationship {
+            ordinal: ordinal as i64,
+            row: relationship.clone(),
+        });
+    }
+    Ok(rows)
 }
 
 fn association_unit(
@@ -898,6 +1153,13 @@ fn guard(db: &Connection, authority: &SourceAuthority) -> Result<()> {
 
 fn original_guard(db: &Connection, authority: &SourceAuthority) -> Result<()> {
     guard(db, authority)?;
+    if authority.cache {
+        selected_ensure!(
+            crate::store::captured_witness::exists(db, authority.batch_id)?,
+            "original capture witness unavailable"
+        );
+        return Ok(());
+    }
     let available:bool=db.query_row("SELECT NOT EXISTS(SELECT 1 FROM native_revision_supersessions WHERE revision_id=?1 AND state<>'retained') AND EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1 AND producer_id=?2 AND batch_id=?3 AND captured_pin=?4)",params![semantic_pin_key(authority.original_pin),authority.producer.id,authority.batch_id,semantic_pin_key(authority.captured_pin)],|r|r.get(0))?;
     selected_ensure!(available, "original witness authority unavailable");
     Ok(())
@@ -986,7 +1248,7 @@ pub(crate) fn source_authority(
             || captured.revision.toolchain_hash != current.revision.toolchain_hash
             || captured.revision.dependency_hash != current.revision.dependency_hash
         {
-            return Ok(AuthorityStep::Full("witness_context_changed"));
+            return Ok(AuthorityStep::Full("destination_witness_unavailable"));
         }
         // Changed capture options (file-size cap, SCIP or manifest path) are a context
         // invalidation: FULL by rule, as the pre-native-first route was, not a witness fallback.
@@ -1038,6 +1300,7 @@ pub(crate) fn source_authority(
             dependency_hash: captured.revision.dependency_hash,
             descriptor,
             target: target.clone(),
+            cache: false,
         });
         cursor.phase = 1;
         return Ok(AuthorityStep::Progress);
@@ -1068,7 +1331,20 @@ pub(crate) fn source_authority(
             return Ok(AuthorityStep::Progress);
         }
         let Some((_, pin)) = cursor.original else {
-            return Ok(AuthorityStep::Full("original_import_missing"));
+            // An import that landed below its capture has no original import; a complete
+            // capture witness, published by an earlier FULL catch-up, stands in for it.
+            if !crate::store::captured_witness::exists(db, authority.batch_id)? {
+                return Ok(AuthorityStep::Full("original_import_missing"));
+            }
+            let full:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_revision_producers WHERE revision_id=?1 AND id=?2 AND version=?3 AND context_mode='fullCaptured')",params![semantic_pin_key(target.pin),authority.producer.id,authority.producer.version],|r|r.get(0))?;
+            if !full {
+                return Ok(AuthorityStep::Full("controlled_profile_requires_full"));
+            }
+            let authority = cursor.authority.as_mut().unwrap();
+            authority.cache = true;
+            authority.original_pin = authority.captured_pin;
+            cursor.phase = 2;
+            return Ok(AuthorityStep::Progress);
         };
         let releasing:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM native_revision_supersessions WHERE revision_id=?1 AND state<>'retained')",[semantic_pin_key(pin)],|r|r.get(0))?;
         if releasing {
@@ -1195,21 +1471,52 @@ pub(crate) fn original_document_begin(
     if captured != current {
         return Ok(WitnessEligibility::Full("selected_version_changed"));
     }
-    let tuple:Option<(i64,bool,bool,String,Option<String>)>=db.query_row("SELECT tuple_id,requested,selected,state,diagnostic FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND producer_version=?3 AND language=?4 AND path=?5",params![semantic_pin_key(authority.original_pin),authority.producer.id,authority.producer.version,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-    let Some((tuple_id, requested, selected, state, diagnostic)) = tuple else {
-        return Ok(WitnessEligibility::Full("original_tuple_missing"));
+    let (tuple_id, requested, selected, state, diagnostic, reasons, cached_authored) = if authority
+        .cache
+    {
+        let Some(snapshot) = crate::store::captured_witness::document(db, authority.batch_id, key)?
+        else {
+            return Ok(WitnessEligibility::Full("original_tuple_missing"));
+        };
+        let [coverage] = snapshot.coverage.as_slice() else {
+            return Err(corrupt("capture witness document coverage"));
+        };
+        if snapshot
+            .provenance
+            .iter()
+            .any(|p| p.derived_from.is_none() || p.basis.is_none())
+        {
+            return Ok(WitnessEligibility::Full("original_provenance_not_derived"));
+        }
+        (
+            0,
+            coverage.requested,
+            coverage.selected,
+            coverage.state,
+            coverage.diagnostic.clone(),
+            coverage.reasons.clone(),
+            Some(!snapshot.provenance.is_empty()),
+        )
+    } else {
+        let tuple:Option<(i64,bool,bool,String,Option<String>)>=db.query_row("SELECT tuple_id,requested,selected,state,diagnostic FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND producer_version=?3 AND language=?4 AND path=?5",params![semantic_pin_key(authority.original_pin),authority.producer.id,authority.producer.version,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let Some((tuple_id, requested, selected, state, diagnostic)) = tuple else {
+            return Ok(WitnessEligibility::Full("original_tuple_missing"));
+        };
+        context::validate_tuple(
+            db,
+            &semantic_pin_key(authority.original_pin),
+            &authority.producer.id,
+            tuple_id,
+        )?;
+        let state: sem::CoverageState = semantic_enum(state)?;
+        let reasons = read_coverage_reasons(db, tuple_id)?;
+        if has_nonderived_original_provenance(db, tuple_id)? {
+            return Ok(WitnessEligibility::Full("original_provenance_not_derived"));
+        }
+        (
+            tuple_id, requested, selected, state, diagnostic, reasons, None,
+        )
     };
-    context::validate_tuple(
-        db,
-        &semantic_pin_key(authority.original_pin),
-        &authority.producer.id,
-        tuple_id,
-    )?;
-    let state: sem::CoverageState = semantic_enum(state)?;
-    let reasons = read_coverage_reasons(db, tuple_id)?;
-    if has_nonderived_original_provenance(db, tuple_id)? {
-        return Ok(WitnessEligibility::Full("original_provenance_not_derived"));
-    }
     if reasons.as_ref().is_some_and(|r| r.omitted) {
         return Ok(WitnessEligibility::Full("original_associations_omitted"));
     }
@@ -1221,11 +1528,14 @@ pub(crate) fn original_document_begin(
         return Ok(WitnessEligibility::Full("original_coverage_differs"));
     }
     if exclusion.is_some() {
-        let authored: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE tuple_id=?1)",
-            [tuple_id],
-            |r| r.get(0),
-        )?;
+        let authored: bool = match cached_authored {
+            Some(authored) => authored,
+            None => db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE tuple_id=?1)",
+                [tuple_id],
+                |r| r.get(0),
+            )?,
+        };
         if bearing || claims || authored {
             return Ok(WitnessEligibility::Full("excluded_original_has_facts"));
         }
@@ -1331,6 +1641,31 @@ pub(crate) fn internal_symbols_page(
         cursor.binding_ordinal = -1;
         cursor.symbol_ordinal = -1;
         cursor.started = true;
+    }
+    if authority.cache {
+        // One capture-witness document per call, keyed by its rowid.
+        let next: Option<(i64, String)> = db
+            .query_row(
+                "SELECT rowid,snapshot_json FROM semantic_batch_witness_documents WHERE batch_id=?1 AND rowid>?2 ORDER BY rowid LIMIT 1",
+                params![authority.batch_id, cursor.tuple],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((rowid, json)) = next else {
+            cursor.done = true;
+            return Ok(result);
+        };
+        reserve(json.len() as u64)?;
+        cursor.tuple = rowid;
+        let snapshot: sem::SemanticSnapshot = serde_json::from_str(&json).context(
+            SelectedIntegrity("incompatible_index: corrupt captured witness snapshot".into()),
+        )?;
+        for binding in &snapshot.declaration_bindings {
+            if binding.syntax_id.is_some() && binding.join.status == sem::JoinStatus::Exact {
+                result.extend(binding.symbols.iter().cloned());
+            }
+        }
+        return Ok(result);
     }
     // Each call advances at most `limit` rows/transitions, including empty parents.
     for _ in 0..limit {
