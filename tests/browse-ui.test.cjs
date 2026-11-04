@@ -1255,6 +1255,25 @@ test("equal head hides the indication, later reads discover newer head and lower
   assertRetained(h); assert.equal(h.timers.size,0);
 });
 
+test("an unchanged head revalidates with its ETag and reuses the remembered digest on 304", async () => {
+  const h = retainedHarness(), sent = [];
+  const tagged = (data, etag) => ({ok:true,status:200,headers:{get:name => name === "ETag" ? etag : null},json:async()=>data});
+  const notModified = {ok:false,status:304,headers:{get:() => '"h1"'},json:async()=>{ throw new Error("a 304 has no body"); }};
+  const replies = [tagged({workspaceRoot:"/synthetic",revision:newerHead},'"h1"'), notModified,
+    tagged({workspaceRoot:"/synthetic",revision:rebuiltHead},'"h2"')];
+  h.context.fetch = async (request, options) => { sent.push([request, options.headers["If-None-Match"] ?? null]); return replies.shift(); };
+  h.run("observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/);
+  h.run("observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/,"a 304 keeps the remembered head");
+  assert.equal(h.get("error").hidden,true);
+  h.run("observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Index rebuilt/);
+  assert.deepEqual(sent,[["/api/status/head",null],["/api/status/head",'"h1"'],["/api/status/head",'"h1"']]);
+  assert.equal(h.run("headRevalidation.etag"),'"h2"');
+  assertRetained(h);
+});
+
 test("different generation is rebuilt, never numerically ordered or silently adopted", async () => {
   const h = retainedHarness();
   h.context.fetch = async () => response({workspaceRoot:"/synthetic",revision:rebuiltHead});

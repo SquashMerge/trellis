@@ -22,6 +22,8 @@ pub use semantic_display::{
     CallSemantic, LANGUAGE_NOTE, LanguageTier, McpSemantic, NO_PRODUCER_NOTE, ProducerNotPublished,
     ProducerSelection, multiple_producers_note,
 };
+#[cfg(feature = "test-support")]
+pub use semantic_display::status_semantic_projections_for_tests;
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
