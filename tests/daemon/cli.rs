@@ -4147,3 +4147,224 @@ async fn architecture_cli_waits_for_startup_reconciliation_after_typed_admission
     drop(replacement);
     trellis::testing::wait_until("replacement daemon cleanup", || !successor.matches());
 }
+
+/// #687: a selected CLI read refused by a peer's exclusive index-use lock
+/// (such as a restarted daemon's startup probe) waits within its bounded read
+/// budget and retries, instead of failing at once with `storage_busy`.
+#[tokio::test]
+async fn status_waits_out_index_use_contention_within_its_read_budget() {
+    let (indexed, status) = read_under_index_use_contention("status", no_selectors, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        status["revision"]["indexGeneration"], indexed["publishedRevision"]["indexGeneration"],
+        "{status}"
+    );
+}
+
+/// #687: contention that outlasts the read budget is still typed `storage_busy`.
+#[tokio::test]
+async fn status_reports_typed_busy_when_contention_outlasts_its_read_budget() {
+    read_under_index_use_contention("status", no_selectors, false).await;
+}
+
+/// #687: metrics reads take the same bounded contention retry as status.
+#[tokio::test]
+async fn metrics_waits_out_index_use_contention_within_its_read_budget() {
+    // File scope reads the index directly, without the Architecture owner.
+    let (_, metrics) = read_under_index_use_contention("metrics", file_metrics_selectors, true)
+        .await
+        .unwrap();
+    assert_eq!(metrics["payload"]["scope"], "file", "{metrics}");
+    assert_eq!(
+        metrics["payload"]["files"][0]["path"], "flow.js",
+        "{metrics}"
+    );
+}
+
+fn no_selectors(_: &std::path::Path, _: &std::path::Path) -> Vec<String> {
+    Vec::new()
+}
+
+/// Exact file-scope selectors, read from the indexed revision before restart.
+fn file_metrics_selectors(root: &std::path::Path, home: &std::path::Path) -> Vec<String> {
+    let revision = command(root, home, "metrics")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        revision.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revision.stderr)
+    );
+    let revision: Value = serde_json::from_slice(&revision.stdout).unwrap();
+    let payload = &revision["payload"];
+    let file = &payload["files"][0];
+    [
+        "--json",
+        "--scope",
+        "file",
+        "--pin",
+        &format!(
+            "{}:{}",
+            payload["indexGeneration"].as_str().unwrap(),
+            payload["indexRevision"]
+        ),
+        "--source-set-id",
+        file["sourceSetId"].as_str().unwrap(),
+        "--language",
+        file["language"].as_str().unwrap(),
+        "--path",
+        file["path"].as_str().unwrap(),
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+/// Run one selected CLI read whose daemon restart is paused before writer
+/// admission while the test holds the index-use lock exclusively. On
+/// `release`, returns the index output and the read's JSON output.
+async fn read_under_index_use_contention(
+    sub: &str,
+    selectors: fn(&std::path::Path, &std::path::Path) -> Vec<String>,
+    release: bool,
+) -> Option<(Value, Value)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use trellis::store::topology::UseGuard;
+
+    // Keep Unix socket paths below the platform sockaddr_un bound.
+    let temp = tempfile::Builder::new()
+        .prefix("trellis-cli-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("flow.js"), "function start() {}\n").unwrap();
+    let daemon = FixtureDaemon::new(&home);
+    let indexed = command(&root, &home, "index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    let selectors = selectors(&root, &home);
+    // A checkout's admitted writer holds the index-use lock shared, so
+    // exclusive contention exists only before a restarted daemon admits one.
+    daemon.stop_attested().unwrap();
+    let use_lock = real_index_db(&home)
+        .parent()
+        .unwrap()
+        .with_extension("lock");
+    // The replacement daemon inherits both fixtures from the status that
+    // starts it: startup reconciliation pauses before admitting its writer,
+    // and the status read pauses after activation, before its selected read.
+    let startup_path = home.join("startup.sock");
+    let contention_path = home.join("contention.sock");
+    let startup_listener = tokio::net::UnixListener::bind(&startup_path).unwrap();
+    let contention_listener = tokio::net::UnixListener::bind(&contention_path).unwrap();
+    let replacement = FixtureDaemon::new(&home);
+    let stdout_path = temp.path().join("read.stdout");
+    let stderr_path = temp.path().join("read.stderr");
+    let mut status = command(&root, &home, sub);
+    status
+        .args(&selectors)
+        .env("TRELLIS_TEST_DAEMON_STARTUP_SOCKET", &startup_path)
+        .env("TRELLIS_TEST_CLI_READ_CONTENTION_SOCKET", &contention_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(
+            fs::File::create(&stdout_path).unwrap(),
+        ))
+        .stderr(std::process::Stdio::from(
+            fs::File::create(&stderr_path).unwrap(),
+        ));
+    let mut child = tokio::process::Command::from(status)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let (mut startup, mut read) = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        let startup = async {
+            let (mut startup, _) = startup_listener.accept().await.unwrap();
+            startup.read_exact(&mut [0]).await.unwrap();
+            startup
+        };
+        let read = async {
+            let (mut read, _) = contention_listener.accept().await.unwrap();
+            let mut arrived = [0];
+            read.read_exact(&mut arrived).await.unwrap();
+            assert_eq!(arrived, *b"R");
+            read
+        };
+        tokio::select! {
+            arrived = async { tokio::join!(startup, read) } => Ok(arrived),
+            exited = child.wait() => Err(exited.unwrap()),
+        }
+    })
+    .await
+    .expect("read did not reach both startup and its selected read")
+    .unwrap_or_else(|exited| {
+        panic!(
+            "{sub} exited ({exited}) before its selected read: {}",
+            fs::read_to_string(&stderr_path).unwrap()
+        )
+    });
+    // Startup holds no writer yet, so this stands in for a peer's EX stage.
+    let exclusive = UseGuard::acquire_existing_readonly_exclusive(&use_lock)
+        .expect("no index-use lock is held before writer admission");
+    read.write_all(&[1]).await.unwrap();
+    let waiting = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        tokio::select! {
+            accepted = contention_listener.accept() => {
+                let (mut waiting, _) = accepted.unwrap();
+                let mut arrived = [0];
+                waiting.read_exact(&mut arrived).await.unwrap();
+                Ok(arrived)
+            }
+            exited = child.wait() => Err(exited.unwrap()),
+        }
+    })
+    .await
+    .expect("status neither waited on contention nor exited");
+    match waiting {
+        Ok(arrived) => assert_eq!(arrived, *b"B"),
+        Err(exited) => panic!(
+            "{sub} did not wait out index-use contention ({exited}): {}",
+            fs::read_to_string(&stderr_path).unwrap()
+        ),
+    }
+    // The refused read is waiting within its budget and has emitted nothing.
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(fs::read(&stdout_path).unwrap().is_empty());
+    if !release {
+        let exited = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, child.wait())
+            .await
+            .expect("contended read outlived its bounded read budget")
+            .unwrap();
+        assert!(!exited.success(), "contended read unexpectedly succeeded");
+        assert!(fs::read(&stdout_path).unwrap().is_empty());
+        let stderr = fs::read_to_string(&stderr_path).unwrap();
+        assert!(
+            stderr.contains("storage_busy: CLI read contention wait expired"),
+            "unexpected contended {sub} error: {stderr}"
+        );
+    }
+    drop(exclusive);
+    startup.write_all(&[1]).await.unwrap();
+    if !release {
+        drop(replacement);
+        return None;
+    }
+    let exited = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, child.wait())
+        .await
+        .expect("read did not complete after the lock was released")
+        .unwrap();
+    assert!(
+        exited.success(),
+        "{}",
+        fs::read_to_string(&stderr_path).unwrap()
+    );
+    let output: Value = serde_json::from_slice(&fs::read(&stdout_path).unwrap()).unwrap();
+    drop(replacement);
+    Some((indexed, output))
+}
