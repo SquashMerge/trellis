@@ -2158,8 +2158,23 @@ pub(crate) fn cooperative_semantic_unit(
     if !admitted() {
         return Ok(SemanticUnitOutcome::Deferred);
     }
-    store.semantic_maintenance_unit(session, continuation, cancel)
+    // One scheduling unit runs bounded continuation steps for at most a short slice, and
+    // rechecks the queue, watcher and priority between steps, so accepted foreground work
+    // waits at most one step while per-unit setup is not paid per document.
+    let started = std::time::Instant::now();
+    loop {
+        let outcome = store.semantic_maintenance_unit(session, continuation, cancel)?;
+        if outcome != SemanticUnitOutcome::Progress
+            || started.elapsed() >= SEMANTIC_UNIT_SLICE
+            || !admitted()
+        {
+            return Ok(outcome);
+        }
+    }
 }
+
+/// The time one semantic maintenance unit may keep the worker between foreground checks.
+const SEMANTIC_UNIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// A checkout's daemon-local writer confirms old-root queue settlement, then
 /// commits mandatory startup reconciliation before its scheduler may claim FIFO requests.

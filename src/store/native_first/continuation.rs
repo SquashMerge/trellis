@@ -12,6 +12,9 @@ pub(crate) enum SemanticUnitOutcome {
     Deferred,
 }
 
+/// How long one S unit may keep stepping inside its snapshot before it returns.
+const STEP_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+
 pub(crate) struct SemanticContinuation {
     target: PendingSemanticTarget,
     next: usize,
@@ -144,251 +147,265 @@ impl Store {
         let limits = batch_publication_limits();
         let target = state.target.clone();
         let result = self.with_pending_semantic_inputs(&target, |db, destination_read| {
-            let captured_read = ReadRevision::new(
-                selection.captured_pin,
-                semantic_pin_key(selection.captured_pin),
-            );
-            let captured = NativeReader {
-                store: self,
-                db,
-                selected: &captured_read,
-            };
-            let destination = NativeReader {
-                store: self,
-                db,
-                selected: destination_read,
-            };
-            if state.current.is_none() {
-                let producer = pending_producer(db, &target, &selection.producer_id)?;
-                state.current = Some(ProducerContinuation {
-                    producer,
-                    admission: None,
-                    admitted: None,
-                    join: None,
-                    counters: BatchCounters::default(),
-                    budget: LookupBudget::new(&limits),
-                    authority_cursor: super::witness::OriginalAdmissionCursor::default(),
-                    authority: None,
-                    // Test-support switch: take the bounded FULL path without a witness attempt.
-                    #[cfg(feature = "test-support")]
-                    full: std::env::var_os("TRELLIS_TEST_FORCE_FULL_REJOIN").is_some(),
-                    #[cfg(not(feature = "test-support"))]
-                    full: false,
-                    target_cursor: super::local_targets::TargetIndexCursor::default(),
-                    target_index_done: false,
-                    witness_preparation: super::witness_preparation::WitnessPreparation::default(),
-                    witness_ready: false,
-                    capture_witness: false,
-                    capture_join: None,
-                });
-            }
-            let current = state.current.as_mut().unwrap();
-            if !current.full && current.authority.is_none() {
-                match super::witness::source_authority(
-                    db,
-                    &target,
-                    &selection,
-                    &mut current.authority_cursor,
-                    &limits,
-                    cancel,
-                )? {
-                    super::witness::AuthorityStep::Progress => return Ok(None),
-                    super::witness::AuthorityStep::Eligible(authority) => {
-                        current.authority = Some(authority)
+            // One coherent snapshot serves several bounded steps; it never survives a return
+            // to worker selection, and the slice keeps foreground work waiting briefly.
+            let started = std::time::Instant::now();
+            loop {
+                let step = (|| {
+                    let captured_read = ReadRevision::new(
+                        selection.captured_pin,
+                        semantic_pin_key(selection.captured_pin),
+                    );
+                    let captured = NativeReader {
+                        store: self,
+                        db,
+                        selected: &captured_read,
+                    };
+                    let destination = NativeReader {
+                        store: self,
+                        db,
+                        selected: destination_read,
+                    };
+                    if state.current.is_none() {
+                        let producer = pending_producer(db, &target, &selection.producer_id)?;
+                        state.current = Some(ProducerContinuation {
+                            producer,
+                            admission: None,
+                            admitted: None,
+                            join: None,
+                            counters: BatchCounters::default(),
+                            budget: LookupBudget::new(&limits),
+                            authority_cursor: super::witness::OriginalAdmissionCursor::default(),
+                            authority: None,
+                            // Test-support switch: take the bounded FULL path without a witness attempt.
+                            #[cfg(feature = "test-support")]
+                            full: std::env::var_os("TRELLIS_TEST_FORCE_FULL_REJOIN").is_some(),
+                            #[cfg(not(feature = "test-support"))]
+                            full: false,
+                            target_cursor: super::local_targets::TargetIndexCursor::default(),
+                            target_index_done: false,
+                            witness_preparation:
+                                super::witness_preparation::WitnessPreparation::default(),
+                            witness_ready: false,
+                            capture_witness: false,
+                            capture_join: None,
+                        });
                     }
-                    super::witness::AuthorityStep::Ineligible => current.full = true,
-                    super::witness::AuthorityStep::Full(reason) => {
-                        current.full = true;
-                        current.capture_witness = reason == "original_import_missing";
+                    let current = state.current.as_mut().unwrap();
+                    if !current.full && current.authority.is_none() {
+                        match super::witness::source_authority(
+                            db,
+                            &target,
+                            &selection,
+                            &mut current.authority_cursor,
+                            &limits,
+                            cancel,
+                        )? {
+                            super::witness::AuthorityStep::Progress => return Ok(None),
+                            super::witness::AuthorityStep::Eligible(authority) => {
+                                current.authority = Some(authority)
+                            }
+                            super::witness::AuthorityStep::Ineligible => current.full = true,
+                            super::witness::AuthorityStep::Full(reason) => {
+                                current.full = true;
+                                current.capture_witness = reason == "original_import_missing";
+                                #[cfg(feature = "test-support")]
+                                crate::semantic_import::note_local_witness_outcome(Some(reason));
+                            }
+                        }
+                        return Ok(None);
+                    }
+                    if !current.full && !current.target_index_done {
+                        if state.target_stage.is_none() {
+                            let mut stage = crate::semantic_batch::staging::Stage::create(
+                                &stage_parent,
+                                &format!("native-target-{}", uuid::Uuid::new_v4()),
+                                &session.incarnation().to_string(),
+                            )?;
+                            stage.release_connection();
+                            state.target_stage = Some(stage);
+                            return Ok(None);
+                        }
+                        let stage = state.target_stage.as_mut().unwrap();
+                        let advanced = super::local_targets::advance(
+                            db,
+                            &target,
+                            selection.captured_pin,
+                            stage,
+                            &mut current.target_cursor,
+                            &limits,
+                            cancel,
+                        );
+                        stage.release_connection();
+                        let advanced = advanced?;
+                        current.target_index_done = advanced.done;
                         #[cfg(feature = "test-support")]
-                        crate::semantic_import::note_local_witness_outcome(Some(reason));
+                        crate::semantic_import::note_local_target_work(
+                            advanced.builds,
+                            advanced.changed_documents,
+                            advanced.current_target_rows,
+                        );
+                        return Ok(None);
                     }
-                }
-                return Ok(None);
-            }
-            if !current.full && !current.target_index_done {
-                if state.target_stage.is_none() {
-                    let mut stage = crate::semantic_batch::staging::Stage::create(
-                        &stage_parent,
-                        &format!("native-target-{}", uuid::Uuid::new_v4()),
-                        &session.incarnation().to_string(),
-                    )?;
-                    stage.release_connection();
-                    state.target_stage = Some(stage);
-                    return Ok(None);
-                }
-                let stage = state.target_stage.as_mut().unwrap();
-                let advanced = super::local_targets::advance(
-                    db,
-                    &target,
-                    selection.captured_pin,
-                    stage,
-                    &mut current.target_cursor,
-                    &limits,
-                    cancel,
-                );
-                stage.release_connection();
-                let advanced = advanced?;
-                current.target_index_done = advanced.done;
-                #[cfg(feature = "test-support")]
-                crate::semantic_import::note_local_target_work(
-                    advanced.builds,
-                    advanced.changed_documents,
-                    advanced.current_target_rows,
-                );
-                return Ok(None);
-            }
-            if current.admission.is_none() && current.admitted.is_none() {
-                let request = format!("native-catchup-{}", uuid::Uuid::new_v4());
-                let incarnation = session.incarnation().to_string();
-                let owner = StageOwner {
-                    request_id: &request,
-                    incarnation: &incarnation,
-                };
-                current.admission = Some(if current.full {
-                    RetainedStageContinuation::new(
-                        db,
-                        &captured,
-                        selection.batch_id,
-                        &stage_parent,
-                        owner,
-                        &limits,
-                        cancel,
-                    )?
-                    .authenticated()
-                } else {
-                    RetainedStageContinuation::new_witnessed(
-                        db,
-                        &captured,
-                        selection.batch_id,
-                        &stage_parent,
-                        owner,
-                        &limits,
-                        cancel,
-                    )?
-                });
-                return Ok(None);
-            }
-            if let Some(admission) = current.admission.as_mut() {
-                if let Some(admitted) =
-                    admission.advance(db, &captured, &mut current.counters, cancel)?
-                {
-                    current.admitted = Some(admitted);
-                    current.admission = None;
-                    if current.full {
-                        current.join = Some(JoinContinuation::new(
-                            target.pin,
-                            limits.clone(),
-                            DestinationMutations::default(),
-                        ));
-                        if current.capture_witness {
-                            current.capture_join = Some(JoinContinuation::new(
-                                selection.captured_pin,
-                                limits.clone(),
-                                DestinationMutations::default(),
-                            ));
+                    if current.admission.is_none() && current.admitted.is_none() {
+                        let request = format!("native-catchup-{}", uuid::Uuid::new_v4());
+                        let incarnation = session.incarnation().to_string();
+                        let owner = StageOwner {
+                            request_id: &request,
+                            incarnation: &incarnation,
+                        };
+                        current.admission = Some(if current.full {
+                            RetainedStageContinuation::new(
+                                db,
+                                &captured,
+                                selection.batch_id,
+                                &stage_parent,
+                                owner,
+                                &limits,
+                                cancel,
+                            )?
+                            .authenticated()
+                        } else {
+                            RetainedStageContinuation::new_witnessed(
+                                db,
+                                &captured,
+                                selection.batch_id,
+                                &stage_parent,
+                                owner,
+                                &limits,
+                                cancel,
+                            )?
+                        });
+                        return Ok(None);
+                    }
+                    if let Some(admission) = current.admission.as_mut() {
+                        if let Some(admitted) =
+                            admission.advance(db, &captured, &mut current.counters, cancel)?
+                        {
+                            current.admitted = Some(admitted);
+                            current.admission = None;
+                            if current.full {
+                                current.join = Some(JoinContinuation::new(
+                                    target.pin,
+                                    limits.clone(),
+                                    DestinationMutations::default(),
+                                ));
+                                if current.capture_witness {
+                                    current.capture_join = Some(JoinContinuation::new(
+                                        selection.captured_pin,
+                                        limits.clone(),
+                                        DestinationMutations::default(),
+                                    ));
+                                }
+                            }
+                        }
+                        return Ok(None);
+                    }
+                    let admitted = current
+                        .admitted
+                        .as_mut()
+                        .context("missing admitted semantic stage")?;
+                    if !current.full && !current.witness_ready {
+                        let stage = state
+                            .target_stage
+                            .as_mut()
+                            .context("missing LOCAL target index")?;
+                        let result = current.witness_preparation.advance(
+                            db,
+                            &target,
+                            current
+                                .authority
+                                .as_deref()
+                                .context("missing original witness authority")?,
+                            &destination,
+                            admitted,
+                            stage,
+                            &limits,
+                            &mut current.counters,
+                            &mut current.budget,
+                            cancel,
+                        );
+                        stage.release_connection();
+                        admitted.stage_mut().release_connection();
+                        current.witness_ready = result?;
+                        if current.witness_ready {
+                            current.join =
+                                Some(JoinContinuation::new_witnessed(target.pin, limits.clone()));
+                        }
+                        return Ok(None);
+                    }
+                    if let Some(capture_join) = current.capture_join.as_mut() {
+                        // The batch's own captured==captured rows, kept privately until the S commit.
+                        let result = capture_join.advance(
+                            admitted,
+                            &captured,
+                            &captured,
+                            &mut current.budget,
+                            &mut current.counters,
+                            cancel,
+                        );
+                        let staged = result.and_then(|joined| {
+                            if joined.is_some() {
+                                let producer = admitted.producer().producer();
+                                let parts = admitted.join_parts()?;
+                                super::super::captured_witness::stage_documents(
+                                    parts.conn, &producer,
+                                )?;
+                            }
+                            Ok(joined.is_some())
+                        });
+                        admitted.stage_mut().release_connection();
+                        if staged? {
+                            current.capture_join = None;
+                        }
+                        return Ok(None);
+                    }
+                    let result = current
+                        .join
+                        .as_mut()
+                        .context("missing semantic join continuation")?
+                        .advance(
+                            admitted,
+                            &captured,
+                            &destination,
+                            &mut current.budget,
+                            &mut current.counters,
+                            cancel,
+                        );
+                    admitted.stage_mut().release_connection();
+                    let joined = result?;
+                    if let Some(joined) = &joined {
+                        ensure!(
+                            admitted.producer().producer() == current.producer,
+                            "selected batch producer descriptor mismatch"
+                        );
+                        ensure!(
+                            joined.destination_revision_id() == target.native_revision_id,
+                            "semantic continuation destination identity mismatch"
+                        );
+                        #[cfg(feature = "test-support")]
+                        if super::oracle::enabled() {
+                            let comparison = super::oracle::check(
+                                self,
+                                db,
+                                &target,
+                                &selection,
+                                &current.producer,
+                                admitted,
+                                cancel,
+                            );
+                            admitted.stage_mut().release_connection();
+                            // Oracle failures are test failures, never producer unavailability.
+                            comparison.map_err(|error| error.context(RejoinOracleMismatch))?;
                         }
                     }
-                }
-                return Ok(None);
-            }
-            let admitted = current
-                .admitted
-                .as_mut()
-                .context("missing admitted semantic stage")?;
-            if !current.full && !current.witness_ready {
-                let stage = state
-                    .target_stage
-                    .as_mut()
-                    .context("missing LOCAL target index")?;
-                let result = current.witness_preparation.advance(
-                    db,
-                    &target,
-                    current
-                        .authority
-                        .as_deref()
-                        .context("missing original witness authority")?,
-                    &destination,
-                    admitted,
-                    stage,
-                    &limits,
-                    &mut current.counters,
-                    &mut current.budget,
-                    cancel,
-                );
-                stage.release_connection();
-                admitted.stage_mut().release_connection();
-                current.witness_ready = result?;
-                if current.witness_ready {
-                    current.join =
-                        Some(JoinContinuation::new_witnessed(target.pin, limits.clone()));
-                }
-                return Ok(None);
-            }
-            if let Some(capture_join) = current.capture_join.as_mut() {
-                // The batch's own captured==captured rows, kept privately until the S commit.
-                let result = capture_join.advance(
-                    admitted,
-                    &captured,
-                    &captured,
-                    &mut current.budget,
-                    &mut current.counters,
-                    cancel,
-                );
-                let staged = result.and_then(|joined| {
-                    if joined.is_some() {
-                        let producer = admitted.producer().producer();
-                        let parts = admitted.join_parts()?;
-                        super::super::captured_witness::stage_documents(parts.conn, &producer)?;
-                    }
-                    Ok(joined.is_some())
-                });
-                admitted.stage_mut().release_connection();
-                if staged? {
-                    current.capture_join = None;
-                }
-                return Ok(None);
-            }
-            let result = current
-                .join
-                .as_mut()
-                .context("missing semantic join continuation")?
-                .advance(
-                    admitted,
-                    &captured,
-                    &destination,
-                    &mut current.budget,
-                    &mut current.counters,
-                    cancel,
-                );
-            admitted.stage_mut().release_connection();
-            let joined = result?;
-            if let Some(joined) = &joined {
-                ensure!(
-                    admitted.producer().producer() == current.producer,
-                    "selected batch producer descriptor mismatch"
-                );
-                ensure!(
-                    joined.destination_revision_id() == target.native_revision_id,
-                    "semantic continuation destination identity mismatch"
-                );
-                #[cfg(feature = "test-support")]
-                if super::oracle::enabled() {
-                    let comparison = super::oracle::check(
-                        self,
-                        db,
-                        &target,
-                        &selection,
-                        &current.producer,
-                        admitted,
-                        cancel,
-                    );
-                    admitted.stage_mut().release_connection();
-                    // Oracle failures are test failures, never producer unavailability.
-                    comparison.map_err(|error| error.context(RejoinOracleMismatch))?;
+                    Ok(joined)
+                })();
+                match step {
+                    Ok(None) if started.elapsed() < STEP_SLICE => check_cancel(cancel)?,
+                    step => return step,
                 }
             }
-            Ok(joined)
         });
         match result {
             Ok(None) => {
