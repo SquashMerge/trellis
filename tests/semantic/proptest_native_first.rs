@@ -803,6 +803,9 @@ enum Op {
     /// Corrupt a copy-eligible document's P rows, then run S (ends the history).
     CorruptCopy {
         pick: usize,
+        /// Corrupt what the publisher consumes while writing the copied rows (the basis
+        /// artifact hash) instead of what the copy reads (a symbol enum).
+        write: bool,
     },
     /// Capture a batch, remove one document, then import below the head.
     DelayedReimport {
@@ -826,7 +829,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
         2 => (any::<[bool; 4]>(), 0u8..16).prop_map(|(covered, flavor)| Op::Reimport { covered, flavor }),
         2 => Just(Op::FailS),
         1 => Just(Op::CatchUp),
-        1 => (0..4usize).prop_map(|pick| Op::CorruptCopy { pick }),
+        1 => (0..4usize, any::<bool>()).prop_map(|(pick, write)| Op::CorruptCopy { pick, write }),
         2 => (any::<[bool; 4]>(), 0u8..16, 0..4usize)
             .prop_map(|(covered, flavor, remove)| Op::DelayedReimport { covered, flavor, remove }),
     ]
@@ -1473,7 +1476,7 @@ impl<'w> Harness<'w> {
 
     /// #669 H1: corruption in a basis row S reads while copying is a typed integrity
     /// failure that schedules a re-index; S publishes nothing.
-    fn corrupt_copy(&mut self, label: &str, pick: usize) -> Result<(), String> {
+    fn corrupt_copy(&mut self, label: &str, pick: usize, write: bool) -> Result<(), String> {
         let world = self.world;
         if self.model.outstanding.is_none()
             && let Some(content) = choose(world, pick % 4, pick)
@@ -1493,6 +1496,15 @@ impl<'w> Harness<'w> {
         let corrupted = world
             .store
             .with_index_sql_for_tests(|db| {
+                if write {
+                    // No raw capture has this artifact hash: the publisher's capture lookup
+                    // for the copied rows is where the corruption is found (#679 re-review).
+                    return Ok(db.execute(
+                        "UPDATE semantic_basis SET artifact_hash=?3 WHERE tuple_id IN \
+                         (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path=?2)",
+                        rusqlite::params![key, path, "0".repeat(64)],
+                    )?);
+                }
                 db.execute_batch("PRAGMA ignore_check_constraints=ON")?;
                 let changed = db.execute(
                     "UPDATE semantic_symbols SET key_scope='bogus' WHERE tuple_id IN \
@@ -1523,7 +1535,9 @@ impl<'w> Harness<'w> {
         match result {
             Err(error) => {
                 let text = format!("{error:#}");
-                if !(text.contains("incompatible_index") || text.contains("invalid semantic")) {
+                if !write
+                    && !(text.contains("incompatible_index") || text.contains("invalid semantic"))
+                {
                     return Err(format!(
                         "{label}: corrupt copy of {path} failed untyped: {text}"
                     ));
@@ -1667,7 +1681,7 @@ impl<'w> Harness<'w> {
             Op::Reimport { covered, flavor } => self.reimport(&label, covered, *flavor)?,
             Op::FailS => self.fail_s(&label)?,
             Op::CatchUp => self.catch_up(&label)?,
-            Op::CorruptCopy { pick } => self.corrupt_copy(&label, *pick)?,
+            Op::CorruptCopy { pick, write } => self.corrupt_copy(&label, *pick, *write)?,
             Op::DelayedReimport {
                 covered,
                 flavor,
@@ -1822,9 +1836,11 @@ fn native_first_copy_controls() {
     eprintln!("omitted control stats: {omitted:?}");
     assert!(omitted.excluded_omitted > 0, "{omitted:?}");
     assert!(omitted.copied_docs > 0, "{omitted:?}");
-    let corrupt = run_history(&[Op::CorruptCopy { pick: 2 }]).unwrap();
-    eprintln!("corruption control stats: {corrupt:?}");
-    assert_eq!(corrupt.corruptions_typed, 1, "{corrupt:?}");
+    for write in [false, true] {
+        let corrupt = run_history(&[Op::CorruptCopy { pick: 2, write }]).unwrap();
+        eprintln!("corruption control (write {write}) stats: {corrupt:?}");
+        assert_eq!(corrupt.corruptions_typed, 1, "{corrupt:?}");
+    }
 }
 
 #[test]
