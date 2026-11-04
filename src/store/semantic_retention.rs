@@ -114,7 +114,12 @@ impl Store {
                 let languages = statement
                     .query_map([key], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                for language in languages.into_iter().filter(|l| configured.contains(l)) {
+                let covered = |language: &String| {
+                    configured
+                        .as_ref()
+                        .is_none_or(|configured| configured.contains(language))
+                };
+                for language in languages.into_iter().filter(covered) {
                     db.execute(
                         "INSERT OR IGNORE INTO retained.legacy_languages VALUES(?1)",
                         [language],
@@ -122,23 +127,26 @@ impl Store {
                 }
             }
             // A language no producer ever covered had no evidence to lose (#664): it is not
-            // configured, so neither an older legacy row nor a carried-over one applies.
-            let mut statement = db.prepare(
-                "SELECT language FROM retained.legacy_languages
-                 UNION SELECT language FROM semantic_reimport WHERE revision_id=?1 AND producer=''",
-            )?;
-            let legacy = statement
-                .query_map([key], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            for language in legacy.iter().filter(|l| !configured.contains(*l)) {
-                db.execute(
-                    "DELETE FROM retained.legacy_languages WHERE language=?1",
-                    [language],
+            // configured, so neither an older legacy row nor a carried-over one applies. Only
+            // a complete inspection shows that: an incomplete one keeps every recorded row.
+            if let Some(configured) = &configured {
+                let mut statement = db.prepare(
+                    "SELECT language FROM retained.legacy_languages
+                     UNION SELECT language FROM semantic_reimport WHERE revision_id=?1 AND producer=''",
                 )?;
-                db.execute(
-                    "DELETE FROM semantic_reimport WHERE revision_id=?1 AND producer='' AND language=?2",
-                    params![key, language],
-                )?;
+                let legacy = statement
+                    .query_map([key], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                for language in legacy.iter().filter(|l| !configured.contains(*l)) {
+                    db.execute(
+                        "DELETE FROM retained.legacy_languages WHERE language=?1",
+                        [language],
+                    )?;
+                    db.execute(
+                        "DELETE FROM semantic_reimport WHERE revision_id=?1 AND producer='' AND language=?2",
+                        params![key, language],
+                    )?;
+                }
             }
             db.execute("INSERT OR IGNORE INTO semantic_reimport SELECT ?1,'',language,'original run inputs were not retained before this upgrade; import a current artifact' FROM retained.legacy_languages", [key])?;
         } else if recovery {

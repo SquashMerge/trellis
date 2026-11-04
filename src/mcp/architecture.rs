@@ -115,14 +115,16 @@ pub fn envelope(id: &Value, payload: Value) -> Value {
 }
 
 /// Whether an answer rests on semantic evidence (#523, #664): references with semantic
-/// sites, or rule evidence that cites a producer binding. Read before evidence sampling,
-/// so a binding the sample leaves out still counts.
+/// sites, or rule evidence that cites a producer's call binding or type relationship. Read
+/// before evidence sampling, so evidence the sample leaves out still counts.
 pub fn uses_semantic_evidence(payload: &Value) -> bool {
     fn binding(value: &Value) -> bool {
         match value {
             Value::Object(object) => {
-                object.get("kind").and_then(Value::as_str) == Some("semanticBinding")
-                    || object.values().any(binding)
+                matches!(
+                    object.get("kind").and_then(Value::as_str),
+                    Some("semanticBinding" | "typeRelationship")
+                ) || object.values().any(binding)
             }
             Value::Array(items) => items.iter().any(binding),
             _ => false,

@@ -340,6 +340,20 @@ impl StateDir {
         Ok(out)
     }
 
+    /// Every run record, or `None` when any record could not be read (#664): an incomplete
+    /// history cannot show that a producer never ran.
+    pub fn complete_runs(&self) -> Result<Option<Vec<RunRecord>>> {
+        let mut records = Vec::new();
+        for (_, record) in self.scan_runs()? {
+            match record {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => {}
+                Err(_) => return Ok(None),
+            }
+        }
+        Ok(Some(records))
+    }
+
     /// Readable run records, newest first. Corrupt records are ignored.
     pub fn runs(&self) -> Result<Vec<RunRecord>> {
         let mut records: Vec<RunRecord> = self
