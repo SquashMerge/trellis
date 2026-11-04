@@ -358,6 +358,8 @@ mod tests {
         state.next_wake(); // consume foreground progress before maintenance selection
         state.inbox.wait(Some(Instant::now())); // consume the accepted enqueue wake
         assert_eq!(state.maintenance_priority_reason(&session, &options), None);
+        // Observe single bounded steps, not a whole time slice.
+        crate::store::set_semantic_step_slice_for_tests(Duration::ZERO);
         let mut semantic = SemanticMaintenance::default();
         assert!(semantic.run_unit(&state, &cancel).is_some());
         assert!(semantic.continuation.is_some());
@@ -988,6 +990,8 @@ mod tests {
         state.next_wake();
         state.inbox.wait(Some(Instant::now()));
         assert_eq!(state.maintenance_priority_reason(&session, &options), None);
+        // Observe single bounded steps, not a whole time slice.
+        crate::store::set_semantic_step_slice_for_tests(Duration::ZERO);
         let mut semantic = SemanticMaintenance::default();
         assert!(semantic.run_unit(&state, &cancel).is_some());
         assert!(semantic.continuation.is_some());

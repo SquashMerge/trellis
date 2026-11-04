@@ -15,6 +15,28 @@ pub(crate) enum SemanticUnitOutcome {
 /// How long one S unit may keep stepping inside its snapshot before it returns.
 const STEP_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static STEP_SLICE_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The S slice; tests that observe single steps set it to zero on their own thread.
+pub(crate) fn step_slice() -> std::time::Duration {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(slice) = STEP_SLICE_OVERRIDE.with(std::cell::Cell::get) {
+        return slice;
+    }
+    STEP_SLICE
+}
+
+/// Make this thread's S units take one bounded step each.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_semantic_step_slice_for_tests(slice: std::time::Duration) {
+    STEP_SLICE_OVERRIDE.with(|cell| cell.set(Some(slice)));
+}
+
 pub(crate) struct SemanticContinuation {
     target: PendingSemanticTarget,
     next: usize,
@@ -402,7 +424,7 @@ impl Store {
                     Ok(joined)
                 })();
                 match step {
-                    Ok(None) if started.elapsed() < STEP_SLICE => check_cancel(cancel)?,
+                    Ok(None) if started.elapsed() < step_slice() => check_cancel(cancel)?,
                     step => return step,
                 }
             }

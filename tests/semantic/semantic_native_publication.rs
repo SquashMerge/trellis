@@ -112,6 +112,20 @@ fn caught_up(store: &trellis::store::Store, reply: &Value) -> trellis::model::In
     assert!(head.index_revision >= native.index_revision);
     head
 }
+/// The daemon writes S's work counts right after the S commit that clears the target; wait
+/// for the file that names exactly that S pin.
+fn work_counts(home: &Path, pin: trellis::model::IndexPin) -> Value {
+    let path = home.join("work-counts.json");
+    let mut work = Value::Null;
+    trellis::testing::wait_until("S work counts", || {
+        work = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null);
+        work["indexPin"] == serde_json::to_value(pin).unwrap()
+    });
+    work
+}
 fn copy_seed(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     fs::set_permissions(to, fs::metadata(from).unwrap().permissions()).unwrap();
@@ -1289,8 +1303,7 @@ fn selected_case(change_b: &str) {
         );
     }
     if change_b.starts_with("oracle_fork_") {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         let (witnessed, fallbacks) = match change_b {
             "oracle_fork_body"
             | "oracle_fork_changed_a"
@@ -1438,8 +1451,7 @@ fn selected_case(change_b: &str) {
         }
     }
     if change_b == "oracle_fork_context" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         eprintln!("context invalidation publication work: {work}");
         // FULL may build separate inventory and filtered views; LOCAL's one-index rule
         // does not apply, but the work must stay bounded by document passes.
@@ -1472,8 +1484,7 @@ fn selected_case(change_b: &str) {
         );
     }
     if change_b == "oracle_fork_successive_local" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         assert_eq!(
             work["fullFallbacks"], 0,
             "second LOCAL must witness the earliest original association: {work}"
@@ -1545,8 +1556,7 @@ fn selected_case(change_b: &str) {
         );
     }
     if change_b == "oracle_fork_missing_raw_key" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         assert_eq!(work["fullFallbacks"], 1, "{work}");
         // Bounded FULL authenticates the binary and probes stored proofs without loading
         // the complete original proof inventory into Rust memory.
@@ -1568,8 +1578,7 @@ fn selected_case(change_b: &str) {
         );
     }
     if change_b == "oracle_fork_healthy_two_producers" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
         assert_eq!(work["destinationJoinsOnReusedDocuments"], 0, "{work}");
         // Only A and C contain captured source claims; B is a changed native
@@ -1700,8 +1709,7 @@ fn selected_case(change_b: &str) {
         );
     }
     if matches!(change_b, "oracle_body" | "oracle_two_producers") {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         eprintln!("publication work counts {change_b}: {work}");
         if change_b == "oracle_body" {
             assert_eq!(work["destinationIndexBuilds"], 1, "{work}");

@@ -2165,16 +2165,13 @@ pub(crate) fn cooperative_semantic_unit(
     loop {
         let outcome = store.semantic_maintenance_unit(session, continuation, cancel)?;
         if outcome != SemanticUnitOutcome::Progress
-            || started.elapsed() >= SEMANTIC_UNIT_SLICE
+            || started.elapsed() >= crate::store::semantic_step_slice()
             || !admitted()
         {
             return Ok(outcome);
         }
     }
 }
-
-/// The time one semantic maintenance unit may keep the worker between foreground checks.
-const SEMANTIC_UNIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// A checkout's daemon-local writer confirms old-root queue settlement, then
 /// commits mandatory startup reconciliation before its scheduler may claim FIFO requests.

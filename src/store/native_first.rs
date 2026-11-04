@@ -9,7 +9,9 @@ mod oracle;
 mod tests;
 pub(crate) mod witness;
 mod witness_preparation;
-pub(crate) use continuation::{SemanticContinuation, SemanticUnitOutcome};
+#[cfg(any(test, feature = "test-support"))]
+pub use continuation::set_semantic_step_slice_for_tests;
+pub(crate) use continuation::{SemanticContinuation, SemanticUnitOutcome, step_slice};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingSemanticSelection {
