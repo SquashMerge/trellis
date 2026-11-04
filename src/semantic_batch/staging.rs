@@ -172,7 +172,17 @@ pub struct Stage {
     index_dir: PathBuf,
     baseline: u64,
     conn: Option<Connection>,
+    /// Statements run in one stage transaction until [`Stage::commit_batch`] or a release.
+    batched: bool,
 }
+
+/// A unit's own stage transaction. It is a savepoint so it nests inside a batch
+/// ([`Stage::begin_batch`]); outside one it begins and commits like `BEGIN`/`COMMIT`.
+pub const UNIT_BEGIN: &str = "SAVEPOINT stage_unit";
+/// Ends a unit transaction begun with [`UNIT_BEGIN`].
+pub const UNIT_COMMIT: &str = "RELEASE stage_unit";
+/// Abandons a unit transaction begun with [`UNIT_BEGIN`].
+pub const UNIT_ROLLBACK: &str = "ROLLBACK TO stage_unit; RELEASE stage_unit";
 
 fn open_connection(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("stage open")?;
@@ -195,6 +205,7 @@ impl Stage {
             index_dir: index_dir.to_owned(),
             baseline,
             conn: None,
+            batched: false,
         };
         let conn = open_connection(&stage.db_path())?;
         conn.execute_batch(STAGE_SCHEMA).context("stage schema")?;
@@ -219,11 +230,34 @@ impl Stage {
         if self.conn.is_none() {
             self.conn = Some(open_connection(&self.db_path())?);
         }
-        Ok(self.conn.as_ref().expect("stage connection just opened"))
+        let conn = self.conn.as_ref().expect("stage connection just opened");
+        if self.batched && conn.is_autocommit() {
+            conn.execute_batch("BEGIN")?;
+        }
+        Ok(conn)
+    }
+
+    /// Runs every later statement in one stage transaction until [`Self::commit_batch`] or
+    /// [`Self::release_connection`]. The stage has no journal: this saves a lock, page write
+    /// and unlock per row, and a commit keeps every statement executed, as autocommit would.
+    pub fn begin_batch(&mut self) {
+        self.batched = true;
+    }
+
+    /// Commits the batch transaction, if one is open, and ends batching.
+    pub fn commit_batch(&mut self) -> rusqlite::Result<()> {
+        self.batched = false;
+        match self.conn.as_ref() {
+            Some(conn) if !conn.is_autocommit() => conn.execute_batch("COMMIT"),
+            _ => Ok(()),
+        }
     }
 
     /// Drops the connection. The publishing writer attaches `stage.db` only after this.
+    /// An open batch is committed first; its error is the owner's to read from
+    /// [`Self::commit_batch`], which a slice owner calls before releasing.
     pub fn release_connection(&mut self) {
+        let _ = self.commit_batch();
         self.conn = None;
     }
 
@@ -727,7 +761,7 @@ impl ClaimSink for StageClaimSink<'_> {
         &mut self,
         doc: &UnitDocument<'_>,
     ) -> std::result::Result<(), ScipCaptureError> {
-        let begun = self.conn.execute_batch("BEGIN");
+        let begun = self.conn.execute_batch(UNIT_BEGIN);
         self.record(begun)?;
         let found = lookup_assigned(self.conn, self.artifact, &self.language, doc.path);
         self.current = self.record(found)?.map(|assigned| assigned.ord);
@@ -811,7 +845,7 @@ impl ClaimSink for StageClaimSink<'_> {
     }
 
     fn end_document(&mut self) -> std::result::Result<(), ScipCaptureError> {
-        let committed = self.conn.execute_batch("COMMIT");
+        let committed = self.conn.execute_batch(UNIT_COMMIT);
         self.record(committed)?;
         self.current = None;
         self.totals.documents += 1;

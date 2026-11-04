@@ -229,10 +229,9 @@ impl RetainedStageContinuation {
         self.advance_unit(db, reader, counters, cancel)
     }
 
-    pub(crate) fn release_connection(&mut self) {
-        if let Some(stage) = self.stage.as_mut() {
-            stage.release_connection();
-        }
+    /// The private stage while admission owns it.
+    pub(crate) fn stage_mut(&mut self) -> Option<&mut Stage> {
+        self.stage.as_mut()
     }
 
     fn advance_unit(

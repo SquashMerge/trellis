@@ -68,18 +68,36 @@ struct ProducerContinuation {
 }
 
 impl SemanticContinuation {
-    fn release_stage_connections(&mut self) {
-        if let Some(stage) = self.target_stage.as_mut() {
+    fn stages(&mut self) -> impl Iterator<Item = &mut crate::semantic_batch::staging::Stage> {
+        let (admission, admitted) = match self.current.as_mut() {
+            Some(current) => (
+                current.admission.as_mut().and_then(|a| a.stage_mut()),
+                current.admitted.as_mut().map(|a| a.stage_mut()),
+            ),
+            None => (None, None),
+        };
+        self.target_stage.as_mut().into_iter().chain(admission).chain(admitted)
+    }
+
+    /// Every private stage the slice starts with writes in one transaction per stage.
+    fn batch_stage_connections(&mut self) {
+        for stage in self.stages() {
+            stage.begin_batch();
+        }
+    }
+
+    /// Commits each slice transaction, then closes the connections. A failed commit is the
+    /// slice's storage error.
+    fn release_stage_connections(&mut self) -> rusqlite::Result<()> {
+        let mut committed = Ok(());
+        for stage in self.stages() {
+            let result = stage.commit_batch();
+            if committed.is_ok() {
+                committed = result;
+            }
             stage.release_connection();
         }
-        if let Some(current) = self.current.as_mut() {
-            if let Some(admission) = current.admission.as_mut() {
-                admission.release_connection();
-            }
-            if let Some(admitted) = current.admitted.as_mut() {
-                admitted.stage_mut().release_connection();
-            }
-        }
+        committed
     }
 }
 
@@ -203,6 +221,7 @@ impl Store {
             // One coherent snapshot serves several bounded steps; it never survives a return
             // to worker selection, and the slice keeps foreground work waiting briefly.
             let started = std::time::Instant::now();
+            state.batch_stage_connections();
             loop {
                 let step = (|| {
                     let captured_read = ReadRevision::new(
@@ -474,8 +493,11 @@ impl Store {
                     },
                     step => step,
                 };
-                state.release_stage_connections();
-                return step;
+                let committed = state.release_stage_connections();
+                return match (step, committed) {
+                    (Ok(_), Err(error)) => Err(error.into()),
+                    (step, _) => step,
+                };
             }
         });
         match result {

@@ -1410,7 +1410,7 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
     for table in ["nat_docs", "nat_done"] {
         conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev])?;
     }
-    conn.execute_batch("BEGIN")?;
+    conn.execute_batch(crate::semantic_batch::staging::UNIT_BEGIN)?;
     let outcome = (|| -> Result<()> {
         let mut stream = reader.inventory()?;
         let mut ord = 0i64;
@@ -1433,11 +1433,11 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
     })();
     match outcome {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(crate::semantic_batch::staging::UNIT_COMMIT)?;
             Ok(())
         }
         Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(crate::semantic_batch::staging::UNIT_ROLLBACK);
             for table in ["nat_docs", "nat_done"] {
                 let _ = conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev]);
             }
@@ -1449,11 +1449,11 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
 /// Runs one pass in a single stage transaction. The stage has no journal, so a failed pass
 /// commits what it wrote rather than rolling back; the next attempt clears every join table.
 fn in_transaction<T>(conn: &Connection, pass: impl FnOnce() -> Result<T>) -> Result<T> {
-    conn.execute_batch("BEGIN")?;
+    conn.execute_batch(crate::semantic_batch::staging::UNIT_BEGIN)?;
     let result = pass();
-    let committed = conn.execute_batch("COMMIT");
-    if committed.is_err() && !conn.is_autocommit() {
-        let _ = conn.execute_batch("ROLLBACK");
+    let committed = conn.execute_batch(crate::semantic_batch::staging::UNIT_COMMIT);
+    if committed.is_err() {
+        let _ = conn.execute_batch(crate::semantic_batch::staging::UNIT_ROLLBACK);
     }
     let value = result?;
     committed?;
