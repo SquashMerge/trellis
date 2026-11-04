@@ -743,8 +743,12 @@ impl JoinContinuation {
         anyhow::ensure!(
             !exists(
                 conn,
-                "SELECT 1 FROM out_provenance o LEFT JOIN proof_identities c ON c.claim_id=o.claim_id \
-             LEFT JOIN sources s ON s.ord=c.source_ord WHERE o.doc=?1 AND \
+                // `proof_identities` by its arms (claims hold positive IDs, witness proofs negative
+                // ones): a LEFT JOIN of the compound view materialized it per document.
+                "SELECT 1 FROM out_provenance o \
+             LEFT JOIN claims c ON c.claim_id=o.claim_id \
+             LEFT JOIN witness_proofs w ON w.identity_id=o.claim_id \
+             LEFT JOIN sources s ON s.ord=COALESCE(c.source_ord,w.source_ord) WHERE o.doc=?1 AND \
              (s.ord IS NULL OR s.language<>?2 OR s.path<>?3 OR o.kind NOT IN (0,1,2,3)) LIMIT 1",
                 &[&doc, &document.language, &document.path]
             )?,

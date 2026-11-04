@@ -85,8 +85,12 @@ pub(super) fn document_flags(
     let claims: i64 = join
         .conn()
         .prepare_cached(
-            "SELECT COUNT(*) FROM proof_identities p JOIN sources s ON s.ord=p.source_ord \
-        WHERE s.language=?1 AND s.path=?2 AND p.record_kind<>'symbolInformation'",
+            // Each arm of `proof_identities` by its own source index: SQLite cannot push the
+            // source join into the compound view and scanned every staged proof per document.
+            "SELECT (SELECT COUNT(*) FROM sources s JOIN claims c ON c.source_ord=s.ord \
+             WHERE s.language=?1 AND s.path=?2 AND c.record_kind<>'symbolInformation') + \
+             (SELECT COUNT(*) FROM sources s JOIN witness_proofs w ON w.source_ord=s.ord \
+             WHERE s.language=?1 AND s.path=?2 AND w.record_kind<>'symbolInformation')",
         )?
         .query_row(params![doc.language, doc.path], |r| r.get(0))?;
     let mut flags = DocFlags {
