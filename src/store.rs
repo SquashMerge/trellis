@@ -3195,7 +3195,16 @@ impl EvidenceResponse {
         show_all: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
         self.store
-            .sequence_in(&self.db, seed, expected, show_all, true)
+            .sequence_in(&self.db, seed, expected, show_all, false, true)
+    }
+    /// The candidates of the browser's Interactions view (#663): see [`Store::sequence_interactions_at`].
+    pub fn sequence_interactions_at(
+        &self,
+        seed: &str,
+        expected: IndexPin,
+    ) -> Result<Option<crate::behavior::SequenceView>> {
+        self.store
+            .sequence_in(&self.db, seed, expected, false, true, true)
     }
     pub fn classes_at(
         &self,
@@ -22496,7 +22505,18 @@ impl Store {
         expected: IndexPin,
         show_all: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, show_all, false))
+        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, show_all, false, false))
+    }
+    /// The candidates of the browser's Interactions view (#663): an enriched view with a
+    /// shown call is kept within the work, depth and participant bounds but not yet the
+    /// visible step bound, which counts internal steps Interactions never draw. The browser
+    /// bounds the arrows it draws after filtering. Any other view is [`Self::sequence_at`].
+    pub fn sequence_interactions_at(
+        &self,
+        seed: &str,
+        expected: IndexPin,
+    ) -> Result<Option<crate::behavior::SequenceView>> {
+        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, false, true, false))
     }
     fn sequence_in(
         &self,
@@ -22504,6 +22524,7 @@ impl Store {
         seed: &str,
         expected: IndexPin,
         show_all: bool,
+        interactions: bool,
         pre_startup: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
         let selected_revision = self.read_revision_for(tx, Some(expected), pre_startup)?;
@@ -22535,7 +22556,14 @@ impl Store {
         // Enrichment applies the visible step bound once incidental calls are hidden (#536).
         let mut view =
             crate::behavior::build_sequence_work(revision, symbol, &file, &calls, show_all)?;
-        graph_read::sequence_calls(self, tx, &selected_revision, &mut view, show_all)?;
+        graph_read::sequence_calls(
+            self,
+            tx,
+            &selected_revision,
+            &mut view,
+            show_all,
+            interactions,
+        )?;
         Ok(Some(view))
     }
 

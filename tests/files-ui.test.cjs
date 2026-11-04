@@ -81,6 +81,18 @@ test("callable mini uses measured renderer; Open full preserves exact DTO seed/p
   assert.equal(h.requests.filter(request=>request.url.endsWith("/sequence")).length,1);
 });
 
+// #663: a mini cut by the raw visible bound is not what Interactions draw: Open full asks again.
+test("Open full of a truncated mini requests the Interactions candidates", async () => {
+  const h=harness(), item=outline("measured");
+  indexedNetwork(h,item,url=>url==="/api/sequence" ? response({...view(item),truncated:true,truncatedBy:["visibleSteps"],steps:[{id:"call",callId:"call",kind:"call",label:"helper",path:"main.java",range:{startLine:1,endLine:1},children:[],alternate:[],hidden:false}]}) : undefined);
+  await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
+  await h.run('selectFilesSymbol(item)');
+  await h.run('openFilesFull()');
+  assert.equal(h.run("section"),"diagrams"); assert.equal(h.run("selectedMethod.id"),"measured");
+  const posts=h.requests.filter(request=>request.url.endsWith("/sequence")).map(request=>JSON.parse(request.options.body));
+  assert.deepEqual(posts,[{seed:"measured",expectedRevision:pin,showAll:false},{seed:"measured",expectedRevision:pin,showAll:false,interactions:true}]);
+});
+
 test("syntax paging echoes continuation, safely displays snippet and exact pinned location resets old inspector", async () => {
   const h=harness(), item=outline("same"), continuation={revision:pin,symbolId:"same",path:"other.java",offset:8,partial:true};
   const location={path:"other.java",sourceHash:"cached-other",range:{startByte:7,endByte:11,startLine:2,startColumn:2,endLine:2,endColumn:6},snippet:"é <script>same</script>"};

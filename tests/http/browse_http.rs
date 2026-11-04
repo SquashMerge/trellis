@@ -598,3 +598,67 @@ async fn published_sequence_api_expands_direct_callees_and_hides_incidental_call
         assert_eq!(all_steps[1]["children"][1]["hidden"], false);
     }
 }
+
+// #663: the browser's Interactions view asks for its candidates before the 200-step visible
+// bound, which counts internal steps the view never draws. A cross-lifeline call after more
+// than 200 internal steps is kept and the view is not truncated. Every other request (no
+// flag, `interactions:false`, Show all) keeps the raw bound for calls-first and Show all.
+#[tokio::test]
+async fn sequence_interactions_keep_a_call_after_more_than_200_internal_steps() {
+    use graph_fixtures::{Publisher, Spec, bind, syntax_id};
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut publisher = Publisher::open(&dir.path().join("state"), &workspace);
+    let internal: String = (0..240).map(|n| format!("value = {n}; ")).collect();
+    // `run` has the long body itself; `outer` reaches the same body through a callee.
+    let source = format!(
+        "struct A;\nimpl A {{ fn run(&self) {{ {internal}B::send(); }} fn outer(&self) {{ self.run(); }} }}\nstruct B;\nimpl B {{ fn send() {{}} }}\n"
+    );
+    let mut spec = Spec::new(&[("a.rs", &source)]);
+    spec.bindings = vec![bind("run", 0, "send"), bind("outer", 0, "run")];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "run");
+    let outer = syntax_id(publisher.native(), "outer");
+    let send = syntax_id(publisher.native(), "send");
+    let app = http::router(
+        http::new(
+            publisher.store.clone(),
+            IndexOptions::new(workspace.clone()),
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let request = json!({"seed":seed,"expectedRevision":pin,"showAll":false,"interactions":true});
+    let (status, view) = call(&app, "POST", "/api/sequence", request).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["semantic"]["tier"], "semantic", "{view}");
+    assert_eq!(view["truncated"], false, "{}", view["warnings"]);
+    assert!(view.get("truncatedBy").is_none(), "{}", view["truncatedBy"]);
+    let steps = view["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 241);
+    assert_eq!(steps.last().unwrap()["target"], json!(send));
+    for request in [
+        json!({"seed":seed,"expectedRevision":pin,"showAll":false}),
+        json!({"seed":seed,"expectedRevision":pin,"showAll":false,"interactions":false}),
+        json!({"seed":seed,"expectedRevision":pin,"showAll":true,"interactions":true}),
+    ] {
+        let (status, raw) = call(&app, "POST", "/api/sequence", request.clone()).await;
+        assert_eq!(status, 200, "{raw}");
+        assert_eq!(raw["truncatedBy"], json!(["visibleSteps"]), "{request}");
+        assert_eq!(raw["steps"].as_array().unwrap().len(), 200, "{request}");
+    }
+    // A callee body longer than the visible bound is expanded for Interactions only.
+    let request = |interactions: bool| json!({"seed":outer,"expectedRevision":pin,"showAll":false,"interactions":interactions});
+    let (status, view) = call(&app, "POST", "/api/sequence", request(true)).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["truncated"], false, "{}", view["warnings"]);
+    let body = view["steps"][0]["children"].as_array().unwrap();
+    assert_eq!(body.len(), 241);
+    assert_eq!(body.last().unwrap()["target"], json!(send));
+    let (status, raw) = call(&app, "POST", "/api/sequence", request(false)).await;
+    assert_eq!(status, 200, "{raw}");
+    assert_eq!(raw["truncatedBy"], json!(["visibleSteps"]));
+    assert!(raw["steps"][0]["children"].as_array().unwrap().is_empty());
+}

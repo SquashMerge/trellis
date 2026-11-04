@@ -3068,6 +3068,10 @@ struct SequenceRequest {
     expected_revision: IndexPin,
     #[serde(default)]
     show_all: bool,
+    /// The browser's Interactions view (#663): its candidates before the visible step
+    /// bound. Show all keeps the raw bounded view.
+    #[serde(default)]
+    interactions: bool,
 }
 #[cfg(feature = "test-support")]
 async fn sequence(
@@ -3079,9 +3083,13 @@ async fn sequence(
         return Err(browse_invalid());
     }
     let result = tokio::task::spawn_blocking(move || {
-        let mut view = s
-            .store
-            .sequence_at(&q.seed, q.expected_revision, q.show_all)?;
+        let mut view = if q.interactions && !q.show_all {
+            s.store
+                .sequence_interactions_at(&q.seed, q.expected_revision)?
+        } else {
+            s.store
+                .sequence_at(&q.seed, q.expected_revision, q.show_all)?
+        };
         if let Some(view) = view.as_mut()
             && let Some(catalog) = s.catalog_snapshot(view.revision)
             && let Some((_, file)) = s.store.source_at(&view.seed.path, Some(view.revision))?
@@ -5309,7 +5317,11 @@ async fn provisioned_core_answer(
                 return Err(browse_invalid());
             }
             let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
-                r.sequence_at(&q.seed, q.expected_revision, q.show_all)
+                if q.interactions && !q.show_all {
+                    r.sequence_interactions_at(&q.seed, q.expected_revision)
+                } else {
+                    r.sequence_at(&q.seed, q.expected_revision, q.show_all)
+                }
             })
             .await?;
             Ok((
