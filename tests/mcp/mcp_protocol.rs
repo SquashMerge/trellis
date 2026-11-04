@@ -14790,7 +14790,10 @@ fn with_bindings(
 
 /// #528 review: compact changes presentation, never the optional evidence chosen for the
 /// same required prefix. Six bound calls, each with eight long-path native hints: full and
-/// compact show the same hints and documents for the same six calls.
+/// compact show the same hints and documents for the same six calls. Both requests name
+/// the same `includeExternal` policy (#665): the modes' different defaults change the
+/// envelope (`externalOmitted`) by a few bytes near the hint page target, which this test
+/// does not compare; `compact_outgoing_leaves_external_calls_out_unless_asked` covers them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_outgoing_keeps_the_full_answers_hints_for_the_same_calls() {
     let mut files = vec![(
@@ -14819,11 +14822,14 @@ async fn compact_outgoing_keeps_the_full_answers_hints_for_the_same_calls() {
     let mut mcp = GraphMcp::start(528, &[spec], Default::default()).await;
     let full = mcp.call_tool(
         "trellis_outgoing_calls",
-        mcp.args("run", json!({"limit":6})),
+        mcp.args("run", json!({"limit":6,"includeExternal":false})),
     );
     let compact = mcp.call_tool(
         "trellis_outgoing_calls",
-        mcp.args("run", json!({"limit":6,"compact":true})),
+        mcp.args(
+            "run",
+            json!({"limit":6,"compact":true,"includeExternal":false}),
+        ),
     );
     let calls = |v: &Value| v["data"]["calls"].as_array().unwrap().clone();
     assert_eq!(calls(&full).len(), 6, "{full}");
