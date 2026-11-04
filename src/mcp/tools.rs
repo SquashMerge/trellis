@@ -162,7 +162,21 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             ],
             &["schemaVersion"],
         ),
-        "trellis_outgoing_calls" | "trellis_incoming_calls" => (
+        "trellis_outgoing_calls" => (
+            &[
+                "schemaVersion",
+                "symbolId",
+                "lookupKey",
+                "limit",
+                "semanticProducerId",
+                "compact",
+                "includeExternal",
+                "expectedBasis",
+                "workspace",
+            ],
+            &["schemaVersion"],
+        ),
+        "trellis_incoming_calls" => (
             &[
                 "schemaVersion",
                 "symbolId",
@@ -186,6 +200,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "maxCalls",
                 "includeExternal",
                 "includeTests",
+                "compact",
                 "expectedBasis",
                 "workspace",
             ],
@@ -291,7 +306,10 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             }
             if name != "trellis_declaration" {
                 semantic_producer(o)?;
-                if o.get("compact").is_some_and(|value| !value.is_boolean()) {
+                if ["compact", "includeExternal"]
+                    .iter()
+                    .any(|field| o.get(*field).is_some_and(|value| !value.is_boolean()))
+                {
                     return Err("invalid_request");
                 }
                 limit(o)
@@ -348,7 +366,7 @@ fn call_graph_arguments(o: &serde_json::Map<String, Value>) -> Result<(), &'stat
     in_range("depth", 0..=MAX_DEPTH)?;
     in_range("maxNodes", 1..=MAX_NODES)?;
     in_range("maxCalls", 0..=MAX_CALLS)?;
-    for field in ["includeExternal", "includeTests"] {
+    for field in ["includeExternal", "includeTests", "compact"] {
         if o.get(field).is_some_and(|value| !value.is_boolean()) {
             return Err("invalid_request");
         }
@@ -359,13 +377,26 @@ fn call_graph_arguments(o: &serde_json::Map<String, Value>) -> Result<(), &'stat
         Some(_) => Err("invalid_request"),
     }
 }
+/// #665: the MCP graph's default `maxNodes` and `maxCalls`, sized so a default answer fits
+/// the 65,536-byte response. A full answer carries every proof: eight nodes and ten
+/// semantic edges in this repository's shape (`DaemonState::enqueue_index`) measured about
+/// 50 KB. A compact answer drops them: fifty nodes and sixty edges measured about 51 KB.
+pub const GRAPH_DEFAULT_LIMITS: (u64, u64) = (8, 10);
+pub const GRAPH_COMPACT_DEFAULT_LIMITS: (u64, u64) = (50, 60);
+
 /// The validated request with defaults materialized; the server fills in the snapshot IDs.
 pub fn call_graph_query(args: &Value) -> crate::graph_query::GraphQuery {
-    use crate::graph_query::{DEFAULT_DEPTH, DEFAULT_MAX_CALLS, DEFAULT_MAX_NODES};
+    use crate::graph_query::DEFAULT_DEPTH;
     let number = |field: &str, default: u64| {
         args.get(field).map_or(default, |v| {
             wire::uint(v).expect("validated call graph bound")
         })
+    };
+    let compact = args.get("compact").and_then(Value::as_bool) == Some(true);
+    let (default_max_nodes, default_max_calls) = if compact {
+        GRAPH_COMPACT_DEFAULT_LIMITS
+    } else {
+        GRAPH_DEFAULT_LIMITS
     };
     crate::graph_query::GraphQuery {
         // A lookup-key root is resolved inside the admitted evidence response.
@@ -379,8 +410,8 @@ pub fn call_graph_query(args: &Value) -> crate::graph_query::GraphQuery {
             .and_then(Value::as_str)
             .map(str::to_owned),
         depth: number("depth", DEFAULT_DEPTH),
-        max_nodes: number("maxNodes", DEFAULT_MAX_NODES),
-        max_calls: number("maxCalls", DEFAULT_MAX_CALLS),
+        max_nodes: number("maxNodes", default_max_nodes),
+        max_calls: number("maxCalls", default_max_calls),
         include_external: args
             .get("includeExternal")
             .is_some_and(|value| value.as_bool().expect("validated call graph flag")),
@@ -577,12 +608,22 @@ pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
             }
         };
         let truncation = if envelope["truncated"] == true {
-            format!(
-                ", truncated: {}",
-                envelope["truncationReason"]
-                    .as_str()
-                    .expect("truncation reason")
-            )
+            let reason = envelope["truncationReason"]
+                .as_str()
+                .expect("truncation reason");
+            // #665: say how much of the bounded graph the response bytes left out.
+            let omitted = &envelope["data"]["responseOmitted"];
+            match (omitted["nodes"].as_u64(), omitted["edges"].as_u64()) {
+                (Some(nodes), Some(edges)) if nodes + edges > 0 => {
+                    let hint = if envelope["data"].get("semanticBases").is_some() {
+                        "; compact:true fits more"
+                    } else {
+                        ""
+                    };
+                    format!(", truncated: {reason} ({nodes} nodes, {edges} edges omitted{hint})")
+                }
+                _ => format!(", truncated: {reason}"),
+            }
         } else {
             String::new()
         };
@@ -1042,7 +1083,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":7,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":8,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
@@ -1288,8 +1329,17 @@ mod tests {
                 defaults.max_calls,
                 defaults.semantic_producer_id
             ),
-            (2, 150, 500, None)
+            (2, 8, 10, None)
         );
+        // #665: compact answers are smaller, so their default limits are larger.
+        let mut v = good(name);
+        v["compact"] = json!(true);
+        let compact = call_graph_query(&v);
+        assert_eq!((compact.max_nodes, compact.max_calls), (50, 60));
+        v["maxNodes"] = json!(150);
+        v["maxCalls"] = json!(500);
+        let compact = call_graph_query(&v);
+        assert_eq!((compact.max_nodes, compact.max_calls), (150, 500));
         let mut v = good(name);
         v["semanticProducerId"] = json!("p");
         v["depth"] = json!(0);
@@ -1361,7 +1411,11 @@ mod tests {
     /// #528: `compact` is an optional boolean on the two call tools only.
     #[test]
     fn compact_is_a_closed_boolean_on_the_call_tools() {
-        for name in ["trellis_outgoing_calls", "trellis_incoming_calls"] {
+        for name in [
+            "trellis_outgoing_calls",
+            "trellis_incoming_calls",
+            "trellis_call_graph",
+        ] {
             let mut valid = good(name);
             for compact in [json!(true), json!(false)] {
                 valid["compact"] = compact;
@@ -1372,15 +1426,25 @@ mod tests {
                 check(name, &valid, "invalid_request");
             }
         }
-        for name in [
-            "trellis_find_symbols",
-            "trellis_declaration",
-            "trellis_call_graph",
-        ] {
+        for name in ["trellis_find_symbols", "trellis_declaration"] {
             let mut other = good(name);
             other["compact"] = json!(true);
             check(name, &other, "invalid_request");
         }
+        // #665: outgoing calls also take a closed `includeExternal`; incoming does not.
+        let name = "trellis_outgoing_calls";
+        let mut valid = good(name);
+        for include in [json!(true), json!(false)] {
+            valid["includeExternal"] = include;
+            assert_eq!(validate(name, Some(&valid)), Ok(()));
+        }
+        for include in [Value::Null, json!(1), json!("true")] {
+            valid["includeExternal"] = include;
+            check(name, &valid, "invalid_request");
+        }
+        let mut other = good("trellis_incoming_calls");
+        other["includeExternal"] = json!(true);
+        check("trellis_incoming_calls", &other, "invalid_request");
     }
     #[test]
     fn summary_uses_the_singular_for_one_item() {

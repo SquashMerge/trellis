@@ -1445,6 +1445,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         wire::uint(v).expect("validated limit") as usize
                     });
                     let compact = args.get("compact").and_then(|v| v.as_bool()) == Some(true);
+                    // #665: compact leaves external calls out unless `includeExternal`.
+                    let include_external = args
+                        .get("includeExternal")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(!compact);
                     let expected = validated_expected_basis(args);
                     let producer = args.get("semanticProducerId").and_then(|v| v.as_str());
                     Some(Box::new(move |runtime, response, sampled, _query| {
@@ -1467,14 +1472,20 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         } else {
                             symbol_id.expect("validated symbol ID")
                         };
-                        let Some(found) = response.mcp_outgoing_with_lines(
+                        let found = match response.mcp_outgoing_with_lines_excluding(
                             symbol_id,
                             limit,
+                            (!include_external).then_some(producer),
                             expected,
                             &|| runtime.mcp_hint_clock_now(accepted),
                             deadline,
-                        )?
-                        else {
+                        ) {
+                            Err(error) if error.is::<crate::store::ProducerNotPublished>() => {
+                                return Ok(producer_failure(id));
+                            }
+                            found => found?,
+                        };
+                        let Some(found) = found else {
                             return Ok(tools::failure(id, "not_found"));
                         };
                         let semantic = match response.mcp_call_semantics(
@@ -1554,6 +1565,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 }
                 ("trellis_call_graph", Some(args)) => {
                     let query = tools::call_graph_query(&serde_json::Value::Object(args.clone()));
+                    let compact = args.get("compact").and_then(|v| v.as_bool()) == Some(true);
                     let lookup_key = args.get("lookupKey").and_then(|value| value.as_str());
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |runtime, response, sampled, _query| {
@@ -1591,6 +1603,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             id,
                             &mut answer,
                             stable_lookup_key.as_deref(),
+                            compact,
                             root,
                             sampled,
                             modern,

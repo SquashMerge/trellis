@@ -6449,7 +6449,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
     // #528: describe and scopeCoverage report the imported JavaScript evidence beside the
     // native coverage, which keeps its syntax tier; other languages have no producer.
     let describe = mcp.call("trellis_workspace_describe", json!({"schemaVersion":1}));
-    assert_eq!(describe["data"]["toolVersion"], 7);
+    assert_eq!(describe["data"]["toolVersion"], 8);
     for (scope, rows) in [
         ("describe", &describe["data"]["languages"]),
         ("incoming", &incoming["data"]["scopeCoverage"]),
@@ -7196,14 +7196,9 @@ async fn partial_import_calls_mcp(name: &str, session: u64) {
     let mut replies = Vec::new();
     for explicit in [false, true] {
         for compact in [false, true] {
-            if name == "trellis_call_graph" && compact {
-                continue;
-            }
-            let mut args = json!({"schemaVersion":1,"symbolId":root});
+            let mut args = json!({"schemaVersion":1,"symbolId":root,"compact":compact});
             if name == "trellis_call_graph" {
                 args["depth"] = json!(2);
-            } else {
-                args["compact"] = json!(compact);
             }
             if explicit {
                 args["semanticProducerId"] = json!("rust-analyzer");
@@ -7221,8 +7216,8 @@ async fn partial_import_calls_mcp(name: &str, session: u64) {
             assert!(
                 result["coverage"]
                     .as_array()
-                    .unwrap()
-                    .iter()
+                    .into_iter()
+                    .flatten()
                     .all(|row| row.get("reasons").is_none())
             );
         } else {
@@ -7462,33 +7457,58 @@ forbid = [{{ calls = "helper" }}]
                     assert_eq!(reply["data"]["text"], source);
                 }
                 "trellis_call_graph" => {
+                    // #665: the compact graph keeps the full graph's nodes and edge
+                    // identities and drops proofs; both modes validate against the catalog.
                     let mut full = None;
-                    for explicit in [false, true] {
-                        for max_calls in [None, Some(1)] {
-                            let mut args = pinned(json!({"symbolId":ids[caller]}));
-                            if explicit {
-                                args["semanticProducerId"] = json!(producer);
-                            }
-                            if let Some(cap) = max_calls {
-                                args["maxCalls"] = json!(cap);
-                            }
-                            let reply = mcp.success(name, args);
-                            let result = &reply["data"]["result"];
-                            let edges = result["edges"].as_array().unwrap();
-                            assert!(!edges.is_empty(), "{reply}");
-                            if max_calls.is_some() {
-                                assert_eq!(edges.len(), 1);
-                            } else {
+                    for compact in [false, true] {
+                        for explicit in [false, true] {
+                            for max_calls in [None, Some(1)] {
+                                let mut args =
+                                    pinned(json!({"symbolId":ids[caller],"compact":compact}));
+                                if explicit {
+                                    args["semanticProducerId"] = json!(producer);
+                                }
+                                if let Some(cap) = max_calls {
+                                    args["maxCalls"] = json!(cap);
+                                }
+                                let reply = mcp.success(name, args);
+                                let result = &reply["data"]["result"];
+                                let edges = result["edges"].as_array().unwrap();
+                                assert!(!edges.is_empty(), "{reply}");
+                                for proof in ["coverage", "provenance"] {
+                                    assert_eq!(result.get(proof).is_none(), compact, "{proof}");
+                                }
+                                assert_eq!(reply["data"].get("semanticBases").is_none(), compact);
+                                if max_calls.is_some() {
+                                    assert_eq!(edges.len(), 1);
+                                    continue;
+                                }
                                 assert!(result["nodes"].as_array().unwrap().len() > 1);
-                                assert!(
-                                    edges
-                                        .iter()
-                                        .any(|edge| edge["binding"]["resolution"] == "resolved")
-                                );
+                                let resolution = |edge: &Value| {
+                                    if compact {
+                                        edge["resolution"].clone()
+                                    } else {
+                                        edge["binding"]["resolution"].clone()
+                                    }
+                                };
+                                assert!(edges.iter().any(|edge| resolution(edge) == "resolved"));
+                                let identities: Vec<_> = edges
+                                    .iter()
+                                    .map(|edge| {
+                                        json!([
+                                            edge["call"]["id"],
+                                            edge["from"],
+                                            edge["to"],
+                                            edge["visit"],
+                                            edge["boundaryReason"],
+                                            resolution(edge)
+                                        ])
+                                    })
+                                    .collect();
                                 if let Some(full) = &full {
-                                    assert_eq!(edges, full);
+                                    assert_eq!(&identities, full);
                                 } else {
-                                    full = Some(edges.clone());
+                                    full = Some(identities);
                                 }
                             }
                         }

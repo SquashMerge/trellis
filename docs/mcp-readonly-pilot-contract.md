@@ -158,6 +158,50 @@ configured. The same selected snapshot supplies this field in describe
 a producer or initiate import; a mismatch requires a current artifact to be
 captured and imported through the existing explicit workflow.
 
+## Amendment (#665): agent-sized call graphs and call lists
+
+From the owner's rc.1 dogfood run (2026-11-03): `trellis_call_graph` with its
+defaults filled the 65,536-byte response at about eight nodes, because every proof
+repeated the same imported basis. `toolVersion` is **8** (previously 7). This
+section wins over the call graph's earlier input and success-envelope text; the
+contract-v1 graph records, traversal, warnings and byte-fit rules are unchanged.
+
+- **Basis table.** Call graph data adds `semanticBases:SemanticBasisEntry[]` and
+  each `result.provenance` row carries `basisRef:UInt|null` instead of `basis`,
+  exactly as the #528 outgoing and incoming table does. Re-inlining the table
+  gives back the contract `GraphResult`.
+- **Compact graph.** `trellis_call_graph` accepts `compact?:boolean` (default
+  false; a non-boolean is `invalid_request`). When true, data omits
+  `semanticBases`, the result omits `coverage` and `provenance`, each edge
+  replaces `binding` with `resolution` (the binding's resolution, or null without
+  one), each node declaration keeps only `role`, `syntaxId`, `document`, `kind`,
+  `name`, `lookupKey` and `range`, and each edge call keeps only `id`,
+  `ownerSyntaxId`, `ordinal`, `range`, `calleeRange` and `spelling`. Nodes, edges,
+  visits, boundaries, frontiers, `omitted`, `hints`, warnings, `partial` and
+  `truncated` are those of the full answer for the same request; the byte fit uses
+  the compact frame. On this repository's shape a compact answer is about a fifth
+  of the full one.
+- **Default limits.** The tool materializes its own defaults, sized to the
+  response: `maxNodes` 8 and `maxCalls` 10, or 50 and 60 with `compact:true`.
+  Eight nodes and ten semantic edges with proofs measured about 50 KB; fifty
+  nodes and sixty compact edges about 51 KB. `depth` stays 2, and the valid ranges
+  (1–150 nodes, 0–500 calls) are unchanged.
+- **Omitted counts.** Data adds required `responseOmitted:{nodes:UInt,edges:UInt}`:
+  the nodes and edge groups of the bounded answer that a response-byte reduction
+  left out, zero otherwise. The summary text repeats them, for example
+  `trellis_call_graph: 11 edges, truncated: response_bytes (110 nodes, 109 edges
+  omitted; compact:true fits more); full result in structuredContent.`
+- **External calls in compact outgoing calls.** `trellis_outgoing_calls` accepts
+  `includeExternal?:boolean`, default true, or false with `compact:true`.
+  When false, calls whose selected binding resolves to an external symbol (the
+  call graph's published external calls, stale ones included) are left out before
+  `limit` applies, and data adds `externalOmitted:UInt`, their count. Kept calls,
+  warnings and completeness are computed as before over the kept calls.
+- **Find ranking.** `trellis_find_symbols` query hits list callables, types and
+  every kind other than fields, parameters and variables first, then those three;
+  within each class the exact, prefix, substring, role, name and ID order is
+  unchanged. Lookup-key resolution and search are unchanged.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)

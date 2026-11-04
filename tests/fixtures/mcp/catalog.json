@@ -922,7 +922,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 7
+                  "const": 8
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -2325,7 +2325,7 @@
       ],
       "type": "object"
     },
-    "description": "Find declarations by literal name or ID substring (no regex). Returns symbol IDs for the other tools, with line ranges. Results are native declarations; `scopeCoverage` also reports each language's selected semantic evidence, and `syntaxOnly` appears only for returned languages without it."
+    "description": "Find declarations by literal name or ID substring (no regex). Returns symbol IDs for the other tools, with line ranges. Results are native declarations; `scopeCoverage` also reports each language's selected semantic evidence, and `syntaxOnly` appears only for returned languages without it. Callables and types rank before fields, parameters and variables."
   },
   {
     "annotations": {
@@ -5582,6 +5582,10 @@
         "lookupKey": {
           "type": "string",
           "minLength": 1
+        },
+        "includeExternal": {
+          "type": "boolean",
+          "description": "Keep calls whose binding is external. Defaults to true, or false with compact:true."
         }
       },
       "required": [
@@ -7350,6 +7354,9 @@
                       "type": "null"
                     }
                   ]
+                },
+                "externalOmitted": {
+                  "$ref": "#/$defs/UInt"
                 }
               },
               "required": [
@@ -7547,7 +7554,7 @@
       ],
       "type": "object"
     },
-    "description": "List the calls made inside one declaration, with semantic bindings and targets where a fresh imported producer covers the language, else syntax-only name hints. Default limit 6 (max 50). Each distinct semantic basis appears once in `semanticBases`, referenced by `semanticBasisRef` and provenance `basisRef`; `compact:true` omits bindings, coverage and provenance for a much smaller answer."
+    "description": "List the calls made inside one declaration, with semantic bindings and targets where a fresh imported producer covers the language, else syntax-only name hints. Default limit 6 (max 50). Each distinct semantic basis appears once in `semanticBases`, referenced by `semanticBasisRef` and provenance `basisRef`; `compact:true` omits bindings, coverage and provenance for a much smaller answer. With `compact:true`, calls bound to external symbols are left out and counted in `externalOmitted` unless `includeExternal:true`."
   },
   {
     "annotations": {
@@ -10355,13 +10362,15 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 150,
-          "default": 150
+          "default": 8,
+          "description": "Default 8, or 50 with compact:true."
         },
         "maxCalls": {
           "type": "integer",
           "minimum": 0,
           "maximum": 500,
-          "default": 500
+          "default": 10,
+          "description": "Default 10, or 60 with compact:true."
         },
         "includeExternal": {
           "type": "boolean",
@@ -10374,6 +10383,10 @@
         "lookupKey": {
           "type": "string",
           "minLength": 1
+        },
+        "compact": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -10751,30 +10764,20 @@
               },
               "then": {
                 "properties": {
-                  "basis": {
-                    "const": null
-                  },
                   "derivedFrom": {
                     "const": null
                   },
                   "freshness": {
                     "const": "fresh"
+                  },
+                  "basisRef": {
+                    "const": null
                   }
                 }
               }
             }
           ],
           "properties": {
-            "basis": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticBasis"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
             "contentHash": {
               "$ref": "#/$defs/Hash"
             },
@@ -10814,6 +10817,16 @@
             },
             "revisionId": {
               "$ref": "#/$defs/Text"
+            },
+            "basisRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -10823,7 +10836,7 @@
             "revisionId",
             "contentHash",
             "evidenceKind",
-            "basis",
+            "basisRef",
             "freshness",
             "derivedFrom"
           ],
@@ -11813,7 +11826,14 @@
           "additionalProperties": false,
           "properties": {
             "declaration": {
-              "$ref": "#/$defs/Declaration"
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Declaration"
+                },
+                {
+                  "$ref": "#/$defs/CompactDeclaration"
+                }
+              ]
             },
             "depth": {
               "$ref": "#/$defs/UInt"
@@ -11829,7 +11849,14 @@
           "additionalProperties": false,
           "properties": {
             "call": {
-              "$ref": "#/$defs/Call"
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Call"
+                },
+                {
+                  "$ref": "#/$defs/CompactCall"
+                }
+              ]
             },
             "from": {
               "$ref": "#/$defs/SyntaxId"
@@ -11877,13 +11904,27 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 9007199254740991
+            },
+            "resolution": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "resolved",
+                    "external",
+                    "ambiguous",
+                    "unresolved"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
             "call",
             "from",
             "to",
-            "binding",
             "visit",
             "boundaryReason",
             "callSiteCount"
@@ -12045,8 +12086,6 @@
             "nodes",
             "edges",
             "frontier",
-            "coverage",
-            "provenance",
             "partial",
             "truncated",
             "warnings",
@@ -12338,6 +12377,259 @@
             "contentHash",
             "provenanceId"
           ]
+        },
+        "LookupProvenance": {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "evidenceKind": {
+                    "const": "measuredSyntax"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": null
+                  },
+                  "derivedFrom": {
+                    "const": null
+                  },
+                  "freshness": {
+                    "const": "fresh"
+                  }
+                }
+              }
+            }
+          ],
+          "properties": {
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "id": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "id",
+            "producerId",
+            "document",
+            "revisionId",
+            "contentHash",
+            "evidenceKind",
+            "basis",
+            "freshness",
+            "derivedFrom"
+          ],
+          "type": "object"
+        },
+        "SemanticBasisEntry": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "lookupDependencies": {
+              "items": {
+                "$ref": "#/$defs/Text"
+              },
+              "type": "array"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "ref": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "ref",
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "type": "object"
+        },
+        "CompactDeclaration": {
+          "additionalProperties": false,
+          "properties": {
+            "role": {
+              "enum": [
+                "test",
+                "production"
+              ]
+            },
+            "syntaxId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "lookupKey": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            }
+          },
+          "required": [
+            "role",
+            "syntaxId",
+            "document",
+            "kind",
+            "name",
+            "lookupKey",
+            "range"
+          ],
+          "type": "object"
+        },
+        "CompactCall": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/OccurrenceId"
+            },
+            "ownerSyntaxId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "ordinal": {
+              "$ref": "#/$defs/UInt"
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "calleeRange": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Range"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "spelling": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "ownerSyntaxId",
+            "ordinal",
+            "range",
+            "calleeRange",
+            "spelling"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -12364,12 +12656,35 @@
                       "type": "null"
                     }
                   ]
+                },
+                "semanticBases": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/SemanticBasisEntry"
+                  }
+                },
+                "responseOmitted": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "nodes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "edges": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "nodes",
+                    "edges"
+                  ]
                 }
               },
               "required": [
                 "requested",
                 "result",
-                "stableLookupKey"
+                "stableLookupKey",
+                "responseOmitted"
               ],
               "type": "object"
             },
@@ -12449,7 +12764,7 @@
                 },
                 "provenance": {
                   "items": {
-                    "$ref": "#/$defs/Provenance"
+                    "$ref": "#/$defs/LookupProvenance"
                   },
                   "type": "array"
                 },
@@ -12558,7 +12873,7 @@
       ],
       "type": "object"
     },
-    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead."
+    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Defaults: depth 2, maxNodes 8, maxCalls 10 with full proofs; `compact:true` keeps node keys, names, paths, edge kinds and resolutions, drops bindings, coverage and provenance, and defaults to maxNodes 50, maxCalls 60. Each distinct semantic basis appears once in `semanticBases`; `responseOmitted` counts nodes and edges cut to fit the response. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead."
   },
   {
     "annotations": {
