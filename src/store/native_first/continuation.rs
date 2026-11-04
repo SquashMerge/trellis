@@ -503,10 +503,12 @@ impl Store {
                     },
                     step => step,
                 };
-                let committed = state.commit_stage_batches();
-                return match (step, committed) {
-                    (Ok(_), Err(error)) => Err(error.into()),
-                    (step, _) => step,
+                // A failed stage commit wins over the step's own outcome, a fallback or content
+                // error included: it is a storage error, so the whole continuation and every
+                // stage it owns (the shared LOCAL target stage too) is discarded, never reused.
+                return match state.commit_stage_batches() {
+                    Ok(()) => step,
+                    Err(error) => Err(error.into()),
                 };
             }
         });
