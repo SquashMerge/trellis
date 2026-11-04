@@ -49,7 +49,7 @@ and deferred nested definitions are available through Show all steps. The origin
 call order and source identities do not change. A zero-call view does not mean no behavior.
 The same Show all steps setting reveals incidental calls (including explicitly labelled logging
 heuristics, external calls and trivial accessors) and restores full admitted step text.
-Frontend filtering cannot recover calls clipped by server limits. The visible 200-step bound,
+Frontend filtering cannot recover calls clipped by server limits. Interactions request their candidates before the visible bound and draw at most 200 arrows after filtering (#663). Otherwise the visible 200-step bound,
 seed 150/callee reserve 50, work, depth and participant bounds and truncation warnings stay unchanged.
 
 Complex loop transfers, unsupported patterns and optional-chain operations may appear as

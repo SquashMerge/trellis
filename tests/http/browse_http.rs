@@ -611,13 +611,15 @@ async fn sequence_interactions_keep_a_call_after_more_than_200_internal_steps() 
     std::fs::create_dir(&workspace).unwrap();
     let mut publisher = Publisher::open(&dir.path().join("state"), &workspace);
     let internal: String = (0..240).map(|n| format!("value = {n}; ")).collect();
+    // `run` has the long body itself; `outer` reaches the same body through a callee.
     let source = format!(
-        "struct A;\nimpl A {{ fn run(&self) {{ {internal}B::send(); }} }}\nstruct B;\nimpl B {{ fn send() {{}} }}\n"
+        "struct A;\nimpl A {{ fn run(&self) {{ {internal}B::send(); }} fn outer(&self) {{ self.run(); }} }}\nstruct B;\nimpl B {{ fn send() {{}} }}\n"
     );
     let mut spec = Spec::new(&[("a.rs", &source)]);
-    spec.bindings = vec![bind("run", 0, "send")];
+    spec.bindings = vec![bind("run", 0, "send"), bind("outer", 0, "run")];
     let pin = publisher.publish(&spec);
     let seed = syntax_id(publisher.native(), "run");
+    let outer = syntax_id(publisher.native(), "outer");
     let send = syntax_id(publisher.native(), "send");
     let app = http::router(
         http::new(
@@ -647,4 +649,16 @@ async fn sequence_interactions_keep_a_call_after_more_than_200_internal_steps() 
         assert_eq!(raw["truncatedBy"], json!(["visibleSteps"]), "{request}");
         assert_eq!(raw["steps"].as_array().unwrap().len(), 200, "{request}");
     }
+    // A callee body longer than the visible bound is expanded for Interactions only.
+    let request = |interactions: bool| json!({"seed":outer,"expectedRevision":pin,"showAll":false,"interactions":interactions});
+    let (status, view) = call(&app, "POST", "/api/sequence", request(true)).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["truncated"], false, "{}", view["warnings"]);
+    let body = view["steps"][0]["children"].as_array().unwrap();
+    assert_eq!(body.len(), 241);
+    assert_eq!(body.last().unwrap()["target"], json!(send));
+    let (status, raw) = call(&app, "POST", "/api/sequence", request(false)).await;
+    assert_eq!(status, 200, "{raw}");
+    assert_eq!(raw["truncatedBy"], json!(["visibleSteps"]));
+    assert!(raw["steps"][0]["children"].as_array().unwrap().is_empty());
 }

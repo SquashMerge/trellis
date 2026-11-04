@@ -489,6 +489,7 @@ pub(super) fn sequence_calls(
     selected: &ReadRevision,
     view: &mut crate::behavior::SequenceView,
     show_all: bool,
+    interactions: bool,
 ) -> Result<()> {
     use crate::behavior::{EvidenceTier, SequenceLimit, SequenceSemantic, cap_visible};
     use crate::graph_query::{self as engine, GraphNode};
@@ -583,16 +584,22 @@ pub(super) fn sequence_calls(
         &mut |id, key| expandable(store, db, selected, &mut bodies, id, key),
         &mut |id, key| accessor(store, db, selected, &mut accessors, id, key),
     )?;
-    // The reserve applies only when a call that may expand is among the steps it keeps.
-    let reserve = shown_within(&view.steps, &targets, &mut { crate::behavior::SEED_STEPS });
-    cap_visible(
-        view,
-        if reserve {
-            crate::behavior::SEED_STEPS
-        } else {
-            crate::behavior::MAX_STEPS
-        },
-    );
+    // Interactions (#663) draw only calls between columns, so the visible step bound, which
+    // counts internal steps, is not theirs: the browser bounds the arrows after filtering.
+    // A view with no shown call is drawn calls-first and keeps the visible bound.
+    let interactions = interactions && shows_call(&view.steps);
+    if !interactions {
+        // The reserve applies only when a call that may expand is among the steps it keeps.
+        let reserve = shown_within(&view.steps, &targets, &mut { crate::behavior::SEED_STEPS });
+        cap_visible(
+            view,
+            if reserve {
+                crate::behavior::SEED_STEPS
+            } else {
+                crate::behavior::MAX_STEPS
+            },
+        );
+    }
     let mut enrichment = Enrichment {
         store,
         db,
@@ -601,6 +608,7 @@ pub(super) fn sequence_calls(
         languages: &languages,
         revision: view.revision,
         show_all,
+        interactions,
         participants: &mut view.participants,
         warnings: &mut view.warnings,
         nodes: vec![GraphNode {
@@ -718,6 +726,8 @@ struct Enrichment<'a, 'b> {
     languages: &'b BTreeSet<String>,
     revision: IndexPin,
     show_all: bool,
+    /// Interactions candidates (#663): expansion is not bounded by visible steps.
+    interactions: bool,
     participants: &'b mut Vec<crate::behavior::Participant>,
     warnings: &'b mut Vec<String>,
     nodes: Vec<crate::graph_query::GraphNode>,
@@ -936,6 +946,16 @@ fn expandable(
         memo.insert(key.path.clone(), callables);
     }
     Ok(memo[&key.path].contains(id))
+}
+
+/// Whether `steps` show a call: what the browser's Interactions view draws from (#663).
+fn shows_call(steps: &[crate::behavior::SequenceStep]) -> bool {
+    steps.iter().filter(|step| !step.hidden).any(|step| {
+        step.kind == "call"
+            || step.call_id.is_some()
+            || shows_call(&step.children)
+            || shows_call(&step.alternate)
+    })
 }
 
 /// Whether a step in `ids` is among the first `limit` shown steps of `steps`, in pre-order.
@@ -1185,7 +1205,7 @@ impl Enrichment<'_, '_> {
             &mut |id, key| accessor(store, db, selected, accessors, id, key),
         )?;
         let shown = visible_count(&body.steps);
-        if self.used + shown > MAX_STEPS {
+        if !self.interactions && self.used + shown > MAX_STEPS {
             self.limits.insert(SequenceLimit::VisibleSteps);
             self.warn(format!(
                 "Sequence step limit reached; the body of {} is not expanded.",
