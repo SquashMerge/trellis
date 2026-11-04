@@ -487,6 +487,25 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
         (db, target, dir, stage)
     }
 
+
+    #[test]
+    fn local_target_lookup_charges_variable_payload_and_checks_stage_limit() {
+        let (db, _target, _dir, mut stage) = fixture();
+        let cancel = Arc::new(AtomicBool::new(false));
+        initialize(&mut stage, pin(2)).unwrap();
+        let name = "a".repeat(256 * 1024);
+        db.execute("UPDATE document_versions SET byte_length=?1 WHERE vid=1", [name.len() as i64 + 2]).unwrap();
+        db.execute("UPDATE native_version_declarations SET name=?1,name_start=1,name_end=?2,end_byte=?3 WHERE vid=1", params![name,name.len() as i64 + 1,name.len() as i64 + 2]).unwrap();
+        let limits = BatchLimits {
+            staging_bytes: stage.bytes() + 64 * 1024,
+            unit_expansion_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        let sid = format!("sid:v1:{}", "1".repeat(32));
+        let result = lookup(&db, pin(1), &key(), &sid, &mut stage, &limits, &mut 0, &cancel);
+        assert!(result.is_err(), "lookup wrote {} stage bytes past {} limit without checking", stage.bytes(), limits.staging_bytes);
+    }
+
     #[test]
     fn local_target_pages_are_shared_and_exact_lookups_are_pin_scoped() {
         let (db, target, _dir, mut stage) = fixture();

@@ -122,7 +122,41 @@ pub(super) struct JoinCtx<'a> {
     /// Whether a source of a language was not read (#576), by revision side and language.
     unread: RefCell<BTreeMap<(u8, String), bool>>,
     /// This unit's proof identities by proof ID ([`JoinCtx::proof_row`]).
-    proofs: RefCell<HashMap<String, Option<Rc<ProofRow>>>>,
+    proofs: RefCell<ProofMemo>,
+}
+
+/// Proof identities one join unit has read, and the live reservation that owns their storage.
+#[derive(Default)]
+pub(super) struct ProofMemo {
+    rows: HashMap<String, Option<Rc<ProofRow>>>,
+    owner: Option<Reservation>,
+}
+
+impl ProofMemo {
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The retained storage of one entry: its key, its row and strings, the `Rc` box, and two
+    /// table slots, since a hash table holds up to twice its entries' capacity.
+    fn entry_bytes(proof_id: &str, row: Option<&ProofRow>) -> Result<u64> {
+        let row = row.map_or(Ok(0), |row| {
+            sizes::sum(&[
+                std::mem::size_of::<ProofRow>() as u64 + 2 * std::mem::size_of::<usize>() as u64,
+                row.language.len() as u64,
+                row.path.len() as u64,
+                row.record_kind.len() as u64,
+                row.fact_digest.len() as u64,
+                row.artifact_hash.len() as u64,
+            ])
+        })?;
+        sizes::sum(&[
+            proof_id.len() as u64,
+            row,
+            sizes::map_entries::<String, Option<Rc<ProofRow>>>(2)?,
+        ])
+    }
 }
 
 /// One staged proof identity (`proof_identities`) with its source and artifact.
@@ -145,7 +179,7 @@ impl JoinCtx<'_> {
     /// identities do not change during a join, so a unit reads each once. Proof IDs are unique
     /// across `claims` and `witness_proofs` (`check_proof_identity_closure`).
     fn proof_row(&self, proof_id: &str) -> Result<Option<Rc<ProofRow>>> {
-        if let Some(found) = self.proofs.borrow().get(proof_id) {
+        if let Some(found) = self.proofs.borrow().rows.get(proof_id) {
             return Ok(found.clone());
         }
         let found = self
@@ -168,11 +202,27 @@ impl JoinCtx<'_> {
             })
             .optional()?
             .map(Rc::new);
-        let mut proofs = self.proofs.borrow_mut();
-        if proofs.len() >= PROOF_MEMO_ENTRIES {
-            proofs.clear();
+        let mut memo = self.proofs.borrow_mut();
+        if memo.rows.len() >= PROOF_MEMO_ENTRIES {
+            // A new table: clearing would keep the old capacity, which the release frees.
+            *memo = ProofMemo::default();
         }
-        proofs.insert(proof_id.to_owned(), found.clone());
+        // The memo is optional: an identity it cannot admit under the unit's live budget is
+        // returned without being retained.
+        let bytes = ProofMemo::entry_bytes(proof_id, found.as_deref())?;
+        let admitted = match memo.owner.as_mut() {
+            Some(owner) => owner.grow(bytes).is_ok(),
+            None => match self.live.reserve(bytes) {
+                Ok(owner) => {
+                    memo.owner = Some(owner);
+                    true
+                }
+                Err(_) => false,
+            },
+        };
+        if admitted {
+            memo.rows.insert(proof_id.to_owned(), found.clone());
+        }
         Ok(found)
     }
 

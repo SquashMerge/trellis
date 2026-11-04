@@ -54,7 +54,7 @@ pub(crate) struct RetainedStageContinuation {
     /// Estimated stage bytes written since the stage directory was last measured.
     unchecked: u64,
     /// The current artifact's checked proof documents (path to source ordinal).
-    proof_documents: HashMap<String, i64>,
+    proof_documents: ProofDocuments,
 }
 
 /// Stage bytes charged per row a unit changes, beyond the payload it reports.
@@ -192,7 +192,7 @@ impl RetainedStageContinuation {
             missing_proof: String::new(),
             missing_found: None,
             unchecked: 0,
-            proof_documents: HashMap::new(),
+            proof_documents: ProofDocuments::default(),
         })
     }
 
@@ -564,7 +564,7 @@ impl RetainedStageContinuation {
                     self.document_key = (String::new(), String::new());
                     self.proof_count = 0;
                     self.document_count = 0;
-                    self.proof_documents.clear();
+                    self.proof_documents = ProofDocuments::default();
                     if self.trusted {
                         self.phase = Phase::Documents;
                     } else {
@@ -788,6 +788,33 @@ impl RetainedStageContinuation {
     }
 }
 
+/// The checked source ordinal of each proof document of the current artifact. Its storage
+/// (path bytes and two table slots per entry, as a hash table holds up to twice its entries)
+/// is charged against half the unit expansion limit, leaving the rest to the page being
+/// staged; a path past that charge is looked up again instead of being retained.
+#[derive(Default)]
+pub(super) struct ProofDocuments {
+    paths: HashMap<String, i64>,
+    bytes: u64,
+}
+
+impl ProofDocuments {
+    fn get(&self, path: &str) -> Option<&i64> {
+        self.paths.get(path)
+    }
+
+    fn insert(&mut self, path: String, ord: i64, limits: &BatchLimits) {
+        let entry = (path.len() as u64).saturating_add(
+            2 * (std::mem::size_of::<(String, i64)>() + std::mem::size_of::<u64>()) as u64,
+        );
+        let bytes = self.bytes.saturating_add(entry);
+        if bytes <= limits.unit_expansion_bytes / 2 {
+            self.bytes = bytes;
+            self.paths.insert(path, ord);
+        }
+    }
+}
+
 /// Witness proof identities staged per admission unit.
 const WITNESS_PROOF_PAGE: i64 = 256;
 
@@ -810,7 +837,7 @@ fn advance_witness_proof(
     conn: &Connection,
     key: &mut String,
     limits: &BatchLimits,
-    assigned: &mut HashMap<String, i64>,
+    assigned: &mut ProofDocuments,
 ) -> Result<Option<WitnessProofPage>> {
     let mut statement = db.prepare_cached(
         "SELECT proof_id,record_kind,fact_digest,language,path FROM semantic_raw_proofs          WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT ?3",
@@ -851,7 +878,7 @@ fn advance_witness_proof(
                     )?
                     .query_row(params![source.ord, entry.ordinal], |row| row.get(0))?;
                 ensure!(present, "retained proof document");
-                assigned.insert(path, source.ord);
+                assigned.insert(path, source.ord, limits);
                 source.ord
             }
         };
@@ -994,6 +1021,22 @@ fn advance_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proof_document_paths_are_retained_only_within_their_charge() {
+        let limits = BatchLimits {
+            unit_expansion_bytes: 400,
+            ..Default::default()
+        };
+        let mut paths = ProofDocuments::default();
+        paths.insert("a".repeat(64), 1, &limits);
+        assert_eq!(paths.get(&"a".repeat(64)), Some(&1));
+        assert!(paths.bytes > 64 && paths.bytes <= 200);
+        // A second entry would pass half the unit expansion limit: it is not retained.
+        paths.insert("b".repeat(64), 2, &limits);
+        assert_eq!(paths.get(&"b".repeat(64)), None);
+        assert_eq!(paths.paths.len(), 1);
+    }
 
     #[test]
     fn full_document_comparison_yields_even_when_accelerator_is_absent() {
