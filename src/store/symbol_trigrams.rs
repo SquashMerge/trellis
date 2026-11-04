@@ -68,6 +68,10 @@ struct Search<'a> {
     name: &'a str,
     id: &'a str,
     role: Option<&'a str>,
+    /// A 0/1 kind class ranked before the match tier (#665): W2 lists callables and
+    /// types before fields, parameters and variables. Its rank column already adds
+    /// `3 * class`, so the literal, FTS and ID-union paths order by it unchanged.
+    class: Option<&'a str>,
     query_parameter: usize,
     limit_parameter: usize,
     match_parameter: usize,
@@ -182,7 +186,14 @@ impl Search<'_> {
         )
     }
 
-    fn ordered_sql(&self, tier: i64, upper: bool, id_shaped: bool, role: Option<&str>) -> String {
+    fn ordered_sql(
+        &self,
+        tier: i64,
+        upper: bool,
+        id_shaped: bool,
+        role: Option<&str>,
+        class: Option<i64>,
+    ) -> String {
         let table = self.source.split(' ').next().unwrap_or_default();
         let alias = self.source.rsplit(' ').next().unwrap_or_default();
         let name = self.name;
@@ -235,9 +246,13 @@ impl Search<'_> {
             (Some(column), Some(role)) => format!(" AND {column}='{role}'"),
             _ => String::new(),
         };
+        let class_filter = match (self.class, class) {
+            (Some(expression), Some(class)) => format!(" AND ({expression})={class}"),
+            _ => String::new(),
+        };
         format!(
             "SELECT {columns} FROM {source} INDEXED BY {table}_search_{index} {joins}
-             WHERE {predicate}{role_filter} ORDER BY {name} COLLATE BINARY,{id} LIMIT ?{limit}",
+             WHERE {predicate}{role_filter}{class_filter} ORDER BY {name} COLLATE BINARY,{id} LIMIT ?{limit}",
             columns = self.columns,
             source = self.source,
             // Keep the ordered source outermost; sparse/literal queries retain
@@ -265,26 +280,33 @@ impl Search<'_> {
         } else {
             &[None]
         };
-        for tier in 0..=2 {
-            for &role in roles {
-                let remaining = limit - hits.len() as i64;
-                if remaining <= 0 {
-                    return Ok(hits);
+        let classes: &[Option<i64>] = if self.class.is_some() {
+            &[Some(0), Some(1)]
+        } else {
+            &[None]
+        };
+        for &class in classes {
+            for tier in 0..=2 {
+                for &role in roles {
+                    let remaining = limit - hits.len() as i64;
+                    if remaining <= 0 {
+                        return Ok(hits);
+                    }
+                    #[cfg(test)]
+                    if tier == 2 && id_shaped {
+                        ID_SCANS.set(ID_SCANS.get() + 1);
+                    }
+                    let mut values = values.to_vec();
+                    values[self.limit_parameter - 1] = &remaining;
+                    if tier == 1 && upper.is_some() {
+                        values.push(&upper);
+                    }
+                    hits.extend(ranked(
+                        db,
+                        &self.ordered_sql(tier, upper.is_some(), id_shaped, role, class),
+                        &values,
+                    )?);
                 }
-                #[cfg(test)]
-                if tier == 2 && id_shaped {
-                    ID_SCANS.set(ID_SCANS.get() + 1);
-                }
-                let mut values = values.to_vec();
-                values[self.limit_parameter - 1] = &remaining;
-                if tier == 1 && upper.is_some() {
-                    values.push(&upper);
-                }
-                hits.extend(ranked(
-                    db,
-                    &self.ordered_sql(tier, upper.is_some(), id_shaped, role),
-                    &values,
-                )?);
             }
         }
         Ok(hits)
@@ -310,10 +332,11 @@ fn prefix_end(prefix: &str) -> Option<String> {
 /// The ID-scan shortcut. Not a fallback: it runs after the names query has
 /// succeeded and only decides whether a second, larger query could change
 /// the answer. A row the ID scan adds matches through its ID only, so its
-/// name neither equals nor starts with the query: it ranks 2. Hits come
-/// ordered by rank. If the names query already filled all `limit` rows with
-/// rank-0 or rank-1 hits, every added row would sort after them and fall
-/// beyond the LIMIT, so the answer is the same without the scan.
+/// name neither equals nor starts with the query: it ranks 2, or 5 in W2's
+/// lower kind class. Hits come ordered by rank. If the names query already
+/// filled all `limit` rows with rank-0 or rank-1 hits, every added row would
+/// sort after them and fall beyond the LIMIT, so the answer is the same
+/// without the scan.
 fn names_decide(hits: &[(String, String, i64)], limit: i64) -> bool {
     i64::try_from(hits.len()).is_ok_and(|n| n >= limit) && hits.last().is_some_and(|h| h.2 <= 1)
 }
@@ -334,10 +357,21 @@ pub(super) fn w2_hits(
     w2_search().hits(db, query, lookahead, &[&revision, &query, &lookahead])
 }
 
+/// Fields, parameters and variables rank after every other kind (#665).
+macro_rules! w2_class {
+    () => {
+        "CASE WHEN d.kind IN ('field','parameter','variable') THEN 1 ELSE 0 END"
+    };
+}
+
 fn w2_search() -> Search<'static> {
     Search {
-        columns: "v.id,d.syntax_id,CASE WHEN lower(d.name)=lower(?2) THEN 0
-            WHEN instr(lower(d.name),lower(?2))=1 THEN 1 ELSE 2 END",
+        columns: concat!(
+            "v.id,d.syntax_id,3*(",
+            w2_class!(),
+            ")+CASE WHEN lower(d.name)=lower(?2) THEN 0
+            WHEN instr(lower(d.name),lower(?2))=1 THEN 1 ELSE 2 END"
+        ),
         source: "native_version_declarations d",
         names: "native_declaration_trigrams",
         ids: "SELECT d.rowid FROM revision_documents m
@@ -350,6 +384,7 @@ fn w2_search() -> Search<'static> {
         name: "d.name",
         id: "d.syntax_id",
         role: Some("d.role"),
+        class: Some(w2_class!()),
         query_parameter: 2,
         limit_parameter: 3,
         match_parameter: 4,
@@ -379,6 +414,7 @@ fn graph_search() -> Search<'static> {
         name: "n.name",
         id: "n.id",
         role: None,
+        class: None,
         query_parameter: 1,
         limit_parameter: 2,
         match_parameter: 3,
@@ -787,7 +823,7 @@ mod tests {
             if search.query_parameter == 2 {
                 values.insert(0, &revision);
             }
-            let sql = search.ordered_sql(1, true, false, None);
+            let sql = search.ordered_sql(1, true, false, None, search.class.map(|_| 0));
             let plan: Vec<String> = db
                 .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
                 .unwrap()
@@ -1002,8 +1038,13 @@ mod tests {
                 i64::from(statement.get_status(StatementStatus::VmStep))
             };
             let legacy_steps = measure(&legacy);
-            let steps =
-                measure(&search.ordered_sql(2, false, false, search.role.map(|_| "production")));
+            let steps = measure(&search.ordered_sql(
+                2,
+                false,
+                false,
+                search.role.map(|_| "production"),
+                search.class.map(|_| 0),
+            ));
             assert!(
                 steps * 10 < legacy_steps * 7,
                 "{}: {steps} VM steps versus legacy {legacy_steps}",
@@ -1025,7 +1066,7 @@ mod tests {
         }
         let measure = |search: Search<'_>| {
             let role = search.role.map(|_| "production");
-            let sql = search.ordered_sql(2, false, false, role);
+            let sql = search.ordered_sql(2, false, false, role, search.class.map(|_| 0));
             let expression = match_expression("oca").unwrap();
             let limit = 5_i64;
             let revision = "pin:v1:test:1";

@@ -138,7 +138,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":7,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":8,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
@@ -170,7 +170,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 7);
+        assert_eq!(ready["data"]["toolVersion"], 8);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -1659,9 +1659,9 @@ fn wire_row<T: serde::Serialize, U: serde::de::DeserializeOwned>(
 /// `semanticBasisRef` and proofs `basisRef`, both indexes into `semanticBases`, instead of
 /// repeating the whole basis. Equal bases share one entry; refs follow the entries'
 /// canonical serialization, so equal answers serialize byte-identically.
-fn intern_bases(
+fn intern_bases<P: serde::Serialize>(
     items: &mut [Value],
-    provenance: impl IntoIterator<Item = crate::native_evidence::Provenance>,
+    provenance: impl IntoIterator<Item = P>,
 ) -> Result<(Vec<Value>, Vec<Value>), &'static str> {
     use std::collections::BTreeMap;
     let provenance: Vec<Value> = provenance
@@ -1985,6 +1985,9 @@ pub fn outgoing(
         let mut data = json!({"symbolId":result.owner.selected.declaration.syntax_id,
             "stableLookupKey":result.owner.source.stable_lookup_key,"displayKey":owner_display,"calls":calls,"documents":documents,
             "semanticBases":bases,"coverage":coverage,"provenance":provenance});
+        if let Some(omitted) = result.external_omitted {
+            data["externalOmitted"] = json!(omitted);
+        }
         if compacted {
             compact_data(&mut data, "calls");
         }
@@ -2039,11 +2042,17 @@ pub fn outgoing(
 /// A complete answer that does not fit is replaced by the exact contract answer for the
 /// largest `maxCalls = k` whose frame fits (`fits(k) && !fits(k + 1)`), re-evaluated over the
 /// facts the query already read. The reduction is disclosed by `data.requested` (the caller's
-/// values) and `truncationReason: "response_bytes"`. `None` means even `k = 0` is too large.
+/// values), `truncationReason: "response_bytes"` and `data.responseOmitted`, the nodes and
+/// edge groups of the bounded answer left out. `None` means even `k = 0` is too large.
+///
+/// #665: each distinct semantic basis is emitted once in `data.semanticBases` and proofs
+/// carry `basisRef`, as outgoing and incoming calls do. `compact` drops the proof detail
+/// (see [`compact_graph`]) and is fitted on its own, smaller frame.
 pub fn call_graph(
     id: &Value,
     answer: &mut crate::graph_query::GraphAnswer,
     stable_lookup_key: Option<&str>,
+    compact: bool,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
@@ -2052,6 +2061,7 @@ pub fn call_graph(
         return Err("store_unavailable: call graph answer is a contract failure");
     };
     let edges = full.edges.len();
+    let nodes = full.nodes.len();
     let requested = answer.requested.clone();
     let basis = json!({"indexGeneration":answer.basis.index_generation.to_string(),
         "indexRevision":answer.basis.index_revision});
@@ -2064,10 +2074,23 @@ pub fn call_graph(
             } else {
                 None
             };
+            let mut projected = serde_json::to_value(result)
+                .map_err(|_| "store_unavailable: call graph projection")?;
+            let Value::Array(rows) = projected["provenance"].take() else {
+                return Err("store_unavailable: call graph provenance projection");
+            };
+            let (bases, provenance) = intern_bases(&mut [], rows)?;
+            projected["provenance"] = Value::Array(provenance);
+            let omitted = json!({"nodes":nodes - result.nodes.len(),
+                "edges":edges - result.edges.len()});
+            let mut data = json!({"stableLookupKey":stable_lookup_key,"requested":requested,
+                "result":projected,"semanticBases":bases,"responseOmitted":omitted});
+            if compact {
+                compact_graph(&mut data);
+            }
             Ok(
                 json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
-            "evidenceBasis":basis,
-            "data":{"stableLookupKey":stable_lookup_key,"requested":requested,"result":result},
+            "evidenceBasis":basis,"data":data,
             "warnings":result.warnings,"partial":result.partial,"truncated":result.truncated,
             "truncationReason":reason}),
             )
@@ -2088,6 +2111,51 @@ pub fn call_graph(
         },
         fits,
     )
+}
+
+/// #665 compact graph: keep the graph (node keys, names, kinds, roles, paths and ranges; edge
+/// endpoints, call sites, visits, boundaries and binding resolutions), frontiers, omissions,
+/// hints, warnings and completeness, and drop the proof detail: `semanticBases`, the
+/// result's `coverage` and `provenance`, each edge's `binding` (replaced by its
+/// `resolution`, null without one), each node declaration's header, ancestors, key, name
+/// range, revision and proof, and each call's document, revision, regions and proof.
+fn compact_graph(data: &mut Value) {
+    if let Some(fields) = data.as_object_mut() {
+        fields.remove("semanticBases");
+    }
+    let result = &mut data["result"];
+    if let Some(fields) = result.as_object_mut() {
+        fields.remove("coverage");
+        fields.remove("provenance");
+    }
+    for node in result["nodes"].as_array_mut().into_iter().flatten() {
+        if let Some(declaration) = node["declaration"].as_object_mut() {
+            for field in [
+                "ancestors",
+                "key",
+                "nameRange",
+                "header",
+                "revisionId",
+                "provenanceId",
+            ] {
+                declaration.remove(field);
+            }
+        }
+    }
+    for edge in result["edges"].as_array_mut().into_iter().flatten() {
+        if let Some(call) = edge["call"].as_object_mut() {
+            for field in ["document", "revisionId", "regionIds", "provenanceId"] {
+                call.remove(field);
+            }
+        }
+        if let Some(fields) = edge.as_object_mut() {
+            let resolution = fields
+                .remove("binding")
+                .and_then(|binding| binding.get("resolution").cloned())
+                .unwrap_or(Value::Null);
+            fields.insert("resolution".into(), resolution);
+        }
+    }
 }
 
 fn fit_call_graph(
@@ -2349,6 +2417,7 @@ mod outgoing_tests {
             },
             calls,
             has_more: result.has_more,
+            external_omitted: None,
         }
     }
 
@@ -3152,6 +3221,7 @@ mod call_graph_tests {
             &json!("graph"),
             answer,
             None,
+            false,
             std::path::Path::new("/w"),
             false,
             modern,
@@ -3264,12 +3334,19 @@ mod call_graph_tests {
             assert_eq!(result["omitted"]["callLimit"], 100);
             assert_eq!(result["omitted"]["responseBytes"], 500 - k as u64);
             assert!(frame_len(&envelope, modern) < crate::mcp::wire::RESPONSE_BYTES);
-            assert_eq!(
-                serde_json::to_value(big.prefix(k).unwrap()).unwrap(),
-                *result
-            );
+            // Syntax-only proofs project `basis: null` as `basisRef: null` (#665).
+            let wire = |result: crate::graph_query::GraphResult| {
+                let mut value = serde_json::to_value(result).unwrap();
+                for proof in value["provenance"].as_array_mut().unwrap() {
+                    let proof = proof.as_object_mut().unwrap();
+                    assert_eq!(proof.remove("basis"), Some(Value::Null));
+                    proof.insert("basisRef".into(), Value::Null);
+                }
+                value
+            };
+            assert_eq!(wire(big.prefix(k).unwrap()), *result);
             let mut probe = envelope.clone();
-            probe["data"]["result"] = serde_json::to_value(big.prefix(k + 1).unwrap()).unwrap();
+            probe["data"]["result"] = wire(big.prefix(k + 1).unwrap());
             assert!(frame_len(&probe, modern) >= crate::mcp::wire::RESPONSE_BYTES);
             assert_eq!(project(&mut big, modern).unwrap(), envelope);
         }
@@ -3586,5 +3663,442 @@ mod size_tests {
         assert_eq!(full["truncationReason"], "response_bytes");
         assert_eq!(page["truncationReason"], "limit");
         assert_eq!(page["data"]["scopeCoverage"], full["data"]["scopeCoverage"]);
+    }
+
+    /// #665: a rooted graph in the live shape of `DaemonState::enqueue_index`. The root
+    /// (`src/daemon/state.rs`) calls `fanout` helpers, each in its own file, and every
+    /// helper calls two leaves beside it. Every call has a resolved direct rust-analyzer
+    /// binding with its own proof, and every declaration its own declaration-binding proof,
+    /// all carrying the same imported basis.
+    fn graph(fanout: usize, max_nodes: u64, max_calls: u64) -> crate::graph_query::GraphAnswer {
+        use crate::graph_query::{
+            DocumentFacts, GraphFacts, GraphRequest, GraphSnapshot, SemanticDocument, evaluate,
+        };
+        use std::{collections::BTreeMap, sync::Arc};
+        const PRODUCER: &str = "rust-analyzer";
+        let mut facts = GraphFacts::complete(GraphSnapshot {
+            source_set_id: SOURCE_SET.into(),
+            revision_id: REVISION.into(),
+        });
+        facts
+            .producers
+            .insert(PRODUCER.into(), ["rust".to_owned()].into());
+        let mut files: BTreeMap<String, (usize, Vec<(String, usize)>)> = BTreeMap::new();
+        let mut edges: Vec<(String, String, usize)> = Vec::new();
+        let root = "src/daemon/state.rs".to_owned();
+        files
+            .entry(root.clone())
+            .or_insert((0, vec![]))
+            .1
+            .push(("enqueue_index".into(), 0));
+        let mut next = 1;
+        for i in 0..fanout {
+            let path = format!("src/daemon/worker_{i}.rs");
+            let file = i + 1;
+            let helper = (format!("schedule_checkout_work_{i}"), next);
+            next += 1;
+            let entry = files.entry(path.clone()).or_insert((file, vec![]));
+            entry.1.push(helper.clone());
+            edges.push((root.clone(), path.clone(), helper.1));
+            for j in 0..2 {
+                let leaf = (format!("record_pending_request_{i}_{j}"), next);
+                next += 1;
+                files.get_mut(&path).unwrap().1.push(leaf.clone());
+                edges.push((path.clone(), path.clone(), leaf.1));
+            }
+        }
+        let sid = |n: usize| format!("sid:v1:{:032x}", 0x5000 + n);
+        // Helpers are 1, 4, 7, ... (owned by the root, 0); leaves follow their helper.
+        let owner_of = |n: usize| -> usize {
+            if n == 0 || (n - 1).is_multiple_of(3) {
+                0
+            } else {
+                n - (n - 1) % 3
+            }
+        };
+        let mut documents: BTreeMap<String, DocumentFacts> = BTreeMap::new();
+        for (path, (file, declarations)) in &files {
+            let key: crate::native_evidence::DocumentKey =
+                serde_json::from_value(document(path)).unwrap();
+            let mut decls = BTreeMap::new();
+            let mut provenance = BTreeMap::new();
+            let mut declaration_bindings = Vec::new();
+            for (name, n) in declarations {
+                let start = 2000 * (n + 1);
+                let declaration: crate::native_evidence::Declaration =
+                    serde_json::from_value(json!({"syntaxId":sid(*n),
+                    "document":document(path),"revisionId":REVISION,"kind":"method",
+                    "role":"production","name":name,"lookupKey":name,
+                    "ancestors":[{"kind":"implementation","name":"DaemonState",
+                        "signature":null,"ordinal":0}],
+                    "key":{"kind":"method","name":name,"signature":null,"ordinal":0},
+                    "range":{"start":start,"end":start + 1800},
+                    "nameRange":{"start":start + 7,"end":start + 7 + name.len()},
+                    "header":{"kind":"method","name":name,"modifiers":["pub"],
+                        "typeParameters":[],"parameters":[
+                            {"name":"self","type":"&self","variadic":false},
+                            {"name":"request","type":"IndexRequest","variadic":false}],
+                        "resultType":"anyhow::Result<RequestId>","bases":[]},
+                    "provenanceId":format!("native-proof:v1:{}", hex(file + 7, 64))}))
+                    .unwrap();
+                decls.insert(sid(*n), declaration);
+                let proof = hex(n + 40, 64);
+                provenance.insert(
+                    proof.clone(),
+                    serde_json::from_value(json!({"id":proof,
+                    "producerId":PRODUCER,"document":document(path),"revisionId":REVISION,
+                    "contentHash":hex(file + 7, 64),"evidenceKind":"declarationBinding",
+                    "basis":basis(),"freshness":"fresh",
+                    "derivedFrom":{"factDigest":hex(n + 41, 64),"provenanceId":hex(n + 42, 64),
+                        "recordKind":"occurrence"}}))
+                    .unwrap(),
+                );
+                declaration_bindings.push(serde_json::from_value(json!({"syntaxId":sid(*n),
+                    "symbols":[{"scheme":"scip","symbol":format!("rust-analyzer cargo trellis 0.1.0 daemon/{name}()."),
+                        "scope":"global","document":null}],
+                    "join":{"anchor":{"contentHash":hex(file + 7, 64),"document":document(path),
+                        "kind":"declarationName","range":{"start":start + 7,"end":start + 7 + name.len()},
+                        "revisionId":REVISION},"candidateIds":[sid(*n)],"diagnostic":null,
+                        "status":"exact"},"provenanceId":proof})).unwrap());
+            }
+            let mut calls: BTreeMap<String, Vec<crate::native_evidence::Call>> = BTreeMap::new();
+            let mut call_bindings = Vec::new();
+            for (ordinal_source, (from, to_path, target)) in edges.iter().enumerate() {
+                if from != path {
+                    continue;
+                }
+                let owner = owner_of(*target);
+                let owned = calls.entry(sid(owner)).or_default();
+                let start = 2000 * (owner + 1) + 100 + 40 * owned.len();
+                let call_id = format!("occ:v2:{:032x}", 0x9000 + ordinal_source);
+                let target_name = &files[to_path].1.iter().find(|d| d.1 == *target).unwrap().0;
+                owned.push(
+                    serde_json::from_value(json!({"id":call_id,"ownerSyntaxId":sid(owner),
+                    "ordinal":owned.len(),"document":document(path),"revisionId":REVISION,
+                    "range":{"start":start,"end":start + 30},
+                    "calleeRange":{"start":start,"end":start + target_name.len()},
+                    "spelling":target_name,"regionIds":[],
+                    "provenanceId":format!("native-proof:v1:{}", hex(file + 7, 64))}))
+                    .unwrap(),
+                );
+                let proof = hex(ordinal_source + 70, 64);
+                provenance.insert(
+                    proof.clone(),
+                    serde_json::from_value(json!({"id":proof,
+                    "producerId":PRODUCER,"document":document(path),"revisionId":REVISION,
+                    "contentHash":hex(file + 7, 64),"evidenceKind":"semanticReference",
+                    "basis":basis(),"freshness":"fresh",
+                    "derivedFrom":{"factDigest":hex(ordinal_source + 71, 64),
+                        "provenanceId":hex(ordinal_source + 72, 64),"recordKind":"occurrence"}}))
+                    .unwrap(),
+                );
+                call_bindings.push(
+                    serde_json::from_value(json!({"callId":call_id,"candidates":[],
+                    "declaredTarget":{"document":document(to_path),"kind":"internal",
+                        "revisionId":REVISION,"syntaxId":sid(*target)},
+                    "dispatch":"direct",
+                    "join":{"anchor":{"contentHash":hex(file + 7, 64),"document":document(path),
+                        "kind":"callee","range":{"start":start,"end":start + target_name.len()},
+                        "revisionId":REVISION},"candidateIds":[call_id],"diagnostic":null,
+                        "status":"exact"},
+                    "possibleDispatch":[],"possibleDispatchComplete":false,"provenanceId":proof,
+                    "resolution":"resolved","staleTarget":false}))
+                    .unwrap(),
+                );
+            }
+            let semantic_coverage = serde_json::from_value(json!({"producerId":PRODUCER,
+                "language":"rust","sourceSetId":SOURCE_SET,"documentPath":path,
+                "revisionId":REVISION,"requested":true,"selected":true,"state":"complete",
+                "supportedRoles":["definition","read","write","call","type","import","alias"],
+                "observedRoles":["definition","read","call","type"],"diagnostic":null,
+                "reasons":null}))
+            .unwrap();
+            for declaration in decls.keys() {
+                facts
+                    .locations
+                    .insert(declaration.clone(), Some(key.clone()));
+            }
+            documents.insert(
+                path.clone(),
+                DocumentFacts {
+                    key: key.clone(),
+                    declarations: decls,
+                    calls,
+                    native_coverage: serde_json::from_value(
+                        serde_json::to_value(native_coverage(path)).unwrap(),
+                    )
+                    .unwrap(),
+                    native_provenance: serde_json::from_value(
+                        serde_json::to_value(native_proof(path, *file)).unwrap(),
+                    )
+                    .unwrap(),
+                    semantic: Some(SemanticDocument {
+                        coverage: semantic_coverage,
+                        provenance,
+                        call_bindings,
+                        declaration_bindings,
+                        symbols: vec![],
+                        type_relationships: vec![],
+                    }),
+                },
+            );
+        }
+        for document in documents.into_values() {
+            facts
+                .documents
+                .insert(document.key.clone(), Arc::new(document));
+        }
+        let requested = GraphRequest {
+            source_set_id: SOURCE_SET.into(),
+            revision_id: REVISION.into(),
+            root_syntax_id: sid(0),
+            semantic_producer_id: Some(PRODUCER.into()),
+            depth: 2,
+            max_nodes,
+            max_calls,
+            include_external: false,
+            include_tests: false,
+        };
+        let outcome = evaluate(&requested, &mut facts).unwrap();
+        crate::graph_query::GraphAnswer {
+            basis: serde_json::from_value(json!({
+                "indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":6}))
+            .unwrap(),
+            requested,
+            outcome,
+            facts,
+        }
+    }
+
+    fn graph_frame_bytes(envelope: &Value) -> usize {
+        let frame = json!({"jsonrpc":"2.0","id":1,
+            "result":crate::mcp::tools::result("trellis_call_graph", envelope.clone(), true)});
+        serde_json::to_vec(&frame).unwrap().len() + 1
+    }
+
+    fn project_graph(answer: &mut crate::graph_query::GraphAnswer, compact: bool) -> Value {
+        super::call_graph(
+            &json!(1),
+            answer,
+            Some("src/daemon/state.rs::DaemonState::enqueue_index"),
+            compact,
+            std::path::Path::new("/Users/someone/projects/trellis"),
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// The pre-#665 wire shape of the same answer: every proof repeats its whole basis.
+    fn inline_graph_bases(envelope: &Value) -> Value {
+        let mut inlined = envelope.clone();
+        let bases = envelope["data"]["semanticBases"]
+            .as_array()
+            .unwrap()
+            .clone();
+        for proof in inlined["data"]["result"]["provenance"]
+            .as_array_mut()
+            .unwrap()
+        {
+            let fields = proof.as_object_mut().unwrap();
+            let basis = match fields.remove("basisRef").unwrap() {
+                Value::Null => Value::Null,
+                reference => {
+                    let mut basis = bases[reference.as_u64().unwrap() as usize].clone();
+                    basis.as_object_mut().unwrap().remove("ref");
+                    basis
+                }
+            };
+            fields.insert("basis".into(), basis);
+        }
+        let data = inlined["data"].as_object_mut().unwrap();
+        data.remove("semanticBases");
+        data.remove("responseOmitted");
+        inlined
+    }
+
+    #[test]
+    fn graph_basis_table_emits_the_imported_basis_once_and_loses_nothing() {
+        let mut answer = graph(3, 150, 500);
+        let full = serde_json::to_value(answer.outcome.clone().unwrap()).unwrap();
+        let page = project_graph(&mut answer, false);
+        let result = &page["data"]["result"];
+        assert_eq!(result["nodes"].as_array().unwrap().len(), 10);
+        assert_eq!(result["edges"].as_array().unwrap().len(), 9);
+        assert_eq!(page["truncationReason"], Value::Null);
+        let bases = page["data"]["semanticBases"].as_array().unwrap();
+        assert_eq!(bases.len(), 1);
+        assert_eq!(bases[0]["ref"], 0);
+        assert_eq!(bases[0]["producerHash"], hex(4, 64));
+        let wire = serde_json::to_string(&page).unwrap();
+        assert_eq!(wire.matches(&hex(4, 64)).count(), 1);
+        let proofs = result["provenance"].as_array().unwrap();
+        assert_eq!(proofs.len(), 23);
+        for proof in proofs {
+            assert!(proof.get("basis").is_none(), "{proof}");
+            let expected = if proof["evidenceKind"] == "measuredSyntax" {
+                json!(null)
+            } else {
+                json!(0)
+            };
+            assert_eq!(proof["basisRef"], expected);
+        }
+        // Re-inlining the table restores the evaluated result exactly.
+        let old = inline_graph_bases(&page);
+        assert_eq!(old["data"]["result"], full);
+        // The live data point: ten nodes took ~60 KB, one cut from the cap.
+        let (now, before) = (graph_frame_bytes(&page), graph_frame_bytes(&old));
+        assert!(before > 60 * 1024, "the old shape is {before} bytes");
+        assert!(
+            now * 10 < before * 8,
+            "{now} bytes is not much below {before}"
+        );
+    }
+
+    #[test]
+    fn compact_graph_keeps_the_graph_and_drops_four_fifths_of_the_bytes() {
+        let mut answer = graph(3, 150, 500);
+        let full = project_graph(&mut answer, false);
+        let page = project_graph(&mut answer, true);
+        let old = graph_frame_bytes(&inline_graph_bases(&full));
+        let bytes = graph_frame_bytes(&page);
+        assert!(bytes * 5 < old, "compact {bytes} bytes, old full {old}");
+        assert!(
+            bytes * 4 < graph_frame_bytes(&full),
+            "compact {bytes} bytes"
+        );
+        let data = page["data"].as_object().unwrap();
+        assert!(!data.contains_key("semanticBases"));
+        assert_eq!(data["responseOmitted"], json!({"nodes":0,"edges":0}));
+        let result = page["data"]["result"].as_object().unwrap();
+        assert!(!result.contains_key("coverage"));
+        assert!(!result.contains_key("provenance"));
+        let (graph, proofs) = (&page["data"]["result"], &full["data"]["result"]);
+        for (node, whole) in graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(proofs["nodes"].as_array().unwrap())
+        {
+            let declaration = node["declaration"].as_object().unwrap();
+            let mut kept: Vec<_> = declaration.keys().map(String::as_str).collect();
+            kept.sort_unstable();
+            assert_eq!(
+                kept,
+                [
+                    "document",
+                    "kind",
+                    "lookupKey",
+                    "name",
+                    "range",
+                    "role",
+                    "syntaxId"
+                ]
+            );
+            for field in kept {
+                assert_eq!(declaration[field], whole["declaration"][field]);
+            }
+            assert_eq!(node["depth"], whole["depth"]);
+        }
+        let edges = graph["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), proofs["edges"].as_array().unwrap().len());
+        for (edge, whole) in edges.iter().zip(proofs["edges"].as_array().unwrap()) {
+            assert!(edge.get("binding").is_none());
+            assert_eq!(edge["resolution"], whole["binding"]["resolution"]);
+            assert_eq!(edge["resolution"], "resolved");
+            for field in ["from", "to", "visit", "boundaryReason", "callSiteCount"] {
+                assert_eq!(edge[field], whole[field], "{field}");
+            }
+            let call = edge["call"].as_object().unwrap();
+            let mut kept: Vec<_> = call.keys().map(String::as_str).collect();
+            kept.sort_unstable();
+            assert_eq!(
+                kept,
+                [
+                    "calleeRange",
+                    "id",
+                    "ordinal",
+                    "ownerSyntaxId",
+                    "range",
+                    "spelling"
+                ]
+            );
+        }
+        for field in [
+            "frontier",
+            "omitted",
+            "hints",
+            "warnings",
+            "partial",
+            "truncated",
+        ] {
+            assert_eq!(graph[field], proofs[field], "{field}");
+        }
+        for field in ["warnings", "partial", "truncated", "truncationReason"] {
+            assert_eq!(page[field], full[field], "{field}");
+        }
+    }
+
+    #[test]
+    fn default_graph_limits_fit_the_response_without_byte_clipping() {
+        for compact in [false, true] {
+            let mut args = json!({"schemaVersion":1,"symbolId":format!("sid:v1:{:032x}", 0x5000)});
+            if compact {
+                args["compact"] = json!(true);
+            }
+            let query = crate::mcp::tools::call_graph_query(&args);
+            let limits = (query.max_nodes, query.max_calls);
+            assert_eq!(limits, if compact { (50, 60) } else { (8, 10) });
+            // A root with forty helpers that each call two more is cut by the limits only.
+            let mut answer = graph(40, limits.0, limits.1);
+            let page = project_graph(&mut answer, compact);
+            let result = &page["data"]["result"];
+            assert_eq!(result["nodes"].as_array().unwrap().len() as u64, limits.0);
+            assert_eq!(result["edges"].as_array().unwrap().len() as u64, limits.1);
+            assert_eq!(page["truncationReason"], "limit", "compact={compact}");
+            assert_eq!(
+                page["data"]["responseOmitted"],
+                json!({"nodes":0,"edges":0})
+            );
+            let bytes = graph_frame_bytes(&page);
+            assert!(bytes < 56 * 1024, "compact={compact}: {bytes} bytes");
+        }
+    }
+
+    #[test]
+    fn byte_clipping_reports_the_omitted_nodes_and_edges() {
+        for compact in [false, true] {
+            let mut answer = graph(40, 150, 500);
+            let full = answer.outcome.clone().unwrap();
+            assert_eq!((full.nodes.len(), full.edges.len()), (121, 120));
+            let page = project_graph(&mut answer, compact);
+            let result = &page["data"]["result"];
+            let nodes = result["nodes"].as_array().unwrap().len();
+            let edges = result["edges"].as_array().unwrap().len();
+            assert!(nodes < 121 && edges < 120, "{nodes} {edges}");
+            assert_eq!(page["truncationReason"], "response_bytes");
+            assert_eq!(
+                page["data"]["responseOmitted"],
+                json!({"nodes":121 - nodes,"edges":120 - edges})
+            );
+            assert!(result["omitted"]["responseBytes"].as_u64().unwrap() > 0);
+            assert!(graph_frame_bytes(&page) <= crate::mcp::wire::RESPONSE_BYTES);
+            let hint = if compact {
+                ""
+            } else {
+                "; compact:true fits more"
+            };
+            let summary = crate::mcp::tools::result("trellis_call_graph", page, true);
+            assert_eq!(
+                summary["content"][0]["text"],
+                format!(
+                    "trellis_call_graph: {edges} edges, truncated: response_bytes ({} nodes, {} \
+                     edges omitted{hint}); full result in structuredContent.",
+                    121 - nodes,
+                    120 - edges
+                )
+            );
+        }
     }
 }
