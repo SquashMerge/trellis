@@ -1903,8 +1903,9 @@ impl From<anyhow::Error> for ApiError {
         })) {
             return Self(StatusCode::CONFLICT, "storage_busy", "Storage is busy");
         }
-        // A spilled large publication holds every reader out until COMMIT;
-        // say so at once instead of a generic busy (#210).
+        // A spilled large publication holds every reader out until COMMIT,
+        // and the read's bounded wait for it ran out (#674); say so instead of
+        // a generic busy (#210).
         if e.chain().any(|cause| {
             cause
                 .downcast_ref::<crate::store::RebuildInProgress>()
