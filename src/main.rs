@@ -1433,6 +1433,11 @@ struct DaemonStop {
     stream: std::os::unix::net::UnixStream,
 }
 
+struct DaemonControl {
+    browser_shutdown: tokio::sync::watch::Sender<bool>,
+    stop_sender: tokio::sync::mpsc::UnboundedSender<DaemonStop>,
+}
+
 async fn run_daemon() -> Result<()> {
     let paths = daemon::SocketPaths::new(&TopologyRoots::production()?.data);
     let Some(owner) = daemon::SocketOwner::acquire(&paths)? else {
@@ -1597,11 +1602,13 @@ async fn run_daemon() -> Result<()> {
                 let browser = browser.clone();
                 let search = search.clone();
                 let id = next_session.fetch_add(1, Ordering::Relaxed);
-                let browser_shutdown = browser_shutdown.clone();
-                let stop_sender = stop_sender.clone();
+                let control = DaemonControl {
+                    browser_shutdown: browser_shutdown.clone(),
+                    stop_sender: stop_sender.clone(),
+                };
                 sockets.insert(id, stream.try_clone()?);
                 let task = connections.spawn_blocking(move || {
-                    let _ = dispatch_connection(stream, id, registry, browser, search, browser_shutdown, stop_sender, accepted_at);
+                    let _ = dispatch_connection(stream, id, registry, browser, search, control, accepted_at);
                 });
                 task_sessions.insert(task.id(), id);
             }
@@ -1858,10 +1865,13 @@ fn dispatch_connection(
     registry: Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
     browser: Arc<tokio::sync::Mutex<daemon::BrowserProvisioner>>,
     search: Arc<daemon::search::SearchService>,
-    browser_shutdown: tokio::sync::watch::Sender<bool>,
-    stop_sender: tokio::sync::mpsc::UnboundedSender<DaemonStop>,
+    control: DaemonControl,
     accepted_at: Instant,
 ) -> Result<()> {
+    let DaemonControl {
+        browser_shutdown,
+        stop_sender,
+    } = control;
     let runtime = tokio::runtime::Handle::current();
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
     use std::io::{Cursor, Read};

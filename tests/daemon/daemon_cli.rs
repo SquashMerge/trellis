@@ -486,7 +486,7 @@ fn daemon_stop_closes_idle_mcp_and_recaptures_model_configuration() {
     assert!(protocol::read_frame::<protocol::Reply>(&mut browser).is_err());
     assert!(protocol::read_frame::<protocol::Reply>(&mut ingress).is_err());
     trellis::testing::wait_until("original daemon exit", || !original.matches());
-    let restarted = run(&home, "status", &root);
+    let mut restarted = run(&home, "status", &root);
     let successor =
         trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid")).unwrap();
     assert!(successor.matches());
@@ -494,6 +494,18 @@ fn daemon_stop_closes_idle_mcp_and_recaptures_model_configuration() {
         serde_json::to_value(original).unwrap(),
         serde_json::to_value(successor).unwrap()
     );
+    // Status can reply while the fill owner has not yet tried the recaptured
+    // model. Wait for its published load result, not merely daemon readiness.
+    trellis::testing::wait_until("restarted daemon model load failure", || {
+        match &restarted["searchIndex"]["unavailableReason"] {
+            Value::Null => {
+                restarted = run(&home, "status", &root);
+                false
+            }
+            Value::String(reason) if reason == "model_load_failed" => true,
+            reason => panic!("restarted daemon did not recapture model configuration: {reason}"),
+        }
+    });
     assert_eq!(
         restarted["searchIndex"]["unavailableReason"],
         "model_load_failed"
