@@ -907,6 +907,9 @@ impl DaemonState {
     /// index-use guard) is held until the watcher and SQLite witnesses are
     /// closed, so GC never sees the index unused mid-close.
     pub(super) fn close(&self, held: Option<Arc<WriterSession>>) {
+        // A retired runtime keeps no index connection, including one an S
+        // continuation still keeps across its yields (#671).
+        self.store.release_semantic_reads();
         self.cancel_active();
         self.search_fill.lock().unwrap().take();
         self.architecture.0.shut_down();

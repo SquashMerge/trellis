@@ -965,7 +965,7 @@ impl Store {
             self.is_ready_disposition(),
             "incompatible_queue: missing queue outside Ready startup"
         );
-        let exclusive = self.roots.index_use_exclusive_existing(&self.identity)?;
+        let exclusive = self.index_use_exclusive()?;
         exclusive.verify()?;
         self.identity.verify()?;
         let path = self.request_db_path();
