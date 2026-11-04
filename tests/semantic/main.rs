@@ -14,6 +14,7 @@ mod semantic_batch_support;
 mod support;
 
 mod java_semantic_import;
+mod proptest_native_first;
 mod proptest_witness_rejoin;
 mod semantic_batch_queue;
 mod semantic_batch_store;
