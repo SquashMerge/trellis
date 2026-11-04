@@ -482,7 +482,7 @@ mod tests {
     fn ranking_fixture() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
-            "CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,name TEXT,role TEXT NOT NULL DEFAULT 'production');
+            "CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,name TEXT,role TEXT NOT NULL DEFAULT 'production',kind TEXT NOT NULL DEFAULT 'function');
              CREATE INDEX native_version_declarations_search_name ON native_version_declarations(name COLLATE BINARY,syntax_id,vid);
              CREATE INDEX native_version_declarations_search_folded ON native_version_declarations(lower(name),name COLLATE BINARY,syntax_id,vid);
              CREATE TABLE document_versions(vid INTEGER PRIMARY KEY,id TEXT);
@@ -588,6 +588,52 @@ mod tests {
         assert_eq!(
             ids(graph),
             [1, 9, 2, 4, 8, 3, 7].map(|id| format!("sid:v1:{id:032x}"))
+        );
+    }
+
+    /// #665: a substring query for `retained` must not bury callables and types under
+    /// fields and parameters literally named `retained`, on every search path.
+    #[test]
+    fn w2_ranks_callables_and_types_before_fields_parameters_and_variables() {
+        let db = ranking_fixture();
+        for (id, name, kind) in [
+            (1, "retained", "field"),
+            (2, "retained", "parameter"),
+            (3, "retained_runs", "function"),
+            (4, "Retained", "type"),
+            (5, "drop_retained", "method"),
+            (6, "retained_count", "variable"),
+        ] {
+            insert_ranked(&db, id, 1, Some(name));
+            db.execute(
+                "UPDATE native_version_declarations SET kind=?1 WHERE rowid=?2",
+                rusqlite::params![kind, id],
+            )
+            .unwrap();
+        }
+        let expected = [4, 3, 5, 1, 2, 6].map(|id| format!("sid:v1:{id:032x}"));
+        for query in ["retained", "RETAINED", "ret"] {
+            for limit in [1, 2, 3, 4, 6, 20] {
+                let actual = w2_hits(&db, "pin:v1:test:1", query, limit).unwrap();
+                let ids: Vec<_> = actual.iter().map(|(_, id)| id.clone()).collect();
+                assert_eq!(ids, expected[..(limit as usize).min(6)], "{query} {limit}");
+                let literal =
+                    with_literal_scan(|| w2_hits(&db, "pin:v1:test:1", query, limit)).unwrap();
+                assert_eq!(actual, literal, "literal {query} {limit}");
+                let ordered =
+                    with_ordered_search(|| w2_hits(&db, "pin:v1:test:1", query, limit)).unwrap();
+                assert_eq!(ordered, actual, "ordered {query} {limit}");
+            }
+        }
+        // Browser/CLI graph search keeps match tier, name, then SID.
+        let graph: Vec<_> = graph_hits(&db, "retained", 20)
+            .unwrap()
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(
+            graph,
+            [4, 1, 2, 6, 3, 5].map(|id| format!("sid:v1:{id:032x}"))
         );
     }
 

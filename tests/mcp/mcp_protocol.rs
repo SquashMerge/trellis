@@ -607,8 +607,21 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
             )
         };
         let truncated = if envelope["truncated"] == true {
+            // #665: a byte-reduced call graph names what it left out.
+            let omitted = &data["responseOmitted"];
+            let detail = match (omitted["nodes"].as_u64(), omitted["edges"].as_u64()) {
+                (Some(nodes), Some(edges)) if nodes + edges > 0 => format!(
+                    " ({nodes} nodes, {edges} edges omitted{})",
+                    if data.get("semanticBases").is_some() {
+                        "; compact:true fits more"
+                    } else {
+                        ""
+                    }
+                ),
+                _ => String::new(),
+            };
             format!(
-                ", truncated: {}",
+                ", truncated: {}{detail}",
                 envelope["truncationReason"].as_str().unwrap()
             )
         } else {
@@ -14597,42 +14610,40 @@ impl GraphMcp {
         self.record(&reply)
     }
 
-    /// The store answer, optionally projected to a frozen edge prefix.
+    /// The store answer, optionally projected to a frozen edge prefix, in its full wire
+    /// shape: each proof's `basis` becomes its `basisRef` into the canonical basis table.
     fn store_answer(&self, arguments: &Value, prefix: Option<usize>) -> Value {
-        let number = |field: &str, default: u64| {
-            arguments
-                .get(field)
-                .map_or(default, |v| v.as_u64().unwrap())
-        };
-        let query = trellis::graph_query::GraphQuery {
-            root_syntax_id: arguments["symbolId"].as_str().unwrap().to_owned(),
-            semantic_producer_id: arguments
-                .get("semanticProducerId")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            depth: number("depth", 2),
-            max_nodes: number("maxNodes", 150),
-            max_calls: number("maxCalls", 500),
-            include_external: arguments
-                .get("includeExternal")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            include_tests: arguments
-                .get("includeTests")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        };
+        let query = trellis::mcp::tools::call_graph_query(arguments);
         let store = trellis::store::Store::open_for_tests(self.temp.path(), &self.root).unwrap();
         let answer = store
             .evidence_response()
             .unwrap()
             .graph_query(&query, None, &mut || Ok(()))
             .unwrap();
-        serde_json::to_value(match prefix {
+        let mut result = serde_json::to_value(match prefix {
             Some(k) => answer.prefix(k).unwrap(),
             None => answer.outcome.unwrap(),
         })
-        .unwrap()
+        .unwrap();
+        let bases: std::collections::BTreeSet<String> = result["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|proof| !proof["basis"].is_null())
+            .map(|proof| serde_json::to_string(&proof["basis"]).unwrap())
+            .collect();
+        for proof in result["provenance"].as_array_mut().unwrap() {
+            let proof = proof.as_object_mut().unwrap();
+            let basis = proof.remove("basis").unwrap();
+            let reference = if basis.is_null() {
+                Value::Null
+            } else {
+                let key = serde_json::to_string(&basis).unwrap();
+                json!(bases.iter().position(|b| *b == key).unwrap())
+            };
+            proof.insert("basisRef".into(), reference);
+        }
+        result
     }
 
     fn name(&self, id: &Value) -> String {
@@ -14834,6 +14845,126 @@ async fn compact_outgoing_keeps_the_full_answers_hints_for_the_same_calls() {
             .any(|h| h["omitted"].as_u64().unwrap_or(0) > 0),
         "{full}"
     );
+    mcp.finish();
+}
+
+/// #665: compact outgoing calls leave calls bound to external symbols (`Ok`, `now`, ...) out
+/// before the limit and count them; `includeExternal` keeps them, and the full answer keeps
+/// them unless asked not to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_outgoing_leaves_external_calls_out_unless_asked() {
+    use graph_fixtures::{Bind, bind};
+    use trellis::semantic_evidence::Resolution;
+    let external = |nth| Bind {
+        resolution: Resolution::External,
+        target: None,
+        ..bind("run", nth, "-")
+    };
+    let spec = with_bindings(
+        &[(
+            "src/lib.rs",
+            "fn run() { ok(); helper(); now(); leaf(); err(); }\nfn helper() {}\nfn leaf() {}\n",
+        )],
+        vec![
+            external(0),
+            bind("run", 1, "helper"),
+            external(2),
+            bind("run", 3, "leaf"),
+            external(4),
+        ],
+    );
+    let mut mcp = GraphMcp::start(665, &[spec], Default::default()).await;
+    let callees = |reply: &Value| -> Vec<String> {
+        reply["data"]["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| call["calleeText"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let compact = mcp.call_tool(
+        "trellis_outgoing_calls",
+        mcp.args("run", json!({"compact":true})),
+    );
+    assert_eq!(callees(&compact), ["helper", "leaf"], "{compact}");
+    assert_eq!(compact["data"]["externalOmitted"], 3);
+    assert_eq!(compact["truncated"], false);
+    // The limit counts kept calls only.
+    let one = mcp.call_tool(
+        "trellis_outgoing_calls",
+        mcp.args("run", json!({"compact":true,"limit":1})),
+    );
+    assert_eq!(callees(&one), ["helper"]);
+    assert_eq!(one["truncationReason"], "limit");
+    for (extra, expected, omitted) in [
+        (
+            json!({"compact":true,"includeExternal":true}),
+            &["ok", "helper", "now", "leaf", "err"][..],
+            None,
+        ),
+        (json!({}), &["ok", "helper", "now", "leaf", "err"][..], None),
+        (
+            json!({"includeExternal":false}),
+            &["helper", "leaf"][..],
+            Some(3),
+        ),
+    ] {
+        let reply = mcp.call_tool("trellis_outgoing_calls", mcp.args("run", extra.clone()));
+        assert_eq!(callees(&reply), expected, "{extra}");
+        assert_eq!(
+            reply["data"].get("externalOmitted").and_then(Value::as_u64),
+            omitted,
+            "{extra}"
+        );
+    }
+    mcp.finish();
+}
+
+/// #665: `compact` reaches the call graph through MCP, with its own default limits, and
+/// the full answer emits each semantic basis once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_graph_compact_and_basis_table_through_mcp() {
+    use graph_fixtures::bind;
+    let spec = with_bindings(
+        &[(
+            "a.rs",
+            "fn a() { b(); c(); }\nfn b() { d(); }\nfn c() {}\nfn d() {}\n",
+        )],
+        vec![bind("a", 0, "b"), bind("a", 1, "c"), bind("b", 0, "d")],
+    );
+    let mut mcp = GraphMcp::start(666, &[spec], Default::default()).await;
+    let producer = json!({"semanticProducerId":graph_fixtures::PRODUCER});
+    let full = mcp.graph(mcp.args("a", producer.clone()));
+    let mut compact_args = producer.clone();
+    compact_args["compact"] = json!(true);
+    let compact = mcp.graph(mcp.args("a", compact_args));
+    assert_eq!(full["data"]["requested"]["maxNodes"], 8);
+    assert_eq!(full["data"]["requested"]["maxCalls"], 10);
+    assert_eq!(compact["data"]["requested"]["maxNodes"], 50);
+    assert_eq!(compact["data"]["requested"]["maxCalls"], 60);
+    let bases = full["data"]["semanticBases"].as_array().unwrap();
+    assert_eq!(bases.len(), 1, "{full}");
+    let proofs = full["data"]["result"]["provenance"].as_array().unwrap();
+    assert!(proofs.iter().all(|p| p.get("basis").is_none()));
+    assert!(proofs.iter().any(|p| p["basisRef"] == 0));
+    assert_eq!(
+        full["data"]["result"],
+        mcp.store_answer(&mcp.args("a", producer.clone()), None)
+    );
+    let (whole, small) = (&full["data"]["result"], &compact["data"]["result"]);
+    assert_eq!(mcp.shape(whole), mcp.shape(small));
+    assert!(small.get("provenance").is_none() && small.get("coverage").is_none());
+    assert!(compact["data"].get("semanticBases").is_none());
+    for edge in small["edges"].as_array().unwrap() {
+        assert!(edge.get("binding").is_none());
+        assert_eq!(edge["resolution"], "resolved");
+    }
+    for envelope in [&full, &compact] {
+        assert_eq!(
+            envelope["data"]["responseOmitted"],
+            json!({"nodes":0,"edges":0})
+        );
+    }
     mcp.finish();
 }
 
@@ -15404,7 +15535,8 @@ async fn call_graph_oversized_answer_is_byte_reduced_and_valid() {
     let spec =
         graph_fixtures::Spec::syntax_only(&[("fan.rs", &graph_fixtures::fanout_source(600))]);
     let mut mcp = GraphMcp::start(316, &[spec], Default::default()).await;
-    let arguments = mcp.args("root", json!({}));
+    // #665: the default limits fit the response; ask for the contract maximum.
+    let arguments = mcp.args("root", json!({"maxNodes":150,"maxCalls":500}));
     let id = mcp.send(arguments.clone());
     let mut line = String::new();
     mcp.reader.read_line(&mut line).unwrap();
@@ -15428,6 +15560,10 @@ async fn call_graph_oversized_answer_is_byte_reduced_and_valid() {
     assert_eq!(envelope["partial"], true);
     assert_eq!(result["omitted"]["callLimit"], 100);
     assert_eq!(result["omitted"]["responseBytes"], 500 - k);
+    assert_eq!(
+        envelope["data"]["responseOmitted"],
+        json!({"nodes":0,"edges":500 - k})
+    );
     assert_eq!(*result, mcp.store_answer(&arguments, Some(k)));
     assert!(
         result["frontier"]
