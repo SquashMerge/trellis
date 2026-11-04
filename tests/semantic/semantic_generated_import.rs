@@ -134,6 +134,11 @@ impl Inproc {
         self.store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &self.cancel)
             .unwrap();
+        drop(leader);
+        // Native N first, then the bounded semantic S the checkout worker would run.
+        self.store
+            .catch_up_semantic_for_tests(&self.cancel)
+            .unwrap();
     }
 
     fn state(&self) -> StateDir {
@@ -889,6 +894,10 @@ fn pickup_batch_with_trailing_slash_survives_full_reuse() {
     trellis::testing::wait_until("the watcher to publish the edit", || {
         world.head().index_revision > imported.index_revision
     });
+    // The watcher generation completes at native N; its semantic S follows.
+    trellis::testing::wait_until("semantic catch-up", || {
+        !world.store.semantic_catch_up_pending_for_tests().unwrap()
+    });
     let head = world.head();
     assert_eq!(
         world.store.selected_raw_inputs_at(head).unwrap().len(),
@@ -943,6 +952,10 @@ fn rust_pickup_batch_survives_store_reuse() {
     .unwrap();
     trellis::testing::wait_until("the watcher to publish the edit", || {
         world.head().index_revision > imported.index_revision
+    });
+    // The watcher generation completes at native N; its semantic S follows.
+    trellis::testing::wait_until("semantic catch-up", || {
+        !world.store.semantic_catch_up_pending_for_tests().unwrap()
     });
     let head = world.head();
     let retained = world.store.selected_raw_inputs_at(head).unwrap();

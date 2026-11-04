@@ -13,6 +13,64 @@ use trellis::{
 };
 
 use crate::semantic_batch_support;
+use trellis::model::{IndexPin, SemanticStatus};
+
+/// Native-first N projects supplied (non-retained) evidence: no unlabelled aggregate read,
+/// and each document carries its own labelled status against the validated basis.
+fn assert_projected(
+    store: &Store,
+    pin: IndexPin,
+    producer: &str,
+    path: &str,
+    status: SemanticStatus,
+    basis: IndexPin,
+) {
+    let error = store.semantic_at(pin).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("labelled per-document read"),
+        "{error:#}"
+    );
+    let projection = store
+        .semantic_projection_at(pin, producer, "rust", path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.semantic_status, status, "{producer} {path}");
+    assert_eq!(projection.semantic_basis_pin, basis, "{producer} {path}");
+}
+
+/// A changed document of a producer with no retained raw input: needs re-import (#620 A6).
+fn assert_needs_reimport(
+    store: &Store,
+    pin: IndexPin,
+    producer: &str,
+    path: &str,
+    basis: IndexPin,
+) {
+    assert_projected(
+        store,
+        pin,
+        producer,
+        path,
+        SemanticStatus::NeedsReimport,
+        basis,
+    );
+    if store.index_baseline().unwrap() == pin {
+        let status = store.status().unwrap();
+        assert!(
+            status
+                .semantic_languages
+                .iter()
+                .any(|row| row.language == "rust"
+                    && matches!(
+                        row.reimport,
+                        Some(trellis::model::SemanticReimport::NeedsReimport { ref reason })
+                            if !reason.is_empty()
+                    )),
+            "{:?}",
+            status.semantic_languages
+        );
+    }
+}
 use semantic_batch_support::{BatchFixture, DocSpec};
 
 fn native_components(
@@ -387,19 +445,8 @@ fn native_only_next_revision_omits_requested_semantics_without_rebinding() {
     assert_ne!(first, second);
     let earlier = store.semantic_at(first).unwrap();
     assert_eq!(earlier.declaration_bindings, semantic.declaration_bindings);
-    let current = store.semantic_at(second).unwrap();
-    assert!(current.provenance.is_empty());
-    assert!(current.symbols.is_empty());
-    assert!(current.declaration_bindings.is_empty());
-    assert!(current.references.is_empty());
-    assert!(current.call_bindings.is_empty());
-    assert!(current.type_relationships.is_empty());
-    assert_eq!(current.coverage[0].state, s::CoverageState::Omitted);
-    assert_eq!(
-        current.coverage[0].diagnostic.as_deref(),
-        Some("semantic producer not run for this revision")
-    );
-    assert_eq!(current.coverage[0].revision_id, next.revision.id);
+    assert_needs_reimport(&store, second, &semantic.producers[0].id, "hello.rs", first);
+    let _ = next;
 }
 
 #[test]
@@ -1147,28 +1194,22 @@ fn typed_next_revision_fills_unsupplied_producer_new_document() {
         stable_vid,
         "unchanged document reused native vid"
     );
-    let final_sem = store.semantic_at(third).unwrap();
-    assert_eq!(final_sem.coverage.len(), 6);
-    assert!(
-        final_sem
-            .coverage
-            .iter()
-            .any(|c| c.producer_id == "semantic.synthetic"
-                && c.document_path == "hello.rs"
-                && c.state == s::CoverageState::Omitted)
-    );
-    assert!(final_sem.coverage.iter().any(|c| c.producer_id == other.id
-        && c.document_path == "zz.rs"
-        && c.state == s::CoverageState::NotRequested));
-    assert!(
-        final_sem
-            .coverage
-            .iter()
-            .any(|c| c.producer_id == requested.id
-                && c.document_path == "zz.rs"
-                && c.state == s::CoverageState::NotRequested)
-    );
-    assert!(final_sem.references.is_empty());
+    // Unchanged hello.rs keeps its basis-P tuple; the changed zz.rs needs re-import.
+    for producer in [
+        "semantic.synthetic",
+        other.id.as_str(),
+        requested.id.as_str(),
+    ] {
+        assert_projected(
+            &store,
+            third,
+            producer,
+            "hello.rs",
+            SemanticStatus::OlderBasis,
+            second,
+        );
+        assert_needs_reimport(&store, third, producer, "zz.rs", second);
+    }
     assert_eq!(
         store.semantic_at(second).unwrap().references,
         supplied.references
@@ -1672,10 +1713,7 @@ fn full_stream_unchanged_capture_keeps_typed_semantic_pin() {
         .run_serving(&options, &cancel, |_| {})
         .unwrap();
     assert_ne!(advanced, pin);
-    let current = store.semantic_at(advanced).unwrap();
-    assert_eq!(current.coverage[0].state, s::CoverageState::Omitted);
-    assert!(current.references.is_empty());
-    assert!(current.symbols.is_empty());
+    assert_needs_reimport(&store, advanced, &semantic.producers[0].id, "hello.rs", pin);
     assert_eq!(
         store.semantic_at(pin).unwrap().references,
         semantic.references
@@ -1814,14 +1852,7 @@ fn native_only_selective_recovery_keeps_requested_heads_without_old_facts() {
             &cancel,
         )
         .unwrap();
-    let selected = store.semantic_at(next).unwrap();
-    assert_eq!(selected.coverage.len(), 1);
-    assert!(selected.coverage[0].requested);
-    assert!(!selected.coverage[0].selected);
-    assert_eq!(selected.coverage[0].state, s::CoverageState::Omitted);
-    assert_eq!(selected.coverage[0].revision_id, changed_native.revision.id);
-    assert!(selected.provenance.is_empty());
-    assert!(selected.references.is_empty());
+    assert_needs_reimport(&store, next, &semantic.producers[0].id, "hello.rs", prior);
     assert_eq!(
         store.semantic_at(prior).unwrap().references,
         semantic.references
@@ -1947,11 +1978,9 @@ fn metadata_only_native_change_omits_semantics_with_reused_document_version() {
         .run_serving(&changed, &cancel, |_| {})
         .unwrap();
     assert_ne!(next, first);
-    let current = store.semantic_at(next).unwrap();
-    assert_eq!(current.coverage[0].state, s::CoverageState::Omitted);
-    assert_eq!(current.coverage[0].revision_id, m_native.revision.id);
-    assert!(current.provenance.is_empty());
-    assert!(current.references.is_empty());
+    // Same document version, but the capture options the full-captured tuple records changed:
+    // that context dependency makes it pending, and with no retained input it needs re-import.
+    assert_needs_reimport(&store, next, &semantic.producers[0].id, "hello.rs", first);
     assert_eq!(
         store.semantic_at(first).unwrap().references,
         semantic.references

@@ -19,7 +19,11 @@ function sequenceTarget(view, step) {
   const evidence = step?.callEvidence, pin = view?.revision;
   if (!["call", "boundary"].includes(step?.kind) || !step.callId || !sourceWitness(step) ||
       typeof pin?.indexGeneration !== "string" || !pin.indexGeneration || !Number.isSafeInteger(pin.indexRevision) ||
-      evidence?.boundaryReason !== "none" || evidence.resolution !== "resolved" || evidence.freshness !== "fresh" ||
+      evidence?.boundaryReason !== "none" || evidence.resolution !== "resolved" ||
+      !(evidence.freshness === "fresh" && !evidence.projection ||
+        evidence.freshness === "possiblyStale" && evidence.projection?.semanticStatus === "olderBasis" &&
+        evidence.projection.currentPin?.indexGeneration === pin.indexGeneration &&
+        evidence.projection.currentPin?.indexRevision === pin.indexRevision) ||
       !["direct", "constructor"].includes(evidence.dispatch) || !evidence.provenanceId || typeof step.target !== "string") return null;
   const participant = view.participants?.find(item => item.id === step.target);
   const declaration = participant?.declaration;
@@ -29,11 +33,18 @@ function sequenceEvidenceLabel(step, view) {
   if (!["call", "boundary"].includes(step?.kind) || !step.callId) return "Measured source syntax";
   const evidence = step.callEvidence;
   if (!evidence) return "measured syntax; target unverified";
+  if (evidence.projection?.semanticStatus === "catchingUp") return "Semantic catching up - native syntax only";
+  if (evidence.projection?.semanticStatus === "needsReimport") return "Semantic needs re-import - native syntax only";
+  if (evidence.projection?.semanticStatus === "olderBasis") {
+    const boundary = evidence.boundaryReason === "none" ? "Resolved at older basis" : "Older basis boundary";
+    return `${boundary} - ${evidence.freshness || "possibly stale"}`;
+  }
   if (evidence.boundaryReason === "none" && step.hidden && step.incidental && !step.target) return "Resolved declaration - hidden incidental call, no lane";
   if (evidence.boundaryReason === "none" && view && !sequenceTarget(view, step)) return "Target unverified - invalid declaration evidence";
   const labels = {none:"Resolved declaration", external:"External boundary", unresolved:"Unresolved target",
     ambiguous:"Ambiguous target", dispatch:"Dispatch boundary", stale:"Stale evidence", nodeLimit:"Target omitted - participant limit",
-    missingEvidence:"Unbound - missing semantic evidence"};
+    missingEvidence:"Unbound - missing semantic evidence", catchingUp:"Semantic catching up - native syntax only",
+    needsReimport:"Semantic needs re-import - native syntax only"};
   return labels[evidence.boundaryReason] || "Target unverified";
 }
 function sequenceTargetActionLabel(declaration) {
@@ -43,15 +54,23 @@ function sequenceTargetActionLabel(declaration) {
 // or why it shows syntax only. Server text, never inferred here.
 function sequenceEvidenceSummary(view) {
   const semantic = view?.semantic;
+  const documents = semantic?.documents || [];
+  const pending = documents.some(item => item.projection?.semanticStatus === "catchingUp");
+  const reimport = documents.some(item => item.projection?.semanticStatus === "needsReimport");
+  const older = documents.some(item => item.projection?.semanticStatus === "olderBasis");
+  if (pending || reimport || older) return [pending && "Semantic catching up", reimport && "Semantic needs re-import", older && "Older semantic basis", semantic?.producerId].filter(Boolean).join(" · ");
   if (semantic?.tier === "semantic" && typeof semantic.producerId === "string" && semantic.producerId)
     return `Semantic bindings · ${semantic.producerId}`;
   return typeof semantic?.reason === "string" && semantic.reason ? `Syntax only · ${semantic.reason}` : "Syntax only";
 }
 // The captured basis of a call's selected binding, as MCP reports it (#522).
 function sequenceBasisLabel(evidence) {
+  const projection = evidence?.projection;
+  const pin = projection?.semanticBasisPin;
+  const projected = projection ? `${{olderBasis:"older basis", needsReimport:"needs re-import"}[projection.semanticStatus] || "catching up"}${pin ? ` ${pin.indexGeneration}:${pin.indexRevision}` : ""} · native ${projection.basisNativeRevisionId}` : "";
   const basis = evidence?.semanticBasis;
-  if (!basis || typeof basis.producerId !== "string") return "";
-  return `basis ${basis.producerId}${typeof basis.producerVersion === "string" ? " " + basis.producerVersion : ""}`;
+  if (!basis || typeof basis.producerId !== "string") return projected;
+  return [projected, `basis ${basis.producerId}${typeof basis.producerVersion === "string" ? " " + basis.producerVersion : ""}`].filter(Boolean).join(" · ");
 }
 // A call that may return early carries its folded `?` and guards (#542); a chain group
 // shows it when one of its calls does. An `if` or `match` carries the guard after it (#558):

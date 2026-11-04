@@ -698,3 +698,11 @@ test("a storage failure stays in the header status line after a checkout is sele
   assert.equal(h.get("workspace-index-label").textContent.startsWith("Fresh"), true);
   assert.equal(h.get("checkout-state").textContent, "Browser storage is unavailable; token was not saved.");
 });
+
+test("semantic document projections prevent a fresh index badge", () => {
+  const h = harness(true);
+  h.run(`status.catchingUp=false;status.semanticLanguages=[{documents:[{projection:{semanticStatus:"olderBasis"}}]}];renderIndexStatus();`);
+  assert.match(h.get("workspace-index-label").textContent, /^Older semantic basis · native rev /);
+  h.run(`status.semanticLanguages[0].documents[0].projection.semanticStatus="catchingUp";renderIndexStatus();`);
+  assert.match(h.get("workspace-index-label").textContent, /^Semantic catching up · native rev /);
+});

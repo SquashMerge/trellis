@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        37
+        40
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -739,9 +739,9 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // Check exact schema-37 names before comparing evidence and the logical
+    // Check exact schema-40 names before comparing evidence and the logical
     // search corpus. FTS shadow bytes depend on publication/merge history.
-    const REQUIRED_V37_TABLES: [&str; 77] = [
+    const REQUIRED_V40_TABLES: [&str; 87] = [
         "class_projections",
         "class_relations",
         "classes",
@@ -789,10 +789,13 @@ fn sqlite_snapshot(
         "revision_producer_bindings",
         "semantic_basis",
         "semantic_basis_lookup_dependencies",
+        "semantic_batch_witness_documents",
+        "semantic_batch_witnesses",
         "semantic_call_bindings",
         "semantic_call_candidates",
         "semantic_call_join_candidates",
         "semantic_call_possible_dispatch",
+        "semantic_catchup_commits",
         "semantic_coverage",
         "semantic_coverage_reasons",
         "semantic_coverage_roles",
@@ -800,8 +803,15 @@ fn sqlite_snapshot(
         "semantic_declaration_bindings",
         "semantic_declaration_join_candidates",
         "semantic_import_reports",
+        "semantic_pending_selections",
+        "semantic_pending_target",
         "semantic_producer_languages",
         "semantic_producers",
+        "semantic_projection_contexts",
+        "semantic_projection_dependencies",
+        "semantic_projection_documents",
+        "semantic_projection_lookup_dependencies",
+        "semantic_projection_origins",
         "semantic_provenance",
         "semantic_raw_batches",
         "semantic_raw_captures",
@@ -822,8 +832,8 @@ fn sqlite_snapshot(
     ];
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
-        REQUIRED_V37_TABLES,
-        "exact schema-37 evidence and search table inventory"
+        REQUIRED_V40_TABLES,
+        "exact schema-40 evidence and search table inventory"
     );
     if tables.contains(&"native_binding_epoch".to_string()) {
         let (first, bound): (i64, i64) = db
@@ -906,7 +916,7 @@ fn sqlite_snapshot(
                 name if name.starts_with("native_version_") =>
                     ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("semantic_") => ("?1 IS NOT NULL", ""),
-                _ => panic!("unhandled schema-37 evidence table: {table}"),
+                _ => panic!("unhandled schema-40 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {

@@ -2119,14 +2119,48 @@ fn rejoined_binding_on_edited_workspace_is_a_stale_boundary_with_its_binding() {
     let index_db = TopologyRoots::isolated_for_tests(cache.clone(), data.clone())
         .index_db(&WorkspaceIdentity::discover(Some(&root), &root).unwrap());
     import_scip_capture(&home, &root, &index_db);
+    let imported_native = {
+        let store = open();
+        let pin = store.index_baseline().unwrap();
+        store
+            .retained_native_snapshot_at(pin)
+            .unwrap()
+            .0
+            .revision
+            .id
+    };
 
     std::fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
-    let r2: trellis::model::IndexPin = serde_json::from_value(
+    let native: trellis::model::IndexPin = serde_json::from_value(
         cli(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
     )
     .unwrap();
     let store = open();
+    // Native N completes the index request; the daemon's semantic S follows.
+    trellis::testing::wait_until("semantic catch-up", || {
+        !store.semantic_catch_up_pending_for_tests().unwrap()
+    });
+    // The head is the semantic catch-up of the edited native revision. Whether the index
+    // request or the watcher published that N first is scheduling: when the watcher's N and
+    // S both land before the request runs, the request publishes nothing and reports the
+    // caught-up head itself, so the head is not always the request's revision plus one.
+    let r2 = store.index_baseline().unwrap();
+    assert!(r2.index_revision >= native.index_revision);
     let (r2_native, _) = store.retained_native_snapshot_at(r2).unwrap();
+    assert_ne!(r2_native.revision.id, imported_native);
+    let caught_up: String = rusqlite::Connection::open(&index_db)
+        .unwrap()
+        .query_row(
+            "SELECT t.native_revision_id FROM semantic_catchup_commits c \
+             JOIN native_revisions t ON t.id=c.target_revision_id WHERE c.revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                r2.index_generation, r2.index_revision
+            )],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(caught_up, r2_native.revision.id);
     let run_id = syntax_id(&r2_native, "run");
     let producer = store.semantic_at(r2).unwrap().producers[0].id.clone();
     let mut q = query(&run_id, true);

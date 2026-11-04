@@ -100,6 +100,32 @@ fn run(home: &Path, args: &[&str]) -> Value {
     stdout.read_to_end(&mut bytes).unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
+/// Native N completes the CLI index request; wait for the daemon's bounded semantic S.
+fn caught_up(store: &trellis::store::Store, reply: &Value) -> trellis::model::IndexPin {
+    let native: trellis::model::IndexPin =
+        serde_json::from_value(reply["publishedRevision"].clone()).unwrap();
+    trellis::testing::wait_until("semantic catch-up", || {
+        !store.semantic_catch_up_pending_for_tests().unwrap()
+    });
+    let head = store.index_baseline().unwrap();
+    assert_eq!(head.index_generation, native.index_generation);
+    assert!(head.index_revision >= native.index_revision);
+    head
+}
+/// The daemon writes S's work counts right after the S commit that clears the target; wait
+/// for the file that names exactly that S pin.
+fn work_counts(home: &Path, pin: trellis::model::IndexPin) -> Value {
+    let path = home.join("work-counts.json");
+    let mut work = Value::Null;
+    trellis::testing::wait_until("S work counts", || {
+        work = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null);
+        work["indexPin"] == serde_json::to_value(pin).unwrap()
+    });
+    work
+}
 fn copy_seed(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     fs::set_permissions(to, fs::metadata(from).unwrap().permissions()).unwrap();
@@ -365,7 +391,7 @@ fn selected_case(change_b: &str) {
         if change_b == "oracle_fork_staggered_producers" {
             // The next batch captures bytes this one holds as stale.
             fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
-            run(&home, &["index", "--workspace", root_string]);
+            caught_up(&store, &run(&home, &["index", "--workspace", root_string]));
         }
         let mut python_binary = scip::types::Index::new();
         let mut doc = scip::types::Document::new();
@@ -402,8 +428,8 @@ fn selected_case(change_b: &str) {
     } else {
         imported
     };
-    let mut prior: trellis::model::IndexPin =
-        serde_json::from_value(imported["publishedRevision"].clone()).unwrap();
+    // An explicit import completes at its semantic commit; any catch-up it left follows.
+    let mut prior = caught_up(&store, &imported);
     let mut prior_semantic = store.semantic_at(prior).unwrap();
     let accepted_artifact_hash = store.selected_raw_inputs_at(prior).unwrap()[0].captures[0]
         .artifact_hash
@@ -414,10 +440,8 @@ fn selected_case(change_b: &str) {
             "fixture must select a proven anchor"
         );
     }
-    let unchanged: trellis::model::IndexPin = serde_json::from_value(
-        run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
-    )
-    .unwrap();
+    let unchanged: trellis::model::IndexPin =
+        caught_up(&store, &run(&home, &["index", "--workspace", root_string]));
     assert_eq!(unchanged, prior);
     assert_eq!(
         store.semantic_at(prior).unwrap().provenance,
@@ -425,10 +449,7 @@ fn selected_case(change_b: &str) {
     );
     if change_b == "oracle_fork_successive_local" {
         fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
-        prior = serde_json::from_value(
-            run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
-        )
-        .unwrap();
+        prior = caught_up(&store, &run(&home, &["index", "--workspace", root_string]));
         prior_semantic = store.semantic_at(prior).unwrap();
         assert!(
             prior_semantic
@@ -465,10 +486,13 @@ fn selected_case(change_b: &str) {
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
         let leader = store.publication_for_tests().unwrap();
-        let seeded = store
+        let native_seed = store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
             .unwrap();
-        assert!(seeded.index_revision > prior.index_revision);
+        drop(leader);
+        let seeded = store.catch_up_semantic_for_tests(&cancel).unwrap();
+        assert!(seeded.index_revision >= native_seed.index_revision);
+        assert!(native_seed.index_revision > prior.index_revision);
         let store = if change_b == "oracle_fork_raw_replacement" {
             let mut extra = scip::types::Occurrence::new();
             extra.range = vec![0, 0, 8];
@@ -623,10 +647,13 @@ fn selected_case(change_b: &str) {
         let (graph, native, capture) =
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
-        let clean_head = store
+        let clean_native = store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
             .unwrap();
-        assert!(clean_head.index_revision > prior.index_revision);
+        drop(leader);
+        let clean_head = store.catch_up_semantic_for_tests(&cancel).unwrap();
+        let leader = store.publication_for_tests().unwrap();
+        assert!(clean_native.index_revision > prior.index_revision);
         assert!(
             store
                 .semantic_at(clean_head)
@@ -671,9 +698,14 @@ fn selected_case(change_b: &str) {
         let (graph, native, capture) =
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
-        let result =
-            store.publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel);
-        let error = result
+        // Native N does not read the captured native rows; semantic S does, and must fail
+        // typed instead of publishing failed producer output.
+        let native_pin = store
+            .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
+            .unwrap();
+        drop(leader);
+        let error = store
+            .catch_up_semantic_for_tests(&cancel)
             .expect_err("native retained-row corruption must not publish failed producer output");
         assert!(
             format!("{error:#}").contains("missing native header"),
@@ -683,14 +715,14 @@ fn selected_case(change_b: &str) {
             let head: i64 = db.query_row(
                 "SELECT index_revision FROM index_metadata WHERE singleton=1", [], |row| row.get(0),
             )?;
-            assert_eq!(head, clean_head.index_revision as i64);
+            assert_eq!(head, native_pin.index_revision as i64);
             let newer: i64 = db.query_row(
                 "SELECT count(*) FROM native_revisions WHERE published_index_revision>?1",
-                [clean_head.index_revision as i64], |row| row.get(0),
+                [native_pin.index_revision as i64], |row| row.get(0),
             )?;
             let failed: i64 = db.query_row(
                 "SELECT count(*) FROM semantic_coverage WHERE revision_id=?1 AND state='failed'",
-                [format!("pin:v1:{}:{}", clean_head.index_generation, clean_head.index_revision + 1)],
+                [format!("pin:v1:{}:{}", native_pin.index_generation, native_pin.index_revision + 1)],
                 |row| row.get(0),
             )?;
             assert_eq!((newer, failed), (0, 0));
@@ -721,13 +753,10 @@ fn selected_case(change_b: &str) {
     }
     if matches!(change_b, "oracle_retained_target" | "oracle_restored_b") {
         fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
-        prior = serde_json::from_value(
-            run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
-        )
-        .unwrap();
+        prior = caught_up(&store, &run(&home, &["index", "--workspace", root_string]));
         prior_semantic = store.semantic_at(prior).unwrap();
     }
-    if change_b == "oracle_mismatch" {
+    if change_b == "native_before_catchup" {
         use trellis::{
             semantic_batch::{BatchLimits, testing::stage_and_join_admitted},
             semantic_evidence as semantic,
@@ -824,16 +853,20 @@ fn selected_case(change_b: &str) {
         assert_eq!(store.selected_raw_inputs_at(prior).unwrap().len(), 1);
         fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
         let capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
-        let error = store
-            .publish_local_oracle_mismatch_for_tests(&options, &capture, &leader, &cancel)
-            .expect_err("oracle mismatch must abort publication");
-        assert!(
-            format!("{error:#}")
-                .contains("LOCAL publication differs from independent FULL rejoin oracle"),
-            "{error:#}"
-        );
-        assert_eq!(store.index_baseline().unwrap(), prior);
+        let native = store
+            .publish_local_for_tests(&options, &capture, &leader, &cancel)
+            .unwrap();
+        assert_ne!(native, prior);
+        assert_eq!(store.index_baseline().unwrap(), native);
         assert_eq!(store.semantic_at(prior).unwrap(), prior_semantic);
+        let projection = store
+            .semantic_projection_at(native, "scip-typescript", "javascript", "src/B.js")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection.semantic_status,
+            trellis::model::SemanticStatus::CatchingUp
+        );
         store
             .with_index_sql_for_tests(|db| {
                 let newer: i64 = db.query_row(
@@ -846,7 +879,7 @@ fn selected_case(change_b: &str) {
                     [format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision + 1)],
                     |row| row.get(0),
                 )?;
-                assert_eq!((newer, failed), (0, 0));
+                assert_eq!((newer, failed), (1, 0));
                 Ok(())
             })
             .unwrap();
@@ -1059,7 +1092,7 @@ fn selected_case(change_b: &str) {
         }).unwrap();
         return;
     }
-    if matches!(change_b, "cancel_before" | "cancel_after") {
+    if change_b == "cancel_after" {
         assert!(
             trellis::testing::signal_daemon_marker(&home.join("daemon.pid"), libc::SIGKILL)
                 .unwrap()
@@ -1100,27 +1133,21 @@ fn selected_case(change_b: &str) {
         };
         fs::write(root.join("src/B.js"), changed_b).unwrap();
         let cancelled = cancel.clone();
-        if change_b == "cancel_before" {
-            store.set_publication_before_semantic_hook_for_tests(move || {
-                cancelled.store(true, std::sync::atomic::Ordering::Release)
-            });
-        } else {
-            let audit = store.clone();
-            store.set_publication_before_commit_hook_for_tests(move || {
-                let writes = audit.take_search_fts_writes_for_tests();
-                assert!(
-                    writes
-                        .iter()
-                        .any(|(operation, _)| *operation == rusqlite::ffi::SQLITE_DELETE)
-                );
-                assert!(
-                    writes
-                        .iter()
-                        .any(|(operation, _)| *operation == rusqlite::ffi::SQLITE_INSERT)
-                );
-                cancelled.store(true, std::sync::atomic::Ordering::Release)
-            });
-        }
+        let audit = store.clone();
+        store.set_publication_before_commit_hook_for_tests(move || {
+            let writes = audit.take_search_fts_writes_for_tests();
+            assert!(
+                writes
+                    .iter()
+                    .any(|(operation, _)| *operation == rusqlite::ffi::SQLITE_DELETE)
+            );
+            assert!(
+                writes
+                    .iter()
+                    .any(|(operation, _)| *operation == rusqlite::ffi::SQLITE_INSERT)
+            );
+            cancelled.store(true, std::sync::atomic::Ordering::Release)
+        });
         let (graph, native, capture) =
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
@@ -1234,10 +1261,12 @@ fn selected_case(change_b: &str) {
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
         let leader = store.publication_for_tests().unwrap();
-        let next = store
+        let native_next = store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
             .unwrap();
-        assert!(next.index_revision > prior.index_revision);
+        drop(leader);
+        let next = store.catch_up_semantic_for_tests(&cancel).unwrap();
+        assert!(native_next.index_revision > prior.index_revision);
         let snapshot = store.semantic_at(next).unwrap();
         assert!(
             snapshot
@@ -1260,8 +1289,7 @@ fn selected_case(change_b: &str) {
     } else {
         vec!["index", "--workspace", root_string]
     };
-    let next: trellis::model::IndexPin =
-        serde_json::from_value(run(&home, &index_args)["publishedRevision"].clone()).unwrap();
+    let next = caught_up(&store, &run(&home, &index_args));
     assert!(next.index_revision > prior.index_revision);
     let snapshot = store.semantic_at(next).unwrap();
     if change_b.starts_with("oracle_") {
@@ -1275,8 +1303,7 @@ fn selected_case(change_b: &str) {
         );
     }
     if change_b.starts_with("oracle_fork_") {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         let (witnessed, fallbacks) = match change_b {
             "oracle_fork_body"
             | "oracle_fork_changed_a"
@@ -1296,13 +1323,17 @@ fn selected_case(change_b: &str) {
             | "oracle_fork_raw_replacement"
             | "oracle_fork_not_requested"
             | "oracle_fork_failed_exclusion"
-            | "oracle_fork_touched_b"
-            | "oracle_fork_fused_beside_lost_target" => (1, 0),
+            | "oracle_fork_touched_b" => (1, 0),
             "oracle_fork_healthy_two_producers" | "oracle_fork_staggered_producers" => (2, 0),
-            "oracle_fork_two_producers"
-            | "oracle_fork_missing_raw_key"
+            // Bounded S decides per producer: the healthy one is witnessed, the corrupt one
+            // falls back to FULL and fails authentication on its own.
+            "oracle_fork_two_producers" => (1, 1),
+            "oracle_fork_missing_raw_key"
             | "oracle_fork_synthetic"
-            | "oracle_fork_fused_target_lost" => (0, 1),
+            | "oracle_fork_fused_target_lost"
+            // Bounded S declines the witness when an omission and a fused association meet
+            // in one document, without proving they share a span: a conservative FULL.
+            | "oracle_fork_fused_beside_lost_target" => (0, 1),
             "oracle_fork_context" => (0, 0),
             _ => panic!("missing branch expectation for {change_b}"),
         };
@@ -1407,33 +1438,53 @@ fn selected_case(change_b: &str) {
             assert_eq!(work["originalRoleParses"], 0, "{change_b}: {work}");
             assert_eq!(work["originalRawDecodes"], 0, "{change_b}: {work}");
         } else {
+            // FULL builds its own destination index over every destination document; a
+            // fallback after an attempted witness also paid for the changed-only index.
             assert!(
-                work["originalRawDecodes"].as_u64().unwrap() > 0,
+                (1..=2).contains(&work["destinationIndexBuilds"].as_u64().unwrap()),
+                "{change_b}: {work}"
+            );
+            assert!(
+                work["destinationDocumentRows"].as_u64().unwrap() >= 1,
                 "{change_b}: {work}"
             );
         }
     }
     if change_b == "oracle_fork_context" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         eprintln!("context invalidation publication work: {work}");
-        assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
+        // FULL may build separate inventory and filtered views; LOCAL's one-index rule
+        // does not apply, but the work must stay bounded by document passes.
+        assert!(
+            (1..=2).contains(&work["destinationIndexBuilds"].as_u64().unwrap()),
+            "{work}"
+        );
         assert_eq!(
             work["destinationDocumentRows"], 2,
             "native FULL must index both documents: {work}"
         );
-        assert_eq!(
-            work["destinationRoleParses"], 2,
-            "native FULL must rejoin both source claims: {work}"
+        assert!(
+            (2..=6).contains(&work["destinationRoleParses"].as_u64().unwrap()),
+            "native FULL must rejoin both source claims in bounded passes: {work}"
         );
+        let mut parses = std::collections::BTreeMap::<&str, usize>::new();
+        for doc in work["parsedRoleSiteDocuments"].as_array().unwrap() {
+            *parses.entry(doc["path"].as_str().unwrap()).or_default() += 1;
+        }
+        assert_eq!(parses.len(), 2, "{work}");
+        for path in ["src/A.js", "src/B.js"] {
+            assert!(
+                (1..=3).contains(&parses.get(path).copied().unwrap_or_default()),
+                "native FULL must parse each source in bounded document passes: {work}"
+            );
+        }
         assert_eq!(
             work["fullFallbacks"], 0,
             "native FULL does not enter the LOCAL fallback: {work}"
         );
     }
     if change_b == "oracle_fork_successive_local" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         assert_eq!(
             work["fullFallbacks"], 0,
             "second LOCAL must witness the earliest original association: {work}"
@@ -1505,13 +1556,11 @@ fn selected_case(change_b: &str) {
         );
     }
     if change_b == "oracle_fork_missing_raw_key" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         assert_eq!(work["fullFallbacks"], 1, "{work}");
-        assert!(
-            work["originalRawProofBytes"].as_u64().unwrap() > 0,
-            "{work}"
-        );
+        // Bounded FULL authenticates the binary and probes stored proofs without loading
+        // the complete original proof inventory into Rust memory.
+        assert_eq!(work["originalRawProofBytes"], 0, "{work}");
         assert!(work["originalRawDecodes"].as_u64().unwrap() > 0, "{work}");
         assert_eq!(
             work["indexPin"],
@@ -1529,8 +1578,7 @@ fn selected_case(change_b: &str) {
         );
     }
     if change_b == "oracle_fork_healthy_two_producers" {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
         assert_eq!(work["destinationJoinsOnReusedDocuments"], 0, "{work}");
         // Only A and C contain captured source claims; B is a changed native
@@ -1594,12 +1642,15 @@ fn selected_case(change_b: &str) {
                 .any(|doc| doc["path"] == "src/B.js"),
             "{work}"
         );
+        // Bounded S verifies each required internal target with one keyed lookup at the
+        // captured pin and one at N, for both producers: bounded by the targets, not the corpus.
         assert!(
-            work["currentTargetLookups"].as_array().unwrap().len() <= 4,
+            work["currentTargetLookups"].as_array().unwrap().len() <= 10,
             "{work}"
         );
         assert!(work["currentTargetRows"].as_u64().unwrap() >= 1, "{work}");
-        assert!(work["currentTargetRows"].as_u64().unwrap() <= 4, "{work}");
+        // The changed-only index's declaration rows plus the keyed target lookups.
+        assert!(work["currentTargetRows"].as_u64().unwrap() <= 16, "{work}");
         let (next_native, _) = store.retained_native_snapshot_at(next).unwrap();
         assert_eq!(
             work["destinationRevision"], next_native.revision.id,
@@ -1658,8 +1709,7 @@ fn selected_case(change_b: &str) {
         );
     }
     if matches!(change_b, "oracle_body" | "oracle_two_producers") {
-        let work: Value =
-            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        let work: Value = work_counts(&home, next);
         eprintln!("publication work counts {change_b}: {work}");
         if change_b == "oracle_body" {
             assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
@@ -1669,11 +1719,15 @@ fn selected_case(change_b: &str) {
             assert_eq!(work["originalRawDecodes"], 0, "{work}");
         } else {
             assert_eq!(work["fullFallbacks"], 1, "{work}");
+            // One shared changed-only index for the witnessed producer; the corrupt producer's
+            // FULL fails authentication before it indexes or parses anything.
+            assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
+            assert_eq!(work["witnessedRejoins"], 1, "{work}");
             assert_eq!(
-                work["destinationIndexBuilds"], 2,
-                "attempted LOCAL work plus FULL fallback: {work}"
+                work["fallbackReasons"],
+                json!(["witness_capture_mismatch"]),
+                "{work}"
             );
-            assert!(work["originalRoleParses"].as_u64().unwrap() > 0, "{work}");
         }
         assert_eq!(work["destinationJoinsOnReusedDocuments"], 0, "{work}");
     }
@@ -1819,12 +1873,7 @@ fn selected_case(change_b: &str) {
         trellis::testing::wait_until("local branch daemon exit", || {
             !trellis::testing::process_running(pid)
         });
-        let full: trellis::model::IndexPin =
-            serde_json::from_value(run(fork, &index_args)["publishedRevision"].clone()).unwrap();
-        assert_eq!(
-            full, next,
-            "forked FULL and LOCAL pins must share the same seeded identity"
-        );
+        let fork_reply = run(fork, &index_args);
         let roots = TopologyRoots::isolated_for_tests(
             if cfg!(target_os = "macos") {
                 fork.join("Library/Caches/dev.squashmerge.trellis")
@@ -1840,6 +1889,11 @@ fn selected_case(change_b: &str) {
         let identity =
             trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
         let oracle = trellis::store::Store::open(roots, identity).unwrap();
+        let full = caught_up(&oracle, &fork_reply);
+        assert_eq!(
+            full, next,
+            "forked FULL and LOCAL pins must share the same seeded identity"
+        );
         assert_eq!(
             serde_json::to_vec(&snapshot).unwrap(),
             serde_json::to_vec(&oracle.semantic_at(full).unwrap()).unwrap(),
@@ -2254,8 +2308,8 @@ fn native_publication_rejoins_accepted_capture_and_unchanged_is_noop() {
 }
 
 #[test]
-fn cancellation_before_and_after_semantic_staging_rolls_back_native_pin() {
-    selected_case("cancel_before");
+fn cancellation_before_native_commit_rolls_back_native_pin() {
+    // Native N no longer stages semantic work; S cancellation is owned by the worker tests.
     selected_case("cancel_after");
 }
 
@@ -2377,8 +2431,8 @@ fn forked_seeded_local_matches_forced_full_oracle() {
 }
 
 #[test]
-fn in_process_oracle_mismatch_aborts_without_failed_producer_publication() {
-    selected_case("oracle_mismatch");
+fn native_publication_keeps_prior_semantics_immutable_until_catchup() {
+    selected_case("native_before_catchup");
 }
 
 #[test]
@@ -2523,9 +2577,8 @@ def seed_small(workspace, daemon, edited=None):
         shutil.copyfile(corpus / relative, dest)
     anchor_hash = m.sha_file(workspace / anchor)
     def publish():
-        output = m.command([str(binary), 'index', '--workspace', str(workspace)], env=m.env_for(daemon.home))
-        pin = json.loads(output)['publishedRevision']
-        return f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
+        m.command([str(binary), 'index', '--workspace', str(workspace)], env=m.env_for(daemon.home))
+        return m.wait_caught_up(daemon.home)
     r1 = publish()
     with closing(sqlite3.connect(f'file:{m.db_for(daemon.home)}?mode=ro', uri=True)) as db:
         assert db.execute('SELECT count(*) FROM revision_documents WHERE revision_id=?', (r1,)).fetchone()[0] == 4
@@ -2589,6 +2642,10 @@ try:
         incarnation=incarnation, request=request, request_mode=complete['mode'], start_wall_ms=wall, cli_end_wall_ms=ended_wall)
     assert observed['publication_mode']=='local', observed
     with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
+        m.check_changed_source(db, revision,relative.as_posix(),(workspace / relative).read_bytes())
+    revision = m.wait_caught_up(home)
+    assert revision == f'{generation}:{int(number)+2}', revision
+    with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
         m.selected_proof(db, revision, anchor.as_posix(), artifact)
         m.check_changed_source(db, revision,relative.as_posix(),(workspace / relative).read_bytes())
     assert m.sha_file(workspace / anchor)==anchor_hash
@@ -2596,10 +2653,11 @@ try:
     assert work['witnessedRejoins']==1 and work['fullFallbacks']==0, work
     assert work['originalNativeRows']==0 and work['originalSourceBytes']==0 and work['originalRawProofBytes']==0, work
     assert work['destinationDocumentRows']==996, work
-    assert len(work['reusedDocuments'])==4 and work['destinationRoleParses']==0, work
+    # Only the anchor is a scip-typescript document: the other sentinels are other languages.
+    assert len(work['reusedDocuments'])==1 and work['destinationRoleParses']==0, work
     with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
         local_digest = m.parity_digest(db, revision, workspace)
-        local_reports = db.execute('SELECT report_json FROM semantic_import_reports ORDER BY rowid').fetchall()
+        local_reports = db.execute('SELECT DISTINCT report_json FROM semantic_import_reports ORDER BY report_json').fetchall()
 finally:
     daemon.stop()
 
@@ -2614,7 +2672,7 @@ try:
     with closing(sqlite3.connect(f'file:{m.db_for(oracle_home)}?mode=ro', uri=True)) as db:
         m.selected_proof(db, oracle_pin, oracle_anchor.as_posix(), oracle_artifact)
         oracle_digest = m.parity_digest(db, oracle_pin, oracle_root)
-        oracle_reports = db.execute('SELECT report_json FROM semantic_import_reports ORDER BY rowid').fetchall()
+        oracle_reports = db.execute('SELECT DISTINCT report_json FROM semantic_import_reports ORDER BY report_json').fetchall()
     assert local_digest == oracle_digest, [name for name in local_digest if local_digest[name] != oracle_digest[name]]
     assert local_digest['semantic_import_reports'] == oracle_digest['semantic_import_reports']
     assert len(local_reports) == len(oracle_reports) == 1, (local_reports, oracle_reports)
@@ -2724,7 +2782,12 @@ fn full_rejoin_parses_each_document_a_bounded_number_of_times() {
     run(&home, &import_args(root_string, &descriptor, &digest));
     // One changed caller makes the next native publication rejoin the selected capture.
     fs::write(root.join("src/C0.js"), caller(0) + "// edited\n").unwrap();
+    let _ = fs::remove_file(home.join("work-counts.json"));
     run(&home, &["index", "--workspace", root_string]);
+    // Counts are exported once, by the bounded semantic S that follows native N.
+    trellis::testing::wait_until("semantic catch-up counts", || {
+        home.join("work-counts.json").exists()
+    });
     let work: Value =
         serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
     let mut parses = std::collections::BTreeMap::<String, usize>::new();
@@ -2733,14 +2796,14 @@ fn full_rejoin_parses_each_document_a_bounded_number_of_times() {
             .entry(doc["path"].as_str().unwrap().to_owned())
             .or_default() += 1;
     }
-    // Each document's references are joined at the captured revision and, unless changed, at
-    // the destination; one join parses a document once.
-    let expected: std::collections::BTreeMap<String, usize> = documents
-        .iter()
-        .map(|(path, _)| (path.clone(), if path == "src/C0.js" { 1 } else { 2 }))
-        .collect();
-    assert_eq!(
-        parses, expected,
-        "a rejoin re-parsed a document per occurrence"
-    );
+    // The staged FULL join has separate captured, destination and filtered-destination
+    // document passes. Each pass may parse a document once, not once per occurrence.
+    assert_eq!(parses.len(), documents.len(), "unexpected parsed documents");
+    for (path, _) in &documents {
+        let count = parses.get(path).copied().unwrap_or_default();
+        assert!(
+            (1..=3).contains(&count),
+            "FULL must parse {path} without re-parsing per occurrence: {parses:?}"
+        );
+    }
 }

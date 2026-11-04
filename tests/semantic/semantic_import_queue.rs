@@ -775,6 +775,37 @@ fn two_document_case(change_b: &str) {
     let joined = if matches!(change_b, "cutoff" | "whole_cas") {
         use std::os::unix::net::UnixStream;
         use std::time::{Duration, Instant};
+        let prior_report = store
+            .semantic_batch_report_at(advanced_pin, &digest)
+            .unwrap()
+            .expect("the original import report remains selected");
+        assert_eq!(prior_report, captured["report"]);
+        let raw_identity = || {
+            let inputs = store.selected_raw_inputs_at(advanced_pin).unwrap();
+            assert_eq!(inputs.len(), 1);
+            let input = &inputs[0];
+            (
+                input.producer_id.clone(),
+                input.batch_id,
+                input.captured_pin,
+                input.captured_revision.clone(),
+                input.source_manifest_hash.clone(),
+                input
+                    .captures
+                    .iter()
+                    .map(|capture| (capture.ordinal, capture.artifact_hash.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let projection = || {
+            ["src/A.js", "src/B.js"].map(|path| {
+                store
+                    .semantic_projection_at(advanced_pin, "scip-typescript", "javascript", path)
+                    .unwrap()
+            })
+        };
+        let prior_raw_identity = raw_identity();
+        let prior_projection = projection();
         let socket = home.join("candidate-cutoff.sock");
         let mut command = cli(&home);
         let child = command
@@ -822,12 +853,26 @@ fn two_document_case(change_b: &str) {
             committed.index_revision >= advanced_pin.index_revision + 2,
             "native reconciliation must precede semantic publication"
         );
-        assert!(
+        assert_eq!(
             store
                 .semantic_batch_report_at(advanced_pin, &digest)
-                .unwrap()
-                .is_none()
+                .unwrap(),
+            Some(prior_report)
         );
+        assert_eq!(raw_identity(), prior_raw_identity);
+        assert_eq!(projection(), prior_projection);
+        if change_b == "cutoff" {
+            let response = store.evidence_response().unwrap();
+            let source = response
+                .source_at("src/A.js", Some(committed))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                source.1.text,
+                "function run(){ target(); } // changed after candidate\n"
+            );
+            response.finish(()).unwrap();
+        }
         response
     } else if matches!(change_b, "ambiguous" | "ambiguous_a" | "missing_a") {
         let mut command = cli(&home);

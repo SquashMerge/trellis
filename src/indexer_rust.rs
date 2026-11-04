@@ -7,6 +7,7 @@ use tree_sitter::Node;
 
 fn provenance() -> Provenance {
     Provenance {
+        projection: None,
         source: "tree-sitter".into(),
         semantic: SemanticState::Unavailable,
     }

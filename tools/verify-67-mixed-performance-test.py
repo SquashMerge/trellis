@@ -205,7 +205,8 @@ class Rusage(unittest.TestCase):
 
 
 class SchemaParity(unittest.TestCase):
-    EXCLUDED = RUNNER.CONTROL_TABLES | RUNNER.DEBT_TABLES | RUNNER.FTS_SHADOW_TABLES
+    EXCLUDED = (RUNNER.CONTROL_TABLES | RUNNER.DEBT_TABLES | RUNNER.FTS_SHADOW_TABLES
+                | RUNNER.DERIVED_CACHE_TABLES)
 
     def schema_db(self):
         source = (RUNNER.REPO / "src/store.rs").read_text()
@@ -227,11 +228,16 @@ class SchemaParity(unittest.TestCase):
 
     def test_schema_text_table_set_matches_required_tables(self):
         self.assertEqual(self.tables(self.schema_db()),
-                         RUNNER.REQUIRED_TABLES | RUNNER.CONTROL_TABLES | RUNNER.FTS_SHADOW_TABLES)
+                         RUNNER.REQUIRED_TABLES | RUNNER.CONTROL_TABLES | RUNNER.FTS_SHADOW_TABLES
+                         | RUNNER.DERIVED_CACHE_TABLES)
 
     def test_every_schema_table_has_a_selected_scope(self):
-        for table in sorted(self.tables(self.schema_db()) - self.EXCLUDED):
-            self.assertTrue(RUNNER.selected_where(table), table)
+        db = self.schema_db()
+        for table in sorted(self.tables(db) - self.EXCLUDED):
+            where = RUNNER.selected_where(table)
+            self.assertTrue(where, table)
+            self.assertEqual(db.execute(f'SELECT * FROM "{table}" selected WHERE {where}',
+                                        ("pin:v1:gen:3",)).fetchall(), [], table)
         with self.assertRaises(RuntimeError):
             RUNNER.selected_where("not_a_table")
 
@@ -253,7 +259,9 @@ class SchemaParity(unittest.TestCase):
         db.execute("INSERT INTO native_source_sets VALUES(?,?)", (source_set, root_id))
         for ordinal, language in enumerate(("javascript", "python")):
             db.execute("INSERT INTO native_source_set_languages VALUES(?,?,?)", (source_set, language, ordinal))
-        pins = {"r1": "pin:v1:gen:1", "import": "pin:v1:gen:2", "r2": "pin:v1:gen:3"}
+        pins = {"r1": f"pin:v1:{root_id}:1", "import": f"pin:v1:{root_id}:2",
+                "r2": f"pin:v1:{root_id}:3"}
+        tuple_id = int(RUNNER.hashlib.sha256(str(root).encode()).hexdigest()[:8], 16) + 1
         natives = {"r1": "revision:v2:one", "import": "revision:v2:two", "r2": "revision:v2:two"}
         for name, pin in pins.items():
             db.execute("INSERT INTO native_revisions VALUES(?,?,?,?,?,?,?,'[]','{}','[]','[]',NULL,'[]',0,'{}','[]',?)",
@@ -280,12 +288,28 @@ class SchemaParity(unittest.TestCase):
         for name in ("import", "r2"):
             db.execute("INSERT INTO semantic_revision_raw_selections VALUES(?,'scip-typescript',1,?)",
                        (pins[name], pins["r1"]))
-        db.execute("INSERT INTO semantic_coverage VALUES(1,?,'scip-typescript','1','javascript','js/a.js',1,1,'complete',NULL)",
+        db.execute("INSERT INTO semantic_coverage VALUES(?,?,'scip-typescript','1','javascript','js/a.js',1,1,'complete',NULL)",
+                   (tuple_id, pins["r2"]))
+        db.execute("INSERT INTO semantic_basis VALUES(1,?,'scip-typescript','1',?,?,'javascript',?,?,?,?,?,?)",
+                   (tuple_id, HEX, artifact, source_set, natives["r1"], header["manifest_hash"], HEX, HEX, HEX))
+        db.execute("INSERT INTO semantic_provenance VALUES(?,'prov',?,'semanticReference','fresh',1,1,'proof','occurrence',?)",
+                   (tuple_id, HEX, HEX))
+        db.execute("INSERT INTO semantic_projection_origins VALUES(?,'scip-typescript',?)",
+                   (pins["r2"], pins["import"]))
+        db.execute("INSERT INTO semantic_projection_documents VALUES(?,'scip-typescript','javascript','js/a.js',0)",
                    (pins["r2"],))
-        db.execute("INSERT INTO semantic_basis VALUES(1,1,'scip-typescript','1',?,?,'javascript',?,?,?,?,?,?)",
-                   (HEX, artifact, source_set, natives["r1"], header["manifest_hash"], HEX, HEX, HEX))
-        db.execute("INSERT INTO semantic_provenance VALUES(1,'prov',?,'semanticReference','fresh',1,1,'proof','occurrence',?)",
-                   (HEX, HEX))
+        db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js')", (tuple_id,))
+        db.execute("INSERT INTO semantic_projection_contexts VALUES(?)", (tuple_id,))
+        db.execute("INSERT INTO semantic_projection_lookup_dependencies VALUES(?,'lookup')", (tuple_id,))
+        db.execute("INSERT INTO semantic_coverage VALUES(?,?,'scip-typescript','1','javascript','js/a.js',1,1,'complete',NULL)",
+                   (tuple_id + 1, pins["r1"]))
+        db.execute("INSERT INTO semantic_projection_origins VALUES(?,'scip-typescript',?)",
+                   (pins["r1"], pins["r1"]))
+        db.execute("INSERT INTO semantic_projection_documents VALUES(?,'scip-typescript','javascript','js/a.js',0)",
+                   (pins["r1"],))
+        db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js')", (tuple_id + 1,))
+        db.execute("INSERT INTO semantic_projection_contexts VALUES(?)", (tuple_id + 1,))
+        db.execute("INSERT INTO semantic_projection_lookup_dependencies VALUES(?,'old-lookup')", (tuple_id + 1,))
         report = {"producerId": "scip-typescript", "identityKind": "executable",
                   "sourceSetId": source_set, "capturedRevision": natives["r1"],
                   "destinationRevision": natives["r2"], "descriptorSha256": HEX,
@@ -306,16 +330,41 @@ class SchemaParity(unittest.TestCase):
         for table in ("semantic_raw_batches", "semantic_raw_captures", "semantic_raw_exclusions",
                       "semantic_raw_documents", "semantic_raw_proofs", "semantic_revision_raw_selections",
                       "semantic_coverage", "semantic_basis", "semantic_provenance",
-                      "semantic_import_reports", "semantic_reimport"):
+                      "semantic_import_reports", "semantic_reimport", "semantic_projection_origins",
+                      "semantic_projection_documents", "semantic_projection_dependencies",
+                      "semantic_projection_contexts", "semantic_projection_lookup_dependencies"):
             columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
             query = f'SELECT * FROM "{table}" selected WHERE {RUNNER.selected_where(table)}'
             rows[table] = [RUNNER.canonical(RUNNER.typed_cells(view.row(table, dict(zip(columns, row)))))
                            for row in db.execute(query, (revision,))]
             self.assertTrue(rows[table], table)
         self.assertEqual(len(rows["semantic_reimport"]), 1)
+        for table in ("semantic_projection_origins", "semantic_projection_documents",
+                      "semantic_projection_dependencies", "semantic_projection_contexts",
+                      "semantic_projection_lookup_dependencies"):
+            self.assertEqual(len(rows[table]), 1, table)
+        # Pending and catchup rows are different workflow phases; exercise each
+        # identity mapping without manufacturing a combined database state.
+        origins = db.execute("SELECT basis_pin FROM semantic_projection_origins WHERE revision_id=?",
+                             (revision,)).fetchone()
+        captured = db.execute("SELECT batch_id,captured_pin FROM semantic_revision_raw_selections WHERE revision_id=?",
+                              (revision,)).fetchone()
+        native = db.execute("SELECT native_revision_id FROM native_revisions WHERE id=?", (revision,)).fetchone()[0]
+        for table, cells in (
+                ("semantic_pending_target", {"singleton": 1, "revision_id": revision,
+                                             "native_revision_id": native, "root_id": view.root_id}),
+                ("semantic_pending_selections", {"revision_id": revision, "producer_id": "scip-typescript",
+                                                 "batch_id": captured[0], "captured_pin": captured[1],
+                                                 "basis_pin": origins[0]}),
+                ("semantic_catchup_commits", {"revision_id": revision, "target_revision_id": origins[0]})):
+            rows[table] = RUNNER.canonical(RUNNER.typed_cells(view.row(table, cells)))
+        with self.assertRaisesRegex(RuntimeError, "unmapped pin identity"):
+            view.row("semantic_catchup_commits", {"revision_id": revision, "target_revision_id": "unknown-pin"})
+        with self.assertRaisesRegex(RuntimeError, "pending target belongs to another root"):
+            view.row("semantic_pending_target", {"root_id": "other-root"})
         return rows
 
-    def test_selected_view_normalizes_a_schema_37_batch_selection_identically_across_roots(self):
+    def test_selected_view_normalizes_a_schema_40_batch_selection_identically_across_roots(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             self.assertEqual(self.normalized_rows(first), self.normalized_rows(second))
 

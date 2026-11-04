@@ -1020,6 +1020,20 @@ test("calls-first preserves extractor-labelled uncertainty outside boundaries on
   assert.equal(JSON.stringify(view),before);
 });
 
+test("older-basis sequence evidence keeps historical identity and is not labelled fresh", () => {
+  const window = {};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window});
+  const projection = {semanticStatus:"olderBasis", currentPin:{indexGeneration:"generation",indexRevision:2},
+    semanticBasisPin:{indexGeneration:"generation",indexRevision:1},basisNativeRevisionId:"native-P"};
+  const evidence = {projection, boundaryReason:"none",freshness:"possiblyStale",historicalFreshness:"fresh"};
+  assert.match(window.TrellisSequence.evidenceLabel({kind:"call",callId:"call",callEvidence:evidence}), /older basis/);
+  assert.match(window.TrellisSequence.basisLabel(evidence), /generation:1.*native-P/);
+  assert.equal(window.TrellisSequence.evidenceSummary({semantic:{documents:[{projection}]}}), "Older semantic basis");
+  projection.semanticStatus = "catchingUp";
+  assert.match(window.TrellisSequence.evidenceLabel({kind:"call",callId:"call",callEvidence:evidence}), /catching up/);
+  assert.equal(window.TrellisSequence.evidenceSummary({semantic:{documents:[{projection}]}}), "Semantic catching up");
+});
+
 // #663: Interactions bound the arrows they draw, after internal steps are filtered out. Internal
 // steps never use that room, and omitted arrows are counted as interactions, not internal steps.
 test("Interactions cap arrows after filtering internal steps and count the omitted ones", () => {

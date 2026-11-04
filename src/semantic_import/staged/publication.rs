@@ -63,9 +63,8 @@ impl<'s, T> Family<'s, T> {
 
 type RawProvenance = (rusqlite::types::Value, i64, String, String, String);
 
-/// One provenance row with its raw claim's fields. Every row is kept (the claim is joined
-/// outer): a row whose claim is gone is a corrupt stage and fails the publication, never a
-/// row silently dropped with the facts it would own.
+/// One provenance row with its raw identity fields. Missing identity metadata is a corrupt
+/// stage and fails publication, never silently dropping the row and its facts.
 fn provenance_row(row: &rusqlite::Row<'_>) -> Result<(i64, RawProvenance)> {
     let claim = |index: usize| -> Result<String> {
         row.get::<_, Option<String>>(index)?
@@ -84,6 +83,21 @@ fn fact<T: codec::ProvenanceOwned>(row: &rusqlite::Row<'_>) -> Result<(i64, T)> 
     ))
 }
 
+// Both identity domains are keyed separately, so publication never materializes the union
+// view. A missing identity leaves NULL metadata and fails `provenance_row`.
+fn provenance_sql(schema: &str) -> String {
+    format!(
+        "SELECT p.doc,p.id,p.kind, \
+         COALESCE(c.proof_id,w.proof_id), \
+         COALESCE(c.record_kind,w.record_kind), \
+         COALESCE(c.fact_digest,w.fact_digest) \
+         FROM {schema}out_provenance p \
+         LEFT JOIN {schema}claims c ON p.claim_id>0 AND c.claim_id=p.claim_id \
+         LEFT JOIN {schema}witness_proofs w ON p.claim_id<0 AND w.identity_id=p.claim_id \
+         ORDER BY p.ord"
+    )
+}
+
 /// Calls `each` with the publication of every coverage row, in coverage order. `schema` is
 /// the stage's schema prefix: `"stage."` when attached, `""` on the stage connection itself.
 pub(crate) fn read_documents(
@@ -100,10 +114,7 @@ pub(crate) fn read_documents(
     let mut coverage = conn.prepare(&format!(
         "SELECT ord, body, provenance FROM {schema}out_coverage ORDER BY ord"
     ))?;
-    let mut provenance = conn.prepare(&format!(
-        "SELECT p.doc, p.id, p.kind, c.proof_id, c.record_kind, c.fact_digest \
-         FROM {schema}out_provenance p LEFT JOIN {schema}claims c ON c.claim_id=p.claim_id ORDER BY p.ord"
-    ))?;
+    let mut provenance = conn.prepare(&provenance_sql(schema))?;
     let mut symbols = facts("out_symbols")?;
     let mut bindings = facts("out_declaration_bindings")?;
     let mut references = facts("out_references")?;
@@ -171,10 +182,7 @@ pub(crate) fn read_documents(
 pub(crate) fn statements(schema: &str) -> Vec<String> {
     let mut statements = vec![
         format!("SELECT ord, body, provenance FROM {schema}out_coverage ORDER BY ord"),
-        format!(
-            "SELECT p.doc, p.id, p.kind, c.proof_id, c.record_kind, c.fact_digest \
-             FROM {schema}out_provenance p LEFT JOIN {schema}claims c ON c.claim_id=p.claim_id ORDER BY p.ord"
-        ),
+        provenance_sql(schema),
     ];
     for table in [
         "out_symbols",

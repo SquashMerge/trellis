@@ -72,7 +72,8 @@ fn language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
             json!({"language":language,"nativeCoverageTier":"syntax","coverage":counts(row),
             "semantic":{"available":tier.semantic(),"producerId":tier.producer_id,
                 "freshness":if tier.freshness.is_empty() {"unavailable"} else {tier.freshness},
-                "coverage":counts(&tier.counts),"note":tier.note,"reimport":tier.reimport}})
+                "coverage":counts(&tier.counts),"note":tier.note,"reimport":tier.reimport,
+                "documents":tier.documents}})
         })
         .collect()
 }
@@ -131,6 +132,11 @@ pub fn describe(
         rows.iter()
             .chain(tiers.iter().map(|tier| &tier.counts))
             .any(|row| row[2] != 0 || row[3] != 0)
+            || tiers.iter().any(|tier| {
+                tier.documents
+                    .iter()
+                    .any(|status| status.projection.semantic_status.is_pending())
+            })
     });
     let languages: Vec<Value> = counts.as_ref().map_or_else(Vec::new, |(rows, tiers)| {
         describe_language_status(rows, tiers)
@@ -150,6 +156,29 @@ pub fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compact_keeps_projection_and_historical_freshness() {
+        let projection = json!({
+            "currentPin":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":2},
+            "semanticBasisPin":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1},
+            "basisNativeRevisionId":"revision:v2:basis", "semanticStatus":"olderBasis"
+        });
+        let mut data = json!({"calls":[{
+            "binding":{},"semanticBasisRef":0,"freshness":"possiblyStale",
+            "historicalFreshness":"fresh","projection":projection
+        }],"coverage":[],"provenance":[],"semanticBases":[],
+            "semanticDocuments":[{"projection":projection}]});
+        compact_data(&mut data, "calls");
+        let call = &data["calls"][0];
+        assert_eq!(call["freshness"], "possiblyStale");
+        assert_eq!(call["historicalFreshness"], "fresh");
+        assert_eq!(call["projection"], projection);
+        assert_eq!(data["semanticDocuments"][0]["projection"], projection);
+        assert!(call.get("binding").is_none());
+        assert!(call.get("semanticBasisRef").is_none());
+        assert!(data.get("provenance").is_none());
+    }
+
     #[test]
     fn describe_closed_ready_and_missing_head() {
         let empty = describe(&json!(1), "project", "reconciling", None, None, None, false);
@@ -275,6 +304,29 @@ const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json','utf8'
 for (const [name, output] of JSON.parse(readFileSync(0,'utf8'))) {
   const validate = ajv.compile(catalog.find(tool => tool.name === name).outputSchema);
   if (!validate(output)) throw Error(name + ': ' + JSON.stringify(validate.errors));
+}
+const pin = {indexGeneration:'123e4567-e89b-42d3-a456-426614174000',indexRevision:2};
+const projection = {currentPin:pin,semanticBasisPin:{...pin,indexRevision:1},
+  basisNativeRevisionId:'revision:v2:historical',semanticStatus:'olderBasis'};
+for (const name of ['trellis_outgoing_calls','trellis_incoming_calls']) {
+  const defs = catalog.find(tool => tool.name === name).outputSchema.$defs;
+  const values = {
+    SemanticProjection:projection,
+    DocumentSemanticStatus:{producerId:'rust-analyzer',language:'rust',path:'src/lib.rs',projection}
+  };
+  for (const [definition,value] of Object.entries(values)) {
+    const validate = ajv.compile({$defs:defs,$ref:'#/$defs/' + definition});
+    if (!validate(value)) throw Error(name + ' valid ' + definition + ': ' + JSON.stringify(validate.errors));
+    if (validate({...value,unknownProjectionField:true})) throw Error(name + ' accepted unknown ' + definition + ' field');
+    for (const field of defs[definition].required) {
+      const missing = {...value}; delete missing[field];
+      if (validate(missing)) throw Error(name + ' accepted missing ' + definition + '.' + field);
+    }
+  }
+  const validateDocument = ajv.compile({$defs:defs,$ref:'#/$defs/DocumentSemanticStatus'});
+  if (validateDocument({...values.DocumentSemanticStatus,projection:{...projection,unknownProjectionField:true}})) {
+    throw Error(name + ' accepted unknown nested projection field');
+  }
 }
 "#;
         let mut child = Command::new("node")
@@ -429,7 +481,7 @@ for (const [name, output] of JSON.parse(readFileSync(0,'utf8'))) {
             rust["semantic"],
             json!({"available":true,"producerId":"rust-analyzer","freshness":"fresh","note":null,
                 "coverage":{"selected":355,"complete":300,"partial":55,"failed":0,"unselected":0},
-                "partialReasons":null,"reimport":null})
+                "partialReasons":null,"reimport":null,"documents":[]})
         );
         assert_eq!(
             fresh["data"]["languages"][0]["semantic"]["available"],
@@ -1056,10 +1108,10 @@ mod find_tests {
             assert_eq!(
                 data["scopeCoverage"],
                 json!([
-                    {"language":"java","nativeCoverageTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null}},
-                    {"language":"rust","nativeCoverageTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null}},
-                    {"language":"python","nativeCoverageTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null}},
-                    {"language":"javascript","nativeCoverageTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null}}
+                    {"language":"java","nativeCoverageTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documents":[]}},
+                    {"language":"rust","nativeCoverageTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documents":[]}},
+                    {"language":"python","nativeCoverageTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documents":[]}},
+                    {"language":"javascript","nativeCoverageTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documents":[]}}
                 ])
             );
             // Incomplete selected scope: partial, one aggregate warning first.
@@ -1606,10 +1658,13 @@ struct CallEvidence {
     evidence_tier: &'static str,
     semantic_basis: Value,
     freshness: Value,
+    historical_freshness: Value,
+    projection: Value,
 }
 
 fn call_evidence(
     semantic: Option<&crate::store::CallSemantic>,
+    projection: Option<&crate::model::SemanticProjection>,
 ) -> Result<CallEvidence, &'static str> {
     use crate::graph_query::BoundaryReason;
     use crate::semantic_evidence::Resolution;
@@ -1621,7 +1676,13 @@ fn call_evidence(
             boundary_reason: json!("missingEvidence"),
             evidence_tier: "syntax",
             semantic_basis: Value::Null,
-            freshness: json!("fresh"),
+            freshness: if projection.is_some() {
+                json!("possiblyStale")
+            } else {
+                json!("fresh")
+            },
+            historical_freshness: Value::Null,
+            projection: json!(projection),
         });
     };
     let value = |v: serde_json::Result<Value>| {
@@ -1642,8 +1703,21 @@ fn call_evidence(
         boundary_reason: value(serde_json::to_value(semantic.boundary_reason))?,
         evidence_tier: "semantic",
         semantic_basis: value(serde_json::to_value(&semantic.provenance.basis))?,
-        freshness: value(serde_json::to_value(semantic.provenance.freshness))?,
+        freshness: value(serde_json::to_value(semantic.effective_freshness))?,
+        historical_freshness: value(serde_json::to_value(semantic.historical_freshness))?,
+        projection: value(serde_json::to_value(&semantic.projection))?,
     })
+}
+
+fn call_projection<'a>(
+    semantic: &'a crate::store::McpSemantic,
+    document: &crate::native_evidence::DocumentKey,
+) -> Option<&'a crate::model::SemanticProjection> {
+    semantic
+        .documents
+        .iter()
+        .find(|status| status.language == document.language && status.path == document.path)
+        .map(|status| &status.projection)
 }
 
 /// A semantic coverage or provenance row in the wire's shared `Coverage`/`Provenance` shape.
@@ -1723,9 +1797,45 @@ fn intern_bases<P: serde::Serialize>(
     Ok((table, provenance))
 }
 
+/// Keep each historical proof labelled even when detached from its call item.
+fn label_projected_proofs(
+    provenance: &mut [Value],
+    semantic: &crate::store::McpSemantic,
+    count: usize,
+) -> Result<(), &'static str> {
+    let mut labels = std::collections::BTreeMap::new();
+    for call in (0..count).filter_map(|index| semantic.call(index)) {
+        let Some(projection) = &call.projection else {
+            continue;
+        };
+        for proof in &call.proofs {
+            let label = json!({"projection":projection,"historicalFreshness":proof.freshness,
+                "effectiveFreshness":projection.effective_freshness(proof.freshness)});
+            if let Some(previous) = labels.insert(proof.id.as_str(), label.clone())
+                && previous != label
+            {
+                return Err("store_unavailable: conflicting projected proof");
+            }
+        }
+    }
+    for proof in provenance {
+        if let Some(label) = proof["id"].as_str().and_then(|id| labels.get(id)) {
+            let fields = label
+                .as_object()
+                .ok_or("store_unavailable: projected proof label")?;
+            proof
+                .as_object_mut()
+                .ok_or("store_unavailable: projected proof")?
+                .extend(fields.clone());
+        }
+    }
+    Ok(())
+}
+
 /// #528 compact mode: keep the answer (items, refs, dispositions, targets, warnings and
 /// completeness) and drop the proof detail: `coverage`, `provenance`, `semanticBases`,
-/// and each item's `binding` and `semanticBasisRef`.
+/// and each item's `binding` and `semanticBasisRef`. Projection and historical freshness
+/// stay on each item; `semanticDocuments` keeps pending selections without bindings.
 fn compact_data(data: &mut Value, items: &str) {
     if let Some(fields) = data.as_object_mut() {
         for field in ["coverage", "provenance", "semanticBases"] {
@@ -1773,7 +1883,12 @@ fn call_warnings<'a>(
             ));
         }
         for proof in &call.proofs {
-            match proof.freshness {
+            match call
+                .projection
+                .as_ref()
+                .map_or(proof.freshness, |projection| {
+                    projection.effective_freshness(proof.freshness)
+                }) {
                 Freshness::Stale => {
                     keys.insert(
                         (1, Some(proof.id.clone())),
@@ -1929,7 +2044,7 @@ pub fn outgoing(
             boundary |= bound.is_none_or(|bound| {
                 bound.boundary_reason != crate::graph_query::BoundaryReason::None
             });
-            let evidence = call_evidence(bound)?;
+            let evidence = call_evidence(bound, call_projection(semantic, &call.document))?;
             calls.push(json!({"callId":call.id,"ownerSyntaxId":call.owner_syntax_id,
                 "ordinal":call.ordinal,"doc":document_ref(&refs, &item.source.document).ok_or("store_unavailable: missing call ref")?,
                 "lines":item.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),
@@ -1940,7 +2055,8 @@ pub fn outgoing(
                     "complete":false},"binding":evidence.binding,"disposition":evidence.disposition,
                 "targetId":evidence.target_id,"boundaryReason":evidence.boundary_reason,
                 "evidenceTier":evidence.evidence_tier,"semanticBasis":evidence.semantic_basis,
-                "freshness":evidence.freshness,"staleBecause":[]}));
+                "freshness":evidence.freshness,"staleBecause":[],
+                "historicalFreshness":evidence.historical_freshness,"projection":evidence.projection}));
         }
         let mut coverage: Vec<_> = coverage.into_values().collect();
         let language_order = |language: &str| match language {
@@ -1965,7 +2081,11 @@ pub fn outgoing(
                     &b.revision_id,
                 ))
         });
-        let incomplete = coverage.iter().any(|c| c.selected && c.state != "complete");
+        let incomplete = coverage.iter().any(|c| c.selected && c.state != "complete")
+            || semantic
+                .documents
+                .iter()
+                .any(|status| status.projection.semantic_status.is_pending());
         let truncated = count < result.calls.len() || limited || clipped;
         let reason = if count < result.calls.len() {
             Some("response_bytes")
@@ -1981,10 +2101,12 @@ pub fn outgoing(
             semantic,
             (0..count).filter_map(|index| semantic.call(index)),
         );
-        let (bases, provenance) = intern_bases(&mut calls, provenance.into_values())?;
+        let (bases, mut provenance) = intern_bases(&mut calls, provenance.into_values())?;
+        label_projected_proofs(&mut provenance, semantic, count)?;
         let mut data = json!({"symbolId":result.owner.selected.declaration.syntax_id,
             "stableLookupKey":result.owner.source.stable_lookup_key,"displayKey":owner_display,"calls":calls,"documents":documents,
-            "semanticBases":bases,"coverage":coverage,"provenance":provenance});
+            "semanticBases":bases,"coverage":coverage,"provenance":provenance,
+            "semanticDocuments":semantic.documents});
         if let Some(omitted) = result.external_omitted {
             data["externalOmitted"] = json!(omitted);
         }
@@ -2079,8 +2201,27 @@ pub fn call_graph(
             let Value::Array(rows) = projected["provenance"].take() else {
                 return Err("store_unavailable: call graph provenance projection");
             };
-            let (bases, provenance) = intern_bases(&mut [], rows)?;
+            let mut rows = rows;
+            let ordinary_count = rows.len();
+            for proof in projected["projectedProvenance"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                rows.push(proof["evidence"].clone());
+            }
+            let (bases, mut provenance) = intern_bases(&mut [], rows)?;
+            let historical = provenance.split_off(ordinary_count);
             projected["provenance"] = Value::Array(provenance);
+            for (proof, evidence) in projected
+                .get_mut("projectedProvenance")
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+                .zip(historical)
+            {
+                proof["evidence"] = evidence;
+            }
             let omitted = json!({"nodes":nodes - result.nodes.len(),
                 "edges":edges - result.edges.len()});
             let mut data = json!({"stableLookupKey":stable_lookup_key,"requested":requested,
@@ -2116,8 +2257,8 @@ pub fn call_graph(
 /// #665 compact graph: keep the graph (node keys, names, kinds, roles, paths and ranges; edge
 /// endpoints, call sites, visits, boundaries and binding resolutions), frontiers, omissions,
 /// hints, warnings and completeness, and drop the proof detail: `semanticBases`, the
-/// result's `coverage` and `provenance`, each edge's `binding` (replaced by its
-/// `resolution`, null without one), each node declaration's header, ancestors, key, name
+/// result's `coverage`, `provenance` and `projectedProvenance`, each edge's `binding`
+/// (replaced by its `resolution`, null without one), each node declaration's header, ancestors, key, name
 /// range, revision and proof, and each call's document, revision, regions and proof.
 fn compact_graph(data: &mut Value) {
     if let Some(fields) = data.as_object_mut() {
@@ -2127,6 +2268,7 @@ fn compact_graph(data: &mut Value) {
     if let Some(fields) = result.as_object_mut() {
         fields.remove("coverage");
         fields.remove("provenance");
+        fields.remove("projectedProvenance");
     }
     for node in result["nodes"].as_array_mut().into_iter().flatten() {
         if let Some(declaration) = node["declaration"].as_object_mut() {
@@ -2274,7 +2416,7 @@ pub fn incoming(
             boundary |= bound.is_none_or(|bound| {
                 bound.boundary_reason != crate::graph_query::BoundaryReason::None
             });
-            let evidence = call_evidence(bound)?;
+            let evidence = call_evidence(bound, call_projection(semantic, &call.document))?;
             callers.push(
                 json!({"callId":call.id,"ownerSyntaxId":call.owner_syntax_id,
                 "callerDisplayKey":display_key(&item.caller),"callerRole":item.caller.role,
@@ -2284,7 +2426,8 @@ pub fn incoming(
                 "matchedBy":"name","binding":evidence.binding,"disposition":evidence.disposition,
                 "targetId":evidence.target_id,"boundaryReason":evidence.boundary_reason,
                 "evidenceTier":evidence.evidence_tier,"semanticBasis":evidence.semantic_basis,
-                "freshness":evidence.freshness,"staleBecause":[]}),
+                "freshness":evidence.freshness,"staleBecause":[],
+                "historicalFreshness":evidence.historical_freshness,"projection":evidence.projection}),
             );
         }
         let mut coverage: Vec<_> = coverage.into_values().collect();
@@ -2325,8 +2468,13 @@ pub fn incoming(
         );
         let incomplete = warnings
             .first()
-            .is_some_and(|warning| warning["code"] == "coverageIncomplete");
-        let (bases, provenance) = intern_bases(&mut callers, provenance.into_values())?;
+            .is_some_and(|warning| warning["code"] == "coverageIncomplete")
+            || semantic
+                .documents
+                .iter()
+                .any(|status| status.projection.semantic_status.is_pending());
+        let (bases, mut provenance) = intern_bases(&mut callers, provenance.into_values())?;
+        label_projected_proofs(&mut provenance, semantic, count)?;
         let mut data = json!({
             "symbolId":owner.declaration.syntax_id,"displayKey":display_key(&owner.declaration),
             "stableLookupKey":result.selected.source.stable_lookup_key,
@@ -2335,7 +2483,7 @@ pub fn incoming(
                     "opaqueMacros","sameNameDeclarations"]},
             "callers":callers,"documents":documents,"semanticBases":bases,"coverage":coverage,
             "scopeCoverage":language_status(&result.scope, tiers),
-            "provenance":provenance});
+            "provenance":provenance,"semanticDocuments":semantic.documents});
         if compact {
             compact_data(&mut data, "callers");
         }
@@ -2909,7 +3057,7 @@ mod incoming_tests {
         for modern in [false, true] {
             let empty = project(fixture(0, false, 0), modern).unwrap();
             let data = &empty["data"];
-            assert_eq!(data.as_object().unwrap().len(), 10);
+            assert_eq!(data.as_object().unwrap().len(), 11);
             assert!(data.get("stableLookupKey").is_some_and(Value::is_null));
             assert_eq!(data["semanticBases"], json!([]));
             assert_eq!(data["documents"], json!([]));
@@ -2937,7 +3085,7 @@ mod incoming_tests {
             assert_eq!(empty["warnings"][0]["code"], "syntaxOnly");
             let full = project(fixture(1, false, 0), modern).unwrap();
             let caller = &full["data"]["callers"][0];
-            assert_eq!(caller.as_object().unwrap().len(), 18);
+            assert_eq!(caller.as_object().unwrap().len(), 20);
             assert_eq!(caller["callerRole"], "production");
             assert_eq!(caller["callerDisplayKey"], "a.js#Owner");
             assert_eq!(caller["calleeText"], "Target");
@@ -3151,6 +3299,7 @@ mod call_graph_tests {
             })
             .collect::<Vec<_>>();
         let document = DocumentFacts {
+            projection: None,
             key: key.clone(),
             declarations: BTreeMap::from([(sid(1), declaration)]),
             calls: BTreeMap::from([(sid(1), owned)]),
@@ -3497,6 +3646,9 @@ mod size_tests {
                 "observedRoles":["definition","read","call","type"],
                 "diagnostic":"unsupported_native_gap"});
             semantic.push(Some(crate::store::CallSemantic {
+                projection: None,
+                historical_freshness: crate::semantic_evidence::Freshness::Fresh,
+                effective_freshness: crate::semantic_evidence::Freshness::Fresh,
                 binding: serde_json::from_value(binding).unwrap(),
                 provenance: serde_json::from_value(proof.clone()).unwrap(),
                 boundary_reason: crate::graph_query::BoundaryReason::Dispatch,
@@ -3530,6 +3682,7 @@ mod size_tests {
                 has_more: true,
             },
             crate::store::McpSemantic {
+                documents: vec![],
                 producer_id: Some("rust-analyzer".into()),
                 note: None,
                 calls: semantic,
@@ -3607,10 +3760,108 @@ mod size_tests {
     }
 
     #[test]
-    fn the_basis_table_cuts_a_full_caller_page_by_over_30_percent() {
-        // Before #528 each caller and proof repeated the whole basis: re-inline it to
-        // compare against the same emitted prefix (the old shape would not even fit it).
-        let page = project(20, false);
+    fn the_basis_table_keeps_the_emitted_caller_prefix_inside_the_response_cap() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let requested = 20;
+        let page = project(requested, false);
+        let callers = page["data"]["callers"].as_array().unwrap();
+        let emitted = callers.len();
+        assert!(emitted > 0 && emitted < requested);
+        assert_eq!(page["partial"], true);
+        assert_eq!(page["truncated"], true);
+        assert_eq!(page["truncationReason"], "response_bytes");
+        let (fixture, semantic) = incoming(requested);
+        for (item, expected) in callers.iter().zip(&fixture.calls[..emitted]) {
+            assert_eq!(item["callId"], expected.call.id);
+        }
+        let mut expected_proofs: BTreeSet<_> = fixture
+            .selected
+            .selected
+            .provenance
+            .iter()
+            .map(|proof| proof.id.as_str())
+            .collect();
+        for (index, item) in fixture.calls[..emitted].iter().enumerate() {
+            expected_proofs.insert(item.provenance.id.as_str());
+            expected_proofs.extend(
+                semantic
+                    .call(index)
+                    .unwrap()
+                    .proofs
+                    .iter()
+                    .map(|proof| proof.id.as_str()),
+            );
+        }
+        let actual_proofs: BTreeSet<_> = page["data"]["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|proof| proof["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(actual_proofs, expected_proofs);
+
+        // Compact projection supplies the exact prefix items, document refs and
+        // disclosure. Restore its omitted full evidence from this Rust-only fixture.
+        let full_prefix = |count: usize| {
+            let mut prefix = project(count, true);
+            assert_eq!(prefix["data"]["callers"].as_array().unwrap().len(), count);
+            let mut coverage = BTreeMap::new();
+            let mut proofs = BTreeMap::new();
+            for row in &fixture.selected.selected.coverage {
+                coverage.insert(
+                    (row.producer_id.clone(), row.document_path.clone()),
+                    row.clone(),
+                );
+            }
+            for proof in &fixture.selected.selected.provenance {
+                proofs.insert(proof.id.clone(), proof.clone());
+            }
+            for (index, caller) in prefix["data"]["callers"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
+                let item = &fixture.calls[index];
+                let bound = semantic.call(index).unwrap();
+                caller["binding"] = json!(bound.binding);
+                caller["semanticBasis"] = json!(bound.provenance.basis);
+                coverage.insert(
+                    (
+                        item.coverage.producer_id.clone(),
+                        item.coverage.document_path.clone(),
+                    ),
+                    item.coverage.clone(),
+                );
+                let tuple: crate::native_evidence::Coverage = wire_row(&bound.coverage).unwrap();
+                coverage.insert(
+                    (tuple.producer_id.clone(), tuple.document_path.clone()),
+                    tuple,
+                );
+                proofs.insert(item.provenance.id.clone(), item.provenance.clone());
+                for proof in &bound.proofs {
+                    proofs.insert(proof.id.clone(), wire_row(proof).unwrap());
+                }
+            }
+            let (bases, mut proofs) = intern_bases(
+                prefix["data"]["callers"].as_array_mut().unwrap(),
+                proofs.into_values(),
+            )
+            .unwrap();
+            label_projected_proofs(&mut proofs, &semantic, count).unwrap();
+            prefix["data"]["semanticBases"] = json!(bases);
+            prefix["data"]["coverage"] = json!(coverage.into_values().collect::<Vec<_>>());
+            prefix["data"]["provenance"] = json!(proofs);
+            prefix["truncationReason"] = json!("response_bytes");
+            prefix
+        };
+        assert_eq!(full_prefix(emitted), page);
+        assert!(
+            frame_bytes(&full_prefix(emitted + 1)) > super::super::wire::RESPONSE_BYTES,
+            "the next complete caller prefix must exceed the wire cap"
+        );
+
+        // Compare the same emitted prefix, not all requested callers, with repeated bases.
         let mut inlined = page.clone();
         let basis = basis();
         for caller in inlined["data"]["callers"].as_array_mut().unwrap() {
@@ -3631,11 +3882,47 @@ mod size_tests {
             .unwrap()
             .remove("semanticBases");
         let (now, before) = (frame_bytes(&page), frame_bytes(&inlined));
-        assert!(before > 50 * 1024, "the old shape is {before} bytes");
         assert!(
-            now * 10 < before * 7,
-            "{now} bytes is not much below {before}"
+            now <= super::super::wire::RESPONSE_BYTES,
+            "interned caller page is {now} bytes"
         );
+        assert!(
+            before > super::super::wire::RESPONSE_BYTES,
+            "inlined caller page unexpectedly fits at {before} bytes"
+        );
+    }
+
+    #[test]
+    fn projected_call_and_shared_proofs_keep_original_history() {
+        let (result, mut semantic) = incoming(1);
+        let projection = crate::model::SemanticProjection {
+            current_pin: result.selected.selected.pin,
+            semantic_basis_pin: crate::model::IndexPin {
+                index_revision: result
+                    .selected
+                    .selected
+                    .pin
+                    .index_revision
+                    .saturating_sub(1),
+                ..result.selected.selected.pin
+            },
+            basis_native_revision_id: "revision:v2:historical".into(),
+            semantic_status: crate::model::SemanticStatus::OlderBasis,
+        };
+        let bound = semantic.calls[0].as_mut().unwrap();
+        bound.projection = Some(projection.clone());
+        bound.effective_freshness = crate::semantic_evidence::Freshness::PossiblyStale;
+        let evidence = call_evidence(Some(bound), None).unwrap();
+        assert_eq!(evidence.freshness, "possiblyStale");
+        assert_eq!(evidence.historical_freshness, "fresh");
+        let mut proofs: Vec<Value> = bound.proofs.iter().map(|proof| json!(proof)).collect();
+        label_projected_proofs(&mut proofs, &semantic, 1).unwrap();
+        for proof in proofs {
+            assert_eq!(proof["projection"], json!(projection));
+            assert_eq!(proof["freshness"], "fresh");
+            assert_eq!(proof["historicalFreshness"], "fresh");
+            assert_eq!(proof["effectiveFreshness"], "possiblyStale");
+        }
     }
 
     #[test]
@@ -3821,6 +4108,7 @@ mod size_tests {
             documents.insert(
                 path.clone(),
                 DocumentFacts {
+                    projection: None,
                     key: key.clone(),
                     declarations: decls,
                     calls,
@@ -3833,6 +4121,7 @@ mod size_tests {
                     )
                     .unwrap(),
                     semantic: Some(SemanticDocument {
+                        projection: None,
                         coverage: semantic_coverage,
                         provenance,
                         call_bindings,
@@ -3916,6 +4205,121 @@ mod size_tests {
         data.remove("semanticBases");
         data.remove("responseOmitted");
         inlined
+    }
+
+    #[test]
+    fn historical_graph_proofs_share_bases_and_compact_keeps_projection_status() {
+        use crate::semantic_evidence::{Freshness, ProjectedEvidence};
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut answer = graph(1, 150, 500);
+        let projection = crate::model::SemanticProjection {
+            current_pin: answer.basis,
+            semantic_basis_pin: crate::model::IndexPin {
+                index_revision: answer.basis.index_revision - 1,
+                ..answer.basis
+            },
+            basis_native_revision_id: REVISION.into(),
+            semantic_status: crate::model::SemanticStatus::OlderBasis,
+        };
+        let result = answer.outcome.as_mut().unwrap();
+        let index = result
+            .provenance
+            .iter()
+            .position(|proof| proof.basis.is_some())
+            .unwrap();
+        let proof = result.provenance.remove(index);
+        let original = json!(proof);
+        let status = crate::model::DocumentSemanticStatus {
+            producer_id: proof.producer_id.clone(),
+            language: proof.document.language.clone(),
+            path: proof.document.path.clone(),
+            projection: projection.clone(),
+        };
+        result.projected_provenance.push(ProjectedEvidence::new(
+            proof,
+            projection.clone(),
+            Freshness::Fresh,
+        ));
+        result.semantic_projections.push(projection.clone());
+        result.semantic_documents.push(status);
+        result.edges[0].projection = Some(projection.clone());
+        result.edges[0].historical_freshness = Some(Freshness::Fresh);
+        result.edges[0].effective_freshness = Some(Freshness::PossiblyStale);
+
+        let full = project_graph(&mut answer, false);
+        let compact = project_graph(&mut answer, true);
+        let bases = full["data"]["semanticBases"].as_array().unwrap();
+        assert_eq!(bases.len(), 1);
+        let projected = &full["data"]["result"]["projectedProvenance"][0];
+        assert_eq!(projected["projection"], json!(projection));
+        assert_eq!(projected["historicalFreshness"], "fresh");
+        assert_eq!(projected["effectiveFreshness"], "possiblyStale");
+        let mut restored = projected["evidence"].clone();
+        let reference = restored
+            .as_object_mut()
+            .unwrap()
+            .remove("basisRef")
+            .unwrap();
+        let mut basis = bases[reference.as_u64().unwrap() as usize].clone();
+        basis.as_object_mut().unwrap().remove("ref");
+        restored["basis"] = basis;
+        assert_eq!(restored, original);
+        assert!(
+            full["data"]["result"]["provenance"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|proof| proof["basisRef"] == reference)
+        );
+        let compact_result = &compact["data"]["result"];
+        for field in ["provenance", "projectedProvenance", "coverage"] {
+            assert!(compact_result.get(field).is_none());
+        }
+        assert!(compact["data"].get("semanticBases").is_none());
+        for field in ["semanticProjections", "semanticDocuments"] {
+            assert_eq!(compact_result[field], full["data"]["result"][field]);
+        }
+        for field in ["projection", "historicalFreshness", "effectiveFreshness"] {
+            assert_eq!(
+                compact_result["edges"][0][field],
+                full["data"]["result"]["edges"][0][field]
+            );
+        }
+
+        let script = r#"
+const {createRequire} = require('node:module');
+const {readFileSync} = require('node:fs');
+const local = createRequire(process.cwd() + '/tests/mcp/package.json');
+const Ajv = local('ajv/dist/2020.js').default;
+const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json','utf8'));
+const schema = catalog.find(tool => tool.name === 'trellis_call_graph').outputSchema;
+const validate = new Ajv({strict:false}).compile(schema);
+for (const output of JSON.parse(readFileSync(0,'utf8'))) {
+  if (!validate(output)) throw Error(JSON.stringify(validate.errors));
+}
+"#;
+        let mut child = Command::new("node")
+            .args(["-e", script])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Node is required by tools/verify");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&json!([full, compact])).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

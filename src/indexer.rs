@@ -177,6 +177,7 @@ fn graph_kind(kind: &str) -> Result<SymbolKind> {
 }
 fn graph_provenance() -> Provenance {
     Provenance {
+        projection: None,
         source: "native-measuredSyntax".into(),
         semantic: SemanticState::Unavailable,
     }

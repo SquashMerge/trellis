@@ -1903,8 +1903,9 @@ impl From<anyhow::Error> for ApiError {
         })) {
             return Self(StatusCode::CONFLICT, "storage_busy", "Storage is busy");
         }
-        // A spilled large publication holds every reader out until COMMIT;
-        // say so at once instead of a generic busy (#210).
+        // A spilled large publication holds every reader out until COMMIT,
+        // and the read's bounded wait for it ran out (#674); say so instead of
+        // a generic busy (#210).
         if e.chain().any(|cause| {
             cause
                 .downcast_ref::<crate::store::RebuildInProgress>()
@@ -4201,6 +4202,7 @@ async fn selected_evidence<T: Send + 'static>(
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response()?;
+        let catching_up = catching_up || response.semantic_catching_up()?;
         if let Some(hook) = &hook {
             hook("before_work");
         }
@@ -4231,6 +4233,7 @@ async fn selected_catalog_read<T: Send + 'static>(
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response().map_err(ApiError::from)?;
+        let catching_up = catching_up || response.semantic_catching_up().map_err(ApiError::from)?;
         if let Some(hook) = &hook {
             hook("before_work");
         }
@@ -5194,7 +5197,8 @@ async fn provisioned_core_answer(
                 } else {
                     response.status()?
                 };
-                status.catching_up = catching_up;
+                let catching_up = catching_up || response.semantic_catching_up()?;
+                status.catching_up |= catching_up;
                 if let Some(hook) = hook {
                     hook("before_read_finish");
                 }
@@ -5401,6 +5405,7 @@ async fn provisioned_core_answer(
             let runtime = runtime.clone();
             let (file, catching_up) = tokio::task::spawn_blocking(move || {
                 let (response, catching_up) = runtime.evidence_response()?;
+                let catching_up = catching_up || response.semantic_catching_up()?;
                 let file = response.source_at(&q.path, pin)?;
                 Ok::<_, anyhow::Error>((response.finish(file)?, catching_up))
             })

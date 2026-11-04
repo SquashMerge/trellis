@@ -519,10 +519,17 @@ fn store_and_import_reach_only_nonexecuting_producer_retention() {
         .collect();
     for (file, text) in files {
         // #632 publication owns retention metadata, never producer execution.
+        // #620 B3: controlled-profile context eligibility reads the static profile table and
+        // the pure layout hash a controlled worktree would use; neither executes a producer.
+        // The executing entry points stay banned by the word checks below.
         let allowed = if file == "src/store.rs" {
             &["retention"][..]
         } else if file == "src/store/semantic_retention.rs" {
             &["retention", "state"][..]
+        } else if file == "src/semantic_batch/descriptor.rs" {
+            &["profiles"][..]
+        } else if file == "src/store/native_first/context.rs" {
+            &["profiles", "worktree"][..]
         } else {
             &[][..]
         };

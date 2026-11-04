@@ -1985,6 +1985,7 @@ mod budget_tests {
                 parent: None,
                 accessor: false,
                 provenance: crate::model::Provenance {
+                    projection: None,
                     source: "syntax".into(),
                     semantic: crate::model::SemanticState::Unavailable,
                 },
@@ -2097,6 +2098,7 @@ mod summary_tests {
                     parent: None,
                     accessor: false,
                     provenance: crate::model::Provenance {
+                        projection: None,
                         source: "syntax".into(),
                         semantic: crate::model::SemanticState::Unavailable,
                     },
@@ -2410,6 +2412,7 @@ mod fit_budget_tests {
                 parent: None,
                 accessor: false,
                 provenance: Provenance {
+                    projection: None,
                     source: "syntax".into(),
                     semantic: crate::model::SemanticState::Unavailable,
                 },

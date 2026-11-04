@@ -240,7 +240,7 @@ fn bindings_map_unresolved_and_unspelled_sites_and_settle_rules() {
             .any(|text| text
                 .as_str()
                 .unwrap()
-                .starts_with("Semantic sites use fresh bindings"))
+                .starts_with("Semantic sites use selected producer bindings"))
     );
 
     let check = read(&store, "check", json!({"expectedBasis":pin}));

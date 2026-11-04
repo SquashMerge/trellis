@@ -140,8 +140,25 @@ impl CargoTargetsBuilder {
         );
     }
 
-    /// Resolves every document's target.
+    /// Resolves every document's target through the same resumable graph cursor.
     pub fn finish(self) -> CargoTargets {
+        let mut continuation = self.into_continuation();
+        loop {
+            if let Some(targets) = continuation.advance() {
+                return targets;
+            }
+        }
+    }
+
+    pub(crate) fn into_continuation(self) -> CargoTargetsContinuation {
+        CargoTargetsContinuation::new(self)
+    }
+}
+
+#[cfg(test)]
+impl CargoTargetsBuilder {
+    /// Original implementation retained only for equivalence tests.
+    fn finish_oracle(self) -> CargoTargets {
         // A skipped manifest may name any workspace file as an explicit target via `../`.
         if self.manifests.iter().any(|manifest| manifest.unread) {
             return CargoTargets::default();
@@ -209,30 +226,7 @@ impl CargoTargetsBuilder {
     }
 }
 
-/// `dir/path`, normalized; `None` when it leaves the workspace or is not a document path.
-fn join(dir: &str, path: &str) -> Option<String> {
-    if path.starts_with('/') || path.contains('\\') {
-        return None;
-    }
-    let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            part => parts.push(part),
-        }
-    }
-    (!parts.is_empty()).then(|| parts.join("/"))
-}
-
-fn parent(path: &str) -> &str {
-    path.rsplit_once('/').map_or("", |(dir, _)| dir)
-}
-
-/// Every document a crate root reaches, and whether every file it reached names only modules
-/// this module can follow exactly. A root that is not a captured document reaches nothing.
+#[cfg(test)]
 fn reach<'d>(
     root: &str,
     files: &BTreeMap<String, FileModules>,
@@ -323,6 +317,495 @@ fn reach<'d>(
     (reached, complete)
 }
 
+/// Resolves retained Cargo module metadata without an artifact-wide graph traversal.
+/// Each advance handles one manifest header, inferred document, explicit target, module
+/// vertex, module edge, owner association or final eligibility probe.
+pub(crate) struct CargoTargetsContinuation {
+    manifests: Vec<Manifest>,
+    files: BTreeMap<String, FileModules>,
+    package: usize,
+    discovery: Option<TargetDiscovery>,
+    targets: Vec<(usize, CargoTarget)>,
+    roots: BTreeMap<String, usize>,
+    poisoned: BTreeSet<usize>,
+    target: usize,
+    pending: Vec<(String, bool, bool)>,
+    seen: BTreeSet<(String, bool)>,
+    reached: BTreeSet<String>,
+    edge: Option<(String, bool, bool, usize, bool)>,
+    owners: BTreeMap<String, BTreeSet<usize>>,
+    output: BTreeMap<String, CargoTarget>,
+    check: Option<(String, usize, usize)>,
+    phase: CargoPhase,
+}
+
+#[derive(Clone, Copy)]
+enum CargoPhase {
+    Discover,
+    Start,
+    Vertex,
+    Associate,
+    ClearSeen,
+    Output,
+    Done,
+}
+
+struct TargetDiscovery {
+    name: String,
+    version: Option<String>,
+    edition_2015: Option<bool>,
+    kind: usize,
+    cursor: String,
+    inferred: BTreeMap<String, String>,
+    explicit: usize,
+    explicit_names: BTreeSet<String>,
+    explicit_paths: BTreeSet<String>,
+    scanning: bool,
+    emitting: bool,
+    discover: bool,
+    found: Vec<CargoTarget>,
+}
+
+const DISCOVERY_KINDS: [(&str, &str, &str, &str); 4] = [
+    ("bin", "bin", "autobins", "src/bin"),
+    ("example", "example", "autoexamples", "examples"),
+    ("test", "test", "autotests", "tests"),
+    ("bench", "bench", "autobenches", "benches"),
+];
+
+impl TargetDiscovery {
+    fn new(manifest: &Manifest, files: &BTreeMap<String, FileModules>) -> Option<Self> {
+        let table = manifest.table.as_ref()?;
+        let package = table.get("package")?.as_table()?;
+        let name = package.get("name")?.as_str()?.to_owned();
+        let version = package
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned);
+        let edition_2015 = match package.get("edition") {
+            None => Some(true),
+            Some(toml::Value::String(edition)) => Some(edition == "2015"),
+            _ => None,
+        };
+        let mut found = vec![];
+        let mut push = |kind: &str, root: String| {
+            found.push(CargoTarget {
+                kind: kind.to_owned(),
+                root,
+                package: name.clone(),
+                version: version.clone(),
+            })
+        };
+        let at = |path: &str| join(&manifest.dir, path);
+        let autolib = bool_field(package, "autolib").ok()?.unwrap_or(true);
+        match table.get("lib") {
+            Some(lib) => {
+                let lib = lib.as_table()?;
+                push(
+                    "lib",
+                    match lib.get("path") {
+                        Some(path) => at(path.as_str()?)?,
+                        None => at("src/lib.rs")?,
+                    },
+                );
+            }
+            None if autolib => {
+                let path = at("src/lib.rs")?;
+                if files.contains_key(&path) {
+                    push("lib", path);
+                }
+            }
+            None => {}
+        }
+        match package.get("build") {
+            Some(toml::Value::String(path)) => push("build", at(path)?),
+            Some(toml::Value::Boolean(false)) => {}
+            Some(toml::Value::Boolean(true)) | None => {
+                let path = at("build.rs")?;
+                if files.contains_key(&path) {
+                    push("build", path);
+                }
+            }
+            Some(_) => return None,
+        }
+        Some(Self {
+            name,
+            version,
+            edition_2015,
+            kind: 0,
+            cursor: String::new(),
+            inferred: BTreeMap::new(),
+            explicit: 0,
+            explicit_names: BTreeSet::new(),
+            explicit_paths: BTreeSet::new(),
+            scanning: true,
+            emitting: false,
+            discover: false,
+            found,
+        })
+    }
+
+    /// `None` is an invalid manifest; `Some(true)` completes its target inventory.
+    fn advance(
+        &mut self,
+        manifest: &Manifest,
+        files: &BTreeMap<String, FileModules>,
+    ) -> Option<bool> {
+        let Some(&(kind, section, auto, directory)) = DISCOVERY_KINDS.get(self.kind) else {
+            return Some(true);
+        };
+        let table = manifest.table.as_ref()?;
+        let package = table.get("package")?.as_table()?;
+        let at = |path: &str| join(&manifest.dir, path);
+        let prefix = format!("{}/", at(directory)?);
+        if self.scanning {
+            if self.cursor.is_empty() {
+                if kind == "bin" {
+                    let main = at("src/main.rs")?;
+                    if files.contains_key(&main) {
+                        self.inferred.insert(self.name.clone(), main);
+                    }
+                }
+                self.cursor = prefix.clone();
+            }
+            use std::ops::Bound::{Excluded, Unbounded};
+            let next = files
+                .range((Excluded(self.cursor.clone()), Unbounded))
+                .next();
+            if let Some((path, _)) = next.filter(|(path, _)| path.starts_with(&prefix)) {
+                self.cursor = path.clone();
+                let rest = path.strip_prefix(&prefix)?;
+                match rest.split('/').collect::<Vec<_>>()[..] {
+                    [file] => {
+                        if let Some(stem) = file.strip_suffix(".rs") {
+                            self.inferred
+                                .entry(stem.to_owned())
+                                .or_insert_with(|| path.clone());
+                        }
+                    }
+                    [stem, "main.rs"] => {
+                        self.inferred
+                            .entry(stem.to_owned())
+                            .or_insert_with(|| path.clone());
+                    }
+                    _ => {}
+                }
+                return Some(false);
+            }
+            self.scanning = false;
+            return Some(false);
+        }
+        if !self.emitting {
+            let entries = match table.get(section) {
+                None => None,
+                Some(toml::Value::Array(entries)) => Some(entries),
+                Some(_) => return None,
+            };
+            if let Some(entry) = entries.and_then(|entries| entries.get(self.explicit)) {
+                let entry = entry.as_table()?;
+                let path = match (entry.get("path"), entry.get("name")) {
+                    (Some(path), _) => at(path.as_str()?)?,
+                    (None, Some(name)) => {
+                        let name = name.as_str()?;
+                        self.inferred
+                            .get(name)
+                            .cloned()
+                            .or_else(|| at(&format!("{directory}/{name}.rs")))?
+                    }
+                    _ => return None,
+                };
+                if let Some(name) = entry.get("name") {
+                    self.explicit_names.insert(name.as_str()?.to_owned());
+                }
+                self.explicit_paths.insert(path.clone());
+                self.found.push(CargoTarget {
+                    kind: kind.to_owned(),
+                    root: path,
+                    package: self.name.clone(),
+                    version: self.version.clone(),
+                });
+                self.explicit += 1;
+                return Some(false);
+            }
+            let discover = match bool_field(package, auto).ok()? {
+                Some(value) => value,
+                None => table.get(section).is_none() || !self.edition_2015?,
+            };
+            self.discover = discover;
+            self.emitting = true;
+            return Some(false);
+        }
+        if let Some((name, path)) = self.inferred.pop_first() {
+            if self.discover
+                && !self.explicit_names.contains(&name)
+                && !self.explicit_paths.contains(&path)
+            {
+                self.found.push(CargoTarget {
+                    kind: kind.to_owned(),
+                    root: path,
+                    package: self.name.clone(),
+                    version: self.version.clone(),
+                });
+            }
+            return Some(false);
+        }
+        if self.explicit_names.pop_first().is_some() {
+            return Some(false);
+        }
+        if self.explicit_paths.pop_first().is_some() {
+            return Some(false);
+        }
+        self.kind += 1;
+        self.cursor.clear();
+        self.explicit = 0;
+        self.scanning = true;
+        self.emitting = false;
+        Some(false)
+    }
+}
+
+impl CargoTargetsContinuation {
+    fn new(builder: CargoTargetsBuilder) -> Self {
+        Self {
+            manifests: builder.manifests,
+            files: builder.files,
+            package: 0,
+            discovery: None,
+            targets: vec![],
+            roots: BTreeMap::new(),
+            poisoned: BTreeSet::new(),
+            target: 0,
+            pending: vec![],
+            seen: BTreeSet::new(),
+            reached: BTreeSet::new(),
+            edge: None,
+            owners: BTreeMap::new(),
+            output: BTreeMap::new(),
+            check: None,
+            phase: CargoPhase::Discover,
+        }
+    }
+
+    pub(crate) fn advance(&mut self) -> Option<CargoTargets> {
+        match self.phase {
+            CargoPhase::Discover => {
+                if self.package >= self.manifests.len() {
+                    self.phase = CargoPhase::Start;
+                    return None;
+                }
+                let manifest = &self.manifests[self.package];
+                if manifest.unread {
+                    self.phase = CargoPhase::Done;
+                    return Some(CargoTargets::default());
+                }
+                if self.discovery.is_none() {
+                    if manifest
+                        .table
+                        .as_ref()
+                        .is_some_and(|table| !table.contains_key("package"))
+                    {
+                        self.package += 1;
+                        return None;
+                    }
+                    self.discovery = TargetDiscovery::new(manifest, &self.files);
+                    if self.discovery.is_none() {
+                        self.poisoned.insert(self.package);
+                        self.package += 1;
+                    }
+                    return None;
+                }
+                let discovery = self.discovery.as_mut().expect("discovery");
+                match discovery.advance(manifest, &self.files) {
+                    Some(false) => {}
+                    Some(true) => {
+                        self.phase = CargoPhase::Start;
+                        // Drain one target per subsequent unit, before the next manifest.
+                    }
+                    None => {
+                        self.poisoned.insert(self.package);
+                        self.discovery = None;
+                        self.package += 1;
+                    }
+                }
+            }
+            CargoPhase::Start => {
+                if let Some(discovery) = self.discovery.as_mut() {
+                    if let Some(target) = discovery.found.pop() {
+                        *self.roots.entry(target.root.clone()).or_default() += 1;
+                        self.targets.push((self.package, target));
+                    } else {
+                        self.discovery = None;
+                        self.package += 1;
+                        self.phase = CargoPhase::Discover;
+                    }
+                    return None;
+                }
+                if self.target >= self.targets.len() {
+                    self.phase = CargoPhase::Output;
+                    return None;
+                }
+                let root = &self.targets[self.target].1.root;
+                if self.files.contains_key(root) {
+                    self.pending.push((root.clone(), true, false));
+                }
+                self.phase = CargoPhase::Vertex;
+            }
+            CargoPhase::Vertex => {
+                if let Some((file, mod_rs, included, index, preflight)) = self.edge.take() {
+                    let modules = self.files.get(&file).expect("captured module");
+                    let Some(module) = modules.refs.get(index) else {
+                        if preflight {
+                            self.edge = Some((file, mod_rs, included, 0, false));
+                        }
+                        return None;
+                    };
+                    if preflight {
+                        if !matches!(module, ModRef::Include(_)) {
+                            self.poisoned.insert(self.targets[self.target].0);
+                        } else {
+                            self.edge = Some((file, mod_rs, included, index + 1, true));
+                        }
+                        return None;
+                    }
+                    self.edge = Some((file.clone(), mod_rs, included, index + 1, false));
+                    let owned = if mod_rs {
+                        parent(&file).to_owned()
+                    } else {
+                        file.strip_suffix(".rs").unwrap_or(&file).to_owned()
+                    };
+                    let (candidates, child_mod_rs, child_included) = match module {
+                        ModRef::Conventional { inline, name } => {
+                            let base = join(&owned, &inline.join("/")).unwrap_or_default();
+                            let prefix = if base.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{base}/{name}")
+                            };
+                            (
+                                vec![format!("{prefix}.rs"), format!("{prefix}/mod.rs")],
+                                None,
+                                false,
+                            )
+                        }
+                        ModRef::Path { inline, path } => {
+                            let base = if inline.is_empty() {
+                                parent(&file).to_owned()
+                            } else {
+                                join(&owned, &inline.join("/")).unwrap_or_default()
+                            };
+                            (join(&base, path).into_iter().collect(), Some(true), false)
+                        }
+                        ModRef::Include(path) => (
+                            join(parent(&file), path).into_iter().collect::<Vec<_>>(),
+                            Some(mod_rs),
+                            true,
+                        ),
+                    };
+                    let found: Vec<_> = candidates
+                        .into_iter()
+                        .filter(|path| self.files.contains_key(path))
+                        .collect();
+                    match found.as_slice() {
+                        [] if child_included => {}
+                        [child] => self.pending.push((
+                            child.clone(),
+                            child_mod_rs.unwrap_or_else(|| child.ends_with("/mod.rs")),
+                            child_included,
+                        )),
+                        _ => {
+                            self.poisoned.insert(self.targets[self.target].0);
+                        }
+                    }
+                    return None;
+                }
+                if let Some((file, mod_rs, included)) = self.pending.pop() {
+                    self.reached.insert(file.clone());
+                    if !self.seen.insert((file.clone(), mod_rs)) {
+                        return None;
+                    }
+                    let modules = self.files.get(&file).expect("captured module");
+                    if modules.unread {
+                        self.phase = CargoPhase::Done;
+                        return Some(CargoTargets::default());
+                    }
+                    if modules.uncertain {
+                        self.poisoned.insert(self.targets[self.target].0);
+                    } else {
+                        self.edge = Some((file, mod_rs, included, 0, included));
+                    }
+                } else {
+                    self.phase = CargoPhase::Associate;
+                }
+            }
+            CargoPhase::Associate => {
+                if let Some(path) = self.reached.pop_first() {
+                    self.owners.entry(path).or_default().insert(self.target);
+                } else {
+                    self.phase = CargoPhase::ClearSeen;
+                }
+            }
+            CargoPhase::ClearSeen => {
+                if self.seen.pop_first().is_none() {
+                    self.target += 1;
+                    self.phase = CargoPhase::Start;
+                }
+            }
+            CargoPhase::Output => {
+                if let Some((path, index, package)) = self.check.take() {
+                    if package < self.manifests.len() {
+                        let dir = &self.manifests[package].dir;
+                        let poisoned = self.poisoned.contains(&package)
+                            && (dir.is_empty() || path.starts_with(&format!("{dir}/")));
+                        if !poisoned {
+                            self.check = Some((path, index, package + 1));
+                        }
+                    } else {
+                        self.output.insert(path, self.targets[index].1.clone());
+                    }
+                } else if let Some((path, owning)) = self.owners.pop_first() {
+                    if owning.len() == 1 {
+                        let index = *owning.first().expect("one owner");
+                        if self.roots.get(&self.targets[index].1.root) == Some(&1) {
+                            self.check = Some((path, index, 0));
+                        }
+                    }
+                } else {
+                    self.phase = CargoPhase::Done;
+                    return Some(CargoTargets {
+                        owners: std::mem::take(&mut self.output),
+                    });
+                }
+            }
+            CargoPhase::Done => return Some(CargoTargets::default()),
+        }
+        None
+    }
+}
+
+/// `dir/path`, normalized; `None` when it leaves the workspace or is not a document path.
+fn join(dir: &str, path: &str) -> Option<String> {
+    if path.starts_with('/') || path.contains('\\') {
+        return None;
+    }
+    let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// Every document a crate root reaches, and whether every file it reached names only modules
+/// this module can follow exactly. A root that is not a captured document reaches nothing.
 fn bool_field(table: &toml::Table, key: &str) -> Result<Option<bool>, ()> {
     match table.get(key) {
         None => Ok(None),
@@ -333,6 +816,7 @@ fn bool_field(table: &toml::Table, key: &str) -> Result<Option<bool>, ()> {
 
 /// The targets one package manifest declares or Cargo infers, by Cargo's target rules.
 /// `None` when the manifest declares something this module cannot read exactly.
+#[cfg(test)]
 fn package_targets(
     dir: &str,
     manifest: &toml::Table,
@@ -670,11 +1154,20 @@ mod tests {
             })
             .chain([json!({"path": "package.json", "type": "present", "bytes": "7b7d"})])
             .collect();
-        let mut builder = CargoTargetsBuilder::from_native_config(&config);
-        for (path, source) in files {
-            builder.add_document(path, source.as_bytes());
-        }
-        builder.finish()
+        let build = || {
+            let mut builder = CargoTargetsBuilder::from_native_config(&config);
+            for (path, source) in files {
+                builder.add_document(path, source.as_bytes());
+            }
+            builder
+        };
+        let expected = build().finish_oracle();
+        let actual = build().finish();
+        assert_eq!(
+            actual.owners, expected.owners,
+            "Cargo continuation matches original finish"
+        );
+        actual
     }
 
     fn of(targets: &CargoTargets, path: &str) -> Option<(String, String)> {
@@ -685,6 +1178,45 @@ mod tests {
 
     fn owned(kind: &str, root: &str) -> Option<(String, String)> {
         Some((kind.to_owned(), root.to_owned()))
+    }
+
+    #[test]
+    fn cargo_finish_yields_per_vertex_and_module_edge() {
+        let config =
+            vec![json!({"path":"Cargo.toml","type":"present","bytes":hex::encode(PACKAGE)})];
+        let build = || {
+            let mut builder = CargoTargetsBuilder::from_native_config(&config);
+            builder.add_document("src/lib.rs", b"mod a; mod b;");
+            builder.add_document("src/a.rs", b"");
+            builder.add_document("src/b.rs", b"");
+            builder
+        };
+        let expected = build().finish_oracle();
+        let mut cursor = build().into_continuation();
+        let mut vertex_units = 0;
+        let mut edge_units = 0;
+        let mut result = None;
+        for _ in 0..200 {
+            let before = cursor.seen.len();
+            let edge = cursor.edge.is_some();
+            if let Some(targets) = cursor.advance() {
+                result = Some(targets);
+                break;
+            }
+            if cursor.seen.len() > before {
+                assert_eq!(cursor.seen.len() - before, 1);
+                vertex_units += 1;
+            }
+            if edge {
+                edge_units += 1;
+            }
+        }
+        assert_eq!(
+            result.expect("small graph finishes").owners,
+            expected.owners
+        );
+        assert_eq!(vertex_units, 3);
+        assert!(edge_units >= 2);
     }
 
     const PACKAGE: &str = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";

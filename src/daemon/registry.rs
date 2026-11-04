@@ -2289,7 +2289,12 @@ impl CheckoutRuntime {
     fn catching_up_in(resources: &ActiveResources, phase: RuntimePhase) -> bool {
         match phase {
             RuntimePhase::Ready => {
-                resources.scheduler.checkout_watch_pending() || resources.scheduler.fifo_pending()
+                resources.scheduler.checkout_watch_pending()
+                    || resources.scheduler.fifo_pending()
+                    || resources
+                        .store
+                        .pending_semantic_target()
+                        .map_or(true, |target| target.is_some())
             }
             _ => true,
         }
@@ -2494,6 +2499,7 @@ impl CheckoutRuntime {
         let lease = resources.scheduler.admission_lease()?;
         let catching_up = Self::catching_up_in(&resources, resources.scheduler.runtime_phase());
         let response = resources.store.evidence_response_daemon_local()?;
+        let catching_up = catching_up || response.semantic_catching_up()?;
         Ok((
             CheckoutEvidence {
                 response,

@@ -119,7 +119,7 @@ test("native coverage labels do not claim the selected semantic tier", () => {
       $ref: "#/$defs/LanguageStatus" });
     const coverage = { selected: 2, complete: 1, partial: 1, failed: 0, unselected: 0 };
     const semantic = { available: true, producerId: "rust-analyzer", freshness: "fresh",
-      coverage, note: null, reimport: null };
+      coverage, note: null, reimport: null, documents: [] };
     if (tool.name === "trellis_workspace_describe") semantic.partialReasons = null;
     const status = { language: "rust", nativeCoverageTier: "syntax", coverage, semantic };
     assert.ok(validate(status), `${tool.name}: ${JSON.stringify(validate.errors)}`);

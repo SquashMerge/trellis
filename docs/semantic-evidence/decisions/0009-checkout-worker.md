@@ -268,3 +268,15 @@ Implementation may show that a rule needs to change. The change is then made to 
 - **MCP concurrency** is real, and agents get a strict, deadline-bounded decision.
 - **Tests** await events and worker pause points instead of sampling lock state; functional tests assert no speed.
 - **Checklist:** #138's inventory is ticked off item by item in #139.
+
+## Amendment: native completion and bounded derived semantic units (#620)
+
+[Owner-approved 2026-11-03](https://github.com/SquashMerge/trellis/issues/620#issuecomment-6610642350): a validated native N publication completes native startup reconciliation, an ordinary native-index request and its covered watcher generation. `H_READY` and `WATCH_ACK` keep their verified capture/root/order meaning; neither claims semantic completion. Explicit semantic-import requests remain running until their semantic commit. Recovery still opens the queue, confirms old-root terminal settlement, reconciles startup and only then claims FIFO; FIFO → watcher → FIFO order is unchanged.
+
+The same checkout worker owns retained semantic catch-up as **lowest-priority resumable bounded units**, below accepted FIFO and watcher work. There is no second publisher. It retains at most one current target with disk staging/cursor state, closes main-index read snapshots before yielding and returns to owning work selection between units. A cancellation check within a monolithic join is not such a yield. Completion uses owner-published signals, not a timer or a failed lock probe.
+
+N and the durable pending target/selected raw IDs commit together. The worker checks root, exact head, native Revision, target and inputs on resume and at S commit. New native work replaces the target and discards only obsolete staging; operation cleanup cannot clear a successor target. Intervening semantic-only pin movement fails exact-head CAS too: re-read the marker; dispose an already fulfilled stage or restage against the current pin for the same native target. Never overwrite an explicit import. S commits semantic rows, a new paired index pin and exact-target clearance atomically, with N’s native Revision retained. Crash recovery rebuilds disposable staging from the durable validated inputs.
+
+Published status remains catching up while semantic work remains. Per-document read states distinguish older-basis evidence from actual pending documents under the [projection addendum](../native-first-delete-design.md#addendum--approved-older-basis-projection-2026-11-03). This scheduling amendment does not change retention/retirement policy, immutable pins, root checks or bounded storage-contention handling.
+
+**Unit slices.** One S unit runs bounded continuation steps inside one coherent read snapshot for at most 50 ms, and the cooperative unit rechecks priority, cancellation and the queue between steps; it then returns to worker selection. No snapshot survives a return to selection, so accepted foreground work waits at most one slice.

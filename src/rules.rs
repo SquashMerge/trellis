@@ -1033,8 +1033,43 @@ fn reference_evidence(module: &Value, site: &Value) -> Value {
     } else {
         ("structuralReference", &module["provenanceId"])
     };
-    json!({"document":{"sourceSetId":module["identity"]["sourceSetId"],"language":module["identity"]["language"],"path":module["identity"]["path"]},
-        "revisionId":module["revisionId"],"range":site["range"],"kind":kind,"syntaxId":site["ownerSyntaxId"],"callId":site["callId"],"provenanceId":provenance})
+    let mut evidence = json!({"document":{"sourceSetId":module["identity"]["sourceSetId"],"language":module["identity"]["language"],"path":module["identity"]["path"]},
+        "revisionId":module["revisionId"],"range":site["range"],"kind":kind,"syntaxId":site["ownerSyntaxId"],"callId":site["callId"],"provenanceId":provenance});
+    if site["mapping"] == "semantic" {
+        for key in [
+            "projection",
+            "freshness",
+            "historicalFreshness",
+            "historicalContentHash",
+            "evidenceKind",
+            "derivedFrom",
+            "basis",
+            "historicalTargets",
+            "historicalExternalTargets",
+            "historicalResolution",
+            "historicalDispatch",
+            "historicalJoin",
+            "semanticBoundary",
+        ] {
+            if let Some(value) = site.get(key) {
+                evidence[key] = value.clone();
+            }
+        }
+        if let Some(revision) = site["projection"]["basisNativeRevisionId"].as_str() {
+            evidence["revisionId"] = json!(revision);
+        }
+    }
+    evidence
+}
+
+fn semantic_evidence(mut evidence: Value, metadata: &BTreeMap<String, Value>) -> Value {
+    for (key, value) in metadata {
+        evidence[key] = value.clone();
+    }
+    if let Some(revision) = evidence["projection"]["basisNativeRevisionId"].as_str() {
+        evidence["revisionId"] = json!(revision);
+    }
+    evidence
 }
 #[derive(Default)]
 struct Bases {
@@ -1397,7 +1432,7 @@ fn evaluate_document(
                 let (status, reason, evidence) =
                     constraint(config, targets, &anchors, doc, d, c, &mut work, check)?;
                 statuses.push(status);
-                constraints.push(json!({"mode":c.mode,"kind":c.kind,"targetRole":c.role,"status":status,"evidence":evidence,"unresolved":reason.into_iter().collect::<Vec<_>>()}));
+                constraints.push(json!({"mode":c.mode,"kind":c.kind,"targetRole":c.role,"status":status,"evidence":evidence,"unresolved":reason.into_iter().collect::<Vec<_>>(),"projection":doc.semantic.projection}));
                 if let Some(reason) = reason
                     && !unresolved.iter().any(|r| r == reason)
                 {
@@ -1419,7 +1454,7 @@ fn evaluate_document(
                 unresolved.push("test_only".into());
             }
             let mut row = json!({"rule":rule.id,"target":identity(d),"destination":null,"sourceLayer":null,"destinationLayer":null,"status":status,"excepted":false,"exceptionReason":null,
-                    "constraints":constraints,"evidence":[native_evidence(d)],"unresolved":unresolved,"referenceCount":0});
+                    "constraints":constraints,"evidence":[native_evidence(d)],"unresolved":unresolved,"referenceCount":0,"projection":doc.semantic.projection});
             ensure!(
                 work.charge(config.exceptions.len()),
                 "bounded_work: exception match budget"
@@ -1440,7 +1475,7 @@ fn evaluate_document(
 }
 
 /// One semantic constraint of a selected declaration (#523): its status, the reason it is
-/// unknown, and its evidence. A call counts when its fresh binding is direct (or a
+/// unknown, and its evidence. A call counts when its selected binding is direct (or a
 /// constructor) to a declaration the target role selects; a type relationship counts when
 /// its target is such a declaration. A required edge is proven by one counted binding; a
 /// forbidden one deviates on one. A forbidden call conforms only when every measured call
@@ -1484,11 +1519,14 @@ fn constraint(
                 uncertain += 1;
                 continue;
             };
+            if anchor.metadata.contains_key("projection") {
+                evidence.push(semantic_evidence(json!({"document":call.document,"revisionId":call.revision_id,"range":anchor.range,"kind":"semanticBinding","syntaxId":call.owner_syntax_id,"callId":call.id,"provenanceId":anchor.provenance_id}), &anchor.metadata));
+            }
             match &anchor.outcome {
                 SemanticOutcome::Internal(key, sid) if anchor.direct => match select(key, sid) {
                     Some(true) => {
                         hits += 1;
-                        evidence.push(json!({"document":call.document,"revisionId":call.revision_id,"range":anchor.range,"kind":"semanticBinding","syntaxId":sid,"callId":call.id,"provenanceId":anchor.provenance_id}));
+                        evidence.push(semantic_evidence(json!({"document":call.document,"revisionId":call.revision_id,"range":anchor.range,"kind":"semanticBinding","syntaxId":sid,"callId":call.id,"provenanceId":anchor.provenance_id}), &anchor.metadata));
                     }
                     Some(false) => {}
                     None => uncertain += 1,
@@ -1506,13 +1544,19 @@ fn constraint(
         {
             ensure!(work.charge(1), "bounded_work: rule evidence budget");
             check()?;
+            if relationship.metadata.contains_key("projection") {
+                evidence.push(semantic_evidence(json!({"document":d.document,"revisionId":d.revision_id,"range":d.range,"kind":"typeRelationship","syntaxId":d.syntax_id,"callId":null,"provenanceId":relationship.provenance_id}), &relationship.metadata));
+            }
             let Some((key, sid)) = &relationship.target else {
+                uncertain += usize::from(
+                    relationship.metadata.get("semanticBoundary") == Some(&json!(true)),
+                );
                 continue;
             };
             match select(key, sid) {
                 Some(true) => {
                     hits += 1;
-                    evidence.push(json!({"document":d.document,"revisionId":d.revision_id,"range":d.range,"kind":"typeRelationship","syntaxId":sid,"callId":null,"provenanceId":relationship.provenance_id}));
+                    evidence.push(semantic_evidence(json!({"document":d.document,"revisionId":d.revision_id,"range":d.range,"kind":"typeRelationship","syntaxId":sid,"callId":null,"provenanceId":relationship.provenance_id}), &relationship.metadata));
                 }
                 Some(false) => {}
                 None => uncertain += 1,
@@ -1534,9 +1578,17 @@ fn constraint(
     };
     let (status, reason) = match (c.mode, bound, hits > 0) {
         (_, false, _) => ("unknown", Some(unavailable)),
+        (_, _, false) if doc.semantic.projection.is_some() => {
+            ("unknown", Some("historical_semantic_absence_unproven"))
+        }
         ("require", _, true) => ("conforms", None),
         ("forbid", _, true) => ("deviates", None),
-        ("forbid", _, false) if calls && uncertain == 0 && doc.semantic.complete => {
+        ("forbid", _, false)
+            if calls
+                && uncertain == 0
+                && doc.semantic.complete
+                && doc.semantic.projection.is_none() =>
+        {
             ("conforms", None)
         }
         _ if uncertain > 0 || (calls && !doc.semantic.complete) => ("unknown", Some(incomplete)),
@@ -1840,7 +1892,7 @@ pub(crate) fn evaluate_prepared<'a>(
                     unresolved.push("test_only".into());
                 }
                 let mut row = json!({"rule":"$layers","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":status,
-                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"]});
+                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"],"projection":edge["projection"]});
                 ensure!(
                     work.charge(config.exceptions.len()),
                     "bounded_work: exception match budget"
@@ -1851,7 +1903,7 @@ pub(crate) fn evaluate_prepared<'a>(
             if denied {
                 let unresolved = if test { vec!["test_only"] } else { vec![] };
                 rows.push(json!({"rule":"$external","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":"deviates",
-                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"]}));
+                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"],"projection":edge["projection"]}));
             }
         }
     }
@@ -1954,7 +2006,7 @@ pub(crate) fn evaluate_prepared<'a>(
     Ok(Evaluation {
         data: json!({"rulesVersion":"rules:v2","indexGeneration":refs.data["indexGeneration"],"indexRevision":refs.data["indexRevision"],"rulesFile":descriptor(config),
         "counts":counts(&instances),"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"unassignedFileCount":unassigned_files,"externalPackages":external_packages,
-        "partialFiles":partial_files,"limitations":limitations}),
+        "partialFiles":partial_files,"limitations":limitations,"semanticDocuments":refs.data["semanticDocuments"],"partial":refs.data["partial"]}),
         layers: assignments,
     })
 }
@@ -1963,7 +2015,7 @@ fn limitations(semantic: bool) -> Vec<String> {
     [
         "Layer results describe observed mapped references, not absence of dependencies.",
         if semantic {
-            "Call and type constraints use fresh bindings of each language's selected producer; unbound, stale, dispatched and ambiguous calls and missing relationships remain unknown, and absence of a required edge is never a violation."
+            "Call and type constraints use selected producer bindings with their proof basis. Historical results are basis-P claims beside native N, never fresh or current absence proofs. Pending endpoints, unbound or dispatched calls and missing relationships remain unknown."
         } else {
             "Calls and type relationships have no admitted bindings and remain unknown."
         },
@@ -2202,6 +2254,61 @@ mod document_parallel_tests {
         ]);
         assert_eq!(snapshot.documents.len(), 2);
         (config, snapshot)
+    }
+
+    #[test]
+    fn detached_rule_proof_retains_historical_basis_and_revision() {
+        let metadata = BTreeMap::from([
+            (
+                "projection".into(),
+                json!({"currentPin":{"indexRevision":4},"semanticBasisPin":{"indexRevision":3},"basisNativeRevisionId":"basis-native","semanticStatus":"olderBasis"}),
+            ),
+            ("historicalFreshness".into(), json!("fresh")),
+            ("freshness".into(), json!("possiblyStale")),
+            (
+                "basis".into(),
+                json!({"artifactHash":"artifact","revisionId":"capture-native"}),
+            ),
+        ]);
+        let proof = semantic_evidence(
+            json!({"revisionId":"current-native","kind":"semanticBinding"}),
+            &metadata,
+        );
+        assert_eq!(proof["revisionId"], "basis-native");
+        assert_eq!(proof["freshness"], "possiblyStale");
+        assert_eq!(proof["historicalFreshness"], "fresh");
+        assert_eq!(proof["basis"]["revisionId"], "capture-native");
+    }
+
+    #[test]
+    fn historical_complete_coverage_never_proves_forbidden_call_absence() {
+        let config = parse("version=1\n[roles.all]\nselect={name='*'}\n[[rules]]\nid='no-calls'\nfor_each='all'\nforbid=[{calls='all'}]\n").unwrap();
+        let mut snapshot = snapshot(&[("src/lib.rs", "pub fn run() {}")]);
+        let doc = &mut snapshot.documents[0];
+        doc.semantic.producer_id = Some("producer".into());
+        doc.semantic.complete = true;
+        doc.semantic.projection = Some(crate::model::SemanticProjection {
+            current_pin: snapshot.pin,
+            semantic_basis_pin: crate::model::IndexPin {
+                index_revision: snapshot.pin.index_revision - 1,
+                ..snapshot.pin
+            },
+            basis_native_revision_id: "basis-native".into(),
+            semantic_status: crate::model::SemanticStatus::OlderBasis,
+        });
+        let base = prepare(&config, &snapshot, &mut || Ok(())).unwrap();
+        assert!(!base.declarations.is_empty());
+        for row in &base.declarations {
+            assert_eq!(row["status"], "unknown");
+            assert_eq!(
+                row["constraints"][0]["unresolved"][0],
+                "historical_semantic_absence_unproven"
+            );
+            assert_eq!(
+                row["constraints"][0]["projection"]["semanticStatus"],
+                "olderBasis"
+            );
+        }
     }
 
     /// #556: rows prepared for every document select what a scoped evaluation returns.

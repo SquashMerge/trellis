@@ -748,6 +748,11 @@ impl World {
                 &self.cancel,
             )
             .unwrap();
+        drop(leader);
+        // Native N first, then the bounded semantic S the checkout worker would run.
+        self.store
+            .catch_up_semantic_for_tests(&self.cancel)
+            .unwrap();
     }
 
     fn join_with(
@@ -4217,6 +4222,11 @@ impl World {
         self.store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &self.cancel)
             .unwrap();
+        drop(leader);
+        // Native N first, then the bounded semantic S the checkout worker would run.
+        self.store
+            .catch_up_semantic_for_tests(&self.cancel)
+            .unwrap();
     }
 
     fn head_key(&self) -> String {
@@ -4286,21 +4296,39 @@ fn native_identity_change_external_import_reason_survives_failure_and_clears_on_
             .all(|row| row.reimport.is_none())
     );
     write_files(&world.root, &[("src/C.js", "function other(){}\n")]);
-    world.republish();
+    // Native-first (#620 A6): the retained external batch is catching up at native N, so no
+    // re-import reason is recorded; its bounded S re-admits it and the head is fresh again.
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let native = world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    assert_eq!(native.index_revision, first.index_revision + 1);
+    let pending = world.store.status().unwrap();
+    assert!(
+        pending
+            .semantic_languages
+            .iter()
+            .all(|row| !matches!(row.reimport, Some(SemanticReimport::NeedsReimport { .. }))),
+        "{:?}",
+        pending.semantic_languages
+    );
+    world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
     let status = world.store.status().unwrap();
     assert_eq!(status.revision.index_generation, first.index_generation);
-    assert_eq!(status.revision.index_revision, first.index_revision + 1);
-    let language = &status.semantic_languages[0];
-    assert!(matches!(
-        language.reimport,
-        Some(SemanticReimport::NeedsReimport { ref reason }) if !reason.is_empty()
-    ));
-    assert_eq!(language.semantic_state, SemanticState::Unavailable);
-    assert_eq!(
-        status.stats.internal + status.stats.external + status.stats.ambiguous,
-        0
+    assert_eq!(status.revision.index_revision, first.index_revision + 2);
+    assert!(
+        status
+            .semantic_languages
+            .iter()
+            .all(|row| row.reimport.is_none())
     );
-    assert_eq!(status.semantic_note, language.semantic_note);
     assert_eq!(world.store.semantic_at(first).unwrap(), prior);
 
     let descriptor = split_definitions(&world, false);
@@ -4403,6 +4431,11 @@ fn multi_artifact_reference_batch_records_multi_artifact_fallback() {
         .store
         .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
         .unwrap();
+    drop(leader);
+    world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
     let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
     let reasons: Vec<&str> = work["fallbackReasons"]
         .as_array()
@@ -4450,7 +4483,285 @@ fn local_edit(world: &World, path: &str, text: &str, counts: &Path) -> Value {
         .store
         .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
         .unwrap();
-    serde_json::from_slice(&fs::read(counts).unwrap()).unwrap()
+    drop(leader);
+    // Native N publishes first; the counts belong to the bounded semantic S that follows.
+    let semantic = world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
+    let work: Value = serde_json::from_slice(&fs::read(counts).unwrap()).unwrap();
+    assert_eq!(work["indexPin"], json!(semantic), "{work}");
+    work
+}
+
+/// An R1 reference batch first imported after C changed, optionally with its target absent.
+fn delayed_import_world(without_target: bool) -> (World, (PathBuf, String), IndexPin) {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+                ("src/C.js", "function other(){ return 1; }\n"),
+            ],
+        )
+    });
+    let captured = world.store.index_baseline().unwrap();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let descriptor = world.write(&fixture);
+    write_files(
+        &world.root,
+        &[("src/C.js", "function other(){ return 2; }\n")],
+    );
+    if without_target {
+        fs::remove_file(world.root.join("src/B.js")).unwrap();
+    }
+    world.republish();
+    let (pin, admitted, joined) = world.publish(&descriptor).unwrap();
+    assert_eq!(joined.captured_pin(), captured);
+    let (captured_native, _) = world.store.retained_native_snapshot_at(captured).unwrap();
+    let (imported_native, _) = world.store.retained_native_snapshot_at(pin).unwrap();
+    assert_ne!(captured_native.revision.id, imported_native.revision.id);
+    assert_eq!(
+        joined.destination_revision_id(),
+        imported_native.revision.id
+    );
+    drop((admitted, joined));
+    assert_delayed_import_matches_full(&world, &descriptor);
+    (world, descriptor, captured)
+}
+
+fn assert_delayed_import_matches_full(
+    world: &World,
+    descriptor: &(PathBuf, String),
+) -> trellis::semantic_evidence::SemanticSnapshot {
+    let head = world.store.index_baseline().unwrap();
+    let published = world.store.semantic_at(head).unwrap();
+    let full = world.memory_publication(descriptor, DestinationMutations::default());
+    assert_eq!(canonical(&published.producers), canonical(&full.producers));
+    assert_published_matches_staged(&published, &full);
+    published
+}
+
+fn assert_delayed_import_witnessed(work: &Value) {
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+    assert!(
+        !work["fallbackReasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "original_import_missing"),
+        "{work}"
+    );
+}
+
+/// C never returns to its captured bytes: importing below head must not force FULL forever.
+/// The first edit may build a capture-side witness; successive edits must reuse it.
+#[test]
+fn below_head_import_witnesses_successive_local_edits() {
+    let (world, descriptor, _) = delayed_import_world(false);
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+    }
+    for value in 3..=5 {
+        let work = local_edit(
+            &world,
+            "src/C.js",
+            &format!("function other(){{ return {value}; }}\n"),
+            &counts,
+        );
+        assert_delayed_import_matches_full(&world, &descriptor);
+        if value > 3 {
+            assert_delayed_import_witnessed(&work);
+            // #669 H1: A and B depend on nothing that changed, so S copies their published
+            // rows; the FULL oracle above still holds for the copied publication.
+            let copied: Vec<_> = work["copiedDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|doc| doc["path"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(copied, ["src/A.js", "src/B.js"], "{work}");
+        }
+    }
+}
+
+/// The first destination lost A's dependent rows because B was absent. Restoring B must use
+/// the complete capture-side associations, not that lossy destination's admitted tuple.
+#[test]
+fn below_head_import_recovers_dependent_rows_when_target_returns() {
+    let (world, descriptor, captured) = delayed_import_world(true);
+    let imported = assert_delayed_import_matches_full(&world, &descriptor);
+    assert!(
+        !imported
+            .references
+            .iter()
+            .any(|row| row.spelling == "target")
+    );
+    assert!(
+        !imported
+            .call_bindings
+            .iter()
+            .any(|row| { row.join.anchor.document.path == "src/A.js" && row.call_id.is_some() })
+    );
+    let version = |pin: IndexPin| -> String {
+        world
+            .db()
+            .query_row(
+                "SELECT v.id FROM revision_documents d JOIN document_versions v ON v.vid=d.vid
+                 WHERE d.revision_id=?1 AND d.language='javascript' AND d.path='src/B.js'",
+                [format!(
+                    "pin:v1:{}:{}",
+                    pin.index_generation, pin.index_revision
+                )],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let captured_version = version(captured);
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+    }
+    // Prime any lazy witness while B is still absent; this destination is lossy as well.
+    local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 3; }\n",
+        &counts,
+    );
+    assert_delayed_import_matches_full(&world, &descriptor);
+    let work = local_edit(&world, "src/B.js", DEFINITIONS_B, &counts);
+    assert_delayed_import_witnessed(&work);
+    assert_eq!(
+        version(world.store.index_baseline().unwrap()),
+        captured_version
+    );
+    let restored = assert_delayed_import_matches_full(&world, &descriptor);
+    let target_in_b = |target: &Option<trellis::semantic_evidence::Target>| {
+        matches!(target, Some(trellis::semantic_evidence::Target::Internal { document, .. })
+            if document.path == "src/B.js")
+    };
+    assert!(restored.references.iter().any(|row| {
+        row.document.path == "src/A.js"
+            && row.spelling == "target"
+            && row.resolution == Resolution::Resolved
+            && target_in_b(&row.declared_target)
+    }));
+    assert!(restored.call_bindings.iter().any(|row| {
+        row.join.anchor.document.path == "src/A.js"
+            && row.call_id.is_some()
+            && row.resolution == Resolution::Resolved
+            && target_in_b(&row.declared_target)
+    }));
+    let work = local_edit(
+        &world,
+        "src/C.js",
+        "function other(){ return 4; }\n",
+        &counts,
+    );
+    assert_delayed_import_witnessed(&work);
+    assert_delayed_import_matches_full(&world, &descriptor);
+}
+
+/// #669 H1: S copies an unchanged document's published rows. Corruption read while copying
+/// fails typed and schedules a re-index, as a read of those rows would.
+#[test]
+fn corruption_read_while_copying_schedules_a_rebuild() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let descriptor = world.write(&fixture);
+    world.publish(&descriptor).unwrap();
+    let import = world.head_key();
+    let db = rusqlite::Connection::open(&world.index_db).unwrap();
+    db.execute_batch("PRAGMA ignore_check_constraints=ON")
+        .unwrap();
+    let corrupted = db
+        .execute(
+            "UPDATE semantic_symbols SET key_scope='bogus' WHERE tuple_id IN \
+             (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
+            [&import],
+        )
+        .unwrap();
+    drop(db);
+    assert!(corrupted > 0);
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let error = world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid semantic enum"),
+        "{error:#}"
+    );
+    assert!(world.store.recovery_pending_for_tests());
+}
+
+/// A corrupt copied basis is first consumed by the publisher's capture lookup.
+#[test]
+fn corruption_found_while_writing_copied_rows_schedules_a_rebuild() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let descriptor = world.write(&fixture);
+    world.publish(&descriptor).unwrap();
+    let import = world.head_key();
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let native = world.store.index_baseline().unwrap();
+    let db = rusqlite::Connection::open(&world.index_db).unwrap();
+    let corrupted = db
+        .execute(
+            "UPDATE semantic_basis SET artifact_hash=?2 WHERE tuple_id IN \
+             (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
+            rusqlite::params![import, "0".repeat(64)],
+        )
+        .unwrap();
+    drop(db);
+    assert!(corrupted > 0);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_raw_captures WHERE artifact_hash='0000000000000000000000000000000000000000000000000000000000000000'"),
+        0
+    );
+    let error = world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::QueryReturnedNoRows)
+        ),
+        "{error:#}"
+    );
+    assert_eq!(world.store.index_baseline().unwrap(), native);
+    assert!(world.store.recovery_pending_for_tests(), "{error:#}");
 }
 
 /// Runs the due revision maintenance until nothing is left to do.
@@ -4913,7 +5224,17 @@ fn a_partly_released_import_revision_is_not_brought_back() {
         "function unrelated(){ return 2; }\n",
         &counts,
     );
-    assert_eq!(work["witnessedRejoins"], 0, "{work}");
+    // Bounded S decides per producer: the other producer's import is intact and witnessed;
+    // the released scip-typescript import is never brought back as witness authority.
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert!(
+        !work["reusedDocuments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|doc| doc["language"] == "javascript"),
+        "{work}"
+    );
     assert_eq!(
         work["fallbackReasons"],
         json!(["original_import_missing"]),
@@ -5010,6 +5331,11 @@ fn a_lost_target_takes_full(shape: fn(DocSpec, &str) -> DocSpec) {
             .store
             .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
             .unwrap();
+        drop(leader);
+        world
+            .store
+            .catch_up_semantic_for_tests(&world.cancel)
+            .unwrap();
         let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
         assert_eq!(
             work["fallbackReasons"],
@@ -5031,12 +5357,36 @@ fn release(world: &World, pin: IndexPin, leader: &trellis::store::topology::Writ
     panic!("release did not finish");
 }
 
+/// Native-first: the replacement batch was captured at the semantic S that still selects the
+/// first batch, and the head holds that capture. A third batch at the head ends the hold; past
+/// the grace every revision that selected the first batch is released.
+fn replace_capture_hold(world: &World) -> IndexPin {
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture();
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let third = world.write(&fixture);
+    let (head, _, _) = world.publish(&third).unwrap();
+    world.store.set_retention_clock_for_tests(2_802, 1_802);
+    let leader = world.store.publication_for_tests().unwrap();
+    world.store.maintain_revisions(&leader).unwrap();
+    head
+}
+
 #[test]
 fn unreferenced_batches_are_collected_with_their_captures() {
-    let (world, older, head) = replaced_batch_world();
+    let (world, older, _) = replaced_batch_world();
     let first_batch = world.count("SELECT MIN(batch_id) FROM semantic_raw_batches");
     let leader = world.store.publication_for_tests().unwrap();
     release(&world, older, &leader);
+    drop(leader);
+    // The held capture of the replacement still selects the first batch.
+    assert_eq!(
+        world.count(&format!(
+            "SELECT COUNT(*) FROM semantic_raw_batches WHERE batch_id={first_batch}"
+        )),
+        1
+    );
+    let head = replace_capture_hold(&world);
     let of_first = |table: &str| -> i64 {
         world.count(&format!(
             "SELECT COUNT(*) FROM {table} WHERE batch_id={first_batch}"
@@ -5046,12 +5396,13 @@ fn unreferenced_batches_are_collected_with_their_captures() {
     assert_eq!(of_first("semantic_raw_captures"), 0);
     assert_eq!(of_first("semantic_raw_exclusions"), 0);
     assert_eq!(
-        world.count("SELECT COUNT(*) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id<>(SELECT MAX(batch_id) FROM semantic_raw_batches)"),
+        world.count(&format!("SELECT COUNT(*) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id={first_batch}")),
         0
     );
-    // The batch the head selects is untouched and still reads.
-    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
-    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_captures"), 1);
+    // The batch the head selects is untouched and still reads; so is the second batch, which
+    // the head's held capture still selects.
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 2);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_captures"), 2);
     assert!(world.count("SELECT COUNT(*) FROM semantic_raw_proofs") > 0);
     assert!(world.count("SELECT COUNT(*) FROM semantic_raw_documents") > 0);
     assert!(!world.store.semantic_at(head).unwrap().coverage.is_empty());
@@ -5060,8 +5411,16 @@ fn unreferenced_batches_are_collected_with_their_captures() {
 
 #[test]
 fn gc_keeps_proofs_referenced_by_retained_provenance() {
-    let (world, older, head) = replaced_batch_world();
+    let (world, older, _) = replaced_batch_world();
     let first_batch = world.count("SELECT MIN(batch_id) FROM semantic_raw_batches");
+    let leader = world.store.publication_for_tests().unwrap();
+    release(&world, older, &leader);
+    drop(leader);
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture();
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let third = world.write(&fixture);
+    let (head, _, _) = world.publish(&third).unwrap();
     // A retained provenance row of the head still derives from one proof of the first batch.
     let (capture_id, proof_id): (i64, String) = world
         .db()
@@ -5082,8 +5441,9 @@ fn gc_keeps_proofs_referenced_by_retained_provenance() {
             Ok(())
         })
         .unwrap();
+    world.store.set_retention_clock_for_tests(2_802, 1_802);
     let leader = world.store.publication_for_tests().unwrap();
-    release(&world, older, &leader);
+    world.store.maintain_revisions(&leader).unwrap();
     let survivors: Vec<(i64, String)> = world
         .db()
         .prepare("SELECT p.capture_id,p.proof_id FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1")
@@ -6058,7 +6418,7 @@ const ajv = new Ajv2020({strict: false, allErrors: true});
 const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json', 'utf8'));
 for (const {name, structuredContent} of JSON.parse(readFileSync(0, 'utf8'))) {
     const validate = ajv.compile(catalog.find(tool => tool.name === name).outputSchema);
-    if (!validate(structuredContent)) throw Error(`${name}: ${JSON.stringify(validate.errors)}`);
+    if (!validate(structuredContent)) throw Error(`${name}: ${JSON.stringify(validate.errors)} structuredContent=${JSON.stringify(structuredContent)}`);
     const missingVersion = {...structuredContent};
     delete missingVersion.schemaVersion;
     if (validate(missingVersion)) throw Error(`${name}: validator accepted missing schemaVersion`);
@@ -7280,6 +7640,235 @@ fn witnessed_local_rejoin_preserves_real_partial_import_metadata() {
     );
 }
 
+/// Architecture wire evidence keeps the imported proof's identity beside native N.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn architecture_wire_preserves_canonical_proof_identity_at_current_and_older_basis() {
+    use trellis::model::SemanticStatus;
+    let files = ["src/lib.js", "src/main.js"];
+    let (world, _) = real_fixture_world("issue444-javascript-calls", &files);
+    let (p, producer) = publish_real_fixture(&world, "issue444-javascript-calls", &files);
+    let published = world.store.semantic_at(p).unwrap();
+    let (native_p, _) = world.store.retained_native_snapshot_at(p).unwrap();
+    let helper_call = native_p
+        .calls
+        .iter()
+        .find(|call| {
+            call.document.path == "src/main.js" && call.spelling.as_deref() == Some("helper")
+        })
+        .unwrap();
+    let binding = published
+        .call_bindings
+        .iter()
+        .find(|binding| binding.call_id.as_deref() == Some(helper_call.id.as_str()))
+        .unwrap();
+    let proof = published
+        .provenance
+        .iter()
+        .find(|proof| proof.id == binding.provenance_id)
+        .unwrap();
+    assert_eq!(proof.freshness, Freshness::Fresh);
+    assert!(proof.basis.is_some());
+    assert!(proof.derived_from.is_some());
+    let trellis::semantic_evidence::Target::Internal {
+        syntax_id,
+        document,
+        revision_id,
+    } = binding.declared_target.as_ref().unwrap()
+    else {
+        panic!("real helper call must have an internal target");
+    };
+    assert_eq!(document.path, "src/lib.js");
+    assert_eq!(revision_id, &native_p.revision.id);
+    assert!(binding.candidates.is_empty());
+    assert!(binding.possible_dispatch.is_empty());
+    let historical_targets = json!([{"role":"declared","kind":"internal",
+        "language":document.language,"path":document.path,"syntaxId":syntax_id,
+        "revisionId":revision_id}]);
+    fs::create_dir_all(world.root.join(".trellis")).unwrap();
+    fs::write(
+        world.root.join(".trellis/rules.toml"),
+        r#"version = 1
+[roles.entry]
+select = { name = "caller", language = ["javascript"] }
+[roles.helper]
+select = { name = "helper", language = ["javascript"] }
+[[rules]]
+id = "entry-must-not-call-helper"
+for_each = "entry"
+forbid = [{ calls = "helper" }]
+"#,
+    )
+    .unwrap();
+    // The startup channel holds the writer before capture. Architecture has its own
+    // owner and can publish P and N cores while startup remains held; no S is driven.
+    let mut mcp = McpSession::start(&world, 600);
+    mcp.catalog();
+    let mut pin = p;
+    for historical in [false, true] {
+        if historical {
+            write_files(
+                &world.root,
+                &[(
+                    "src/pending.js",
+                    "export function pending() { return missing(); }\n",
+                )],
+            );
+            let (graph, native, capture) = index_workspace_bundle(
+                &IndexOptions::new(world.root.clone()),
+                world.store.root_id(),
+                &world.cancel,
+                |_| {},
+            )
+            .unwrap();
+            let leader = world.store.publication_for_tests().unwrap();
+            pin = world
+                .store
+                .publish_native(&graph, &capture, &native, &leader, p, &world.cancel)
+                .unwrap();
+            drop(leader);
+            assert_ne!(pin, p);
+            assert_ne!(native.revision.id, native_p.revision.id);
+            for path in files {
+                let projection = world
+                    .store
+                    .semantic_projection_at(pin, &producer, "javascript", path)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(projection.semantic_status, SemanticStatus::OlderBasis);
+                assert_eq!(projection.current_pin, pin);
+                assert_eq!(projection.semantic_basis_pin, p);
+                assert_eq!(projection.basis_native_revision_id, native_p.revision.id);
+            }
+            let pending = world
+                .store
+                .semantic_projection_at(pin, &producer, "javascript", "src/pending.js")
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.semantic_status, SemanticStatus::CatchingUp);
+        }
+        let basis = json!(pin);
+        let arguments = json!({"schemaVersion":1,"expectedBasis":basis,"limit":50});
+        let references = mcp.success("trellis_references", arguments.clone());
+        let checked = mcp.success("trellis_rules_check", arguments.clone());
+        let instance = checked["data"]["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|instance| instance["rule"] == "entry-must-not-call-helper")
+            .unwrap();
+        assert_eq!(instance["status"], "deviates", "{checked}");
+        let mut explain_arguments = arguments;
+        explain_arguments["rule"] = instance["rule"].clone();
+        explain_arguments["target"] = instance["target"].clone();
+        let explained = mcp.success("trellis_rules_explain", explain_arguments);
+        let (native, _) = world.store.retained_native_snapshot_at(pin).unwrap();
+        for reply in [&references, &checked, &explained] {
+            assert_eq!(reply["evidenceBasis"], basis, "{reply}");
+            assert_eq!(reply["data"]["indexGeneration"], basis["indexGeneration"]);
+            assert_eq!(reply["data"]["indexRevision"], basis["indexRevision"]);
+            if historical {
+                let pending = reply["data"]["semanticDocuments"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|status| status["path"] == "src/pending.js")
+                    .unwrap();
+                assert_eq!(pending["producerId"], producer);
+                assert_eq!(pending["projection"]["semanticStatus"], "catchingUp");
+                assert_eq!(pending["projection"]["currentPin"], basis);
+                assert_eq!(pending["projection"]["semanticBasisPin"], json!(p));
+                assert_eq!(pending["coverageState"], Value::Null);
+                assert_eq!(pending["boundary"], true);
+                for field in ["provenanceId", "basis", "derivedFrom"] {
+                    assert!(pending.get(field).is_none(), "{pending}");
+                }
+                assert_eq!(reply["data"]["partial"], true);
+            }
+        }
+        let sites: Vec<_> = references["data"]["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|edge| edge["sites"].as_array().unwrap())
+            .filter(|site| site["provenanceId"] == proof.id)
+            .collect();
+        assert!(!sites.is_empty(), "{references}");
+        for site in &sites {
+            assert_eq!(site["mapping"], "semantic");
+            assert_eq!(site["callId"], helper_call.id);
+        }
+        let mut evidence = sites;
+        for reply in [&checked, &explained] {
+            let constraint = &reply["data"]["instances"][0]["constraints"][0];
+            let rows = constraint["evidence"].as_array().unwrap();
+            let semantic: Vec<_> = rows
+                .iter()
+                .filter(|row| row["provenanceId"] == proof.id)
+                .collect();
+            assert!(!semantic.is_empty(), "{reply}");
+            evidence.extend(semantic);
+            // Native declarations and calls remain measured N facts, not derived proofs.
+            for kind in ["declaration", "call"] {
+                let row = rows.iter().find(|row| row["kind"] == kind).unwrap();
+                let expected = if kind == "declaration" {
+                    let declaration = native
+                        .declarations
+                        .iter()
+                        .find(|declaration| json!(declaration.syntax_id) == row["syntaxId"])
+                        .unwrap();
+                    json!({"document":declaration.document,"revisionId":declaration.revision_id,
+                        "range":declaration.range,"kind":"declaration",
+                        "syntaxId":declaration.syntax_id,"callId":null,
+                        "provenanceId":declaration.provenance_id})
+                } else {
+                    let call = native
+                        .calls
+                        .iter()
+                        .find(|call| json!(call.id) == row["callId"])
+                        .unwrap();
+                    json!({"document":call.document,"revisionId":call.revision_id,
+                        "range":call.range,"kind":"call","syntaxId":call.owner_syntax_id,
+                        "callId":call.id,"provenanceId":call.provenance_id})
+                };
+                assert_eq!(row, &expected);
+            }
+        }
+        for row in evidence {
+            assert_eq!(row["provenanceId"], proof.id);
+            assert_eq!(row["basis"], json!(proof.basis));
+            assert_eq!(row["derivedFrom"], json!(proof.derived_from));
+            assert_eq!(row["historicalContentHash"], proof.content_hash);
+            assert_eq!(row["historicalFreshness"], json!(proof.freshness));
+            assert_eq!(row["evidenceKind"], json!(proof.evidence_kind));
+            assert!(row.get("captureId").is_none(), "{row}");
+            if historical {
+                assert_eq!(row["freshness"], "possiblyStale");
+                assert_eq!(row["projection"]["currentPin"], basis);
+                assert_eq!(row["projection"]["semanticBasisPin"], json!(p));
+                assert_eq!(
+                    row["projection"]["basisNativeRevisionId"],
+                    native_p.revision.id
+                );
+                assert_eq!(row["projection"]["semanticStatus"], "olderBasis");
+                assert_eq!(row["historicalTargets"], historical_targets);
+                assert_eq!(
+                    row["historicalJoin"]["revisionId"],
+                    binding.join.anchor.revision_id
+                );
+                if row["kind"] == "semanticBinding" {
+                    assert_eq!(row["revisionId"], proof.revision_id);
+                }
+            } else {
+                assert_eq!(row["freshness"], json!(proof.freshness));
+                assert!(row["projection"].is_null(), "{row}");
+            }
+        }
+    }
+    // The causal startup hold, not an elapsed quiet period, kept N selected until now.
+    assert_eq!(world.store.index_baseline().unwrap(), pin);
+    mcp.finish();
+}
+
 /// #599: enumerate the live catalog, not a hand-picked subset of MCP tools. All responses
 /// (including bootstrap and argument failures) go through McpSession's catalog validator.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8031,6 +8620,11 @@ fn witnessed_local_rejoin_does_not_keep_a_method_direct_in_an_edited_document() 
         .store
         .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
         .unwrap();
+    drop(leader);
+    world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
     let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
     assert_eq!(work["witnessedRejoins"], 1, "{work}");
     assert_eq!(calls(&world), [call("f", "Unknown"), call("g", "Direct")]);
@@ -8196,15 +8790,24 @@ fn witnessed_semantic_spill_marks_readers_before_commit() {
         let options = IndexOptions::new(world.root.clone());
         let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
         let leader = world.store.publication_for_tests().unwrap();
-        let result =
-            world
-                .store
-                .publish_local_for_tests(&options, &capture, &leader, &world.cancel);
+        let native = world
+            .store
+            .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+            .unwrap();
+        drop(leader);
+        assert_ne!(native, prior);
+        // Native N never spills semantic work; the bounded S commit is what spills.
+        let result = world.store.catch_up_semantic_for_tests(&world.cancel);
         assert!(observed.load(Ordering::Acquire));
         world.cancel.store(false, Ordering::Release);
         let expected = if rollback {
             assert!(result.is_err());
-            prior
+            // Cancelling S rolls back only S; N stays readable and S retries to completion.
+            assert_eq!(world.store.status().unwrap().revision, native);
+            world
+                .store
+                .catch_up_semantic_for_tests(&world.cancel)
+                .unwrap()
         } else {
             result.unwrap()
         };
@@ -8214,6 +8817,122 @@ fn witnessed_semantic_spill_marks_readers_before_commit() {
             assert_eq!(work["witnessedRejoins"], 1, "{work}");
         }
     }
+}
+
+/// #674: a read from another thread that finds the S commit spilled waits on the
+/// gate's signal for that commit, then reads the new S head instead of failing
+/// `rebuild_in_progress`.
+#[test]
+fn a_read_during_a_spilled_semantic_commit_reads_the_new_head() {
+    use std::sync::{Mutex, atomic::Ordering, mpsc};
+    use trellis::store::SemanticPublicationStage;
+
+    enum Event {
+        Waiting,
+        Done(anyhow::Result<trellis::model::IndexPin>),
+    }
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+                ("src/c.rs", "fn other() { }\n"),
+            ],
+        );
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g) = (symbol("r()."), symbol("impl#[S]f()."), symbol("g()."));
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 15, 16], &[], &f, 0)
+                .occurrence(&[0, 20, 21], &[], &g, 0)
+                .symbol(&r, 17, &[]),
+            DocSpec::new("src/b.rs")
+                .occurrence(&[1, 12, 13], &[], &f, 1)
+                .occurrence(&[2, 3, 4], &[], &g, 1)
+                .symbol(&f, 26, &[])
+                .symbol(&g, 17, &[]),
+            DocSpec::new("src/c.rs"),
+        ],
+    );
+    drop(world.publish(&world.write(&fixture)).unwrap());
+    let (events, events_rx) = mpsc::channel();
+    let events_rx = Arc::new(Mutex::new(events_rx));
+    let reader = Arc::new(Mutex::new(None));
+    let first_event = Arc::new(Mutex::new(None));
+    let (reading, observer_reader, observer_events, observer_first) = (
+        world.store.clone(),
+        reader.clone(),
+        events_rx.clone(),
+        first_event.clone(),
+    );
+    let observed = Arc::new(AtomicBool::new(false));
+    let observed_hook = observed.clone();
+    world
+        .store
+        .set_semantic_publication_observer_for_tests(move |stage, db| {
+            if stage == SemanticPublicationStage::BeforeSemantic {
+                db.pragma_update(None, "cache_size", -64).unwrap();
+            } else if !observed_hook.swap(true, Ordering::AcqRel) {
+                // Spilled: start a reader on another thread and hold the commit
+                // until it is waiting on the spill (or has already returned).
+                let waiting = events.clone();
+                reading.set_before_spill_wait_hook_for_tests(move || {
+                    let _ = waiting.send(Event::Waiting);
+                });
+                let (store, done) = (reading.clone(), events.clone());
+                *observer_reader.lock().unwrap() = Some(std::thread::spawn(move || {
+                    let _ = done.send(Event::Done(store.status().map(|s| s.revision)));
+                }));
+                let event = observer_events
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                    .expect("the reader neither waited nor returned");
+                *observer_first.lock().unwrap() = Some(event);
+            }
+        });
+    write_files(&world.root, &[("src/c.rs", "fn other() { let _ = 1; }\n")]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let caught_up = world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
+    assert!(observed.load(Ordering::Acquire), "semantic work must spill");
+    let result = match first_event.lock().unwrap().take().unwrap() {
+        Event::Done(result) => {
+            result.map_err(|error| anyhow::anyhow!("read failed at once: {error:#}"))
+        }
+        Event::Waiting => match events_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("the waiting reader did not return after COMMIT")
+        {
+            Event::Done(result) => result,
+            Event::Waiting => panic!("the reader waited twice"),
+        },
+    };
+    reader.lock().unwrap().take().unwrap().join().unwrap();
+    assert_eq!(
+        result.unwrap_or_else(|error| panic!("{error:#}")),
+        caught_up
+    );
 }
 
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the
@@ -10158,4 +10877,510 @@ async fn two_producers_for_one_language_fall_back_for_that_language_only() {
     );
     mcp.finish();
     assert!(!world.store.recovery_pending_for_tests());
+}
+
+#[test]
+fn bounded_retained_adapter_accepts_original_whitespace_descriptor_bytes() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let descriptor = world.write(&fixture);
+    let bytes = serde_json::to_vec_pretty(&descriptor_value(&descriptor)).unwrap();
+    fs::write(&descriptor.0, &bytes).unwrap();
+    let descriptor = (descriptor.0, semantic_batch_support::sha256(&bytes));
+    drop(world.publish(&descriptor).unwrap());
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_delayed_import_matches_full(&world, &descriptor);
+    let retained: Vec<u8> = world
+        .db()
+        .query_row(
+            "SELECT descriptor_bytes FROM semantic_raw_batches",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, bytes);
+    assert!(world.stage_dirs().is_empty());
+}
+
+#[test]
+fn bounded_retained_binary_and_proof_corruption_publish_no_partial_facts_or_cache() {
+    for proof in [false, true] {
+        let (world, _, _) = delayed_import_world(false);
+        assert_eq!(
+            world.count("SELECT COUNT(*) FROM semantic_batch_witnesses"),
+            0
+        );
+        assert_eq!(
+            world.count("SELECT COUNT(*) FROM semantic_batch_witness_documents"),
+            0
+        );
+        world
+            .store
+            .with_index_sql_for_tests(|db| {
+                if proof {
+                    db.execute(
+                        "UPDATE semantic_raw_proofs SET canonical_bytes=X'7b7d' WHERE rowid=(SELECT MAX(rowid) FROM semantic_raw_proofs)",
+                        [],
+                    )?;
+                } else {
+                    let (capture, mut bytes): (i64, Vec<u8>) = db.query_row(
+                        "SELECT capture_id,binary_bytes FROM semantic_raw_captures LIMIT 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    *bytes.last_mut().unwrap() ^= 1;
+                    db.execute(
+                        "UPDATE semantic_raw_captures SET binary_bytes=?1 WHERE capture_id=?2",
+                        rusqlite::params![bytes, capture],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        // A same-native republish copies the validated rows; an edit makes S re-admit the
+        // retained batch through bounded FULL, which authenticates it.
+        write_files(
+            &world.root,
+            &[("src/C.js", "function other(){ return 9; }\n")],
+        );
+        world.republish_with_rejoin();
+        let head = world.store.index_baseline().unwrap();
+        let snapshot = world.store.semantic_at(head).unwrap();
+        assert_eq!(snapshot.coverage.len(), 3);
+        assert!(
+            snapshot
+                .coverage
+                .iter()
+                .all(|row| { row.state == trellis::semantic_evidence::CoverageState::Failed })
+        );
+        assert!(snapshot.provenance.is_empty());
+        assert!(snapshot.symbols.is_empty());
+        assert!(snapshot.declaration_bindings.is_empty());
+        assert!(snapshot.references.is_empty());
+        assert!(snapshot.call_bindings.is_empty());
+        assert!(snapshot.type_relationships.is_empty());
+        assert_eq!(
+            world.count("SELECT COUNT(*) FROM semantic_batch_witnesses"),
+            0
+        );
+        assert_eq!(
+            world.count("SELECT COUNT(*) FROM semantic_batch_witness_documents"),
+            0
+        );
+        assert!(world.stage_dirs().is_empty());
+    }
+}
+
+#[test]
+fn bounded_retained_cancellation_after_streaming_rolls_back_publication_and_cache() {
+    use std::sync::atomic::Ordering;
+    use trellis::store::SemanticPublicationStage;
+
+    let (world, _, _) = delayed_import_world(false);
+    let prior = world.store.index_baseline().unwrap();
+    let snapshot = world.store.semantic_at(prior).unwrap();
+    let revisions = world.count("SELECT COUNT(*) FROM native_revisions");
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_batch_witnesses"),
+        0
+    );
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_batch_witness_documents"),
+        0
+    );
+    let observed = Arc::new(AtomicBool::new(false));
+    let observed_hook = observed.clone();
+    let cancel = world.cancel.clone();
+    world
+        .store
+        .set_semantic_publication_observer_for_tests(move |stage, db| {
+            if stage == SemanticPublicationStage::AfterDocument {
+                assert_eq!(
+                    db.query_row("SELECT COUNT(*) FROM semantic_batch_witnesses", [], |r| r
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT COUNT(*) FROM semantic_batch_witness_documents",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    3
+                );
+                observed_hook.store(true, Ordering::Release);
+                cancel.store(true, Ordering::Release);
+            }
+        });
+    write_files(
+        &world.root,
+        &[("src/C.js", "function other(){ return 9; }\n")],
+    );
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    // Native-first: N publishes; the FULL catch-up S stages the capture witness and is the
+    // transaction a late cancellation rolls back, cache and all.
+    let native_pin = world
+        .store
+        .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let result = world.store.catch_up_semantic_for_tests(&world.cancel);
+    assert!(observed.load(Ordering::Acquire));
+    let error = result.unwrap_err();
+    assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
+    world.cancel.store(false, Ordering::Release);
+    assert_eq!(world.store.index_baseline().unwrap(), native_pin);
+    assert_eq!(world.store.semantic_at(prior).unwrap(), snapshot);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM native_revisions"),
+        revisions + 1
+    );
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_batch_witnesses"),
+        0
+    );
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_batch_witness_documents"),
+        0
+    );
+    assert!(world.stage_dirs().is_empty());
+}
+
+#[test]
+fn rust_below_head_rejoin_is_local_unless_cargo_context_differs_from_capture() {
+    const MANIFEST: &str = "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n";
+    const MOVED: &str =
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[lib]\npath = \"src/alt.rs\"\n";
+    const LIB: &str = "mod b;\nfn run() { b::target(); }\n";
+    const B: &str = "pub fn target() {}\n";
+    const RUN: &str = "rust-analyzer cargo fixture 0.1.0 run().";
+    const TARGET: &str = "rust-analyzer cargo fixture 0.1.0 b/target().";
+    let world = world_with(
+        |root| {
+            write_files(
+                root,
+                &[
+                    ("Cargo.toml", MANIFEST),
+                    ("src/lib.rs", LIB),
+                    ("src/b.rs", B),
+                    ("src/alt.rs", "mod b;\n"),
+                    ("src/c.rs", "fn extra() {}\n"),
+                ],
+            );
+        },
+        true,
+    );
+    let docs = || {
+        let lib = occ_at(DocSpec::new("src/lib.rs"), LIB, ("run", 0), None, RUN, 1);
+        let lib = occ_at(lib, LIB, ("target", 0), Some(8), TARGET, 0).symbol(RUN, 17, &[]);
+        let b = occ_at(DocSpec::new("src/b.rs"), B, ("target", 0), None, TARGET, 1).symbol(
+            TARGET,
+            17,
+            &[],
+        );
+        vec![DocSpec::new("src/alt.rs"), b, DocSpec::new("src/c.rs"), lib]
+    };
+    let captured = world.store.index_baseline().unwrap();
+    let (original_native, _) = world.store.retained_native_snapshot_at(captured).unwrap();
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact("rust", docs());
+    let descriptor = world.write(&fixture);
+    write_files(&world.root, &[("src/c.rs", "fn extra() { let _ = 0; }\n")]);
+    world.republish();
+    world.publish(&descriptor).unwrap();
+    let counts = world._state.path().join("rust-owner-counts.json");
+    // SAFETY: nextest isolates each test process; this test owns both hooks.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
+        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+    }
+    for value in 1..=2 {
+        let work = local_edit(
+            &world,
+            "src/c.rs",
+            &format!("fn extra() {{ let _ = {value}; }}\n"),
+            &counts,
+        );
+        assert_delayed_import_matches_full(&world, &descriptor);
+        if value == 1 {
+            assert_eq!(
+                work["fallbackReasons"],
+                json!(["original_import_missing"]),
+                "{work}"
+            );
+        } else {
+            assert_delayed_import_witnessed(&work);
+            assert_eq!(work["originalRawDecodes"], 0, "{work}");
+        }
+    }
+
+    write_files(&world.root, &[("Cargo.toml", MOVED)]);
+    let (moved, session) = trellis::index_coordinator::reconcile_workspace(
+        &world.store,
+        &IndexOptions::new(world.root.clone()),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    drop(session);
+    // Startup reconciliation completes at native N; its semantic S follows.
+    world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
+    let (moved_native, _) = world.store.retained_native_snapshot_at(moved).unwrap();
+    assert_ne!(
+        original_native.revision.dependency_hash,
+        moved_native.revision.dependency_hash
+    );
+    for value in 3..=4 {
+        let old = world.store.index_baseline().unwrap();
+        let previous = world.store.semantic_at(old).unwrap();
+        let work = local_edit(
+            &world,
+            "src/c.rs",
+            &format!("fn extra() {{ let _ = {value}; }}\n"),
+            &counts,
+        );
+        assert_eq!(work["fullFallbacks"], 1, "{work}");
+        assert_eq!(work["witnessedRejoins"], 0, "{work}");
+        assert_eq!(
+            work["fallbackReasons"],
+            json!(["destination_witness_unavailable"]),
+            "{work}"
+        );
+        let published = assert_delayed_import_matches_full(&world, &descriptor);
+        assert_eq!(world.store.semantic_at(old).unwrap(), previous);
+        assert_eq!(
+            world
+                .store
+                .selected_raw_inputs_at(world.store.index_baseline().unwrap())
+                .unwrap()[0]
+                .captured_pin,
+            captured
+        );
+        let target = published
+            .symbols
+            .iter()
+            .find(|row| row.key.symbol == TARGET)
+            .unwrap();
+        assert_eq!(target.key.document.as_ref().unwrap().path, "src/lib.rs");
+        let (native, _) = world
+            .store
+            .retained_native_snapshot_at(world.store.index_baseline().unwrap())
+            .unwrap();
+        assert!(published.call_bindings.iter().any(|call| matches!(
+            &call.declared_target,
+            Some(trellis::semantic_evidence::Target::Internal { revision_id, document, .. })
+                if revision_id == &native.revision.id && document.path == "src/b.rs"
+        )));
+        assert!(
+            published
+                .references
+                .iter()
+                .any(|reference| reference.spelling == "target"
+                    && reference.resolution == Resolution::Resolved)
+        );
+    }
+
+    let recaptured = world.store.index_baseline().unwrap();
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let mut fresh_docs = docs();
+    fresh_docs[2] = DocSpec::new("src/c.rs")
+        .occurrence(
+            &[0, 3, 8],
+            &[],
+            "rust-analyzer cargo fixture 0.1.0 extra().",
+            1,
+        )
+        .symbol("rust-analyzer cargo fixture 0.1.0 extra().", 17, &[]);
+    fixture.artifact("rust", fresh_docs);
+    let replacement = world.write(&fixture);
+    world.publish(&replacement).unwrap();
+    let work = local_edit(&world, "src/c.rs", "fn extra() { let _ = 5; }\n", &counts);
+    assert_delayed_import_witnessed(&work);
+    assert_eq!(work["originalRawDecodes"], 0, "{work}");
+    let published = assert_delayed_import_matches_full(&world, &replacement);
+    let target = published
+        .symbols
+        .iter()
+        .find(|row| row.key.symbol == TARGET)
+        .unwrap();
+    assert_eq!(target.key.document.as_ref().unwrap().path, "src/alt.rs");
+    assert_eq!(
+        world
+            .store
+            .selected_raw_inputs_at(world.store.index_baseline().unwrap())
+            .unwrap()[0]
+            .captured_pin,
+        recaptured
+    );
+}
+
+#[test]
+fn empty_last_selector_release_drains_orphan_capture_witnesses_and_raw_batch() {
+    let world = definitions_world();
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let captured = world.store.index_baseline().unwrap();
+    let (a, b) = definitions_docs();
+    let mut first = world.fixture().reference("scip-typescript");
+    first.artifact("javascript", vec![a.clone(), b.clone()]);
+    let first = world.write(&first);
+    let mut replacement = world.fixture().reference("scip-typescript");
+    replacement.artifact(
+        "javascript",
+        vec![a.occurrence(&[0, 0, 1], &[], "pkg extra.", 0), b],
+    );
+    let replacement = world.write(&replacement);
+
+    write_files(
+        &world.root,
+        &[("src/B.js", "function target(){ return 2; }\n")],
+    );
+    world.republish();
+    let imported = world.publish(&first).unwrap().0;
+    fs::remove_file(world.root.join("src/A.js")).unwrap();
+    fs::remove_file(world.root.join("src/B.js")).unwrap();
+    world.republish_with_rejoin();
+    let empty = world.store.index_baseline().unwrap();
+    let selected = world.store.selected_raw_inputs_at(empty).unwrap();
+    let retired_batch = selected[0].batch_id;
+    assert_eq!(selected[0].captured_pin, captured);
+    assert!(world.store.semantic_at(empty).unwrap().coverage.is_empty());
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_batch_witnesses"),
+        1
+    );
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_batch_witness_documents"),
+        2
+    );
+
+    let head = world.publish(&replacement).unwrap().0;
+    let replacement_selection = world.store.selected_raw_inputs_at(head).unwrap();
+    assert_ne!(replacement_selection[0].batch_id, retired_batch);
+    let retained_head = world.store.semantic_at(head).unwrap();
+    let retained_capture = world.store.retained_native_snapshot_at(captured).unwrap();
+    world.store.set_retention_clock_for_tests(2_001, 1_001);
+    run_maintenance(&world);
+    assert_eq!(revision_state(&world, imported), "released");
+    assert_eq!(revision_state(&world, empty), "released");
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM native_revision_release_debt"),
+        0
+    );
+    assert_eq!(
+        world.count(&format!(
+            "SELECT COUNT(*) FROM semantic_revision_raw_selections WHERE batch_id={retired_batch}"
+        )),
+        0
+    );
+    for table in [
+        "semantic_batch_witnesses",
+        "semantic_batch_witness_documents",
+        "semantic_raw_captures",
+        "semantic_raw_batches",
+    ] {
+        assert_eq!(
+            world.count(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE batch_id={retired_batch}"
+            )),
+            0,
+            "orphan rows remain in {table} after the last selector is released"
+        );
+    }
+    assert_eq!(world.store.semantic_at(head).unwrap(), retained_head);
+    let selected = world.store.selected_raw_inputs_at(head).unwrap();
+    assert_eq!(selected[0].batch_id, replacement_selection[0].batch_id);
+    assert_eq!(
+        selected[0].captured_pin,
+        replacement_selection[0].captured_pin
+    );
+    let capture = world.store.retained_native_snapshot_at(captured).unwrap();
+    assert_eq!(json!(capture.0), json!(retained_capture.0));
+    assert_eq!(capture.1, retained_capture.1);
+    run_maintenance(&world);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM native_revision_release_debt"),
+        0
+    );
+}
+
+#[test]
+fn bounded_full_rejoin_accepts_empty_destination_and_preserves_selected_capture() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a, b]);
+    let descriptor = world.write(&fixture);
+    let (prior, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let prior_semantic = world.store.semantic_at(prior).unwrap();
+    let (prior_native, prior_sources) = world.store.retained_native_snapshot_at(prior).unwrap();
+    let selected = world.store.selected_raw_inputs_at(prior).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].captures.len(), 1);
+    assert!(!prior_semantic.coverage.is_empty());
+    assert!(!prior_semantic.producers.is_empty());
+
+    fs::remove_file(world.root.join("src/A.js")).unwrap();
+    fs::remove_file(world.root.join("src/B.js")).unwrap();
+    world.republish_with_rejoin();
+
+    let head = world.store.index_baseline().unwrap();
+    assert_ne!(head, prior);
+    assert_eq!(world.rejoin_failures(), 0);
+    let published = assert_delayed_import_matches_full(&world, &descriptor);
+    assert!(published.coverage.is_empty());
+    assert!(published.provenance.is_empty());
+    assert!(published.symbols.is_empty());
+    assert!(published.declaration_bindings.is_empty());
+    assert!(published.references.is_empty());
+    assert!(published.call_bindings.is_empty());
+    assert!(published.type_relationships.is_empty());
+    assert_eq!(
+        canonical(&published.producers),
+        canonical(&prior_semantic.producers)
+    );
+    let rejoined = world.store.selected_raw_inputs_at(head).unwrap();
+    assert_eq!(rejoined.len(), 1);
+    assert_eq!(rejoined[0].batch_id, selected[0].batch_id);
+    assert_eq!(rejoined[0].captured_pin, selected[0].captured_pin);
+    assert_eq!(rejoined[0].captures.len(), selected[0].captures.len());
+    assert_eq!(rejoined[0].proofs.len(), selected[0].proofs.len());
+    assert_eq!(rejoined[0].documents, selected[0].documents);
+
+    let (empty, sources) = world.store.retained_native_snapshot_at(head).unwrap();
+    assert!(empty.revision.documents.is_empty());
+    assert!(sources.is_empty());
+    assert_eq!(json!(empty.producer), json!(prior_native.producer));
+    world
+        .store
+        .with_native_reader(head, |reader| {
+            let header = reader.header()?;
+            assert_eq!(json!(header.producer), json!(empty.producer));
+            assert_eq!(json!(header.source_set), json!(empty.source_set));
+            assert_eq!(json!(header.revision), json!(empty.revision));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(world.store.semantic_at(prior).unwrap(), prior_semantic);
+    let (retained, sources) = world.store.retained_native_snapshot_at(prior).unwrap();
+    assert_eq!(json!(retained), json!(prior_native));
+    assert_eq!(sources, prior_sources);
+    assert!(world.stage_dirs().is_empty());
 }

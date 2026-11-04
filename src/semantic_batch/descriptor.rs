@@ -266,6 +266,35 @@ impl Descriptor {
         pinned_producer(&self.trust_origin, &self.profile_id, &self.producer)
     }
 
+    /// The admitted run's controlled context policy, or full captured context.
+    /// Supplied batches, pickups and the synthetic stand-in cannot narrow input dependencies.
+    pub fn context_profile(&self) -> Result<Option<crate::producer::profiles::Row>> {
+        use crate::producer::{ProducerName, TrustProfile, profiles};
+        let Some(generation) = self.generation.as_ref() else {
+            return Ok(None);
+        };
+        if generation.origin == GenerationOrigin::OwnerPickup {
+            if generation.trust_profile.is_some() {
+                return Err(admission("generation trust profile"));
+            }
+            return Ok(None);
+        }
+        let trust = match generation.trust_profile {
+            Some(GenerationTrust::Restricted) => TrustProfile::Restricted,
+            Some(GenerationTrust::Trusted) => TrustProfile::Trusted,
+            None => return Err(admission("generation trust profile")),
+        };
+        let pinned = self.check_producer()?;
+        if pinned.name == profiles::STUB_NAME {
+            return Ok(None);
+        }
+        let producer =
+            ProducerName::parse(&pinned.name).ok_or_else(|| admission("producer profile pin"))?;
+        profiles::row(profiles::Target::Real(producer), trust)
+            .map(Some)
+            .map_err(|_| admission("generation trust profile"))
+    }
+
     /// Generation-origin rule: an external import carries a null `generation`; a generated one
     /// carries exactly the origin and ID of its job.
     pub fn check_origin(&self, origin: ImportOrigin, generation_id: Option<&str>) -> Result<()> {
@@ -281,11 +310,11 @@ impl Descriptor {
             }
             _ => false,
         };
-        if matches {
-            Ok(())
-        } else {
-            Err(admission("generation origin"))
+        if !matches {
+            return Err(admission("generation origin"));
         }
+        self.context_profile()?;
+        Ok(())
     }
 
     /// The project-root spellings a stored batch may bind to on store reuse. Every spelling

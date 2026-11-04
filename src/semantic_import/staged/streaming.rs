@@ -158,7 +158,12 @@ fn push_reserved<T>(
 }
 
 impl<'a> CompletedGlobal<'a> {
-    fn new(ctx: &'a JoinCtx<'a>, side: u8, filtered: bool, source_set_id: &str) -> Result<Self> {
+    pub(super) fn new(
+        ctx: &'a JoinCtx<'a>,
+        side: u8,
+        filtered: bool,
+        source_set_id: &str,
+    ) -> Result<Self> {
         Ok(Self {
             ctx,
             side,
@@ -469,6 +474,56 @@ impl GlobalWriter<'_> {
 /// discovery did not visit (an ineligible or failed document), and the captured status of
 /// destination targets that are not captured targets of the same document. Unshared pins only:
 /// with the two discovery passes it completes the status of every key `g_definitions` holds.
+/// Completes missing declaration statuses for one owner document. The continuation visits
+/// source ordinals in order, so its target set is bounded by one admitted document.
+pub(super) fn remaining_document_status(
+    captured: &StagedSide<'_>,
+    destination: &StagedSide<'_>,
+    owner: i64,
+    document: &native::DocumentKey,
+    captured_status: bool,
+) -> Result<()> {
+    let ctx = captured.ctx;
+    let (side, sql) = if captured_status {
+        (
+            captured,
+            "SELECT g.syntax_id FROM g_definitions g WHERE g.side=1 AND g.owner_doc=?1 \
+         AND NOT EXISTS (SELECT 1 FROM g_definitions c WHERE c.side=0 \
+         AND c.owner_doc=g.owner_doc AND c.syntax_id=g.syntax_id) ORDER BY g.syntax_id",
+        )
+    } else {
+        (
+            destination,
+            "SELECT g.syntax_id FROM g_definitions g WHERE g.side=0 AND g.owner_doc=?1 \
+         AND NOT EXISTS (SELECT 1 FROM w_docs w WHERE w.source_ord=g.owner_doc \
+         AND w.eligible=1 AND w.failed=0) ORDER BY g.syntax_id",
+        )
+    };
+    ctx.charge(1)?;
+    let mut statement = ctx.conn.prepare_cached(sql)?;
+    let mut rows = statement.query([owner])?;
+    let mut targets = BTreeSet::new();
+    let mut reservation = ctx.live.reserve(0)?;
+    while let Some(row) = rows.next()? {
+        ctx.check_cancel()?;
+        ctx.charge(1)?;
+        let value = row.get_ref(0)?;
+        reservation.grow(sizes::sum(&[
+            sizes::map_entries::<String, ()>(1)?,
+            codec::sid_len(value)?,
+        ])?)?;
+        targets.insert(codec::sid_text(value)?);
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let Some((ord, _)) = side.doc_row(document)? else {
+        return Ok(());
+    };
+    let group = side.group(document)?.context("missing native document")?;
+    write_target_status(ctx, side.rev, ord, &group, &targets)
+}
+
 pub(super) fn remaining_target_status(
     captured: &StagedSide<'_>,
     destination: &StagedSide<'_>,
@@ -1416,6 +1471,76 @@ pub(super) fn claims_side<'a>(
 
 /// Pass 1 (captured) or 3 (eligible destination): the complete global context of one side.
 /// A document without claims contributes nothing, so its native facts are never loaded.
+pub(super) fn discover_document(
+    side: &StagedSide<'_>,
+    encoding: u8,
+    target_status: TargetStatus,
+    document: &native::DocumentKey,
+) -> Result<()> {
+    let global = || CompletedGlobal::new(side.ctx, side.side, false, side.source_set_id());
+    let mut writer = GlobalWriter {
+        global: global()?,
+        targets: BTreeSet::new(),
+        targets_reservation: side.ctx.live.reserve(0)?,
+    };
+    let _view_document_reservation = side.ctx.live.reserve(sizes::sum(&[
+        std::mem::size_of::<native::DocumentKey>() as u64,
+        sizes::document(document)?,
+    ])?)?;
+    let claims = DocumentClaims::load(side, document)?;
+    if claims.claims.is_empty() {
+        return Ok(());
+    }
+    let local_store = claims_side(side, document.clone(), Rc::new(claims))?;
+    let reads = global()?;
+    let mut local = DocumentIndex::new(&reads, document)?;
+    for claim in local_store.claims() {
+        let claim = claim?;
+        let mut operation = local_store.operation()?;
+        if let Some((range, row)) =
+            discover_join_claim(encoding, &local_store, &mut writer, &claim, &mut operation)?
+        {
+            local.put_type_use(document, range.start, range.end, &row.symbol)?;
+        }
+    }
+    for declaration in &local_store
+        .borrowed_group(document)?
+        .context("missing native document")?
+        .native
+        .declarations
+    {
+        if declaration.kind != "method" {
+            continue;
+        }
+        let Some(range) = &declaration.name_range else {
+            continue;
+        };
+        let mut symbols_operation = local_store.operation()?;
+        local_store.reserve_operation(&mut symbols_operation, || {
+            local.type_uses_clone_bytes(document, range.start, range.end)
+        })?;
+        for symbol in local.type_uses(document, range.start, range.end)? {
+            let _summary_reservation = side.ctx.live.reserve(sizes::sum(&[
+                sizes::declaration(declaration)?,
+                (std::mem::size_of::<MethodSummary>() - std::mem::size_of::<native::Declaration>())
+                    as u64,
+            ])?)?;
+            let summary = MethodSummary {
+                target_owner_matches: method_target_owner_matches(
+                    &local_store,
+                    &local,
+                    declaration,
+                    &symbol,
+                )?,
+                method: declaration.clone(),
+            };
+            writer.method(document, &symbol, summary)?;
+        }
+    }
+    writer.target_declarations(&local_store, document, target_status)?;
+    Ok(())
+}
+
 pub(super) fn discover_side<'a>(
     side: &StagedSide<'a>,
     encoding: u8,
@@ -1424,70 +1549,10 @@ pub(super) fn discover_side<'a>(
     let global = || -> Result<CompletedGlobal<'a>> {
         CompletedGlobal::new(side.ctx, side.side, false, side.source_set_id())
     };
-    let mut writer = GlobalWriter {
-        global: global()?,
-        targets: BTreeSet::new(),
-        targets_reservation: side.ctx.live.reserve(0)?,
-    };
     for document in side.documents() {
-        let document = document?;
-        let _view_document_reservation = side.ctx.live.reserve(sizes::sum(&[
-            std::mem::size_of::<native::DocumentKey>() as u64,
-            sizes::document(&document)?,
-        ])?)?;
-        let claims = DocumentClaims::load(side, &document)?;
-        if claims.claims.is_empty() {
-            continue;
-        }
-        let local_store = claims_side(side, document.clone(), Rc::new(claims))?;
-        let reads = global()?;
-        let mut local = DocumentIndex::new(&reads, &document)?;
-        for claim in local_store.claims() {
-            let claim = claim?;
-            let mut operation = local_store.operation()?;
-            if let Some((range, row)) =
-                discover_join_claim(encoding, &local_store, &mut writer, &claim, &mut operation)?
-            {
-                local.put_type_use(&document, range.start, range.end, &row.symbol)?;
-            }
-        }
-        for declaration in &local_store
-            .borrowed_group(&document)?
-            .context("missing native document")?
-            .native
-            .declarations
-        {
-            if declaration.kind != "method" {
-                continue;
-            }
-            let Some(range) = &declaration.name_range else {
-                continue;
-            };
-            let mut symbols_operation = local_store.operation()?;
-            local_store.reserve_operation(&mut symbols_operation, || {
-                local.type_uses_clone_bytes(&document, range.start, range.end)
-            })?;
-            for symbol in local.type_uses(&document, range.start, range.end)? {
-                let _summary_reservation = side.ctx.live.reserve(sizes::sum(&[
-                    sizes::declaration(declaration)?,
-                    (std::mem::size_of::<MethodSummary>()
-                        - std::mem::size_of::<native::Declaration>()) as u64,
-                ])?)?;
-                let summary = MethodSummary {
-                    target_owner_matches: method_target_owner_matches(
-                        &local_store,
-                        &local,
-                        declaration,
-                        &symbol,
-                    )?,
-                    method: declaration.clone(),
-                };
-                writer.method(&document, &symbol, summary)?;
-            }
-        }
-        writer.target_declarations(&local_store, &document, target_status)?;
+        discover_document(side, encoding, target_status, &document?)?;
     }
-    Ok(writer.global)
+    global()
 }
 
 /// One document's Common join against a completed global context. The returned guard holds
@@ -2112,7 +2177,46 @@ mod reservation_tests {
             mutations: DestinationMutations::default(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             unread: Default::default(),
+            proofs: Default::default(),
         }
+    }
+
+    #[test]
+    fn proof_identity_memo_retains_a_live_reservation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sources(ord INTEGER PRIMARY KEY,language TEXT,path TEXT);
+             CREATE TABLE artifacts(ordinal INTEGER PRIMARY KEY,sha256 TEXT);
+             CREATE TABLE proof_identities(proof_id TEXT PRIMARY KEY,source_ord INTEGER,
+                 artifact INTEGER,record_kind TEXT,fact_digest TEXT,claim_id INTEGER,
+                 capture_id INTEGER);
+             INSERT INTO sources VALUES(0,'rust','src/lib.rs');",
+        )
+        .unwrap();
+        let proof_id = "a".repeat(64);
+        conn.execute("INSERT INTO artifacts VALUES(0,?1)", ["b".repeat(64)])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO proof_identities VALUES(?1,0,0,'occurrence',?2,-1,1)",
+            params![proof_id, "c".repeat(64)],
+        )
+        .unwrap();
+        let mut limits = BatchLimits::PRODUCTION;
+        limits.unit_expansion_bytes = 4096;
+        let ctx = row_context(&conn, limits);
+        assert_eq!(ctx.live.high_water(), 0);
+        let proof = ctx.proof_row(&proof_id).unwrap().unwrap();
+        assert_eq!(proof.path, "src/lib.rs");
+        drop(proof);
+        assert_eq!(ctx.proofs.borrow().len(), 1);
+        assert!(
+            ctx.live.high_water() > 0,
+            "the retained proof strings, Rc and HashMap storage need a live reservation"
+        );
+        assert!(
+            ctx.live.reserve(ctx.limits.unit_expansion_bytes).is_err(),
+            "dropping the caller must not release storage still owned by the memo"
+        );
     }
 
     #[test]
@@ -2339,6 +2443,7 @@ mod reservation_tests {
             mutations: DestinationMutations::default(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             unread: Default::default(),
+            proofs: Default::default(),
         };
         let global = CompletedGlobal {
             ctx: &ctx,

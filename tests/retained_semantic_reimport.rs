@@ -223,7 +223,7 @@ impl World {
         let version: u32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 40);
         db.pragma_update(None, "user_version", version - 1).unwrap();
         drop(db);
         // The real daemon establishes the new native head and owns retained FIFO work.
@@ -386,6 +386,237 @@ impl World {
 }
 
 #[test]
+fn ordinary_native_edit_keeps_retained_run_out_of_generated_fifo() {
+    ordinary_retained_edit(false);
+}
+
+#[test]
+fn ordinary_context_edit_keeps_retained_run_out_of_generated_fifo() {
+    ordinary_retained_edit(true);
+}
+
+fn ordinary_retained_edit(context_only: bool) {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
+        index_coordinator::{IndexJobCoordinator, reconcile_workspace},
+        indexer::IndexOptions,
+        store::Store,
+    };
+
+    let snapshot = |db: &Connection| -> rusqlite::Result<Value> {
+        let (key, native, producer, toolchain): (String, String, String, String) = db.query_row(
+            "SELECT n.id,n.native_revision_id,b.producer_sha,n.retained_toolchain
+             FROM index_metadata m JOIN native_revisions n
+               ON n.id='pin:v1:'||m.index_generation||':'||m.index_revision
+             JOIN revision_producer_bindings b ON b.revision_id=n.id WHERE m.singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let toolchain: Value = serde_json::from_str(&toolchain).unwrap();
+        let reasons = db.prepare("SELECT producer,language,reason FROM semantic_reimport WHERE revision_id=?1 ORDER BY producer,language")?
+            .query_map([&key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(
+            json!({"head":key,"nativeRevisionId":native,"producerSha":producer,
+            "nativeExecutable":toolchain["nativeExecutable"],"reimport":reasons}),
+        )
+    };
+    let world = World::new();
+    let before_run = {
+        // The daemon is another process; this test owns no Store handles yet.
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        snapshot(&db).unwrap()
+    };
+    let (_run, original, original_options) = world.run_once();
+    let descriptor: Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(descriptor["generation"]["origin"], "trellisRun");
+    support::stop_daemon(&world.checkout.home);
+    let after_run = {
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        snapshot(&db).unwrap()
+    };
+    assert!(before_run["reimport"].as_array().unwrap().is_empty());
+    assert!(after_run["reimport"].as_array().unwrap().is_empty());
+    let baseline_invocations = world.invocation_count();
+    let roots = TopologyRoots::isolated_for_tests(
+        cache_dir(&world.checkout.home),
+        data_dir(&world.checkout.home),
+    );
+    let identity =
+        WorkspaceIdentity::discover(Some(&world.checkout.root), &world.checkout.root).unwrap();
+    let store = Store::open(roots, identity).unwrap();
+    let options = IndexOptions::new(world.checkout.root.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_unchanged, session) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    let after_reconcile = store
+        .with_index_read_for_tests(|db| Ok(snapshot(db)?))
+        .unwrap();
+    assert_ne!(
+        after_run["producerSha"], after_reconcile["producerSha"],
+        "bootstrap must exercise actual CLI-to-test executable recovery"
+    );
+    // Complete that legitimate recovery before the ordinary-edit experiment.
+    let state = trellis::http::new(
+        store.clone(),
+        options.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session_without_tick_for_tests(session.clone());
+    state.force_root_transition_tick_for_tests().unwrap();
+    let bootstrap_request = store.current_request().unwrap().unwrap();
+    assert_eq!(bootstrap_request.state, "done");
+    assert_eq!(
+        bootstrap_request.request_kind,
+        trellis::store::requests::RequestKind::SemanticImport
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&bootstrap_request.options_json).unwrap(),
+        original_options
+    );
+    let baseline = store
+        .with_index_read_for_tests(|db| Ok(snapshot(db)?))
+        .unwrap();
+    assert!(
+        baseline["reimport"].as_array().unwrap().is_empty(),
+        "{baseline}"
+    );
+    let pending: i64 = store
+        .with_index_read_for_tests(|db| {
+            Ok(
+                db.query_row("SELECT count(*) FROM semantic_pending_target", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        })
+        .unwrap();
+    assert_eq!(pending, 0);
+    use sha2::Digest;
+    let executing = hex::encode(sha2::Sha256::digest(
+        fs::read(std::env::current_exe().unwrap()).unwrap(),
+    ));
+    assert_eq!(baseline["producerSha"], executing);
+    assert_eq!(baseline["nativeExecutable"], executing);
+    let prior = store.index_baseline().unwrap();
+    let stable = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
+        .unwrap()
+        .run_serving(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(
+        stable, prior,
+        "post-recovery unchanged reconciliation moved the head"
+    );
+    assert_eq!(
+        store
+            .with_index_read_for_tests(|db| Ok(snapshot(db)?))
+            .unwrap(),
+        baseline
+    );
+    let baseline_generated = world.generated_rows().len();
+    assert_eq!(world.invocation_count(), baseline_invocations);
+    assert_eq!(
+        fs::read(original_options["descriptor"].as_str().unwrap()).unwrap(),
+        original
+    );
+    let key = |pin: trellis::model::IndexPin| {
+        format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
+    };
+    let raw_identity = |pin| {
+        store.with_index_read_for_tests(|db| {
+            Ok(db.query_row(
+                "SELECT batch_id,captured_pin FROM semantic_revision_raw_selections WHERE revision_id=?1 AND producer_id=?2",
+                rusqlite::params![key(pin), PRODUCER], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )?)
+        }).unwrap()
+    };
+    let original_raw = raw_identity(prior);
+    let edited = "function u00000() { g(); } // ordinary native edit\nfunction g() {}\n";
+    let original_source =
+        fs::read_to_string(world.checkout.root.join("javascript/u00000.js")).unwrap();
+    if context_only {
+        fs::write(world.checkout.root.join("Cargo.lock"), "version = 4\n").unwrap();
+    } else {
+        fs::write(world.checkout.root.join("javascript/u00000.js"), edited).unwrap();
+    }
+    let native = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
+        .unwrap()
+        .run_serving(&options, &cancel, |_| {})
+        .unwrap();
+    let after_native = store
+        .with_index_read_for_tests(|db| Ok(snapshot(db)?))
+        .unwrap();
+    assert_eq!(after_native["producerSha"], baseline["producerSha"]);
+    assert_eq!(
+        after_native["nativeExecutable"],
+        baseline["nativeExecutable"]
+    );
+    assert_ne!(native, prior);
+    assert_eq!(raw_identity(native), original_raw);
+    let response = store.evidence_response().unwrap();
+    assert_eq!(
+        response
+            .source_at("javascript/u00000.js", Some(native))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        if context_only {
+            original_source.as_str()
+        } else {
+            edited
+        }
+    );
+    response.finish(()).unwrap();
+    drop(response);
+    let projection = store
+        .semantic_projection_at(native, PRODUCER, "javascript", "javascript/u00000.js")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        projection.semantic_status,
+        trellis::model::SemanticStatus::CatchingUp
+    );
+    let reimport_at_native: i64 = store.with_index_read_for_tests(|db| {
+        let pending: (String, i64, String, String) = db.query_row(
+            "SELECT t.revision_id,s.batch_id,s.captured_pin,s.basis_pin
+             FROM semantic_pending_target t JOIN semantic_pending_selections s ON s.revision_id=t.revision_id
+             WHERE t.singleton=1 AND s.producer_id=?1", [PRODUCER],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(pending.0, key(native));
+        assert_eq!((pending.1, pending.2), original_raw);
+        assert_eq!(pending.3, key(projection.semantic_basis_pin));
+        Ok(db.query_row("SELECT count(*) FROM semantic_reimport WHERE revision_id=?1 AND producer=?2",
+            rusqlite::params![key(native), PRODUCER], |row| row.get(0))?)
+    }).unwrap();
+
+    // Outside Tokio, no worker thread races this exact next foreground selection.
+    let foreground = state.force_root_transition_tick_for_tests();
+    // Close Store-owned SQLite witnesses before the independent requests.db reader.
+    drop(state);
+    drop(store);
+    let generated = world.generated_rows();
+    assert!(
+        foreground.is_ok(),
+        "ordinary foreground selection failed: {foreground:?}"
+    );
+    assert_eq!(
+        (reimport_at_native, generated.len()),
+        (0, baseline_generated),
+        "ordinary projected N manufactured reimport state or generated FIFO work: {generated:?}"
+    );
+    assert_eq!(world.invocation_count(), baseline_invocations);
+    assert_eq!(
+        fs::read(original_options["descriptor"].as_str().unwrap()).unwrap(),
+        original
+    );
+    assert_eq!(generated.last().unwrap().2, original_options);
+}
+
+#[test]
 fn binary_only_retained_recovery_is_fresh_at_head() {
     binary_only_recovery("javascript");
 }
@@ -411,6 +642,7 @@ fn binary_only_recovery(language: &'static str) {
 }
 
 fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, &str)>) {
+    use rusqlite::OptionalExtension;
     use std::io::Write;
     let world = World::for_language(language, "multi-producer", None);
     let (_, original, options) = world.run_once();
@@ -580,9 +812,10 @@ fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, 
     for (path, bytes) in pages {
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
+    let mut completed_drift_pin = None;
     if let Some((path, bytes)) = drift {
         fs::write(world.checkout.root.join(path), bytes).unwrap();
-        reply(
+        let indexed = reply(
             "context drift index",
             rebuilt_cli()
                 .args(["index", "--workspace"])
@@ -610,17 +843,174 @@ fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, 
             captured_proofs,
             "historical proofs changed after {path}"
         );
+
+        let returned = format!(
+            "pin:v1:{}:{}",
+            indexed["publishedRevision"]["indexGeneration"]
+                .as_str()
+                .unwrap(),
+            indexed["publishedRevision"]["indexRevision"]
+                .as_u64()
+                .unwrap()
+        );
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        // The watcher may already have completed S before this unchanged index request.
+        let target: String = db
+            .query_row(
+                "SELECT target_revision_id FROM semantic_catchup_commits WHERE revision_id=?1",
+                [&returned],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .unwrap_or_else(|| returned.clone());
+        let recovered_key = format!(
+            "pin:v1:{}:{}",
+            status["revision"]["indexGeneration"].as_str().unwrap(),
+            status["revision"]["indexRevision"].as_u64().unwrap()
+        );
+        let (native, same_native, changed_native): (String, bool, bool) = db.query_row(
+            "SELECT n.native_revision_id,n.native_revision_id=r.native_revision_id,n.native_revision_id<>p.native_revision_id FROM native_revisions n JOIN native_revisions r ON r.id=?2 JOIN native_revisions p ON p.id=?3 WHERE n.id=?1",
+            rusqlite::params![target, returned, recovered_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert!(
+            same_native,
+            "returned pin and target must share native identity"
+        );
+        assert!(changed_native, "context drift must change native identity");
+        let (basis_pin, pending): (String, bool) = db.query_row(
+            "SELECT o.basis_pin,d.pending FROM semantic_projection_origins o JOIN semantic_projection_documents d USING(revision_id,producer_id) WHERE o.revision_id=?1 AND o.producer_id=?2 AND d.language=?3",
+            rusqlite::params![target, PRODUCER, language], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert!(pending, "{path}: retained N must record semantic catch-up");
+        let basis_revisions: Vec<String> = db.prepare(
+            "SELECT DISTINCT b.captured_native_revision_id FROM semantic_basis b JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.selected=1 AND c.producer_id=?2",
+        ).unwrap().query_map(rusqlite::params![basis_pin, PRODUCER], |row| row.get(0))
+            .unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            basis_revisions,
+            vec![descriptor["sourceRevision"].as_str().unwrap().to_owned()]
+        );
+        drop(db);
+
+        let mut completed = None;
+        // No in-process state signal crosses the rebuilt daemon boundary. Observe its
+        // exact committed (S,N) record, releasing each DELETE read before waiting.
+        trellis::testing::wait_until("context drift semantic target commits", || {
+            let db = Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+            let pins: Vec<String> = db
+                .prepare(
+                    "SELECT revision_id FROM semantic_catchup_commits WHERE target_revision_id=?1",
+                )
+                .unwrap()
+                .query_map([&target], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(
+                pins.len() <= 1,
+                "multiple semantic commits for {target}: {pins:?}"
+            );
+            completed = pins.into_iter().next();
+            completed.is_some()
+        });
+        let completed = completed.unwrap();
+        assert_eq!(
+            completed.rsplit_once(':').unwrap().0,
+            target.rsplit_once(':').unwrap().0
+        );
+        let db =
+            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.execute_batch("BEGIN").unwrap();
+        let (completed_native, advanced): (String, bool) = db.query_row(
+            "SELECT s.native_revision_id,s.published_index_revision=n.published_index_revision+1 FROM native_revisions s JOIN native_revisions n ON n.id=?2 WHERE s.id=?1",
+            rusqlite::params![completed, target], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(completed_native, native);
+        assert!(advanced, "S must advance exactly its native target");
+        let head: String = db.query_row(
+            "SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(head, completed, "unexpected successor after {target}");
+        let pending: i64 = db
+            .query_row("SELECT count(*) FROM semantic_pending_target", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending, 0, "S must clear its target");
+        let same_selection: bool = db.query_row(
+            "SELECT n.batch_id=s.batch_id AND n.captured_pin=s.captured_pin FROM semantic_revision_raw_selections n JOIN semantic_revision_raw_selections s USING(producer_id) WHERE n.revision_id=?1 AND s.revision_id=?2 AND n.producer_id=?3",
+            rusqlite::params![target, completed, PRODUCER], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            same_selection,
+            "catch-up must retain the original raw selection"
+        );
+        let (proofs, conservative): (i64, i64) = db.query_row(
+            "SELECT count(*),COALESCE(sum(p.freshness<>'fresh' AND p.capture_id IS NOT NULL AND p.derived_from_provenance_id IS NOT NULL AND p.derived_from_record_kind IS NOT NULL AND p.derived_from_fact_digest IS NOT NULL),0) FROM semantic_provenance p JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.selected=1 AND c.producer_id=?2",
+            rusqlite::params![completed, PRODUCER], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let coverage: Vec<(String, String, bool, bool, String, Option<String>)> = db.prepare(
+            "SELECT language,path,requested,selected,state,diagnostic FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 ORDER BY language,path",
+        ).unwrap().query_map(rusqlite::params![completed, PRODUCER], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+        }).unwrap().map(Result::unwrap).collect();
+        assert!(
+            proofs > 0,
+            "completed catch-up must select semantic evidence: context={path} R={returned} N={target} S={completed} native={native} coverage={coverage:?}"
+        );
+        assert_eq!(
+            proofs, conservative,
+            "real context drift gets no freshness exception"
+        );
+        db.execute_batch("COMMIT").unwrap();
+        drop(db);
+        let settled = reply(
+            "context drift completed status",
+            rebuilt_cli()
+                .args(["status", "--workspace"])
+                .arg(&world.checkout.root)
+                .output()
+                .unwrap(),
+        );
+        assert_ne!(
+            settled["semanticLanguages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["language"] == language)
+                .unwrap()["semanticState"],
+            "fresh"
+        );
+        assert_eq!(
+            original_proofs(),
+            captured_proofs,
+            "historical proofs changed after S for {path}"
+        );
+        completed_drift_pin = Some(completed);
     }
     assert_eq!(world.invocation_count(), 1);
     assert_eq!(
         fs::read(options["descriptor"].as_str().unwrap()).unwrap(),
         original
     );
-    assert_eq!(descriptor["sourceRevision"].as_str().unwrap(), {
-        let db =
-            Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        db.query_row("SELECT b.captured_native_revision_id FROM semantic_basis b JOIN semantic_coverage c USING(tuple_id) JOIN index_metadata m ON c.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE c.selected=1 AND c.producer_id='trellis-synthetic-scip' LIMIT 1", [], |row| row.get::<_, String>(0)).unwrap()
-    });
+    let db = Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let basis_pin = completed_drift_pin.unwrap_or_else(|| db.query_row(
+        "SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1",
+        [], |row| row.get::<_, String>(0),
+    ).unwrap());
+    let basis_revisions: Vec<String> = db.prepare(
+        "SELECT DISTINCT b.captured_native_revision_id FROM semantic_basis b JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.selected=1 AND c.producer_id=?2",
+    ).unwrap().query_map(rusqlite::params![basis_pin, PRODUCER], |row| row.get(0))
+        .unwrap().map(Result::unwrap).collect();
+    assert_eq!(
+        basis_revisions,
+        vec![descriptor["sourceRevision"].as_str().unwrap().to_owned()]
+    );
 }
 
 #[test]

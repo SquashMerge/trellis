@@ -535,6 +535,94 @@ fn origin_rule_binds_job_to_generation() {
 }
 
 #[test]
+fn context_profile_uses_only_supported_real_run_authority() {
+    use super::descriptor::ImportOrigin;
+    use crate::producer::{ProducerName, TrustProfile, profiles};
+    let run = |name: &str, trust: &str| {
+        let pin = pinned_producer_by_id(name).unwrap();
+        let mut value = with_generation(generation_json("trellisRun"));
+        value["trustOrigin"] = json!(pin.trust_origin);
+        value["profileId"] = json!(pin.profile_id);
+        value["producer"] = json!({
+            "name":pin.name,"version":pin.version,"identityKind":pin.identity_kind.as_str(),
+            "executableHash":pin.executable_hash,"positionEncoding":pin.position_encoding,"languages":pin.languages,
+        });
+        value["generation"]["trustProfile"] = json!(trust);
+        Descriptor::parse(&descriptor_bytes(&value)).unwrap()
+    };
+    for (name, producer) in [
+        ("scip-java", ProducerName::ScipJava),
+        ("scip-typescript", ProducerName::ScipTypescript),
+        ("scip-python", ProducerName::ScipPython),
+        ("rust-analyzer", ProducerName::RustAnalyzer),
+    ] {
+        let descriptor = run(name, "trusted");
+        assert_eq!(
+            descriptor.context_profile().unwrap(),
+            Some(profiles::Row {
+                target: profiles::Target::Real(producer),
+                trust: TrustProfile::Trusted,
+            })
+        );
+        assert!(
+            descriptor
+                .check_origin(ImportOrigin::TrellisRun, Some(RUN_ID))
+                .is_ok()
+        );
+    }
+    let restricted = run("scip-python", "restricted");
+    assert_eq!(
+        restricted.context_profile().unwrap().unwrap().trust,
+        TrustProfile::Restricted
+    );
+    let unsupported = run("rust-analyzer", "restricted");
+    assert!(matches!(
+        unsupported.check_origin(ImportOrigin::TrellisRun, Some(RUN_ID)),
+        Err(ScipCaptureError::InvalidAdmission(_))
+    ));
+    let mut invalid_pin = restricted;
+    invalid_pin.producer.executable_hash = hex('0');
+    assert!(matches!(
+        invalid_pin.context_profile(),
+        Err(ScipCaptureError::InvalidAdmission(_))
+    ));
+}
+
+#[test]
+fn context_profile_keeps_supplied_pickup_and_stub_full_captured() {
+    use super::descriptor::ImportOrigin;
+    let external = Descriptor::parse(&descriptor_bytes(&descriptor_json())).unwrap();
+    assert_eq!(external.context_profile().unwrap(), None);
+    let pickup = Descriptor::parse(&descriptor_bytes(&with_generation(generation_json(
+        "ownerPickup",
+    ))))
+    .unwrap();
+    assert_eq!(pickup.context_profile().unwrap(), None);
+    assert!(
+        pickup
+            .check_origin(ImportOrigin::OwnerPickup, Some(RUN_ID))
+            .is_ok()
+    );
+    let mut invalid_pickup = pickup;
+    invalid_pickup.generation.as_mut().unwrap().trust_profile =
+        Some(super::descriptor::GenerationTrust::Restricted);
+    assert!(matches!(
+        invalid_pickup.check_origin(ImportOrigin::OwnerPickup, Some(RUN_ID)),
+        Err(ScipCaptureError::InvalidAdmission(_))
+    ));
+    let mut stub = Descriptor::parse(&descriptor_bytes(&with_generation(generation_json(
+        "trellisRun",
+    ))))
+    .unwrap();
+    assert_eq!(stub.context_profile().unwrap(), None);
+    stub.generation.as_mut().unwrap().trust_profile = None;
+    assert!(matches!(
+        stub.check_origin(ImportOrigin::TrellisRun, Some(RUN_ID)),
+        Err(ScipCaptureError::InvalidAdmission(_))
+    ));
+}
+
+#[test]
 fn reuse_accepts_every_admitted_project_root() {
     use super::{StageInput, descriptor::GenerationOrigin};
     let workspace = std::path::Path::new("/work/my repo");

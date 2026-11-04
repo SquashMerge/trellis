@@ -27,7 +27,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 37
+SCHEMA_VERSION = 40
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -309,6 +309,20 @@ def db_for(home):
     return found[0]
 
 
+def wait_caught_up(home):
+    """Native N completes an index request; return the head once semantic S cleared its target."""
+    while True:
+        with closing(sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)) as db:
+            db.execute("BEGIN")
+            pending = db.execute("SELECT count(*) FROM semantic_pending_target").fetchone()[0]
+            head = db.execute("SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1").fetchone()
+            db.execute("COMMIT")
+        if pending == 0:
+            return f"pin:v1:{head[0]}:{head[1]}"
+        require(time.monotonic() < DEADLINE, "semantic catch-up did not finish")
+        time.sleep(.01)
+
+
 def published(db, output, size):
     require(db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION,
             f"mixed performance requires schema{SCHEMA_VERSION}")
@@ -316,7 +330,8 @@ def published(db, output, size):
     pin = index_result["publishedRevision"]
     revision = f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
     head = db.execute("SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1").fetchone()
-    require(head == (pin["indexGeneration"], pin["indexRevision"]),
+    # Native N answers the CLI; a following semantic S may already be the head.
+    require(head[0] == pin["indexGeneration"] and head[1] in (pin["indexRevision"], pin["indexRevision"] + 1),
             f"{size}: CLI pin differs from durable index_metadata")
     require(db.execute("SELECT count(*) FROM native_revisions WHERE id=?", (revision,)).fetchone()[0] == 1,
             f"{size}: missing selected revision header")
@@ -655,7 +670,7 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# schema-37 tables, immutable surrogate keys, and current pin normalization.
+# schema-40 tables, immutable surrogate keys, and current pin normalization.
 # Match tests/daemon/cli.rs: check FTS shadow inventory, compare logical corpus cells.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
@@ -680,8 +695,13 @@ semantic_reference_candidates semantic_call_bindings semantic_call_candidates
 semantic_call_possible_dispatch semantic_call_join_candidates semantic_type_relationships
 semantic_raw_batches semantic_raw_captures semantic_raw_exclusions semantic_revision_raw_selections
 semantic_raw_proofs semantic_raw_documents semantic_import_reports semantic_reimport
+semantic_projection_origins semantic_projection_documents semantic_projection_dependencies
+semantic_projection_contexts semantic_projection_lookup_dependencies
+semantic_pending_target semantic_pending_selections semantic_catchup_commits
 """.split())
 CONTROL_TABLES = {"native_revision_supersessions", "native_binding_epoch", "revision_producer_bindings"}
+# Witness caches depend on prior work, not published evidence; check their schema only.
+DERIVED_CACHE_TABLES = {"semantic_batch_witnesses", "semantic_batch_witness_documents"}
 FTS_SHADOW_TABLES = {"head_search_fts_config", "head_search_fts_content", "head_search_fts_data",
                      "head_search_fts_docsize", "head_search_fts_idx"}
 DEBT_TABLES = {"native_revision_release_debt", "native_release_candidate_versions",
@@ -708,7 +728,9 @@ def selected_where(table):
         return "? IS NOT NULL"
     elif table in {"revision_capture_inputs", "revision_documents", "semantic_revision_producers",
                    "semantic_requested_producers", "semantic_requested_producer_languages",
-                   "semantic_coverage", "semantic_revision_raw_selections", "semantic_reimport"}:
+                   "semantic_coverage", "semantic_revision_raw_selections", "semantic_reimport",
+                   "semantic_projection_origins", "semantic_projection_documents",
+                   "semantic_pending_target", "semantic_pending_selections", "semantic_catchup_commits"}:
         return "revision_id=?"
     elif table == "native_source_sets":
         return "id=(SELECT source_set_id FROM native_revisions WHERE id=?)"
@@ -734,7 +756,9 @@ def selected_where(table):
     elif table in {"semantic_coverage_roles", "semantic_coverage_reasons", "semantic_basis",
                    "semantic_provenance",
                    "semantic_symbols", "semantic_declaration_bindings", "semantic_references",
-                   "semantic_call_bindings", "semantic_type_relationships"}:
+                   "semantic_call_bindings", "semantic_type_relationships",
+                   "semantic_projection_dependencies", "semantic_projection_contexts",
+                   "semantic_projection_lookup_dependencies"}:
         return f"tuple_id IN ({selected})"
     elif table in {"semantic_basis_lookup_dependencies"}:
         return f"basis_id IN (SELECT basis_id FROM semantic_basis WHERE tuple_id IN ({selected}))"
@@ -756,7 +780,13 @@ def selected_where(table):
                 "JOIN semantic_revision_raw_selections current ON current.batch_id=r.batch_id "
                 "AND current.producer_id=r.producer_id "
                 "WHERE current.revision_id=? AND r.revision_id=selected.revision_id "
-                "AND r.producer_id=selected.producer_id)")
+                "AND r.producer_id=selected.producer_id) "
+                # Native-first N and S carry the same report forward: keep the import's own.
+                "AND NOT EXISTS(SELECT 1 FROM semantic_import_reports earlier "
+                "JOIN native_revisions e ON e.id=earlier.revision_id "
+                "JOIN native_revisions this ON this.id=selected.revision_id "
+                "WHERE earlier.producer_id=selected.producer_id AND earlier.report_json=selected.report_json "
+                "AND e.published_index_revision<this.published_index_revision)")
     else:
         raise RuntimeError(f"unclassified schema-{SCHEMA_VERSION} selected table: {table}")
 
@@ -771,13 +801,13 @@ def parity_digest(db, revision, physical_root):
     require(db.execute("PRAGMA foreign_key_check").fetchone() is None, "retained evidence foreign-key violation")
     tables = {row[0] for row in db.execute("""SELECT name FROM sqlite_master WHERE type='table'
         AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' AND name NOT LIKE '%trigrams%'""")}
-    expected_tables = REQUIRED_TABLES | CONTROL_TABLES | FTS_SHADOW_TABLES
+    expected_tables = REQUIRED_TABLES | CONTROL_TABLES | FTS_SHADOW_TABLES | DERIVED_CACHE_TABLES
     require(tables == expected_tables,
             f"schema{SCHEMA_VERSION} selected inventory mismatch: missing={expected_tables-tables}, "
             f"extra={tables-expected_tables}")
     output = {}
     # FTS shadow segment bytes depend on publication history, not selected output.
-    for table in sorted(tables - CONTROL_TABLES - DEBT_TABLES - FTS_SHADOW_TABLES):
+    for table in sorted(tables - CONTROL_TABLES - DEBT_TABLES - FTS_SHADOW_TABLES - DERIVED_CACHE_TABLES):
         where = selected_where(table)
         columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
         require(columns, f"empty table schema: {table}")
@@ -1044,10 +1074,13 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
     require(sha_file(workspace / anchor) == expected, "full r2 changed frozen anchor")
     output = command([str(binary), "index", "--workspace", str(workspace)], env=env_for(daemon.home))
     full = json.loads(output)["publishedRevision"]
-    r2 = f"pin:v1:{full['indexGeneration']}:{full['indexRevision']}"
+    native_r2 = f"pin:v1:{full['indexGeneration']}:{full['indexRevision']}"
+    r2 = wait_caught_up(daemon.home)
     with closing(sqlite3.connect(f"file:{db_for(daemon.home)}?mode=ro", uri=True)) as db:
         selected_proof(db, r2, anchor.as_posix(), artifact)
         published(db, output, size)
+    require(r2 in (native_r2, f"pin:v1:{full['indexGeneration']}:{full['indexRevision'] + 1}"),
+            "semantic catch-up must pair with native r2")
     require(r2 not in (r1, imported), "untimed full r2 must publish a new selected pin")
     with closing(sqlite3.connect(f"file:{db_for(daemon.home)}?mode=ro", uri=True)) as db:
         native_ids = db.execute("SELECT native_revision_id FROM native_revisions WHERE id IN (?,?)",
@@ -1060,7 +1093,7 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
 
 
 class SelectedView:
-    """Closed schema-37 view retaining all selected columns plus input-closure digests."""
+    """Closed schema-40 view retaining all selected columns plus input-closure digests."""
     def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
         self.physical_root = physical_root.resolve(strict=True)
@@ -1078,6 +1111,10 @@ class SelectedView:
                     "region": {}, "class": {}, "class-ref": {}, "graph-node": {},
                     "tuple": {}, "basis": {}, "batch": {}, "capture": {}, "proof": {},
                     "provenance": {}, "symbol": {}, "binding": {}}
+        # A native-first semantic S names the native N it caught up; both runs have one.
+        for (target,) in db.execute(
+                "SELECT target_revision_id FROM semantic_catchup_commits WHERE revision_id=?", (revision,)):
+            self.ids["pin"][target] = "<catch-up-native-pin>"
         self.r1 = None
         for language, path, vid, gid, cid in db.execute(
                 "SELECT language,path,vid,gid,cid FROM revision_documents WHERE revision_id=?",
@@ -1176,9 +1213,13 @@ class SelectedView:
             self.ids["capture"][capture] = (producer, artifact, ordinal, tuple(r1_doc))
             self.capture_descriptor = descriptor
             self.capture_pin = captured_pin
+            # Native-first N and S carry the import's report forward; the import pin is the
+            # earliest revision that holds it.
             imported = db.execute("""SELECT r.revision_id FROM semantic_revision_raw_selections r
                 JOIN semantic_import_reports i ON i.revision_id=r.revision_id AND i.producer_id=r.producer_id
-                WHERE r.batch_id=? AND r.producer_id=?""", (batch, producer)).fetchall()
+                JOIN native_revisions n ON n.id=r.revision_id
+                WHERE r.batch_id=? AND r.producer_id=?
+                ORDER BY n.published_index_revision LIMIT 1""", (batch, producer)).fetchall()
             require(len(imported) == 1 and imported[0][0] != revision,
                     "selected batch has no unique imported report pin")
             self.ids["pin"][imported[0][0]] = "<import-pin>"
@@ -1214,10 +1255,10 @@ class SelectedView:
                     "(SELECT tuple_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
                 self.ids["binding"][raw] = (table, self.ids["tuple"][tuple_id], ordinal)
 
-    def map(self, family, value):
+    def map(self, family, value, where=None):
         if value is None:
             return None
-        require(value in self.ids[family], f"unmapped {family} identity: {value!r}")
+        require(value in self.ids[family], f"unmapped {family} identity: {value!r} in {where}")
         return (family, self.ids[family][value])
 
     def embedded(self, value):
@@ -1268,6 +1309,9 @@ class SelectedView:
                     "native source set is not tied to root identity")
             cells["root_id"] = "<physical-root>"
             cells["id"] = self.map("source-set", cells["id"])
+        if table == "semantic_pending_target":
+            require(cells["root_id"] == self.root_id, "pending target belongs to another root")
+            cells["root_id"] = "<physical-root>"
         if table == "native_revisions":
             inventory = json.loads(cells["source_inventory"])
             require(len(inventory) == len(self.docs), "selected native inventory is incomplete")
@@ -1339,7 +1383,7 @@ class SelectedView:
                 family = column.removesuffix("_id") if column.endswith("_id") else column
             elif column == "source_set_id":
                 family = "source-set"
-            elif column in ("revision_id", "captured_pin") or (table == "native_revisions" and column == "id"):
+            elif column in ("revision_id", "captured_pin", "basis_pin", "target_revision_id") or (table == "native_revisions" and column == "id"):
                 family = "pin"
             elif column in ("native_revision_id", "captured_revision", "captured_native_revision_id",
                             "join_native_revision_id", "internal_native_revision_id",
@@ -1370,7 +1414,7 @@ class SelectedView:
             elif table == "class_relations" and column == "id":
                 family = "class-ref"
             if family:
-                cells[column] = self.map(family, value)
+                cells[column] = self.map(family, value, f"{table}.{column}")
         return cells
 
 
@@ -1452,6 +1496,7 @@ def main():
                 "before_requests": before, "start": started, "start_wall_ms": wall,
                 "expected_revision": f"{generation}:{int(number)+1}"})
             require(local["publication_mode"] == "local", "smoke edit did not publish LOCAL")
+            local["revision"] = wait_caught_up(home)
             with closing(sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)) as db:
                 selected_proof(db, local["revision"], anchor.as_posix(), artifact)
                 check_changed_source(db, local["revision"], relative.as_posix(),

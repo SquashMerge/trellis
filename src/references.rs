@@ -28,7 +28,7 @@ pub struct DocumentInput {
     pub file: SourceFile,
     pub declarations: Vec<Declaration>,
     pub calls: Vec<Call>,
-    /// The fresh semantic evidence of this document's selected producer (#523).
+    /// Selected current or explicitly labelled historical producer evidence.
     pub semantic: DocumentSemantic,
 }
 pub struct Snapshot {
@@ -40,9 +40,8 @@ pub struct Snapshot {
     pub evidence_gaps: BTreeMap<DocumentKey, &'static str>,
 }
 
-/// Fresh bindings of one document under its language's selected producer (#483, #523).
-/// Only fresh rows of a selected, complete or partial coverage tuple are admitted; stale
-/// evidence is left out, so the document falls back to structural syntax evidence.
+/// Selected producer evidence: current fresh bindings or an authorized historical overlay.
+/// Historical outcomes retain P authority and cannot be re-resolved against native N.
 #[derive(Debug, Default, Clone)]
 pub struct DocumentSemantic {
     /// The selected producer, when the document has a usable coverage tuple.
@@ -53,6 +52,11 @@ pub struct DocumentSemantic {
     pub anchors: Vec<SemanticAnchor>,
     /// Fresh `extends`/`implements` relationships whose source is declared here.
     pub relationships: Vec<SemanticRelationship>,
+    /// Native-N selection of a validated historical semantic basis, or explicit pending.
+    pub projection: Option<crate::model::SemanticProjection>,
+    /// The original coverage status, including unavailable/not-requested evidence.
+    pub coverage_state: Option<String>,
+    pub boundary: bool,
 }
 
 /// One bound name or call in a document.
@@ -68,6 +72,7 @@ pub struct SemanticAnchor {
     pub direct: bool,
     pub outcome: SemanticOutcome,
     pub provenance_id: String,
+    pub metadata: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +84,8 @@ pub enum SemanticOutcome {
     External,
     Ambiguous,
     Unresolved,
+    /// An endpoint is not eligible against native N; never resolve it by spelling.
+    Boundary,
 }
 
 /// A fresh semantic type relationship from a declaration of this document.
@@ -90,6 +97,7 @@ pub struct SemanticRelationship {
     /// The internal target, or `None` for an external one.
     pub target: Option<(usize, String)>,
     pub provenance_id: String,
+    pub metadata: BTreeMap<String, Value>,
 }
 #[derive(Debug)]
 pub struct Projection {
@@ -122,12 +130,14 @@ pub struct ReferenceBase {
     sources: Vec<Option<SourceReferences>>,
     /// Language to selected producer.
     producers: BTreeMap<String, String>,
+    semantic_documents: Vec<Value>,
     /// The most sites each edge keeps; `select` samples at most this many.
     sample_limit: usize,
     work_used: usize,
 }
 /// One source document's resolved sites.
 struct SourceReferences {
+    projection: Option<crate::model::SemanticProjection>,
     /// (target, test) -> (sites, semantic sites, samples)
     edges: BTreeMap<(Target, bool), (usize, usize, Vec<Site>)>,
     unresolved: Vec<(Site, &'static str)>,
@@ -161,6 +171,8 @@ struct Site {
     mapping: &'static str,
     /// The semantic binding's provenance; null for structural sites.
     provenance_id: Option<String>,
+    #[serde(flatten)]
+    semantic_metadata: BTreeMap<String, Value>,
 }
 #[derive(Clone, Serialize)]
 struct Lines {
@@ -530,6 +542,7 @@ fn resolve(
             request.check()?;
             merge_work(&mut rust.work, work.used, check)?;
             let mut found = SourceReferences {
+                projection: doc.semantic.projection.clone(),
                 edges: BTreeMap::new(),
                 unresolved: Vec::new(),
                 proof: BTreeSet::new(),
@@ -546,7 +559,11 @@ fn resolve(
             {
                 check()?;
                 let anchor = anchor.map(|index| &doc.semantic.anchors[index]);
+                let historical = doc.semantic.projection.is_some();
                 let structural = match &raw {
+                    // Historical claims cannot be resolved against N by spelling. Any
+                    // independent structural fallback must remain explicitly native-N.
+                    Some(_) if historical && anchor.is_some() => None,
                     None => None,
                     Some(_) if site.owner_syntax_id.is_none() => {
                         Some(SiteResolution::unknown("reference_owner_ambiguous"))
@@ -594,6 +611,7 @@ fn resolve(
                         let anchor = anchor.expect("semantic resolution has an anchor");
                         site.mapping = "semantic";
                         site.provenance_id = Some(anchor.provenance_id.clone());
+                        site.semantic_metadata = anchor.metadata.clone();
                         resolution
                     }
                     (None, Some(resolution)) => resolution,
@@ -652,6 +670,18 @@ fn resolve(
         modules,
         sources,
         producers,
+        semantic_documents: docs
+            .iter()
+            .filter_map(|doc| {
+                doc.semantic.projection.as_ref().map(|projection| {
+                    json!({
+                        "producerId":doc.semantic.producer_id,"language":doc.key.language,
+                        "path":doc.key.path,"projection":projection,
+                        "coverageState":doc.semantic.coverage_state,"boundary":doc.semantic.boundary
+                    })
+                })
+            })
+            .collect(),
         sample_limit,
         work_used: rust.work.used,
     })
@@ -736,8 +766,14 @@ impl ReferenceBase {
                     n if n == count => "semantic",
                     _ => "mixed",
                 };
-                let edge = json!({"source":identities[source],"target":target,"count":count,
+                let mut edge = json!({"source":identities[source],"target":target,"count":count,
                     "sites":sampled,"omittedSites":omitted,"evidenceTier":tier,"semanticSites":semantic});
+                // The edge itself is detachable even when sampling omits other sites.
+                if *semantic > 0
+                    && let Some(projection) = &found.projection
+                {
+                    edge["projection"] = json!(projection);
+                }
                 if *test {
                     tests.push(edge);
                 } else {
@@ -767,7 +803,7 @@ impl ReferenceBase {
         if self.producers.is_empty() {
             limitations.push("No selected semantic producer has fresh bindings for these documents; every site is structural syntax evidence.");
         } else {
-            limitations.push("Semantic sites use fresh bindings of each language's selected producer: a site's final name or callee, measured calls and type references with an exact internal target in this snapshot. Bindings outside the checkout resolve a site without naming a package; stale, unselected or missing bindings fall back to structural evidence, and calls the producer did not bind are not counted.");
+            limitations.push("Semantic sites use selected producer bindings. Historical basis-P sites retain their original claims and proof basis, never fresh or current absence. Pending endpoints stop semantic traversal; independent structural sites describe captured native-N syntax only.");
         }
         let semantic_producers: Vec<_> = self
             .producers
@@ -780,6 +816,8 @@ impl ReferenceBase {
                 "referencesVersion":"references:v2","indexGeneration":self.pin.index_generation.to_string(),
                 "indexRevision":self.pin.index_revision,"evidenceTier":if semantic_sites > 0 { "mixed" } else { "syntax" },"semanticComplete":false,
                 "semanticProducers":semantic_producers,
+                "semanticDocuments":self.semantic_documents,
+                "partial":!self.semantic_documents.is_empty(),
                 "modules":emitted_modules,"externalPackages":external_packages.into_values().collect::<Vec<_>>(),"production":production,"tests":tests,"unresolved":unresolved,
                 "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len(),"semanticSites":semantic_sites},
                 "partialFiles":self.partial_files,
@@ -798,14 +836,24 @@ fn semantic_resolution(
     structural: Option<&SiteResolution>,
     locate: &impl Fn(usize, &str) -> Option<usize>,
 ) -> Option<SiteResolution> {
+    let historical = anchor.metadata.contains_key("projection");
     match &anchor.outcome {
+        SemanticOutcome::Boundary => Some(SiteResolution::unknown("semantic_endpoint_catching_up")),
+        SemanticOutcome::External if historical => {
+            Some(SiteResolution::unknown("historical_external_claim"))
+        }
+        SemanticOutcome::Ambiguous | SemanticOutcome::Unresolved if historical => {
+            Some(SiteResolution::unknown("historical_resolution_unproven"))
+        }
         // A target outside this snapshot is stale: the structural result stands.
-        SemanticOutcome::Internal(document, sid) => {
-            locate(*document, sid).map(|target| SiteResolution {
+        SemanticOutcome::Internal(document, sid) => locate(*document, sid)
+            .map(|target| SiteResolution {
                 targets: BTreeSet::from([Target::Native(target)]),
                 ..SiteResolution::default()
             })
-        }
+            .or_else(|| {
+                historical.then(|| SiteResolution::unknown("semantic_endpoint_catching_up"))
+            }),
         // A proved package target says more than a binding outside the checkout.
         SemanticOutcome::External => structural
             .is_none_or(|resolution| resolution.targets.is_empty())
@@ -886,6 +934,7 @@ impl SiteContext<'_> {
             call_id,
             mapping: "structural",
             provenance_id: None,
+            semantic_metadata: BTreeMap::new(),
         })
     }
 }
@@ -959,12 +1008,16 @@ fn prepare_file(
         )?;
         let mut anchor: Option<usize> = None;
         let mut invocation: Option<usize> = None;
+        let mut historical_anchor: Option<usize> = None;
         for (_, indexes) in anchors_by_start.range(item.start..item.end) {
             for &index in indexes {
                 owner_step(&mut work, check)?;
                 let candidate = &anchors[index];
                 if candidate.range.end <= item.end {
                     consumed[index] = true;
+                    if candidate.metadata.contains_key("projection") {
+                        historical_anchor = historical_anchor.or(Some(index));
+                    }
                 } else if candidate.call_id.is_some() && candidate.range.start == item.start {
                     consumed[index] = true;
                     invocation = invocation.or(Some(index));
@@ -986,7 +1039,7 @@ fn prepare_file(
         sites.push(PreparedSite {
             raw: Some(item),
             site,
-            anchor: anchor.or(invocation),
+            anchor: anchor.or(invocation).or(historical_anchor),
         });
     }
     // Calls and type references with an internal target that no structural site covers
@@ -999,8 +1052,11 @@ fn prepare_file(
             if anchor.call_id.is_some() != calls_first
                 || consumed[index]
                 || !usable(anchor)
-                || !matches!(anchor.outcome, SemanticOutcome::Internal(..))
-                || (anchor.call_id.is_none() && !anchor.type_role)
+                || (!matches!(anchor.outcome, SemanticOutcome::Internal(..))
+                    && !anchor.metadata.contains_key("projection"))
+                || (anchor.call_id.is_none()
+                    && !anchor.type_role
+                    && !anchor.metadata.contains_key("projection"))
                 || !covered.insert((anchor.range.start, anchor.range.end))
             {
                 continue;
@@ -1329,6 +1385,57 @@ fn relative_path(source: &str, relative: &str) -> Option<String> {
         }
     }
     Some(parts.join("/"))
+}
+
+#[cfg(test)]
+mod historical_projection_tests {
+    use super::*;
+
+    fn anchor(outcome: SemanticOutcome) -> SemanticAnchor {
+        SemanticAnchor {
+            range: crate::native_evidence::Range { start: 0, end: 1 },
+            call_id: None,
+            type_role: true,
+            direct: false,
+            outcome,
+            provenance_id: "proof".into(),
+            metadata: BTreeMap::from([(
+                "projection".into(),
+                json!({"semanticStatus":"olderBasis"}),
+            )]),
+        }
+    }
+
+    #[test]
+    fn historical_unknown_and_external_claims_never_use_current_structural_targets() {
+        let structural = SiteResolution {
+            targets: BTreeSet::from([Target::Native(4)]),
+            ..SiteResolution::default()
+        };
+        for outcome in [
+            SemanticOutcome::Unresolved,
+            SemanticOutcome::Ambiguous,
+            SemanticOutcome::External,
+            SemanticOutcome::Boundary,
+        ] {
+            let result =
+                semantic_resolution(&anchor(outcome), Some(&structural), &|_, _| Some(4)).unwrap();
+            assert!(result.targets.is_empty());
+            assert!(result.residual.is_some());
+        }
+    }
+
+    #[test]
+    fn historical_internal_target_missing_from_native_is_a_boundary() {
+        let result = semantic_resolution(
+            &anchor(SemanticOutcome::Internal(1, "target".into())),
+            None,
+            &|_, _| None,
+        )
+        .unwrap();
+        assert!(result.targets.is_empty());
+        assert_eq!(result.residual, Some("semantic_endpoint_catching_up"));
+    }
 }
 
 #[cfg(test)]

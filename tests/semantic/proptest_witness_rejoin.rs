@@ -494,31 +494,126 @@ fn publish_local(
     let options = IndexOptions::new(world.root.clone());
     let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {})
         .map_err(|error| format!("{label}: capture failed: {error:#}"))?;
-    let leader = world
-        .store
-        .publication_for_tests()
-        .map_err(|error| format!("{label}: writer unavailable: {error:#}"))?;
+    let session = Arc::new(trellis::store::topology::WriterSession::writer(
+        world
+            .store
+            .publication_for_tests()
+            .map_err(|error| format!("{label}: writer unavailable: {error:#}"))?,
+    ));
     let before = world.store.index_baseline().unwrap();
-    let before_snapshot = world.store.semantic_at(before).ok();
-    world
+    let before_snapshot = world
         .store
-        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .semantic_at(before)
+        .map_err(|error| format!("{label}: prior semantic snapshot failed: {error:#}"))?;
+    let before_native = world
+        .store
+        .with_native_reader(before, |reader| Ok(reader.header()?.revision.id))
+        .map_err(|error| format!("{label}: prior native identity failed: {error:#}"))?;
+    let native = world
+        .store
+        .publish_local_for_tests(
+            &options,
+            &capture,
+            session.writer_guard().unwrap(),
+            &world.cancel,
+        )
         .map_err(|error| format!("{label}: LOCAL publication failed: {error:#}"))?;
-    let bytes = fs::read(counts)
-        .map_err(|error| format!("{label}: work counts missing after publish: {error}"))?;
-    let work: Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("{label}: work counts unreadable: {error}"))?;
-    stats.steps += 1;
-    check_publication(&work, label, expected_reusable, stats)?;
-    // Publication is atomic: a revision that already existed still reads the same rows.
-    if let Some(snapshot) = before_snapshot
-        && let Ok(after) = world.store.semantic_at(before)
-        && after != snapshot
+    let native_identity = world
+        .store
+        .with_native_reader(native, |reader| Ok(reader.header()?.revision.id))
+        .map_err(|error| format!("{label}: N native identity failed: {error:#}"))?;
+    assert_eq!(before_snapshot.producers.len(), 1);
+    let selected_producer = before_snapshot.producers[0].id.clone();
+    let projections = || {
+        capture
+            .files
+            .iter()
+            .map(|file| {
+                world.store.semantic_projection_at(
+                    native,
+                    &selected_producer,
+                    &file.language,
+                    &file.path,
+                )
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+    };
+    let native_projections =
+        projections().map_err(|error| format!("{label}: N projection failed: {error:#}"))?;
+    let raw_identity = || {
+        world.store.selected_raw_inputs_at(native).map(|inputs| {
+            inputs
+                .into_iter()
+                .map(|input| (input.producer_id, input.batch_id, input.captured_pin))
+                .collect::<Vec<_>>()
+        })
+    };
+    let native_raw =
+        raw_identity().map_err(|error| format!("{label}: N raw identity failed: {error:#}"))?;
+    let source_path = &capture.files[0].path;
+    let native_source = world
+        .store
+        .source_at(source_path, Some(native))
+        .map_err(|error| format!("{label}: N source failed: {error:#}"))?
+        .unwrap();
+    if native_source.1.text != capture.files[0].text {
+        return Err(format!("{label}: N did not publish captured source bytes"));
+    }
+    if world.store.index_baseline().unwrap() != native {
+        return Err(format!("{label}: head moved before S"));
+    }
+    let completed = world
+        .store
+        .complete_pending_semantic_for_tests(native, &session, &world.cancel)
+        .map_err(|error| format!("{label}: bounded semantic completion failed: {error:#}"))?;
+    if projections().map_err(|error| format!("{label}: retained N projection failed: {error:#}"))?
+        != native_projections
+        || world
+            .store
+            .source_at(source_path, Some(native))
+            .unwrap()
+            .unwrap()
+            != native_source
+        || world.store.semantic_at(before).unwrap() != before_snapshot
+        || raw_identity()
+            .map_err(|error| format!("{label}: retained N raw identity failed: {error:#}"))?
+            != native_raw
     {
         return Err(format!(
-            "{label}: an already published revision changed after a later publication"
+            "{label}: a retained P or N changed after semantic completion"
         ));
     }
+    stats.steps += 1;
+    let Some(semantic) = completed else {
+        if native_identity != before_native
+            || world.store.semantic_at(native).unwrap() != before_snapshot
+        {
+            return Err(format!(
+                "{label}: no-target publication changed native or semantic authority"
+            ));
+        }
+        return Ok(());
+    };
+    if !native_projections.iter().any(Option::is_some) {
+        return Err(format!(
+            "{label}: native movement did not record semantic projections"
+        ));
+    }
+    let semantic_identity = world
+        .store
+        .with_native_reader(semantic, |reader| Ok(reader.header()?.revision.id))
+        .map_err(|error| format!("{label}: S native identity failed: {error:#}"))?;
+    if semantic_identity != native_identity {
+        return Err(format!("{label}: S recaptured native identity"));
+    }
+    let bytes = fs::read(counts)
+        .map_err(|error| format!("{label}: work counts missing after semantic publish: {error}"))?;
+    let work: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{label}: work counts unreadable: {error}"))?;
+    if work["indexPin"] != serde_json::to_value(semantic).unwrap() {
+        return Err(format!("{label}: work counts do not belong to S: {work}"));
+    }
+    check_publication(&work, label, expected_reusable, stats)?;
     Ok(())
 }
 

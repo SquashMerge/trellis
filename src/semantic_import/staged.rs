@@ -40,12 +40,14 @@ use serde::Serialize;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     rc::{Rc, Weak},
     sync::atomic::Ordering,
 };
 
 mod claim_size;
+mod continuation;
+pub(crate) use continuation::JoinContinuation;
 pub(crate) mod codec;
 pub(super) mod group_size;
 pub(super) mod heap;
@@ -54,6 +56,9 @@ pub(crate) mod publication;
 mod settle;
 pub(super) mod sizes;
 mod streaming;
+
+mod witness;
+
 pub(super) mod target_size;
 use live::{LiveBudget, Reservation};
 
@@ -116,9 +121,111 @@ pub(super) struct JoinCtx<'a> {
     cancel: CancelFlag,
     /// Whether a source of a language was not read (#576), by revision side and language.
     unread: RefCell<BTreeMap<(u8, String), bool>>,
+    /// This unit's proof identities by proof ID ([`JoinCtx::proof_row`]).
+    proofs: RefCell<ProofMemo>,
 }
 
+/// Proof identities one join unit has read, and the live reservation that owns their storage.
+#[derive(Default)]
+pub(super) struct ProofMemo {
+    rows: HashMap<String, Option<Rc<ProofRow>>>,
+    owner: Option<Reservation>,
+}
+
+impl ProofMemo {
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The retained storage of one entry: its key, its row and strings, the `Rc` box, and two
+    /// table slots, since a hash table holds up to twice its entries' capacity.
+    fn entry_bytes(proof_id: &str, row: Option<&ProofRow>) -> Result<u64> {
+        let row = row.map_or(Ok(0), |row| {
+            sizes::sum(&[
+                std::mem::size_of::<ProofRow>() as u64 + 2 * std::mem::size_of::<usize>() as u64,
+                row.language.len() as u64,
+                row.path.len() as u64,
+                row.record_kind.len() as u64,
+                row.fact_digest.len() as u64,
+                row.artifact_hash.len() as u64,
+            ])
+        })?;
+        sizes::sum(&[
+            proof_id.len() as u64,
+            row,
+            sizes::map_entries::<String, Option<Rc<ProofRow>>>(2)?,
+        ])
+    }
+}
+
+/// One staged proof identity (`proof_identities`) with its source and artifact.
+pub(super) struct ProofRow {
+    pub(super) language: String,
+    pub(super) path: String,
+    pub(super) record_kind: String,
+    pub(super) fact_digest: String,
+    pub(super) artifact_hash: String,
+    pub(super) claim_id: i64,
+    pub(super) capture_id: Option<i64>,
+}
+
+/// Proof identities one unit keeps in [`JoinCtx::proofs`]; a fuller memo is cleared.
+const PROOF_MEMO_ENTRIES: usize = 16_384;
+
 impl JoinCtx<'_> {
+    /// The staged proof identity with `proof_id`, if any. Settling one document looks up each
+    /// of its proofs several times (provenance, check, validation, claim ID); the stage's
+    /// identities do not change during a join, so a unit reads each once. Proof IDs are unique
+    /// across `claims` and `witness_proofs` (`check_proof_identity_closure`).
+    fn proof_row(&self, proof_id: &str) -> Result<Option<Rc<ProofRow>>> {
+        if let Some(found) = self.proofs.borrow().rows.get(proof_id) {
+            return Ok(found.clone());
+        }
+        let found = self
+            .conn
+            .prepare_cached(
+                "SELECT s.language,s.path,p.record_kind,p.fact_digest,a.sha256,p.claim_id,p.capture_id \
+                 FROM proof_identities p JOIN sources s ON s.ord=p.source_ord \
+                 JOIN artifacts a ON a.ordinal=p.artifact WHERE p.proof_id=?1",
+            )?
+            .query_row([proof_id], |row| {
+                Ok(ProofRow {
+                    language: row.get(0)?,
+                    path: row.get(1)?,
+                    record_kind: row.get(2)?,
+                    fact_digest: row.get(3)?,
+                    artifact_hash: row.get(4)?,
+                    claim_id: row.get(5)?,
+                    capture_id: row.get(6)?,
+                })
+            })
+            .optional()?
+            .map(Rc::new);
+        let mut memo = self.proofs.borrow_mut();
+        if memo.rows.len() >= PROOF_MEMO_ENTRIES {
+            // A new table: clearing would keep the old capacity, which the release frees.
+            *memo = ProofMemo::default();
+        }
+        // The memo is optional: an identity it cannot admit under the unit's live budget is
+        // returned without being retained.
+        let bytes = ProofMemo::entry_bytes(proof_id, found.as_deref())?;
+        let admitted = match memo.owner.as_mut() {
+            Some(owner) => owner.grow(bytes).is_ok(),
+            None => match self.live.reserve(bytes) {
+                Ok(owner) => {
+                    memo.owner = Some(owner);
+                    true
+                }
+                Err(_) => false,
+            },
+        };
+        if admitted {
+            memo.rows.insert(proof_id.to_owned(), found.clone());
+        }
+        Ok(found)
+    }
+
     /// Cached groups also retain their unit reservation. On pressure, discard cache ownership;
     /// live callers keep the group and its charge until their last Rc drops.
     fn reserve_native(&self, bytes: u64) -> Result<Reservation> {
@@ -197,8 +304,12 @@ const DUPLICATE_SYMBOL_KEY: &str = "duplicate semantic symbol key";
 const OUTPUT_CHECK_ROWS: u64 = 10_000;
 
 fn stage_bytes(conn: &Connection) -> Result<u64> {
-    let pages: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-    let size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let pages: i64 = conn
+        .prepare_cached("PRAGMA page_count")?
+        .query_row([], |row| row.get(0))?;
+    let size: i64 = conn
+        .prepare_cached("PRAGMA page_size")?
+        .query_row([], |row| row.get(0))?;
     Ok(u64::try_from(pages)?.saturating_mul(u64::try_from(size)?))
 }
 
@@ -812,6 +923,47 @@ impl<'a> StagedSide<'a> {
         Ok((claim, claim_id))
     }
 
+    fn proof_identity(
+        &self,
+        proof: &str,
+        kind: &str,
+        digest: &str,
+    ) -> Result<(RawClaimDocument, i64)> {
+        if self.local_claims.is_some() {
+            let (claim, id) = self.local_claim(proof, kind, digest)?;
+            return Ok((
+                RawClaimDocument {
+                    language: claim.language.clone(),
+                    path: claim.envelope.relative_path.clone(),
+                    artifact_hash: claim.artifact_hash.clone(),
+                },
+                id,
+            ));
+        }
+        let found = self
+            .ctx
+            .proof_row(proof)?
+            .filter(|row| row.record_kind == kind && row.fact_digest == digest)
+            .map(|row| {
+                (
+                    RawClaimDocument {
+                        language: row.language.clone(),
+                        path: row.path.clone(),
+                        artifact_hash: row.artifact_hash.clone(),
+                    },
+                    row.claim_id,
+                )
+            });
+        let (claim, id) = found.ok_or(ScipCaptureError::MissingProof)?;
+        anyhow::ensure!(
+            self.document
+                .as_ref()
+                .is_none_or(|doc| doc.language == claim.language && doc.path == claim.path),
+            "foreign witness proof"
+        );
+        Ok((claim, id))
+    }
+
     fn proof_filter(&self) -> &'static str {
         if self.filtered { ELIGIBLE_JOIN } else { "" }
     }
@@ -1088,25 +1240,34 @@ impl ProofIdentities for StagedSide<'_> {
                 }
             }));
         }
-        let sql = format!(
-            "SELECT s.language, s.path, c.record_kind, c.fact_digest, a.sha256 FROM claims c \
-             JOIN sources s ON s.ord=c.source_ord JOIN artifacts a ON a.ordinal=c.artifact {} WHERE c.proof_id=?1",
-            self.proof_filter()
-        );
-        let proof = self
-            .ctx
-            .conn
-            .prepare_cached(&sql)?
-            .query_row([proof_id], |row| {
-                Ok(ProofRef {
-                    language: row.get(0)?,
-                    path: row.get(1)?,
-                    record_kind: row.get(2)?,
-                    fact_digest: row.get(3)?,
-                    artifact_hash: row.get(4)?,
+        let proof = if self.filtered {
+            let sql = format!(
+                "SELECT s.language, s.path, c.record_kind, c.fact_digest, a.sha256 FROM proof_identities c \
+                 JOIN sources s ON s.ord=c.source_ord JOIN artifacts a ON a.ordinal=c.artifact {} WHERE c.proof_id=?1",
+                self.proof_filter()
+            );
+            self.ctx
+                .conn
+                .prepare_cached(&sql)?
+                .query_row([proof_id], |row| {
+                    Ok(ProofRef {
+                        language: row.get(0)?,
+                        path: row.get(1)?,
+                        record_kind: row.get(2)?,
+                        fact_digest: row.get(3)?,
+                        artifact_hash: row.get(4)?,
+                    })
                 })
+                .optional()?
+        } else {
+            self.ctx.proof_row(proof_id)?.map(|row| ProofRef {
+                language: row.language.clone(),
+                path: row.path.clone(),
+                record_kind: row.record_kind.clone(),
+                fact_digest: row.fact_digest.clone(),
+                artifact_hash: row.artifact_hash.clone(),
             })
-            .optional()?;
+        };
         Ok(proof.filter(|proof| {
             self.document.as_ref().is_none_or(|document| {
                 document.language == proof.language && document.path == proof.path
@@ -1355,7 +1516,7 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
     for table in ["nat_docs", "nat_done"] {
         conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev])?;
     }
-    conn.execute_batch("BEGIN")?;
+    conn.execute_batch(crate::semantic_batch::staging::UNIT_BEGIN)?;
     let outcome = (|| -> Result<()> {
         let mut stream = reader.inventory()?;
         let mut ord = 0i64;
@@ -1378,11 +1539,11 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
     })();
     match outcome {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(crate::semantic_batch::staging::UNIT_COMMIT)?;
             Ok(())
         }
         Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(crate::semantic_batch::staging::UNIT_ROLLBACK);
             for table in ["nat_docs", "nat_done"] {
                 let _ = conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev]);
             }
@@ -1394,11 +1555,11 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
 /// Runs one pass in a single stage transaction. The stage has no journal, so a failed pass
 /// commits what it wrote rather than rolling back; the next attempt clears every join table.
 fn in_transaction<T>(conn: &Connection, pass: impl FnOnce() -> Result<T>) -> Result<T> {
-    conn.execute_batch("BEGIN")?;
+    conn.execute_batch(crate::semantic_batch::staging::UNIT_BEGIN)?;
     let result = pass();
-    let committed = conn.execute_batch("COMMIT");
-    if committed.is_err() && !conn.is_autocommit() {
-        let _ = conn.execute_batch("ROLLBACK");
+    let committed = conn.execute_batch(crate::semantic_batch::staging::UNIT_COMMIT);
+    if committed.is_err() {
+        let _ = conn.execute_batch(crate::semantic_batch::staging::UNIT_ROLLBACK);
     }
     let value = result?;
     committed?;
@@ -1412,9 +1573,8 @@ fn reset_for_destination(conn: &Connection, destination: IndexPin) -> Result<i64
     }
     let generation = destination.index_generation.to_string();
     let previous: Option<(String, i64)> = conn
-        .query_row("SELECT generation, revision FROM join_state", [], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
+        .prepare_cached("SELECT generation, revision FROM join_state")?
+        .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()?;
     if previous.as_ref() != Some(&(generation.clone(), destination.index_revision as i64)) {
         for table in ["nat_docs", "nat_done"] {
@@ -1437,9 +1597,9 @@ static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// together with the rows this attempt writes.
 fn retained_rows(conn: &Connection) -> Result<u64> {
     let mut total = 0u64;
-    let count = conn.query_row("SELECT COUNT(*) FROM nat_docs", [], |row| {
-        row.get::<_, i64>(0)
-    })?;
+    let count = conn
+        .prepare_cached("SELECT COUNT(*) FROM nat_docs")?
+        .query_row([], |row| row.get::<_, i64>(0))?;
     total = total
         .checked_add(u64::try_from(count)?)
         .ok_or_else(|| ScipCaptureError::LimitExceeded("staged rows".into()))?;
@@ -1466,6 +1626,7 @@ struct StagedJoin<'a> {
     identical_joins: Cell<bool>,
     identity_kind: &'static str,
     descriptor_sha256: &'a str,
+    witnessed: bool,
 }
 
 const COVERAGE: usize = 0;
@@ -2392,11 +2553,11 @@ impl StagedJoin<'_> {
         let requested: i64 = {
             let mut total = 0;
             for language in &languages {
-                total += conn.query_row(
-                    "SELECT COUNT(*) FROM nat_docs WHERE rev=?1 AND language=?2",
-                    params![self.destination.rev, language],
-                    |row| row.get::<_, i64>(0),
-                )?;
+                total += conn
+                    .prepare_cached("SELECT COUNT(*) FROM nat_docs WHERE rev=?1 AND language=?2")?
+                    .query_row(params![self.destination.rev, language], |row| {
+                        row.get::<_, i64>(0)
+                    })?;
             }
             total
         };
@@ -2494,7 +2655,8 @@ fn emit_ledger_diagnostic(ctx: &JoinCtx<'_>, lookup_steps: u64) {
     let pages = (|| -> Result<(u64, i64)> {
         let freelist: i64 = ctx
             .conn
-            .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+            .prepare_cached("PRAGMA freelist_count")?
+            .query_row([], |row| row.get(0))?;
         Ok((stage_bytes(ctx.conn)?, freelist))
     })();
     let line = serde_json::json!({
@@ -2531,6 +2693,40 @@ pub fn join_staged(
     cancel: &CancelFlag,
 ) -> Result<JoinedBatch> {
     let captured_pin = admitted.captured_pin();
+    join_staged_using(
+        admitted,
+        destination,
+        limits,
+        budget,
+        counters,
+        mutations,
+        cancel,
+        |body| {
+            if captured_pin == destination {
+                store.with_native_reader(captured_pin, |reader| body(reader, reader))
+            } else {
+                store.with_native_reader(captured_pin, |captured| {
+                    store.with_native_reader(destination, |reader| body(captured, reader))
+                })
+            }
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join_staged_using(
+    admitted: &mut AdmittedBatch,
+    destination: IndexPin,
+    limits: &BatchLimits,
+    budget: &mut LookupBudget,
+    counters: &mut BatchCounters,
+    mutations: DestinationMutations,
+    cancel: &CancelFlag,
+    with_readers: impl FnOnce(
+        &dyn Fn(&NativeReader<'_>, &NativeReader<'_>) -> Result<JoinedBatch>,
+    ) -> Result<JoinedBatch>,
+) -> Result<JoinedBatch> {
+    let captured_pin = admitted.captured_pin();
     let shared = captured_pin == destination;
     let parts = admitted.join_parts()?;
     let ctx = JoinCtx {
@@ -2554,6 +2750,7 @@ pub fn join_staged(
         },
         cancel: cancel.clone(),
         unread: RefCell::default(),
+        proofs: RefCell::default(),
     };
     let producer = parts.producer.producer();
     let body =
@@ -2622,6 +2819,7 @@ pub fn join_staged(
                 identical_joins: Cell::new(false),
                 identity_kind: descriptor.producer.identity_kind.as_str(),
                 descriptor_sha256: parts.descriptor_sha256,
+                witnessed: false,
             };
             let report = join.run()?;
             emit_ledger_diagnostic(&ctx, ctx.budget.borrow().used());
@@ -2637,13 +2835,7 @@ pub fn join_staged(
     let result = reset_for_destination(ctx.conn, destination).and_then(|attempt| {
         ctx.reserve_rows(RETAINED_SEED, retained_rows(ctx.conn)?)?;
         ctx.check_output()?;
-        if shared {
-            store.with_native_reader(captured_pin, |reader| body(attempt, reader, reader))
-        } else {
-            store.with_native_reader(captured_pin, |captured| {
-                store.with_native_reader(destination, |reader| body(attempt, captured, reader))
-            })
-        }
+        with_readers(&|captured, destination_reader| body(attempt, captured, destination_reader))
     });
     *budget = ctx.budget.into_inner();
     {

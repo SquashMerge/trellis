@@ -1327,11 +1327,8 @@ impl EvidenceResponse {
         });
         let mut external_omitted = 0;
         if let Some(producer) = exclude_external {
-            let semantic = self.mcp_call_semantics(
-                producer,
-                &owner.declaration.document.language,
-                measured.iter(),
-            )?;
+            let semantic =
+                self.mcp_call_semantics(producer, &owner.declaration.document, measured.iter())?;
             let mut index = 0;
             measured.retain(|_| {
                 let external = semantic.call(index).is_some_and(|call| {

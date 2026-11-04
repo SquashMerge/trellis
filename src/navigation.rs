@@ -483,6 +483,7 @@ mod tests {
             parent: None,
             accessor: false,
             provenance: Provenance {
+                projection: None,
                 source: "tree-sitter".into(),
                 semantic: SemanticState::Unavailable,
             },
