@@ -2229,11 +2229,11 @@ fn dispatch_connection(
             request.operation.as_str(),
             "index" | "semantic_import" | "producer_pickup" | "producer_run" | "producer_cancel"
         );
-        // Pauses a status read after activation, so a fixture can take
+        // Pauses a read-only request after activation, so a fixture can take
         // index-use contention before the selected read (#687).
         #[cfg(all(feature = "test-support", unix))]
-        let mut contention_fixture = std::env::var_os("TRELLIS_TEST_CLI_READ_CONTENTION_SOCKET")
-            .filter(|_| request.operation == "status");
+        let mut contention_fixture =
+            std::env::var_os("TRELLIS_TEST_CLI_READ_CONTENTION_SOCKET").filter(|_| replayable_read);
         #[cfg(all(feature = "test-support", unix))]
         if let Some(path) = &contention_fixture {
             use std::io::{Read, Write};
@@ -2425,28 +2425,32 @@ fn dispatch_connection(
                         .min(64 * 1024 * 1024);
                     #[cfg(not(feature = "test-support"))]
                     let limit = 64 * 1024 * 1024;
-                    let (body, _) = checkout.metrics_response(
-                        options,
-                        &mut || {
-                            if Instant::now() >= request_deadline {
-                                anyhow::bail!("deadline_exceeded");
-                            }
-                            Ok(())
-                        },
-                        registry::MetricsResponseHooks {
-                            before_work: &mut before_work,
-                            before_finish: &mut || {},
-                            after_finish: &mut || {},
-                            on_write: &mut on_write,
-                            on_progress: &mut on_progress,
-                        },
-                        limit,
-                    )?;
-                    let value = serde_json::from_slice(&body)?;
-                    if Instant::now() >= request_deadline {
-                        anyhow::bail!("deadline_exceeded");
-                    }
-                    Ok(value)
+                    // Errors become `selected`, so typed contention reaches the
+                    // shared bounded retry below instead of returning (#687).
+                    (|| {
+                        let (body, _) = checkout.metrics_response(
+                            options,
+                            &mut || {
+                                if Instant::now() >= request_deadline {
+                                    anyhow::bail!("deadline_exceeded");
+                                }
+                                Ok(())
+                            },
+                            registry::MetricsResponseHooks {
+                                before_work: &mut before_work,
+                                before_finish: &mut || {},
+                                after_finish: &mut || {},
+                                on_write: &mut on_write,
+                                on_progress: &mut on_progress,
+                            },
+                            limit,
+                        )?;
+                        let value = serde_json::from_slice(&body)?;
+                        if Instant::now() >= request_deadline {
+                            anyhow::bail!("deadline_exceeded");
+                        }
+                        Ok(value)
+                    })()
                 }
                 "index" => {
                     ensure!(
