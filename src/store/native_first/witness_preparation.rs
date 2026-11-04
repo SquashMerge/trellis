@@ -218,6 +218,10 @@ impl WitnessPreparation {
                 }
                 self.target_after = id;
             }
+            // Lookups charge the LOCAL target stage per MiB; each page and the last one also
+            // measure it, as well as the admitted stage.
+            target_stage.budget(limits).check()?;
+            self.lookup_unchecked = 0;
             if more {
                 budget.check()?;
                 return Ok(false);

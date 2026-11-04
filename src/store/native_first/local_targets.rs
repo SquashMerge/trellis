@@ -39,8 +39,32 @@ CREATE TABLE local_target_documents(pin TEXT NOT NULL,source_set TEXT NOT NULL,l
 CREATE TABLE local_target_declarations(pin TEXT NOT NULL,source_set TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,present INTEGER NOT NULL,kind TEXT,name TEXT,name_start INTEGER,name_end INTEGER,callable INTEGER,PRIMARY KEY(pin,source_set,language,path,syntax_id)) WITHOUT ROWID;
 ";
 
-/// Stage bytes charged for one cached lookup row.
+/// Fixed stage bytes charged for one cached lookup row, beyond its text and blob fields.
 const LOOKUP_STAGE_BYTES: u64 = 512;
+
+/// The stage bytes one cached lookup row may take: the fixed row cost plus twice its variable
+/// fields (record and index copies of the key, the declaration's kind and name).
+fn lookup_stage_bytes(
+    pin: IndexPin,
+    key: &DocumentKey,
+    sid: &[u8],
+    declaration: Option<&CurrentDeclaration>,
+) -> u64 {
+    let fields = [
+        semantic_pin_key(pin).len(),
+        key.source_set_id.len(),
+        key.language.len(),
+        key.path.len(),
+        sid.len(),
+        declaration.map_or(0, |d| d.kind.len()),
+        declaration
+            .and_then(|d| d.name.as_ref())
+            .map_or(0, String::len),
+    ]
+    .iter()
+    .fold(0u64, |total, len| total.saturating_add(*len as u64));
+    LOOKUP_STAGE_BYTES.saturating_add(fields.saturating_mul(2))
+}
 
 fn corrupt(message: &str) -> anyhow::Error {
     SelectedIntegrity(format!("incompatible_index: {message}")).into()
@@ -377,7 +401,10 @@ pub(crate) fn lookup(
     };
     let rows = declaration.is_some() as usize;
     put(conn, pin, key, vid, &encoded, declaration.as_ref(), limits)?;
-    stage.budget(limits).charge(unchecked, LOOKUP_STAGE_BYTES)?;
+    stage.budget(limits).charge(
+        unchecked,
+        lookup_stage_bytes(pin, key, &encoded, declaration.as_ref()),
+    )?;
     Ok(TargetLookup {
         declaration,
         rows,
@@ -487,14 +514,17 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
         (db, target, dir, stage)
     }
 
-
     #[test]
     fn local_target_lookup_charges_variable_payload_and_checks_stage_limit() {
         let (db, _target, _dir, mut stage) = fixture();
         let cancel = Arc::new(AtomicBool::new(false));
         initialize(&mut stage, pin(2)).unwrap();
         let name = "a".repeat(256 * 1024);
-        db.execute("UPDATE document_versions SET byte_length=?1 WHERE vid=1", [name.len() as i64 + 2]).unwrap();
+        db.execute(
+            "UPDATE document_versions SET byte_length=?1 WHERE vid=1",
+            [name.len() as i64 + 2],
+        )
+        .unwrap();
         db.execute("UPDATE native_version_declarations SET name=?1,name_start=1,name_end=?2,end_byte=?3 WHERE vid=1", params![name,name.len() as i64 + 1,name.len() as i64 + 2]).unwrap();
         let limits = BatchLimits {
             staging_bytes: stage.bytes() + 64 * 1024,
@@ -502,8 +532,22 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
             ..Default::default()
         };
         let sid = format!("sid:v1:{}", "1".repeat(32));
-        let result = lookup(&db, pin(1), &key(), &sid, &mut stage, &limits, &mut 0, &cancel);
-        assert!(result.is_err(), "lookup wrote {} stage bytes past {} limit without checking", stage.bytes(), limits.staging_bytes);
+        let result = lookup(
+            &db,
+            pin(1),
+            &key(),
+            &sid,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        );
+        assert!(
+            result.is_err(),
+            "lookup wrote {} stage bytes past {} limit without checking",
+            stage.bytes(),
+            limits.staging_bytes
+        );
     }
 
     #[test]
