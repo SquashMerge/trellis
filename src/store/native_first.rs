@@ -551,6 +551,9 @@ impl Store {
         }
         let db = self.cache_write()?;
         storage_result(db.pragma_update(None, "cache_size", -PUBLICATION_CACHE_KIB))?;
+        // Declared before the transaction so it drops after it: on an error or
+        // unwind the mark stays set until the rollback has released the lock.
+        let mut blocked = ReadersBlockedWatch::new(&self.publication_gate, 0);
         let tx = storage_result(Transaction::new_unchecked(
             &db,
             TransactionBehavior::Immediate,
@@ -592,7 +595,7 @@ impl Store {
             tx.execute(sql, params![key, old])?;
         }
         copy_semantic_rows(&tx, &old, &key, true)?;
-        let mut blocked = ReadersBlockedWatch::new(&self.publication_gate, 0);
+        blocked.check(&tx);
         #[cfg(feature = "test-support")]
         let mut observer = self.semantic_publication_observer.lock().unwrap().take();
         #[cfg(feature = "test-support")]
@@ -720,7 +723,11 @@ impl Store {
         leader.verify()?;
         self.identity.verify()?;
         check_cancel(cancel)?;
+        blocked.check(&tx);
+        Self::semantic_commit_cache_diagnostic(&tx);
         let committed = storage_result(tx.commit());
+        // COMMIT (or its rollback) released the lock: wake waiting readers.
+        drop(blocked);
         Self::semantic_phase_diagnostic("commit", "end");
         match committed {
             Ok(()) => Ok(Some(next)),
