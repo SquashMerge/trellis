@@ -18,12 +18,12 @@ pub use search::{
     SearchHeadChanged, SearchHeadDelta,
 };
 pub use search_startup::RecentSearchCheckout;
+#[cfg(feature = "test-support")]
+pub use semantic_display::status_semantic_projections_for_tests;
 pub use semantic_display::{
     CallSemantic, LANGUAGE_NOTE, LanguageTier, McpSemantic, NO_PRODUCER_NOTE, ProducerNotPublished,
     ProducerSelection, multiple_producers_note,
 };
-#[cfg(feature = "test-support")]
-pub use semantic_display::status_semantic_projections_for_tests;
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
@@ -3099,6 +3099,12 @@ impl EvidenceResponse {
         let mut status = self.store.read_status_for(&self.db, true)?;
         semantic_display::status_semantics(&self.db, &mut status)?;
         Ok(status)
+    }
+    /// The admitted head's control status for the browser's `/status/head` digest
+    /// (#666): the same validated, per-admission cached read as [`Self::status`],
+    /// without the per-language semantic projection, which the digest never shows.
+    pub fn status_head(&self) -> Result<IndexStatus> {
+        self.store.read_status_for(&self.db, true)
     }
     pub fn validate_pin(&self, pin: IndexPin) -> Result<()> {
         self.selected(Some(pin))?;
