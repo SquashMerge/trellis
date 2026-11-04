@@ -50,6 +50,10 @@ impl World {
     }
 
     fn for_language(language: &'static str, name: &str, hook: Option<&Path>) -> Self {
+        Self::for_workspace(language, name, hook, false)
+    }
+
+    fn for_workspace(language: &'static str, name: &str, hook: Option<&Path>, git: bool) -> Self {
         let stub = tempfile::tempdir().unwrap();
         let marker = stub.path().join("invocations");
         let mut env = support::stub_env(stub.path(), &json!({"marker":marker}));
@@ -62,6 +66,14 @@ impl World {
         }
         let checkout = start_checkout(
             |root| {
+                if git {
+                    let output = std::process::Command::new("git")
+                        .args(["init", "--quiet"])
+                        .arg(root)
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "git init failed: {output:?}");
+                }
                 uniform_workspace(root, &[language], 1);
                 let (path, source) = if language == "rust" {
                     ("rust/u00000.rs", "fn u00000() { g(); }\nfn g() {}\n")
@@ -1005,7 +1017,9 @@ fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, 
 fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
     use std::io::Write;
 
-    let world = World::new();
+    let world = World::for_workspace("javascript", "git-status", None, true);
+    let workspace_marker = world.checkout.root.join(".git/trellis/workspace-id");
+    let original_marker = fs::read(&workspace_marker).unwrap();
     let (_, original, options) = world.run_once();
     let descriptor: Value = serde_json::from_slice(&original).unwrap();
     let run_dir = Path::new(options["descriptor"].as_str().unwrap())
@@ -1071,8 +1085,13 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
         trellis::native_ids::digest(b"", &fs::read(env!("CARGO_BIN_EXE_trellis")).unwrap())
     );
     let socket = world._stub.path().join("after-startup.sock");
+    let claim_socket = world._stub.path().join("after-claim.sock");
     let index = rebuilt_cli()
         .env("TRELLIS_TEST_RETAINED_AFTER_STARTUP_SOCKET", &socket)
+        .env(
+            "TRELLIS_TEST_SEMANTIC_CRASH_AFTER_CLAIM_SOCKET",
+            &claim_socket,
+        )
         .args(["index", "--workspace"])
         .arg(&world.checkout.root)
         .args(["--max-file-bytes", "1048576"])
@@ -1085,6 +1104,24 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
     });
     let startup_native = native_identity();
     assert_ne!(startup_native, old_native);
+    let pending = reply(
+        "Git checkout status before retained admission",
+        rebuilt_cli()
+            .args(["status", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        pending["workspaceRoot"],
+        world.checkout.root.to_str().unwrap()
+    );
+    assert_eq!(
+        pending["revision"]["indexGeneration"],
+        old["indexGeneration"]
+    );
+    assert_eq!(pending["catchingUp"], true);
+    assert_eq!(fs::read(&workspace_marker).unwrap(), original_marker);
     trellis::testing::wait_until(
         "post-start index accepted ahead of retained recovery",
         || {
@@ -1108,6 +1145,27 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
         startup_native,
         "own post-start native capture must supersede startup before retained import"
     );
+    trellis::testing::wait_until("retained import claimed", || claim_socket.exists());
+    let claimed = reply(
+        "Git checkout status during retained admission",
+        rebuilt_cli()
+            .args(["status", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        claimed["workspaceRoot"],
+        world.checkout.root.to_str().unwrap()
+    );
+    assert_eq!(
+        claimed["revision"]["indexGeneration"],
+        old["indexGeneration"]
+    );
+    assert_eq!(claimed["catchingUp"], true);
+    assert_eq!(fs::read(&workspace_marker).unwrap(), original_marker);
+    fs::write(claim_socket.with_extension("done"), []).unwrap();
+    std::os::unix::net::UnixStream::connect(&claim_socket).unwrap();
     trellis::testing::wait_until(
         "new native capture identity readmits retained input",
         || {
@@ -1144,6 +1202,11 @@ fn changed_executable_readmits_retained_run_again_within_the_same_generation() {
         "retained recovery failed after own post-start capture: {rows:?}"
     );
     assert_eq!(js["reimport"], Value::Null);
+    assert_eq!(
+        status["workspaceRoot"],
+        world.checkout.root.to_str().unwrap()
+    );
+    assert_eq!(fs::read(&workspace_marker).unwrap(), original_marker);
     world.assert_recovered_basis(&status, &descriptor);
     assert_eq!(
         fs::read(options["descriptor"].as_str().unwrap()).unwrap(),
@@ -1564,24 +1627,168 @@ fn upgraded_changed_sources_keep_syntax_and_report_reimport_without_rerunning_pr
 }
 
 #[test]
-fn first_upgrade_reports_known_native_language_but_clean_start_has_no_false_reimport() {
+fn unreadable_successful_run_does_not_erase_published_upgrade_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let world = World::new();
+    let (run, _, _) = world.run_once();
+    let state = state_dir(&world.checkout);
+    world.upgrade(|root| {
+        let db = Connection::open(state.join("retention.sqlite")).unwrap();
+        db.execute("DELETE FROM retained_runs", []).unwrap();
+        drop(db);
+        fs::write(root.join("tool.py"), "def tool():\n    pass\n").unwrap();
+    });
+    let needs_reimport = |status: &Value| {
+        status["semanticLanguages"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["language"] == "javascript"))
+            .is_some_and(|row| row["reimport"]["state"] == "needsReimport")
+    };
+    let before = world.status();
+    assert!(needs_reimport(&before), "before fault: {before}");
+
+    // Model an ordinary permission fault on the existing successful record.
+    let record = state
+        .join("runs")
+        .join(run["runId"].as_str().unwrap())
+        .join("run.json");
+    let permissions = fs::metadata(&record).unwrap().permissions();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(
+        fs::read(&record).is_err(),
+        "fault must make run.json unreadable"
+    );
+    fs::write(
+        world.checkout.root.join("extra.js"),
+        "function extra() {}\n",
+    )
+    .unwrap();
+    let indexed = world
+        .checkout
+        .cli()
+        .args(["index", "--workspace"])
+        .arg(&world.checkout.root)
+        .output()
+        .unwrap();
+    // Restore before checking the result so even an indexing failure cleans up the fault.
+    fs::set_permissions(&record, permissions).unwrap();
+    reply("index with unreadable successful run", indexed);
+    let during = world.status();
+
+    // Readability returning must not require a second upgrade to recover the warning.
+    fs::write(
+        world.checkout.root.join("extra.js"),
+        "function extra() { return 1; }\n",
+    )
+    .unwrap();
+    reply(
+        "index after successful record becomes readable",
+        world
+            .checkout
+            .cli()
+            .args(["index", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    let after = world.status();
+    assert!(
+        needs_reimport(&during),
+        "after unreadable history: {during}; after readability restored: {after}"
+    );
+    assert!(
+        needs_reimport(&after),
+        "after readability restored: {after}"
+    );
+    assert_eq!(world.invocation_count(), 1);
+}
+
+/// #664: a language that never had a producer is not configured, before and after an
+/// upgrade. Nothing was lost, so nothing needs re-import.
+#[test]
+fn first_upgrade_reports_no_reimport_for_languages_without_producer_history() {
     let world = World::new();
     assert!(world.status().get("semanticLanguages").is_none());
-    world.upgrade(|_| {});
+    world.upgrade(|root| fs::write(root.join("tool.py"), "def tool():\n    pass\n").unwrap());
     let status = world.status();
-    let rows = status["semanticLanguages"].as_array().unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["language"], "javascript");
-    assert_eq!(rows[0]["semanticState"], "unavailable");
-    assert_eq!(rows[0]["reimport"]["state"], "needsReimport");
     assert!(
-        rows[0]["reimport"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("not retained before this upgrade")
+        status["semanticLanguages"]
+            .as_array()
+            .is_none_or(|rows| rows.iter().all(|row| row["reimport"].is_null())),
+        "{status}"
+    );
+    assert!(
+        !status
+            .to_string()
+            .contains("not retained before this upgrade"),
+        "{status}"
     );
     assert!(world.generated_rows().is_empty());
     assert_eq!(world.invocation_count(), 0);
+    // A legacy row an earlier version wrote for a never-configured language is dropped at
+    // the next publication.
+    support::stop_daemon(&world.checkout.home);
+    let catalog = Connection::open(state_dir(&world.checkout).join("retention.sqlite")).unwrap();
+    catalog
+        .execute("INSERT INTO legacy_languages VALUES('python')", [])
+        .unwrap();
+    drop(catalog);
+    fs::write(
+        world.checkout.root.join("tool.py"),
+        "def tool():\n    return 1\n",
+    )
+    .unwrap();
+    reply(
+        "index after an earlier legacy row",
+        world
+            .checkout
+            .cli()
+            .args(["index", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    let status = world.status();
+    assert!(
+        !status
+            .to_string()
+            .contains("not retained before this upgrade"),
+        "{status}"
+    );
+}
+
+/// #664: a language whose producer published evidence before its inputs were retained
+/// needs re-import after the upgrade; a language no producer ever covered does not.
+#[test]
+fn first_upgrade_reports_reimport_only_for_languages_with_producer_history() {
+    let world = World::new();
+    world.run_once();
+    let catalog = state_dir(&world.checkout).join("retention.sqlite");
+    world.upgrade(|root| {
+        // Evidence published before retention: its run inputs were never retained.
+        let db = Connection::open(&catalog).unwrap();
+        db.execute("DELETE FROM retained_runs", []).unwrap();
+        drop(db);
+        fs::write(root.join("tool.py"), "def tool():\n    pass\n").unwrap();
+    });
+    let status = world.status();
+    let rows = status["semanticLanguages"].as_array().unwrap();
+    let row = |language: &str| rows.iter().find(|row| row["language"] == language);
+    let js = row("javascript").unwrap();
+    assert_eq!(js["reimport"]["state"], "needsReimport", "{status}");
+    assert!(
+        js["reimport"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not retained before this upgrade"),
+        "{status}"
+    );
+    let python = row("python").unwrap();
+    assert_eq!(python["reimport"], Value::Null, "{status}");
+    assert_eq!(python["semanticProducerId"], Value::Null, "{status}");
+    assert_eq!(world.generated_rows().len(), 1);
+    assert_eq!(world.invocation_count(), 1);
 }
 
 #[test]

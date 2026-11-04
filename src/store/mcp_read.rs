@@ -1161,6 +1161,8 @@ pub struct McpOutgoingWithLines {
     pub owner: McpDeclarationWithLines,
     pub calls: Vec<McpOutgoingCallWithLines>,
     pub has_more: bool,
+    /// External calls left out (#665), or `None` when they were kept.
+    pub external_omitted: Option<usize>,
 }
 
 fn mcp_callee_text(
@@ -1255,6 +1257,31 @@ impl EvidenceResponse {
         hint_now: &dyn Fn() -> std::time::Instant,
         required_deadline: std::time::Instant,
     ) -> Result<Option<McpOutgoing>> {
+        Ok(self
+            .mcp_outgoing_excluding(
+                symbol_id,
+                limit,
+                None,
+                expected,
+                hint_now,
+                required_deadline,
+            )?
+            .map(|(outgoing, _)| outgoing))
+    }
+
+    /// Outgoing calls, without those whose selected binding is external when
+    /// `exclude_external` names the producer selection (#665). External calls are dropped
+    /// before `limit` applies, so a page holds up to `limit` non-external calls; the second
+    /// value counts the external calls left out.
+    fn mcp_outgoing_excluding(
+        &self,
+        symbol_id: &str,
+        limit: usize,
+        exclude_external: Option<Option<&str>>,
+        expected: Option<IndexPin>,
+        hint_now: &dyn Fn() -> std::time::Instant,
+        required_deadline: std::time::Instant,
+    ) -> Result<Option<(McpOutgoing, usize)>> {
         use crate::native_evidence::{DocumentKey, Provenance};
         let selected = self.selected(None)?;
         ensure!(
@@ -1298,6 +1325,20 @@ impl EvidenceResponse {
                 &b.id,
             ))
         });
+        let mut external_omitted = 0;
+        if let Some(producer) = exclude_external {
+            let semantic =
+                self.mcp_call_semantics(producer, &owner.declaration.document, measured.iter())?;
+            let mut index = 0;
+            measured.retain(|_| {
+                let external = semantic.call(index).is_some_and(|call| {
+                    call.binding.resolution == crate::semantic_evidence::Resolution::External
+                });
+                index += 1;
+                external_omitted += usize::from(external);
+                !external
+            });
+        }
         let has_more = measured.len() > limit;
         let mut calls = Vec::new();
         for call in measured.into_iter().take(limit) {
@@ -1659,11 +1700,14 @@ impl EvidenceResponse {
             // Distinct eligible matches left unexamined once eight hints passed.
             item.omitted = Some(unexamined.len());
         }
-        Ok(Some(McpOutgoing {
-            owner,
-            calls,
-            has_more,
-        }))
+        Ok(Some((
+            McpOutgoing {
+                owner,
+                calls,
+                has_more,
+            },
+            external_omitted,
+        )))
     }
 }
 
@@ -1676,8 +1720,35 @@ impl EvidenceResponse {
         hint_now: &dyn Fn() -> std::time::Instant,
         required_deadline: std::time::Instant,
     ) -> Result<Option<McpOutgoingWithLines>> {
-        let Some(outgoing) =
-            self.mcp_outgoing(symbol_id, limit, expected, hint_now, required_deadline)?
+        self.mcp_outgoing_with_lines_excluding(
+            symbol_id,
+            limit,
+            None,
+            expected,
+            hint_now,
+            required_deadline,
+        )
+    }
+
+    /// [`Self::mcp_outgoing_with_lines`], leaving out external calls when
+    /// `exclude_external` names the producer selection (#665).
+    pub fn mcp_outgoing_with_lines_excluding(
+        &self,
+        symbol_id: &str,
+        limit: usize,
+        exclude_external: Option<Option<&str>>,
+        expected: Option<IndexPin>,
+        hint_now: &dyn Fn() -> std::time::Instant,
+        required_deadline: std::time::Instant,
+    ) -> Result<Option<McpOutgoingWithLines>> {
+        let Some((outgoing, external_omitted)) = self.mcp_outgoing_excluding(
+            symbol_id,
+            limit,
+            exclude_external,
+            expected,
+            hint_now,
+            required_deadline,
+        )?
         else {
             return Ok(None);
         };
@@ -1748,6 +1819,7 @@ impl EvidenceResponse {
             },
             calls,
             has_more: outgoing.has_more,
+            external_omitted: exclude_external.map(|_| external_omitted),
         }))
     }
 }

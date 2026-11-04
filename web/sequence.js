@@ -247,6 +247,10 @@ function sequenceStepColumn(view, step) {
 // - every other step draws nothing: internal steps, nested callables, calls without a target and
 //   any branch, try, chain or same-column call around an arrow (`through`: its arrows draw in
 //   its place). `hiddenSteps` counts the shown DTO steps that draw nothing; Show all has them.
+// - at most SEQUENCE_INTERACTION_LIMIT arrows are drawn, in source order (#663). The server
+//   sends Interactions candidates before its visible step bound, which counts internal steps;
+//   this bound counts arrows only, and `omittedInteractions` counts the arrows past it.
+const SEQUENCE_INTERACTION_LIMIT = 200;
 function sequenceInteractions(view, options, earlyReturn) {
   const visible = new Set(), through = new Set(), loops = new Set(), returns = new Set(), holds = new Set();
   const nested = step => [...(step.children || []), ...(step.alternate || [])];
@@ -255,9 +259,10 @@ function sequenceInteractions(view, options, earlyReturn) {
     const target = sequenceTarget(view, step);
     return !!target && sequenceColumn(target).id !== sequenceStepColumn(view, step).id;
   };
+  let arrows = 0;
   const scan = step => {
     if (step.hidden) return false;
-    let any = crosses(step);
+    let any = crosses(step) && ++arrows <= SEQUENCE_INTERACTION_LIMIT;
     if (any) returns.add(step);
     for (const child of nested(step)) any = scan(child) || any;
     if (any) holds.add(step);
@@ -265,7 +270,8 @@ function sequenceInteractions(view, options, earlyReturn) {
   };
   for (const step of view?.steps || []) scan(step);
   let hiddenSteps = 0;
-  const fold = step => { if (step.hidden) return; hiddenSteps++; for (const child of nested(step)) fold(child); };
+  // An omitted arrow is an interaction, not an internal step.
+  const fold = step => { if (step.hidden) return; if (!crosses(step)) hiddenSteps++; for (const child of nested(step)) fold(child); };
   const place = steps => {
     for (const step of steps || []) {
       if (step.hidden) continue;
@@ -282,7 +288,8 @@ function sequenceInteractions(view, options, earlyReturn) {
   const exits = step => !step.hidden && (!!sequenceEarlyReturn(step) || nested(step).some(exits));
   // The frame's tag says "loop"; its guard says only what qualifies it, if anything.
   const loopLabel = step => earlyReturn(step) || exits(step) ? "may exit early" : "";
-  return {interactions:true, visible, through, loops, returns, hiddenSteps, loopLabel, earlyReturn};
+  const omittedInteractions = Math.max(0, arrows - SEQUENCE_INTERACTION_LIMIT);
+  return {interactions:true, visible, through, loops, returns, hiddenSteps, omittedInteractions, loopLabel, earlyReturn};
 }
 // What to say when the admitted view has no displayed calls (#594).
 // Counts come from the server; the reasons are the steps' own.

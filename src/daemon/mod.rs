@@ -277,6 +277,7 @@ pub struct BrowserProvisioner {
     token: Option<String>,
     effective_address: Option<std::net::SocketAddr>,
     closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl Default for BrowserProvisioner {
@@ -296,6 +297,7 @@ impl BrowserProvisioner {
             token: None,
             effective_address: None,
             closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            task: None,
         }
     }
 
@@ -413,6 +415,21 @@ impl BrowserProvisioner {
         self.token_inode = Some(inode);
         self.token = Some(token);
         Ok(address)
+    }
+
+    pub fn start_owned(
+        &mut self,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        self.task = Some(self.spawn_with_shutdown(shutdown)?);
+        Ok(())
+    }
+
+    pub async fn finish_owned(&mut self) -> anyhow::Result<()> {
+        if let Some(task) = self.task.take() {
+            task.await??;
+        }
+        Ok(())
     }
 
     /// Start serving without consuming the provisioner. New explicit serve

@@ -367,6 +367,9 @@ impl DaemonState {
         match outcome {
             Ok(session) => {
                 self.replace_serving_session(Some(session));
+                if let Some(lifecycle) = self.lifecycle.get() {
+                    lifecycle();
+                }
                 *self.startup_error.lock().unwrap() = None;
                 self.startup_failures.store(0, Ordering::Release);
                 *self.startup_backoff.lock().unwrap() = STARTUP_BACKOFF_FIRST;
@@ -392,6 +395,9 @@ impl DaemonState {
                     &mut *self.runtime.lock().unwrap()
                 {
                     *waiting = true;
+                }
+                if let Some(lifecycle) = self.lifecycle.get() {
+                    lifecycle();
                 }
                 if crate::store::nonterminal_storage_busy(&error) {
                     self.note_state_change();

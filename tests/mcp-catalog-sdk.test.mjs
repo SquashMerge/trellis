@@ -62,7 +62,7 @@ test("the eleven-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 7);
+  assert.equal(describe.toolVersion.const, 8);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
@@ -208,6 +208,21 @@ test("call graph accepts only its closed, unclamped public input", () => {
   assert.equal(validate({ schemaVersion: 1 }), false);
   assert.equal(validate({ ...valid, symbolId: "sid:v1:ABC" }), false);
   assert.equal(graph.inputSchema.properties.depth.default, 2);
-  assert.equal(graph.inputSchema.properties.maxNodes.default, 150);
-  assert.equal(graph.inputSchema.properties.maxCalls.default, 500);
+  // #665: defaults sized to the response; compact:true has its own larger defaults.
+  assert.equal(graph.inputSchema.properties.maxNodes.default, 8);
+  assert.equal(graph.inputSchema.properties.maxCalls.default, 10);
+  assert.equal(graph.inputSchema.properties.compact.default, false);
+  assert.ok(validate({ ...valid, compact: true }));
+  for (const compact of [null, 1, "true"]) assert.equal(validate({ ...valid, compact }), false);
+});
+
+test("outgoing calls accept a closed includeExternal; incoming calls do not", () => {
+  const valid = { schemaVersion: 1, symbolId: `sid:v1:${"a".repeat(32)}` };
+  const outgoing = ajv.compile(tools.find(tool => tool.name === "trellis_outgoing_calls").inputSchema);
+  const incoming = ajv.compile(tools.find(tool => tool.name === "trellis_incoming_calls").inputSchema);
+  for (const includeExternal of [true, false]) {
+    assert.ok(outgoing({ ...valid, compact: true, includeExternal }));
+  }
+  for (const includeExternal of [null, 1, "true"]) assert.equal(outgoing({ ...valid, includeExternal }), false);
+  assert.equal(incoming({ ...valid, includeExternal: true }), false);
 });

@@ -57,7 +57,10 @@ releases use CPU.
 
 The model is optional for the browser and lexical symbol search, but required for
 vector-based semantic symbol search. Trellis never downloads weights implicitly.
-If a daemon is already running, installing the model does not reconfigure it: follow the [manual restart steps](semantic-search-local-cache.md#configuration-and-daemon-restart).
+If a daemon is already running, install prints a restart hint. Close active MCP clients,
+then run `trellis daemon stop` and start Trellis again to load the model. Restart any
+`trellis serve` command too. Model loading and vector coverage build in the background;
+lexical results stay available. See the [restart steps](semantic-search-local-cache.md#configuration-and-daemon-restart).
 See the [local model guide](semantic-search-local-cache.md) for optional configuration
 and availability diagnostics.
 
@@ -91,9 +94,12 @@ trellis serve --token-file ~/.trellis-private/token
 To stop everything, or before you change the port or token file, stop the daemon. Otherwise `serve` fails with `serve bind conflicts with running listener` or `serve token file conflicts with running listener`.
 
 ```sh
-pgrep -fl 'trellis daemon'    # find the PID and check it's yours
-kill -TERM <pid>
+trellis daemon stop
 ```
+
+Stop waits for accepted indexing or import work to finish and for the old daemon
+to release ownership. It can take longer than a minute; there is no completion
+read timeout.
 
 ### Keep a live serve detached
 
@@ -296,7 +302,7 @@ An upgrade can rebuild the native index when its schema or extractor changes. Tr
 
 If the inputs are missing or no longer match, status, the web app and MCP show **semantic evidence needs re-import**, with a per-language reason. Run the producer again using the commands above, or refresh your configured pickup artifact. A queued import does not clear the warning; successful validated publication does. A retained batch alone never means evidence is fresh.
 
-The first upgrade onto this retention behavior also needs re-import: older versions deleted successful run inputs. Trellis does not migrate old index layouts to recover them. Retained inputs are disposable and GC may remove them; keep any artifact you need to archive outside Trellis. Configured pickup keeps its existing artifact-watch behavior.
+The first upgrade onto this retention behavior also needs re-import for languages a producer covered (a successful `producer run` or a configured pickup): older versions deleted successful run inputs. A language that never had a producer is reported as not configured. Trellis does not migrate old index layouts to recover them. Retained inputs are disposable and GC may remove them; keep any artifact you need to archive outside Trellis. Configured pickup keeps its existing artifact-watch behavior.
 
 ## 6. Architecture rules
 

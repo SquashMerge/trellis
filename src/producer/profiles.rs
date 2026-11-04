@@ -13,7 +13,7 @@ use std::{
 };
 
 /// The pin id of the test-support stand-in producer.
-pub const STUB_NAME: &str = "trellis-synthetic-scip";
+pub const STUB_NAME: &str = crate::scip_admission::STUB_PRODUCER;
 const RUST_REFUSAL: &str = "rust-analyzer cannot disable build scripts or proc macros";
 const JAVA_BUILD_FILES: [&str; 6] = [
     "pom.xml",
@@ -47,13 +47,7 @@ impl Target {
             Self::Real(producer) => {
                 crate::scip_admission::producer_language(producer.as_str()).unwrap_or("javascript")
             }
-            Self::Stub => {
-                #[cfg(feature = "test-support")]
-                if std::env::var("TRELLIS_TEST_PRODUCER_STUB_LANGUAGE").as_deref() == Ok("rust") {
-                    return "rust";
-                }
-                "javascript"
-            }
+            Self::Stub => crate::scip_admission::stub_language(),
         }
     }
 

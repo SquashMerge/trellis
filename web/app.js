@@ -27,6 +27,8 @@ window.TrellisIndexPin = IndexPin;
 const objectValue = value => !!value && typeof value === "object" && !Array.isArray(value);
 const sourceCache = new Map();
 let headObservation = null;
+// The last head digest and its ETag for the selected checkout: an unchanged head is a 304 (#666).
+let headRevalidation = {root:null, etag:null, data:null};
 function resetHeadObservation() {
   headObservation = null;
   $("retained-pin-status").hidden = true;
@@ -58,7 +60,8 @@ function observePinnedHead() {
       for (let attempt = 0; attempt < 2; attempt++) {
         observation.again = false;
         try {
-          const data = await api("/api/status/head", "GET", undefined, () => current() && headObservation === observation);
+          if (headRevalidation.root !== root) headRevalidation = {root, etag:null, data:null};
+          const data = await api("/api/status/head", "GET", undefined, () => current() && headObservation === observation, headRevalidation);
           if (!current() || headObservation !== observation) return;
           if (data.workspaceRoot !== workspace || !data.revision) throw new Error("Head unavailable");
           const head = IndexPin.copy(data.revision);
@@ -265,7 +268,7 @@ async function readNavigationLocation(force = false) {
     if (!current()) return;
     window.TrellisShell?.showView("sequence");
     $("sequence-state").textContent = "Loading sequence link…";
-    const data = await api("/api/sequence", "POST", {seed:id, expectedRevision:revision, showAll:false}, current);
+    const data = await api("/api/sequence", "POST", {seed:id, expectedRevision:revision, showAll:false, interactions:true}, current);
     if (!current()) return;
     if (!IndexPin.equal(data?.revision, revision) || data?.seed?.id !== id) throw new Error("Sequence link provenance mismatch. Nothing displayed.");
     $("all-steps").checked = false;
@@ -312,7 +315,9 @@ function selectedUrl(path, method, root) {
   if (!root || !uniqueSelectableRoot(root)) throw new Error("Choose an available checkout first.");
   return `/api/checkouts/${encodeURIComponent(root)}/${suffix}`;
 }
-async function api(path, method = "GET", body, callerCurrent = () => true) {
+// `conditional` ({etag, data}) revalidates a GET: a 304 answers with the remembered data,
+// and a fresh answer replaces both (#666).
+async function api(path, method = "GET", body, callerCurrent = () => true, conditional = null) {
   const session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
   const url = selectedUrl(path, method, root);
   const guarded = path.startsWith("/api/source?");
@@ -329,15 +334,17 @@ async function api(path, method = "GET", body, callerCurrent = () => true) {
     });
     await Promise.race([timeout, (async () => {
       response = await fetch(url, {method, cache: "no-store", credentials: "omit", redirect: "error", signal: controller.signal,
-        headers: {Authorization: `Bearer ${token}`, ...(body === undefined ? {} : {"Content-Type": "application/json"})},
+        headers: {Authorization: `Bearer ${token}`, ...(body === undefined ? {} : {"Content-Type": "application/json"}),
+          ...(conditional?.etag ? {"If-None-Match": conditional.etag} : {})},
         body: body === undefined ? undefined : JSON.stringify(body)});
       if (!current()) throw aborted();
-      data = response.status === 204 ? null : await response.json();
+      data = response.status === 204 ? null : response.status === 304 && conditional?.etag ? conditional.data : await response.json();
     })()]);
   } catch (error) { if (!current()) throw aborted(); throw error; }
   finally { clearTimeout(timer); pendingRequests.delete(controller); }
   // Check before any HTTP error side effects, including invalidation on 409.
   if (!current()) throw aborted();
+  if (response.status === 304 && conditional?.etag) return data;
   if (!response.ok) {
     const error = new Error(data?.error?.message || `Request failed (${response.status})`);
     error.status = response.status;
@@ -348,6 +355,10 @@ async function api(path, method = "GET", body, callerCurrent = () => true) {
     if (error.status === 401 || error.status === 403) disconnect(`Authentication failed (${error.code || error.status}). Connect with a daemon token again.`);
     else if (root && error.code === "workspace_selection_failed") invalidateSelection("Checkout identity changed. Choose an available checkout again.");
     throw error;
+  }
+  if (conditional) {
+    conditional.etag = response.headers?.get?.("ETag") || null;
+    conditional.data = data;
   }
   observePinnedResponse(path, method, body, data);
   return data;
@@ -1238,7 +1249,7 @@ async function renderFilesMini(current) {
   if (empty) window.TrellisSequence.renderEmpty(container, empty, () => { if (current()) void perform(() => navigateDiagram(data.seed, revision, "sequence", null, true)); }, !onlyEmpty);
   // One short status line; the sequence's caveats and diagnostics live behind the ⓘ (#526).
   const notes = [...(data.warnings || [])];
-  if (data.truncated) notes.push("Truncated by sequence limits; Open full shows the same bounded steps.");
+  if (data.truncated) notes.push("Truncated by sequence limits; Open full loads the sequence again.");
   if (outcome.status !== "rendered" && !empty) notes.push(`Pele fell back: ${outcome.reason}`);
   $("files-mini-notes").replaceChildren(...notes.map(note => element("li", note, "detail")));
   $("files-mini-state").textContent = `Indexed revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps" : ""}${notes.length ? ` · ${notes.length} ${notes.length === 1 ? "note" : "notes"} in ⓘ` : ""}`;
@@ -1300,7 +1311,8 @@ if (typeof ResizeObserver === "function" && $("files-mini-sequence")?.parentElem
 $("files-mini-floor-open")?.addEventListener("click", () => perform(openFilesFull, $("files-mini-floor-open")));
 async function openFilesFull() {
   if (section !== "files" || !filesMini || !filesSymbol || !IndexPin.equal(filesMini.revision, status?.revision)) return;
-  return navigateDiagram(filesSymbol.symbol, filesMini.revision, "sequence", filesMini);
+  // A mini cut by the visible step bound is not what Interactions draw (#663): ask again.
+  return navigateDiagram(filesSymbol.symbol, filesMini.revision, "sequence", filesMini.truncated ? null : filesMini);
 }
 function updateFilesBasis() {
   if (!$("files-working")) return;
@@ -1592,7 +1604,8 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
   if ($("sequence-incidental")) $("sequence-incidental").hidden = true;
   $("sequence-state").textContent = `Loading ${symbol.name}…`;
   await browseRequest(async () => {
-    const data = admitted || await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked}, current);
+    // Interactions (#663) ask for their candidates before the visible step bound; Show all does not.
+    const data = admitted || await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked, interactions:!$("all-steps").checked}, current);
     if (!current()) return;
     if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); throw new Error("Sequence provenance mismatch. Nothing displayed."); }
     if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
@@ -1633,7 +1646,7 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     renderIncidentalToggle(data, options);
     // Interactions (#636) draw no internal step; the one count of them is in the status line.
     const interactions = window.TrellisSequence.display(data, options);
-    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${interactions.interactions ? ` · Interactions · ${interactions.hiddenSteps} internal steps hidden` : ""}${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
+    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${interactions.interactions ? ` · Interactions · ${interactions.hiddenSteps} internal steps hidden` : ""}${interactions.omittedInteractions ? ` · truncated: ${interactions.omittedInteractions} later ${interactions.omittedInteractions === 1 ? "interaction" : "interactions"} not shown` : ""}${data.truncated ? " · truncated by sequence limits" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
     published = true;
   }, current, "sequence-state");
@@ -2490,7 +2503,7 @@ async function openCallableSequence(row, pin) {
   const context = navigationContext(), ticket = ++navigationSerial;
   const current = () => ticket === navigationSerial && navigationCurrent(context);
   $("sequence-state").textContent = `Loading ${row.name}…`;
-  const data = await api("/api/sequence", "POST", {seed:row.sid, expectedRevision:pin, showAll:false}, current);
+  const data = await api("/api/sequence", "POST", {seed:row.sid, expectedRevision:pin, showAll:false, interactions:true}, current);
   if (!current()) return;
   if (!IndexPin.equal(data?.revision, pin) || data?.seed?.id !== row.sid) throw new Error("Sequence provenance mismatch. Nothing displayed.");
   // The shared navigation owner records history and returns to Diagrams.

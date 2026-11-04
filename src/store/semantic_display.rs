@@ -414,6 +414,18 @@ pub(super) fn document_projections(
     Ok(documents)
 }
 
+#[cfg(feature = "test-support")]
+static STATUS_SEMANTIC_PROJECTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many status semantic projections this process has run (#666), so a test can see
+/// that the browser's head digest skips them.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn status_semantic_projections_for_tests() -> usize {
+    STATUS_SEMANTIC_PROJECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Replace status's publication-time semantic counts with each language's selected producer
 /// bindings (#483): internal, external and ambiguous calls, with the rest unresolved.
 /// `semanticLanguages` reports every indexed language; `stats` is their combined total.
@@ -421,6 +433,8 @@ pub(super) fn status_semantics(
     db: &Connection,
     status: &mut crate::model::IndexStatus,
 ) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    STATUS_SEMANTIC_PROJECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let key = semantic_pin_key(status.revision);
     let defaults = default_producers(db, &key)?;
     let reimports = super::semantic_retention::semantic_reimport_at(db, &key)?;

@@ -1033,3 +1033,34 @@ test("older-basis sequence evidence keeps historical identity and is not labelle
   assert.match(window.TrellisSequence.evidenceLabel({kind:"call",callId:"call",callEvidence:evidence}), /catching up/);
   assert.equal(window.TrellisSequence.evidenceSummary({semantic:{documents:[{projection}]}}), "Semantic catching up");
 });
+
+// #663: Interactions bound the arrows they draw, after internal steps are filtered out. Internal
+// steps never use that room, and omitted arrows are counted as interactions, not internal steps.
+test("Interactions cap arrows after filtering internal steps and count the omitted ones", () => {
+  const window = {};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window});
+  const witness = {path:"a.rs", range:{startLine:1, endLine:1}};
+  const seed = {id:"seed", name:"run", ...witness};
+  const participants = [{id:"seed", label:"run", declaration:seed, column:{id:"A", label:"A"}},
+    {id:"send", label:"send", declaration:{id:"send", name:"send", ...witness}, column:{id:"B", label:"B"}}];
+  const call = id => ({id, kind:"call", label:"B::send", callId:`measured-${id}`, target:"send", ...witness, hidden:false,
+    callEvidence:{boundaryReason:"none", resolution:"resolved", freshness:"fresh", dispatch:"direct", provenanceId:`proof-${id}`}, children:[], alternate:[]});
+  const internal = n => Array.from({length:n}, (_, i) => ({id:`effect-${i}`, kind:"effect", label:`write: v${i}`, ...witness, hidden:false, children:[], alternate:[]}));
+  const view = steps => ({seed, participants, revision:{indexGeneration:"fixture", indexRevision:1}, semantic:{tier:"semantic"}, steps});
+  // More than 200 internal steps, then one cross-lifeline call: drawn, nothing omitted.
+  const late = view([...internal(240), call("late")]);
+  const sparse = window.TrellisSequence.display(late, {interactions:true});
+  assert.equal(sparse.interactions, true);
+  assert.equal(sparse.returns.has(late.steps[240]), true, "the late interaction is drawn");
+  assert.equal(sparse.omittedInteractions, 0, "no interaction was cut");
+  assert.equal(sparse.hiddenSteps, 240);
+  // 205 arrows: the first 200 are drawn in source order and 5 are counted as omitted.
+  const dense = view([...internal(3), ...Array.from({length:205}, (_, n) => call(`call-${n}`))]);
+  const capped = window.TrellisSequence.display(dense, {interactions:true});
+  assert.equal(capped.returns.size, 200);
+  assert.equal(capped.returns.has(dense.steps[202]), true);
+  assert.equal(capped.returns.has(dense.steps[203]), false);
+  assert.equal(capped.visible.has(dense.steps[203]), false);
+  assert.equal(capped.omittedInteractions, 5);
+  assert.equal(capped.hiddenSteps, 3, "omitted arrows are not internal steps");
+});

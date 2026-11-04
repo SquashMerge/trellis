@@ -169,6 +169,8 @@ test("sequence selection sends no query or provider calls; Show all steps is exp
   h.get("all-steps").checked=true; await h.get("all-steps").listeners.change();
   assert.deepEqual(requests.map(r=>r[0]),["/api/sequence","/api/sequence"]);
   assert.equal(requests[0][1].showAll,false); assert.equal(requests[1][1].showAll,true);
+  // #663: Interactions ask for their candidates before the raw visible bound; Show all does not.
+  assert.equal(requests[0][1].interactions,true); assert.equal(requests[1][1].interactions,false);
   assert.deepEqual(requests[0][1].expectedRevision,JSON.parse(JSON.stringify(h.run("status.revision"))));
 });
 
@@ -1253,6 +1255,25 @@ test("equal head hides the indication, later reads discover newer head and lower
   assertRetained(h); assert.equal(h.timers.size,0);
 });
 
+test("an unchanged head revalidates with its ETag and reuses the remembered digest on 304", async () => {
+  const h = retainedHarness(), sent = [];
+  const tagged = (data, etag) => ({ok:true,status:200,headers:{get:name => name === "ETag" ? etag : null},json:async()=>data});
+  const notModified = {ok:false,status:304,headers:{get:() => '"h1"'},json:async()=>{ throw new Error("a 304 has no body"); }};
+  const replies = [tagged({workspaceRoot:"/synthetic",revision:newerHead},'"h1"'), notModified,
+    tagged({workspaceRoot:"/synthetic",revision:rebuiltHead},'"h2"')];
+  h.context.fetch = async (request, options) => { sent.push([request, options.headers["If-None-Match"] ?? null]); return replies.shift(); };
+  h.run("observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/);
+  h.run("observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/,"a 304 keeps the remembered head");
+  assert.equal(h.get("error").hidden,true);
+  h.run("observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Index rebuilt/);
+  assert.deepEqual(sent,[["/api/status/head",null],["/api/status/head",'"h1"'],["/api/status/head",'"h1"']]);
+  assert.equal(h.run("headRevalidation.etag"),'"h2"');
+  assertRetained(h);
+});
+
 test("different generation is rebuilt, never numerically ordered or silently adopted", async () => {
   const h = retainedHarness();
   h.context.fetch = async () => response({workspaceRoot:"/synthetic",revision:rebuiltHead});
@@ -1669,7 +1690,7 @@ test("with no method selected Sequence lists at most five named highest-cognitiv
 test("a starting callable opens its sequence at the exact sid and pin, then the list hides", async () => {
   const {h, posts} = await startHarness(body => ({...view(body.seed), seed:{...symbol(body.seed), id:body.seed}}));
   await h.get("sequence-start-list").children[1].children[0].listeners.click();
-  assert.deepEqual(posts, [{seed:"sid:v1:two",expectedRevision:metricPin,showAll:false}]);
+  assert.deepEqual(posts, [{seed:"sid:v1:two",expectedRevision:metricPin,showAll:false,interactions:true}]);
   assert.equal(h.run("selectedMethod.id"), "sid:v1:two");
   assert.equal(h.get("sequence-start").hidden, true);
   assert.equal(h.get("sequence-start-list").children.length, 0);

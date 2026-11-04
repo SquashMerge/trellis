@@ -323,6 +323,27 @@ meaning changes, and the server response is the same.
 - **Renderers.** Both renderers draw the same arrows, returns, activations and loop frames.
   Pele validates the returns, activation count and frames it draws, as it validates rows.
 
+### Interactions bound after filtering (#663)
+
+Owner issue #663 (2026-11-03). It amends the #536 visible bound and the #542 seed reserve
+for the Interactions view only. The visible bound counts internal steps that Interactions
+never draw, so a cross-column call after 200 internal steps was cut before it could be drawn.
+
+- **Request.** The browser's `/api/sequence` request adds `interactions:true` when it is not
+  showing all steps. Without it, with `interactions:false`, or with `showAll:true`, the
+  response is the bounded view above, unchanged (calls-first, the Files preview, Show all).
+- **Candidates.** With `interactions:true`, an enriched view that shows a call keeps the
+  seed and expands callee bodies within the work (2000), depth and participant bounds, but
+  not the 200-step visible bound or the seed reserve. A syntax-only view, or one with no
+  shown call, is drawn calls-first and keeps the visible bound.
+- **Arrow bound.** The browser draws at most 200 arrows, in source order, after filtering.
+  Internal steps use none of that room. When arrows are cut, the status line says
+  "truncated: N later interactions not shown"; an omitted arrow is not counted as an
+  internal step. `truncated` from the server now means a work, depth or participant bound,
+  and the status line says "truncated by sequence limits".
+- **Files preview.** The preview keeps the bounded view. Open full reuses its DTO unless
+  that DTO was truncated, in which case it requests the Interactions candidates.
+
 The browser draws an expanded step's arrows and notes from its `lane`, shows the tier and
 reason in the sequence status line, and offers a "Show all steps" / "Show interactions"
 (or "Show calls" for a syntax-only view) shortcut (the same `showAll` setting as Options →

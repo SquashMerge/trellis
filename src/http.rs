@@ -3069,6 +3069,10 @@ struct SequenceRequest {
     expected_revision: IndexPin,
     #[serde(default)]
     show_all: bool,
+    /// The browser's Interactions view (#663): its candidates before the visible step
+    /// bound. Show all keeps the raw bounded view.
+    #[serde(default)]
+    interactions: bool,
 }
 #[cfg(feature = "test-support")]
 async fn sequence(
@@ -3080,9 +3084,13 @@ async fn sequence(
         return Err(browse_invalid());
     }
     let result = tokio::task::spawn_blocking(move || {
-        let mut view = s
-            .store
-            .sequence_at(&q.seed, q.expected_revision, q.show_all)?;
+        let mut view = if q.interactions && !q.show_all {
+            s.store
+                .sequence_interactions_at(&q.seed, q.expected_revision)?
+        } else {
+            s.store
+                .sequence_at(&q.seed, q.expected_revision, q.show_all)?
+        };
         if let Some(view) = view.as_mut()
             && let Some(catalog) = s.catalog_snapshot(view.revision)
             && let Some((_, file)) = s.store.source_at(&view.seed.path, Some(view.revision))?
@@ -4025,6 +4033,7 @@ async fn provisioned_core(
     Path((root_key, suffix)): Path<(String, String)>,
     method: axum::http::Method,
     uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     use crate::daemon::registry::SelectionError;
@@ -4108,6 +4117,9 @@ async fn provisioned_core(
                         method: &method,
                         suffix: &suffix,
                         uri: &uri,
+                        if_none_match: headers
+                            .get(header::IF_NONE_MATCH)
+                            .and_then(|value| value.to_str().ok()),
                         body,
                     },
                     hook.clone(),
@@ -4541,7 +4553,35 @@ struct BrowserCoreRequest<'a> {
     method: &'a axum::http::Method,
     suffix: &'a str,
     uri: &'a axum::http::Uri,
+    /// The browser's `If-None-Match`, honoured by `/status/head` only (#666).
+    if_none_match: Option<&'a str>,
     body: Bytes,
+}
+
+/// The head digest with a strong `ETag` over its exact bytes (#666). A poll whose
+/// `If-None-Match` names the current digest gets `304 Not Modified` and no body.
+fn status_head_response(digest: &Value, if_none_match: Option<&str>) -> Response {
+    let bytes = serde_json::to_vec(digest).expect("head digest serializes");
+    let etag = format!("\"{}\"", &hex::encode(Sha256::digest(&bytes))[..32]);
+    let unchanged = if_none_match.is_some_and(|tags| {
+        tags.split(',')
+            .map(|tag| tag.trim().trim_start_matches("W/"))
+            .any(|tag| tag == etag)
+    });
+    let mut response = if unchanged {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            Bytes::from(bytes),
+        )
+            .into_response()
+    };
+    response.headers_mut().insert(
+        header::ETAG,
+        etag.parse().expect("hex ETag is a header value"),
+    );
+    response
 }
 
 async fn provisioned_core_answer(
@@ -4556,6 +4596,7 @@ async fn provisioned_core_answer(
         method,
         suffix,
         uri,
+        if_none_match,
         body,
     } = request;
     match route {
@@ -5150,7 +5191,12 @@ async fn provisioned_core_answer(
             let runtime = runtime.clone();
             let (status, catching_up) = tokio::task::spawn_blocking(move || {
                 let (response, catching_up) = runtime.evidence_response()?;
-                let mut status = response.status()?;
+                // #666: the head digest needs no per-language semantic projection.
+                let mut status = if head {
+                    response.status_head()?
+                } else {
+                    response.status()?
+                };
                 let catching_up = catching_up || response.semantic_catching_up()?;
                 status.catching_up |= catching_up;
                 if let Some(hook) = hook {
@@ -5169,13 +5215,13 @@ async fn provisioned_core_answer(
             // The head digest (#527) is the fixed-size part of the same status read that
             // the browser polls; diagnostics and statistics stay on `status`.
             let body = if head {
-                Json(json!({
+                let digest = json!({
                     "workspaceRoot": status.workspace_root,
                     "revision": status.revision,
                     "catchingUp": status.catching_up,
                     "indexedAt": status.indexed_at,
-                }))
-                .into_response()
+                });
+                status_head_response(&digest, if_none_match)
             } else {
                 let mut body = serde_json::to_value(status).map_err(|_| {
                     ApiError(
@@ -5313,7 +5359,11 @@ async fn provisioned_core_answer(
                 return Err(browse_invalid());
             }
             let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
-                r.sequence_at(&q.seed, q.expected_revision, q.show_all)
+                if q.interactions && !q.show_all {
+                    r.sequence_interactions_at(&q.seed, q.expected_revision)
+                } else {
+                    r.sequence_at(&q.seed, q.expected_revision, q.show_all)
+                }
             })
             .await?;
             Ok((

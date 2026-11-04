@@ -379,6 +379,280 @@ fn model_list_reads_user_configuration_without_workspace_or_runtime_state() {
 }
 
 #[test]
+fn daemon_stop_without_a_daemon_creates_no_runtime_state() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let output = cli(&home).args(["daemon", "stop"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stopped: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stopped["stopped"], false);
+    assert!(!fixture_roots(&home).data.exists());
+    assert!(!fixture_roots(&home).cache.exists());
+}
+
+/// Stop has no reply deadline: accepted index work must finish before the
+/// socket owner retires, even after the old generic CLI bound has passed.
+#[test]
+fn daemon_stop_waits_past_the_cli_reply_bound_for_accepted_index() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use trellis::daemon::protocol;
+
+    struct ClaimGate(UnixStream);
+    impl Drop for ClaimGate {
+        fn drop(&mut self) {
+            let _ = self.0.write_all(b"R");
+        }
+    }
+
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "stop-drain");
+    fs::create_dir(root.join(".git")).unwrap();
+    trellis::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let claim_socket = temp.path().join("claim.sock");
+    let listener = UnixListener::bind(&claim_socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // The daemon captures the hook path, but only explicit index dispatch
+    // installs the hook; startup reconciliation can finish normally.
+    let initial = cli(&home)
+        .args(["status", "--workspace"])
+        .arg(&root)
+        .env("TRELLIS_TEST_DAEMON_INDEX_CLAIM_SOCKET", &claim_socket)
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let original = trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid")).unwrap();
+    let socket = fixture_socket_paths(&home).socket;
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+            .unwrap();
+    let mut mcp = UnixStream::connect(&socket).unwrap();
+    mcp.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    protocol::write_frame(&mut mcp, &protocol::Request {
+        id: 1,
+        operation: "mcp".into(),
+        payload: serde_json::json!({"workspace":root,"device":identity.device,"inode":identity.inode,"mcpIdentity":protocol::mcp_identity()}),
+    }).unwrap();
+    let attached: protocol::Reply = protocol::read_frame(&mut mcp).unwrap();
+    assert_eq!(attached.payload["result"], true, "{attached:?}");
+
+    let mut command = cli(&home);
+    command
+        .args(["index", "--workspace"])
+        .arg(&root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut index = Owned(command.spawn().unwrap());
+    let mut accepted = None;
+    trellis::testing::wait_until("explicit index FIFO claim", || {
+        assert!(
+            index.0.try_wait().unwrap().is_none(),
+            "index exited before claim"
+        );
+        accepted = listener.accept().ok().map(|(stream, _)| stream);
+        accepted.is_some()
+    });
+    let mut gate = ClaimGate(accepted.unwrap());
+    gate.0
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let mut claimed = [0];
+    gate.0.read_exact(&mut claimed).unwrap();
+    assert_eq!(&claimed, b"C");
+
+    let mut command = cli(&home);
+    command
+        .args(["daemon", "stop"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let past_bound = lower_cli_reply_bound(&mut command);
+    let mut stop = Owned(command.spawn().unwrap());
+    // This peer was attached before stop. Its EOF proves shutdown admission,
+    // so process startup time cannot account for the following held interval.
+    assert_eq!(mcp.read(&mut [0]).unwrap(), 0);
+    std::thread::sleep(past_bound);
+    let stopped_early = stop.0.try_wait().unwrap();
+    let retained_owner = socket.exists() && original.matches();
+    drop(gate); // Release the writer before any RED assertion can panic.
+
+    let (exit, out, err) = finished(&mut stop);
+    let _ = finished(&mut index); // Shutdown may close this caller's socket.
+    trellis::testing::wait_until("drained daemon exit", || !original.matches());
+    assert!(
+        stopped_early.is_none(),
+        "stop stopped waiting while index was claimed: {err}"
+    );
+    assert!(
+        retained_owner,
+        "shutdown retired the owner before accepted work finished"
+    );
+    assert!(exit.success(), "{err}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["stopped"],
+        true
+    );
+    assert!(
+        !socket.exists(),
+        "stop acknowledged before socket retirement"
+    );
+
+    // Open only after the daemon exited: no separate descriptor can disturb
+    // the live SQLite writer's process locks.
+    let queue = rusqlite::Connection::open_with_flags(
+        fixture_roots(&home).requests_db(&identity),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let terminal: (String, Option<String>, Option<i64>) = queue.query_row(
+        "SELECT state, result_generation, result_revision FROM requests WHERE request_kind='index' ORDER BY seq DESC LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(
+        terminal.0, "done",
+        "accepted index did not publish before stop"
+    );
+    assert!(terminal.1.is_some() && terminal.2.is_some());
+}
+
+#[test]
+fn daemon_stop_closes_idle_mcp_and_recaptures_model_configuration() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::protocol;
+
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let models = temp.path().join("models");
+    write_search_configuration(&home, &models);
+    let root = checkout(temp.path(), "model-restart");
+    fs::create_dir(root.join(".git")).unwrap();
+    run(&home, "index", &root);
+    let initial = run(&home, "status", &root);
+    assert_eq!(
+        initial["searchIndex"]["unavailableReason"],
+        "model_not_configured"
+    );
+    let original = trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid")).unwrap();
+    let socket = fixture_socket_paths(&home).socket;
+    let mut mcp = UnixStream::connect(&socket).unwrap();
+    mcp.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+            .unwrap();
+    protocol::write_frame(&mut mcp, &protocol::Request {
+        id: 1,
+        operation: "mcp".into(),
+        payload: serde_json::json!({"workspace":root,"device":identity.device,"inode":identity.inode,"mcpIdentity":protocol::mcp_identity()}),
+    }).unwrap();
+    let attached: protocol::Reply = protocol::read_frame(&mut mcp).unwrap();
+    assert_eq!(attached.payload["result"], true);
+    let mut ingress = UnixStream::connect(&socket).unwrap();
+    ingress
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let mut browser = UnixStream::connect(&socket).unwrap();
+    browser
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    protocol::write_frame(&mut browser, &protocol::Request {
+        id: 2,
+        operation: "serve".into(),
+        payload: serde_json::json!({"workspace":root,"bind":"127.0.0.1:0","tokenFile":home.join("token"),"options":{}}),
+    }).unwrap();
+    let served: protocol::Reply = protocol::read_frame(&mut browser).unwrap();
+    assert!(served.payload["result"].is_string(), "{served:?}");
+    let snapshot = models
+        .join(REVIEWED_MODEL_NAME)
+        .join(REVIEWED_MODEL_REVISION);
+    // Presence selects the model on restart; tiny invalid files must then give
+    // model_load_failed, never a false claim of verified embedding readiness.
+    for name in [
+        "1_Pooling/config.json",
+        "config.json",
+        "config_sentence_transformers.json",
+        "model.safetensors",
+        "modeling_qwen3_bidirectional.py",
+        "modules.json",
+        "sentence_bert_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ] {
+        let path = snapshot.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"invalid fixture").unwrap();
+    }
+    assert_eq!(
+        run(&home, "status", &root)["searchIndex"]["unavailableReason"],
+        "model_not_configured"
+    );
+    let output = cli(&home).args(["daemon", "stop"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["stopped"],
+        true
+    );
+    assert!(
+        !socket.exists(),
+        "stop acknowledged before socket ownership ended"
+    );
+    assert!(protocol::read_frame::<protocol::Reply>(&mut mcp).is_err());
+    assert!(protocol::read_frame::<protocol::Reply>(&mut browser).is_err());
+    assert!(protocol::read_frame::<protocol::Reply>(&mut ingress).is_err());
+    trellis::testing::wait_until("original daemon exit", || !original.matches());
+    let mut restarted = run(&home, "status", &root);
+    let successor =
+        trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid")).unwrap();
+    assert!(successor.matches());
+    assert_ne!(
+        serde_json::to_value(original).unwrap(),
+        serde_json::to_value(successor).unwrap()
+    );
+    // Status can reply while the fill owner has not yet tried the recaptured
+    // model. Wait for its published load result, not merely daemon readiness.
+    trellis::testing::wait_until("restarted daemon model load failure", || {
+        match &restarted["searchIndex"]["unavailableReason"] {
+            Value::Null => {
+                restarted = run(&home, "status", &root);
+                false
+            }
+            Value::String(reason) if reason == "model_load_failed" => true,
+            reason => panic!("restarted daemon did not recapture model configuration: {reason}"),
+        }
+    });
+    assert_eq!(
+        restarted["searchIndex"]["unavailableReason"],
+        "model_load_failed"
+    );
+    assert_eq!(
+        restarted["revision"]["indexGeneration"],
+        initial["revision"]["indexGeneration"]
+    );
+}
+
+#[test]
 fn configured_search_status_reports_startup_configuration_without_model_files() {
     let temp = short_temp();
     let home = temp.path().join("home");
