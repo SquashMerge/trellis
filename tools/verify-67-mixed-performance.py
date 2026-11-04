@@ -1203,9 +1203,13 @@ class SelectedView:
             self.ids["capture"][capture] = (producer, artifact, ordinal, tuple(r1_doc))
             self.capture_descriptor = descriptor
             self.capture_pin = captured_pin
+            # Native-first N and S carry the import's report forward; the import pin is the
+            # earliest revision that holds it.
             imported = db.execute("""SELECT r.revision_id FROM semantic_revision_raw_selections r
                 JOIN semantic_import_reports i ON i.revision_id=r.revision_id AND i.producer_id=r.producer_id
-                WHERE r.batch_id=? AND r.producer_id=?""", (batch, producer)).fetchall()
+                JOIN native_revisions n ON n.id=r.revision_id
+                WHERE r.batch_id=? AND r.producer_id=?
+                ORDER BY n.published_index_revision LIMIT 1""", (batch, producer)).fetchall()
             require(len(imported) == 1 and imported[0][0] != revision,
                     "selected batch has no unique imported report pin")
             self.ids["pin"][imported[0][0]] = "<import-pin>"

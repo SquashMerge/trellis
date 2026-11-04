@@ -2121,11 +2121,17 @@ fn rejoined_binding_on_edited_workspace_is_a_stale_boundary_with_its_binding() {
     import_scip_capture(&home, &root, &index_db);
 
     std::fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
-    let r2: trellis::model::IndexPin = serde_json::from_value(
+    let native: trellis::model::IndexPin = serde_json::from_value(
         cli(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
     )
     .unwrap();
     let store = open();
+    // Native N completes the index request; the daemon's semantic S follows.
+    trellis::testing::wait_until("semantic catch-up", || {
+        !store.semantic_catch_up_pending_for_tests().unwrap()
+    });
+    let r2 = store.index_baseline().unwrap();
+    assert_eq!(r2.index_revision, native.index_revision + 1);
     let (r2_native, _) = store.retained_native_snapshot_at(r2).unwrap();
     let run_id = syntax_id(&r2_native, "run");
     let producer = store.semantic_at(r2).unwrap().producers[0].id.clone();

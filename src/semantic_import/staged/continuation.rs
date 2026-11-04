@@ -363,6 +363,10 @@ impl JoinContinuation {
                     for document in &page {
                         join.ctx.check_cancel()?;
                         join.ctx.row("nat_docs")?;
+                        #[cfg(feature = "test-support")]
+                        if !self.witnessed && (rev == 1 || shared) {
+                            crate::semantic_import::note_destination_document();
+                        }
                         self.last += 1;
                         conn.prepare_cached("INSERT INTO nat_docs VALUES(?1,?2,?3,?4,?5,?6,NULL)")?
                             .execute(params![
@@ -375,6 +379,10 @@ impl JoinContinuation {
                             ])?;
                     }
                     if page.is_empty() {
+                        #[cfg(feature = "test-support")]
+                        if !self.witnessed && (rev == 1 || shared) {
+                            crate::semantic_import::note_destination_index_build();
+                        }
                         conn.execute("INSERT INTO nat_done VALUES(?1)", [rev])?;
                         self.transition(if shared || rev == 1 {
                             if self.witnessed {

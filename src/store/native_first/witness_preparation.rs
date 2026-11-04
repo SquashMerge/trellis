@@ -100,6 +100,8 @@ impl WitnessPreparation {
                 .optional()?;
             match (ord, decision) {
                 (Some(ord), WitnessEligibility::Witness(witness)) => {
+                    #[cfg(feature = "test-support")]
+                    crate::semantic_import::note_reused_document(&witness.document);
                     WitnessStageWriter::new(admitted.stage_mut(), limits, counters)?
                         .stage_source_witness(ord, witness.as_ref())?;
                     self.source = Some(SourcePreparation {

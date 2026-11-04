@@ -127,6 +127,9 @@ pub(super) fn document_flags(
         }
         let excluded = if !witness.requested {
             Some("notRequested".to_owned())
+        } else if let Some(exclusion) = &witness.exclusion {
+            // The same raw exclusion FULL reads, so a failed exclusion keeps its diagnostic.
+            Some(exclusion.clone())
         } else if witness.state == semantic::CoverageState::Omitted {
             Some("unsupported".to_owned())
         } else {
@@ -146,7 +149,10 @@ pub(super) fn document_flags(
             return fallback("factless source selected version differs");
         }
         flags.requested = input.requested;
-        flags.failed = decision == "changedBytes" || input.exclusion.as_deref() == Some("failed");
+        // A document the batch never requested stays notRequested even when its bytes changed,
+        // as FULL reports it; only requested documents fail on unmeasurable captured anchors.
+        flags.failed = input.requested
+            && (decision == "changedBytes" || input.exclusion.as_deref() == Some("failed"));
         Ok((flags, input.exclusion))
     }
 }

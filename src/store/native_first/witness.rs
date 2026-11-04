@@ -52,6 +52,8 @@ pub(crate) struct OriginalSourceWitness {
     pub state: sem::CoverageState,
     pub diagnostic: Option<String>,
     pub reasons: Option<sem::CoverageReasons>,
+    /// The batch's raw exclusion of this document, which FULL's coverage also reads.
+    pub exclusion: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -74,7 +76,10 @@ pub(crate) enum WitnessEligibility {
 pub(crate) enum AuthorityStep {
     Progress,
     Eligible(Box<SourceAuthority>),
+    /// A witness was attempted and declined: FULL, counted as a fallback with its reason.
     Full(&'static str),
+    /// The witnessed route does not apply (context invalidation): FULL by rule.
+    Ineligible,
 }
 
 #[derive(Default)]
@@ -983,6 +988,16 @@ pub(crate) fn source_authority(
         {
             return Ok(AuthorityStep::Full("witness_context_changed"));
         }
+        // Changed capture options (file-size cap, SCIP or manifest path) are a context
+        // invalidation: FULL by rule, as the pre-native-first route was, not a witness fallback.
+        let same_options: bool = db.query_row(
+            "SELECT c.reconcile_options IS n.reconcile_options FROM native_revisions c JOIN native_revisions n WHERE c.id=?1 AND n.id=?2",
+            params![semantic_pin_key(selection.captured_pin), semantic_pin_key(target.pin)],
+            |r| r.get(0),
+        )?;
+        if !same_options {
+            return Ok(AuthorityStep::Ineligible);
+        }
         let producer = pinned.producer();
         let producer_ok:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_revision_producers s JOIN semantic_producers p ON p.id=s.id AND p.version=s.version WHERE s.revision_id=?1 AND s.id=?2 AND p.version=?3 AND p.executable_hash=?4 AND p.kind='semantic' AND p.position_encoding=?5)",params![semantic_pin_key(target.pin),selection.producer_id,producer.version,producer.executable_hash,semantic_variant(&producer.position_encoding)?],|r|r.get(0))?;
         selected_ensure!(
@@ -995,7 +1010,11 @@ pub(crate) fn source_authority(
         let entry = &descriptor.artifacts[0];
         let (capture_id,valid):(i64,bool)=db.query_row("SELECT capture_id,ordinal=?2 AND language=?3 AND artifact_hash=?4 AND producer_id=?5 AND source_set_id=?6 AND captured_revision=?7 AND decoder_version=?8 AND length(binary_bytes)=?9 FROM semantic_raw_captures WHERE batch_id=?1 AND ordinal=?2",
             params![selection.batch_id,entry.ordinal,entry.language,entry.sha256,producer.id,descriptor.source_set.id,descriptor.source_revision,descriptor.decoder_version,i64::try_from(entry.byte_length)?],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        selected_ensure!(valid, "witness capture mismatch");
+        if !valid {
+            // A retained artifact that no longer matches its descriptor is the producer's
+            // failure, as FULL authenticates and reports it, never index corruption.
+            return Ok(AuthorityStep::Full("witness_capture_mismatch"));
+        }
         let mut captures =
             db.prepare("SELECT capture_id FROM semantic_raw_captures WHERE batch_id=?1 LIMIT 2")?;
         let mut captures = captures.query([selection.batch_id])?;
@@ -1225,6 +1244,7 @@ pub(crate) fn original_document_begin(
             state,
             diagnostic,
             reasons,
+            exclusion,
         },
     )))
 }

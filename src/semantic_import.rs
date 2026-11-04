@@ -146,12 +146,11 @@ impl<'a> MeasuredFacts<'a> {
         native: &'a native::Artifact,
         sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
     ) -> Result<MeasuredAnchors<'a>> {
+        // Bounded S counts its destination index where it builds one (#620); an in-memory
+        // anchor table over a non-destination revision is original work.
         #[cfg(feature = "test-support")]
         count_publication_work(|work| {
-            if work.destination_revision == native.revision.id {
-                work.destination_index_builds += 1;
-                work.destination_document_rows += native.revision.documents.len();
-            } else {
+            if work.destination_revision != native.revision.id {
                 work.original_index_builds += 1;
             }
         });
@@ -937,6 +936,23 @@ pub(crate) fn note_local_target_work(builds: usize, documents: usize, rows: usiz
         work.destination_index_builds += builds;
         work.destination_document_rows += documents;
         work.current_target_rows += rows;
+    });
+}
+/// One FULL destination inventory document, measured for a non-witnessed producer join.
+#[cfg(feature = "test-support")]
+pub(crate) fn note_destination_document() {
+    count_publication_work(|work| work.destination_document_rows += 1);
+}
+/// One complete FULL destination index, built per non-witnessed producer join.
+#[cfg(feature = "test-support")]
+pub(crate) fn note_destination_index_build() {
+    count_publication_work(|work| work.destination_index_builds += 1);
+}
+/// An unchanged document whose original source association the witnessed join reuses.
+#[cfg(feature = "test-support")]
+pub(crate) fn note_reused_document(document: &native::DocumentKey) {
+    count_publication_work(|work| {
+        work.reused_documents.insert(document.clone());
     });
 }
 #[cfg(feature = "test-support")]

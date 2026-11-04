@@ -377,7 +377,7 @@ fn selected_case(change_b: &str) {
         if change_b == "oracle_fork_staggered_producers" {
             // The next batch captures bytes this one holds as stale.
             fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
-            run(&home, &["index", "--workspace", root_string]);
+            caught_up(&store, &run(&home, &["index", "--workspace", root_string]));
         }
         let mut python_binary = scip::types::Index::new();
         let mut doc = scip::types::Document::new();
@@ -414,8 +414,8 @@ fn selected_case(change_b: &str) {
     } else {
         imported
     };
-    let mut prior: trellis::model::IndexPin =
-        serde_json::from_value(imported["publishedRevision"].clone()).unwrap();
+    // An explicit import completes at its semantic commit; any catch-up it left follows.
+    let mut prior = caught_up(&store, &imported);
     let mut prior_semantic = store.semantic_at(prior).unwrap();
     let accepted_artifact_hash = store.selected_raw_inputs_at(prior).unwrap()[0].captures[0]
         .artifact_hash
@@ -684,9 +684,14 @@ fn selected_case(change_b: &str) {
         let (graph, native, capture) =
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
-        let result =
-            store.publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel);
-        let error = result
+        // Native N does not read the captured native rows; semantic S does, and must fail
+        // typed instead of publishing failed producer output.
+        let native_pin = store
+            .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
+            .unwrap();
+        drop(leader);
+        let error = store
+            .catch_up_semantic_for_tests(&cancel)
             .expect_err("native retained-row corruption must not publish failed producer output");
         assert!(
             format!("{error:#}").contains("missing native header"),
@@ -696,14 +701,14 @@ fn selected_case(change_b: &str) {
             let head: i64 = db.query_row(
                 "SELECT index_revision FROM index_metadata WHERE singleton=1", [], |row| row.get(0),
             )?;
-            assert_eq!(head, clean_head.index_revision as i64);
+            assert_eq!(head, native_pin.index_revision as i64);
             let newer: i64 = db.query_row(
                 "SELECT count(*) FROM native_revisions WHERE published_index_revision>?1",
-                [clean_head.index_revision as i64], |row| row.get(0),
+                [native_pin.index_revision as i64], |row| row.get(0),
             )?;
             let failed: i64 = db.query_row(
                 "SELECT count(*) FROM semantic_coverage WHERE revision_id=?1 AND state='failed'",
-                [format!("pin:v1:{}:{}", clean_head.index_generation, clean_head.index_revision + 1)],
+                [format!("pin:v1:{}:{}", native_pin.index_generation, native_pin.index_revision + 1)],
                 |row| row.get(0),
             )?;
             assert_eq!((newer, failed), (0, 0));
@@ -1305,13 +1310,17 @@ fn selected_case(change_b: &str) {
             | "oracle_fork_raw_replacement"
             | "oracle_fork_not_requested"
             | "oracle_fork_failed_exclusion"
-            | "oracle_fork_touched_b"
-            | "oracle_fork_fused_beside_lost_target" => (1, 0),
+            | "oracle_fork_touched_b" => (1, 0),
             "oracle_fork_healthy_two_producers" | "oracle_fork_staggered_producers" => (2, 0),
-            "oracle_fork_two_producers"
-            | "oracle_fork_missing_raw_key"
+            // Bounded S decides per producer: the healthy one is witnessed, the corrupt one
+            // falls back to FULL and fails authentication on its own.
+            "oracle_fork_two_producers" => (1, 1),
+            "oracle_fork_missing_raw_key"
             | "oracle_fork_synthetic"
-            | "oracle_fork_fused_target_lost" => (0, 1),
+            | "oracle_fork_fused_target_lost"
+            // Bounded S declines the witness when an omission and a fused association meet
+            // in one document, without proving they share a span: a conservative FULL.
+            | "oracle_fork_fused_beside_lost_target" => (0, 1),
             "oracle_fork_context" => (0, 0),
             _ => panic!("missing branch expectation for {change_b}"),
         };
@@ -1416,8 +1425,14 @@ fn selected_case(change_b: &str) {
             assert_eq!(work["originalRoleParses"], 0, "{change_b}: {work}");
             assert_eq!(work["originalRawDecodes"], 0, "{change_b}: {work}");
         } else {
+            // FULL builds its own destination index over every destination document; a
+            // fallback after an attempted witness also paid for the changed-only index.
             assert!(
-                work["originalRawDecodes"].as_u64().unwrap() > 0,
+                (1..=2).contains(&work["destinationIndexBuilds"].as_u64().unwrap()),
+                "{change_b}: {work}"
+            );
+            assert!(
+                work["destinationDocumentRows"].as_u64().unwrap() >= 1,
                 "{change_b}: {work}"
             );
         }
@@ -1618,12 +1633,15 @@ fn selected_case(change_b: &str) {
                 .any(|doc| doc["path"] == "src/B.js"),
             "{work}"
         );
+        // Bounded S verifies each required internal target with one keyed lookup at the
+        // captured pin and one at N, for both producers: bounded by the targets, not the corpus.
         assert!(
-            work["currentTargetLookups"].as_array().unwrap().len() <= 4,
+            work["currentTargetLookups"].as_array().unwrap().len() <= 10,
             "{work}"
         );
         assert!(work["currentTargetRows"].as_u64().unwrap() >= 1, "{work}");
-        assert!(work["currentTargetRows"].as_u64().unwrap() <= 4, "{work}");
+        // The changed-only index's declaration rows plus the keyed target lookups.
+        assert!(work["currentTargetRows"].as_u64().unwrap() <= 16, "{work}");
         let (next_native, _) = store.retained_native_snapshot_at(next).unwrap();
         assert_eq!(
             work["destinationRevision"], next_native.revision.id,
@@ -1693,11 +1711,15 @@ fn selected_case(change_b: &str) {
             assert_eq!(work["originalRawDecodes"], 0, "{work}");
         } else {
             assert_eq!(work["fullFallbacks"], 1, "{work}");
+            // One shared changed-only index for the witnessed producer; the corrupt producer's
+            // FULL fails authentication before it indexes or parses anything.
+            assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
+            assert_eq!(work["witnessedRejoins"], 1, "{work}");
             assert_eq!(
-                work["destinationIndexBuilds"], 2,
-                "attempted LOCAL work plus FULL fallback: {work}"
+                work["fallbackReasons"],
+                json!(["witness_capture_mismatch"]),
+                "{work}"
             );
-            assert!(work["originalRoleParses"].as_u64().unwrap() > 0, "{work}");
         }
         assert_eq!(work["destinationJoinsOnReusedDocuments"], 0, "{work}");
     }
@@ -1843,12 +1865,7 @@ fn selected_case(change_b: &str) {
         trellis::testing::wait_until("local branch daemon exit", || {
             !trellis::testing::process_running(pid)
         });
-        let full: trellis::model::IndexPin =
-            serde_json::from_value(run(fork, &index_args)["publishedRevision"].clone()).unwrap();
-        assert_eq!(
-            full, next,
-            "forked FULL and LOCAL pins must share the same seeded identity"
-        );
+        let fork_reply = run(fork, &index_args);
         let roots = TopologyRoots::isolated_for_tests(
             if cfg!(target_os = "macos") {
                 fork.join("Library/Caches/dev.squashmerge.trellis")
@@ -1864,6 +1881,11 @@ fn selected_case(change_b: &str) {
         let identity =
             trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
         let oracle = trellis::store::Store::open(roots, identity).unwrap();
+        let full = caught_up(&oracle, &fork_reply);
+        assert_eq!(
+            full, next,
+            "forked FULL and LOCAL pins must share the same seeded identity"
+        );
         assert_eq!(
             serde_json::to_vec(&snapshot).unwrap(),
             serde_json::to_vec(&oracle.semantic_at(full).unwrap()).unwrap(),
@@ -2623,7 +2645,8 @@ try:
     assert work['witnessedRejoins']==1 and work['fullFallbacks']==0, work
     assert work['originalNativeRows']==0 and work['originalSourceBytes']==0 and work['originalRawProofBytes']==0, work
     assert work['destinationDocumentRows']==996, work
-    assert len(work['reusedDocuments'])==4 and work['destinationRoleParses']==0, work
+    # Only the anchor is a scip-typescript document: the other sentinels are other languages.
+    assert len(work['reusedDocuments'])==1 and work['destinationRoleParses']==0, work
     with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
         local_digest = m.parity_digest(db, revision, workspace)
         local_reports = db.execute('SELECT report_json FROM semantic_import_reports ORDER BY rowid').fetchall()

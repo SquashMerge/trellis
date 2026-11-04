@@ -4222,6 +4222,11 @@ impl World {
         self.store
             .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &self.cancel)
             .unwrap();
+        drop(leader);
+        // Native N first, then the bounded semantic S the checkout worker would run.
+        self.store
+            .catch_up_semantic_for_tests(&self.cancel)
+            .unwrap();
     }
 
     fn head_key(&self) -> String {

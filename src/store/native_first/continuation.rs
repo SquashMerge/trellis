@@ -18,6 +18,10 @@ pub(crate) struct SemanticContinuation {
     current: Option<ProducerContinuation>,
     prepared: Vec<PreparedSemantic>,
     target_stage: Option<crate::semantic_batch::staging::Stage>,
+    /// Test-support cost counters of this operation only, carried across yields so work
+    /// another owner does between units (an import, a native publication) is never counted.
+    #[cfg(feature = "test-support")]
+    work: crate::semantic_import::PublicationWork,
 }
 struct ProducerContinuation {
     producer: crate::semantic_evidence::Producer,
@@ -37,6 +41,29 @@ struct ProducerContinuation {
 
 impl Store {
     pub(crate) fn semantic_maintenance_unit(
+        &self,
+        session: &topology::WriterSession,
+        continuation: &mut Option<SemanticContinuation>,
+        cancel: &CancelFlag,
+    ) -> Result<SemanticUnitOutcome> {
+        #[cfg(feature = "test-support")]
+        let outer = crate::semantic_import::publication_work_checkpoint();
+        #[cfg(feature = "test-support")]
+        if let Some(state) = continuation.as_ref() {
+            crate::semantic_import::restore_publication_work(state.work.clone());
+        }
+        let result = self.semantic_unit(session, continuation, cancel);
+        #[cfg(feature = "test-support")]
+        {
+            if let Some(state) = continuation.as_mut() {
+                state.work = crate::semantic_import::publication_work_checkpoint();
+            }
+            crate::semantic_import::restore_publication_work(outer);
+        }
+        result
+    }
+
+    fn semantic_unit(
         &self,
         session: &topology::WriterSession,
         continuation: &mut Option<SemanticContinuation>,
@@ -68,7 +95,14 @@ impl Store {
             return Ok(SemanticUnitOutcome::Idle);
         };
         if continuation.is_none() {
+            #[cfg(feature = "test-support")]
+            crate::semantic_import::reset_publication_work(
+                &target.native_revision_id,
+                BTreeSet::new(),
+            );
             *continuation = Some(SemanticContinuation {
+                #[cfg(feature = "test-support")]
+                work: crate::semantic_import::publication_work_checkpoint(),
                 target,
                 next: 0,
                 current: None,
@@ -157,6 +191,7 @@ impl Store {
                     super::witness::AuthorityStep::Eligible(authority) => {
                         current.authority = Some(authority)
                     }
+                    super::witness::AuthorityStep::Ineligible => current.full = true,
                     super::witness::AuthorityStep::Full(_reason) => {
                         current.full = true;
                         #[cfg(feature = "test-support")]

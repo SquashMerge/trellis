@@ -609,22 +609,47 @@ fn pending_release_excludes_history_and_released_requested_pin_expires() {
             .is_some()
     );
     store.set_retention_clock_for_tests(1_901, 901);
+    // Native-first: the head projects its unchanged documents from validated basis P, so P is
+    // held past the grace while the head references it; history stays served.
     let permit = store.maintenance_try_enter().unwrap();
     let probe = store.open_maintenance_queue_probe().unwrap();
-    assert_eq!(
+    assert_ne!(
         store
             .maintenance_step(&leader, &permit, &probe, || true)
             .unwrap(),
         MaintenanceOutcome::Progress
     );
+    drop(probe);
+    drop(permit);
+    store.maintain_revisions(&leader).unwrap();
     assert!(
         store
             .semantic_history_for(second, &producer, &doc, &syntax)
             .unwrap()
-            .is_none()
+            .is_some()
     );
-    drop(probe);
-    drop(permit);
+    assert!(
+        store
+            .semantic_history_for(first, &producer, &doc, &syntax)
+            .is_ok()
+    );
+    // A validated semantic publication ends the projection; P then follows the grace.
+    let (graph, next, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (semantic_next, captured_next) = evidence(&next, root.path());
+    store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &next,
+            &semantic_next,
+            &captured_next,
+            &leader,
+            second,
+            &cancel,
+        )
+        .unwrap();
+    store.set_retention_clock_for_tests(2_802, 1_802);
     store.maintain_revisions(&leader).unwrap();
     let error = store
         .semantic_history_for(first, &producer, &doc, &syntax)
@@ -705,10 +730,47 @@ fn latest_eligible_tuple_does_not_fall_back_to_older_matching_facts() {
         semantic.declaration_bindings
     );
     store.set_retention_clock_for_tests(1_901, 901);
-    store.release_revision(second, &leader).unwrap();
+    // Native-first: third projects from validated basis second, which stays held.
+    let held = store.release_revision(second, &leader).unwrap_err();
+    assert!(format!("{held:#}").starts_with("storage_busy"), "{held:#}");
     assert!(
         store
             .semantic_history_for(third, &producer, &doc, &syntax)
+            .unwrap()
+            .is_some()
+    );
+    // A validated publication at the head ends the projection; then second is released and
+    // third has no older eligible tuple to fall back to.
+    let (graph, current, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (mut omitted, current_captured) = evidence(&current, root.path());
+    omitted.provenance.clear();
+    omitted.symbols.clear();
+    omitted.declaration_bindings.clear();
+    omitted.references.clear();
+    omitted.call_bindings.clear();
+    omitted.type_relationships.clear();
+    omitted.coverage[0].selected = false;
+    omitted.coverage[0].state = s::CoverageState::Omitted;
+    omitted.coverage[0].observed_roles.clear();
+    omitted.coverage[0].diagnostic = Some("not run".into());
+    let fourth = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &current,
+            &omitted,
+            &current_captured,
+            &leader,
+            third,
+            &cancel,
+        )
+        .unwrap();
+    store.set_retention_clock_for_tests(2_802, 1_802);
+    store.release_revision(second, &leader).unwrap();
+    assert!(
+        store
+            .semantic_history_for(fourth, &producer, &doc, &syntax)
             .unwrap()
             .is_none()
     );
@@ -854,12 +916,13 @@ fn unchanged_bytes_new_native_id_are_possibly_stale() {
     assert_eq!(history.presentation_freshness, s::Freshness::PossiblyStale);
     assert_eq!(history.coverage.revision_id, native.revision.id);
     assert_eq!(history.provenance[0].revision_id, native.revision.id);
+    // Native-first N serves no unlabelled aggregate; the document is labelled instead.
+    assert!(store.semantic_at(second).is_err());
     assert!(
         store
-            .semantic_at(second)
+            .semantic_projection_at(second, producer, "rust", "hello.rs")
             .unwrap()
-            .declaration_bindings
-            .is_empty()
+            .is_some()
     );
 }
 

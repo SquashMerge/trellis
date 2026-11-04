@@ -888,18 +888,23 @@ fn streamed_new_native_revision_omits_old_facts_and_keeps_producers_separate() {
     let native_only = store
         .publish_stream_native_only_for_tests(&options, &capture, &leader, &cancel)
         .unwrap();
-    let current = store.semantic_at(native_only).unwrap();
-    assert!(current.references.is_empty());
-    assert!(current.call_bindings.is_empty());
-    assert_eq!(current.coverage.len(), 2);
-    assert_eq!(current.coverage[0].state, s::CoverageState::Omitted);
-    assert_eq!(current.coverage[1].state, s::CoverageState::NotRequested);
+    // Native-first: the changed document of a producer without retained input needs re-import.
+    assert!(store.semantic_at(native_only).is_err());
+    let current = store
+        .semantic_projection_at(native_only, &semantic.producers[0].id, "rust", "hello.rs")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current.semantic_status,
+        trellis::model::SemanticStatus::NeedsReimport
+    );
+    assert_eq!(current.semantic_basis_pin, first);
     let status = store.status().unwrap();
     assert!(matches!(
         status.semantic_languages[0].reimport,
         Some(trellis::model::SemanticReimport::NeedsReimport { ref reason }) if !reason.is_empty()
     ));
-    assert_ne!(current.coverage[0].revision_id, native.revision.id);
+    assert_ne!(current.basis_native_revision_id, "");
     assert_eq!(
         store.semantic_at(first).unwrap().references,
         semantic.references
@@ -933,15 +938,17 @@ fn descriptor_languages_cover_new_documents_without_prior_language_tuples() {
     let second = store
         .publish_native(&graph, &capture, &next, &leader, first, &cancel)
         .unwrap();
-    let snapshot = store.semantic_at(second).unwrap();
-    let python = snapshot
-        .coverage
-        .iter()
-        .find(|row| row.language == s::Language::Python && row.document_path == "added.py")
+    // A new document in a descriptor language is changed: with no retained input it needs
+    // re-import rather than an invented tuple (#620 A6).
+    let python = store
+        .semantic_projection_at(second, &semantic.producers[0].id, "python", "added.py")
+        .unwrap()
         .unwrap();
-    assert_eq!(python.state, s::CoverageState::NotRequested);
-    assert!(!python.requested && !python.selected);
-    assert_eq!(snapshot.producers, semantic.producers);
+    assert_eq!(
+        python.semantic_status,
+        trellis::model::SemanticStatus::NeedsReimport
+    );
+    assert_eq!(python.semantic_basis_pin, first);
     assert_eq!(
         store.semantic_at(first).unwrap().coverage,
         semantic.coverage
