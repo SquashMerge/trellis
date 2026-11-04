@@ -169,6 +169,8 @@ test("sequence selection sends no query or provider calls; Show all steps is exp
   h.get("all-steps").checked=true; await h.get("all-steps").listeners.change();
   assert.deepEqual(requests.map(r=>r[0]),["/api/sequence","/api/sequence"]);
   assert.equal(requests[0][1].showAll,false); assert.equal(requests[1][1].showAll,true);
+  // #663: Interactions ask for their candidates before the raw visible bound; Show all does not.
+  assert.equal(requests[0][1].interactions,true); assert.equal(requests[1][1].interactions,false);
   assert.deepEqual(requests[0][1].expectedRevision,JSON.parse(JSON.stringify(h.run("status.revision"))));
 });
 
@@ -1669,7 +1671,7 @@ test("with no method selected Sequence lists at most five named highest-cognitiv
 test("a starting callable opens its sequence at the exact sid and pin, then the list hides", async () => {
   const {h, posts} = await startHarness(body => ({...view(body.seed), seed:{...symbol(body.seed), id:body.seed}}));
   await h.get("sequence-start-list").children[1].children[0].listeners.click();
-  assert.deepEqual(posts, [{seed:"sid:v1:two",expectedRevision:metricPin,showAll:false}]);
+  assert.deepEqual(posts, [{seed:"sid:v1:two",expectedRevision:metricPin,showAll:false,interactions:true}]);
   assert.equal(h.run("selectedMethod.id"), "sid:v1:two");
   assert.equal(h.get("sequence-start").hidden, true);
   assert.equal(h.get("sequence-start-list").children.length, 0);
