@@ -27,6 +27,8 @@ window.TrellisIndexPin = IndexPin;
 const objectValue = value => !!value && typeof value === "object" && !Array.isArray(value);
 const sourceCache = new Map();
 let headObservation = null;
+// The last head digest and its ETag for the selected checkout: an unchanged head is a 304 (#666).
+let headRevalidation = {root:null, etag:null, data:null};
 function resetHeadObservation() {
   headObservation = null;
   $("retained-pin-status").hidden = true;
@@ -58,7 +60,8 @@ function observePinnedHead() {
       for (let attempt = 0; attempt < 2; attempt++) {
         observation.again = false;
         try {
-          const data = await api("/api/status/head", "GET", undefined, () => current() && headObservation === observation);
+          if (headRevalidation.root !== root) headRevalidation = {root, etag:null, data:null};
+          const data = await api("/api/status/head", "GET", undefined, () => current() && headObservation === observation, headRevalidation);
           if (!current() || headObservation !== observation) return;
           if (data.workspaceRoot !== workspace || !data.revision) throw new Error("Head unavailable");
           const head = IndexPin.copy(data.revision);
@@ -312,7 +315,9 @@ function selectedUrl(path, method, root) {
   if (!root || !uniqueSelectableRoot(root)) throw new Error("Choose an available checkout first.");
   return `/api/checkouts/${encodeURIComponent(root)}/${suffix}`;
 }
-async function api(path, method = "GET", body, callerCurrent = () => true) {
+// `conditional` ({etag, data}) revalidates a GET: a 304 answers with the remembered data,
+// and a fresh answer replaces both (#666).
+async function api(path, method = "GET", body, callerCurrent = () => true, conditional = null) {
   const session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
   const url = selectedUrl(path, method, root);
   const guarded = path.startsWith("/api/source?");
@@ -329,15 +334,17 @@ async function api(path, method = "GET", body, callerCurrent = () => true) {
     });
     await Promise.race([timeout, (async () => {
       response = await fetch(url, {method, cache: "no-store", credentials: "omit", redirect: "error", signal: controller.signal,
-        headers: {Authorization: `Bearer ${token}`, ...(body === undefined ? {} : {"Content-Type": "application/json"})},
+        headers: {Authorization: `Bearer ${token}`, ...(body === undefined ? {} : {"Content-Type": "application/json"}),
+          ...(conditional?.etag ? {"If-None-Match": conditional.etag} : {})},
         body: body === undefined ? undefined : JSON.stringify(body)});
       if (!current()) throw aborted();
-      data = response.status === 204 ? null : await response.json();
+      data = response.status === 204 ? null : response.status === 304 && conditional?.etag ? conditional.data : await response.json();
     })()]);
   } catch (error) { if (!current()) throw aborted(); throw error; }
   finally { clearTimeout(timer); pendingRequests.delete(controller); }
   // Check before any HTTP error side effects, including invalidation on 409.
   if (!current()) throw aborted();
+  if (response.status === 304 && conditional?.etag) return data;
   if (!response.ok) {
     const error = new Error(data?.error?.message || `Request failed (${response.status})`);
     error.status = response.status;
@@ -348,6 +355,10 @@ async function api(path, method = "GET", body, callerCurrent = () => true) {
     if (error.status === 401 || error.status === 403) disconnect(`Authentication failed (${error.code || error.status}). Connect with a daemon token again.`);
     else if (root && error.code === "workspace_selection_failed") invalidateSelection("Checkout identity changed. Choose an available checkout again.");
     throw error;
+  }
+  if (conditional) {
+    conditional.etag = response.headers?.get?.("ETag") || null;
+    conditional.data = data;
   }
   observePinnedResponse(path, method, body, data);
   return data;

@@ -2944,3 +2944,138 @@ async fn selected_status_head_is_the_bounded_digest_of_the_same_status() {
         selected_json(app, "POST", &format!("{prefix}/status/head"), Value::Null).await;
     assert_eq!(code, axum::http::StatusCode::NOT_FOUND);
 }
+
+#[cfg(feature = "test-support")]
+async fn head_with(
+    app: axum::Router,
+    path: &str,
+    if_none_match: Option<&str>,
+) -> (axum::http::StatusCode, Option<String>, Vec<u8>) {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", "127.0.0.1:7331")
+        .header(
+            "authorization",
+            "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+    if let Some(tag) = if_none_match {
+        request = request.header("if-none-match", tag);
+    }
+    let response = app
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let etag = response
+        .headers()
+        .get("etag")
+        .map(|value| value.to_str().unwrap().to_owned());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, etag, body.to_vec())
+}
+
+// #666: the browser polls the head digest every few seconds. It skips the status's
+// per-language semantic projection, and an unchanged head answers `304` to its ETag.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn unchanged_status_head_is_a_cheap_conditional_read() {
+    use std::sync::Arc;
+    use trellis::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::{status_semantic_projections_for_tests as projections, topology::TopologyRoots},
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("core.js"), "function step() { return 1; }\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(roots);
+    registry
+        .register(&identity, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let app = ProvisionedBrowser::new(
+        Arc::new(tokio::sync::Mutex::new(registry)),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap()
+    .router();
+    let prefix = format!("/api/checkouts/{}", identity.root_key);
+    let head_path = format!("{prefix}/status/head");
+    let full = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            let (code, _, body) =
+                selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+            if code == axum::http::StatusCode::OK && body["catchingUp"] == false {
+                break body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The full status still runs its projection; the head digest never does.
+    let before = projections();
+    selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+    assert_eq!(projections(), before + 1);
+    let before = projections();
+    let (code, etag, body) = head_with(app.clone(), &head_path, None).await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    let etag = etag.expect("the head digest carries an ETag");
+    let head: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(head["revision"], full["revision"]);
+    for tag in [
+        etag.clone(),
+        format!("W/{etag}"),
+        format!("\"other\", {etag}"),
+    ] {
+        let (code, again, body) = head_with(app.clone(), &head_path, Some(&tag)).await;
+        assert_eq!(code, axum::http::StatusCode::NOT_MODIFIED, "{tag}");
+        assert_eq!(again.as_deref(), Some(etag.as_str()));
+        assert!(body.is_empty());
+    }
+    let (code, again, same) = head_with(app.clone(), &head_path, Some("\"other\"")).await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    assert_eq!((again.as_deref(), same), (Some(etag.as_str()), body));
+    assert_eq!(
+        projections(),
+        before,
+        "head polls ran a semantic projection"
+    );
+    // A new head is a full answer with a new tag, even to the old tag.
+    fs::write(root.join("more.js"), "function more() { return 2; }\n").unwrap();
+    let (code, _, job) = selected_json(
+        app.clone(),
+        "POST",
+        &format!("{prefix}/index"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{job}");
+    let newer = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            let (code, tag, body) = head_with(app.clone(), &head_path, Some(&etag)).await;
+            if code == axum::http::StatusCode::OK {
+                let head: Value = serde_json::from_slice(&body).unwrap();
+                if head["revision"] != full["revision"] && head["catchingUp"] == false {
+                    break tag.unwrap();
+                }
+            } else {
+                assert_eq!(code, axum::http::StatusCode::NOT_MODIFIED);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_ne!(newer, etag);
+}
