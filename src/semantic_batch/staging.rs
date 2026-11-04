@@ -390,6 +390,40 @@ fn serialized_len(value: &impl serde::Serialize, limit: u64) -> Result<u64> {
     Ok(counter.bytes)
 }
 
+/// Serializes `value` into a buffer that may grow only to `limit` bytes; past it the payload
+/// is `unit expansion bytes`, as [`serialized_len`] would have charged it.
+fn serialized_bounded(value: &impl serde::Serialize, limit: u64) -> Result<String> {
+    struct Bounded {
+        bytes: Vec<u8>,
+        limit: u64,
+        exceeded: bool,
+    }
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if (self.bytes.len() as u64).saturating_add(bytes.len() as u64) > self.limit {
+                self.exceeded = true;
+                return Err(std::io::Error::other("witness serialization limit"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Bounded {
+        bytes: Vec::new(),
+        limit,
+        exceeded: false,
+    };
+    let result = serde_json::to_writer(&mut buffer, value);
+    if buffer.exceeded {
+        return Err(ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into());
+    }
+    result?;
+    Ok(String::from_utf8(buffer.bytes)?)
+}
+
 pub(crate) fn charge_witness_row(conn: &Connection, limits: &BatchLimits) -> Result<()> {
     let changed = conn
         .prepare_cached(
@@ -446,14 +480,13 @@ impl<'a> WitnessStageWriter<'a> {
     }
 
     fn payload(&mut self, value: &impl serde::Serialize) -> Result<(String, u64)> {
-        let length = serialized_len(value, self.limits.unit_expansion_bytes)?;
+        // One serialization: the buffer may grow only to the largest payload whose doubled
+        // reservation still fits the unit expansion limit.
+        let body = serialized_bounded(value, self.limits.unit_expansion_bytes / 2)?;
+        let length = body.len() as u64;
         let reservation = length.saturating_mul(2);
-        if reservation > self.limits.unit_expansion_bytes {
-            return Err(ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into());
-        }
         charge_witness_row(self.conn, self.limits)?;
         self.row_check(reservation)?;
-        let body = serde_json::to_string(value)?;
         self.counters.retained_admission_bytes_high_water = self
             .counters
             .retained_admission_bytes_high_water
