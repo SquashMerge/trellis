@@ -518,17 +518,46 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
         assert!(cursor.done);
         assert_eq!((builds, documents, rows), (1, 1, 2));
         let sid = format!("sid:v1:{}", "1".repeat(32));
-        let now = lookup(&db, pin(2), &key(), &sid, &mut stage, &limits, &mut 0, &cancel).unwrap();
+        let now = lookup(
+            &db,
+            pin(2),
+            &key(),
+            &sid,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        )
+        .unwrap();
         assert_eq!(now.declaration.unwrap().name.as_deref(), Some("new"));
         assert!(!now.read);
-        let old = lookup(&db, pin(1), &key(), &sid, &mut stage, &limits, &mut 0, &cancel).unwrap();
+        let old = lookup(
+            &db,
+            pin(1),
+            &key(),
+            &sid,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        )
+        .unwrap();
         assert_eq!(old.declaration.unwrap().name.as_deref(), Some("old"));
         assert!(old.read);
         assert_eq!(old.rows, 1);
         assert!(
-            !lookup(&db, pin(1), &key(), &sid, &mut stage, &limits, &mut 0, &cancel)
-                .unwrap()
-                .read
+            !lookup(
+                &db,
+                pin(1),
+                &key(),
+                &sid,
+                &mut stage,
+                &limits,
+                &mut 0,
+                &cancel
+            )
+            .unwrap()
+            .read
         );
         let mut second = TargetIndexCursor::default();
         for _ in 0..3 {
@@ -566,9 +595,18 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
             ..Default::default()
         };
         let sid = format!("sid:v1:{}", "1".repeat(32));
-        let error = lookup(&db, pin(2), &key(), &sid, &mut stage, &limits, &mut 0, &cancel)
-            .err()
-            .unwrap();
+        let error = lookup(
+            &db,
+            pin(2),
+            &key(),
+            &sid,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        )
+        .err()
+        .unwrap();
         assert!(error.downcast_ref::<ScipCaptureError>().is_some());
         let count: i64 = stage
             .conn()
@@ -586,18 +624,59 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
         let cancel = Arc::new(AtomicBool::new(false));
         let limits = BatchLimits::default();
         let missing = format!("sid:v1:{}", "3".repeat(32));
-        let absent = lookup(&db, pin(2), &key(), &missing, &mut stage, &limits, &mut 0, &cancel).unwrap();
+        let absent = lookup(
+            &db,
+            pin(2),
+            &key(),
+            &missing,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        )
+        .unwrap();
         assert!(absent.declaration.is_none() && absent.read && absent.rows == 0);
         assert!(
-            !lookup(&db, pin(2), &key(), &missing, &mut stage, &limits, &mut 0, &cancel)
-                .unwrap()
-                .read
+            !lookup(
+                &db,
+                pin(2),
+                &key(),
+                &missing,
+                &mut stage,
+                &limits,
+                &mut 0,
+                &cancel
+            )
+            .unwrap()
+            .read
         );
         let unnamed = format!("sid:v1:{}", "2".repeat(32));
-        let present = lookup(&db, pin(2), &key(), &unnamed, &mut stage, &limits, &mut 0, &cancel).unwrap();
+        let present = lookup(
+            &db,
+            pin(2),
+            &key(),
+            &unnamed,
+            &mut stage,
+            &limits,
+            &mut 0,
+            &cancel,
+        )
+        .unwrap();
         assert!(present.declaration.unwrap().name.is_none());
         assert_eq!(present.rows, 1);
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(lookup(&db, pin(2), &key(), &unnamed, &mut stage, &limits, &mut 0, &cancel).is_err());
+        assert!(
+            lookup(
+                &db,
+                pin(2),
+                &key(),
+                &unnamed,
+                &mut stage,
+                &limits,
+                &mut 0,
+                &cancel
+            )
+            .is_err()
+        );
     }
 }

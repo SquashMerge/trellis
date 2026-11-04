@@ -782,9 +782,8 @@ impl RetainedStageContinuation {
             )?;
         }
         counters.retained_admission_units += 1;
-        counters.retained_admission_rows_high_water = counters
-            .retained_admission_rows_high_water
-            .max(changed);
+        counters.retained_admission_rows_high_water =
+            counters.retained_admission_rows_high_water.max(changed);
         Ok(None)
     }
 }
@@ -859,7 +858,9 @@ fn advance_witness_proof(
         let next = match identity {
             Some(identity) => identity,
             None => conn
-                .prepare_cached("SELECT identity_id FROM witness_proofs ORDER BY identity_id LIMIT 1")?
+                .prepare_cached(
+                    "SELECT identity_id FROM witness_proofs ORDER BY identity_id LIMIT 1",
+                )?
                 .query_row([], |row| row.get(0))
                 .optional()?
                 .unwrap_or(0),
@@ -868,7 +869,15 @@ fn advance_witness_proof(
         .ok_or_else(|| admission("witness proof identity exhausted"))?;
         identity = Some(next);
         super::super::staging::charge_witness_row(conn, limits)?;
-        insert.execute(params![next, entry.ordinal, source, kind, digest, proof, capture])?;
+        insert.execute(params![
+            next,
+            entry.ordinal,
+            source,
+            kind,
+            digest,
+            proof,
+            capture
+        ])?;
         *key = proof;
         page.rows += 1;
         page.high_water = page.high_water.max(bytes);

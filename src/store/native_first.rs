@@ -453,9 +453,10 @@ impl Store {
             // S binds new keys to the same cached statements row after row. Without the
             // query planner stability guarantee SQLite re-prepares a statement whenever a
             // value it planned around (a LIMIT, a small-integer comparison) is rebound.
-            storage_result(
-                db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true),
-            )?;
+            storage_result(db.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
+                true,
+            ))?;
             if pending_target(db)?.as_ref() != Some(target) {
                 return Ok(None);
             }

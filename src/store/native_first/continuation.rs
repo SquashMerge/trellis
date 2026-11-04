@@ -76,7 +76,11 @@ impl SemanticContinuation {
             ),
             None => (None, None),
         };
-        self.target_stage.as_mut().into_iter().chain(admission).chain(admitted)
+        self.target_stage
+            .as_mut()
+            .into_iter()
+            .chain(admission)
+            .chain(admitted)
     }
 
     /// Every private stage the slice starts with writes in one transaction per stage.

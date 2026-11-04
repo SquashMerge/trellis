@@ -206,15 +206,14 @@ impl WitnessPreparation {
                             "INSERT INTO witness_target_status VALUES(?1,?2,?3,?4,0,?5,?6,?7)",
                         )?
                         .execute(params![
-                                rev,
-                                key.language,
-                                key.path,
-                                encoded,
-                                named,
-                                named && row.name.is_some(),
-                                row.kind == "method"
-                            ],
-                        )?;
+                            rev,
+                            key.language,
+                            key.path,
+                            encoded,
+                            named,
+                            named && row.name.is_some(),
+                            row.kind == "method"
+                        ])?;
                     }
                 }
                 self.target_after = id;
