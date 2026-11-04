@@ -126,6 +126,10 @@ candidate qualification, explicitly stop your old daemon using the
 then index/import with the candidate. The runner never stops a daemon, and leaves
 an auto-started daemon running. Its report does not attest the daemon's binary.
 
+A search index still being embedded reports `search_coverage_building`, distinct
+from `missing_search_capability`. It remains a qualification failure until coverage
+is complete; wait for background embedding to finish before rerunning the smoke.
+
 The script discovers the live catalog, validates inputs and every returned
 `structuredContent` against its live JSON Schemas, and records per-call timings
 and result sizes, plus host load averages (1, 5 and 15 minutes) before and after

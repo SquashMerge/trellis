@@ -102,8 +102,12 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
       const reason = value.data?.searchIndex?.unavailableReason;
       if (modelReasons.has(reason) || name === 'trellis_search_symbols' && value.data.searchIndex.state !== 'complete') {
         row.status = 'fail';
-        row.reason = 'missing_search_capability';
-        if (modelReasons.has(reason)) row.code = reason;
+        row.reason = value.data.searchIndex.state === 'building' || value.data.searchIndex.state === 'partial'
+          ? 'search_coverage_building' : 'missing_search_capability';
+        if (modelReasons.has(reason)) {
+          row.reason = 'missing_search_capability';
+          row.code = reason;
+        }
       }
       if (name === 'trellis_workspace_describe') row.watcherDegraded = value.data.watcherDegraded === true;
       if (name === 'trellis_workspace_describe' && value.data.indexState !== 'ready') {

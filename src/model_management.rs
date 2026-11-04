@@ -44,6 +44,7 @@ pub struct InstallReport {
     pub verified: bool,
     pub already_installed: bool,
     pub restart_required: bool,
+    pub restart_command: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,6 +67,7 @@ pub struct RemoveReport {
     pub directory: PathBuf,
     pub removed: bool,
     pub restart_required: bool,
+    pub restart_command: &'static str,
 }
 
 /// Download only the currently reviewed immutable snapshot, verifying every file
@@ -110,6 +112,7 @@ pub fn remove(models_dir: &Path, name: &str, revision: &str) -> Result<RemoveRep
         directory,
         removed: false,
         restart_required: true,
+        restart_command: "trellis daemon stop",
     };
     if !models_dir.try_exists()? {
         return Ok(report);
@@ -312,6 +315,7 @@ async fn install_with(
         verified: true,
         already_installed: false,
         restart_required: true,
+        restart_command: "trellis daemon stop",
     };
     if report.directory.try_exists()? {
         verify_snapshot(&report.directory, files).with_context(|| format!(
@@ -654,6 +658,8 @@ mod tests {
             .await
             .unwrap();
         assert!(report.verified && report.restart_required && !report.already_installed);
+        let output = serde_json::to_value(&report).unwrap();
+        assert_eq!(output["restartCommand"], "trellis daemon stop");
         assert_eq!(
             *source.calls.borrow(),
             CONTENTS
@@ -665,12 +671,11 @@ mod tests {
             assert_eq!(fs::read(report.directory.join(relative)).unwrap(), *bytes);
         }
         source.calls.borrow_mut().clear();
-        assert!(
-            install_with(&models, name, revision, &files, &source)
-                .await
-                .unwrap()
-                .already_installed
-        );
+        let existing = install_with(&models, name, revision, &files, &source)
+            .await
+            .unwrap();
+        assert!(existing.already_installed);
+        assert_eq!(existing.restart_command, "trellis daemon stop");
         assert!(source.calls.borrow().is_empty());
         fs::write(report.directory.join("weights.bin"), "modified").unwrap();
         let listed = list_with(&models, name, revision, &files).unwrap();
