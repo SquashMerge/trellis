@@ -2177,6 +2177,7 @@ mod reservation_tests {
             mutations: DestinationMutations::default(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             unread: Default::default(),
+            proofs: Default::default(),
         }
     }
 
@@ -2404,6 +2405,7 @@ mod reservation_tests {
             mutations: DestinationMutations::default(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             unread: Default::default(),
+            proofs: Default::default(),
         };
         let global = CompletedGlobal {
             ctx: &ctx,

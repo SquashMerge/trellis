@@ -154,6 +154,7 @@ impl JoinContinuation {
             },
             cancel: cancel.clone(),
             unread: RefCell::default(),
+            proofs: RefCell::default(),
         };
         let producer = parts.producer.producer();
         let result = (|| {

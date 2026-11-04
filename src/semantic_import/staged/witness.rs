@@ -504,10 +504,11 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 && raw.artifact_hash == basis.artifact_hash,
             "original proof document differs"
         );
-        let capture: Option<i64> = join
-            .conn()
-            .prepare_cached("SELECT capture_id FROM proof_identities WHERE proof_id=?1")?
-            .query_row([&derived.provenance_id], |row| row.get(0))?;
+        let capture = join
+            .ctx
+            .proof_row(&derived.provenance_id)?
+            .context("original proof has no staged identity")?
+            .capture_id;
         anyhow::ensure!(
             capture == Some(p.capture_id),
             "original proof capture differs"
@@ -597,10 +598,11 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         {
             return fallback("original fused proof authority differs");
         }
-        let capture: Option<i64> = join
-            .conn()
-            .prepare_cached("SELECT capture_id FROM proof_identities WHERE proof_id=?1")?
-            .query_row([&derived.provenance_id], |row| row.get(0))?;
+        let capture = join
+            .ctx
+            .proof_row(&derived.provenance_id)?
+            .context("original proof has no staged identity")?
+            .capture_id;
         anyhow::ensure!(
             capture == Some(p.capture_id),
             "original fused proof capture differs"
