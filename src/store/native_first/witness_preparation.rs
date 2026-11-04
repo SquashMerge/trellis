@@ -115,7 +115,13 @@ impl WitnessPreparation {
                     writer.stage_witness_coverage(ord, &coverage, "changedBytes")?;
                     writer.finish_source_witness(ord)?;
                 }
-                (None, WitnessEligibility::NewDocument(_)) => {}
+                (None, WitnessEligibility::NewDocument(_) | WitnessEligibility::Uncovered(_)) => {}
+                (Some(ord), WitnessEligibility::Uncovered(coverage)) => {
+                    let mut writer =
+                        WitnessStageWriter::new(admitted.stage_mut(), limits, counters)?;
+                    writer.stage_witness_coverage(ord, &coverage, "newDocument")?;
+                    writer.finish_source_witness(ord)?;
+                }
                 (_, WitnessEligibility::Full(reason)) => return Err(WitnessFallback(reason).into()),
                 _ => return Err(WitnessFallback("witness_source_inventory_mismatch").into()),
             }

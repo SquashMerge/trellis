@@ -70,6 +70,7 @@ pub(crate) enum WitnessEligibility {
     Witness(OriginalSourceWitness),
     ChangedBytes(CoverageInput),
     NewDocument(CoverageInput),
+    Uncovered(CoverageInput),
     Full(&'static str),
 }
 
@@ -949,9 +950,13 @@ pub(crate) fn source_authority(
         )?;
         let descriptor = Descriptor::parse_admitted(&bytes, &sha, limits)?;
         let pinned = descriptor.check_producer()?;
-        if descriptor.trust_origin != crate::scip_admission::REFERENCE_TRUST_ORIGIN
-            || descriptor.artifacts.len() != 1
-        {
+        if descriptor.trust_origin == crate::scip_admission::SYNTHETIC_TRUST_ORIGIN {
+            return Ok(AuthorityStep::Full("synthetic_producer"));
+        }
+        if descriptor.artifacts.len() != 1 {
+            return Ok(AuthorityStep::Full("multi_artifact_batch"));
+        }
+        if descriptor.trust_origin != crate::scip_admission::REFERENCE_TRUST_ORIGIN {
             return Ok(AuthorityStep::Full("unsupported_witness_profile"));
         }
         descriptor.check_pages(limits)?;
@@ -973,10 +978,12 @@ pub(crate) fn source_authority(
             &captured.source_set,
             &captured.revision,
         )?;
+        // As the pre-native-first witness did, config (ignore inventory, capture options) is
+        // not a witness guard: unchanged documents keep their exact version identity, which
+        // binds extraction context, and every target is verified selectively against N.
         if captured.producer != current.producer
             || captured.source_set != current.source_set
             || captured.revision.toolchain_hash != current.revision.toolchain_hash
-            || captured.revision.config_hash != current.revision.config_hash
             || captured.revision.dependency_hash != current.revision.dependency_hash
         {
             return Ok(AuthorityStep::Full("witness_context_changed"));
@@ -1119,12 +1126,19 @@ pub(crate) fn original_document_begin(
         "witness source identity changed"
     );
     let language: sem::Language = semantic_enum(key.language.clone())?;
-    if !authority.producer.languages.contains(&language) {
-        return Ok(WitnessEligibility::Full("source_language_not_covered"));
-    }
     let Some(current) = selected_version(db, target.pin, key)? else {
         return Ok(WitnessEligibility::Full("destination_source_missing"));
     };
+    if !authority.producer.languages.contains(&language) {
+        // Another producer's language: FULL emits no coverage row or fact for it either.
+        return Ok(WitnessEligibility::Uncovered(CoverageInput {
+            document: key.clone(),
+            current,
+            requested: false,
+            selected: false,
+            exclusion: None,
+        }));
+    }
     let captured = selected_version(db, authority.captured_pin, key)?;
     let raw:Option<(String,String,i64)>=db.query_row("SELECT source_hash,wire_digest,capped FROM semantic_raw_documents WHERE capture_id=?1 AND language=?2 AND path=?3",params![authority.capture_id,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let exclusion:Option<String>=db.query_row("SELECT reason FROM semantic_raw_exclusions WHERE batch_id=?1 AND language=?2 AND path=?3",params![authority.batch_id,key.language,key.path],|r|r.get(0)).optional()?;

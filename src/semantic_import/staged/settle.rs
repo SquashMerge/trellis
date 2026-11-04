@@ -968,7 +968,7 @@ impl StagedJoin<'_> {
                 && (!captured.fused_proofs.is_empty() || !captured.fused_calls.is_empty())
             {
                 return Err(crate::semantic_batch::staging::WitnessFallback(
-                    "lost target in fused original association",
+                    "fused_reference_target_lost",
                 )
                 .into());
             }

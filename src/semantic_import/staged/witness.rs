@@ -618,12 +618,29 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
     }
     for row in &mut destination.call_bindings {
         row.join.anchor.revision_id = join.destination_id().to_owned();
+        // A reused row is no destination classification of a target outside the reused
+        // documents: the rejoin takes the captured one under its own rule, as FULL does (#557).
+        if let Some(semantic::Target::Internal { document, .. }) = &row.declared_target
+            && !reused_source(join, document)?
+        {
+            row.declared_target = None;
+        }
     }
     Ok(Prepared {
         facts,
         destination,
         reservation,
     })
+}
+
+/// Whether `doc`'s source association is reused unchanged from the original import.
+fn reused_source(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Result<bool> {
+    exists(
+        join.conn(),
+        "SELECT 1 FROM source_witnesses w JOIN sources s ON s.ord=w.source_ord \
+         WHERE s.language=?1 AND s.path=?2 AND w.decision='reused' AND w.complete=1",
+        &[&doc.language, &doc.path],
+    )
 }
 
 fn append<T>(values: &mut Vec<T>, ordinal: i64, value: T) -> Result<()> {
