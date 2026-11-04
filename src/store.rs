@@ -6664,6 +6664,7 @@ macro_rules! revision_release_holds {
             WHERE o.basis_pin=native_revision_supersessions.revision_id
             AND o.revision_id<>native_revision_supersessions.revision_id)
          AND NOT EXISTS(SELECT 1 FROM semantic_pending_selections s
+            JOIN semantic_pending_target t ON t.revision_id=s.revision_id
             WHERE s.captured_pin=native_revision_supersessions.revision_id
             AND s.revision_id<>native_revision_supersessions.revision_id)
          AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s

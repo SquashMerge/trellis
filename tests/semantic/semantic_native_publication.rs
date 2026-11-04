@@ -2649,7 +2649,7 @@ try:
     assert len(work['reusedDocuments'])==1 and work['destinationRoleParses']==0, work
     with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
         local_digest = m.parity_digest(db, revision, workspace)
-        local_reports = db.execute('SELECT report_json FROM semantic_import_reports ORDER BY rowid').fetchall()
+        local_reports = db.execute('SELECT DISTINCT report_json FROM semantic_import_reports ORDER BY report_json').fetchall()
 finally:
     daemon.stop()
 
@@ -2664,7 +2664,7 @@ try:
     with closing(sqlite3.connect(f'file:{m.db_for(oracle_home)}?mode=ro', uri=True)) as db:
         m.selected_proof(db, oracle_pin, oracle_anchor.as_posix(), oracle_artifact)
         oracle_digest = m.parity_digest(db, oracle_pin, oracle_root)
-        oracle_reports = db.execute('SELECT report_json FROM semantic_import_reports ORDER BY rowid').fetchall()
+        oracle_reports = db.execute('SELECT DISTINCT report_json FROM semantic_import_reports ORDER BY report_json').fetchall()
     assert local_digest == oracle_digest, [name for name in local_digest if local_digest[name] != oracle_digest[name]]
     assert local_digest['semantic_import_reports'] == oracle_digest['semantic_import_reports']
     assert len(local_reports) == len(oracle_reports) == 1, (local_reports, oracle_reports)

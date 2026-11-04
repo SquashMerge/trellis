@@ -780,7 +780,13 @@ def selected_where(table):
                 "JOIN semantic_revision_raw_selections current ON current.batch_id=r.batch_id "
                 "AND current.producer_id=r.producer_id "
                 "WHERE current.revision_id=? AND r.revision_id=selected.revision_id "
-                "AND r.producer_id=selected.producer_id)")
+                "AND r.producer_id=selected.producer_id) "
+                # Native-first N and S carry the same report forward: keep the import's own.
+                "AND NOT EXISTS(SELECT 1 FROM semantic_import_reports earlier "
+                "JOIN native_revisions e ON e.id=earlier.revision_id "
+                "JOIN native_revisions this ON this.id=selected.revision_id "
+                "WHERE earlier.producer_id=selected.producer_id AND earlier.report_json=selected.report_json "
+                "AND e.published_index_revision<this.published_index_revision)")
     else:
         raise RuntimeError(f"unclassified schema-{SCHEMA_VERSION} selected table: {table}")
 
@@ -1249,10 +1255,10 @@ class SelectedView:
                     "(SELECT tuple_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
                 self.ids["binding"][raw] = (table, self.ids["tuple"][tuple_id], ordinal)
 
-    def map(self, family, value):
+    def map(self, family, value, where=None):
         if value is None:
             return None
-        require(value in self.ids[family], f"unmapped {family} identity: {value!r}")
+        require(value in self.ids[family], f"unmapped {family} identity: {value!r} in {where}")
         return (family, self.ids[family][value])
 
     def embedded(self, value):
@@ -1408,7 +1414,7 @@ class SelectedView:
             elif table == "class_relations" and column == "id":
                 family = "class-ref"
             if family:
-                cells[column] = self.map(family, value)
+                cells[column] = self.map(family, value, f"{table}.{column}")
         return cells
 
 

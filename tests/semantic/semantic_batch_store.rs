@@ -5246,12 +5246,36 @@ fn release(world: &World, pin: IndexPin, leader: &trellis::store::topology::Writ
     panic!("release did not finish");
 }
 
+/// Native-first: the replacement batch was captured at the semantic S that still selects the
+/// first batch, and the head holds that capture. A third batch at the head ends the hold; past
+/// the grace every revision that selected the first batch is released.
+fn replace_capture_hold(world: &World) -> IndexPin {
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture();
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let third = world.write(&fixture);
+    let (head, _, _) = world.publish(&third).unwrap();
+    world.store.set_retention_clock_for_tests(2_802, 1_802);
+    let leader = world.store.publication_for_tests().unwrap();
+    world.store.maintain_revisions(&leader).unwrap();
+    head
+}
+
 #[test]
 fn unreferenced_batches_are_collected_with_their_captures() {
-    let (world, older, head) = replaced_batch_world();
+    let (world, older, _) = replaced_batch_world();
     let first_batch = world.count("SELECT MIN(batch_id) FROM semantic_raw_batches");
     let leader = world.store.publication_for_tests().unwrap();
     release(&world, older, &leader);
+    drop(leader);
+    // The held capture of the replacement still selects the first batch.
+    assert_eq!(
+        world.count(&format!(
+            "SELECT COUNT(*) FROM semantic_raw_batches WHERE batch_id={first_batch}"
+        )),
+        1
+    );
+    let head = replace_capture_hold(&world);
     let of_first = |table: &str| -> i64 {
         world.count(&format!(
             "SELECT COUNT(*) FROM {table} WHERE batch_id={first_batch}"
@@ -5261,12 +5285,13 @@ fn unreferenced_batches_are_collected_with_their_captures() {
     assert_eq!(of_first("semantic_raw_captures"), 0);
     assert_eq!(of_first("semantic_raw_exclusions"), 0);
     assert_eq!(
-        world.count("SELECT COUNT(*) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id<>(SELECT MAX(batch_id) FROM semantic_raw_batches)"),
+        world.count(&format!("SELECT COUNT(*) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id={first_batch}")),
         0
     );
-    // The batch the head selects is untouched and still reads.
-    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
-    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_captures"), 1);
+    // The batch the head selects is untouched and still reads; so is the second batch, which
+    // the head's held capture still selects.
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 2);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_captures"), 2);
     assert!(world.count("SELECT COUNT(*) FROM semantic_raw_proofs") > 0);
     assert!(world.count("SELECT COUNT(*) FROM semantic_raw_documents") > 0);
     assert!(!world.store.semantic_at(head).unwrap().coverage.is_empty());
@@ -5275,8 +5300,16 @@ fn unreferenced_batches_are_collected_with_their_captures() {
 
 #[test]
 fn gc_keeps_proofs_referenced_by_retained_provenance() {
-    let (world, older, head) = replaced_batch_world();
+    let (world, older, _) = replaced_batch_world();
     let first_batch = world.count("SELECT MIN(batch_id) FROM semantic_raw_batches");
+    let leader = world.store.publication_for_tests().unwrap();
+    release(&world, older, &leader);
+    drop(leader);
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture();
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let third = world.write(&fixture);
+    let (head, _, _) = world.publish(&third).unwrap();
     // A retained provenance row of the head still derives from one proof of the first batch.
     let (capture_id, proof_id): (i64, String) = world
         .db()
@@ -5297,8 +5330,9 @@ fn gc_keeps_proofs_referenced_by_retained_provenance() {
             Ok(())
         })
         .unwrap();
+    world.store.set_retention_clock_for_tests(2_802, 1_802);
     let leader = world.store.publication_for_tests().unwrap();
-    release(&world, older, &leader);
+    world.store.maintain_revisions(&leader).unwrap();
     let survivors: Vec<(i64, String)> = world
         .db()
         .prepare("SELECT p.capture_id,p.proof_id FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1")

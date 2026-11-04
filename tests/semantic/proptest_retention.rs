@@ -150,9 +150,10 @@ impl Machine {
             basis,
         });
     }
-    /// A native N holds its basis and the captures of its pending selections while it still
-    /// records them: certainly while it is head, retained or pending whole; a partly released
-    /// N may already have dropped them.
+    /// A native N holds its basis while it still records its projection: certainly while it is
+    /// head, retained or pending whole; a partly released N may already have dropped it. Its
+    /// pending captures are held only while its catch-up target is outstanding, and every edit
+    /// here completes its S.
     fn basis_holds(&self, partial: bool) -> BTreeSet<usize> {
         self.revisions
             .iter()
@@ -161,11 +162,7 @@ impl Machine {
                 matches!(r.state, State::Head | State::Retained | State::PendingWhole)
                     || (partial && r.state == State::PendingPartial)
             })
-            .flat_map(|r| {
-                r.basis
-                    .into_iter()
-                    .chain(r.selected.into_iter().flatten().map(|s| s.capture))
-            })
+            .filter_map(|r| r.basis)
             .collect()
     }
     // Only head selections are roots. Earlier *still selected* rows are import witnesses.
@@ -574,9 +571,7 @@ impl Machine {
                 self.apply(Op::Advance(1));
                 self.apply(Op::Edit);
                 self.apply(Op::Import(slot));
-                // Native-first N holds the captures of its pending selections, so the import
-                // becomes due once that N, superseded one tick later, is released too.
-                self.apply(Op::Advance(900));
+                self.apply(Op::Advance(899));
                 for _ in 0..1000 {
                     if self.revisions[import].state == State::PendingWhole {
                         break;
