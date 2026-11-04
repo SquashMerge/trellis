@@ -407,6 +407,23 @@ mod tests {
         assert_eq!(envelope(&id, test_only)["warnings"], json!([]));
     }
 
+    /// #664: implements/extends constraints can use a producer relationship without a call binding.
+    #[test]
+    fn rules_type_relationship_evidence_is_not_syntax_only() {
+        let id = json!(1);
+        // Shape of the real positive implements result in
+        // tests/core/architecture_semantic.rs::type_relationships_settle_implements_constraints.
+        // With no layer policy, there is no separate semanticBinding instance to mask it.
+        let payload = json!({"indexGeneration":"g","indexRevision":1,
+            "instances":[{"rule":"squares-are-shapes","status":"conforms",
+                "evidence":[{"kind":"declaration"}],
+                "constraints":[{"mode":"require","kind":"implements","status":"conforms",
+                    "evidence":[{"kind":"declaration"},
+                        {"kind":"typeRelationship","provenanceId":"rel-square"}]}]}],
+            "testOnly":[]});
+        assert_eq!(envelope(&id, payload)["warnings"], json!([]));
+    }
+
     #[test]
     fn external_destinations_are_closed_and_never_native_sources() {
         for (language, package, standard_library) in [

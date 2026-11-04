@@ -1236,6 +1236,84 @@ fn upgraded_changed_sources_keep_syntax_and_report_reimport_without_rerunning_pr
     assert_eq!(world.invocation_count(), 1);
 }
 
+#[test]
+fn unreadable_successful_run_does_not_erase_published_upgrade_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let world = World::new();
+    let (run, _, _) = world.run_once();
+    let state = state_dir(&world.checkout);
+    world.upgrade(|root| {
+        let db = Connection::open(state.join("retention.sqlite")).unwrap();
+        db.execute("DELETE FROM retained_runs", []).unwrap();
+        drop(db);
+        fs::write(root.join("tool.py"), "def tool():\n    pass\n").unwrap();
+    });
+    let needs_reimport = |status: &Value| {
+        status["semanticLanguages"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["language"] == "javascript"))
+            .is_some_and(|row| row["reimport"]["state"] == "needsReimport")
+    };
+    let before = world.status();
+    assert!(needs_reimport(&before), "before fault: {before}");
+
+    // Model an ordinary permission fault on the existing successful record.
+    let record = state
+        .join("runs")
+        .join(run["runId"].as_str().unwrap())
+        .join("run.json");
+    let permissions = fs::metadata(&record).unwrap().permissions();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(
+        fs::read(&record).is_err(),
+        "fault must make run.json unreadable"
+    );
+    fs::write(
+        world.checkout.root.join("extra.js"),
+        "function extra() {}\n",
+    )
+    .unwrap();
+    let indexed = world
+        .checkout
+        .cli()
+        .args(["index", "--workspace"])
+        .arg(&world.checkout.root)
+        .output()
+        .unwrap();
+    // Restore before checking the result so even an indexing failure cleans up the fault.
+    fs::set_permissions(&record, permissions).unwrap();
+    reply("index with unreadable successful run", indexed);
+    let during = world.status();
+
+    // Readability returning must not require a second upgrade to recover the warning.
+    fs::write(
+        world.checkout.root.join("extra.js"),
+        "function extra() { return 1; }\n",
+    )
+    .unwrap();
+    reply(
+        "index after successful record becomes readable",
+        world
+            .checkout
+            .cli()
+            .args(["index", "--workspace"])
+            .arg(&world.checkout.root)
+            .output()
+            .unwrap(),
+    );
+    let after = world.status();
+    assert!(
+        needs_reimport(&during),
+        "after unreadable history: {during}; after readability restored: {after}"
+    );
+    assert!(
+        needs_reimport(&after),
+        "after readability restored: {after}"
+    );
+    assert_eq!(world.invocation_count(), 1);
+}
+
 /// #664: a language that never had a producer is not configured, before and after an
 /// upgrade. Nothing was lost, so nothing needs re-import.
 #[test]
