@@ -57,7 +57,10 @@ releases use CPU.
 
 The model is optional for the browser and lexical symbol search, but required for
 vector-based semantic symbol search. Trellis never downloads weights implicitly.
-If a daemon is already running, installing the model does not reconfigure it: follow the [manual restart steps](semantic-search-local-cache.md#configuration-and-daemon-restart).
+If a daemon is already running, install prints a restart hint. Close active MCP clients,
+then run `trellis daemon stop` and start Trellis again to load the model. Restart any
+`trellis serve` command too. Model loading and vector coverage build in the background;
+lexical results stay available. See the [restart steps](semantic-search-local-cache.md#configuration-and-daemon-restart).
 See the [local model guide](semantic-search-local-cache.md) for optional configuration
 and availability diagnostics.
 
@@ -91,8 +94,7 @@ trellis serve --token-file ~/.trellis-private/token
 To stop everything, or before you change the port or token file, stop the daemon. Otherwise `serve` fails with `serve bind conflicts with running listener` or `serve token file conflicts with running listener`.
 
 ```sh
-pgrep -fl 'trellis daemon'    # find the PID and check it's yours
-kill -TERM <pid>
+trellis daemon stop
 ```
 
 ### Keep a live serve detached

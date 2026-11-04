@@ -44,8 +44,8 @@ enum Command {
     Semantic(SemanticCommand),
     /// Plan and inspect headless semantic producers. Planning executes nothing.
     Producer(ProducerCommand),
-    /// Run the elected user-level socket service.
-    Daemon,
+    /// Run the user-level socket service, or stop the existing daemon.
+    Daemon(DaemonArgs),
     /// Serve one read-only MCP connection on line-framed stdin/stdout.
     Mcp(WorkspaceArgs),
     /// Serve the authenticated loopback API and browser inspector. Refresh is explicit.
@@ -96,6 +96,16 @@ struct NavigationFixtureArgs {
         "sequence-missing", "sequence-constructor", "sequence-library", "sequence-expand"
     ])]
     mode: String,
+}
+#[derive(Args)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    command: Option<DaemonCommand>,
+}
+#[derive(Subcommand)]
+enum DaemonCommand {
+    /// Stop the per-user daemon across all checkouts. Does not start one.
+    Stop,
 }
 #[derive(Args)]
 struct ModelArgs {
@@ -395,8 +405,11 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "trellis=info".into()),
         )
         .init();
-    if matches!(&command, Command::Daemon) {
-        return run_daemon().await;
+    if let Command::Daemon(args) = &command {
+        return match args.command {
+            None => run_daemon().await,
+            Some(DaemonCommand::Stop) => print_json(&stop_existing_daemon()?),
+        };
     }
     if let Command::Serve(args) = &command {
         return serve_via_daemon(args).await;
@@ -422,7 +435,7 @@ async fn main() -> Result<()> {
                 &args.mode,
             )?)?;
         }
-        Command::Daemon | Command::Serve(_) | Command::GitRead(_) => unreachable!(),
+        Command::Daemon(_) | Command::Serve(_) | Command::GitRead(_) => unreachable!(),
         Command::Mcp(args) => {
             let (_, identity) = args.resolve_unattached()?;
             let socket = socket_path()?;
@@ -1389,6 +1402,37 @@ fn serve_control_failure(result: std::io::Result<usize>) -> anyhow::Error {
     }
 }
 
+fn stop_existing_daemon() -> Result<serde_json::Value> {
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixStream;
+    let mut stream = match UnixStream::connect(socket_path()?) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(serde_json::json!({"stopped": false}));
+        }
+        Err(error) => return Err(error).context("daemon_unavailable"),
+    };
+    stream.set_read_timeout(Some(CLI_REPLY_BOUND))?;
+    stream.set_write_timeout(Some(CLI_REPLY_BOUND))?;
+    let request = daemon_request("daemon_stop", serde_json::json!({}));
+    protocol::write_frame(&mut stream, &request)?;
+    let reply: protocol::Reply = protocol::read_frame(&mut stream)
+        .context("daemon_unavailable: stop completion not received")?;
+    ensure!(reply.id == request.id, "invalid daemon stop reply");
+    checked_reply(reply)
+}
+
+struct DaemonStop {
+    session: u64,
+    request: u64,
+    stream: std::os::unix::net::UnixStream,
+}
+
 async fn run_daemon() -> Result<()> {
     let paths = daemon::SocketPaths::new(&TopologyRoots::production()?.data);
     let Some(owner) = daemon::SocketOwner::acquire(&paths)? else {
@@ -1471,8 +1515,10 @@ async fn run_daemon() -> Result<()> {
     let next_session = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
     let mut connections = tokio::task::JoinSet::new();
-    let idle = daemon::run_idle_lifecycle(registry.clone());
-    tokio::pin!(idle);
+    let mut sockets = std::collections::HashMap::new();
+    let mut task_sessions = std::collections::HashMap::new();
+    let (stop_sender, mut stop_receiver) = tokio::sync::mpsc::unbounded_channel::<DaemonStop>();
+    let mut idle = Box::pin(daemon::run_idle_lifecycle(registry.clone()));
     // A test-elected daemon ends with the test process that owns it (#130),
     // even when the test never stops it or is killed before its guards run.
     let owner_gone = async {
@@ -1504,11 +1550,22 @@ async fn run_daemon() -> Result<()> {
             Ok("econnaborted") => Some(libc::ECONNABORTED),
             _ => None,
         };
-    loop {
+    let stop = loop {
         tokio::select! {
-            result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break; }
-            () = &mut owner_gone => break,
-            _ = connections.join_next(), if !connections.is_empty() => {}
+            stop = stop_receiver.recv() => break stop,
+            result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break None; }
+            () = &mut owner_gone => break None,
+            completed = connections.join_next_with_id(), if !connections.is_empty() => {
+                if let Some(completed) = completed {
+                    let task = match completed {
+                        Ok((task, _)) => task,
+                        Err(error) => error.id(),
+                    };
+                    if let Some(session) = task_sessions.remove(&task) {
+                        sockets.remove(&session);
+                    }
+                }
+            }
             accepted = async {
                 #[cfg(feature = "test-support")]
                 if let Some(errno) = injected_accept_errno {
@@ -1541,21 +1598,55 @@ async fn run_daemon() -> Result<()> {
                 let search = search.clone();
                 let id = next_session.fetch_add(1, Ordering::Relaxed);
                 let browser_shutdown = browser_shutdown.clone();
-                connections.spawn_blocking(move || {
-                    let _ = dispatch_connection(stream, id, registry, browser, search, browser_shutdown, accepted_at);
+                let stop_sender = stop_sender.clone();
+                sockets.insert(id, stream.try_clone()?);
+                let task = connections.spawn_blocking(move || {
+                    let _ = dispatch_connection(stream, id, registry, browser, search, browser_shutdown, stop_sender, accepted_at);
                 });
+                task_sessions.insert(task.id(), id);
             }
         }
+    };
+    drop(idle);
+    if let Some(stop) = &stop {
+        sockets.remove(&stop.session);
+    }
+    // Socket shutdown wakes idle MCP readers and incomplete ingress too; aborting
+    // a spawn_blocking task would leave those readers running.
+    for stream in sockets.values() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+    if stop.is_some() {
+        browser_shutdown.send_replace(true);
+        registry::CheckoutRegistry::cancel_producers(registry.clone()).await?;
     }
     stop_daemon_connections(&browser_shutdown, &mut connections).await;
+    browser.lock().await.finish_owned().await?;
+    if stop.is_some() {
+        registry::CheckoutRegistry::shutdown(registry.clone()).await?;
+    }
+    drop(browser);
+    drop(registry);
     drop(listener);
     drop(owner);
+    if let Some(mut stop) = stop {
+        // Acknowledgment proves this elected owner released its socket/lock.
+        // Another client may already be starting a successor.
+        stop.stream.set_write_timeout(Some(CLI_REPLY_BOUND))?;
+        protocol::write_frame(
+            &mut stop.stream,
+            &protocol::Reply {
+                id: stop.request,
+                payload: serde_json::json!({"result": {"stopped": true}}),
+            },
+        )?;
+    }
     Ok(())
 }
 
-async fn stop_daemon_connections(
+async fn stop_daemon_connections<T: 'static>(
     shutdown: &tokio::sync::watch::Sender<bool>,
-    connections: &mut tokio::task::JoinSet<()>,
+    connections: &mut tokio::task::JoinSet<T>,
 ) {
     shutdown.send_replace(true);
     while connections.join_next().await.is_some() {}
@@ -1768,6 +1859,7 @@ fn dispatch_connection(
     browser: Arc<tokio::sync::Mutex<daemon::BrowserProvisioner>>,
     search: Arc<daemon::search::SearchService>,
     browser_shutdown: tokio::sync::watch::Sender<bool>,
+    stop_sender: tokio::sync::mpsc::UnboundedSender<DaemonStop>,
     accepted_at: Instant,
 ) -> Result<()> {
     let runtime = tokio::runtime::Handle::current();
@@ -1812,6 +1904,20 @@ fn dispatch_connection(
             request.operation != "metrics",
             "metrics admission preface required"
         );
+    }
+    if request.operation == "daemon_stop" {
+        ensure!(
+            request.payload == serde_json::json!({}),
+            "invalid daemon stop request"
+        );
+        stop_sender
+            .send(DaemonStop {
+                session,
+                request: request.id,
+                stream,
+            })
+            .map_err(|_| anyhow::anyhow!("daemon_unavailable: daemon already stopping"))?;
+        return Ok(());
     }
     if request.operation == "mcp" {
         let relayed = request
@@ -2039,7 +2145,7 @@ fn dispatch_connection(
                     .register_serve(&registry, &identity, options, bind, &token_file)
                     .await?;
                 if first {
-                    browser.spawn_with_shutdown(browser_shutdown.subscribe())?;
+                    browser.start_owned(browser_shutdown.subscribe())?;
                 }
                 Ok::<_, anyhow::Error>(address)
             })?;

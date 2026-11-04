@@ -321,6 +321,78 @@ fn serve_connections_hold_only_the_daemon_until_the_last_disconnect() {
     assert!(registry.advance(due).unwrap().exit);
 }
 
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn explicit_shutdown_waits_for_active_startup_and_retires_its_resources() {
+    let (_base, id, mut registry, now) = fixture();
+    registry.browser_request_at(&id, now).unwrap();
+    assert_eq!(
+        registry.next_lifecycle_deadline(now),
+        Some(now + BROWSER_IDLE_DELAY)
+    );
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        let _ = entered_tx.lock().unwrap().take().unwrap().send(());
+        let _ = resume_rx.lock().unwrap().recv();
+    }));
+    // This status-only activation has no FIFO row whose terminal transition
+    // could hide a missing lifecycle wake after startup finishes.
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, entered_rx)
+        .await
+        .expect("startup worker did not reach its pause")
+        .unwrap();
+    assert!(runtime.has_active_resources());
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let mut shutdown = std::pin::pin!(CheckoutRegistry::shutdown(registry.clone()));
+    let completed_while_held = tokio::time::timeout(
+        trellis::testing::HANG_BACKSTOP,
+        std::future::poll_fn(
+            |cx| match std::future::Future::poll(shutdown.as_mut(), cx) {
+                std::task::Poll::Ready(_) => std::task::Poll::Ready(true),
+                std::task::Poll::Pending => {
+                    // No other task locks this registry. Once shutdown clears
+                    // the browser deadline, this same poll must scan release
+                    // and reach its lifecycle wait.
+                    let checked = registry.try_lock().unwrap();
+                    if checked.next_lifecycle_deadline(now).is_none() {
+                        std::task::Poll::Ready(false)
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }
+            },
+        ),
+    )
+    .await
+    .expect("shutdown did not reach its active-worker wait");
+    let resources_while_held = runtime.has_active_resources();
+    // Release even an incorrectly completed shutdown before reporting failure.
+    resume_tx.send(()).unwrap();
+    assert!(
+        !completed_while_held,
+        "shutdown completed while its startup worker was paused"
+    );
+    assert!(
+        resources_while_held,
+        "shutdown dropped the active worker's resources"
+    );
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, shutdown)
+        .await
+        .expect("shutdown did not wake after startup completed")
+        .unwrap();
+    assert_eq!(
+        scheduler.runtime_phase(),
+        trellis::http::RuntimePhase::Retired
+    );
+    assert!(!runtime.has_active_resources());
+    assert_eq!(registry.lock().await.active_count(), 0);
+}
+
 #[tokio::test]
 async fn lifecycle_driver_exits_when_startup_deadline_is_due() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::starting_at(

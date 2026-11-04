@@ -67,7 +67,8 @@ or an older managed revision; listing an old revision does not make it loadable 
 installable. Removal does not change configuration.
 
 All three commands print machine-readable JSON. Install reports `verified`,
-`alreadyInstalled` and `restartRequired`; remove reports `removed` and `restartRequired`.
+`alreadyInstalled`, `restartRequired` and `restartCommand: "trellis daemon stop"`;
+remove reports `removed`, `restartRequired` and the same `restartCommand`.
 `model list` reports `configuration`, `installed` and `appliesTo:"next_daemon_start"`.
 Configuration includes the resolved paths, model pin, backend setting and per-field sources.
 Listed entries include `filesPresent` for the reviewed revision (`null` for older revisions)
@@ -132,17 +133,20 @@ installation/removal and replacing the executable do not reconfigure an existing
 A running daemon may still hold loaded weights after removal; removal is not immediate
 unloading. Changes apply on the next daemon startup.
 
-There is no `trellis daemon stop` or `trellis daemon restart` command. To apply changes,
-perform these steps yourself; the model commands do not run them:
+To apply changes, use the command printed in the install/remove report's `restartCommand`:
 
-1. Stop active Trellis MCP/CLI clients so they cannot auto-start the old configuration.
-2. Find the per-user daemon with `pgrep -fl '[t]rellis daemon'`, inspect its PID, and stop
-   that process with `kill -TERM <pid>`. Wait for it to exit. If you started `trellis daemon`
-   in a foreground terminal, Ctrl-C stops that process. Ctrl-C on `trellis serve` stops
-   the serve client, not necessarily the shared daemon.
-3. Run `trellis status --workspace /absolute/path/to/checkout` to auto-start the new daemon
-   with the user configuration, then reconnect your clients. Remove unintended development
-   overrides from that startup environment first.
+1. Close active Trellis MCP/CLI clients so they cannot auto-start another daemon during
+   shutdown. Ctrl-C on `trellis serve` stops only that client, not the shared daemon.
+2. Run `trellis daemon stop`. It stops the per-user daemon across all checkouts and closes
+   its browser and client connections. It returns after the old daemon releases its socket
+   and election lock. If no daemon is running, it succeeds without starting one.
+3. Run `trellis status --workspace /absolute/path/to/checkout` to auto-start a daemon with
+   the new configuration, then reconnect your MCP clients and restart `trellis serve`.
+   Remove unintended development overrides from that startup environment first.
+
+Install/remove do not run these steps automatically. Loading and vector coverage are
+asynchronous after restart; `building` or `partial` search state is not a missing model,
+and lexical results remain available.
 
 Do not delete the socket or lock file to restart it; the newly elected daemon handles
 any stale socket left by the stopped process.

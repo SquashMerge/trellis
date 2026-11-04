@@ -379,6 +379,132 @@ fn model_list_reads_user_configuration_without_workspace_or_runtime_state() {
 }
 
 #[test]
+fn daemon_stop_without_a_daemon_creates_no_runtime_state() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let output = cli(&home).args(["daemon", "stop"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stopped: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stopped["stopped"], false);
+    assert!(!fixture_roots(&home).data.exists());
+    assert!(!fixture_roots(&home).cache.exists());
+}
+
+#[test]
+fn daemon_stop_closes_idle_mcp_and_recaptures_model_configuration() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::protocol;
+
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let models = temp.path().join("models");
+    write_search_configuration(&home, &models);
+    let root = checkout(temp.path(), "model-restart");
+    fs::create_dir(root.join(".git")).unwrap();
+    run(&home, "index", &root);
+    let initial = run(&home, "status", &root);
+    assert_eq!(
+        initial["searchIndex"]["unavailableReason"],
+        "model_not_configured"
+    );
+    let original = trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid")).unwrap();
+    let socket = fixture_socket_paths(&home).socket;
+    let mut mcp = UnixStream::connect(&socket).unwrap();
+    mcp.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+            .unwrap();
+    protocol::write_frame(&mut mcp, &protocol::Request {
+        id: 1,
+        operation: "mcp".into(),
+        payload: serde_json::json!({"workspace":root,"device":identity.device,"inode":identity.inode,"mcpIdentity":protocol::mcp_identity()}),
+    }).unwrap();
+    let attached: protocol::Reply = protocol::read_frame(&mut mcp).unwrap();
+    assert_eq!(attached.payload["result"], true);
+    let mut ingress = UnixStream::connect(&socket).unwrap();
+    ingress
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let mut browser = UnixStream::connect(&socket).unwrap();
+    browser
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    protocol::write_frame(&mut browser, &protocol::Request {
+        id: 2,
+        operation: "serve".into(),
+        payload: serde_json::json!({"workspace":root,"bind":"127.0.0.1:0","tokenFile":home.join("token"),"options":{}}),
+    }).unwrap();
+    let served: protocol::Reply = protocol::read_frame(&mut browser).unwrap();
+    assert!(served.payload["result"].is_string(), "{served:?}");
+    let snapshot = models
+        .join(REVIEWED_MODEL_NAME)
+        .join(REVIEWED_MODEL_REVISION);
+    // Presence selects the model on restart; tiny invalid files must then give
+    // model_load_failed, never a false claim of verified embedding readiness.
+    for name in [
+        "1_Pooling/config.json",
+        "config.json",
+        "config_sentence_transformers.json",
+        "model.safetensors",
+        "modeling_qwen3_bidirectional.py",
+        "modules.json",
+        "sentence_bert_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ] {
+        let path = snapshot.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"invalid fixture").unwrap();
+    }
+    assert_eq!(
+        run(&home, "status", &root)["searchIndex"]["unavailableReason"],
+        "model_not_configured"
+    );
+    let output = cli(&home).args(["daemon", "stop"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["stopped"],
+        true
+    );
+    assert!(
+        !socket.exists(),
+        "stop acknowledged before socket ownership ended"
+    );
+    assert!(protocol::read_frame::<protocol::Reply>(&mut mcp).is_err());
+    assert!(protocol::read_frame::<protocol::Reply>(&mut browser).is_err());
+    assert!(protocol::read_frame::<protocol::Reply>(&mut ingress).is_err());
+    trellis::testing::wait_until("original daemon exit", || !original.matches());
+    let restarted = run(&home, "status", &root);
+    let successor =
+        trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid")).unwrap();
+    assert!(successor.matches());
+    assert_ne!(
+        serde_json::to_value(original).unwrap(),
+        serde_json::to_value(successor).unwrap()
+    );
+    assert_eq!(
+        restarted["searchIndex"]["unavailableReason"],
+        "model_load_failed"
+    );
+    assert_eq!(
+        restarted["revision"]["indexGeneration"],
+        initial["revision"]["indexGeneration"]
+    );
+}
+
+#[test]
 fn configured_search_status_reports_startup_configuration_without_model_files() {
     let temp = short_temp();
     let home = temp.path().join("home");

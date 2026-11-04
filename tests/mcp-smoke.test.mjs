@@ -179,6 +179,9 @@ test('known unavailable capabilities fail while watcher degradation and native p
     assert.equal(report.blockedTools, 0);
     assert.equal(report.calls, tools.length);
     if (mode === 'watcher') assert.equal(report.results[0].watcherDegraded, true);
+    if (mode === 'search_building') {
+      assert.equal(report.results.find(row => row.tool === 'trellis_search_symbols').reason, 'search_coverage_building');
+    }
   }
 });
 

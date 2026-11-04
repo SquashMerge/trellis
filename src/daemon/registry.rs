@@ -759,6 +759,47 @@ impl CheckoutRegistry {
         }
     }
 
+    /// Cancel producer owners without holding the registry they may need.
+    pub async fn cancel_producers(registry: Arc<tokio::sync::Mutex<Self>>) -> anyhow::Result<()> {
+        let runtimes: Vec<_> = registry.lock().await.runtimes.values().cloned().collect();
+        tokio::task::spawn_blocking(move || {
+            for runtime in runtimes {
+                runtime.producer.shutdown();
+                runtime.pickup.shutdown();
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Explicit shutdown bypasses idle grace, not accepted work or retirement.
+    /// Call only after closing and draining client/browser ingress.
+    pub async fn shutdown(registry: Arc<tokio::sync::Mutex<Self>>) -> anyhow::Result<()> {
+        let signal = {
+            let mut checked = registry.lock().await;
+            for entry in checked.entries.values_mut() {
+                entry.sessions.clear();
+                entry.browser_until = None;
+            }
+            checked.lifecycle_signal()
+        };
+        loop {
+            let notified = signal.notified();
+            {
+                let mut checked = registry.lock().await;
+                for key in checked.entries.keys().cloned().collect::<Vec<_>>() {
+                    checked
+                        .release(&key)
+                        .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+                }
+                if checked.runtimes.is_empty() {
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+
     pub fn known_roots(&self) -> Vec<(String, PathBuf)> {
         let mut roots: Vec<_> = self
             .entries
