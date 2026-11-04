@@ -7614,6 +7614,28 @@ forbid = [{{ calls = "helper" }}]
                                 .find(|item| item["rule"] == "entry-must-not-call-helper")
                                 .unwrap();
                             assert_eq!(instance["status"], "deviates", "{full}");
+                            // #664: the deviation rests on the producer's binding, so the
+                            // answer does not say it is syntax-only.
+                            fn semantic(value: &Value) -> bool {
+                                match value {
+                                    Value::Object(object) => {
+                                        object.get("kind") == Some(&Value::from("semanticBinding"))
+                                            || object.values().any(semantic)
+                                    }
+                                    Value::Array(items) => items.iter().any(semantic),
+                                    _ => false,
+                                }
+                            }
+                            assert!(semantic(instance), "{full}");
+                            assert!(
+                                full["warnings"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .all(|warning| warning["code"] != "syntaxOnly"),
+                                "{name}: {}",
+                                full["warnings"]
+                            );
                         }
                         let whole = flatten(&full);
                         assert!(!whole.is_empty(), "{name}: {full}");

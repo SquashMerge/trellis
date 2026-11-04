@@ -352,6 +352,30 @@ fn capped_whole(id: &Value, name: &str, envelope: Value, modern: bool) -> Value 
 mod tests {
     use super::*;
 
+    /// #664: a rules answer whose evidence includes a producer binding is not syntax-only,
+    /// even when sampling leaves that binding out; one with structural evidence only is.
+    #[test]
+    fn rules_answers_warn_syntax_only_only_without_semantic_evidence() {
+        let id = json!(1);
+        let item = |kind: &str| json!({"kind":kind});
+        let check = |evidence: Vec<Value>| {
+            json!({"indexGeneration":"g","indexRevision":1,
+                "instances":[{"rule":"r","evidence":evidence}],"testOnly":[]})
+        };
+        let syntax = check(vec![item("structuralReference")]);
+        assert_eq!(envelope(&id, syntax)["warnings"][0]["code"], "syntaxOnly");
+        let semantic = check(vec![item("structuralReference"), item("semanticBinding")]);
+        assert_eq!(envelope(&id, semantic)["warnings"], json!([]));
+        // A calls constraint carries its binding on the constraint's own evidence.
+        let mut constraint = check(vec![item("structuralReference")]);
+        constraint["instances"][0]["constraints"] =
+            json!([{"kind":"calls","evidence":[item("call"), item("semanticBinding")]}]);
+        assert_eq!(envelope(&id, constraint)["warnings"], json!([]));
+        let mut test_only = check(vec![]);
+        test_only["testOnly"] = json!([{"rule":"r","evidence":[item("semanticBinding")]}]);
+        assert_eq!(envelope(&id, test_only)["warnings"], json!([]));
+    }
+
     #[test]
     fn external_destinations_are_closed_and_never_native_sources() {
         for (language, package, standard_library) in [

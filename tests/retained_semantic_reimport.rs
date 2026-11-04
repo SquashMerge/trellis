@@ -1236,25 +1236,61 @@ fn upgraded_changed_sources_keep_syntax_and_report_reimport_without_rerunning_pr
     assert_eq!(world.invocation_count(), 1);
 }
 
+/// #664: a language that never had a producer is not configured, before and after an
+/// upgrade. Nothing was lost, so nothing needs re-import.
 #[test]
-fn first_upgrade_reports_known_native_language_but_clean_start_has_no_false_reimport() {
+fn first_upgrade_reports_no_reimport_for_languages_without_producer_history() {
     let world = World::new();
     assert!(world.status().get("semanticLanguages").is_none());
-    world.upgrade(|_| {});
+    world.upgrade(|root| fs::write(root.join("tool.py"), "def tool():\n    pass\n").unwrap());
     let status = world.status();
-    let rows = status["semanticLanguages"].as_array().unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["language"], "javascript");
-    assert_eq!(rows[0]["semanticState"], "unavailable");
-    assert_eq!(rows[0]["reimport"]["state"], "needsReimport");
     assert!(
-        rows[0]["reimport"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("not retained before this upgrade")
+        status["semanticLanguages"]
+            .as_array()
+            .is_none_or(|rows| rows.iter().all(|row| row["reimport"].is_null())),
+        "{status}"
+    );
+    assert!(
+        !status
+            .to_string()
+            .contains("not retained before this upgrade"),
+        "{status}"
     );
     assert!(world.generated_rows().is_empty());
     assert_eq!(world.invocation_count(), 0);
+}
+
+/// #664: a language whose producer published evidence before its inputs were retained
+/// needs re-import after the upgrade; a language no producer ever covered does not.
+#[test]
+fn first_upgrade_reports_reimport_only_for_languages_with_producer_history() {
+    let world = World::new();
+    world.run_once();
+    let catalog = state_dir(&world.checkout).join("retention.sqlite");
+    world.upgrade(|root| {
+        // Evidence published before retention: its run inputs were never retained.
+        let db = Connection::open(&catalog).unwrap();
+        db.execute("DELETE FROM retained_runs", []).unwrap();
+        drop(db);
+        fs::write(root.join("tool.py"), "def tool():\n    pass\n").unwrap();
+    });
+    let status = world.status();
+    let rows = status["semanticLanguages"].as_array().unwrap();
+    let row = |language: &str| rows.iter().find(|row| row["language"] == language);
+    let js = row("javascript").unwrap();
+    assert_eq!(js["reimport"]["state"], "needsReimport", "{status}");
+    assert!(
+        js["reimport"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not retained before this upgrade"),
+        "{status}"
+    );
+    let python = row("python").unwrap();
+    assert_eq!(python["reimport"], Value::Null, "{status}");
+    assert_eq!(python["semanticProducerId"], Value::Null, "{status}");
+    assert_eq!(world.generated_rows().len(), 1);
+    assert_eq!(world.invocation_count(), 1);
 }
 
 #[test]

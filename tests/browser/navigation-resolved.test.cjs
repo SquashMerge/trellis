@@ -78,7 +78,7 @@ for (const mode of ["zero", "sole", "multiple", "unresolved"]) {
         assert.deepEqual(calls, [], "no guessing from a source spelling");
         assert.equal(await page.getByRole("menuitem", {name:/Sequence of callee/}).count(), 0);
         assert.ok(navigation.targets.some(target => target.reason === "enclosing" && target.symbol.id === fixture.caller));
-        await page.getByRole("menuitem", {name:/^Sequence · enclosing · syntax · measured/}).waitFor();
+        await page.getByRole("menuitem", {name:/^Sequence · enclosing · measured declaration · measured/}).waitFor();
         if (mode === "multiple") {
           assert.ok(navigation.warnings.includes("multiple semantic producers for rust; showing syntax"));
           assert.match(await page.locator(".classes-context-menu").textContent(), /multiple semantic producers for rust; showing syntax/);
