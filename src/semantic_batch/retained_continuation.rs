@@ -84,17 +84,16 @@ impl RetainedStageContinuation {
         cancel: &CancelFlag,
     ) -> Result<Self> {
         check_cancel(cancel)?;
-        let length: i64 = db.query_row(
-            "SELECT length(descriptor_bytes) FROM semantic_raw_batches WHERE batch_id=?1",
-            [batch_id],
-            |row| row.get(0),
-        )?;
+        let length: i64 = db
+            .prepare_cached(
+                "SELECT length(descriptor_bytes) FROM semantic_raw_batches WHERE batch_id=?1",
+            )?
+            .query_row([batch_id], |row| row.get(0))?;
         ensure!(length >= 0, "retained descriptor length");
         if length as u64 > limits.descriptor_bytes {
             return Err(ScipCaptureError::LimitExceeded("descriptor bytes".into()).into());
         }
-        let (bytes, stored_sha): (Vec<u8>, String) = db.query_row(
-            "SELECT descriptor_bytes,descriptor_sha256 FROM semantic_raw_batches WHERE batch_id=?1",
+        let (bytes, stored_sha): (Vec<u8>, String) = db.prepare_cached("SELECT descriptor_bytes,descriptor_sha256 FROM semantic_raw_batches WHERE batch_id=?1")?.query_row(
             [batch_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -110,8 +109,7 @@ impl RetainedStageContinuation {
         )?;
         descriptor.check_pages(limits)?;
         descriptor.check_artifacts(limits)?;
-        let metadata_ok: bool = db.query_row(
-            "SELECT producer_id=?2 AND producer_version=?3 AND profile_id=?4 AND source_set_id=?5 AND captured_revision=?6 AND source_manifest_hash=?7 AND decoder_version=?8 FROM semantic_raw_batches WHERE batch_id=?1",
+        let metadata_ok: bool = db.prepare_cached("SELECT producer_id=?2 AND producer_version=?3 AND profile_id=?4 AND source_set_id=?5 AND captured_revision=?6 AND source_manifest_hash=?7 AND decoder_version=?8 FROM semantic_raw_batches WHERE batch_id=?1")?.query_row(
             params![batch_id, producer.name, producer.version, descriptor.profile_id,
                 descriptor.source_set.id, descriptor.source_revision,
                 descriptor.source_manifest_hash, descriptor.decoder_version], |row| row.get(0),
@@ -119,8 +117,7 @@ impl RetainedStageContinuation {
         ensure!(metadata_ok, "retained batch metadata");
         // Existing original-publication or complete captured-witness authority, not an old
         // target binding or freshness grant. Missing document accelerators require FULL.
-        let original: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s JOIN native_revisions r ON r.id=s.revision_id WHERE s.batch_id=?1 AND s.producer_id=?2 AND s.captured_pin=?3 AND r.native_revision_id=?4 AND r.source_set_id=?5) OR EXISTS(SELECT 1 FROM semantic_batch_witnesses WHERE batch_id=?1)",
+        let original: bool = db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s JOIN native_revisions r ON r.id=s.revision_id WHERE s.batch_id=?1 AND s.producer_id=?2 AND s.captured_pin=?3 AND r.native_revision_id=?4 AND r.source_set_id=?5) OR EXISTS(SELECT 1 FROM semantic_batch_witnesses WHERE batch_id=?1)")?.query_row(
             params![batch_id, producer.name,
                 format!("pin:v1:{}:{}", reader.pin().index_generation, reader.pin().index_revision),
                 descriptor.source_revision, descriptor.source_set.id], |row| row.get(0),
@@ -220,7 +217,8 @@ impl RetainedStageContinuation {
     }
 
     /// One actual stored row, copy block or original top-level SCIP unit. The caller closes
-    /// its coherent captured/raw read transaction after every return, before worker selection.
+    /// its coherent captured/raw read transaction after every return, before worker selection,
+    /// and releases the private stage connection ([`Self::release_connection`]) before it yields.
     pub(crate) fn advance(
         &mut self,
         db: &Connection,
@@ -228,11 +226,13 @@ impl RetainedStageContinuation {
         counters: &mut BatchCounters,
         cancel: &CancelFlag,
     ) -> Result<Option<AdmittedBatch>> {
-        let result = self.advance_unit(db, reader, counters, cancel);
+        self.advance_unit(db, reader, counters, cancel)
+    }
+
+    pub(crate) fn release_connection(&mut self) {
         if let Some(stage) = self.stage.as_mut() {
             stage.release_connection();
         }
-        result
     }
 
     fn advance_unit(
@@ -275,8 +275,7 @@ impl RetainedStageContinuation {
                 // of an already validated retained row.
                 if self.trusted && self.inventory_artifact < descriptor.artifacts.len() {
                     let entry = &descriptor.artifacts[self.inventory_artifact];
-                    let key: Option<(String, String)> = db.query_row(
-                        "SELECT d.language,d.path FROM semantic_raw_captures c JOIN semantic_raw_documents d ON d.capture_id=c.capture_id WHERE c.batch_id=?1 AND c.ordinal=?2 AND (d.language,d.path)>(?3,?4) ORDER BY d.language,d.path LIMIT 1",
+                    let key: Option<(String, String)> = db.prepare_cached("SELECT d.language,d.path FROM semantic_raw_captures c JOIN semantic_raw_documents d ON d.capture_id=c.capture_id WHERE c.batch_id=?1 AND c.ordinal=?2 AND (d.language,d.path)>(?3,?4) ORDER BY d.language,d.path LIMIT 1")?.query_row(
                         params![self.batch_id, entry.ordinal, self.inventory_key.0, self.inventory_key.1], |row| Ok((row.get(0)?, row.get(1)?)),
                     ).optional()?;
                     if let Some(key) = key {
@@ -393,15 +392,13 @@ impl RetainedStageContinuation {
                 }
             }
             Phase::Coverage => {
-                let source: Option<(i64, String, String, String)> = conn.query_row(
-                    "SELECT ord,language,path,content_hash FROM sources WHERE ord>?1 ORDER BY ord LIMIT 1",
+                let source: Option<(i64, String, String, String)> = conn.prepare_cached("SELECT ord,language,path,content_hash FROM sources WHERE ord>?1 ORDER BY ord LIMIT 1")?.query_row(
                     [self.coverage_cursor], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 ).optional()?;
                 if let Some((ord, language, path, hash)) = source {
                     self.coverage_cursor = ord;
                     if self.producer.languages.contains(&language) {
-                        let exclusion: Option<String> = db.query_row(
-                            "SELECT reason FROM semantic_raw_exclusions WHERE batch_id=?1 AND language=?2 AND path=?3",
+                        let exclusion: Option<String> = db.prepare_cached("SELECT reason FROM semantic_raw_exclusions WHERE batch_id=?1 AND language=?2 AND path=?3")?.query_row(
                             params![self.batch_id, language, path], |row| row.get(0),
                         ).optional()?;
                         let assignments = db.prepare_cached(
@@ -478,8 +475,7 @@ impl RetainedStageContinuation {
                         self.missing_artifact += 1;
                         self.missing_proof.clear();
                     } else {
-                        let proof: Option<(String, String, String)> = db.query_row(
-                            "SELECT p.proof_id,p.language,p.path FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.batch_id=?1 AND c.ordinal=?2 AND p.proof_id>?3 ORDER BY p.proof_id LIMIT 1",
+                        let proof: Option<(String, String, String)> = db.prepare_cached("SELECT p.proof_id,p.language,p.path FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.batch_id=?1 AND c.ordinal=?2 AND p.proof_id>?3 ORDER BY p.proof_id LIMIT 1")?.query_row(
                             params![self.batch_id, entry.ordinal, self.missing_proof],
                             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                         ).optional()?;
@@ -528,8 +524,7 @@ impl RetainedStageContinuation {
                 }
             }
             Phase::Exclusions => {
-                let next: Option<(String, String)> = db.query_row(
-                    "SELECT language,path FROM semantic_raw_exclusions WHERE batch_id=?1 AND (language,path)>(?2,?3) ORDER BY language,path LIMIT 1",
+                let next: Option<(String, String)> = db.prepare_cached("SELECT language,path FROM semantic_raw_exclusions WHERE batch_id=?1 AND (language,path)>(?2,?3) ORDER BY language,path LIMIT 1")?.query_row(
                     params![self.batch_id, self.exclusion_key.0, self.exclusion_key.1],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 ).optional()?;
@@ -546,8 +541,7 @@ impl RetainedStageContinuation {
             }
             Phase::Artifact => {
                 if let Some(entry) = descriptor.artifacts.get(self.artifact) {
-                    self.capture_id = db.query_row(
-                        "SELECT capture_id FROM semantic_raw_captures WHERE batch_id=?1 AND ordinal=?2 AND language=?3 AND producer_id=?4 AND artifact_hash=?5 AND source_set_id=?6 AND captured_revision=?7 AND decoder_version=?8 AND length(binary_bytes)=?9",
+                    self.capture_id = db.prepare_cached("SELECT capture_id FROM semantic_raw_captures WHERE batch_id=?1 AND ordinal=?2 AND language=?3 AND producer_id=?4 AND artifact_hash=?5 AND source_set_id=?6 AND captured_revision=?7 AND decoder_version=?8 AND length(binary_bytes)=?9")?.query_row(
                         params![self.batch_id, entry.ordinal, entry.language, self.producer.name, entry.sha256,
                             descriptor.source_set.id, descriptor.source_revision, descriptor.decoder_version, entry.byte_length as i64], |row| row.get(0),
                     ).optional()?.ok_or_else(|| admission("retained artifact metadata"))?;
@@ -566,7 +560,7 @@ impl RetainedStageContinuation {
                         self.phase = Phase::Copy;
                     }
                 } else {
-                    let captures: i64 = db.query_row("SELECT COUNT(*) FROM (SELECT ordinal FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal LIMIT ?2)", params![self.batch_id, descriptor.artifacts.len() as i64 + 1], |row| row.get(0))?;
+                    let captures: i64 = db.prepare_cached("SELECT COUNT(*) FROM (SELECT ordinal FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal LIMIT ?2)")?.query_row( params![self.batch_id, descriptor.artifacts.len() as i64 + 1], |row| row.get(0))?;
                     ensure!(
                         captures as usize == descriptor.artifacts.len(),
                         "retained artifact inventory"
@@ -617,11 +611,8 @@ impl RetainedStageContinuation {
                     stream: None,
                 };
                 let assigned: i64 = conn
-                    .query_row(
-                        "SELECT documents FROM retained_assignments WHERE artifact=?1",
-                        [entry.ordinal],
-                        |row| row.get(0),
-                    )
+                    .prepare_cached("SELECT documents FROM retained_assignments WHERE artifact=?1")?
+                    .query_row([entry.ordinal], |row| row.get(0))
                     .optional()?
                     .unwrap_or(0);
                 let assigned = u64::try_from(assigned)
@@ -705,8 +696,7 @@ impl RetainedStageContinuation {
                 }
             }
             Phase::ProofInventory => {
-                let next: Option<String> = db.query_row(
-                    "SELECT proof_id FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT 1",
+                let next: Option<String> = db.prepare_cached("SELECT proof_id FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT 1")?.query_row(
                     params![self.capture_id, self.proof_key], |row| row.get(0),
                 ).optional()?;
                 if let Some(key) = next {
@@ -721,8 +711,7 @@ impl RetainedStageContinuation {
                 }
             }
             Phase::DocumentInventory => {
-                let next: Option<(String, String)> = db.query_row(
-                    "SELECT language,path FROM semantic_raw_documents WHERE capture_id=?1 AND (language,path)>(?2,?3) ORDER BY language,path LIMIT 1",
+                let next: Option<(String, String)> = db.prepare_cached("SELECT language,path FROM semantic_raw_documents WHERE capture_id=?1 AND (language,path)>(?2,?3) ORDER BY language,path LIMIT 1")?.query_row(
                     params![self.capture_id, self.document_key.0, self.document_key.1], |row| Ok((row.get(0)?, row.get(1)?)),
                 ).optional()?;
                 if let Some(key) = next {
@@ -738,8 +727,7 @@ impl RetainedStageContinuation {
                 }
             }
             Phase::Verify => {
-                let row: Option<(i64, bool)> = conn.query_row(
-                    "SELECT c.source_ord,EXISTS(SELECT 1 FROM documents d WHERE d.source_ord=c.source_ord) FROM coverage c WHERE c.source_ord>?1 AND c.artifact IS NOT NULL ORDER BY c.source_ord LIMIT 1",
+                let row: Option<(i64, bool)> = conn.prepare_cached("SELECT c.source_ord,EXISTS(SELECT 1 FROM documents d WHERE d.source_ord=c.source_ord) FROM coverage c WHERE c.source_ord>?1 AND c.artifact IS NOT NULL ORDER BY c.source_ord LIMIT 1")?.query_row(
                     [self.coverage_cursor], |row| Ok((row.get(0)?, row.get(1)?)),
                 ).optional()?;
                 if let Some((ord, present)) = row {
@@ -804,27 +792,23 @@ fn advance_witness_proof(
     ensure!(language == entry.language, "retained proof language");
     let source = super::super::staging::lookup_assigned(conn, entry.ordinal, &language, &path)?
         .ok_or_else(|| admission("retained unlisted proof"))?;
-    let present: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM documents WHERE source_ord=?1 AND artifact=?2)",
-        params![source.ord, entry.ordinal],
-        |row| row.get(0),
-    )?;
+    let present: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM documents WHERE source_ord=?1 AND artifact=?2)",
+        )?
+        .query_row(params![source.ord, entry.ordinal], |row| row.get(0))?;
     ensure!(present, "retained proof document");
     let identity: Option<i64> = conn
-        .query_row(
-            "SELECT identity_id FROM witness_proofs ORDER BY identity_id LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT identity_id FROM witness_proofs ORDER BY identity_id LIMIT 1")?
+        .query_row([], |row| row.get(0))
         .optional()?;
     let identity = identity
         .unwrap_or(0)
         .checked_sub(1)
         .ok_or_else(|| admission("witness proof identity exhausted"))?;
     super::super::staging::charge_witness_row(conn, limits)?;
-    conn.execute(
-        "INSERT INTO witness_proofs VALUES(?1,?2,?3,?4,?5,?6,?7)",
-        params![
+    conn.prepare_cached("INSERT INTO witness_proofs VALUES(?1,?2,?3,?4,?5,?6,?7)")?
+        .execute(params![
             identity,
             entry.ordinal,
             source.ord,
@@ -832,8 +816,7 @@ fn advance_witness_proof(
             digest,
             proof,
             capture
-        ],
-    )?;
+        ])?;
     *key = proof;
     Ok(Some(bytes))
 }
@@ -851,8 +834,7 @@ fn advance_document(
     key: &mut (String, String),
 ) -> Result<Option<bool>> {
     if trusted {
-        let row: Option<DocumentRow> = db.query_row(
-            "SELECT rowid,language,path,source_hash,wire_digest,capped FROM semantic_raw_documents WHERE capture_id=?1 AND (language,path)>(?2,?3) ORDER BY language,path LIMIT 1",
+        let row: Option<DocumentRow> = db.prepare_cached("SELECT rowid,language,path,source_hash,wire_digest,capped FROM semantic_raw_documents WHERE capture_id=?1 AND (language,path)>(?2,?3) ORDER BY language,path LIMIT 1")?.query_row(
             params![capture, key.0, key.1], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         ).optional()?;
         let Some((_id, language, path, hash, wire, capped)) = row else {
@@ -868,14 +850,13 @@ fn advance_document(
         )?;
         *key = (language, path);
     } else {
-        let row: Option<DocumentRow> = conn.query_row(
-            "SELECT d.source_ord,s.language,s.path,s.content_hash,d.wire_digest,d.capped FROM documents d JOIN sources s ON s.ord=d.source_ord WHERE d.artifact=?1 AND d.path>?2 ORDER BY d.path LIMIT 1",
+        let row: Option<DocumentRow> = conn.prepare_cached("SELECT d.source_ord,s.language,s.path,s.content_hash,d.wire_digest,d.capped FROM documents d JOIN sources s ON s.ord=d.source_ord WHERE d.artifact=?1 AND d.path>?2 ORDER BY d.path LIMIT 1")?.query_row(
             params![entry.ordinal, cursor.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         ).optional()?;
         let Some((_id, language, path, hash, wire, capped)) = row else {
             return Ok(None);
         };
-        let same: Option<bool> = db.query_row("SELECT source_hash=?4 AND wire_digest=?5 AND capped=?6 FROM semantic_raw_documents WHERE capture_id=?1 AND language=?2 AND path=?3",
+        let same: Option<bool> = db.prepare_cached("SELECT source_hash=?4 AND wire_digest=?5 AND capped=?6 FROM semantic_raw_documents WHERE capture_id=?1 AND language=?2 AND path=?3")?.query_row(
             params![capture, language, path, hash, wire, capped], |row| row.get(0)).optional()?;
         ensure!(
             same.unwrap_or(true),
@@ -899,8 +880,7 @@ fn advance_proof(
 ) -> Result<Option<u64>> {
     let byte_length;
     if trusted {
-        let row: Option<ProofRow> = db.query_row(
-            "SELECT rowid,proof_id,record_kind,fact_digest,language,path,canonical_bytes FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT 1",
+        let row: Option<ProofRow> = db.prepare_cached("SELECT rowid,proof_id,record_kind,fact_digest,language,path,canonical_bytes FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT 1")?.query_row(
             params![capture, key.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
         ).optional()?;
         let Some((id, proof, kind, digest, language, path, bytes)) = row else {
@@ -910,11 +890,11 @@ fn advance_proof(
         ensure!(language == entry.language, "retained proof language");
         let source = super::super::staging::lookup_assigned(conn, entry.ordinal, &language, &path)?
             .ok_or_else(|| admission("retained unlisted proof"))?;
-        let present: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM documents WHERE source_ord=?1 AND artifact=?2)",
-            params![source.ord, entry.ordinal],
-            |row| row.get(0),
-        )?;
+        let present: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM documents WHERE source_ord=?1 AND artifact=?2)",
+            )?
+            .query_row(params![source.ord, entry.ordinal], |row| row.get(0))?;
         ensure!(present, "retained proof document");
         let claim = super::super::staging::claim_from_stage(
             &bytes,
@@ -932,15 +912,14 @@ fn advance_proof(
         *cursor = id;
         *key = proof;
     } else {
-        let row: Option<ProofRow> = conn.query_row(
-            "SELECT c.claim_id,c.proof_id,c.record_kind,c.fact_digest,s.language,s.path,c.canonical_bytes FROM claims c JOIN sources s ON s.ord=c.source_ord WHERE c.artifact=?1 AND c.claim_id>?2 ORDER BY c.claim_id LIMIT 1",
+        let row: Option<ProofRow> = conn.prepare_cached("SELECT c.claim_id,c.proof_id,c.record_kind,c.fact_digest,s.language,s.path,c.canonical_bytes FROM claims c JOIN sources s ON s.ord=c.source_ord WHERE c.artifact=?1 AND c.claim_id>?2 ORDER BY c.claim_id LIMIT 1")?.query_row(
             params![entry.ordinal, *cursor], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
         ).optional()?;
         let Some((id, proof, kind, digest, language, path, bytes)) = row else {
             return Ok(None);
         };
         byte_length = bytes.len() as u64;
-        let same: bool = db.query_row("SELECT record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6 AND canonical_bytes=?7 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2",
+        let same: bool = db.prepare_cached("SELECT record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6 AND canonical_bytes=?7 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2")?.query_row(
             params![capture, proof, kind, digest, language, path, bytes], |row| row.get(0)).optional()?.unwrap_or(false);
         ensure!(same, "retained proof differs from authenticated binary");
         *cursor = id;

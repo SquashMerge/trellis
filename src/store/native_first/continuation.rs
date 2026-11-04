@@ -67,6 +67,22 @@ struct ProducerContinuation {
     capture_join: Option<JoinContinuation>,
 }
 
+impl SemanticContinuation {
+    fn release_stage_connections(&mut self) {
+        if let Some(stage) = self.target_stage.as_mut() {
+            stage.release_connection();
+        }
+        if let Some(current) = self.current.as_mut() {
+            if let Some(admission) = current.admission.as_mut() {
+                admission.release_connection();
+            }
+            if let Some(admitted) = current.admitted.as_mut() {
+                admitted.stage_mut().release_connection();
+            }
+        }
+    }
+}
+
 impl Store {
     pub(crate) fn semantic_maintenance_unit(
         &self,
@@ -89,6 +105,21 @@ impl Store {
             crate::semantic_import::restore_publication_work(outer);
         }
         result
+    }
+
+    /// Opt-in (`TRELLIS_INDEX_DIAGNOSTICS=1`), best-effort S phase marker for profiling;
+    /// never carries IDs, paths or pins.
+    pub(super) fn semantic_phase_diagnostic(phase: &'static str, detail: &'static str) {
+        if std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
+            use std::io::Write as _;
+            let wall_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "semantic-s phase={phase} detail={detail} wall_ms={wall_ms}"
+            );
+        }
     }
 
     fn semantic_unit(
@@ -225,10 +256,15 @@ impl Store {
                         )? {
                             super::witness::AuthorityStep::Progress => return Ok(None),
                             super::witness::AuthorityStep::Eligible(authority) => {
+                                Self::semantic_phase_diagnostic("authority", "witnessed");
                                 current.authority = Some(authority)
                             }
-                            super::witness::AuthorityStep::Ineligible => current.full = true,
+                            super::witness::AuthorityStep::Ineligible => {
+                                Self::semantic_phase_diagnostic("authority", "ineligible");
+                                current.full = true
+                            }
                             super::witness::AuthorityStep::Full(reason) => {
+                                Self::semantic_phase_diagnostic("authority", reason);
                                 current.full = true;
                                 current.capture_witness = reason == "original_import_missing";
                                 #[cfg(feature = "test-support")]
@@ -258,9 +294,11 @@ impl Store {
                             &limits,
                             cancel,
                         );
-                        stage.release_connection();
                         let advanced = advanced?;
                         current.target_index_done = advanced.done;
+                        if advanced.done {
+                            Self::semantic_phase_diagnostic("target_index", "done");
+                        }
                         #[cfg(feature = "test-support")]
                         crate::semantic_import::note_local_target_work(
                             advanced.builds,
@@ -304,6 +342,10 @@ impl Store {
                         if let Some(admitted) =
                             admission.advance(db, &captured, &mut current.counters, cancel)?
                         {
+                            Self::semantic_phase_diagnostic(
+                                "admitted",
+                                if current.full { "full" } else { "witnessed" },
+                            );
                             current.admitted = Some(admitted);
                             current.admission = None;
                             if current.full {
@@ -347,10 +389,9 @@ impl Store {
                             &mut current.budget,
                             cancel,
                         );
-                        stage.release_connection();
-                        admitted.stage_mut().release_connection();
                         current.witness_ready = result?;
                         if current.witness_ready {
+                            Self::semantic_phase_diagnostic("witness_prepared", "done");
                             current.join =
                                 Some(JoinContinuation::new_witnessed(target.pin, limits.clone()));
                         }
@@ -376,8 +417,8 @@ impl Store {
                             }
                             Ok(joined.is_some())
                         });
-                        admitted.stage_mut().release_connection();
                         if staged? {
+                            Self::semantic_phase_diagnostic("capture_join", "done");
                             current.capture_join = None;
                         }
                         return Ok(None);
@@ -394,9 +435,9 @@ impl Store {
                             &mut current.counters,
                             cancel,
                         );
-                    admitted.stage_mut().release_connection();
                     let joined = result?;
                     if let Some(joined) = &joined {
+                        Self::semantic_phase_diagnostic("joined", "done");
                         ensure!(
                             admitted.producer().producer() == current.producer,
                             "selected batch producer descriptor mismatch"
@@ -423,10 +464,18 @@ impl Store {
                     }
                     Ok(joined)
                 })();
-                match step {
-                    Ok(None) if started.elapsed() < step_slice() => check_cancel(cancel)?,
-                    step => return step,
-                }
+                // Private stage connections live for the slice: reopening one per step (schema
+                // load, pragmas) cost more than the step. They close before every return, so the
+                // publishing writer attaches only closed stage files.
+                let step = match step {
+                    Ok(None) if started.elapsed() < step_slice() => match check_cancel(cancel) {
+                        Ok(()) => continue,
+                        Err(error) => Err(error),
+                    },
+                    step => step,
+                };
+                state.release_stage_connections();
+                return step;
             }
         });
         match result {

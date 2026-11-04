@@ -48,7 +48,7 @@ fn limit(name: &str) -> anyhow::Error {
 
 fn initialize(stage: &mut Stage, pin: IndexPin) -> Result<bool> {
     let conn = stage.conn()?;
-    let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_target_owner')", [], |r| r.get(0))?;
+    let exists: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_target_owner')")?.query_row( [], |r| r.get(0))?;
     if !exists {
         conn.execute_batch(SCHEMA)?;
         conn.execute(
@@ -56,11 +56,9 @@ fn initialize(stage: &mut Stage, pin: IndexPin) -> Result<bool> {
             [semantic_pin_key(pin)],
         )?;
     }
-    let owner: String = conn.query_row(
-        "SELECT pin FROM local_target_owner WHERE singleton=1",
-        [],
-        |r| r.get(0),
-    )?;
+    let owner: String = conn
+        .prepare_cached("SELECT pin FROM local_target_owner WHERE singleton=1")?
+        .query_row([], |r| r.get(0))?;
     selected_ensure!(owner == semantic_pin_key(pin), "LOCAL index target changed");
     Ok(!exists)
 }
@@ -85,11 +83,9 @@ fn reserve_row(row: &rusqlite::Row<'_>, limits: &BatchLimits) -> Result<()> {
 }
 
 fn account(conn: &Connection, limits: &BatchLimits) -> Result<()> {
-    let rows: i64 = conn.query_row(
-        "SELECT rows FROM local_target_owner WHERE singleton=1",
-        [],
-        |r| r.get(0),
-    )?;
+    let rows: i64 = conn
+        .prepare_cached("SELECT rows FROM local_target_owner WHERE singleton=1")?
+        .query_row([], |r| r.get(0))?;
     if rows < 0 || rows as u64 >= limits.staged_rows {
         return Err(limit("staged rows"));
     }
@@ -176,11 +172,9 @@ pub(crate) fn advance(
             cursor.active = None;
         }
     } else {
-        let source_set: String = db.query_row(
-            "SELECT source_set_id FROM native_revisions WHERE id=?1",
-            [semantic_pin_key(target.pin)],
-            |r| r.get(0),
-        )?;
+        let source_set: String = db
+            .prepare_cached("SELECT source_set_id FROM native_revisions WHERE id=?1")?
+            .query_row([semantic_pin_key(target.pin)], |r| r.get(0))?;
         let (after_language, after_path) = cursor
             .after
             .as_ref()
@@ -204,7 +198,7 @@ pub(crate) fn advance(
             let captured = witness::selected_version(db, captured_pin, &key)?;
             cursor.after = Some((key.language.clone(), key.path.clone()));
             if captured.as_ref() != Some(&version) {
-                let complete: Option<(i64,bool)> = conn.query_row("SELECT vid,complete FROM local_target_documents WHERE pin=?1 AND source_set=?2 AND language=?3 AND path=?4", params![semantic_pin_key(target.pin),key.source_set_id,key.language,key.path], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+                let complete: Option<(i64,bool)> = conn.prepare_cached("SELECT vid,complete FROM local_target_documents WHERE pin=?1 AND source_set=?2 AND language=?3 AND path=?4")?.query_row( params![semantic_pin_key(target.pin),key.source_set_id,key.language,key.path], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
                 if let Some((vid, _)) = complete {
                     selected_ensure!(vid == version.vid, "LOCAL document version changed");
                 }
@@ -283,7 +277,7 @@ fn put(
     limits: &BatchLimits,
 ) -> Result<()> {
     let pin = semantic_pin_key(pin);
-    let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM local_target_declarations WHERE pin=?1 AND source_set=?2 AND language=?3 AND path=?4 AND syntax_id=?5)",params![pin,key.source_set_id,key.language,key.path,sid], |r| r.get(0))?;
+    let exists: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM local_target_declarations WHERE pin=?1 AND source_set=?2 AND language=?3 AND path=?4 AND syntax_id=?5)")?.query_row(params![pin,key.source_set_id,key.language,key.path,sid], |r| r.get(0))?;
     if !exists {
         account(conn, limits)?;
     }
@@ -363,7 +357,7 @@ pub(crate) fn lookup(
     }
     drop(cached);
     drop(stmt);
-    let complete: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM local_target_documents WHERE pin=?1 AND source_set=?2 AND language=?3 AND path=?4 AND vid=?5 AND complete=1)",params![semantic_pin_key(pin),key.source_set_id,key.language,key.path,vid], |r|r.get(0))?;
+    let complete: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM local_target_documents WHERE pin=?1 AND source_set=?2 AND language=?3 AND path=?4 AND vid=?5 AND complete=1)")?.query_row(params![semantic_pin_key(pin),key.source_set_id,key.language,key.path,vid], |r|r.get(0))?;
     let read = !complete && version.is_some();
     let declaration = if read {
         witness::current_declaration(db, pin, key, syntax_id, &mut |bytes| {

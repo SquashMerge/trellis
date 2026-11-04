@@ -176,6 +176,7 @@ pub struct Stage {
 
 fn open_connection(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("stage open")?;
+    conn.set_prepared_statement_cache_capacity(128);
     conn.execute_batch(&format!(
         "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE; PRAGMA cache_size=-{STAGE_CACHE_KIB};"
     ))
@@ -335,10 +336,11 @@ fn serialized_len(value: &impl serde::Serialize, limit: u64) -> Result<u64> {
 }
 
 pub(crate) fn charge_witness_row(conn: &Connection, limits: &BatchLimits) -> Result<()> {
-    let changed = conn.execute(
-        "UPDATE witness_state SET staged_rows=staged_rows+1 WHERE singleton=1 AND staged_rows<?1",
-        [i64::try_from(limits.staged_rows)?],
-    )?;
+    let changed = conn
+        .prepare_cached(
+            "UPDATE witness_state SET staged_rows=staged_rows+1 WHERE singleton=1 AND staged_rows<?1",
+        )?
+        .execute([i64::try_from(limits.staged_rows)?])?;
     if changed != 1 {
         return Err(ScipCaptureError::LimitExceeded("staged rows".into()).into());
     }
@@ -352,7 +354,14 @@ pub(crate) struct WitnessStageWriter<'a> {
     limits: &'a BatchLimits,
     counters: &'a mut super::BatchCounters,
     changes_before: u64,
+    /// Reserved bytes staged since the last directory-size check.
+    unchecked: u64,
 }
+
+/// Rows re-measure the stage directory after this many reserved bytes (or an eighth of the
+/// staging limit, if smaller); each writer and every completion measures it too. Walking
+/// the directory per row cost more than staging the row.
+const WITNESS_CHECK_BYTES: u64 = 1 << 20;
 
 impl<'a> WitnessStageWriter<'a> {
     pub(crate) fn new(
@@ -361,6 +370,7 @@ impl<'a> WitnessStageWriter<'a> {
         counters: &'a mut super::BatchCounters,
     ) -> Result<Self> {
         let budget = stage.budget(limits);
+        budget.check()?;
         let conn = stage.conn()?;
         Ok(Self {
             conn,
@@ -368,7 +378,17 @@ impl<'a> WitnessStageWriter<'a> {
             limits,
             counters,
             changes_before: conn.total_changes(),
+            unchecked: 0,
         })
+    }
+
+    fn row_check(&mut self, reserved: u64) -> Result<()> {
+        self.unchecked = self.unchecked.saturating_add(reserved);
+        if self.unchecked >= WITNESS_CHECK_BYTES.min(self.budget.staging_bytes / 8) {
+            self.budget.check()?;
+            self.unchecked = 0;
+        }
+        Ok(())
     }
 
     fn payload(&mut self, value: &impl serde::Serialize) -> Result<(String, u64)> {
@@ -378,7 +398,7 @@ impl<'a> WitnessStageWriter<'a> {
             return Err(ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into());
         }
         charge_witness_row(self.conn, self.limits)?;
-        self.budget.check()?;
+        self.row_check(reservation)?;
         let body = serde_json::to_string(value)?;
         self.counters.retained_admission_bytes_high_water = self
             .counters
@@ -418,12 +438,12 @@ impl<'a> WitnessStageWriter<'a> {
         decision: &str,
         value: &impl serde::Serialize,
     ) -> Result<()> {
-        let (body, _) = self.payload(value)?;
+        let (body, bytes) = self.payload(value)?;
         self.conn.execute(
             "INSERT INTO source_witnesses(source_ord,decision,body) VALUES(?1,?2,?3)",
             params![source_ord, decision, body],
         )?;
-        self.budget.check()?;
+        self.row_check(bytes)?;
         Ok(())
     }
 
@@ -433,17 +453,15 @@ impl<'a> WitnessStageWriter<'a> {
         ordinal: i64,
         row: &crate::store::native_first::witness::OriginalRow,
     ) -> Result<()> {
-        let open: bool = self.conn.query_row(
+        let open: bool = self.conn.prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM source_witnesses WHERE source_ord=?1 AND decision='reused' AND complete=0)",
-            [source_ord], |row| row.get(0),
-        )?;
+        )?.query_row([source_ord], |row| row.get(0))?;
         ensure!(open && ordinal >= 0, "witness association source not open");
         let (body, bytes) = self.payload(row)?;
-        self.conn.execute(
-            "INSERT INTO original_associations VALUES(?1,?2,?3,?4)",
-            params![source_ord, ordinal, body, i64::try_from(bytes)?],
-        )?;
-        self.budget.check()?;
+        self.conn
+            .prepare_cached("INSERT INTO original_associations VALUES(?1,?2,?3,?4)")?
+            .execute(params![source_ord, ordinal, body, i64::try_from(bytes)?])?;
+        self.row_check(bytes)?;
         Ok(())
     }
 
@@ -478,12 +496,12 @@ impl<'a> WitnessStageWriter<'a> {
         self.counters.retained_admission_bytes_high_water =
             self.counters.retained_admission_bytes_high_water.max(bytes);
         charge_witness_row(self.conn, self.limits)?;
-        self.budget.check()?;
-        self.conn.execute(
-            "INSERT INTO witness_internal_symbols VALUES(?1,?2,?3,?4) ON CONFLICT DO NOTHING",
-            params![scope, language, path, key.symbol],
-        )?;
-        self.budget.check()?;
+        self.row_check(bytes.saturating_mul(2))?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO witness_internal_symbols VALUES(?1,?2,?3,?4) ON CONFLICT DO NOTHING",
+            )?
+            .execute(params![scope, language, path, key.symbol])?;
         Ok(())
     }
 
@@ -508,8 +526,7 @@ impl Drop for WitnessStageWriter<'_> {
 
 /// Conservative owned decoding allowance, queried before reading event payloads.
 pub(crate) fn original_rows_reservation(conn: &Connection, source_ord: i64) -> Result<u64> {
-    let (bytes, rows): (i64, i64) = conn.query_row(
-        "SELECT COALESCE(SUM(body_bytes),0),COUNT(*) FROM original_associations WHERE source_ord=?1",
+    let (bytes, rows): (i64, i64) = conn.prepare_cached("SELECT COALESCE(SUM(body_bytes),0),COUNT(*) FROM original_associations WHERE source_ord=?1")?.query_row(
         [source_ord], |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     u64::try_from(bytes)?
@@ -525,11 +542,10 @@ pub(crate) fn original_rows_reservation(conn: &Connection, source_ord: i64) -> R
 
 /// Both metadata routes must resolve every emitted provenance row, never silently drop it.
 pub(crate) fn check_proof_identity_closure(conn: &Connection) -> Result<()> {
-    let invalid: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM claims WHERE claim_id<=0) OR
+    let invalid: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM claims WHERE claim_id<=0) OR
          EXISTS(SELECT 1 FROM claims c WHERE EXISTS(SELECT 1 FROM witness_proofs w WHERE w.proof_id=c.proof_id)) OR
          EXISTS(SELECT 1 FROM claims c WHERE EXISTS(SELECT 1 FROM witness_proofs w WHERE w.artifact=c.artifact AND w.fact_digest=c.fact_digest)) OR
-         EXISTS(SELECT 1 FROM out_provenance p WHERE NOT EXISTS(SELECT 1 FROM proof_identities i WHERE i.identity_id=p.claim_id))",
+         EXISTS(SELECT 1 FROM out_provenance p WHERE NOT EXISTS(SELECT 1 FROM proof_identities i WHERE i.identity_id=p.claim_id))")?.query_row(
         [], |row| row.get(0),
     )?;
     ensure!(!invalid, "staged proof identity closure");

@@ -498,6 +498,7 @@ impl Store {
         let Some(_permit) = self.maintenance_try_enter() else {
             return Ok(None);
         };
+        Self::semantic_phase_diagnostic("commit", "start");
         let selected_ids = target
             .selections
             .iter()
@@ -662,6 +663,7 @@ impl Store {
         self.identity.verify()?;
         check_cancel(cancel)?;
         let committed = storage_result(tx.commit());
+        Self::semantic_phase_diagnostic("commit", "end");
         match committed {
             Ok(()) => Ok(Some(next)),
             Err(error) => {

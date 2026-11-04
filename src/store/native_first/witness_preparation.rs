@@ -6,6 +6,11 @@ use crate::semantic_batch::staging::{Stage, WitnessFallback, WitnessStageWriter}
 use crate::semantic_batch::{AdmittedBatch, BatchCounters, BatchLimits, LookupBudget};
 use std::collections::VecDeque;
 
+/// Rows (or inventory documents) per preparation step. A page stays bounded by the unit
+/// expansion byte reservation; one row per step spent most of the step on fixed overhead.
+const PAGE_ROWS: usize = 256;
+const INVENTORY_PAGE: usize = 64;
+
 #[derive(Default)]
 pub(super) struct WitnessPreparation {
     inventory: CanonicalInventoryCursor,
@@ -14,6 +19,7 @@ pub(super) struct WitnessPreparation {
     source: Option<SourcePreparation>,
     symbols: witness::InternalSymbolCursor,
     symbols_done: bool,
+    tables_ready: bool,
     target_after: i64,
     targets_done: bool,
     target_count: u64,
@@ -57,8 +63,11 @@ impl WitnessPreparation {
         lookup_budget.charge(1)?;
         let budget = admitted.stage().budget(limits);
         let conn = admitted.stage_mut().conn()?;
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS witness_required_targets(id INTEGER PRIMARY KEY,language TEXT NOT NULL,path TEXT NOT NULL,syntax_id TEXT NOT NULL,UNIQUE(language,path,syntax_id));
+        if !self.tables_ready {
+            self.tables_ready = true;
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS witness_required_targets(id INTEGER PRIMARY KEY,language TEXT NOT NULL,path TEXT NOT NULL,syntax_id TEXT NOT NULL,UNIQUE(language,path,syntax_id));
             CREATE TABLE IF NOT EXISTS witness_target_status(rev INTEGER NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,syntax_id BLOB NOT NULL,n INTEGER NOT NULL,named INTEGER NOT NULL,name_ok INTEGER NOT NULL,method INTEGER NOT NULL,UNIQUE(rev,language,path,syntax_id,n));")?;
+        }
         if let Some(source) = self.source.as_mut() {
             let mut used = 0;
             let page = witness::original_document_page(
@@ -66,7 +75,7 @@ impl WitnessPreparation {
                 authority,
                 &source.witness,
                 &mut source.cursor,
-                1,
+                PAGE_ROWS,
                 &mut |bytes| reserve_page(&mut used, bytes, limits),
             )?;
             for row in &page.rows {
@@ -92,11 +101,8 @@ impl WitnessPreparation {
         if let Some(document) = self.documents.pop_front() {
             let decision = witness::original_document_begin(db, authority, target, &document)?;
             let ord: Option<i64> = conn
-                .query_row(
-                    "SELECT ord FROM sources WHERE language=?1 AND path=?2",
-                    params![document.language, document.path],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT ord FROM sources WHERE language=?1 AND path=?2")?
+                .query_row(params![document.language, document.path], |r| r.get(0))
                 .optional()?;
             match (ord, decision) {
                 (Some(ord), WitnessEligibility::Witness(witness)) => {
@@ -130,7 +136,7 @@ impl WitnessPreparation {
             return Ok(false);
         }
         if !self.inventory_done {
-            let page = destination.canonical_inventory_page(&mut self.inventory, 1)?;
+            let page = destination.canonical_inventory_page(&mut self.inventory, INVENTORY_PAGE)?;
             self.inventory_done = page.is_empty();
             self.documents
                 .extend(page.into_iter().map(|document| document.key));
@@ -142,7 +148,7 @@ impl WitnessPreparation {
                 db,
                 authority,
                 &mut self.symbols,
-                1,
+                PAGE_ROWS,
                 &mut |bytes| reserve_page(&mut used, bytes, limits),
             )?;
             let mut writer = WitnessStageWriter::new(admitted.stage_mut(), limits, counters)?;
@@ -156,8 +162,7 @@ impl WitnessPreparation {
             return Ok(false);
         }
         if !self.targets_done {
-            let next: Option<(i64, String, String, String)> = conn.query_row(
-                "SELECT id,language,path,syntax_id FROM witness_required_targets WHERE id>?1 ORDER BY id LIMIT 1",
+            let next: Option<(i64, String, String, String)> = conn.prepare_cached("SELECT id,language,path,syntax_id FROM witness_required_targets WHERE id>?1 ORDER BY id LIMIT 1")?.query_row(
                 [self.target_after], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
             if let Some((id, language, path, syntax_id)) = next {
                 let key = DocumentKey {
@@ -271,7 +276,7 @@ fn stage_target(
     limits: &BatchLimits,
     count: &mut u64,
 ) -> Result<()> {
-    let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM witness_required_targets WHERE language=?1 AND path=?2 AND syntax_id=?3)",
+    let present: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM witness_required_targets WHERE language=?1 AND path=?2 AND syntax_id=?3)")?.query_row(
         params![document.language,document.path,syntax_id], |r|r.get(0))?;
     if !present {
         if *count >= limits.candidates {

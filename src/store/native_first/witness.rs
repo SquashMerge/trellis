@@ -430,7 +430,7 @@ fn cache_rows(
             "original provenance source mismatch"
         );
         let kind = semantic_variant(&derived.record_kind)?;
-        let membership:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2 AND record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6)",params![a.capture_id,derived.provenance_id,kind,derived.fact_digest,w.document.language,w.document.path],|r|r.get(0))?;
+        let membership:bool=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2 AND record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6)")?.query_row(params![a.capture_id,derived.provenance_id,kind,derived.fact_digest,w.document.language,w.document.path],|r|r.get(0))?;
         selected_ensure!(membership, "original derivation identity mismatch");
         let basis_id = match bases.iter().position(|b| b == basis) {
             Some(index) => index,
@@ -641,7 +641,7 @@ fn association_unit(
     }
     if c.phase == 1 {
         let observed = c.child_phase == 1;
-        let mut stmt=db.prepare("SELECT ordinal,role FROM semantic_coverage_roles WHERE tuple_id=?1 AND kind=?2 AND ordinal>?3 ORDER BY ordinal LIMIT 1")?;
+        let mut stmt=db.prepare_cached("SELECT ordinal,role FROM semantic_coverage_roles WHERE tuple_id=?1 AND kind=?2 AND ordinal>?3 ORDER BY ordinal LIMIT 1")?;
         let mut rows = stmt.query(params![
             w.tuple_id,
             if observed { "observed" } else { "supported" },
@@ -671,7 +671,7 @@ fn association_unit(
     }
     if c.phase == 2 {
         if c.parent != 0 {
-            let mut stmt=db.prepare("SELECT ordinal,lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
+            let mut stmt=db.prepare_cached("SELECT ordinal,lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
             let mut rows = stmt.query(params![c.parent, c.child_ordinal])?;
             if let Some(row) = rows.next()? {
                 row_reserve(row, reserve)?;
@@ -691,7 +691,7 @@ fn association_unit(
             c.child_ordinal = -1;
             return Ok(None);
         }
-        let mut stmt=db.prepare("SELECT basis_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash FROM semantic_basis WHERE tuple_id=?1 AND basis_id>?2 ORDER BY basis_id LIMIT 1")?;
+        let mut stmt=db.prepare_cached("SELECT basis_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash FROM semantic_basis WHERE tuple_id=?1 AND basis_id>?2 ORDER BY basis_id LIMIT 1")?;
         let mut rows = stmt.query(params![w.tuple_id, c.after_id])?;
         let Some(row) = rows.next()? else {
             next_parent(c, 3);
@@ -731,7 +731,7 @@ fn association_unit(
         return Ok(Some(OriginalRow::Basis(b)));
     }
     if c.phase == 3 {
-        let mut stmt=db.prepare("SELECT provenance_id,content_hash,evidence_kind,freshness,basis_id,capture_id,derived_from_provenance_id,derived_from_record_kind,derived_from_fact_digest FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id>?2 ORDER BY provenance_id LIMIT 1")?;
+        let mut stmt=db.prepare_cached("SELECT provenance_id,content_hash,evidence_kind,freshness,basis_id,capture_id,derived_from_provenance_id,derived_from_record_kind,derived_from_fact_digest FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id>?2 ORDER BY provenance_id LIMIT 1")?;
         let mut rows = stmt.query(params![w.tuple_id, c.after_text])?;
         let Some(row) = rows.next()? else {
             next_parent(c, 4);
@@ -750,7 +750,7 @@ fn association_unit(
             capture_id == a.capture_id && row.get_ref(1)?.as_str()? == w.source_hash,
             "original provenance source mismatch"
         );
-        let membership:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2 AND record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6)",params![capture_id,raw,kind,digest,w.document.language,w.document.path],|r|r.get(0))?;
+        let membership:bool=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2 AND record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6)")?.query_row(params![capture_id,raw,kind,digest,w.document.language,w.document.path],|r|r.get(0))?;
         selected_ensure!(membership, "original derivation identity mismatch");
         let proof = OriginalProvenance {
             id: row.get(0)?,
@@ -770,7 +770,7 @@ fn association_unit(
     }
     if c.phase == 4 {
         if c.parent != 0 {
-            let mut stmt=db.prepare("SELECT * FROM semantic_symbol_targets WHERE symbol_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
+            let mut stmt=db.prepare_cached("SELECT * FROM semantic_symbol_targets WHERE symbol_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
             let mut rows = stmt.query(params![c.parent, c.child_ordinal])?;
             if let Some(row) = rows.next()? {
                 row_reserve(row, reserve)?;
@@ -792,7 +792,7 @@ fn association_unit(
             c.child_ordinal = -1;
             return Ok(None);
         }
-        let mut stmt=db.prepare("SELECT symbol_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id FROM semantic_symbols WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
+        let mut stmt=db.prepare_cached("SELECT symbol_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id FROM semantic_symbols WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
         let mut rows = stmt.query(params![w.tuple_id, c.after_id])?;
         let Some(row) = rows.next()? else {
             next_parent(c, 5);
@@ -823,7 +823,7 @@ fn association_unit(
         if c.parent != 0 {
             return declaration_child(db, source_set, c, reserve);
         }
-        let mut stmt=db.prepare("SELECT binding_id,ordinal,syntax_id,provenance_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic FROM semantic_declaration_bindings WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
+        let mut stmt=db.prepare_cached("SELECT binding_id,ordinal,syntax_id,provenance_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic FROM semantic_declaration_bindings WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
         let mut rows = stmt.query(params![w.tuple_id, c.after_id])?;
         let Some(row) = rows.next()? else {
             next_parent(c, 6);
@@ -850,7 +850,7 @@ fn association_unit(
         if !c.parent_blob.is_empty() {
             return reference_child(db, w.tuple_id, source_set, c, reserve);
         }
-        let mut stmt=db.prepare("SELECT * FROM semantic_references WHERE tuple_id=?1 AND reference_id>?2 ORDER BY reference_id LIMIT 1")?;
+        let mut stmt=db.prepare_cached("SELECT * FROM semantic_references WHERE tuple_id=?1 AND reference_id>?2 ORDER BY reference_id LIMIT 1")?;
         let mut rows = stmt.query(params![w.tuple_id, c.after_blob])?;
         let Some(row) = rows.next()? else {
             next_parent(c, 7);
@@ -886,7 +886,7 @@ fn association_unit(
         if c.parent != 0 {
             return call_child(db, source_set, c, reserve);
         }
-        let mut stmt=db.prepare("SELECT * FROM semantic_call_bindings WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
+        let mut stmt=db.prepare_cached("SELECT * FROM semantic_call_bindings WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
         let mut rows = stmt.query(params![w.tuple_id, c.after_id])?;
         let Some(row) = rows.next()? else {
             next_parent(c, 8);
@@ -912,7 +912,7 @@ fn association_unit(
         return Ok(Some(OriginalRow::CallBinding(binding)));
     }
     if c.phase == 8 {
-        let mut stmt=db.prepare("SELECT * FROM semantic_type_relationships WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
+        let mut stmt=db.prepare_cached("SELECT * FROM semantic_type_relationships WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
         let mut rows = stmt.query(params![w.tuple_id, c.after_id])?;
         let Some(row) = rows.next()? else {
             next_parent(c, 10);
@@ -947,7 +947,7 @@ fn declaration_child(
     reserve: &mut Reserve<'_>,
 ) -> Result<Option<OriginalRow>> {
     if c.child_phase == 0 {
-        let mut stmt=db.prepare("SELECT ordinal,scheme,symbol,scope,document_language,document_path FROM semantic_declaration_binding_symbols WHERE binding_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
+        let mut stmt=db.prepare_cached("SELECT ordinal,scheme,symbol,scope,document_language,document_path FROM semantic_declaration_binding_symbols WHERE binding_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
         let mut rows = stmt.query(params![c.parent, c.child_ordinal])?;
         if let Some(row) = rows.next()? {
             row_reserve(row, reserve)?;
@@ -974,7 +974,7 @@ fn declaration_child(
         c.child_ordinal = -1;
         return Ok(None);
     }
-    let mut stmt=db.prepare("SELECT ordinal,candidate_id FROM semantic_declaration_join_candidates WHERE binding_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
+    let mut stmt=db.prepare_cached("SELECT ordinal,candidate_id FROM semantic_declaration_join_candidates WHERE binding_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
     let mut rows = stmt.query(params![c.parent, c.child_ordinal])?;
     if let Some(row) = rows.next()? {
         row_reserve(row, reserve)?;
@@ -1003,7 +1003,7 @@ fn reference_child(
     reserve: &mut Reserve<'_>,
 ) -> Result<Option<OriginalRow>> {
     if c.child_phase == 0 {
-        let mut stmt=db.prepare("SELECT ordinal,role FROM semantic_reference_roles WHERE tuple_id=?1 AND reference_id=?2 AND ordinal>?3 ORDER BY ordinal LIMIT 1")?;
+        let mut stmt=db.prepare_cached("SELECT ordinal,role FROM semantic_reference_roles WHERE tuple_id=?1 AND reference_id=?2 AND ordinal>?3 ORDER BY ordinal LIMIT 1")?;
         let mut rows = stmt.query(params![tuple, c.parent_blob, c.child_ordinal])?;
         if let Some(row) = rows.next()? {
             row_reserve(row, reserve)?;
@@ -1024,7 +1024,7 @@ fn reference_child(
         c.child_ordinal = -1;
         return Ok(None);
     }
-    let mut stmt=db.prepare("SELECT * FROM semantic_reference_candidates WHERE tuple_id=?1 AND reference_id=?2 AND ordinal>?3 ORDER BY ordinal LIMIT 1")?;
+    let mut stmt=db.prepare_cached("SELECT * FROM semantic_reference_candidates WHERE tuple_id=?1 AND reference_id=?2 AND ordinal>?3 ORDER BY ordinal LIMIT 1")?;
     let mut rows = stmt.query(params![tuple, c.parent_blob, c.child_ordinal])?;
     if let Some(row) = rows.next()? {
         row_reserve(row, reserve)?;
@@ -1054,7 +1054,7 @@ fn call_child(
     reserve: &mut Reserve<'_>,
 ) -> Result<Option<OriginalRow>> {
     if c.child_phase == 0 {
-        let mut stmt=db.prepare("SELECT ordinal,candidate_id FROM semantic_call_join_candidates WHERE binding_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
+        let mut stmt=db.prepare_cached("SELECT ordinal,candidate_id FROM semantic_call_join_candidates WHERE binding_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
         let mut rows = stmt.query(params![c.parent, c.child_ordinal])?;
         if let Some(row) = rows.next()? {
             row_reserve(row, reserve)?;
@@ -1080,7 +1080,7 @@ fn call_child(
     } else {
         "SELECT * FROM semantic_call_possible_dispatch WHERE binding_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1"
     };
-    let mut stmt = db.prepare(sql)?;
+    let mut stmt = db.prepare_cached(sql)?;
     let mut rows = stmt.query(params![c.parent, c.child_ordinal])?;
     if let Some(row) = rows.next()? {
         row_reserve(row, reserve)?;
@@ -1144,8 +1144,7 @@ fn guard(db: &Connection, authority: &SourceAuthority) -> Result<()> {
         pending_target(db)?.as_ref() == Some(&authority.target),
         "witness target changed"
     );
-    let selected: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1 AND producer_id=?2 AND batch_id=?3 AND captured_pin=?4)",
+    let selected: bool = db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1 AND producer_id=?2 AND batch_id=?3 AND captured_pin=?4)")?.query_row(
         params![semantic_pin_key(authority.target.pin), authority.producer.id, authority.batch_id, semantic_pin_key(authority.captured_pin)], |r|r.get(0))?;
     selected_ensure!(selected, "witness raw selection changed");
     Ok(())
@@ -1160,7 +1159,7 @@ fn original_guard(db: &Connection, authority: &SourceAuthority) -> Result<()> {
         );
         return Ok(());
     }
-    let available:bool=db.query_row("SELECT NOT EXISTS(SELECT 1 FROM native_revision_supersessions WHERE revision_id=?1 AND state<>'retained') AND EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1 AND producer_id=?2 AND batch_id=?3 AND captured_pin=?4)",params![semantic_pin_key(authority.original_pin),authority.producer.id,authority.batch_id,semantic_pin_key(authority.captured_pin)],|r|r.get(0))?;
+    let available:bool=db.prepare_cached("SELECT NOT EXISTS(SELECT 1 FROM native_revision_supersessions WHERE revision_id=?1 AND state<>'retained') AND EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1 AND producer_id=?2 AND batch_id=?3 AND captured_pin=?4)")?.query_row(params![semantic_pin_key(authority.original_pin),authority.producer.id,authority.batch_id,semantic_pin_key(authority.captured_pin)],|r|r.get(0))?;
     selected_ensure!(available, "original witness authority unavailable");
     Ok(())
 }
@@ -1170,11 +1169,10 @@ pub(crate) fn selected_version(
     pin: IndexPin,
     key: &DocumentKey,
 ) -> Result<Option<SelectedVersion>> {
-    db.query_row(
-        "SELECT m.vid,v.id,v.content_hash,v.byte_length,v.extraction_context,v.producer_id,v.producer_version
+    db.prepare_cached("SELECT m.vid,v.id,v.content_hash,v.byte_length,v.extraction_context,v.producer_id,v.producer_version
          FROM revision_documents m JOIN document_versions v ON v.vid=m.vid AND v.language=m.language AND v.path=m.path
          JOIN native_revisions r ON r.id=m.revision_id
-         WHERE m.revision_id=?1 AND m.language=?2 AND m.path=?3 AND r.source_set_id=?4",
+         WHERE m.revision_id=?1 AND m.language=?2 AND m.path=?3 AND r.source_set_id=?4")?.query_row(
         params![semantic_pin_key(pin),key.language,key.path,key.source_set_id], |r| {
             Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))
         }).optional()?.map(|(vid,version_id,content_hash,length,extraction_context,producer_id,producer_version)| {
@@ -1197,16 +1195,15 @@ pub(crate) fn source_authority(
         "witness target changed"
     );
     if cursor.phase == 0 {
-        let length: i64 = db.query_row(
-            "SELECT length(descriptor_bytes) FROM semantic_raw_batches WHERE batch_id=?1",
-            [selection.batch_id],
-            |r| r.get(0),
-        )?;
+        let length: i64 = db
+            .prepare_cached(
+                "SELECT length(descriptor_bytes) FROM semantic_raw_batches WHERE batch_id=?1",
+            )?
+            .query_row([selection.batch_id], |r| r.get(0))?;
         if length < 0 || length as u64 > limits.descriptor_bytes {
             return Ok(AuthorityStep::Full("descriptor_bound"));
         }
-        let (bytes, sha): (Vec<u8>, String) = db.query_row(
-            "SELECT descriptor_bytes,descriptor_sha256 FROM semantic_raw_batches WHERE batch_id=?1",
+        let (bytes, sha): (Vec<u8>, String) = db.prepare_cached("SELECT descriptor_bytes,descriptor_sha256 FROM semantic_raw_batches WHERE batch_id=?1")?.query_row(
             [selection.batch_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -1252,8 +1249,7 @@ pub(crate) fn source_authority(
         }
         // Changed capture options (file-size cap, SCIP or manifest path) are a context
         // invalidation: FULL by rule, as the pre-native-first route was, not a witness fallback.
-        let same_options: bool = db.query_row(
-            "SELECT c.reconcile_options IS n.reconcile_options FROM native_revisions c JOIN native_revisions n WHERE c.id=?1 AND n.id=?2",
+        let same_options: bool = db.prepare_cached("SELECT c.reconcile_options IS n.reconcile_options FROM native_revisions c JOIN native_revisions n WHERE c.id=?1 AND n.id=?2")?.query_row(
             params![semantic_pin_key(selection.captured_pin), semantic_pin_key(target.pin)],
             |r| r.get(0),
         )?;
@@ -1261,24 +1257,25 @@ pub(crate) fn source_authority(
             return Ok(AuthorityStep::Ineligible);
         }
         let producer = pinned.producer();
-        let producer_ok:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_revision_producers s JOIN semantic_producers p ON p.id=s.id AND p.version=s.version WHERE s.revision_id=?1 AND s.id=?2 AND p.version=?3 AND p.executable_hash=?4 AND p.kind='semantic' AND p.position_encoding=?5)",params![semantic_pin_key(target.pin),selection.producer_id,producer.version,producer.executable_hash,semantic_variant(&producer.position_encoding)?],|r|r.get(0))?;
+        let producer_ok:bool=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_revision_producers s JOIN semantic_producers p ON p.id=s.id AND p.version=s.version WHERE s.revision_id=?1 AND s.id=?2 AND p.version=?3 AND p.executable_hash=?4 AND p.kind='semantic' AND p.position_encoding=?5)")?.query_row(params![semantic_pin_key(target.pin),selection.producer_id,producer.version,producer.executable_hash,semantic_variant(&producer.position_encoding)?],|r|r.get(0))?;
         selected_ensure!(
             producer_ok && producer.id == selection.producer_id,
             "witness producer mismatch"
         );
-        let metadata:bool=db.query_row("SELECT producer_id=?2 AND producer_version=?3 AND profile_id=?4 AND source_set_id=?5 AND captured_revision=?6 AND source_manifest_hash=?7 AND decoder_version=?8 FROM semantic_raw_batches WHERE batch_id=?1",
+        let metadata:bool=db.prepare_cached("SELECT producer_id=?2 AND producer_version=?3 AND profile_id=?4 AND source_set_id=?5 AND captured_revision=?6 AND source_manifest_hash=?7 AND decoder_version=?8 FROM semantic_raw_batches WHERE batch_id=?1")?.query_row(
             params![selection.batch_id,producer.id,producer.version,descriptor.profile_id,descriptor.source_set.id,descriptor.source_revision,descriptor.source_manifest_hash,descriptor.decoder_version],|r|r.get(0))?;
         selected_ensure!(metadata, "witness batch metadata mismatch");
         let entry = &descriptor.artifacts[0];
-        let (capture_id,valid):(i64,bool)=db.query_row("SELECT capture_id,ordinal=?2 AND language=?3 AND artifact_hash=?4 AND producer_id=?5 AND source_set_id=?6 AND captured_revision=?7 AND decoder_version=?8 AND length(binary_bytes)=?9 FROM semantic_raw_captures WHERE batch_id=?1 AND ordinal=?2",
+        let (capture_id,valid):(i64,bool)=db.prepare_cached("SELECT capture_id,ordinal=?2 AND language=?3 AND artifact_hash=?4 AND producer_id=?5 AND source_set_id=?6 AND captured_revision=?7 AND decoder_version=?8 AND length(binary_bytes)=?9 FROM semantic_raw_captures WHERE batch_id=?1 AND ordinal=?2")?.query_row(
             params![selection.batch_id,entry.ordinal,entry.language,entry.sha256,producer.id,descriptor.source_set.id,descriptor.source_revision,descriptor.decoder_version,i64::try_from(entry.byte_length)?],|r|Ok((r.get(0)?,r.get(1)?)))?;
         if !valid {
             // A retained artifact that no longer matches its descriptor is the producer's
             // failure, as FULL authenticates and reports it, never index corruption.
             return Ok(AuthorityStep::Full("witness_capture_mismatch"));
         }
-        let mut captures =
-            db.prepare("SELECT capture_id FROM semantic_raw_captures WHERE batch_id=?1 LIMIT 2")?;
+        let mut captures = db.prepare_cached(
+            "SELECT capture_id FROM semantic_raw_captures WHERE batch_id=?1 LIMIT 2",
+        )?;
         let mut captures = captures.query([selection.batch_id])?;
         selected_ensure!(
             captures.next()?.is_some() && captures.next()?.is_none(),
@@ -1311,7 +1308,7 @@ pub(crate) fn source_authority(
         .ok_or_else(|| corrupt("completed witness cursor"))?;
     guard(db, authority)?;
     if cursor.phase == 1 {
-        let row:Option<(i64,String,i64,String,String)>=db.query_row("SELECT s.rowid,s.revision_id,r.published_index_revision,r.native_revision_id,r.source_set_id FROM semantic_revision_raw_selections s JOIN native_revisions r ON r.id=s.revision_id WHERE s.batch_id=?1 AND s.rowid>?2 AND s.producer_id=?3 AND s.captured_pin=?4 ORDER BY s.rowid LIMIT 1",
+        let row:Option<(i64,String,i64,String,String)>=db.prepare_cached("SELECT s.rowid,s.revision_id,r.published_index_revision,r.native_revision_id,r.source_set_id FROM semantic_revision_raw_selections s JOIN native_revisions r ON r.id=s.revision_id WHERE s.batch_id=?1 AND s.rowid>?2 AND s.producer_id=?3 AND s.captured_pin=?4 ORDER BY s.rowid LIMIT 1")?.query_row(
             params![authority.batch_id,cursor.after_selection,authority.producer.id,semantic_pin_key(authority.captured_pin)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
         if let Some((rowid, key, revision, native, sources)) = row {
             cursor.after_selection = rowid;
@@ -1352,7 +1349,7 @@ pub(crate) fn source_authority(
             cursor.phase = 2;
             return Ok(AuthorityStep::Progress);
         };
-        let releasing:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM native_revision_supersessions WHERE revision_id=?1 AND state<>'retained')",[semantic_pin_key(pin)],|r|r.get(0))?;
+        let releasing:bool=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM native_revision_supersessions WHERE revision_id=?1 AND state<>'retained')")?.query_row([semantic_pin_key(pin)],|r|r.get(0))?;
         if releasing {
             return Ok(AuthorityStep::Full("original_import_releasing"));
         }
@@ -1379,7 +1376,7 @@ pub(crate) fn source_authority(
         .languages
         .get(cursor.inventory.0)
     {
-        let row:Option<(String,String)>=db.query_row("SELECT m.path,v.content_hash FROM revision_documents m JOIN document_versions v ON v.vid=m.vid WHERE m.revision_id=?1 AND m.language=?2 AND m.path>?3 ORDER BY m.path LIMIT 1",
+        let row:Option<(String,String)>=db.prepare_cached("SELECT m.path,v.content_hash FROM revision_documents m JOIN document_versions v ON v.vid=m.vid WHERE m.revision_id=?1 AND m.language=?2 AND m.path>?3 ORDER BY m.path LIMIT 1")?.query_row(
             params![semantic_pin_key(authority.captured_pin),language,cursor.inventory.1],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         if let Some((path, hash)) = row {
             cursor
@@ -1412,7 +1409,7 @@ pub(crate) fn source_authority(
 }
 
 fn has_nonderived_original_provenance(db: &Connection, tuple: i64) -> Result<bool> {
-    db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE tuple_id=?1 AND capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL)",[tuple],|row|row.get(0)).map_err(Into::into)
+    db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE tuple_id=?1 AND capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL)")?.query_row([tuple],|row|row.get(0)).map_err(Into::into)
 }
 
 pub(crate) fn original_document_begin(
@@ -1441,9 +1438,9 @@ pub(crate) fn original_document_begin(
         }));
     }
     let captured = selected_version(db, authority.captured_pin, key)?;
-    let raw:Option<(String,String,i64)>=db.query_row("SELECT source_hash,wire_digest,capped FROM semantic_raw_documents WHERE capture_id=?1 AND language=?2 AND path=?3",params![authority.capture_id,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    let exclusion:Option<String>=db.query_row("SELECT reason FROM semantic_raw_exclusions WHERE batch_id=?1 AND language=?2 AND path=?3",params![authority.batch_id,key.language,key.path],|r|r.get(0)).optional()?;
-    let claims:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE capture_id=?1 AND language=?2 AND path=?3)",params![authority.capture_id,key.language,key.path],|r|r.get(0))?;
+    let raw:Option<(String,String,i64)>=db.prepare_cached("SELECT source_hash,wire_digest,capped FROM semantic_raw_documents WHERE capture_id=?1 AND language=?2 AND path=?3")?.query_row(params![authority.capture_id,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let exclusion:Option<String>=db.prepare_cached("SELECT reason FROM semantic_raw_exclusions WHERE batch_id=?1 AND language=?2 AND path=?3")?.query_row(params![authority.batch_id,key.language,key.path],|r|r.get(0)).optional()?;
+    let claims:bool=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE capture_id=?1 AND language=?2 AND path=?3)")?.query_row(params![authority.capture_id,key.language,key.path],|r|r.get(0))?;
     let Some(captured) = captured else {
         selected_ensure!(
             raw.is_none() && exclusion.is_none() && !claims,
@@ -1511,7 +1508,7 @@ pub(crate) fn original_document_begin(
             Some(!snapshot.provenance.is_empty()),
         )
     } else {
-        let tuple:Option<(i64,bool,bool,String,Option<String>)>=db.query_row("SELECT tuple_id,requested,selected,state,diagnostic FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND producer_version=?3 AND language=?4 AND path=?5",params![semantic_pin_key(authority.original_pin),authority.producer.id,authority.producer.version,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let tuple:Option<(i64,bool,bool,String,Option<String>)>=db.prepare_cached("SELECT tuple_id,requested,selected,state,diagnostic FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND producer_version=?3 AND language=?4 AND path=?5")?.query_row(params![semantic_pin_key(authority.original_pin),authority.producer.id,authority.producer.version,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
         let Some((tuple_id, requested, selected, state, diagnostic)) = tuple else {
             return Ok(WitnessEligibility::Full("original_tuple_missing"));
         };
@@ -1543,11 +1540,11 @@ pub(crate) fn original_document_begin(
     if exclusion.is_some() {
         let authored: bool = match cached_authored {
             Some(authored) => authored,
-            None => db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE tuple_id=?1)",
-                [tuple_id],
-                |r| r.get(0),
-            )?,
+            None => db
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE tuple_id=?1)",
+                )?
+                .query_row([tuple_id], |r| r.get(0))?,
         };
         if bearing || claims || authored {
             return Ok(WitnessEligibility::Full("excluded_original_has_facts"));
@@ -1584,7 +1581,7 @@ pub(crate) fn current_declaration(
     };
     let encoded =
         id_codec::encode_sid(syntax_id).ok_or_else(|| corrupt("invalid targeted syntax ID"))?;
-    let mut stmt=db.prepare("SELECT kind,name,name_start,name_end,start_byte,end_byte FROM native_version_declarations WHERE vid=?1 AND syntax_id=?2 LIMIT 2")?;
+    let mut stmt=db.prepare_cached("SELECT kind,name,name_start,name_end,start_byte,end_byte FROM native_version_declarations WHERE vid=?1 AND syntax_id=?2 LIMIT 2")?;
     let mut rows = stmt.query(params![version.vid, encoded])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
@@ -1658,8 +1655,7 @@ pub(crate) fn internal_symbols_page(
     if authority.cache {
         // One capture-witness document per call, keyed by its rowid.
         let next: Option<(i64, String)> = db
-            .query_row(
-                "SELECT rowid,snapshot_json FROM semantic_batch_witness_documents WHERE batch_id=?1 AND rowid>?2 ORDER BY rowid LIMIT 1",
+            .prepare_cached("SELECT rowid,snapshot_json FROM semantic_batch_witness_documents WHERE batch_id=?1 AND rowid>?2 ORDER BY rowid LIMIT 1")?.query_row(
                 params![authority.batch_id, cursor.tuple],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1683,7 +1679,7 @@ pub(crate) fn internal_symbols_page(
     // Each call advances at most `limit` rows/transitions, including empty parents.
     for _ in 0..limit {
         if let Some(binding) = cursor.binding {
-            let mut stmt=db.prepare("SELECT ordinal,scheme,symbol,scope,document_language,document_path FROM semantic_declaration_binding_symbols WHERE binding_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
+            let mut stmt=db.prepare_cached("SELECT ordinal,scheme,symbol,scope,document_language,document_path FROM semantic_declaration_binding_symbols WHERE binding_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 1")?;
             let mut rows = stmt.query(params![binding, cursor.symbol_ordinal])?;
             if let Some(row) = rows.next()? {
                 row_reserve(row, reserve)?;
@@ -1707,12 +1703,12 @@ pub(crate) fn internal_symbols_page(
                 cursor.symbol_ordinal = -1;
             }
         } else {
-            let row:Option<(i64,i64)>=db.query_row("SELECT binding_id,ordinal FROM semantic_declaration_bindings WHERE tuple_id=?1 AND ordinal>?2 AND syntax_id IS NOT NULL AND join_status='exact' ORDER BY ordinal LIMIT 1",params![cursor.tuple,cursor.binding_ordinal],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let row:Option<(i64,i64)>=db.prepare_cached("SELECT binding_id,ordinal FROM semantic_declaration_bindings WHERE tuple_id=?1 AND ordinal>?2 AND syntax_id IS NOT NULL AND join_status='exact' ORDER BY ordinal LIMIT 1")?.query_row(params![cursor.tuple,cursor.binding_ordinal],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             if let Some((id, ordinal)) = row {
                 cursor.binding = Some(id);
                 cursor.binding_ordinal = ordinal;
             } else {
-                let next:Option<i64>=db.query_row("SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND tuple_id>?3 ORDER BY tuple_id LIMIT 1",params![semantic_pin_key(authority.original_pin),authority.producer.id,cursor.tuple],|r|r.get(0)).optional()?;
+                let next:Option<i64>=db.prepare_cached("SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND tuple_id>?3 ORDER BY tuple_id LIMIT 1")?.query_row(params![semantic_pin_key(authority.original_pin),authority.producer.id,cursor.tuple],|r|r.get(0)).optional()?;
                 if let Some(tuple) = next {
                     cursor.tuple = tuple;
                     cursor.binding_ordinal = -1;

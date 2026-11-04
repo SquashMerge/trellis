@@ -250,8 +250,7 @@ impl JoinContinuation {
         join: &StagedJoin<'_>,
         rev: u8,
     ) -> Result<Option<(i64, native::DocumentKey)>> {
-        Ok(join.conn().query_row(
-            "SELECT ord,language,path FROM nat_docs WHERE rev=?1 AND ord>?2 ORDER BY ord LIMIT 1",
+        Ok(join.conn().prepare_cached("SELECT ord,language,path FROM nat_docs WHERE rev=?1 AND ord>?2 ORDER BY ord LIMIT 1")?.query_row(
             params![rev, self.last], |row| Ok((row.get(0)?, native::DocumentKey {
                 source_set_id: if rev == 0 { join.captured.source_set_id() }
                     else { join.destination.source_set_id() }.to_owned(),
@@ -428,11 +427,12 @@ impl JoinContinuation {
             }
             Phase::ClaimInventory => {
                 let next: Option<(i64, String, String)> = conn
-                    .query_row(
+                    .prepare_cached(
                         "SELECT ord,language,path FROM sources WHERE ord>?1 ORDER BY ord LIMIT 1",
-                        [self.last],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
+                    )?
+                    .query_row([self.last], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
                     .optional()?;
                 if let Some((ord, language, path)) = next {
                     anyhow::ensure!(
@@ -470,11 +470,12 @@ impl JoinContinuation {
             }
             Phase::DestinationTargets | Phase::CapturedTargets => {
                 let next: Option<(i64, String, String)> = conn
-                    .query_row(
+                    .prepare_cached(
                         "SELECT ord,language,path FROM sources WHERE ord>?1 ORDER BY ord LIMIT 1",
-                        [self.last],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
+                    )?
+                    .query_row([self.last], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
                     .optional()?;
                 if let Some((ord, language, path)) = next {
                     let document = native::DocumentKey {
@@ -609,8 +610,7 @@ impl JoinContinuation {
                 }
             }
             Phase::OutputClosure => {
-                let next: Option<(i64,String,String)> = conn.query_row(
-                    "SELECT ord,language,path FROM out_coverage WHERE ord>?1 ORDER BY ord LIMIT 1",
+                let next: Option<(i64,String,String)> = conn.prepare_cached("SELECT ord,language,path FROM out_coverage WHERE ord>?1 ORDER BY ord LIMIT 1")?.query_row(
                     [self.last], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
                 ).optional()?;
                 if let Some((ord, language, path)) = next {
@@ -687,11 +687,12 @@ impl JoinContinuation {
     ) -> Result<()> {
         let conn = join.conn();
         let coverage: Option<(i64, String, Option<String>)> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT ord,body,provenance FROM out_coverage WHERE language=?1 AND path=?2",
-                params![document.language, document.path],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+            )?
+            .query_row(params![document.language, document.path], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .optional()?;
         let requested = join
             .producer

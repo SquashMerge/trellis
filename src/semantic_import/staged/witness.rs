@@ -48,9 +48,8 @@ fn header(
     join: &StagedJoin<'_>,
     doc: &native::DocumentKey,
 ) -> Result<(String, String, Reservation)> {
-    let found: Option<(String,i64)> = join.conn().query_row(
-        "SELECT w.decision,length(CAST(w.body AS BLOB)) FROM source_witnesses w JOIN sources s ON s.ord=w.source_ord \
-         WHERE s.language=?1 AND s.path=?2 AND w.complete=1", params![doc.language,doc.path],
+    let found: Option<(String,i64)> = join.conn().prepare_cached("SELECT w.decision,length(CAST(w.body AS BLOB)) FROM source_witnesses w JOIN sources s ON s.ord=w.source_ord \
+         WHERE s.language=?1 AND s.path=?2 AND w.complete=1")?.query_row( params![doc.language,doc.path],
         |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((decision, bytes)) = found else {
         return fallback("missing complete source witness");
@@ -61,12 +60,13 @@ fn header(
             .and_then(|v| v.checked_add(1024))
             .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
     )?;
-    let body = join.conn().query_row(
-        "SELECT w.body FROM source_witnesses w JOIN sources s ON s.ord=w.source_ord \
+    let body = join
+        .conn()
+        .prepare_cached(
+            "SELECT w.body FROM source_witnesses w JOIN sources s ON s.ord=w.source_ord \
          WHERE s.language=?1 AND s.path=?2",
-        params![doc.language, doc.path],
-        |r| r.get(0),
-    )?;
+        )?
+        .query_row(params![doc.language, doc.path], |r| r.get(0))?;
     Ok((decision, body, reservation))
 }
 
@@ -82,12 +82,13 @@ pub(super) fn document_flags(
         return Ok((DocFlags::default(), None));
     }
     let (decision, body, _reservation) = header(join, doc)?;
-    let claims: i64 = join.conn().query_row(
-        "SELECT COUNT(*) FROM proof_identities p JOIN sources s ON s.ord=p.source_ord \
+    let claims: i64 = join
+        .conn()
+        .prepare_cached(
+            "SELECT COUNT(*) FROM proof_identities p JOIN sources s ON s.ord=p.source_ord \
         WHERE s.language=?1 AND s.path=?2 AND p.record_kind<>'symbolInformation'",
-        params![doc.language, doc.path],
-        |r| r.get(0),
-    )?;
+        )?
+        .query_row(params![doc.language, doc.path], |r| r.get(0))?;
     let mut flags = DocFlags {
         claims: u64::try_from(claims)?,
         ..DocFlags::default()
@@ -178,11 +179,10 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         return fallback("nonreusable source entered fact settlement");
     }
     let witness: OriginalSourceWitness = serde_json::from_str(&body)?;
-    let source_ord: i64 = join.conn().query_row(
-        "SELECT ord FROM sources WHERE language=?1 AND path=?2",
-        params![doc.language, doc.path],
-        |r| r.get(0),
-    )?;
+    let source_ord: i64 = join
+        .conn()
+        .prepare_cached("SELECT ord FROM sources WHERE language=?1 AND path=?2")?
+        .query_row(params![doc.language, doc.path], |r| r.get(0))?;
     // The typed event storage estimate admits decoded parents, children, indexing maps,
     // the final claim map and the destination copy before any body is materialized.
     let bytes = original_rows_reservation(join.conn(), source_ord)?;
@@ -500,11 +500,10 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 && raw.artifact_hash == basis.artifact_hash,
             "original proof document differs"
         );
-        let capture: Option<i64> = join.conn().query_row(
-            "SELECT capture_id FROM proof_identities WHERE proof_id=?1",
-            [&derived.provenance_id],
-            |row| row.get(0),
-        )?;
+        let capture: Option<i64> = join
+            .conn()
+            .prepare_cached("SELECT capture_id FROM proof_identities WHERE proof_id=?1")?
+            .query_row([&derived.provenance_id], |row| row.get(0))?;
         anyhow::ensure!(
             capture == Some(p.capture_id),
             "original proof capture differs"
@@ -594,11 +593,10 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         {
             return fallback("original fused proof authority differs");
         }
-        let capture: Option<i64> = join.conn().query_row(
-            "SELECT capture_id FROM proof_identities WHERE proof_id=?1",
-            [&derived.provenance_id],
-            |row| row.get(0),
-        )?;
+        let capture: Option<i64> = join
+            .conn()
+            .prepare_cached("SELECT capture_id FROM proof_identities WHERE proof_id=?1")?
+            .query_row([&derived.provenance_id], |row| row.get(0))?;
         anyhow::ensure!(
             capture == Some(p.capture_id),
             "original fused proof capture differs"

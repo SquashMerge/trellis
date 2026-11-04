@@ -202,8 +202,12 @@ const DUPLICATE_SYMBOL_KEY: &str = "duplicate semantic symbol key";
 const OUTPUT_CHECK_ROWS: u64 = 10_000;
 
 fn stage_bytes(conn: &Connection) -> Result<u64> {
-    let pages: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-    let size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let pages: i64 = conn
+        .prepare_cached("PRAGMA page_count")?
+        .query_row([], |row| row.get(0))?;
+    let size: i64 = conn
+        .prepare_cached("PRAGMA page_size")?
+        .query_row([], |row| row.get(0))?;
     Ok(u64::try_from(pages)?.saturating_mul(u64::try_from(size)?))
 }
 
@@ -837,22 +841,21 @@ impl<'a> StagedSide<'a> {
         let found = self
             .ctx
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT s.language,s.path,a.sha256,p.claim_id FROM proof_identities p \
              JOIN sources s ON s.ord=p.source_ord JOIN artifacts a ON a.ordinal=p.artifact \
              WHERE p.proof_id=?1 AND p.record_kind=?2 AND p.fact_digest=?3",
-                params![proof, kind, digest],
-                |row| {
-                    Ok((
-                        RawClaimDocument {
-                            language: row.get(0)?,
-                            path: row.get(1)?,
-                            artifact_hash: row.get(2)?,
-                        },
-                        row.get(3)?,
-                    ))
-                },
-            )
+            )?
+            .query_row(params![proof, kind, digest], |row| {
+                Ok((
+                    RawClaimDocument {
+                        language: row.get(0)?,
+                        path: row.get(1)?,
+                        artifact_hash: row.get(2)?,
+                    },
+                    row.get(3)?,
+                ))
+            })
             .optional()?;
         let (claim, id) = found.ok_or(ScipCaptureError::MissingProof)?;
         anyhow::ensure!(
@@ -1464,9 +1467,8 @@ fn reset_for_destination(conn: &Connection, destination: IndexPin) -> Result<i64
     }
     let generation = destination.index_generation.to_string();
     let previous: Option<(String, i64)> = conn
-        .query_row("SELECT generation, revision FROM join_state", [], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
+        .prepare_cached("SELECT generation, revision FROM join_state")?
+        .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()?;
     if previous.as_ref() != Some(&(generation.clone(), destination.index_revision as i64)) {
         for table in ["nat_docs", "nat_done"] {
@@ -1489,9 +1491,9 @@ static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// together with the rows this attempt writes.
 fn retained_rows(conn: &Connection) -> Result<u64> {
     let mut total = 0u64;
-    let count = conn.query_row("SELECT COUNT(*) FROM nat_docs", [], |row| {
-        row.get::<_, i64>(0)
-    })?;
+    let count = conn
+        .prepare_cached("SELECT COUNT(*) FROM nat_docs")?
+        .query_row([], |row| row.get::<_, i64>(0))?;
     total = total
         .checked_add(u64::try_from(count)?)
         .ok_or_else(|| ScipCaptureError::LimitExceeded("staged rows".into()))?;
@@ -2445,11 +2447,11 @@ impl StagedJoin<'_> {
         let requested: i64 = {
             let mut total = 0;
             for language in &languages {
-                total += conn.query_row(
-                    "SELECT COUNT(*) FROM nat_docs WHERE rev=?1 AND language=?2",
-                    params![self.destination.rev, language],
-                    |row| row.get::<_, i64>(0),
-                )?;
+                total += conn
+                    .prepare_cached("SELECT COUNT(*) FROM nat_docs WHERE rev=?1 AND language=?2")?
+                    .query_row(params![self.destination.rev, language], |row| {
+                        row.get::<_, i64>(0)
+                    })?;
             }
             total
         };
@@ -2547,7 +2549,8 @@ fn emit_ledger_diagnostic(ctx: &JoinCtx<'_>, lookup_steps: u64) {
     let pages = (|| -> Result<(u64, i64)> {
         let freelist: i64 = ctx
             .conn
-            .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+            .prepare_cached("PRAGMA freelist_count")?
+            .query_row([], |row| row.get(0))?;
         Ok((stage_bytes(ctx.conn)?, freelist))
     })();
     let line = serde_json::json!({

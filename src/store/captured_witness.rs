@@ -78,12 +78,9 @@ fn snapshot_row(publication: sem::SemanticPublication) -> Result<(String, String
 }
 
 pub(crate) fn exists(tx: &Connection, batch_id: i64) -> Result<bool> {
-    tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM semantic_batch_witnesses WHERE batch_id=?1)",
-        [batch_id],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
+    tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_batch_witnesses WHERE batch_id=?1)")?
+        .query_row([batch_id], |row| row.get(0))
+        .map_err(Into::into)
 }
 
 /// Moves one already validated captured==captured publication into the existing snapshot
