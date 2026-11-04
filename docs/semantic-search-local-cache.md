@@ -139,7 +139,9 @@ To apply changes, use the command printed in the install/remove report's `restar
    shutdown. Ctrl-C on `trellis serve` stops only that client, not the shared daemon.
 2. Run `trellis daemon stop`. It stops the per-user daemon across all checkouts and closes
    its browser and client connections. It returns after the old daemon releases its socket
-   and election lock. If no daemon is running, it succeeds without starting one.
+   and election lock. Accepted indexing or import work finishes first, so stop can take
+   longer than a minute and waits without a completion read timeout. If no daemon is
+   running, it succeeds without starting one.
 3. Run `trellis status --workspace /absolute/path/to/checkout` to auto-start a daemon with
    the new configuration, then reconnect your MCP clients and restart `trellis serve`.
    Remove unintended development overrides from that startup environment first.

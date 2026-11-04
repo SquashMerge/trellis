@@ -737,8 +737,9 @@ fn checked_reply(reply: protocol::Reply) -> Result<serde_json::Value> {
 /// the whole reply: a liveness backstop, not a deadline.
 const INDEX_REPLY_BOUND: Duration = Duration::from_secs(10 * 60);
 
-/// How long every other non-metrics CLI call waits on a silent daemon, per
-/// socket read. Tests lower it with `TRELLIS_TEST_CLI_REPLY_BOUND_MS` to prove
+/// How long other non-metrics CLI calls wait on a silent daemon, per socket
+/// read. Daemon stop waits for ownership release without this completion bound.
+/// Tests lower it with `TRELLIS_TEST_CLI_REPLY_BOUND_MS` to prove
 /// a call outlives it without waiting a minute (#201).
 const CLI_REPLY_BOUND: Duration = Duration::from_secs(60);
 
@@ -1417,7 +1418,8 @@ fn stop_existing_daemon() -> Result<serde_json::Value> {
         }
         Err(error) => return Err(error).context("daemon_unavailable"),
     };
-    stream.set_read_timeout(Some(CLI_REPLY_BOUND))?;
+    // Accepted work may outlive ordinary CLI reply bounds. Success means the
+    // elected owner has actually retired, not merely accepted the stop request.
     stream.set_write_timeout(Some(CLI_REPLY_BOUND))?;
     let request = daemon_request("daemon_stop", serde_json::json!({}));
     protocol::write_frame(&mut stream, &request)?;
@@ -2437,6 +2439,18 @@ fn dispatch_connection(
                         (1..=16_777_216).contains(&options.max_file_bytes),
                         "max-file-bytes must be 1..16777216"
                     );
+                    #[cfg(feature = "test-support")]
+                    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_INDEX_CLAIM_SOCKET") {
+                        checkout.set_after_claim_hook_for_tests(move || {
+                            use std::io::{Read, Write};
+                            let mut hook = std::os::unix::net::UnixStream::connect(path)
+                                .expect("connect accepted index fixture");
+                            hook.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+                                .unwrap();
+                            hook.write_all(b"C").unwrap();
+                            hook.read_exact(&mut [0]).unwrap();
+                        });
+                    }
                     checkout.cli_index(&options)
                 }
                 "semantic_import" => {

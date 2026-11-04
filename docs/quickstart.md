@@ -97,6 +97,10 @@ To stop everything, or before you change the port or token file, stop the daemon
 trellis daemon stop
 ```
 
+Stop waits for accepted indexing or import work to finish and for the old daemon
+to release ownership. It can take longer than a minute; there is no completion
+read timeout.
+
 ### Keep a live serve detached
 
 For a long-running live instance, do not leave `serve` owned by an agent's tool

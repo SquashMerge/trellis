@@ -395,6 +395,142 @@ fn daemon_stop_without_a_daemon_creates_no_runtime_state() {
     assert!(!fixture_roots(&home).cache.exists());
 }
 
+/// Stop has no reply deadline: accepted index work must finish before the
+/// socket owner retires, even after the old generic CLI bound has passed.
+#[test]
+fn daemon_stop_waits_past_the_cli_reply_bound_for_accepted_index() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use trellis::daemon::protocol;
+
+    struct ClaimGate(UnixStream);
+    impl Drop for ClaimGate {
+        fn drop(&mut self) {
+            let _ = self.0.write_all(b"R");
+        }
+    }
+
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "stop-drain");
+    fs::create_dir(root.join(".git")).unwrap();
+    trellis::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let claim_socket = temp.path().join("claim.sock");
+    let listener = UnixListener::bind(&claim_socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // The daemon captures the hook path, but only explicit index dispatch
+    // installs the hook; startup reconciliation can finish normally.
+    let initial = cli(&home)
+        .args(["status", "--workspace"])
+        .arg(&root)
+        .env("TRELLIS_TEST_DAEMON_INDEX_CLAIM_SOCKET", &claim_socket)
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let original = trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid")).unwrap();
+    let socket = fixture_socket_paths(&home).socket;
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+            .unwrap();
+    let mut mcp = UnixStream::connect(&socket).unwrap();
+    mcp.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    protocol::write_frame(&mut mcp, &protocol::Request {
+        id: 1,
+        operation: "mcp".into(),
+        payload: serde_json::json!({"workspace":root,"device":identity.device,"inode":identity.inode,"mcpIdentity":protocol::mcp_identity()}),
+    }).unwrap();
+    let attached: protocol::Reply = protocol::read_frame(&mut mcp).unwrap();
+    assert_eq!(attached.payload["result"], true, "{attached:?}");
+
+    let mut command = cli(&home);
+    command
+        .args(["index", "--workspace"])
+        .arg(&root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut index = Owned(command.spawn().unwrap());
+    let mut accepted = None;
+    trellis::testing::wait_until("explicit index FIFO claim", || {
+        assert!(
+            index.0.try_wait().unwrap().is_none(),
+            "index exited before claim"
+        );
+        accepted = listener.accept().ok().map(|(stream, _)| stream);
+        accepted.is_some()
+    });
+    let mut gate = ClaimGate(accepted.unwrap());
+    gate.0
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let mut claimed = [0];
+    gate.0.read_exact(&mut claimed).unwrap();
+    assert_eq!(&claimed, b"C");
+
+    let mut command = cli(&home);
+    command
+        .args(["daemon", "stop"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let past_bound = lower_cli_reply_bound(&mut command);
+    let mut stop = Owned(command.spawn().unwrap());
+    // This peer was attached before stop. Its EOF proves shutdown admission,
+    // so process startup time cannot account for the following held interval.
+    assert_eq!(mcp.read(&mut [0]).unwrap(), 0);
+    std::thread::sleep(past_bound);
+    let stopped_early = stop.0.try_wait().unwrap();
+    let retained_owner = socket.exists() && original.matches();
+    drop(gate); // Release the writer before any RED assertion can panic.
+
+    let (exit, out, err) = finished(&mut stop);
+    let _ = finished(&mut index); // Shutdown may close this caller's socket.
+    trellis::testing::wait_until("drained daemon exit", || !original.matches());
+    assert!(
+        stopped_early.is_none(),
+        "stop stopped waiting while index was claimed: {err}"
+    );
+    assert!(
+        retained_owner,
+        "shutdown retired the owner before accepted work finished"
+    );
+    assert!(exit.success(), "{err}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["stopped"],
+        true
+    );
+    assert!(
+        !socket.exists(),
+        "stop acknowledged before socket retirement"
+    );
+
+    // Open only after the daemon exited: no separate descriptor can disturb
+    // the live SQLite writer's process locks.
+    let queue = rusqlite::Connection::open_with_flags(
+        fixture_roots(&home).requests_db(&identity),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let terminal: (String, Option<String>, Option<i64>) = queue.query_row(
+        "SELECT state, result_generation, result_revision FROM requests WHERE request_kind='index' ORDER BY seq DESC LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(
+        terminal.0, "done",
+        "accepted index did not publish before stop"
+    );
+    assert!(terminal.1.is_some() && terminal.2.is_some());
+}
+
 #[test]
 fn daemon_stop_closes_idle_mcp_and_recaptures_model_configuration() {
     use std::os::unix::net::UnixStream;
