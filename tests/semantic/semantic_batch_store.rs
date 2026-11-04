@@ -8789,6 +8789,13 @@ fn a_read_during_a_spilled_semantic_commit_reads_the_new_head() {
         .store
         .set_semantic_publication_observer_for_tests(move |stage, db| {
             if stage == SemanticPublicationStage::BeforeSemantic {
+                // #674 option 2: the S commit's writer holds a typical commit's
+                // dirty pages (512 MiB) without spilling.
+                let cache: i64 = db
+                    .pragma_query_value(None, "cache_size", |row| row.get(0))
+                    .unwrap();
+                assert_eq!(cache, -512 * 1024, "S commit writer cache_size");
+                // Force a spill on this small fixture.
                 db.pragma_update(None, "cache_size", -64).unwrap();
             } else if !observed_hook.swap(true, Ordering::AcqRel) {
                 // Spilled: start a reader on another thread and hold the commit

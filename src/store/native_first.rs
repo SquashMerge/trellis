@@ -550,7 +550,7 @@ impl Store {
             );
         }
         let db = self.cache_write()?;
-        storage_result(db.pragma_update(None, "cache_size", -PUBLICATION_CACHE_KIB))?;
+        storage_result(db.pragma_update(None, "cache_size", -SEMANTIC_COMMIT_CACHE_KIB))?;
         // Declared before the transaction so it drops after it: on an error or
         // unwind the mark stays set until the rollback has released the lock.
         let mut blocked = ReadersBlockedWatch::new(&self.publication_gate, 0);

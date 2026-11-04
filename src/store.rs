@@ -962,6 +962,13 @@ impl DerefMut for IndexConnection {
 // the caller's verified exclusive leader guard alive across its transaction.
 /// Page cache for a publication's connection, in KiB (256 MiB).
 const PUBLICATION_CACHE_KIB: i64 = 256 * 1024;
+/// Page cache for the S commit's writer, in KiB (512 MiB). The S commit writes
+/// a whole revision's semantic rows in one transaction; a typical one dirties
+/// about 380–440 MiB on a 1.4k-document Rust checkout, and a spill past the
+/// cache holds every reader out until COMMIT (#674). Pages are allocated only
+/// as used, and the cache is freed with the per-commit connection. Measured
+/// against the 8 GiB S RSS cap: peak RSS 7.48 GiB vs 7.31 GiB at 256 MiB.
+const SEMANTIC_COMMIT_CACHE_KIB: i64 = 512 * 1024;
 
 enum PublicationConnection {
     Live(IndexConnection),
