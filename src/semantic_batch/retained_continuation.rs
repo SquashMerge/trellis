@@ -2,6 +2,7 @@
 use super::*;
 use crate::{model::IndexPin, scip_admission::PinnedProducer, store::CanonicalInventoryCursor};
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::{Seek, SeekFrom},
 };
@@ -50,9 +51,16 @@ pub(crate) struct RetainedStageContinuation {
     missing_artifact: usize,
     missing_proof: String,
     missing_found: Option<u32>,
+    /// Estimated stage bytes written since the stage directory was last measured.
+    unchecked: u64,
+    /// The current artifact's checked proof documents (path to source ordinal).
+    proof_documents: HashMap<String, i64>,
 }
 
-#[derive(Clone, Copy)]
+/// Stage bytes charged per row a unit changes, beyond the payload it reports.
+const ROW_STAGE_BYTES: u64 = 512;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Inventory,
     Sources,
@@ -183,6 +191,8 @@ impl RetainedStageContinuation {
             missing_artifact: 0,
             missing_proof: String::new(),
             missing_found: None,
+            unchecked: 0,
+            proof_documents: HashMap::new(),
         })
     }
 
@@ -258,6 +268,8 @@ impl RetainedStageContinuation {
         let dir = stage.dir().to_owned();
         let conn = stage.conn()?;
         let before = conn.total_changes();
+        let phase = self.phase;
+        let mut payload = 0u64;
         let passes = Passes {
             descriptor,
             producer: &self.producer,
@@ -552,6 +564,7 @@ impl RetainedStageContinuation {
                     self.document_key = (String::new(), String::new());
                     self.proof_count = 0;
                     self.document_count = 0;
+                    self.proof_documents.clear();
                     if self.trusted {
                         self.phase = Phase::Documents;
                     } else {
@@ -638,7 +651,13 @@ impl RetainedStageContinuation {
                         conn,
                         &mut self.proof_key,
                         &self.limits,
+                        &mut self.proof_documents,
                     )?
+                    .map(|page| {
+                        self.proof_count += page.rows - 1;
+                        payload = page.bytes;
+                        page.high_water
+                    })
                 } else {
                     advance_proof(
                         db,
@@ -651,6 +670,7 @@ impl RetainedStageContinuation {
                     )?
                 };
                 if let Some(bytes) = bytes {
+                    payload = payload.max(bytes);
                     counters.retained_admission_bytes_high_water =
                         counters.retained_admission_bytes_high_water.max(bytes);
                     self.proof_count += 1;
@@ -749,17 +769,41 @@ impl RetainedStageContinuation {
                 )));
             }
         }
-        budget.check()?;
+        let changed = conn.total_changes() - before;
+        // Row units measure the stage directory per MiB staged and at every phase change,
+        // as the witness writer does; copy and decode units write in bulk and measure each.
+        if phase != self.phase || matches!(phase, Phase::Copy | Phase::Decode) {
+            self.unchecked = 0;
+            budget.check()?;
+        } else {
+            budget.charge(
+                &mut self.unchecked,
+                payload.saturating_add(changed.saturating_mul(ROW_STAGE_BYTES)),
+            )?;
+        }
         counters.retained_admission_units += 1;
         counters.retained_admission_rows_high_water = counters
             .retained_admission_rows_high_water
-            .max(conn.total_changes() - before);
+            .max(changed);
         Ok(None)
     }
 }
 
-/// Identity-only retained read. Reserve borrowed scalar fields before making owned strings;
-/// neither canonical proof bytes nor the SCIP binary participates in witness admission.
+/// Witness proof identities staged per admission unit.
+const WITNESS_PROOF_PAGE: i64 = 256;
+
+/// One page of witness proofs: rows staged, the largest row reservation, and the bytes
+/// reserved in all.
+struct WitnessProofPage {
+    rows: i64,
+    high_water: u64,
+    bytes: u64,
+}
+
+/// Identity-only retained read of up to [`WITNESS_PROOF_PAGE`] proofs. Reserve borrowed
+/// scalar fields before making owned strings; neither canonical proof bytes nor the SCIP
+/// binary participates in witness admission. `assigned` caches each proof document's
+/// assigned source ordinal for this artifact, after its staged document row is checked.
 fn advance_witness_proof(
     db: &Connection,
     capture: i64,
@@ -767,57 +811,70 @@ fn advance_witness_proof(
     conn: &Connection,
     key: &mut String,
     limits: &BatchLimits,
-) -> Result<Option<u64>> {
+    assigned: &mut HashMap<String, i64>,
+) -> Result<Option<WitnessProofPage>> {
     let mut statement = db.prepare_cached(
-        "SELECT proof_id,record_kind,fact_digest,language,path FROM semantic_raw_proofs          WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT 1",
+        "SELECT proof_id,record_kind,fact_digest,language,path FROM semantic_raw_proofs          WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT ?3",
     )?;
-    let mut rows = statement.query(params![capture, key.as_str()])?;
-    let Some(row) = rows.next()? else {
-        return Ok(None);
+    let mut rows = statement.query(params![capture, key.as_str(), WITNESS_PROOF_PAGE])?;
+    let mut page = WitnessProofPage {
+        rows: 0,
+        high_water: 0,
+        bytes: 0,
     };
-    let mut bytes = 256_u64;
-    for index in 0..5 {
-        let value = row.get_ref(index)?.as_str()?;
-        bytes = bytes.saturating_add((value.len() as u64).saturating_mul(2));
-    }
-    if bytes > limits.unit_expansion_bytes {
-        return Err(ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into());
-    }
-    let proof: String = row.get(0)?;
-    let kind: String = row.get(1)?;
-    let digest: String = row.get(2)?;
-    let language: String = row.get(3)?;
-    let path: String = row.get(4)?;
-    ensure!(language == entry.language, "retained proof language");
-    let source = super::super::staging::lookup_assigned(conn, entry.ordinal, &language, &path)?
-        .ok_or_else(|| admission("retained unlisted proof"))?;
-    let present: bool = conn
-        .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM documents WHERE source_ord=?1 AND artifact=?2)",
-        )?
-        .query_row(params![source.ord, entry.ordinal], |row| row.get(0))?;
-    ensure!(present, "retained proof document");
-    let identity: Option<i64> = conn
-        .prepare_cached("SELECT identity_id FROM witness_proofs ORDER BY identity_id LIMIT 1")?
-        .query_row([], |row| row.get(0))
-        .optional()?;
-    let identity = identity
-        .unwrap_or(0)
+    let mut identity: Option<i64> = None;
+    let mut insert =
+        conn.prepare_cached("INSERT INTO witness_proofs VALUES(?1,?2,?3,?4,?5,?6,?7)")?;
+    while let Some(row) = rows.next()? {
+        let mut bytes = 256_u64;
+        for index in 0..5 {
+            let value = row.get_ref(index)?.as_str()?;
+            bytes = bytes.saturating_add((value.len() as u64).saturating_mul(2));
+        }
+        if bytes > limits.unit_expansion_bytes {
+            return Err(ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into());
+        }
+        let proof: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let digest: String = row.get(2)?;
+        let language: String = row.get(3)?;
+        let path: String = row.get(4)?;
+        ensure!(language == entry.language, "retained proof language");
+        let source = match assigned.get(&path) {
+            Some(ord) => *ord,
+            None => {
+                let source =
+                    super::super::staging::lookup_assigned(conn, entry.ordinal, &language, &path)?
+                        .ok_or_else(|| admission("retained unlisted proof"))?;
+                let present: bool = conn
+                    .prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM documents WHERE source_ord=?1 AND artifact=?2)",
+                    )?
+                    .query_row(params![source.ord, entry.ordinal], |row| row.get(0))?;
+                ensure!(present, "retained proof document");
+                assigned.insert(path, source.ord);
+                source.ord
+            }
+        };
+        let next = match identity {
+            Some(identity) => identity,
+            None => conn
+                .prepare_cached("SELECT identity_id FROM witness_proofs ORDER BY identity_id LIMIT 1")?
+                .query_row([], |row| row.get(0))
+                .optional()?
+                .unwrap_or(0),
+        }
         .checked_sub(1)
         .ok_or_else(|| admission("witness proof identity exhausted"))?;
-    super::super::staging::charge_witness_row(conn, limits)?;
-    conn.prepare_cached("INSERT INTO witness_proofs VALUES(?1,?2,?3,?4,?5,?6,?7)")?
-        .execute(params![
-            identity,
-            entry.ordinal,
-            source.ord,
-            kind,
-            digest,
-            proof,
-            capture
-        ])?;
-    *key = proof;
-    Ok(Some(bytes))
+        identity = Some(next);
+        super::super::staging::charge_witness_row(conn, limits)?;
+        insert.execute(params![next, entry.ordinal, source, kind, digest, proof, capture])?;
+        *key = proof;
+        page.rows += 1;
+        page.high_water = page.high_water.max(bytes);
+        page.bytes = page.bytes.saturating_add(bytes);
+    }
+    Ok((page.rows > 0).then_some(page))
 }
 
 type DocumentRow = (i64, String, String, String, String, i64);

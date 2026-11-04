@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 /// expansion byte reservation; one row per step spent most of the step on fixed overhead.
 const PAGE_ROWS: usize = 256;
 const INVENTORY_PAGE: usize = 64;
+/// Required targets looked up per preparation step.
+const TARGET_PAGE: i64 = 64;
 
 #[derive(Default)]
 pub(super) struct WitnessPreparation {
@@ -23,6 +25,8 @@ pub(super) struct WitnessPreparation {
     target_after: i64,
     targets_done: bool,
     target_count: u64,
+    /// Estimated LOCAL target stage bytes since that stage was last measured.
+    lookup_unchecked: u64,
 }
 struct SourcePreparation {
     ord: i64,
@@ -162,9 +166,14 @@ impl WitnessPreparation {
             return Ok(false);
         }
         if !self.targets_done {
-            let next: Option<(i64, String, String, String)> = conn.prepare_cached("SELECT id,language,path,syntax_id FROM witness_required_targets WHERE id>?1 ORDER BY id LIMIT 1")?.query_row(
-                [self.target_after], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-            if let Some((id, language, path, syntax_id)) = next {
+            // A page of required targets per step; each target is still one lookup step.
+            let page: Vec<(i64, String, String, String)> = conn.prepare_cached("SELECT id,language,path,syntax_id FROM witness_required_targets WHERE id>?1 ORDER BY id LIMIT ?2")?.query_map(
+                params![self.target_after, TARGET_PAGE], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+            let more = !page.is_empty();
+            for (index, (id, language, path, syntax_id)) in page.into_iter().enumerate() {
+                if index > 0 {
+                    lookup_budget.charge(1)?;
+                }
                 let key = DocumentKey {
                     source_set_id: authority.source_set_id.clone(),
                     language,
@@ -178,6 +187,7 @@ impl WitnessPreparation {
                         &syntax_id,
                         target_stage,
                         limits,
+                        &mut self.lookup_unchecked,
                         cancel,
                     )?;
                     #[cfg(feature = "test-support")]
@@ -207,6 +217,8 @@ impl WitnessPreparation {
                     }
                 }
                 self.target_after = id;
+            }
+            if more {
                 budget.check()?;
                 return Ok(false);
             }

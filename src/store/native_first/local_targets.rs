@@ -39,6 +39,9 @@ CREATE TABLE local_target_documents(pin TEXT NOT NULL,source_set TEXT NOT NULL,l
 CREATE TABLE local_target_declarations(pin TEXT NOT NULL,source_set TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,present INTEGER NOT NULL,kind TEXT,name TEXT,name_start INTEGER,name_end INTEGER,callable INTEGER,PRIMARY KEY(pin,source_set,language,path,syntax_id)) WITHOUT ROWID;
 ";
 
+/// Stage bytes charged for one cached lookup row.
+const LOOKUP_STAGE_BYTES: u64 = 512;
+
 fn corrupt(message: &str) -> anyhow::Error {
     SelectedIntegrity(format!("incompatible_index: {message}")).into()
 }
@@ -297,6 +300,10 @@ fn put(
 
 /// Exact selected normalized lookup. Both hits and absence are cached under the
 /// requested pin and selected vid; only fully indexed documents prove absence.
+///
+/// A cache miss stages one row; the stage directory is measured once `unchecked` (the
+/// caller's running estimate) reaches a MiB, not on every lookup.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lookup(
     db: &Connection,
     pin: IndexPin,
@@ -304,6 +311,7 @@ pub(crate) fn lookup(
     syntax_id: &str,
     stage: &mut Stage,
     limits: &BatchLimits,
+    unchecked: &mut u64,
     cancel: &CancelFlag,
 ) -> Result<TargetLookup> {
     check_cancel(cancel)?;
@@ -371,7 +379,7 @@ pub(crate) fn lookup(
     };
     let rows = declaration.is_some() as usize;
     put(conn, pin, key, vid, &encoded, declaration.as_ref(), limits)?;
-    stage.budget(limits).check()?;
+    stage.budget(limits).charge(unchecked, LOOKUP_STAGE_BYTES)?;
     Ok(TargetLookup {
         declaration,
         rows,
@@ -512,15 +520,15 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
         assert!(cursor.done);
         assert_eq!((builds, documents, rows), (1, 1, 2));
         let sid = format!("sid:v1:{}", "1".repeat(32));
-        let now = lookup(&db, pin(2), &key(), &sid, &mut stage, &limits, &cancel).unwrap();
+        let now = lookup(&db, pin(2), &key(), &sid, &mut stage, &limits, &mut 0, &cancel).unwrap();
         assert_eq!(now.declaration.unwrap().name.as_deref(), Some("new"));
         assert!(!now.read);
-        let old = lookup(&db, pin(1), &key(), &sid, &mut stage, &limits, &cancel).unwrap();
+        let old = lookup(&db, pin(1), &key(), &sid, &mut stage, &limits, &mut 0, &cancel).unwrap();
         assert_eq!(old.declaration.unwrap().name.as_deref(), Some("old"));
         assert!(old.read);
         assert_eq!(old.rows, 1);
         assert!(
-            !lookup(&db, pin(1), &key(), &sid, &mut stage, &limits, &cancel)
+            !lookup(&db, pin(1), &key(), &sid, &mut stage, &limits, &mut 0, &cancel)
                 .unwrap()
                 .read
         );
@@ -560,7 +568,7 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
             ..Default::default()
         };
         let sid = format!("sid:v1:{}", "1".repeat(32));
-        let error = lookup(&db, pin(2), &key(), &sid, &mut stage, &limits, &cancel)
+        let error = lookup(&db, pin(2), &key(), &sid, &mut stage, &limits, &mut 0, &cancel)
             .err()
             .unwrap();
         assert!(error.downcast_ref::<ScipCaptureError>().is_some());
@@ -580,18 +588,18 @@ CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,kind TEXT,na
         let cancel = Arc::new(AtomicBool::new(false));
         let limits = BatchLimits::default();
         let missing = format!("sid:v1:{}", "3".repeat(32));
-        let absent = lookup(&db, pin(2), &key(), &missing, &mut stage, &limits, &cancel).unwrap();
+        let absent = lookup(&db, pin(2), &key(), &missing, &mut stage, &limits, &mut 0, &cancel).unwrap();
         assert!(absent.declaration.is_none() && absent.read && absent.rows == 0);
         assert!(
-            !lookup(&db, pin(2), &key(), &missing, &mut stage, &limits, &cancel)
+            !lookup(&db, pin(2), &key(), &missing, &mut stage, &limits, &mut 0, &cancel)
                 .unwrap()
                 .read
         );
         let unnamed = format!("sid:v1:{}", "2".repeat(32));
-        let present = lookup(&db, pin(2), &key(), &unnamed, &mut stage, &limits, &cancel).unwrap();
+        let present = lookup(&db, pin(2), &key(), &unnamed, &mut stage, &limits, &mut 0, &cancel).unwrap();
         assert!(present.declaration.unwrap().name.is_none());
         assert_eq!(present.rows, 1);
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(lookup(&db, pin(2), &key(), &unnamed, &mut stage, &limits, &cancel).is_err());
+        assert!(lookup(&db, pin(2), &key(), &unnamed, &mut stage, &limits, &mut 0, &cancel).is_err());
     }
 }

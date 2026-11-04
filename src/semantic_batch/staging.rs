@@ -151,6 +151,21 @@ pub struct StageBudget {
 }
 
 impl StageBudget {
+    /// Charges `reserved` staged bytes and measures the stage once [`WITNESS_CHECK_BYTES`]
+    /// (or an eighth of the staging limit, if smaller) have accumulated in `unchecked`.
+    pub(crate) fn charge(
+        &self,
+        unchecked: &mut u64,
+        reserved: u64,
+    ) -> std::result::Result<(), ScipCaptureError> {
+        *unchecked = unchecked.saturating_add(reserved);
+        if *unchecked >= WITNESS_CHECK_BYTES.min(self.staging_bytes / 8) {
+            *unchecked = 0;
+            self.check()?;
+        }
+        Ok(())
+    }
+
     pub fn check(&self) -> std::result::Result<(), ScipCaptureError> {
         let staged = tree_bytes(&self.dir);
         if staged > self.staging_bytes {
@@ -395,7 +410,7 @@ pub(crate) struct WitnessStageWriter<'a> {
 /// Rows re-measure the stage directory after this many reserved bytes (or an eighth of the
 /// staging limit, if smaller); each writer and every completion measures it too. Walking
 /// the directory per row cost more than staging the row.
-const WITNESS_CHECK_BYTES: u64 = 1 << 20;
+pub(crate) const WITNESS_CHECK_BYTES: u64 = 1 << 20;
 
 impl<'a> WitnessStageWriter<'a> {
     pub(crate) fn new(
@@ -417,11 +432,7 @@ impl<'a> WitnessStageWriter<'a> {
     }
 
     fn row_check(&mut self, reserved: u64) -> Result<()> {
-        self.unchecked = self.unchecked.saturating_add(reserved);
-        if self.unchecked >= WITNESS_CHECK_BYTES.min(self.budget.staging_bytes / 8) {
-            self.budget.check()?;
-            self.unchecked = 0;
-        }
+        self.budget.charge(&mut self.unchecked, reserved)?;
         Ok(())
     }
 
