@@ -365,6 +365,11 @@ impl Store {
                                 &limits,
                                 cancel,
                             )?
+                            .copying(super::copy::CopyFilter {
+                                target: target.clone(),
+                                captured_pin: selection.captured_pin,
+                                producer: selection.producer_id.clone(),
+                            })
                         });
                         return Ok(None);
                     }

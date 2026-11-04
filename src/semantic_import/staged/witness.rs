@@ -643,12 +643,24 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
     })
 }
 
-/// Whether `doc`'s source association is reused unchanged from the original import.
+/// Whether `doc` is copied from its published basis (#669 H1): the join neither settles it
+/// nor checks its closure; the publisher copies its basis tuple.
+pub(super) fn copied(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Result<bool> {
+    exists(
+        join.conn(),
+        "SELECT 1 FROM source_witnesses w JOIN sources s ON s.ord=w.source_ord \
+         WHERE s.language=?1 AND s.path=?2 AND w.decision='copied' AND w.complete=1",
+        &[&doc.language, &doc.path],
+    )
+}
+
+/// Whether `doc`'s source association is reused unchanged from the original import, copied
+/// or re-settled.
 fn reused_source(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Result<bool> {
     exists(
         join.conn(),
         "SELECT 1 FROM source_witnesses w JOIN sources s ON s.ord=w.source_ord \
-         WHERE s.language=?1 AND s.path=?2 AND w.decision='reused' AND w.complete=1",
+         WHERE s.language=?1 AND s.path=?2 AND w.decision IN ('reused','copied') AND w.complete=1",
         &[&doc.language, &doc.path],
     )
 }

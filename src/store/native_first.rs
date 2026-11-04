@@ -2,6 +2,7 @@
 use super::*;
 pub(super) mod context;
 mod continuation;
+pub(crate) mod copy;
 mod local_targets;
 #[cfg(feature = "test-support")]
 mod oracle;
@@ -598,6 +599,8 @@ impl Store {
         if let Some(observer) = observer.as_mut() {
             observer(crate::store::SemanticPublicationStage::BeforeSemantic, &tx);
         }
+        // Read once, for the documents a witnessed stage copies from its basis (#669 H1).
+        let mut destination = None;
         for output in prepared.iter_mut() {
             check_cancel(cancel)?;
             match &mut output.output {
@@ -606,24 +609,68 @@ impl Store {
                     if let Some(batch) = output.capture_witness {
                         super::captured_witness::publish_staged(&tx, parts.conn, batch)?;
                     }
+                    let mut copied: std::collections::VecDeque<_> =
+                        copy::copied_documents(parts.conn, &parts.descriptor.source_set.id)?.into();
+                    if !copied.is_empty() && destination.is_none() {
+                        destination = Some(copy::CopyDestination::read(self, &tx, target)?);
+                    }
+                    let producer = &output.producer;
+                    // Copied and staged documents are written in canonical key order, as one
+                    // settlement of every document would have written them.
+                    let mut write = |document: &crate::semantic_evidence::SemanticPublication| {
+                        check_cancel(cancel)?;
+                        write_import_coverage(&tx, &key, document)?;
+                        blocked.check(&tx);
+                        #[cfg(feature = "test-support")]
+                        if let Some(observer) = observer.as_mut() {
+                            observer(crate::store::SemanticPublicationStage::AfterDocument, &tx);
+                        }
+                        anyhow::Ok(())
+                    };
+                    // Corruption read while copying is a read-path integrity failure: report
+                    // it so it schedules a re-index, as a read would.
+                    let copy_one = |document: &crate::native_evidence::DocumentKey| {
+                        (|| {
+                            let (basis, tuple) =
+                                copy::copy_source(&tx, target, &producer.id, document)?.context(
+                                    SelectedIntegrity(
+                                        "incompatible_index: copied document lost its basis".into(),
+                                    ),
+                                )?;
+                            copy::copied_document(
+                                &tx,
+                                &basis,
+                                tuple,
+                                producer,
+                                destination.as_ref().context("copy destination")?,
+                            )
+                        })()
+                        .map_err(|error| self.report_index_failure(error))
+                    };
                     crate::semantic_import::read_staged_documents(
                         parts.conn,
                         "",
-                        &output.producer,
+                        producer,
                         &mut |document| {
-                            check_cancel(cancel)?;
-                            write_import_coverage(&tx, &key, &document)?;
-                            blocked.check(&tx);
-                            #[cfg(feature = "test-support")]
-                            if let Some(observer) = observer.as_mut() {
-                                observer(
-                                    crate::store::SemanticPublicationStage::AfterDocument,
-                                    &tx,
+                            if let [coverage] = document.coverage.as_slice() {
+                                let staged = (
+                                    semantic_variant(&coverage.language)?,
+                                    coverage.document_path.clone(),
                                 );
+                                while copied.front().is_some_and(|doc| {
+                                    (doc.language.as_str(), doc.path.as_str())
+                                        < (staged.0.as_str(), staged.1.as_str())
+                                }) {
+                                    let doc = copied.pop_front().expect("front checked");
+                                    write(&copy_one(&doc)?)?;
+                                }
                             }
-                            Ok(())
+                            write(&document)
                         },
                     )?;
+                    while let Some(doc) = copied.pop_front() {
+                        write(&copy_one(&doc)?)?;
+                    }
                     context::publish(
                         self,
                         &tx,

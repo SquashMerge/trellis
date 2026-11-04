@@ -65,7 +65,7 @@ CREATE TABLE witness_proofs(identity_id INTEGER PRIMARY KEY CHECK(identity_id<0)
 CREATE INDEX witness_proofs_source ON witness_proofs(source_ord, record_kind);
 CREATE VIEW proof_identities AS SELECT claim_id AS identity_id, claim_id, artifact, source_ord, record_kind, fact_digest, proof_id, NULL AS capture_id FROM claims c UNION ALL SELECT identity_id, identity_id AS claim_id, artifact, source_ord, record_kind, fact_digest, proof_id, capture_id FROM witness_proofs w;
 CREATE TABLE witness_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), internal_symbols_complete INTEGER NOT NULL DEFAULT 0 CHECK(internal_symbols_complete IN (0,1)), staged_rows INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE source_witnesses(source_ord INTEGER PRIMARY KEY, decision TEXT NOT NULL CHECK(decision IN ('reused','changedBytes','newDocument')), body TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0,1)));
+CREATE TABLE source_witnesses(source_ord INTEGER PRIMARY KEY, decision TEXT NOT NULL CHECK(decision IN ('reused','copied','changedBytes','newDocument')), body TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0,1)));
 CREATE TABLE original_associations(source_ord INTEGER NOT NULL, ordinal INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, PRIMARY KEY(source_ord,ordinal)) WITHOUT ROWID;
 CREATE TABLE witness_internal_symbols(scope INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(scope,language,path,symbol)) WITHOUT ROWID;
 CREATE INDEX witness_internal_symbols_symbol ON witness_internal_symbols(symbol);
@@ -535,6 +535,21 @@ impl<'a> WitnessStageWriter<'a> {
             "witness source version mismatch"
         );
         self.header(source_ord, "reused", witness)
+    }
+
+    /// A reused source whose published rows S copies (#669 H1): no original rows are staged
+    /// and the join does not settle it; the publisher copies its basis tuple.
+    pub(crate) fn stage_copied_source(
+        &mut self,
+        source_ord: i64,
+        witness: &crate::store::native_first::witness::OriginalSourceWitness,
+    ) -> Result<()> {
+        ensure!(
+            witness.captured_version == witness.current_version,
+            "witness source version mismatch"
+        );
+        self.header(source_ord, "copied", witness)?;
+        self.finish_source_witness(source_ord)
     }
 
     pub(crate) fn stage_witness_coverage(

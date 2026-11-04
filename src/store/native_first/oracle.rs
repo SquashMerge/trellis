@@ -42,6 +42,26 @@ pub(super) fn check(
                 Ok(())
             },
         )?;
+        // Documents the witnessed stage copies are compared as the publisher writes them.
+        let source_set_id = admitted.descriptor().source_set.id.clone();
+        let copied = super::copy::copied_documents(admitted.join_parts()?.conn, &source_set_id)?;
+        if !copied.is_empty() {
+            let destination = super::copy::CopyDestination::read(store, db, target)?;
+            for document in &copied {
+                let (basis, tuple) = super::copy::copy_source(db, target, &producer.id, document)?
+                    .context("FULL oracle copied document has no basis")?;
+                let copy = super::copy::copied_document(db, &basis, tuple, producer, &destination)?;
+                actual.coverage.extend(copy.coverage);
+                actual.provenance.extend(copy.provenance);
+                actual.symbols.extend(copy.symbols);
+                actual
+                    .declaration_bindings
+                    .extend(copy.declaration_bindings);
+                actual.references.extend(copy.references);
+                actual.call_bindings.extend(copy.call_bindings);
+                actual.type_relationships.extend(copy.type_relationships);
+            }
+        }
         let destination_read = ReadRevision::new(target.pin, semantic_pin_key(target.pin));
         let selected = store.selected_raw_input_results_from_db(
             db,

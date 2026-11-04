@@ -561,6 +561,10 @@ impl JoinContinuation {
                         self.last = -1;
                     }
                 } else if let Some((ord, document)) = self.document(join, join.destination.rev)? {
+                    if self.witnessed && witness::copied(join, &document)? {
+                        self.last = ord;
+                        return Ok(None);
+                    }
                     let captured = captured_global()?;
                     let destination = if shared {
                         captured.eligible_view()?
@@ -604,7 +608,9 @@ impl JoinContinuation {
             }
             Phase::Closure => {
                 if let Some((ord, document)) = self.document(join, join.destination.rev)? {
-                    self.closure_document(join, &document)?;
+                    if !(self.witnessed && witness::copied(join, &document)?) {
+                        self.closure_document(join, &document)?;
+                    }
                     self.last = ord;
                 } else {
                     self.transition(Phase::OutputClosure);

@@ -916,6 +916,8 @@ pub(crate) struct PublicationWork {
     destination_document_rows: usize,
     destination_revision: String,
     reused_documents: BTreeSet<native::DocumentKey>,
+    /// Unchanged documents S copies from their published basis (#669 H1).
+    copied_documents: BTreeSet<native::DocumentKey>,
 }
 #[cfg(feature = "test-support")]
 thread_local! { static PUBLICATION_WORK: std::cell::RefCell<PublicationWork> =
@@ -949,6 +951,12 @@ pub(crate) fn note_destination_index_build() {
     count_publication_work(|work| work.destination_index_builds += 1);
 }
 /// An unchanged document whose original source association the witnessed join reuses.
+#[cfg(feature = "test-support")]
+pub(crate) fn note_copied_document(document: &native::DocumentKey) {
+    count_publication_work(|work| {
+        work.copied_documents.insert(document.clone());
+    });
+}
 #[cfg(feature = "test-support")]
 pub(crate) fn note_reused_document(document: &native::DocumentKey) {
     count_publication_work(|work| {
@@ -3742,7 +3750,11 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
 
 /// The provenance ID of a rejoined fact: a digest of the raw proof, the destination revision
 /// and the evidence kind, so it needs no lookup table.
-fn rejoin_provenance_id(raw_id: &str, revision_id: &str, kind: semantic::EvidenceKind) -> String {
+pub(crate) fn rejoin_provenance_id(
+    raw_id: &str,
+    revision_id: &str,
+    kind: semantic::EvidenceKind,
+) -> String {
     native_ids::digest(
         b"trellis.semantic-rejoin.v1\0",
         &native_ids::canonical(

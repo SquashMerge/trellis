@@ -109,6 +109,22 @@ impl WitnessPreparation {
                 .query_row(params![document.language, document.path], |r| r.get(0))
                 .optional()?;
             match (ord, decision) {
+                (Some(ord), WitnessEligibility::Witness(witness))
+                    if (super::copy::CopyFilter {
+                        target: target.clone(),
+                        captured_pin: authority.captured_pin,
+                        producer: authority.producer.id.clone(),
+                    })
+                    .copies(db, &document)? =>
+                {
+                    #[cfg(feature = "test-support")]
+                    {
+                        crate::semantic_import::note_reused_document(&witness.document);
+                        crate::semantic_import::note_copied_document(&witness.document);
+                    }
+                    WitnessStageWriter::new(admitted.stage_mut(), limits, counters)?
+                        .stage_copied_source(ord, witness.as_ref())?;
+                }
                 (Some(ord), WitnessEligibility::Witness(witness)) => {
                     #[cfg(feature = "test-support")]
                     crate::semantic_import::note_reused_document(&witness.document);

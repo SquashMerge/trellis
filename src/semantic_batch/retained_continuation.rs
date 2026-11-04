@@ -55,6 +55,8 @@ pub(crate) struct RetainedStageContinuation {
     unchecked: u64,
     /// The current artifact's checked proof documents (path to source ordinal).
     proof_documents: ProofDocuments,
+    /// Witnessed S: the documents it copies, whose proof identities are not staged.
+    copy: Option<crate::store::native_first::copy::CopyFilter>,
 }
 
 /// Stage bytes charged per row a unit changes, beyond the payload it reports.
@@ -193,6 +195,7 @@ impl RetainedStageContinuation {
             missing_found: None,
             unchecked: 0,
             proof_documents: ProofDocuments::default(),
+            copy: None,
         })
     }
 
@@ -237,6 +240,12 @@ impl RetainedStageContinuation {
         cancel: &CancelFlag,
     ) -> Result<Option<AdmittedBatch>> {
         self.advance_unit(db, reader, counters, cancel)
+    }
+
+    /// Witnessed S does not stage the proof identities of the documents it copies (#669 H1).
+    pub(crate) fn copying(mut self, filter: crate::store::native_first::copy::CopyFilter) -> Self {
+        self.copy = Some(filter);
+        self
     }
 
     /// The private stage while admission owns it.
@@ -652,6 +661,9 @@ impl RetainedStageContinuation {
                         &mut self.proof_key,
                         &self.limits,
                         &mut self.proof_documents,
+                        self.copy
+                            .as_ref()
+                            .map(|filter| (filter, descriptor.source_set.id.as_str())),
                     )?
                     .map(|page| {
                         self.proof_count += page.rows - 1;
@@ -788,24 +800,25 @@ impl RetainedStageContinuation {
     }
 }
 
-/// The checked source ordinal of each proof document of the current artifact. Its storage
+/// The checked source ordinal of each proof document of the current artifact, or `None` for
+/// a document S copies, whose proof identities are not staged (#669 H1). Its storage
 /// (path bytes and two table slots per entry, as a hash table holds up to twice its entries)
 /// is charged against half the unit expansion limit, leaving the rest to the page being
 /// staged; a path past that charge is looked up again instead of being retained.
 #[derive(Default)]
 pub(super) struct ProofDocuments {
-    paths: HashMap<String, i64>,
+    paths: HashMap<String, Option<i64>>,
     bytes: u64,
 }
 
 impl ProofDocuments {
-    fn get(&self, path: &str) -> Option<&i64> {
+    fn get(&self, path: &str) -> Option<&Option<i64>> {
         self.paths.get(path)
     }
 
-    fn insert(&mut self, path: String, ord: i64, limits: &BatchLimits) {
+    fn insert(&mut self, path: String, ord: Option<i64>, limits: &BatchLimits) {
         let entry = (path.len() as u64).saturating_add(
-            2 * (std::mem::size_of::<(String, i64)>() + std::mem::size_of::<u64>()) as u64,
+            2 * (std::mem::size_of::<(String, Option<i64>)>() + std::mem::size_of::<u64>()) as u64,
         );
         let bytes = self.bytes.saturating_add(entry);
         if bytes <= limits.unit_expansion_bytes / 2 {
@@ -830,6 +843,7 @@ struct WitnessProofPage {
 /// scalar fields before making owned strings; neither canonical proof bytes nor the SCIP
 /// binary participates in witness admission. `assigned` caches each proof document's
 /// assigned source ordinal for this artifact, after its staged document row is checked.
+#[allow(clippy::too_many_arguments)]
 fn advance_witness_proof(
     db: &Connection,
     capture: i64,
@@ -838,6 +852,7 @@ fn advance_witness_proof(
     key: &mut String,
     limits: &BatchLimits,
     assigned: &mut ProofDocuments,
+    copy: Option<(&crate::store::native_first::copy::CopyFilter, &str)>,
 ) -> Result<Option<WitnessProofPage>> {
     let mut statement = db.prepare_cached(
         "SELECT proof_id,record_kind,fact_digest,language,path FROM semantic_raw_proofs          WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT ?3",
@@ -866,8 +881,24 @@ fn advance_witness_proof(
         let language: String = row.get(3)?;
         let path: String = row.get(4)?;
         ensure!(language == entry.language, "retained proof language");
-        let source = match assigned.get(&path) {
-            Some(ord) => *ord,
+        let cached = assigned.get(&path).copied();
+        let copied = match (cached, copy) {
+            (None, Some((filter, source_set_id))) => filter.copies(
+                db,
+                &crate::native_evidence::DocumentKey {
+                    source_set_id: source_set_id.to_owned(),
+                    language: language.clone(),
+                    path: path.clone(),
+                },
+            )?,
+            _ => false,
+        };
+        let source = match cached {
+            Some(ord) => ord,
+            None if copied => {
+                assigned.insert(path, None, limits);
+                None
+            }
             None => {
                 let source =
                     super::super::staging::lookup_assigned(conn, entry.ordinal, &language, &path)?
@@ -878,9 +909,17 @@ fn advance_witness_proof(
                     )?
                     .query_row(params![source.ord, entry.ordinal], |row| row.get(0))?;
                 ensure!(present, "retained proof document");
-                assigned.insert(path, source.ord, limits);
-                source.ord
+                assigned.insert(path, Some(source.ord), limits);
+                Some(source.ord)
             }
+        };
+        page.rows += 1;
+        page.high_water = page.high_water.max(bytes);
+        page.bytes = page.bytes.saturating_add(bytes);
+        let Some(source) = source else {
+            // A copied document's proof identities are not staged; the cursor still advances.
+            *key = proof;
+            continue;
         };
         let next = match identity {
             Some(identity) => identity,
@@ -906,9 +945,6 @@ fn advance_witness_proof(
             capture
         ])?;
         *key = proof;
-        page.rows += 1;
-        page.high_water = page.high_water.max(bytes);
-        page.bytes = page.bytes.saturating_add(bytes);
     }
     Ok((page.rows > 0).then_some(page))
 }
@@ -1029,11 +1065,11 @@ mod tests {
             ..Default::default()
         };
         let mut paths = ProofDocuments::default();
-        paths.insert("a".repeat(64), 1, &limits);
-        assert_eq!(paths.get(&"a".repeat(64)), Some(&1));
+        paths.insert("a".repeat(64), Some(1), &limits);
+        assert_eq!(paths.get(&"a".repeat(64)), Some(&Some(1)));
         assert!(paths.bytes > 64 && paths.bytes <= 200);
         // A second entry would pass half the unit expansion limit: it is not retained.
-        paths.insert("b".repeat(64), 2, &limits);
+        paths.insert("b".repeat(64), Some(2), &limits);
         assert_eq!(paths.get(&"b".repeat(64)), None);
         assert_eq!(paths.paths.len(), 1);
     }
