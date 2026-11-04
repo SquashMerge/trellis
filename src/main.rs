@@ -2225,6 +2225,30 @@ fn dispatch_connection(
         };
         let args = request.payload.get("args").context("missing args")?;
         let deadline = request_deadline;
+        let replayable_read = !matches!(
+            request.operation.as_str(),
+            "index" | "semantic_import" | "producer_pickup" | "producer_run" | "producer_cancel"
+        );
+        // Pauses a status read after activation, so a fixture can take
+        // index-use contention before the selected read (#687).
+        #[cfg(all(feature = "test-support", unix))]
+        let mut contention_fixture = std::env::var_os("TRELLIS_TEST_CLI_READ_CONTENTION_SOCKET")
+            .filter(|_| request.operation == "status");
+        #[cfg(all(feature = "test-support", unix))]
+        if let Some(path) = &contention_fixture {
+            use std::io::{Read, Write};
+            let mut fixture = std::os::unix::net::UnixStream::connect(path)
+                .expect("connect CLI read contention fixture");
+            fixture
+                .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+                .unwrap();
+            fixture
+                .write_all(b"R")
+                .expect("report CLI read before the selected read");
+            fixture
+                .read_exact(&mut [0])
+                .expect("release CLI read contention fixture");
+        }
         loop {
             // Recorded before the read: a state change between the read and
             // the wait below is never missed.
@@ -2462,19 +2486,42 @@ fn dispatch_connection(
                 }
                 _ => anyhow::bail!("unknown daemon operation"),
             };
+            // A peer's exclusive index-use lock (a restarted daemon's startup
+            // probe or recovery stage, or another process) refuses the read
+            // with typed contention (#687). It publishes no in-process signal,
+            // so wait out this bounded external contention like activation
+            // above, then report typed expiry. Only read-only calls repeat.
+            if replayable_read
+                && selected
+                    .as_ref()
+                    .err()
+                    .is_some_and(trellis::store::cli_read_retryable_contention)
+            {
+                if Instant::now() >= deadline {
+                    break Err(trellis::store::cli_read_busy_expired());
+                }
+                #[cfg(all(feature = "test-support", unix))]
+                if let Some(path) = contention_fixture.take() {
+                    use std::io::Write;
+                    let mut signal = std::os::unix::net::UnixStream::connect(path)
+                        .expect("connect CLI read contention fixture");
+                    signal
+                        .write_all(b"B")
+                        .expect("report CLI read contention wait");
+                }
+                std::thread::sleep(
+                    Duration::from_millis(20)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+                continue;
+            }
             // Mandatory startup reconciliation may be running when a CLI read first attaches.
             // This only repeats read-only calls; index is never replayed.
-            if !matches!(
-                request.operation.as_str(),
-                "index"
-                    | "semantic_import"
-                    | "producer_pickup"
-                    | "producer_run"
-                    | "producer_cancel"
-            ) && selected
-                .as_ref()
-                .err()
-                .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
+            if replayable_read
+                && selected
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
                 && Instant::now() < deadline
             {
                 #[cfg(all(feature = "test-support", unix))]
