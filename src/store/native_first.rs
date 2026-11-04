@@ -190,7 +190,8 @@ pub(super) fn write_pending(
 }
 
 fn pending_target(db: &Connection) -> Result<Option<PendingSemanticTarget>> {
-    let marker: Option<(String,String,String)> = db.query_row("SELECT revision_id,native_revision_id,root_id FROM semantic_pending_target WHERE singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    // Every S step re-reads the marker; its statements stay prepared.
+    let marker: Option<(String,String,String)> = db.prepare_cached("SELECT revision_id,native_revision_id,root_id FROM semantic_pending_target WHERE singleton=1")?.query_row([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let Some((key, native_revision_id, root_id)) = marker else {
         let missing: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_pending_selections s JOIN index_metadata m ON m.singleton=1 AND s.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision)",[],|r|r.get(0))?;
         selected_ensure!(
@@ -200,14 +201,14 @@ fn pending_target(db: &Connection) -> Result<Option<PendingSemanticTarget>> {
         return Ok(None);
     };
     let pin = parse_pin(&key)?;
-    let head: (String,i64,String) = db.query_row("SELECT m.index_generation,m.index_revision,r.native_revision_id FROM index_metadata m JOIN native_revisions r ON r.id=?1 WHERE m.singleton=1", [&key], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let head: (String,i64,String) = db.prepare_cached("SELECT m.index_generation,m.index_revision,r.native_revision_id FROM index_metadata m JOIN native_revisions r ON r.id=?1 WHERE m.singleton=1")?.query_row([&key], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     selected_ensure!(
         head.0 == pin.index_generation.to_string()
             && head.1 == pin.index_revision as i64
             && head.2 == native_revision_id,
         "incompatible_index: pending semantic target differs from head"
     );
-    let mut statement = db.prepare("SELECT producer_id,batch_id,captured_pin,basis_pin FROM semantic_pending_selections WHERE revision_id=?1 ORDER BY producer_id")?;
+    let mut statement = db.prepare_cached("SELECT producer_id,batch_id,captured_pin,basis_pin FROM semantic_pending_selections WHERE revision_id=?1 ORDER BY producer_id")?;
     let rows = statement.query_map([&key], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -449,6 +450,12 @@ impl Store {
         read: impl FnOnce(&Connection, &ReadRevision) -> Result<T>,
     ) -> Result<Option<T>> {
         self.native_at_reconcile(target.pin, |db, selected| {
+            // S binds new keys to the same cached statements row after row. Without the
+            // query planner stability guarantee SQLite re-prepares a statement whenever a
+            // value it planned around (a LIMIT, a small-integer comparison) is rebound.
+            storage_result(
+                db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true),
+            )?;
             if pending_target(db)?.as_ref() != Some(target) {
                 return Ok(None);
             }

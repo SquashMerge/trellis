@@ -144,7 +144,7 @@ pub(crate) fn advance(
         if limits.page_rows == 0 {
             return Err(limit("page rows"));
         }
-        let mut stmt = db.prepare("SELECT syntax_id,kind,name,name_start,name_end,start_byte,end_byte FROM native_version_declarations WHERE vid=?1 AND syntax_id>?2 ORDER BY syntax_id LIMIT ?3")?;
+        let mut stmt = db.prepare_cached("SELECT syntax_id,kind,name,name_start,name_end,start_byte,end_byte FROM native_version_declarations WHERE vid=?1 AND syntax_id>?2 ORDER BY syntax_id LIMIT ?3")?;
         let mut rows = stmt.query(params![
             version.vid,
             after.as_slice(),
@@ -183,7 +183,7 @@ pub(crate) fn advance(
             .as_ref()
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .unwrap_or(("", ""));
-        let mut stmt = db.prepare("SELECT language,path FROM revision_documents WHERE revision_id=?1 AND (language,path)>(?2,?3) ORDER BY language,path LIMIT 1")?;
+        let mut stmt = db.prepare_cached("SELECT language,path FROM revision_documents WHERE revision_id=?1 AND (language,path)>(?2,?3) ORDER BY language,path LIMIT 1")?;
         let mut rows = stmt.query(params![
             semantic_pin_key(target.pin),
             after_language,
@@ -326,7 +326,7 @@ pub(crate) fn lookup(
     let version = witness::selected_version(db, pin, key)?;
     let vid = version.as_ref().map_or(0, |v| v.vid);
     let conn = stage.conn()?;
-    let mut stmt = conn.prepare("SELECT vid,present,kind,name,name_start,name_end,callable FROM local_target_declarations WHERE pin=?1 AND source_set=?2 AND language=?3 AND path=?4 AND syntax_id=?5")?;
+    let mut stmt = conn.prepare_cached("SELECT vid,present,kind,name,name_start,name_end,callable FROM local_target_declarations WHERE pin=?1 AND source_set=?2 AND language=?3 AND path=?4 AND syntax_id=?5")?;
     let mut cached = stmt.query(params![
         semantic_pin_key(pin),
         key.source_set_id,

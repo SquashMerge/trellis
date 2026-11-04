@@ -202,6 +202,10 @@ pub const UNIT_ROLLBACK: &str = "ROLLBACK TO stage_unit; RELEASE stage_unit";
 fn open_connection(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("stage open")?;
     conn.set_prepared_statement_cache_capacity(128);
+    // Stage statements are cached and rebound per row; a plan fixed at prepare time avoids
+    // re-preparing them whenever a bound LIMIT or small integer changes.
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true)
+        .context("stage pragmas")?;
     conn.execute_batch(&format!(
         "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE; PRAGMA cache_size=-{STAGE_CACHE_KIB};"
     ))
