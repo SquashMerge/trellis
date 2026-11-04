@@ -1336,9 +1336,15 @@ pub(crate) fn source_authority(
             if !crate::store::captured_witness::exists(db, authority.batch_id)? {
                 return Ok(AuthorityStep::Full("original_import_missing"));
             }
-            let full:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_revision_producers WHERE revision_id=?1 AND id=?2 AND version=?3 AND context_mode='fullCaptured')",params![semantic_pin_key(target.pin),authority.producer.id,authority.producer.version],|r|r.get(0))?;
-            if !full {
-                return Ok(AuthorityStep::Full("controlled_profile_requires_full"));
+            if context::controlled_unchanged(
+                db,
+                &semantic_pin_key(target.pin),
+                &semantic_pin_key(target.pin),
+                &authority.producer.id,
+                cancel,
+            )? == Some(false)
+            {
+                return Ok(AuthorityStep::Full("controlled_profile_inputs_changed"));
             }
             let authority = cursor.authority.as_mut().unwrap();
             authority.cache = true;
@@ -1350,10 +1356,17 @@ pub(crate) fn source_authority(
         if releasing {
             return Ok(AuthorityStep::Full("original_import_releasing"));
         }
-        // Controlled profiles need the owner's profile-input comparison, not just equal VID.
-        let full:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_revision_producers WHERE revision_id=?1 AND id=?2 AND version=?3 AND context_mode='fullCaptured')",params![semantic_pin_key(pin),authority.producer.id,authority.producer.version],|r|r.get(0))?;
-        if !full {
-            return Ok(AuthorityStep::Full("controlled_profile_requires_full"));
+        // Controlled profiles need the owner's profile-input comparison, not just equal VID:
+        // the effective inputs recorded at the original import must still hold at N.
+        if context::controlled_unchanged(
+            db,
+            &semantic_pin_key(pin),
+            &semantic_pin_key(target.pin),
+            &authority.producer.id,
+            cancel,
+        )? == Some(false)
+        {
+            return Ok(AuthorityStep::Full("controlled_profile_inputs_changed"));
         }
         cursor.authority.as_mut().unwrap().original_pin = pin;
         cursor.phase = 2;

@@ -110,6 +110,39 @@ fn input_hash(
     )
 }
 
+/// Whether a validated producer row's recorded context still holds at `target`: equal for a
+/// full-captured row is not decided here (`None`); a controlled profile compares its own
+/// effective inputs at `target` with the hash recorded at `basis`.
+pub(in crate::store) fn controlled_unchanged(
+    db: &Connection,
+    basis: &str,
+    target: &str,
+    producer: &str,
+    cancel: &CancelFlag,
+) -> Result<Option<bool>> {
+    let (mode, trust, recorded): (String, Option<String>, Option<String>) = db.query_row(
+        "SELECT context_mode,context_trust,context_input_hash FROM semantic_revision_producers WHERE revision_id=?1 AND id=?2",
+        params![basis, producer],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let Some(row) = profile(producer, &mode, trust.as_deref(), recorded.as_deref())? else {
+        return Ok(None);
+    };
+    let (config, dependencies): (String, String) = db.query_row(
+        "SELECT retained_config,retained_dependencies FROM native_revisions WHERE id=?1",
+        [target],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let config: Vec<serde_json::Value> = serde_json::from_str(&config).context(
+        SelectedIntegrity("incompatible_index: corrupt retained config".into()),
+    )?;
+    let dependencies: Vec<serde_json::Value> = serde_json::from_str(&dependencies).context(
+        SelectedIntegrity("incompatible_index: corrupt retained dependencies".into()),
+    )?;
+    let hash = input_hash(db, target, &row, &config, &dependencies, cancel)?;
+    Ok(Some(recorded.as_deref() == Some(hash.as_str())))
+}
+
 pub(in crate::store) fn publish(
     store: &Store,
     db: &Connection,
