@@ -75,7 +75,10 @@ pub(super) fn discarded(
          AND previous.native_revision_id<>current.native_revision_id
          AND NOT EXISTS(SELECT 1 FROM semantic_coverage selected
              WHERE selected.revision_id=?2 AND selected.producer_id=prior.producer_id
-             AND selected.language=prior.language AND selected.selected=1)";
+             AND selected.language=prior.language AND selected.selected=1)
+         -- A retained raw selection the native-first S will re-admit is catching up (#620).
+         AND NOT EXISTS(SELECT 1 FROM semantic_pending_selections pending
+             WHERE pending.revision_id=?2 AND pending.producer_id=prior.producer_id)";
     let sql = if retention_attached {
         format!(
             "{ORDINARY_RETAINED_PENDING}{sql} AND NOT EXISTS(

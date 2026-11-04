@@ -631,6 +631,15 @@ impl Store {
         tx.execute("INSERT INTO semantic_projection_documents SELECT ?1,d.producer_id,d.language,d.path,d.pending FROM semantic_projection_documents d JOIN semantic_projection_origins o ON o.revision_id=?1 AND o.producer_id=d.producer_id WHERE d.revision_id=?2",params![key,old])?;
         index_dependencies(&tx, &key)?;
         semantic_retention::copy(&tx, &old, &key, None)?;
+        // A producer S re-admitted no longer needs a re-import.
+        for output in prepared.iter() {
+            if matches!(output.output, PreparedOutput::Joined { .. }) {
+                tx.execute(
+                    "DELETE FROM semantic_reimport WHERE revision_id=?1 AND producer=?2",
+                    params![key, output.producer.id],
+                )?;
+            }
+        }
         search::publish_head(&tx, &key)?;
         let published_at = self.retention_time()?;
         stamp_predecessor(&tx, &old, published_at.as_secs() as i64)?;

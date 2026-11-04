@@ -67,6 +67,8 @@ struct Revision {
     superseded: Option<i64>,
     selected: [Option<Selection>; 2],
     epoch: usize,
+    /// Native-first N: the validated semantic pin its unchanged documents project from.
+    basis: Option<usize>,
 }
 struct Batch {
     slot: Slot,
@@ -111,6 +113,7 @@ impl Machine {
                 superseded: None,
                 selected: [None; 2],
                 epoch: 0,
+                basis: None,
             }],
             batches: vec![],
             now: 1_000,
@@ -125,6 +128,15 @@ impl Machine {
         format!("pin:v1:{}:{}", p.index_generation, p.index_revision)
     }
     fn publish(&mut self, pin: IndexPin, selected: [Option<Selection>; 2], edited: bool) {
+        self.publish_with_basis(pin, selected, edited, None);
+    }
+    fn publish_with_basis(
+        &mut self,
+        pin: IndexPin,
+        selected: [Option<Selection>; 2],
+        edited: bool,
+        basis: Option<usize>,
+    ) {
         let h = self.head();
         assert_eq!(pin.index_revision, self.revisions[h].pin.index_revision + 1);
         self.revisions[h].state = State::Retained;
@@ -135,7 +147,26 @@ impl Machine {
             superseded: None,
             selected,
             epoch: self.revisions[h].epoch + usize::from(edited),
+            basis,
         });
+    }
+    /// A native N holds its basis and the captures of its pending selections while it still
+    /// records them: certainly while it is head, retained or pending whole; a partly released
+    /// N may already have dropped them.
+    fn basis_holds(&self, partial: bool) -> BTreeSet<usize> {
+        self.revisions
+            .iter()
+            .filter(|r| r.basis.is_some())
+            .filter(|r| {
+                matches!(r.state, State::Head | State::Retained | State::PendingWhole)
+                    || (partial && r.state == State::PendingPartial)
+            })
+            .flat_map(|r| {
+                r.basis
+                    .into_iter()
+                    .chain(r.selected.into_iter().flatten().map(|s| s.capture))
+            })
+            .collect()
     }
     // Only head selections are roots. Earlier *still selected* rows are import witnesses.
     fn holds(&self) -> BTreeSet<usize> {
@@ -151,6 +182,7 @@ impl Machine {
                 roots.insert(first);
             }
         }
+        roots.extend(self.basis_holds(false));
         roots
     }
     fn rows_for(&self, selected: [Option<Selection>; 2]) -> Rows {
@@ -264,7 +296,15 @@ impl Machine {
                     self.trace
                 );
             }
-            if matches!(r.state, State::Head | State::Retained) {
+            if matches!(r.state, State::Head | State::Retained) && r.basis.is_some() {
+                // A retained native N keeps its labelled projection; it has no aggregate read.
+                let error = self.world.store.semantic_at(r.pin).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("labelled per-document read"),
+                    "revision {i}: {error:#} {:?}",
+                    self.trace
+                );
+            } else if matches!(r.state, State::Head | State::Retained) {
                 assert!(
                     self.world.store.semantic_at(r.pin).is_ok(),
                     "revision {i}: {:?}",
@@ -312,6 +352,8 @@ impl Machine {
     }
     fn step(&mut self) -> MaintenanceOutcome {
         let holds = self.holds();
+        let mut held_or_partial = holds.clone();
+        held_or_partial.extend(self.basis_holds(true));
         let before = self.model_observation();
         let leader = self.world.store.publication_for_tests().unwrap();
         let permit = self.world.store.maintenance_try_enter().unwrap();
@@ -377,7 +419,7 @@ impl Machine {
                     .all(|(i, r)| match r.state {
                         State::PendingWhole | State::PendingPartial => false,
                         State::Retained =>
-                            holds.contains(&i) || self.now - r.superseded.unwrap() < 900,
+                            held_or_partial.contains(&i) || self.now - r.superseded.unwrap() < 900,
                         _ => true,
                     }),
                 "idle with due work: {:?}",
@@ -478,9 +520,20 @@ impl Machine {
                 let selected = self.revisions[self.head()].selected;
                 let content = format!("function other(){{ return {}; }}\n", self.revisions.len());
                 write_files(&self.world.root, &[("src/C.js", &content)]);
+                let basis = self.head();
                 self.world.republish_with_rejoin();
                 let pin = self.world.store.index_baseline().unwrap();
-                self.publish(pin, selected, true);
+                if pin.index_revision == self.revisions[basis].pin.index_revision + 2 {
+                    // Native-first: N, which projects from the previous validated pin, then S.
+                    let native = IndexPin {
+                        index_revision: pin.index_revision - 1,
+                        ..pin
+                    };
+                    self.publish_with_basis(native, selected, true, Some(basis));
+                    self.publish(pin, selected, false);
+                } else {
+                    self.publish(pin, selected, true);
+                }
             }
             Op::Reselect(slot, n) => {
                 let pool: Vec<_> = self
@@ -521,7 +574,9 @@ impl Machine {
                 self.apply(Op::Advance(1));
                 self.apply(Op::Edit);
                 self.apply(Op::Import(slot));
-                self.apply(Op::Advance(899));
+                // Native-first N holds the captures of its pending selections, so the import
+                // becomes due once that N, superseded one tick later, is released too.
+                self.apply(Op::Advance(900));
                 for _ in 0..1000 {
                     if self.revisions[import].state == State::PendingWhole {
                         break;
@@ -600,16 +655,22 @@ fn two_slots_keep_only_head_roots_and_replacement_preserves_other() {
     );
     m.apply(Op::Advance(1));
     m.apply(Op::Drain);
-    assert_eq!(m.holds(), BTreeSet::from([2, 3, 4, 5]));
+    // Each edit publishes native N then semantic S: revisions are 0, import 1, N2, S3,
+    // import 4, N5, S6, import 7, N8, S9. The head roots are the captures S3 and S6 and the
+    // imports 4 and 7; the released N revisions no longer hold their bases.
+    assert_eq!(m.holds(), BTreeSet::from([3, 4, 6, 7]));
     assert_eq!(
         m.revisions.iter().map(|r| r.state).collect::<Vec<_>>(),
         vec![
             State::Released,
             State::Released,
+            State::Released,
             State::Retained,
             State::Retained,
+            State::Released,
             State::Retained,
             State::Retained,
+            State::Released,
             State::Head
         ]
     );
@@ -620,7 +681,7 @@ fn two_slots_keep_only_head_roots_and_replacement_preserves_other() {
             "both slots must exercise raw proofs"
         );
     }
-    assert_eq!(m.revisions[3].selected[0].unwrap().batch, 0); // incidental old JS
+    assert_eq!(m.revisions[4].selected[0].unwrap().batch, 0); // incidental old JS
 }
 
 #[test]

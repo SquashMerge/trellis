@@ -249,6 +249,7 @@ impl Store {
                         &limits,
                         cancel,
                     )?
+                    .authenticated()
                 } else {
                     RetainedStageContinuation::new_witnessed(
                         db,

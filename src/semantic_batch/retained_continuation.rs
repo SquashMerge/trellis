@@ -189,6 +189,13 @@ impl RetainedStageContinuation {
         })
     }
 
+    /// FULL catch-up re-authenticates every retained original through the bounded decoder, as
+    /// before native-first: a stored binary that no longer matches fails that artifact typed.
+    pub(crate) fn authenticated(mut self) -> Self {
+        self.trusted = false;
+        self
+    }
+
     /// Admits only metadata. The owner stages guarded original association pages before join.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_witnessed(

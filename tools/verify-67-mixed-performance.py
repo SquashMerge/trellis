@@ -1105,6 +1105,10 @@ class SelectedView:
                     "region": {}, "class": {}, "class-ref": {}, "graph-node": {},
                     "tuple": {}, "basis": {}, "batch": {}, "capture": {}, "proof": {},
                     "provenance": {}, "symbol": {}, "binding": {}}
+        # A native-first semantic S names the native N it caught up; both runs have one.
+        for (target,) in db.execute(
+                "SELECT target_revision_id FROM semantic_catchup_commits WHERE revision_id=?", (revision,)):
+            self.ids["pin"][target] = "<catch-up-native-pin>"
         self.r1 = None
         for language, path, vid, gid, cid in db.execute(
                 "SELECT language,path,vid,gid,cid FROM revision_documents WHERE revision_id=?",

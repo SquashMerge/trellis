@@ -4296,21 +4296,39 @@ fn native_identity_change_external_import_reason_survives_failure_and_clears_on_
             .all(|row| row.reimport.is_none())
     );
     write_files(&world.root, &[("src/C.js", "function other(){}\n")]);
-    world.republish();
+    // Native-first (#620 A6): the retained external batch is catching up at native N, so no
+    // re-import reason is recorded; its bounded S re-admits it and the head is fresh again.
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let native = world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    assert_eq!(native.index_revision, first.index_revision + 1);
+    let pending = world.store.status().unwrap();
+    assert!(
+        pending
+            .semantic_languages
+            .iter()
+            .all(|row| !matches!(row.reimport, Some(SemanticReimport::NeedsReimport { .. }))),
+        "{:?}",
+        pending.semantic_languages
+    );
+    world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
     let status = world.store.status().unwrap();
     assert_eq!(status.revision.index_generation, first.index_generation);
-    assert_eq!(status.revision.index_revision, first.index_revision + 1);
-    let language = &status.semantic_languages[0];
-    assert!(matches!(
-        language.reimport,
-        Some(SemanticReimport::NeedsReimport { ref reason }) if !reason.is_empty()
-    ));
-    assert_eq!(language.semantic_state, SemanticState::Unavailable);
-    assert_eq!(
-        status.stats.internal + status.stats.external + status.stats.ambiguous,
-        0
+    assert_eq!(status.revision.index_revision, first.index_revision + 2);
+    assert!(
+        status
+            .semantic_languages
+            .iter()
+            .all(|row| row.reimport.is_none())
     );
-    assert_eq!(status.semantic_note, language.semantic_note);
     assert_eq!(world.store.semantic_at(first).unwrap(), prior);
 
     let descriptor = split_definitions(&world, false);
