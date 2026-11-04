@@ -132,9 +132,18 @@ struct PublicationGate {
     /// Set while a live publication's transaction has spilled pages to
     /// `index.db`. In rollback-journal mode that spill takes EXCLUSIVE until
     /// COMMIT, so every reader of the prior head is locked out (#210).
-    readers_blocked: Mutex<Option<RebuildInProgress>>,
+    readers_blocked: Mutex<Option<SpilledPublication>>,
+    /// Signalled when `readers_blocked` clears: the publication's transaction
+    /// has committed or rolled back, so readers waiting on it can retry (#674).
+    readers_unblocked: Condvar,
     #[cfg(test)]
     test_after_readers_unblocked: TestOneShotHook,
+    /// Runs when a reader starts waiting on a spilled publication.
+    #[cfg(any(test, feature = "test-support"))]
+    test_before_spill_wait: TestOneShotHook,
+    /// Replaces `SPILLED_PUBLICATION_READ_WAIT` for this gate's readers.
+    #[cfg(test)]
+    test_spill_read_wait: Mutex<Option<Duration>>,
     #[cfg(feature = "test-support")]
     test_ambiguous_settlement_once: AtomicBool,
     #[cfg(feature = "test-support")]
@@ -157,7 +166,84 @@ impl std::fmt::Debug for PublicationGate {
         f.debug_struct("PublicationGate").finish_non_exhaustive()
     }
 }
+/// A live publication whose transaction has spilled to `index.db`.
+#[derive(Clone, Debug)]
+struct SpilledPublication {
+    rebuild: RebuildInProgress,
+    /// The publishing thread: its own reads cannot wait for its own COMMIT.
+    publisher: std::thread::ThreadId,
+}
+
+/// How long an in-process read that finds a spilled publication holding the
+/// index waits for it to commit before failing `rebuild_in_progress` (#674).
+/// A normal S commit holds the lock for well under this; a full rebuild may
+/// hold it longer, and its readers still fail typed and retry.
+pub const SPILLED_PUBLICATION_READ_WAIT: Duration = Duration::from_secs(10);
+
+thread_local! {
+    /// The end of the current lock attempt's wait on a spilled publication.
+    static SPILL_WAIT_UNTIL: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// What a busy read found on its gate.
+enum SpillWait {
+    /// No spilled publication holds the index: ordinary contention.
+    NotBlocked,
+    /// The spilled publication ended; the read retries its lock.
+    Cleared,
+    /// The budget ran out (or the reader is the publisher): `rebuild_in_progress`.
+    Expired,
+}
+
 impl PublicationGate {
+    fn spill_read_wait(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(wait) = *self.test_spill_read_wait.lock().unwrap() {
+            return wait;
+        }
+        SPILLED_PUBLICATION_READ_WAIT
+    }
+
+    /// Wait on the gate's own signal for a spilled publication to end, up to
+    /// the read budget of this lock attempt (`attempt` is SQLite's busy count;
+    /// its first call starts the budget).
+    fn wait_for_spilled_publication(&self, attempt: i32) -> SpillWait {
+        if attempt == 0 {
+            SPILL_WAIT_UNTIL.with(|until| until.set(None));
+        }
+        let publisher = match self.readers_blocked.lock().unwrap().as_ref() {
+            None => return SpillWait::NotBlocked,
+            Some(spill) => spill.publisher,
+        };
+        if publisher == std::thread::current().id() {
+            return SpillWait::Expired;
+        }
+        let until = SPILL_WAIT_UNTIL.with(|until| {
+            let end = until
+                .get()
+                .unwrap_or_else(|| Instant::now() + self.spill_read_wait());
+            until.set(Some(end));
+            end
+        });
+        #[cfg(any(test, feature = "test-support"))]
+        self.test_before_spill_wait.run();
+        let mut blocked = self.readers_blocked.lock().unwrap();
+        loop {
+            if blocked.is_none() {
+                return SpillWait::Cleared;
+            }
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return SpillWait::Expired;
+            }
+            blocked = self
+                .readers_unblocked
+                .wait_timeout(blocked, remaining)
+                .unwrap()
+                .0;
+        }
+    }
+
     fn publish_waiting(&self, state: &GateState) {
         self.waiting_published
             .store(state.waiting, std::sync::atomic::Ordering::Release);
@@ -183,8 +269,9 @@ impl PublicationGate {
 const CLOSING: usize = 1 << (usize::BITS - 1);
 
 /// A read found the index locked by a publication that has spilled to the
-/// file, which holds readers out until it commits (#210). Readers fail with
-/// this at once instead of waiting out their busy budget.
+/// file, which holds readers out until it commits (#210). An in-process read
+/// waits up to `SPILLED_PUBLICATION_READ_WAIT` for that commit (#674), then
+/// fails with this instead of waiting out its ordinary busy budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RebuildInProgress {
     pub since: SystemTime,
@@ -211,11 +298,20 @@ thread_local! {
     static READ_GATE: std::cell::RefCell<Weak<PublicationGate>> = const { std::cell::RefCell::new(Weak::new()) };
 }
 
+/// The publication gate of the index this thread reads, if it is live.
+fn read_gate() -> Option<Arc<PublicationGate>> {
+    READ_GATE.with(|gate| gate.borrow().upgrade())
+}
+
 /// Whether the index this thread reads is locked by a spilled publication.
 fn read_gate_blocked() -> Option<RebuildInProgress> {
-    READ_GATE
-        .with(|gate| gate.borrow().upgrade())
-        .and_then(|gate| gate.readers_blocked.lock().unwrap().clone())
+    read_gate().and_then(|gate| {
+        gate.readers_blocked
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|spill| spill.rebuild.clone())
+    })
 }
 
 /// Marks a live publication's transaction as blocking readers once SQLite
@@ -251,9 +347,12 @@ impl<'a> ReadersBlockedWatch<'a> {
             )
         };
         if status == rusqlite::ffi::SQLITE_OK && current > 0 {
-            *self.gate.readers_blocked.lock().unwrap() = Some(RebuildInProgress {
-                since: SystemTime::now(),
-                documents: self.documents,
+            *self.gate.readers_blocked.lock().unwrap() = Some(SpilledPublication {
+                rebuild: RebuildInProgress {
+                    since: SystemTime::now(),
+                    documents: self.documents,
+                },
+                publisher: std::thread::current().id(),
             });
             self.marked = true;
         }
@@ -263,6 +362,7 @@ impl Drop for ReadersBlockedWatch<'_> {
     fn drop(&mut self) {
         if self.marked {
             *self.gate.readers_blocked.lock().unwrap() = None;
+            self.gate.readers_unblocked.notify_all();
             #[cfg(test)]
             self.gate.test_after_readers_unblocked.run();
         }
@@ -4480,10 +4580,18 @@ pub fn with_read_deadline<T>(deadline: Instant, read: impl FnOnce() -> T) -> T {
 
 /// SQLite busy handler for read-scope connections: back off briefly while the
 /// scope's deadline allows, then give up (BUSY). A connection used after its
-/// scope ended falls back to a bounded wait (as `busy_timeout` would).
+/// scope ended falls back to a bounded wait (as `busy_timeout` would). A
+/// spilled in-process publication is waited out on its own signal, for up to
+/// `SPILLED_PUBLICATION_READ_WAIT` even past the scope's deadline (#674).
 fn read_deadline_busy(attempt: i32) -> bool {
-    if read_gate_blocked().is_some() {
-        return false;
+    // A spilled publication holds readers out until COMMIT (#210): wait for
+    // that on its own signal, not the ordinary backoff (#674).
+    if let Some(gate) = read_gate() {
+        match gate.wait_for_spilled_publication(attempt) {
+            SpillWait::NotBlocked => {}
+            SpillWait::Cleared => return true,
+            SpillWait::Expired => return false,
+        }
     }
     let pause = Duration::from_millis((1_u64 << attempt.clamp(0, 4) as u32).min(20));
     let remaining = match read_deadline() {
@@ -4519,7 +4627,7 @@ fn open_index_marker_probe(
     // Inside a read scope a read-only connection's waits share the scope's one
     // deadline (#142); otherwise each SQLite call waits up to `busy_wait`.
     // A standard read outside a scope uses the same handler with its own 5 s
-    // budget, so it too stops waiting at once on a spilled publication (#210).
+    // budget, so it too waits on a spilled publication's own signal (#210, #674).
     if !writable
         && !busy_wait.is_zero()
         && (read_deadline().is_some() || busy_wait == Duration::from_secs(5))
@@ -18696,6 +18804,14 @@ impl Store {
         hook: impl FnOnce() + Send + 'static,
     ) {
         self.publication_before_commit_hook.set(hook);
+    }
+
+    /// Run `hook` once, when a reader of this index starts waiting on a
+    /// spilled publication (#674).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_before_spill_wait_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        self.publication_gate.test_before_spill_wait.set(hook);
     }
 
     #[cfg(feature = "test-support")]

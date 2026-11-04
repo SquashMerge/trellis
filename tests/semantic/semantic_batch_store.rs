@@ -8728,6 +8728,122 @@ fn witnessed_semantic_spill_marks_readers_before_commit() {
     }
 }
 
+/// #674: a read from another thread that finds the S commit spilled waits on the
+/// gate's signal for that commit, then reads the new S head instead of failing
+/// `rebuild_in_progress`.
+#[test]
+fn a_read_during_a_spilled_semantic_commit_reads_the_new_head() {
+    use std::sync::{Mutex, atomic::Ordering, mpsc};
+    use trellis::store::SemanticPublicationStage;
+
+    enum Event {
+        Waiting,
+        Done(anyhow::Result<trellis::model::IndexPin>),
+    }
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+                ("src/c.rs", "fn other() { }\n"),
+            ],
+        );
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g) = (symbol("r()."), symbol("impl#[S]f()."), symbol("g()."));
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 15, 16], &[], &f, 0)
+                .occurrence(&[0, 20, 21], &[], &g, 0)
+                .symbol(&r, 17, &[]),
+            DocSpec::new("src/b.rs")
+                .occurrence(&[1, 12, 13], &[], &f, 1)
+                .occurrence(&[2, 3, 4], &[], &g, 1)
+                .symbol(&f, 26, &[])
+                .symbol(&g, 17, &[]),
+            DocSpec::new("src/c.rs"),
+        ],
+    );
+    drop(world.publish(&world.write(&fixture)).unwrap());
+    let (events, events_rx) = mpsc::channel();
+    let events_rx = Arc::new(Mutex::new(events_rx));
+    let reader = Arc::new(Mutex::new(None));
+    let first_event = Arc::new(Mutex::new(None));
+    let (reading, observer_reader, observer_events, observer_first) = (
+        world.store.clone(),
+        reader.clone(),
+        events_rx.clone(),
+        first_event.clone(),
+    );
+    let observed = Arc::new(AtomicBool::new(false));
+    let observed_hook = observed.clone();
+    world
+        .store
+        .set_semantic_publication_observer_for_tests(move |stage, db| {
+            if stage == SemanticPublicationStage::BeforeSemantic {
+                db.pragma_update(None, "cache_size", -64).unwrap();
+            } else if !observed_hook.swap(true, Ordering::AcqRel) {
+                // Spilled: start a reader on another thread and hold the commit
+                // until it is waiting on the spill (or has already returned).
+                let waiting = events.clone();
+                reading.set_before_spill_wait_hook_for_tests(move || {
+                    let _ = waiting.send(Event::Waiting);
+                });
+                let (store, done) = (reading.clone(), events.clone());
+                *observer_reader.lock().unwrap() = Some(std::thread::spawn(move || {
+                    let _ = done.send(Event::Done(store.status().map(|s| s.revision)));
+                }));
+                let event = observer_events
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                    .expect("the reader neither waited nor returned");
+                *observer_first.lock().unwrap() = Some(event);
+            }
+        });
+    write_files(&world.root, &[("src/c.rs", "fn other() { let _ = 1; }\n")]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let caught_up = world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
+    assert!(observed.load(Ordering::Acquire), "semantic work must spill");
+    let result = match first_event.lock().unwrap().take().unwrap() {
+        Event::Done(result) => {
+            result.map_err(|error| anyhow::anyhow!("read failed at once: {error:#}"))
+        }
+        Event::Waiting => match events_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("the waiting reader did not return after COMMIT")
+        {
+            Event::Done(result) => result,
+            Event::Waiting => panic!("the reader waited twice"),
+        },
+    };
+    reader.lock().unwrap().take().unwrap().join().unwrap();
+    assert_eq!(
+        result.unwrap_or_else(|error| panic!("{error:#}")),
+        caught_up
+    );
+}
+
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the
 /// per-document cap shrunk below src/lib.rs's 36 occurrences: the document is admitted partial
 /// with the typed reason, keeps exactly its definitions, and both join paths agree.

@@ -614,7 +614,7 @@ Before read admission has sampled `catchingUp`, a `too_many_requests` or `deadli
 | `index_not_ready` | No valid published head; true |
 | `not_found` | Valid ID or cached path missing; false |
 | `too_many_requests`, `deadline_exceeded` | Admission cap or deadline; true |
-| `rebuild_in_progress` | A large publication has spilled to `index.db` and holds every reader of the prior head out until it commits (#210); the read fails at once instead of waiting; true |
+| `rebuild_in_progress` | A large publication has spilled to `index.db` and holds every reader of the prior head out until it commits (#210); the read waits up to 10 s for that commit and then reads the new head (a pinned read keeps its pin), and fails with this only if the publication still holds the index (#674); true |
 | `root_changed` | Opened workspace root pathname missing or its `(device,inode)` differs, including the final response check; false for this opened workspace, `currentBasis:null` |
 | `store_unavailable` | Unsafe/unreadable/invalid store or missing required coverage; false (no automatic same-call retry) |
 | `workspace_selection_failed` | No answering checkout; typed reason `not_absolute`, `not_checkout`, `different_repository`, `identity_changed` (false), or `unavailable` (true). Attempted workspace is bounded and tagged. |

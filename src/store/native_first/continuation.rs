@@ -151,6 +151,37 @@ impl Store {
         }
     }
 
+    /// Opt-in (`TRELLIS_INDEX_DIAGNOSTICS=1`) page-cache use of the S commit's
+    /// writer just before COMMIT: whether it spilled to `index.db` (#674).
+    pub(super) fn semantic_commit_cache_diagnostic(db: &Connection) {
+        if std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
+            use std::io::Write as _;
+            let status = |op| {
+                let (mut current, mut highwater) = (0, 0);
+                // SAFETY: the handle belongs to a live connection used on this
+                // thread, and the out-pointers are valid locals.
+                unsafe {
+                    rusqlite::ffi::sqlite3_db_status(
+                        db.handle(),
+                        op,
+                        &mut current,
+                        &mut highwater,
+                        0,
+                    )
+                };
+                current
+            };
+            let used = status(rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED);
+            let spill = status(rusqlite::ffi::SQLITE_DBSTATUS_CACHE_SPILL);
+            let written = status(rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE);
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "semantic-s phase=commit_cache detail=before_commit cache_used_mib={} cache_spill_pages={spill} cache_write_pages={written}",
+                used >> 20
+            );
+        }
+    }
+
     fn semantic_unit(
         &self,
         session: &topology::WriterSession,
