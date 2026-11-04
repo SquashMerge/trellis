@@ -634,9 +634,12 @@ test("declaration menus expose exact Sequence, Inspect and source actions withou
   h.request=async()=>response([{symbol:method,reason:"declaration",matchKind:"measured",action:"sequence"}]);
   await h.nav.open(h.event(),{path:method.path,line:4});
   assert.equal(h.selected.length+h.inspected.length+h.openedSources.length,0);
-  const sequence=h.latest.actions.find(a=>a.label.startsWith("Sequence · syntax ·"));assert.ok(sequence);
-  assert.ok(h.latest.actions.find(a=>a.label.startsWith("Inspect ·")));
-  assert.ok(h.latest.actions.find(a=>a.label.startsWith("Read declaration source")));
+  // #664: the target is a measured declaration; the sequence it opens may be semantic, so no
+  // declaration action claims a syntax tier.
+  const sequence=h.latest.actions.find(a=>a.label.startsWith("Sequence · measured declaration ·"));assert.ok(sequence);
+  assert.ok(h.latest.actions.find(a=>a.label.startsWith("Inspect · measured declaration ·")));
+  assert.ok(h.latest.actions.find(a=>a.label.startsWith("Read declaration source · measured declaration ·")));
+  assert.ok(h.latest.actions.every(a=>!/· syntax ·/.test(a.label||"")),JSON.stringify(h.latest.actions.map(a=>a.label)));
   assert.equal(h.latest.actions.find(a=>a.label.startsWith("Call graph")).disabled,true);
   sequence.run();assert.equal(h.selected[0],method);
 });
@@ -645,7 +648,8 @@ test("enclosing callable and supported class actions use measured identity, not 
   const h=harness(),method=declaration(),cls=declaration("A","class");
   h.request=async()=>response([{symbol:method,reason:"enclosing",matchKind:"measured",action:"sequence"}]);
   await h.nav.open(h.event(),{path:method.path,line:5});
-  const enclosing=h.latest.actions.find(a=>a.label.startsWith("Sequence · enclosing · syntax"));assert.ok(enclosing);
+  const enclosing=h.latest.actions.find(a=>a.label.startsWith("Sequence · enclosing · measured declaration ·"));assert.ok(enclosing);
+  assert.ok(h.latest.actions.find(a=>a.label.startsWith("Inspect enclosing declaration · measured declaration ·")));
   enclosing.run();assert.equal(h.selected[0],method);
   h.request=async()=>response([{symbol:cls,reason:"declaration",matchKind:"measured",action:"class"}]);
   await h.nav.open(h.event(),{path:cls.path,line:4});
@@ -780,7 +784,7 @@ test("multiple producer warning leaves only explicitly labelled syntax choices a
     {symbol:declaration("guess"),reason:"call",action:"sequence",matchKind:"syntaxCandidate"}],{warnings:[warning]});
   await h.nav.open(h.event(),{path:"src/A.java",line:5});
   assert.equal(h.latest.actions.some(a=>a.label.startsWith("Sequence of callee")),false);
-  const syntax=h.latest.actions.find(a=>a.label.startsWith("Sequence · enclosing · syntax"));assert.ok(syntax);
+  const syntax=h.latest.actions.find(a=>a.label.startsWith("Sequence · enclosing · measured declaration"));assert.ok(syntax);
   assert.equal(h.latest.actions.find(a=>a.label===warning).disabled,true);
   syntax.run();assert.equal(h.selected[0],method);
 });

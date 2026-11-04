@@ -529,8 +529,9 @@ The three tools retain the resolved envelope/selection/admission failure forms,
 both emitted production and test edges, using `edges`/`edge`; check/explain counts
 production `instances`/`instance`. New successful results always have
 `partial:true,truncated:false,truncationReason:null`. They warn `syntaxOnly` with null
-provenance unless the payload's `evidenceTier` is `mixed` (references with semantic
-sites, #523). Bounded site samples retain exact counts/omissions in the payload;
+provenance unless the answer rests on semantic evidence: the payload's `evidenceTier` is
+`mixed` (references with semantic sites, #523), or a check/explain instance or constraint
+cites a `semanticBinding` or `typeRelationship`, counted before evidence sampling (#664). Bounded site samples retain exact counts/omissions in the payload;
 this is not top-level verdict truncation or proof of semantic completeness.
 
 Only these new output schemas add nonretryable codes `invalid_rules`,

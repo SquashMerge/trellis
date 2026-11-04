@@ -110,9 +110,38 @@ pub fn list(modern: bool) -> Value {
 }
 
 pub fn envelope(id: &Value, payload: Value) -> Value {
+    let semantic = uses_semantic_evidence(&payload);
+    envelope_with(id, payload, semantic)
+}
+
+/// Whether an answer rests on semantic evidence (#523, #664): references with semantic
+/// sites, or rule evidence that cites a producer's call binding or type relationship. Read
+/// before evidence sampling, so evidence the sample leaves out still counts.
+pub fn uses_semantic_evidence(payload: &Value) -> bool {
+    fn binding(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                matches!(
+                    object.get("kind").and_then(Value::as_str),
+                    Some("semanticBinding" | "typeRelationship")
+                ) || object.values().any(binding)
+            }
+            Value::Array(items) => items.iter().any(binding),
+            _ => false,
+        }
+    }
+    payload["evidenceTier"] == "mixed"
+        || ["instances", "testOnly"]
+            .iter()
+            .any(|field| binding(&payload[*field]))
+}
+
+/// The envelope of an answer whose evidence tier was read before sampling.
+pub fn envelope_with(id: &Value, payload: Value, semantic: bool) -> Value {
     let basis = json!({"indexGeneration":payload["indexGeneration"],"indexRevision":payload["indexRevision"]});
-    // References with semantic sites are not syntax-only (#523); other results keep the note.
-    let warnings = if payload["evidenceTier"] == "mixed" {
+    // An answer resting on semantic evidence is not syntax-only (#523, #664); other results
+    // keep the note.
+    let warnings = if semantic {
         json!([])
     } else {
         json!([{"code":"syntaxOnly","message":"Structural syntax evidence is not semantic dependency resolution","provenanceId":null}])
@@ -351,6 +380,51 @@ fn capped_whole(id: &Value, name: &str, envelope: Value, modern: bool) -> Value 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #664: a rules answer whose evidence includes a producer binding is not syntax-only,
+    /// even when sampling leaves that binding out; one with structural evidence only is.
+    #[test]
+    fn rules_answers_warn_syntax_only_only_without_semantic_evidence() {
+        let id = json!(1);
+        let item = |kind: &str| json!({"kind":kind});
+        let check = |evidence: Vec<Value>| {
+            json!({"indexGeneration":"g","indexRevision":1,
+                "instances":[{"rule":"r","evidence":evidence}],"testOnly":[]})
+        };
+        let syntax = check(vec![item("structuralReference")]);
+        assert_eq!(envelope(&id, syntax)["warnings"][0]["code"], "syntaxOnly");
+        let semantic = check(vec![item("structuralReference"), item("semanticBinding")]);
+        assert_eq!(envelope(&id, semantic)["warnings"], json!([]));
+        // A calls constraint carries its binding on the constraint's own evidence.
+        let mut constraint = check(vec![item("structuralReference")]);
+        constraint["instances"][0]["constraints"] =
+            json!([{"kind":"calls","evidence":[item("call"), item("semanticBinding")]}]);
+        assert_eq!(envelope(&id, constraint)["warnings"], json!([]));
+        let mut sampled = check(vec![item("structuralReference"), item("semanticBinding")]);
+        let semantic = uses_semantic_evidence(&sampled);
+        sample_evidence(&mut sampled, 1);
+        assert_eq!(envelope_with(&id, sampled, semantic)["warnings"], json!([]));
+        let mut test_only = check(vec![]);
+        test_only["testOnly"] = json!([{"rule":"r","evidence":[item("semanticBinding")]}]);
+        assert_eq!(envelope(&id, test_only)["warnings"], json!([]));
+    }
+
+    /// #664: implements/extends constraints can use a producer relationship without a call binding.
+    #[test]
+    fn rules_type_relationship_evidence_is_not_syntax_only() {
+        let id = json!(1);
+        // Shape of the real positive implements result in
+        // tests/core/architecture_semantic.rs::type_relationships_settle_implements_constraints.
+        // With no layer policy, there is no separate semanticBinding instance to mask it.
+        let payload = json!({"indexGeneration":"g","indexRevision":1,
+            "instances":[{"rule":"squares-are-shapes","status":"conforms",
+                "evidence":[{"kind":"declaration"}],
+                "constraints":[{"mode":"require","kind":"implements","status":"conforms",
+                    "evidence":[{"kind":"declaration"},
+                        {"kind":"typeRelationship","provenanceId":"rel-square"}]}]}],
+            "testOnly":[]});
+        assert_eq!(envelope(&id, payload)["warnings"], json!([]));
+    }
 
     #[test]
     fn external_destinations_are_closed_and_never_native_sources() {

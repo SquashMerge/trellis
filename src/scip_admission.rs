@@ -137,6 +137,24 @@ pub fn producer_language(producer_id: &str) -> Option<&'static str> {
     }
 }
 
+/// The language a `producer run` of `producer_id` covers: a real reference producer's, or
+/// the test stub's (#664). `None` for an unknown producer.
+pub fn run_language(producer_id: &str) -> Option<&'static str> {
+    producer_language(producer_id).or_else(|| (producer_id == STUB_PRODUCER).then(stub_language))
+}
+
+/// The id of the test-support stand-in producer.
+pub const STUB_PRODUCER: &str = "trellis-synthetic-scip";
+
+/// The one language the test-support stub producer's runs cover.
+pub fn stub_language() -> &'static str {
+    #[cfg(feature = "test-support")]
+    if std::env::var("TRELLIS_TEST_PRODUCER_STUB_LANGUAGE").as_deref() == Ok("rust") {
+        return "rust";
+    }
+    "javascript"
+}
+
 /// The language of each producer the witness fast path accepts. `scip-java` is omitted on
 /// purpose: its rejoin has always taken the FULL path, and that behavior is preserved.
 pub fn witness_language(producer_id: &str) -> Option<&'static str> {
