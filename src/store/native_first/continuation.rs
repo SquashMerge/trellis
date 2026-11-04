@@ -132,6 +132,10 @@ impl Store {
                     budget: LookupBudget::new(&limits),
                     authority_cursor: super::witness::OriginalAdmissionCursor::default(),
                     authority: None,
+                    // Test-support switch: take the bounded FULL path without a witness attempt.
+                    #[cfg(feature = "test-support")]
+                    full: std::env::var_os("TRELLIS_TEST_FORCE_FULL_REJOIN").is_some(),
+                    #[cfg(not(feature = "test-support"))]
                     full: false,
                     target_cursor: super::local_targets::TargetIndexCursor::default(),
                     target_index_done: false,
@@ -153,10 +157,10 @@ impl Store {
                     super::witness::AuthorityStep::Eligible(authority) => {
                         current.authority = Some(authority)
                     }
-                    super::witness::AuthorityStep::Full(reason) => {
+                    super::witness::AuthorityStep::Full(_reason) => {
                         current.full = true;
                         #[cfg(feature = "test-support")]
-                        crate::semantic_import::note_local_witness_outcome(Some(reason));
+                        crate::semantic_import::note_local_witness_outcome(Some(_reason));
                     }
                 }
                 return Ok(None);
@@ -353,7 +357,7 @@ impl Store {
                     *continuation = None;
                     return Err(error);
                 }
-                if let Some(fallback) =
+                if let Some(_fallback) =
                     error.downcast_ref::<crate::semantic_batch::staging::WitnessFallback>()
                 {
                     let current = state
@@ -367,7 +371,7 @@ impl Store {
                         current.authority = None;
                         current.full = true;
                         #[cfg(feature = "test-support")]
-                        crate::semantic_import::note_local_witness_outcome(Some(fallback.0));
+                        crate::semantic_import::note_local_witness_outcome(Some(_fallback.0));
                         return Ok(SemanticUnitOutcome::Progress);
                     }
                 }

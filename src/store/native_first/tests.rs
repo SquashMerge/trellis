@@ -100,7 +100,11 @@ fn pending_uses_recorded_endpoints_not_transitive_call_paths() {
         projected(&db, 2, "c.js").semantic_status,
         SemanticStatus::CatchingUp
     );
-    assert!(!endpoint_eligible(&db, pin(2), "producer", "javascript", "b.js", pin(1)).unwrap());
+    assert!(
+        endpoint_boundary(&db, pin(2), "producer", "javascript", "b.js", pin(1))
+            .unwrap()
+            .is_some()
+    );
     let a = projected(&db, 2, "a.js");
     assert_eq!(a.semantic_basis_pin, pin(1));
     assert_eq!(a.basis_native_revision_id, "native-1");

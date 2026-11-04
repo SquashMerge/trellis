@@ -2,7 +2,6 @@
 //! Every call uses the owner's fresh exact-target snapshot; no SQLite handle survives it.
 use super::*;
 use crate::native_evidence::{DocumentKey, Range};
-use crate::scip_raw::RawProofIdentity;
 use crate::semantic_batch::{
     BatchLimits,
     descriptor::{Descriptor, SourceManifestHasher},
@@ -18,8 +17,6 @@ pub(crate) struct SourceAuthority {
     pub captured_pin: IndexPin,
     pub original_pin: IndexPin,
     pub producer: sem::Producer,
-    pub descriptor_sha256: String,
-    pub decoder_version: String,
     pub source_set_id: String,
     pub captured_revision_id: String,
     pub source_manifest_hash: String,
@@ -67,9 +64,9 @@ pub(crate) struct CoverageInput {
 }
 
 pub(crate) enum WitnessEligibility {
-    Witness(OriginalSourceWitness),
+    Witness(Box<OriginalSourceWitness>),
     ChangedBytes(CoverageInput),
-    NewDocument(CoverageInput),
+    NewDocument,
     Uncovered(CoverageInput),
     Full(&'static str),
 }
@@ -263,8 +260,6 @@ pub(crate) enum OriginalRow {
 
 #[derive(Debug)]
 pub(crate) struct CurrentDeclaration {
-    pub version: SelectedVersion,
-    pub syntax_id: String,
     pub kind: String,
     pub name: Option<String>,
     pub name_range: Option<Range>,
@@ -974,7 +969,7 @@ pub(crate) fn source_authority(
         )?;
         // Project-root admission already ran; bind all immutable source/header components again.
         descriptor.bind_header(
-            &[descriptor.metadata.project_root.clone()],
+            std::slice::from_ref(&descriptor.metadata.project_root),
             &captured.source_set,
             &captured.revision,
         )?;
@@ -1016,8 +1011,6 @@ pub(crate) fn source_authority(
             captured_pin: selection.captured_pin,
             original_pin: selection.captured_pin,
             producer,
-            descriptor_sha256: sha,
-            decoder_version: descriptor.decoder_version.clone(),
             source_set_id: descriptor.source_set.id.clone(),
             captured_revision_id: descriptor.source_revision.clone(),
             source_manifest_hash: descriptor.source_manifest_hash.clone(),
@@ -1148,13 +1141,7 @@ pub(crate) fn original_document_begin(
             raw.is_none() && exclusion.is_none() && !claims,
             "raw association outside captured inventory"
         );
-        return Ok(WitnessEligibility::NewDocument(CoverageInput {
-            document: key.clone(),
-            current,
-            requested: false,
-            selected: false,
-            exclusion: None,
-        }));
+        return Ok(WitnessEligibility::NewDocument);
     };
     if raw.is_none() && exclusion.is_none() {
         return Ok(WitnessEligibility::Full("raw_document_missing"));
@@ -1224,75 +1211,22 @@ pub(crate) fn original_document_begin(
             return Ok(WitnessEligibility::Full("excluded_original_has_facts"));
         }
     }
-    Ok(WitnessEligibility::Witness(OriginalSourceWitness {
-        tuple_id,
-        document: key.clone(),
-        captured_version: captured,
-        current_version: current,
-        source_hash: source_hash.clone(),
-        wire_digest: raw.as_ref().map(|r| r.1.clone()),
-        capped: raw.map(|r| r.2),
-        requested,
-        selected,
-        state,
-        diagnostic,
-        reasons,
-    }))
-}
-
-pub(crate) fn raw_document_proof_identity_page(
-    db: &Connection,
-    authority: &SourceAuthority,
-    key: &DocumentKey,
-    after: (&str, &str),
-    limit: usize,
-    reserve: &mut Reserve<'_>,
-) -> Result<Vec<RawProofIdentity>> {
-    original_guard(db, authority)?;
-    ensure!(limit > 0, "witness page limit must be positive");
-    selected_ensure!(
-        key.source_set_id == authority.source_set_id,
-        "raw proof source set mismatch"
-    );
-    let mut stmt=db.prepare("SELECT p.proof_id,p.record_kind,p.fact_digest,p.language,p.path,c.artifact_hash,c.producer_id,c.source_set_id,c.captured_revision,c.decoder_version FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE p.capture_id=?1 AND p.language=?2 AND p.path=?3 AND (p.record_kind,p.fact_digest)>(?4,?5) ORDER BY p.record_kind,p.fact_digest LIMIT ?6")?;
-    let mut rows = stmt.query(params![
-        authority.capture_id,
-        key.language,
-        key.path,
-        after.0,
-        after.1,
-        i64::try_from(limit)?
-    ])?;
-    let mut result = Vec::new();
-    while let Some(row) = rows.next()? {
-        row_reserve(row, reserve)?;
-        selected_ensure!(
-            row.get_ref(5)?.as_str()? == authority.artifact_hash
-                && row.get_ref(6)?.as_str()? == authority.producer.id
-                && row.get_ref(7)?.as_str()? == authority.source_set_id
-                && row.get_ref(8)?.as_str()? == authority.captured_revision_id
-                && row.get_ref(9)?.as_str()? == authority.decoder_version,
-            "raw proof capture mismatch"
-        );
-        selected_ensure!(
-            crate::scip_admission::hexhash(row.get_ref(0)?.as_str()?)
-                && crate::scip_admission::hexhash(row.get_ref(2)?.as_str()?)
-                && matches!(
-                    row.get_ref(1)?.as_str()?,
-                    "occurrence" | "symbolInformation" | "relationship"
-                ),
-            "invalid raw proof metadata"
-        );
-        result.push(RawProofIdentity {
-            proof_id: row.get(0)?,
-            record_kind: row.get(1)?,
-            fact_digest: row.get(2)?,
-            language: row.get(3)?,
-            path: row.get(4)?,
-            artifact_hash: row.get(5)?,
-        });
-    }
-    Ok(result)
+    Ok(WitnessEligibility::Witness(Box::new(
+        OriginalSourceWitness {
+            tuple_id,
+            document: key.clone(),
+            captured_version: captured,
+            current_version: current,
+            source_hash: source_hash.clone(),
+            wire_digest: raw.as_ref().map(|r| r.1.clone()),
+            capped: raw.map(|r| r.2),
+            requested,
+            selected,
+            state,
+            diagnostic,
+            reasons,
+        },
+    )))
 }
 
 pub(crate) fn current_declaration(
@@ -1331,8 +1265,6 @@ pub(crate) fn current_declaration(
     selected_ensure!(rows.next()?.is_none(), "duplicate targeted declaration");
     match (name, start, end) {
         (None, None, None) => Ok(Some(CurrentDeclaration {
-            version,
-            syntax_id: syntax_id.to_owned(),
             kind,
             name: None,
             name_range: None,
@@ -1349,8 +1281,6 @@ pub(crate) fn current_declaration(
             );
             let callable = matches!(kind.as_str(), "function" | "method" | "constructor");
             Ok(Some(CurrentDeclaration {
-                version,
-                syntax_id: syntax_id.to_owned(),
                 kind,
                 name: Some(name),
                 name_range: Some(Range {

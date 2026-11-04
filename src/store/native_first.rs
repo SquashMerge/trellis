@@ -262,6 +262,11 @@ pub(crate) fn semantic_projection_for(
             "incompatible_index: projection document disposition missing"
         );
     }
+    let retained: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1 AND producer_id=?2)",
+        params![key, producer],
+        |r| r.get(0),
+    )?;
     row.map(|(basis, native, pending)| {
         let tuple: Option<i64> = db.query_row(
             "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
@@ -273,8 +278,10 @@ pub(crate) fn semantic_projection_for(
             current_pin: pin,
             semantic_basis_pin: parse_pin(&basis)?,
             basis_native_revision_id: native,
-            semantic_status: if pending {
+            semantic_status: if pending && retained {
                 SemanticStatus::CatchingUp
+            } else if pending {
+                SemanticStatus::NeedsReimport
             } else {
                 SemanticStatus::OlderBasis
             },
@@ -293,7 +300,7 @@ pub(crate) fn projection_tuple(
     let Some(projection) = semantic_projection_for(db, pin, producer, language, path)? else {
         return Ok(None);
     };
-    if projection.semantic_status == SemanticStatus::CatchingUp {
+    if projection.semantic_status.is_pending() {
         return Ok(None);
     }
     let basis = semantic_pin_key(projection.semantic_basis_pin);
@@ -304,18 +311,29 @@ pub(crate) fn projection_tuple(
     Ok(Some((basis, tuple, projection)))
 }
 
-pub(crate) fn endpoint_eligible(
+/// `None` when the endpoint is eligible older-basis evidence; otherwise its boundary.
+pub(crate) fn endpoint_boundary(
     db: &Connection,
     pin: IndexPin,
     producer: &str,
     language: &str,
     path: &str,
     basis_pin: IndexPin,
-) -> Result<bool> {
+) -> Result<Option<crate::graph_query::BoundaryReason>> {
+    use crate::graph_query::BoundaryReason;
     Ok(
-        semantic_projection_for(db, pin, producer, language, path)?.is_some_and(|p| {
-            p.semantic_basis_pin == basis_pin && p.semantic_status == SemanticStatus::OlderBasis
-        }),
+        match semantic_projection_for(db, pin, producer, language, path)? {
+            Some(p)
+                if p.semantic_basis_pin == basis_pin
+                    && p.semantic_status == SemanticStatus::OlderBasis =>
+            {
+                None
+            }
+            Some(p) if p.semantic_status.is_pending() => {
+                Some(BoundaryReason::pending(p.semantic_status))
+            }
+            _ => Some(BoundaryReason::CatchingUp),
+        },
     )
 }
 
@@ -657,7 +675,7 @@ pub(crate) fn projected_semantic_document(
     let Some(projection) = semantic_projection_for(db, pin, producer, language, path)? else {
         return Ok(None);
     };
-    if projection.semantic_status == SemanticStatus::CatchingUp {
+    if projection.semantic_status.is_pending() {
         return Ok(Some((projection, None)));
     }
     let (_, tuple, _) = projection_tuple(db, pin, producer, language, path)?

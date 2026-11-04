@@ -53,6 +53,19 @@ pub enum BoundaryReason {
     NodeLimit,
     MissingEvidence,
     CatchingUp,
+    /// No retained raw input will catch the document up; its language needs re-import.
+    NeedsReimport,
+}
+
+impl BoundaryReason {
+    /// The boundary a pending (`catchingUp` or `needsReimport`) document imposes.
+    pub fn pending(status: crate::model::SemanticStatus) -> Self {
+        if status == crate::model::SemanticStatus::NeedsReimport {
+            Self::NeedsReimport
+        } else {
+            Self::CatchingUp
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,15 +425,16 @@ pub trait GraphSource {
         projection: &crate::model::SemanticProjection,
         producer: &str,
         document: &DocumentKey,
-    ) -> Result<bool> {
+    ) -> Result<Option<BoundaryReason>> {
         let target = self.document(document)?;
-        Ok(target.projection.as_ref().is_some_and(|other| {
+        let eligible = target.projection.as_ref().is_some_and(|other| {
             other.semantic_status == crate::model::SemanticStatus::OlderBasis
                 && other.semantic_basis_pin == projection.semantic_basis_pin
         }) && target
             .semantic
             .as_ref()
-            .is_some_and(|semantic| semantic.coverage.producer_id == producer))
+            .is_some_and(|semantic| semantic.coverage.producer_id == producer);
+        Ok((!eligible).then(|| endpoint_reason(target.projection.as_ref())))
     }
     fn document(&mut self, key: &DocumentKey) -> Result<Arc<DocumentFacts>>;
     /// The role of an exactly located declaration, without requiring its whole document.
@@ -459,7 +473,8 @@ pub struct GraphFacts {
     pub locations: BTreeMap<String, Option<DocumentKey>>,
     pub documents: BTreeMap<DocumentKey, Arc<DocumentFacts>>,
     pub history: BTreeMap<(DocumentKey, String), Option<Arc<HistoryFacts>>>,
-    pub projection_endpoints: BTreeMap<(String, DocumentKey, String), bool>,
+    /// `None` is an eligible older-basis endpoint; otherwise the boundary it imposes.
+    pub projection_endpoints: BTreeMap<(String, DocumentKey, String), Option<BoundaryReason>>,
 }
 
 impl GraphFacts {
@@ -522,7 +537,7 @@ impl GraphSource for &GraphFacts {
         projection: &crate::model::SemanticProjection,
         producer: &str,
         document: &DocumentKey,
-    ) -> Result<bool> {
+    ) -> Result<Option<BoundaryReason>> {
         let key = (
             producer.to_owned(),
             document.clone(),
@@ -534,12 +549,15 @@ impl GraphSource for &GraphFacts {
         if self.memo {
             return Err(anyhow!(FACTS_MISS));
         }
-        Ok(self.documents.get(document).is_some_and(|doc| {
-            doc.projection.as_ref().is_some_and(|other| {
-                other.semantic_status == crate::model::SemanticStatus::OlderBasis
-                    && other.semantic_basis_pin == projection.semantic_basis_pin
-            })
-        }))
+        let target = self
+            .documents
+            .get(document)
+            .and_then(|doc| doc.projection.as_ref());
+        let eligible = target.is_some_and(|other| {
+            other.semantic_status == crate::model::SemanticStatus::OlderBasis
+                && other.semantic_basis_pin == projection.semantic_basis_pin
+        });
+        Ok((!eligible).then(|| endpoint_reason(target)))
     }
 
     fn history(&mut self, key: &DocumentKey, syntax_id: &str) -> Result<Option<Arc<HistoryFacts>>> {
@@ -576,7 +594,7 @@ impl GraphSource for GraphFacts {
         projection: &crate::model::SemanticProjection,
         producer: &str,
         document: &DocumentKey,
-    ) -> Result<bool> {
+    ) -> Result<Option<BoundaryReason>> {
         (&*self).projection_endpoint(projection, producer, document)
     }
     fn history(&mut self, key: &DocumentKey, id: &str) -> Result<Option<Arc<HistoryFacts>>> {
@@ -706,9 +724,10 @@ pub(crate) fn semantic<'a>(
     }
     match &doc.semantic {
         Some(semantic) => Ok(Some(semantic)),
-        None if doc.projection.as_ref().is_some_and(|projection| {
-            projection.semantic_status == crate::model::SemanticStatus::CatchingUp
-        }) =>
+        None if doc
+            .projection
+            .as_ref()
+            .is_some_and(|projection| projection.semantic_status.is_pending()) =>
         {
             Ok(None)
         }
@@ -804,8 +823,12 @@ pub(crate) fn call_disposition<'a>(
         }
     });
     if let (Some(projection), Some((binding, proof))) = (projection, selected) {
-        let mut eligible = projection.semantic_status == crate::model::SemanticStatus::OlderBasis
-            && source.projection_endpoint(projection, &proof.producer_id, &call.document)?;
+        let mut pending = if projection.semantic_status == crate::model::SemanticStatus::OlderBasis
+        {
+            source.projection_endpoint(projection, &proof.producer_id, &call.document)?
+        } else {
+            Some(BoundaryReason::pending(projection.semantic_status))
+        };
         for target in binding
             .declared_target
             .iter()
@@ -818,12 +841,17 @@ pub(crate) fn call_disposition<'a>(
                 ..
             } = target
             {
-                eligible &= revision_id == &projection.basis_native_revision_id
-                    && source.projection_endpoint(projection, &proof.producer_id, document)?;
+                if pending.is_none() {
+                    pending = if revision_id == &projection.basis_native_revision_id {
+                        source.projection_endpoint(projection, &proof.producer_id, document)?
+                    } else {
+                        Some(BoundaryReason::CatchingUp)
+                    };
+                }
             }
         }
-        if !eligible {
-            reason = BoundaryReason::CatchingUp;
+        if let Some(pending) = pending {
+            reason = pending;
         }
     }
     let target = selected.and_then(|(binding, _)| {
@@ -841,7 +869,10 @@ pub(crate) fn call_disposition<'a>(
     });
     let exact_target = match target {
         Some((id, key))
-            if reason != BoundaryReason::CatchingUp && source.locate(id)?.as_ref() == Some(key) =>
+            if !matches!(
+                reason,
+                BoundaryReason::CatchingUp | BoundaryReason::NeedsReimport
+            ) && source.locate(id)?.as_ref() == Some(key) =>
         {
             Some((id, key))
         }
@@ -967,11 +998,11 @@ pub fn evaluate(
                 source.check_work()?;
                 let disposition = call_disposition(semantic, call, source)?;
                 let selected = disposition.selected;
-                let reason = if semantic.is_none()
-                    && doc.projection.as_ref().is_some_and(|projection| {
-                        projection.semantic_status == crate::model::SemanticStatus::CatchingUp
+                let reason = if let Some(projection) =
+                    doc.projection.as_ref().filter(|projection| {
+                        semantic.is_none() && projection.semantic_status.is_pending()
                     }) {
-                    BoundaryReason::CatchingUp
+                    BoundaryReason::pending(projection.semantic_status)
                 } else {
                     disposition.boundary_reason
                 };
@@ -1609,4 +1640,13 @@ fn warnings_with(
             provenance_id,
         })
         .collect()
+}
+
+/// An ineligible endpoint's boundary: its own pending status, else catching up.
+fn endpoint_reason(target: Option<&crate::model::SemanticProjection>) -> BoundaryReason {
+    target
+        .filter(|projection| projection.semantic_status.is_pending())
+        .map_or(BoundaryReason::CatchingUp, |projection| {
+            BoundaryReason::pending(projection.semantic_status)
+        })
 }

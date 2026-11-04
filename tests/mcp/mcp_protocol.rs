@@ -760,6 +760,7 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str, home: &P
                     row["semantic"],
                     json!({"available":false,"producerId":null,"freshness":"unavailable",
                         "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
+                        "documents":[],
                         "note":"no semantic producer published; showing syntax","partialReasons":null,"reimport":null})
                 );
             }
@@ -855,6 +856,7 @@ fn empty_scope_coverage() -> Value {
             "selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
             "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
                 "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
+                "documents":[],
                 "note":"no semantic producer published; showing syntax","reimport":null}})
     };
     json!([row("java"), row("rust"), row("python"), row("javascript")])
@@ -6848,6 +6850,7 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             "failed":counts[3],"unselected":counts[4]},
             "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
                 "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
+                "documents":[],
                 "note":"no semantic producer published; showing syntax","reimport":null}})
     };
     assert_eq!(

@@ -132,6 +132,10 @@ impl World {
         trellis::testing::wait_until("native revision for the batch directory", || {
             self.head() != before
         });
+        // Native N completes the watcher generation; semantic S follows as worker maintenance.
+        trellis::testing::wait_until("semantic catch-up", || {
+            !self.store.semantic_catch_up_pending_for_tests().unwrap()
+        });
         self.quiet();
     }
 

@@ -461,8 +461,9 @@ async function refreshStatus(followup = false) {
   const semantic = (status.semanticLanguages || []).map(row => {
     const documents = row.documents || [];
     const pending = documents.filter(item => item.projection?.semanticStatus === "catchingUp").length;
+    const reimport = documents.filter(item => item.projection?.semanticStatus === "needsReimport").length;
     const older = documents.filter(item => item.projection?.semanticStatus === "olderBasis").length;
-    const availability = [pending && `${pending} catching up`, older && `${older} older basis`].filter(Boolean).join(", ");
+    const availability = [pending && `${pending} catching up`, reimport && `${reimport} need re-import`, older && `${older} older basis`].filter(Boolean).join(", ");
     const evidence = `${row.language}: semantic evidence ${availability || row.semanticState}`;
     return row.reimport?.state === "needsReimport"
       ? `${evidence}; needs re-import — ${row.reimport.reason}. Re-import a current artifact.` : evidence;
@@ -622,6 +623,9 @@ function selectedIndexStatus() {
   const projections = (status.semanticLanguages || []).flatMap(row => row.documents || []).map(row => row.projection);
   if (projections.some(projection => projection?.semanticStatus === "catchingUp")) {
     return {state:"catching-up", text:`Semantic catching up · native rev ${IndexPin.label(pin)}`};
+  }
+  if (projections.some(projection => projection?.semanticStatus === "needsReimport")) {
+    return {state:"stale", text:`Semantic needs re-import · native rev ${IndexPin.label(pin)}`};
   }
   if (projections.some(projection => projection?.semanticStatus === "olderBasis")) {
     return {state:"stale", text:`Older semantic basis · native rev ${IndexPin.label(pin)}`};

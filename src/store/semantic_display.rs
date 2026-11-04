@@ -175,8 +175,8 @@ impl GraphSource for Locate<'_> {
         projection: &crate::model::SemanticProjection,
         producer: &str,
         document: &DocumentKey,
-    ) -> Result<bool> {
-        native_first::endpoint_eligible(
+    ) -> Result<Option<crate::graph_query::BoundaryReason>> {
+        native_first::endpoint_boundary(
             self.db,
             self.selected.pin,
             producer,
@@ -246,9 +246,10 @@ impl<'a> SemanticCalls<'a> {
             language,
             path,
         )?;
-        if projection.as_ref().is_some_and(|projection| {
-            projection.semantic_status == crate::model::SemanticStatus::CatchingUp
-        }) {
+        if projection
+            .as_ref()
+            .is_some_and(|projection| projection.semantic_status.is_pending())
+        {
             self.tuples.insert(key, None);
             return Ok(None);
         }
@@ -1309,7 +1310,7 @@ pub(super) fn architecture_semantic(
         doc.semantic.producer_id = Some(producer.to_owned());
         if projection
             .as_ref()
-            .is_some_and(|p| p.semantic_status == crate::model::SemanticStatus::CatchingUp)
+            .is_some_and(|p| p.semantic_status.is_pending())
         {
             doc.semantic.boundary = true;
             continue;
@@ -1467,14 +1468,16 @@ pub(super) fn architecture_semantic(
             };
             if let Some(projection) = &projection {
                 let doc = &documents[target];
-                if !super::native_first::endpoint_eligible(
+                if super::native_first::endpoint_boundary(
                     db,
                     pin,
                     &producer,
                     &doc.key.language,
                     &doc.key.path,
                     projection.semantic_basis_pin,
-                )? {
+                )?
+                .is_some()
+                {
                     return Ok(None);
                 }
             }

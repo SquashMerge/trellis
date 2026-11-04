@@ -7561,26 +7561,47 @@ fn read_semantic_history(
         "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
         params![key, producer_id, document.language, document.path], |r| r.get(0),
     ).optional()?;
-    let Some(selected_tuple) = selected_tuple else {
-        return Ok(None);
-    };
-    let selected_snapshot = read_semantic_tuple(db, key, Some(selected_tuple), None, false)?;
-    let [selected_coverage] = <[_; 1]>::try_from(selected_snapshot.coverage).map_err(|_| {
-        SelectedIntegrity("incompatible_index: corrupt selected semantic coverage".into())
-    })?;
-    let state: CoverageState = selected_coverage.state;
-    if !matches!(state, CoverageState::Failed | CoverageState::Omitted) {
-        return Ok(None);
+    if let Some(selected_tuple) = selected_tuple {
+        let selected_snapshot = read_semantic_tuple(db, key, Some(selected_tuple), None, false)?;
+        let [selected_coverage] = <[_; 1]>::try_from(selected_snapshot.coverage).map_err(|_| {
+            SelectedIntegrity("incompatible_index: corrupt selected semantic coverage".into())
+        })?;
+        let state: CoverageState = selected_coverage.state;
+        if !matches!(state, CoverageState::Failed | CoverageState::Omitted) {
+            return Ok(None);
+        }
+        selected_ensure!(
+            selected_snapshot.provenance.is_empty()
+                && selected_snapshot.symbols.is_empty()
+                && selected_snapshot.declaration_bindings.is_empty()
+                && selected_snapshot.references.is_empty()
+                && selected_snapshot.call_bindings.is_empty()
+                && selected_snapshot.type_relationships.is_empty(),
+            "incompatible_index: corrupt unselected semantic tuple contains facts"
+        );
+    } else {
+        // Native-first N has no current tuple for a projected document: its retained history
+        // is served as before, labelled by presentation freshness (#620 ruling on A6).
+        let pin = IndexPin {
+            index_generation: key
+                .strip_prefix("pin:v1:")
+                .and_then(|rest| rest.rsplit_once(':'))
+                .and_then(|(generation, _)| generation.parse().ok())
+                .context("invalid semantic history pin")?,
+            index_revision,
+        };
+        if native_first::semantic_projection_for(
+            db,
+            pin,
+            producer_id,
+            &document.language,
+            &document.path,
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
     }
-    selected_ensure!(
-        selected_snapshot.provenance.is_empty()
-            && selected_snapshot.symbols.is_empty()
-            && selected_snapshot.declaration_bindings.is_empty()
-            && selected_snapshot.references.is_empty()
-            && selected_snapshot.call_bindings.is_empty()
-            && selected_snapshot.type_relationships.is_empty(),
-        "incompatible_index: corrupt unselected semantic tuple contains facts"
-    );
     let selected_document: Option<String> = db.query_row(
         "SELECT v.content_hash FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?1 AND d.language=?2 AND d.path=?3",
         params![key, document.language, document.path], |r| r.get(0),
@@ -9125,7 +9146,7 @@ fn write_native(
         for (expected, canonical) in [
             (
                 &a.revision.toolchain_hash,
-                crate::native_ids::canonical(&retained_toolchain),
+                crate::native_ids::canonical(retained_toolchain),
             ),
             (
                 &a.revision.config_hash,

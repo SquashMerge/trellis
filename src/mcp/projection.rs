@@ -133,9 +133,9 @@ pub fn describe(
             .chain(tiers.iter().map(|tier| &tier.counts))
             .any(|row| row[2] != 0 || row[3] != 0)
             || tiers.iter().any(|tier| {
-                tier.documents.iter().any(|status| {
-                    status.projection.semantic_status == crate::model::SemanticStatus::CatchingUp
-                })
+                tier.documents
+                    .iter()
+                    .any(|status| status.projection.semantic_status.is_pending())
             })
     });
     let languages: Vec<Value> = counts.as_ref().map_or_else(Vec::new, |(rows, tiers)| {
@@ -2082,9 +2082,10 @@ pub fn outgoing(
                 ))
         });
         let incomplete = coverage.iter().any(|c| c.selected && c.state != "complete")
-            || semantic.documents.iter().any(|status| {
-                status.projection.semantic_status == crate::model::SemanticStatus::CatchingUp
-            });
+            || semantic
+                .documents
+                .iter()
+                .any(|status| status.projection.semantic_status.is_pending());
         let truncated = count < result.calls.len() || limited || clipped;
         let reason = if count < result.calls.len() {
             Some("response_bytes")
@@ -2380,9 +2381,10 @@ pub fn incoming(
         let incomplete = warnings
             .first()
             .is_some_and(|warning| warning["code"] == "coverageIncomplete")
-            || semantic.documents.iter().any(|status| {
-                status.projection.semantic_status == crate::model::SemanticStatus::CatchingUp
-            });
+            || semantic
+                .documents
+                .iter()
+                .any(|status| status.projection.semantic_status.is_pending());
         let (bases, mut provenance) = intern_bases(&mut callers, provenance.into_values())?;
         label_projected_proofs(&mut provenance, semantic, count)?;
         let mut data = json!({

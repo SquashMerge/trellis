@@ -34,6 +34,7 @@ function sequenceEvidenceLabel(step, view) {
   const evidence = step.callEvidence;
   if (!evidence) return "measured syntax; target unverified";
   if (evidence.projection?.semanticStatus === "catchingUp") return "Semantic catching up - native syntax only";
+  if (evidence.projection?.semanticStatus === "needsReimport") return "Semantic needs re-import - native syntax only";
   if (evidence.projection?.semanticStatus === "olderBasis") {
     const boundary = evidence.boundaryReason === "none" ? "Resolved at older basis" : "Older basis boundary";
     return `${boundary} - ${evidence.freshness || "possibly stale"}`;
@@ -42,7 +43,8 @@ function sequenceEvidenceLabel(step, view) {
   if (evidence.boundaryReason === "none" && view && !sequenceTarget(view, step)) return "Target unverified - invalid declaration evidence";
   const labels = {none:"Resolved declaration", external:"External boundary", unresolved:"Unresolved target",
     ambiguous:"Ambiguous target", dispatch:"Dispatch boundary", stale:"Stale evidence", nodeLimit:"Target omitted - participant limit",
-    missingEvidence:"Unbound - missing semantic evidence"};
+    missingEvidence:"Unbound - missing semantic evidence", catchingUp:"Semantic catching up - native syntax only",
+    needsReimport:"Semantic needs re-import - native syntax only"};
   return labels[evidence.boundaryReason] || "Target unverified";
 }
 function sequenceTargetActionLabel(declaration) {
@@ -54,8 +56,9 @@ function sequenceEvidenceSummary(view) {
   const semantic = view?.semantic;
   const documents = semantic?.documents || [];
   const pending = documents.some(item => item.projection?.semanticStatus === "catchingUp");
+  const reimport = documents.some(item => item.projection?.semanticStatus === "needsReimport");
   const older = documents.some(item => item.projection?.semanticStatus === "olderBasis");
-  if (pending || older) return [pending && "Semantic catching up", older && "Older semantic basis", semantic?.producerId].filter(Boolean).join(" · ");
+  if (pending || reimport || older) return [pending && "Semantic catching up", reimport && "Semantic needs re-import", older && "Older semantic basis", semantic?.producerId].filter(Boolean).join(" · ");
   if (semantic?.tier === "semantic" && typeof semantic.producerId === "string" && semantic.producerId)
     return `Semantic bindings · ${semantic.producerId}`;
   return typeof semantic?.reason === "string" && semantic.reason ? `Syntax only · ${semantic.reason}` : "Syntax only";
@@ -64,7 +67,7 @@ function sequenceEvidenceSummary(view) {
 function sequenceBasisLabel(evidence) {
   const projection = evidence?.projection;
   const pin = projection?.semanticBasisPin;
-  const projected = projection ? `${projection.semanticStatus === "olderBasis" ? "older basis" : "catching up"}${pin ? ` ${pin.indexGeneration}:${pin.indexRevision}` : ""} · native ${projection.basisNativeRevisionId}` : "";
+  const projected = projection ? `${{olderBasis:"older basis", needsReimport:"needs re-import"}[projection.semanticStatus] || "catching up"}${pin ? ` ${pin.indexGeneration}:${pin.indexRevision}` : ""} · native ${projection.basisNativeRevisionId}` : "";
   const basis = evidence?.semanticBasis;
   if (!basis || typeof basis.producerId !== "string") return projected;
   return [projected, `basis ${basis.producerId}${typeof basis.producerVersion === "string" ? " " + basis.producerVersion : ""}`].filter(Boolean).join(" · ");

@@ -885,7 +885,8 @@
             "semanticStatus": {
               "enum": [
                 "olderBasis",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             }
           },
@@ -2275,7 +2276,8 @@
             "semanticStatus": {
               "enum": [
                 "olderBasis",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             }
           },
@@ -3824,7 +3826,8 @@
             "semanticStatus": {
               "enum": [
                 "olderBasis",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             }
           },
@@ -5449,7 +5452,8 @@
             "semanticStatus": {
               "enum": [
                 "olderBasis",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             }
           },
@@ -5976,7 +5980,8 @@
                 "stale",
                 "nodeLimit",
                 "missingEvidence",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             },
             "callId": {
@@ -7599,7 +7604,8 @@
             "semanticStatus": {
               "enum": [
                 "olderBasis",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             }
           },
@@ -8904,7 +8910,8 @@
                 "stale",
                 "nodeLimit",
                 "missingEvidence",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             },
             "evidenceTier": {
@@ -9713,7 +9720,8 @@
             "semanticStatus": {
               "enum": [
                 "olderBasis",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             }
           },
@@ -10630,7 +10638,8 @@
             "semanticStatus": {
               "enum": [
                 "olderBasis",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             }
           },
@@ -12389,7 +12398,8 @@
                 "stale",
                 "nodeLimit",
                 "missingEvidence",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             },
             "callSiteCount": {
@@ -12925,7 +12935,8 @@
             "semanticStatus": {
               "enum": [
                 "olderBasis",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             }
           },
@@ -15541,7 +15552,8 @@
             "semanticStatus": {
               "enum": [
                 "olderBasis",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             }
           },
@@ -18333,7 +18345,8 @@
             "semanticStatus": {
               "enum": [
                 "olderBasis",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             }
           },
@@ -21349,7 +21362,8 @@
             "semanticStatus": {
               "enum": [
                 "olderBasis",
-                "catchingUp"
+                "catchingUp",
+                "needsReimport"
               ]
             }
           },

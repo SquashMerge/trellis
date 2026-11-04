@@ -32,7 +32,17 @@ pub struct IndexPin {
 #[serde(rename_all = "camelCase")]
 pub enum SemanticStatus {
     OlderBasis,
+    /// A retained `producer run` batch is selected; bounded semantic S will finish it.
     CatchingUp,
+    /// Changed, or depends on a changed document, and no retained raw input will catch it up:
+    /// the producer's language carries the #650 `needsReimport` reason.
+    NeedsReimport,
+}
+impl SemanticStatus {
+    /// Older-basis evidence is not served for this document: a hard semantic boundary.
+    pub fn is_pending(self) -> bool {
+        matches!(self, Self::CatchingUp | Self::NeedsReimport)
+    }
 }
 
 /// One selected document's availability, independent of coverage and proof freshness.

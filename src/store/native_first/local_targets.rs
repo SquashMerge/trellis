@@ -15,6 +15,8 @@ pub(crate) struct TargetIndexCursor {
 }
 
 #[derive(Default)]
+// Work fields feed the test-support cost counters only.
+#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 pub(crate) struct TargetAdvance {
     pub done: bool,
     pub builds: usize,
@@ -22,6 +24,8 @@ pub(crate) struct TargetAdvance {
     pub current_target_rows: usize,
 }
 
+// Work fields feed the test-support cost counters only.
+#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 pub(crate) struct TargetLookup {
     pub declaration: Option<CurrentDeclaration>,
     /// Actual normalized native declaration rows fetched, not probes or cache hits.
@@ -152,9 +156,8 @@ pub(crate) fn advance(
             check_cancel(cancel)?;
             reserve_row(row, limits)?;
             let encoded: Vec<u8> = row.get(0)?;
-            let sid = id_codec::decode_sid(&encoded)
-                .map_err(|_| corrupt("invalid LOCAL declaration ID"))?;
-            let decl = decode_declaration(row, version.clone(), sid)?;
+            id_codec::decode_sid(&encoded).map_err(|_| corrupt("invalid LOCAL declaration ID"))?;
+            let decl = decode_declaration(row, version.clone())?;
             put(
                 conn,
                 target.pin,
@@ -227,7 +230,6 @@ pub(crate) fn advance(
 fn decode_declaration(
     row: &rusqlite::Row<'_>,
     version: SelectedVersion,
-    syntax_id: String,
 ) -> Result<CurrentDeclaration> {
     let (kind, name, start, end, outer_start, outer_end): (
         String,
@@ -264,8 +266,6 @@ fn decode_declaration(
     };
     let callable = name.is_some() && matches!(kind.as_str(), "function" | "method" | "constructor");
     Ok(CurrentDeclaration {
-        version,
-        syntax_id,
         kind,
         name,
         name_range,
@@ -340,12 +340,10 @@ pub(crate) fn lookup(
         );
         let present: bool = row.get(1)?;
         let declaration = if present {
-            let version = version.ok_or_else(|| corrupt("LOCAL cached document absent"))?;
+            version.ok_or_else(|| corrupt("LOCAL cached document absent"))?;
             let start: Option<i64> = row.get(4)?;
             let end: Option<i64> = row.get(5)?;
             Some(CurrentDeclaration {
-                version,
-                syntax_id: syntax_id.to_owned(),
                 kind: row.get(2)?,
                 name: row.get(3)?,
                 name_range: start.zip(end).map(|(s, e)| Range {

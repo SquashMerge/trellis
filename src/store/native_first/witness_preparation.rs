@@ -101,10 +101,10 @@ impl WitnessPreparation {
             match (ord, decision) {
                 (Some(ord), WitnessEligibility::Witness(witness)) => {
                     WitnessStageWriter::new(admitted.stage_mut(), limits, counters)?
-                        .stage_source_witness(ord, &witness)?;
+                        .stage_source_witness(ord, witness.as_ref())?;
                     self.source = Some(SourcePreparation {
                         ord,
-                        witness,
+                        witness: *witness,
                         cursor: witness::OriginalAssociationCursor::default(),
                         ordinal: 0,
                     });
@@ -115,7 +115,7 @@ impl WitnessPreparation {
                     writer.stage_witness_coverage(ord, &coverage, "changedBytes")?;
                     writer.finish_source_witness(ord)?;
                 }
-                (None, WitnessEligibility::NewDocument(_) | WitnessEligibility::Uncovered(_)) => {}
+                (None, WitnessEligibility::NewDocument | WitnessEligibility::Uncovered(_)) => {}
                 (Some(ord), WitnessEligibility::Uncovered(coverage)) => {
                     let mut writer =
                         WitnessStageWriter::new(admitted.stage_mut(), limits, counters)?;

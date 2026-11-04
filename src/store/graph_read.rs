@@ -143,9 +143,10 @@ impl SnapshotGraphSource<'_> {
             &key.language,
             &key.path,
         )?;
-        if projection.as_ref().is_some_and(|projection| {
-            projection.semantic_status == crate::model::SemanticStatus::CatchingUp
-        }) {
+        if projection
+            .as_ref()
+            .is_some_and(|projection| projection.semantic_status.is_pending())
+        {
             return Ok(None);
         }
         let basis_key = projection.as_ref().map_or_else(
@@ -228,8 +229,8 @@ impl GraphSource for SnapshotGraphSource<'_> {
         projection: &crate::model::SemanticProjection,
         producer: &str,
         document: &DocumentKey,
-    ) -> Result<bool> {
-        let eligible = native_first::endpoint_eligible(
+    ) -> Result<Option<crate::graph_query::BoundaryReason>> {
+        let eligible = native_first::endpoint_boundary(
             self.db,
             self.selected.pin,
             producer,
@@ -435,9 +436,10 @@ pub(super) fn navigation_calls(
         &key.language,
         &key.path,
     )?;
-    if projection.as_ref().is_some_and(|projection| {
-        projection.semantic_status == crate::model::SemanticStatus::CatchingUp
-    }) {
+    if projection
+        .as_ref()
+        .is_some_and(|projection| projection.semantic_status.is_pending())
+    {
         return Ok(());
     }
     let basis_key = projection.as_ref().map_or_else(
@@ -627,7 +629,9 @@ pub(super) fn sequence_calls(
                         step.call_evidence = Some(crate::behavior::CallEvidence {
                             projection: Some(projection.clone()),
                             historical_freshness: None,
-                            boundary_reason: crate::graph_query::BoundaryReason::CatchingUp,
+                            boundary_reason: crate::graph_query::BoundaryReason::pending(
+                                projection.semantic_status,
+                            ),
                             resolution: None,
                             dispatch: None,
                             freshness: None,
@@ -1135,14 +1139,14 @@ impl Enrichment<'_, '_> {
             };
             let disposition =
                 engine::call_disposition(semantic, call, self.source).map_err(engine_error)?;
-            let mut reason = if semantic.is_none()
-                && document.projection.as_ref().is_some_and(|projection| {
-                    projection.semantic_status == crate::model::SemanticStatus::CatchingUp
+            let mut reason =
+                if let Some(projection) = document.projection.as_ref().filter(|projection| {
+                    semantic.is_none() && projection.semantic_status.is_pending()
                 }) {
-                BoundaryReason::CatchingUp
-            } else {
-                disposition.boundary_reason
-            };
+                    BoundaryReason::pending(projection.semantic_status)
+                } else {
+                    disposition.boundary_reason
+                };
             // A hidden incidental step (an accessor, a logging call) takes no lane and has no
             // target (#547); its call evidence keeps the binding. Show all, which shows it,
             // gives it a lane.
