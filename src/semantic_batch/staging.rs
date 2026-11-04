@@ -411,6 +411,8 @@ pub(crate) struct WitnessStageWriter<'a> {
     changes_before: u64,
     /// Reserved bytes staged since the last directory-size check.
     unchecked: u64,
+    /// The reused source this writer has seen open; its later rows skip the probe.
+    open_source: Option<i64>,
 }
 
 /// Rows re-measure the stage directory after this many reserved bytes (or an eighth of the
@@ -434,6 +436,7 @@ impl<'a> WitnessStageWriter<'a> {
             counters,
             changes_before: conn.total_changes(),
             unchecked: 0,
+            open_source: None,
         })
     }
 
@@ -504,10 +507,13 @@ impl<'a> WitnessStageWriter<'a> {
         ordinal: i64,
         row: &crate::store::native_first::witness::OriginalRow,
     ) -> Result<()> {
-        let open: bool = self.conn.prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM source_witnesses WHERE source_ord=?1 AND decision='reused' AND complete=0)",
-        )?.query_row([source_ord], |row| row.get(0))?;
+        // Only this writer completes a source, so one probe per source and writer holds.
+        let open = self.open_source == Some(source_ord)
+            || self.conn.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM source_witnesses WHERE source_ord=?1 AND decision='reused' AND complete=0)",
+            )?.query_row([source_ord], |row| row.get(0))?;
         ensure!(open && ordinal >= 0, "witness association source not open");
+        self.open_source = Some(source_ord);
         let (body, bytes) = self.payload(row)?;
         self.conn
             .prepare_cached("INSERT INTO original_associations VALUES(?1,?2,?3,?4)")?
@@ -524,6 +530,7 @@ impl<'a> WitnessStageWriter<'a> {
             )? == 1,
             "witness source completion"
         );
+        self.open_source = None;
         self.budget.check()?;
         Ok(())
     }

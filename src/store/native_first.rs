@@ -227,18 +227,18 @@ fn pending_target(db: &Connection) -> Result<Option<PendingSemanticTarget>> {
             basis_pin: parse_pin(&basis)?,
         });
     }
-    let malformed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_pending_selections s LEFT JOIN semantic_revision_raw_selections r ON r.revision_id=s.revision_id AND r.producer_id=s.producer_id LEFT JOIN semantic_projection_origins o ON o.revision_id=s.revision_id AND o.producer_id=s.producer_id WHERE s.revision_id=?1 AND (r.batch_id IS NOT s.batch_id OR r.captured_pin IS NOT s.captured_pin OR o.basis_pin IS NOT s.basis_pin))", [&key], |r|r.get(0))?;
+    let malformed: bool = db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_pending_selections s LEFT JOIN semantic_revision_raw_selections r ON r.revision_id=s.revision_id AND r.producer_id=s.producer_id LEFT JOIN semantic_projection_origins o ON o.revision_id=s.revision_id AND o.producer_id=s.producer_id WHERE s.revision_id=?1 AND (r.batch_id IS NOT s.batch_id OR r.captured_pin IS NOT s.captured_pin OR o.basis_pin IS NOT s.basis_pin))")?.query_row([&key], |r|r.get(0))?;
     selected_ensure!(
         !malformed,
         "incompatible_index: pending raw selection differs"
     );
-    let count: i64 = db.query_row(
-        "SELECT count(*) FROM semantic_revision_raw_selections r
+    let count: i64 = db
+        .prepare_cached(
+            "SELECT count(*) FROM semantic_revision_raw_selections r
          JOIN semantic_projection_origins o ON o.revision_id=r.revision_id
             AND o.producer_id=r.producer_id WHERE r.revision_id=?1",
-        [&key],
-        |r| r.get(0),
-    )?;
+        )?
+        .query_row([&key], |r| r.get(0))?;
     selected_ensure!(
         !selections.is_empty() && count == selections.len() as i64,
         "incompatible_index: pending semantic selection missing"

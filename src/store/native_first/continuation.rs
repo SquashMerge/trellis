@@ -86,16 +86,17 @@ impl SemanticContinuation {
         }
     }
 
-    /// Commits each slice transaction, then closes the connections. A failed commit is the
-    /// slice's storage error.
-    fn release_stage_connections(&mut self) -> rusqlite::Result<()> {
+    /// Commits each slice transaction. A failed commit is the slice's storage error. The
+    /// private connections stay open with their page caches across yields: no other
+    /// connection opens a stage while S owns it, and a joined stage is closed when it is
+    /// queued for publication, so the publishing writer attaches only closed stage files.
+    fn commit_stage_batches(&mut self) -> rusqlite::Result<()> {
         let mut committed = Ok(());
         for stage in self.stages() {
             let result = stage.commit_batch();
             if committed.is_ok() {
                 committed = result;
             }
-            stage.release_connection();
         }
         committed
     }
@@ -483,9 +484,8 @@ impl Store {
                     }
                     Ok(joined)
                 })();
-                // Private stage connections live for the slice: reopening one per step (schema
-                // load, pragmas) cost more than the step. They close before every return, so the
-                // publishing writer attaches only closed stage files.
+                // Private stage connections outlive the step and the slice: reopening one
+                // (schema load, pragmas, a cold page cache) cost more than the step.
                 let step = match step {
                     Ok(None) if started.elapsed() < step_slice() => match check_cancel(cancel) {
                         Ok(()) => continue,
@@ -493,7 +493,7 @@ impl Store {
                     },
                     step => step,
                 };
-                let committed = state.release_stage_connections();
+                let committed = state.commit_stage_batches();
                 return match (step, committed) {
                     (Ok(_), Err(error)) => Err(error.into()),
                     (step, _) => step,
@@ -506,7 +506,10 @@ impl Store {
                 Ok(SemanticUnitOutcome::Progress)
             }
             Ok(Some(Some(joined))) => {
-                let current = state.current.take().unwrap();
+                let mut current = state.current.take().unwrap();
+                let mut admitted = current.admitted.take().unwrap();
+                // A joined stage waits for publication closed; the publisher attaches it.
+                admitted.stage_mut().release_connection();
                 #[cfg(feature = "test-support")]
                 if !current.full {
                     crate::semantic_import::note_local_witness_outcome(None);
@@ -514,7 +517,7 @@ impl Store {
                 state.prepared.push(PreparedSemantic {
                     producer: current.producer,
                     output: PreparedOutput::Joined {
-                        admitted: Box::new(current.admitted.unwrap()),
+                        admitted: Box::new(admitted),
                         joined,
                     },
                     capture_witness: current.capture_witness.then_some(selection.batch_id),

@@ -202,9 +202,10 @@ impl WitnessPreparation {
                             .context("invalid witnessed target syntax ID")?;
                         let named = row.name_range.is_some();
                         crate::semantic_batch::staging::charge_witness_row(conn, limits)?;
-                        conn.execute(
+                        conn.prepare_cached(
                             "INSERT INTO witness_target_status VALUES(?1,?2,?3,?4,0,?5,?6,?7)",
-                            params![
+                        )?
+                        .execute(params![
                                 rev,
                                 key.language,
                                 key.path,
@@ -297,10 +298,10 @@ fn stage_target(
             );
         }
         crate::semantic_batch::staging::charge_witness_row(conn, limits)?;
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO witness_required_targets(language,path,syntax_id) VALUES(?1,?2,?3)",
-            params![document.language, document.path, syntax_id],
-        )?;
+        )?
+        .execute(params![document.language, document.path, syntax_id])?;
         *count += 1;
     }
     Ok(())

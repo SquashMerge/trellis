@@ -92,10 +92,8 @@ fn account(conn: &Connection, limits: &BatchLimits) -> Result<()> {
     if rows < 0 || rows as u64 >= limits.staged_rows {
         return Err(limit("staged rows"));
     }
-    conn.execute(
-        "UPDATE local_target_owner SET rows=rows+1 WHERE singleton=1",
-        [],
-    )?;
+    conn.prepare_cached("UPDATE local_target_owner SET rows=rows+1 WHERE singleton=1")?
+        .execute([])?;
     Ok(())
 }
 
@@ -294,7 +292,7 @@ fn put(
         ),
         None => (None, None, None, None, None),
     };
-    conn.execute("INSERT INTO local_target_declarations(pin,source_set,language,path,vid,syntax_id,present,kind,name,name_start,name_end,callable) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(pin,source_set,language,path,syntax_id) DO UPDATE SET vid=excluded.vid,present=excluded.present,kind=excluded.kind,name=excluded.name,name_start=excluded.name_start,name_end=excluded.name_end,callable=excluded.callable",params![pin,key.source_set_id,key.language,key.path,vid,sid,declaration.is_some(),kind,name,start,end,callable])?;
+    conn.prepare_cached("INSERT INTO local_target_declarations(pin,source_set,language,path,vid,syntax_id,present,kind,name,name_start,name_end,callable) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(pin,source_set,language,path,syntax_id) DO UPDATE SET vid=excluded.vid,present=excluded.present,kind=excluded.kind,name=excluded.name,name_start=excluded.name_start,name_end=excluded.name_end,callable=excluded.callable")?.execute(params![pin,key.source_set_id,key.language,key.path,vid,sid,declaration.is_some(),kind,name,start,end,callable])?;
     Ok(())
 }
 
