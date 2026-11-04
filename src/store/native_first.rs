@@ -627,8 +627,8 @@ impl Store {
                         }
                         anyhow::Ok(())
                     };
-                    // Corruption read while copying is a read-path integrity failure: report
-                    // it so it schedules a re-index, as a read would.
+                    // Corruption read or written while copying is reported, so it schedules a
+                    // re-index as a read would; the publication transaction is not committed.
                     let copy_one = |document: &crate::native_evidence::DocumentKey| {
                         (|| {
                             let (basis, tuple) =
@@ -662,14 +662,17 @@ impl Store {
                                         < (staged.0.as_str(), staged.1.as_str())
                                 }) {
                                     let doc = copied.pop_front().expect("front checked");
-                                    write(&copy_one(&doc)?)?;
+                                    // Writing a copied row can be where its corruption is found.
+                                    write(&copy_one(&doc)?)
+                                        .map_err(|error| self.report_index_failure(error))?;
                                 }
                             }
                             write(&document)
                         },
                     )?;
                     while let Some(doc) = copied.pop_front() {
-                        write(&copy_one(&doc)?)?;
+                        write(&copy_one(&doc)?)
+                            .map_err(|error| self.report_index_failure(error))?;
                     }
                     context::publish(
                         self,
