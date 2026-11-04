@@ -19,12 +19,18 @@ pub(super) struct PublishedAdmission {
     pub(super) before_lookup: TestOneShotHook,
     #[cfg(test)]
     pub(super) before_remember: TestOneShotHook,
+    /// Status semantic projections this Store and its clones have run (#672).
+    #[cfg(feature = "test-support")]
+    projections: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
 struct AdmissionState {
     epoch: u64,
     entry: Option<(AdmissionKey, IndexStatus)>,
+    /// The same head's status with its semantic projection (#672): the control status it
+    /// was projected from and the result.
+    semantics: Option<(AdmissionKey, IndexStatus, IndexStatus)>,
 }
 
 impl PublishedAdmission {
@@ -32,6 +38,7 @@ impl PublishedAdmission {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.epoch = state.epoch.wrapping_add(1);
         state.entry = None;
+        state.semantics = None;
     }
 }
 
@@ -119,5 +126,62 @@ impl Store {
             state.entry = Some((key, status.clone()));
         }
         Ok(status)
+    }
+
+    /// `status` with its per-language semantic projection (#672). The projection reads only
+    /// the snapshot, so it is remembered for the same admission key as the control status:
+    /// the published pin and the index file's commit counter. Any commit, including an N or
+    /// S publication, changes the key; a read of another pin or snapshot never sees it.
+    pub(super) fn status_with_semantics(
+        &self,
+        db: &Connection,
+        mut status: IndexStatus,
+    ) -> Result<IndexStatus> {
+        let Some(key) = self.admission_key(db)? else {
+            self.project_status_semantics(db, &mut status)?;
+            return Ok(status);
+        };
+        let epoch = {
+            let state = self
+                .published_admission
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((cached, control, projected)) = &state.semantics
+                && *cached == key
+                && *control == status
+            {
+                return Ok(projected.clone());
+            }
+            state.epoch
+        };
+        let control = status.clone();
+        self.project_status_semantics(db, &mut status)?;
+        let mut state = self
+            .published_admission
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.epoch == epoch {
+            state.semantics = Some((key, control, status.clone()));
+        }
+        Ok(status)
+    }
+
+    fn project_status_semantics(&self, db: &Connection, status: &mut IndexStatus) -> Result<()> {
+        #[cfg(feature = "test-support")]
+        self.published_admission
+            .projections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        semantic_display::status_semantics(db, status)
+    }
+
+    /// How many status semantic projections this Store and its clones have run (#672).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn status_semantic_projections_for_tests(&self) -> usize {
+        self.published_admission
+            .projections
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
