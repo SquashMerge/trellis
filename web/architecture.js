@@ -869,7 +869,9 @@
       const target = get("architecture-inspector-content"); target.replaceChildren(); reviewChips(target);
       paragraph(target, `Authored exception · ${entry.reason}`);
       detailList(target, {kind:"instances", rule:entry.rule, path:entry.target.path, excepted:"true", exceptionReason:entry.reason}, active, (list, rows) => {
-        const matching = rows.filter(({instance:r}) => r.target?.path === entry.target.path && r.destination?.path === entry.destination.path);
+        const matches = (identity, authored) => !!identity && Object.entries(authored).every(([key, value]) =>
+          identity[key === "source_set" ? "sourceSetId" : key] === value);
+        const matching = rows.filter(({instance:r}) => matches(r.target, entry.target) && matches(r.destination, entry.destination));
         for (const row of matching) {
           paragraph(list, `${row.role} · ${row.instance.referenceCount} exact reference sites`);
           detailList(list, {kind:"pairs", role:row.role, source:JSON.stringify(row.instance.target), target:JSON.stringify(row.instance.destination)}, active, pairItems(active), NO_PAIRS);
