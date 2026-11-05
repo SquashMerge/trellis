@@ -5934,13 +5934,26 @@ async fn a_call_expires_from_its_read_while_the_coordinator_is_held() {
 async fn mcp_find_answers_from_its_admitted_snapshot_while_a_publication_is_pending() {
     let temp = tempfile::tempdir().unwrap();
     let (identity, registry, runtime) = ready_registry(temp.path(), 84).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let worker_gate = ReadGate::default();
+    let gate = ReadGate::default();
+    let _release_on_failure = McpFillRelease([worker_gate.clone(), gate.clone()]);
+    let held = worker_gate.clone();
+    let worker_scheduler = scheduler.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let _worker = worker_scheduler.hold_worker_for_tests();
+        (held.hook())();
+    });
+    let held = worker_gate.clone();
+    tokio::task::spawn_blocking(move || held.await_held(1))
+        .await
+        .unwrap();
     let admitted = {
         let (response, _) = runtime.evidence_response().unwrap();
         let revision = response.status().unwrap().revision;
         response.finish(()).unwrap();
         revision
     };
-    let gate = ReadGate::default();
     runtime.set_mcp_admitted_gate_for_tests(gate.hook());
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 84, None);
     let find = |id: u64, query: &str| {
@@ -5958,13 +5971,12 @@ async fn mcp_find_answers_from_its_admitted_snapshot_while_a_publication_is_pend
     // While that read holds its snapshot, change the source so the worker
     // has a newer publication pending.
     fs::write(identity.root.join("a.js"), "function moved() {}\n").unwrap();
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        while !runtime.catching_up() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the watcher never queued the edit");
+    let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Content,
+    )))
+    .add_path(identity.root.join("a.js"));
+    assert!(scheduler.submit_watch_event_for_tests(Ok(event)));
+    assert!(scheduler.checkout_watch_pending());
     gate.open();
     let reply = next_reply(&mut reader);
     tool(&reply, None, true);
@@ -5985,6 +5997,8 @@ async fn mcp_find_answers_from_its_admitted_snapshot_while_a_publication_is_pend
             .all(|c| c["revisionId"] == coverage[0]["revisionId"]),
         "{reply}"
     );
+    worker_gate.open();
+    worker.await.unwrap();
     // Once published, a new call answers from the newer revision.
     let newer = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         for id in 2.. {
