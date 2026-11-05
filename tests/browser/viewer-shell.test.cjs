@@ -101,6 +101,15 @@ async function published(callback, signal, {rules = null, git = false, additiona
       const url = new URL(request.url());
       if (url.pathname.startsWith("/api/")) requests.push({url, method:request.method(), body:request.method() === "POST" ? request.postDataJSON() : null});
     });
+    // #697: catchingUp is advisory and can change at one revision as N and S publish, so a
+    // test reads the page's freshness against the samples the page itself received, in
+    // arrival order: checkout list rows and selected status reads.
+    const freshnessSamples = [];
+    page.on("response", response => {
+      const url = new URL(response.url());
+      const kind = url.pathname === "/api/checkouts" ? "list" : /^\/api\/checkouts\/[a-f0-9]{64}\/status$/.test(url.pathname) ? "status" : null;
+      if (kind && response.request().method() === "GET" && response.ok()) freshnessSamples.push(response.json().then(data => ({kind, data})));
+    });
     await page.goto(`${server.base}/`, {waitUntil:"networkidle"});
     assert.deepEqual(requests, [], "opening the viewer does not authenticate or select a checkout");
     await page.locator("#token").fill(paths.token);
@@ -113,7 +122,7 @@ async function published(callback, signal, {rules = null, git = false, additiona
     assert.equal(requests.some(row => row.method === "POST"), false, "arrival never starts indexing");
     await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("Indexed snapshot · max"));
     await page.locator('.directory-pick[title="src/"]').waitFor();
-    const reloadedPin = await callback({page, paths, server, pin, requests});
+    const reloadedPin = await callback({page, paths, server, pin, requests, freshnessSamples});
     const observedPins = reloadedPin ? [pin, reloadedPin] : [pin];
     assert.deepEqual(errors, []);
     const metricsRequests = requests.filter(row => row.url.pathname.endsWith("/metrics"));
@@ -243,7 +252,15 @@ async function noOverflow(page, width) {
   }
 }
 
-test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top callables and aggregates", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests}) => {
+// The selected checkout's freshness in the last sample the page received: a status read, or
+// a later checkout list row. The label follows whichever the page applied last.
+async function pageFreshness(samples, rootKey) {
+  const rows = (await Promise.all(samples)).map(({kind, data}) => kind === "status" ? data : data.checkouts?.find(row => row.rootKey === rootKey));
+  const last = rows.filter(Boolean).at(-1);
+  assert.ok(last, "the page received the selected checkout's status");
+  return {revision:last.revision, freshness:last.catchingUp ? "catching-up" : "fresh"};
+}
+test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top callables and aggregates", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests, freshnessSamples}) => {
   const listing = await H.api(server.base, paths.token, "GET", "/api/checkouts");
   assert.equal(listing.status, 200);
   const checkout = listing.data.checkouts.find(row => row.rootKey === server.rootKey);
@@ -256,8 +273,10 @@ test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top
   const status = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "status"));
   assert.equal(status.status, 200, JSON.stringify(status.data));
   assert.deepEqual(status.data.revision, pin);
-  const freshness = status.data.catchingUp ? "catching-up" : "fresh";
-  assert.equal(await page.locator("#workspace-index-state").getAttribute("data-state"), freshness);
+  // That read is a separate sample: its catchingUp may differ at the same revision (#697).
+  const rendered = await pageFreshness(freshnessSamples, server.rootKey);
+  assert.deepEqual(rendered.revision, pin, "the page rendered the published pin");
+  assert.equal(await page.locator("#workspace-index-state").getAttribute("data-state"), rendered.freshness, "the label shows the freshness of the status the page rendered");
   assert.match(await page.locator("#workspace-index-label").textContent(), new RegExp(`rev(?:ision)? ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`));
   await expandSources(page);
   let payload = await metrics(server, paths, pin, "max");
