@@ -10593,6 +10593,40 @@ fn head_producers(world: &World) -> Vec<String> {
         .collect()
 }
 
+/// Status names a language's failed documents before its partial ones: a document the producer
+/// excluded as failed is `not in producer output` in the one-line coverage summary.
+#[test]
+fn coverage_summary_names_failed_documents_first() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"gaps\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+                ("src/lib.rs", GAPS_RS),
+                ("src/gated.rs", "pub fn gated() {}\n"),
+            ],
+        )
+    });
+    let mut fixture = world.fixture();
+    fixture.artifact("rust", vec![gaps_doc()]);
+    fixture.exclude("rust", "src/gated.rs", "failed");
+    let descriptor = world.write(&fixture);
+    world.publish(&descriptor).unwrap();
+    let status = world.store.status().unwrap();
+    let coverage = language_row(&status, "rust").coverage.clone().unwrap();
+    assert_eq!(
+        (coverage.complete, coverage.partial, coverage.failed),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        coverage.summary.as_deref(),
+        Some("failed: 1 · not in producer output; partial: 1 · native macro/attribute gaps only")
+    );
+}
+
 fn language_row<'s>(
     status: &'s trellis::model::IndexStatus,
     language: &str,

@@ -408,8 +408,13 @@ pub struct SemanticCoverageSummary {
     /// Omitted, unsupported and not-requested tuples.
     pub unselected: usize,
     pub partial_reasons: PartialReasons,
-    /// One line for people, such as `partial: 243 · native macro/attribute gaps only`; absent
-    /// when no tuple is partial.
+    /// Failed tuples whose document the producer excluded as failed or left out of its output
+    /// (`excluded_failed_by_producer`); the rest failed on an unmeasurable source anchor. Read
+    /// only to build `summary`.
+    #[serde(skip)]
+    pub failed_not_in_output: usize,
+    /// One line for people, such as `failed: 106 · not in producer output; partial: 243 ·
+    /// native macro/attribute gaps only`; absent when no tuple is failed or partial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 }
@@ -438,34 +443,109 @@ pub struct GapOccurrences {
     pub other: u64,
 }
 impl SemanticCoverageSummary {
-    /// `partial: N · <reasons>`: "native macro/attribute gaps only" when every partial tuple
-    /// is partial only for gaps of those kinds, else each reason with its document count.
+    /// `failed: N · <reasons>; partial: M · <reasons>`, each part present only when its count
+    /// is non-zero. Failed tuples are "not in producer output" when the producer excluded every
+    /// one, else each reason with its document count. Partial tuples are "native
+    /// macro/attribute gaps only" when every one is partial only for gaps of those kinds, else
+    /// each reason with its document count.
     pub fn describe(&self) -> Option<String> {
-        if self.partial == 0 {
-            return None;
-        }
-        let reasons = &self.partial_reasons;
-        let detail = if reasons.native_gaps_only == self.partial {
-            if reasons.unsupported_occurrences.other == 0 {
-                "native macro/attribute gaps only".to_owned()
+        let mut parts = Vec::new();
+        if self.failed > 0 {
+            let detail = if self.failed_not_in_output == self.failed {
+                "not in producer output".to_owned()
             } else {
-                "native gaps only".to_owned()
-            }
-        } else {
-            [
-                ("native gaps", reasons.native_gaps),
-                ("document cap", reasons.capped),
-                ("omitted dependents", reasons.omitted),
-                ("captured diagnostics", reasons.captured_diagnostics),
-                ("unrecorded", reasons.unrecorded),
-            ]
-            .into_iter()
-            .filter(|(_, count)| *count > 0)
-            .map(|(reason, count)| format!("{reason} {count}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-        };
-        Some(format!("partial: {} · {detail}", self.partial))
+                counted(&[
+                    ("not in producer output", self.failed_not_in_output),
+                    (
+                        "unmeasurable source anchor",
+                        self.failed.saturating_sub(self.failed_not_in_output),
+                    ),
+                ])
+            };
+            parts.push(format!("failed: {} · {detail}", self.failed));
+        }
+        if self.partial > 0 {
+            let reasons = &self.partial_reasons;
+            let detail = if reasons.native_gaps_only == self.partial {
+                if reasons.unsupported_occurrences.other == 0 {
+                    "native macro/attribute gaps only".to_owned()
+                } else {
+                    "native gaps only".to_owned()
+                }
+            } else {
+                counted(&[
+                    ("native gaps", reasons.native_gaps),
+                    ("document cap", reasons.capped),
+                    ("omitted dependents", reasons.omitted),
+                    ("captured diagnostics", reasons.captured_diagnostics),
+                    ("unrecorded", reasons.unrecorded),
+                ])
+            };
+            parts.push(format!("partial: {} · {detail}", self.partial));
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+}
+/// Each reason with a non-zero count, as `reason count`, comma-separated.
+fn counted(reasons: &[(&str, usize)]) -> String {
+    reasons
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(reason, count)| format!("{reason} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+#[cfg(test)]
+mod coverage_summary_tests {
+    use super::*;
+
+    fn coverage(failed: usize, partial: usize) -> SemanticCoverageSummary {
+        SemanticCoverageSummary {
+            complete: 19,
+            failed,
+            failed_not_in_output: failed,
+            partial,
+            partial_reasons: PartialReasons {
+                native_gaps: partial,
+                native_gaps_only: partial,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn describe_names_failed_before_partial_and_omits_zero_counts() {
+        assert_eq!(
+            coverage(106, 252).describe().as_deref(),
+            Some(
+                "failed: 106 · not in producer output; partial: 252 · native macro/attribute gaps only"
+            )
+        );
+        assert_eq!(
+            coverage(106, 0).describe().as_deref(),
+            Some("failed: 106 · not in producer output")
+        );
+        assert_eq!(
+            coverage(0, 252).describe().as_deref(),
+            Some("partial: 252 · native macro/attribute gaps only")
+        );
+        assert_eq!(coverage(0, 0).describe(), None);
+    }
+
+    #[test]
+    fn describe_counts_failed_reasons_when_they_differ() {
+        let mut mixed = coverage(3, 0);
+        mixed.failed_not_in_output = 2;
+        assert_eq!(
+            mixed.describe().as_deref(),
+            Some("failed: 3 · not in producer output 2, unmeasurable source anchor 1")
+        );
+        mixed.failed_not_in_output = 0;
+        assert_eq!(
+            mixed.describe().as_deref(),
+            Some("failed: 3 · unmeasurable source anchor 3")
+        );
     }
 }
 #[cfg(test)]

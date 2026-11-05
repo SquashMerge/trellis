@@ -381,7 +381,7 @@ trellis status | jq '.semanticLanguages[] | {language, semanticState, semanticPr
 `partial` means Trellis knows something is missing, not that something is wrong. The results you got are valid, but they may not be all of them, so don't read a missing call or reference as proof that there is none.
 
 - **MCP answers** have `partial: true` when the answer was cut off, or when any searched file has incomplete evidence. `warnings` and the per-language coverage counts say which.
-- **`trellis status`** counts each language's files as complete, partial or failed under `coverage`. `coverage.summary` gives the common reason, such as `partial: 1 · native macro/attribute gaps only`.
+- **`trellis status`** counts each language's files as complete, partial or failed under `coverage`. `coverage.summary` gives the common reasons, failed first, such as `partial: 1 · native macro/attribute gaps only` or `failed: 2 · not in producer output; partial: 1 · native macro/attribute gaps only`.
 - **`failed` under `coverage`** means the imported evidence doesn't cover a file. Usually the file wasn't compiled, as with [feature-gated Rust](#feature-gated-rust-code), or it changed after the import.
 
 The most common cause is Rust macros. A macro Trellis can't see into is shown as a boundary, and the file counts as partial. See [known limitations](known-limitations.md#rust-macros).

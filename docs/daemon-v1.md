@@ -114,10 +114,17 @@ from the reasons the import recorded per document ([contract](semantic-evidence/
 reason), `capped`, `omitted`, `capturedDiagnostics` and `unrecorded` (partial tuples without
 recorded reasons). One document can count under several reasons.
 `unsupportedOccurrences` sums the occurrences by gap kind: `{macroInvocation, attributeItem,
-macroDefinition, other}`. `summary` is one line, present when any tuple is partial, for example
-`partial: 243 · native macro/attribute gaps only`, where every partial document is partial only
-for macro invocation, attribute or macro definition gaps (`native gaps only` when some gap is of
-kind `other`). When the partial documents have other reasons,
+macroDefinition, other}`. `summary` is one line, present when any tuple is failed or partial.
+It gives the failed part first, then the partial part, joined by `; `, and leaves out a part
+whose count is zero, for example
+`failed: 106 · not in producer output; partial: 243 · native macro/attribute gaps only`.
+`not in producer output` means every failed document has diagnostic
+`excluded_failed_by_producer`: the producer excluded it as failed, or `trellis producer run`
+found it missing from the producer's SCIP output. Otherwise the failed part lists each reason
+with its document count, such as `failed: 3 · not in producer output 2, unmeasurable source
+anchor 1`. In the partial part, `native macro/attribute gaps only` means every partial document
+is partial only for macro invocation, attribute or macro definition gaps (`native gaps only`
+when some gap is of kind `other`). When the partial documents have other reasons,
 it lists each reason with its document count, such as
 `partial: 3 · native gaps 2, document cap 1`, where `document cap` counts documents admitted
 under a per-document SCIP cap (occurrences, or another per-document wire cap; contract v1).
