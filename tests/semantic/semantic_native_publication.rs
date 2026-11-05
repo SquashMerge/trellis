@@ -2851,7 +2851,14 @@ fn full_rejoin_parses_each_document_a_bounded_number_of_times() {
     fs::write(root.join("src/C0.js"), caller(0) + "// edited\n").unwrap();
     let _ = fs::remove_file(home.join("work-counts.json"));
     let reply = run(&home, &["index", "--workspace", root_string]);
-    let store = trellis::store::Store::open(roots, identity).unwrap();
+    // The test's own daemon may hold the index briefly: admission contention is typed
+    // and retried, and nothing else is (#712).
+    let store = retry_oracle_admission(|| {
+        trellis::store::Store::open(
+            roots.clone(),
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+        )
+    });
     let pin = caught_up(&store, &reply);
     let work = work_counts(&home, pin);
     let mut parses = std::collections::BTreeMap::<String, usize>::new();
