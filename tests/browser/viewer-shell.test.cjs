@@ -58,7 +58,7 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(callback, signal, {rules = null, git = false, additionalRootKeys = []} = {}) {
+async function published(callback, signal, {rules = null, git = false, additionalRootKeys = [], freshness = false} = {}) {
   const paths = H.fixture("function anchor() { return 0; }\n", "anchor.js");
   mkdirSync(join(paths.workspace, "src", "nested"), {recursive:true});
   writeFileSync(join(paths.workspace, "src", "flow.js"), flowSource);
@@ -102,13 +102,17 @@ async function published(callback, signal, {rules = null, git = false, additiona
       if (url.pathname.startsWith("/api/")) requests.push({url, method:request.method(), body:request.method() === "POST" ? request.postDataJSON() : null});
     });
     // #697: catchingUp is advisory and can change at one revision as N and S publish, so a
-    // test reads the page's freshness against the samples the page itself received, in
-    // arrival order: checkout list rows and selected status reads.
+    // test that opts in reads the page's freshness against the samples the page itself
+    // received, in arrival order: checkout list rows and selected status reads. A body the
+    // browser no longer holds (navigation, an intercepted response) is recorded as
+    // unavailable rather than rejecting outside the test.
     const freshnessSamples = [];
-    page.on("response", response => {
+    if (freshness) page.on("response", response => {
       const url = new URL(response.url());
       const kind = url.pathname === "/api/checkouts" ? "list" : /^\/api\/checkouts\/[a-f0-9]{64}\/status$/.test(url.pathname) ? "status" : null;
-      if (kind && response.request().method() === "GET" && response.ok()) freshnessSamples.push(response.json().then(data => ({kind, data})));
+      if (kind && response.request().method() === "GET" && response.ok()) {
+        freshnessSamples.push(response.json().then(data => ({kind, data}), error => ({kind, unavailable:error.message})));
+      }
     });
     await page.goto(`${server.base}/`, {waitUntil:"networkidle"});
     assert.deepEqual(requests, [], "opening the viewer does not authenticate or select a checkout");
@@ -254,11 +258,15 @@ async function noOverflow(page, width) {
 
 // The selected checkout's freshness in the last sample the page received: a status read, or
 // a later checkout list row. The label follows whichever the page applied last.
+// Only a later sample can override an earlier one, so an unreadable last sample fails here
+// instead of falling back to an older sample or to the test's own read.
 async function pageFreshness(samples, rootKey) {
-  const rows = (await Promise.all(samples)).map(({kind, data}) => kind === "status" ? data : data.checkouts?.find(row => row.rootKey === rootKey));
-  const last = rows.filter(Boolean).at(-1);
+  const received = (await Promise.all(samples)).filter(({kind, data}) => kind === "status" || !data || data.checkouts?.some(row => row.rootKey === rootKey));
+  const last = received.at(-1);
   assert.ok(last, "the page received the selected checkout's status");
-  return {revision:last.revision, freshness:last.catchingUp ? "catching-up" : "fresh"};
+  assert.equal(last.unavailable, undefined, `the page's last ${last.kind} sample is readable`);
+  const row = last.kind === "status" ? last.data : last.data.checkouts.find(item => item.rootKey === rootKey);
+  return {revision:row.revision, freshness:row.catchingUp ? "catching-up" : "fresh"};
 }
 test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top callables and aggregates", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests, freshnessSamples}) => {
   const listing = await H.api(server.base, paths.token, "GET", "/api/checkouts");
@@ -341,7 +349,7 @@ test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top
   const canvas = await page.locator(".canvas-area").boundingBox();
   const inspector = await page.locator("#call-inspector").boundingBox();
   assert.ok(explorer.x + explorer.width <= canvas.x && canvas.x + canvas.width <= inspector.x, "desktop keeps separate explorer, canvas and inspector columns");
-}));
+}, undefined, {freshness:true}));
 
 test("Viewer starts with production heat and includes stored tests at the same complete pin", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests}) => {
   assert.equal(await page.locator("#metric-include-tests").isChecked(), false);
