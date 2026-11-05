@@ -64,6 +64,7 @@ pub mod semantic_evidence;
 pub mod semantic_import;
 pub mod skipped_config;
 pub(crate) mod skipped_source;
+pub mod sqlite_config;
 pub mod store;
 mod symbol_lookup;
 pub mod syntax_bounds;

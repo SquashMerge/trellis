@@ -390,6 +390,8 @@ const CLI_ARCHITECTURE_WAIT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before any SQLite connection opens (#673).
+    trellis::sqlite_config::disable_memory_statistics();
     let command = Cli::parse().command;
     if let Command::GitRead(args) = &command {
         trellis::git_status::write_child_response(&args.root, &args.mode, args.path.as_deref())?;
