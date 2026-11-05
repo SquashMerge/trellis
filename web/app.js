@@ -1617,7 +1617,18 @@ function highlightSequenceBoundary(data, options) {
     node.setAttribute("data-boundary-highlight", "true"); highlighted.add(id); first ||= node;
   }
   const missing = ids.size - highlighted.size;
-  notice.append(element("span", `${highlighted.size} boundary call${highlighted.size === 1 ? "" : "s"} highlighted.${missing ? ` ${missing} boundary call${missing === 1 ? " is" : "s are"} not shown${options.showDetails ? " in this admitted sequence." : " in Interactions; internal or folded steps may be hidden."}` : ""}`));
+  let sameColumn = false;
+  const findInternal = step => {
+    if (ids.has(step.callId)) {
+      const target = window.TrellisSequence.target(data, step);
+      sameColumn ||= !!target && window.TrellisSequence.column(target).id === window.TrellisSequence.stepColumn(data, step).id;
+    }
+    for (const child of [...(step.children || []), ...(step.alternate || [])]) findInternal(child);
+  };
+  for (const step of data.steps) findInternal(step);
+  const reason = options.showDetails ? " in this admitted sequence." : sameColumn
+    ? " in Interactions; calls within one participant are hidden." : " in Interactions; internal or folded steps may be hidden.";
+  notice.append(element("span", `${highlighted.size} boundary call${highlighted.size === 1 ? "" : "s"} highlighted.${missing ? ` ${missing} boundary call${missing === 1 ? " is" : "s are"} not shown${reason}` : ""}`));
   if (missing && !options.showDetails) {
     const show = element("button", "Show all steps"); show.type = "button";
     show.addEventListener("click", () => { if (options.isCurrent()) { $("all-steps").checked = true; void loadSequence(); } }); notice.append(show);
@@ -1667,6 +1678,16 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     };
     const diagram = $("sequence-diagram");
     const expanded = new Set();
+    if (sequenceBoundary?.symbolId === symbol.id) {
+      const ids = new Set(sequenceBoundary.callIds);
+      const reveal = step => {
+        let matched = ids.has(step.callId);
+        for (const child of [...(step.children || []), ...(step.alternate || [])]) matched = reveal(child) || matched;
+        if (matched && step.kind === "group") expanded.add(step.id);
+        return matched;
+      };
+      for (const step of data.steps) reveal(step);
+    }
     // No calls is not no behavior. Keep any unknown/control markers beside this guidance.
     const empty = window.TrellisSequence.emptySummary(data, options);
     const onlyEmpty = empty && !window.TrellisSequence.display(data, options).visible.size;
