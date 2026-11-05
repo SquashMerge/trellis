@@ -11632,7 +11632,7 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
                 ("src/lib.rs", "mod a; mod b;\n"),
                 (
                     "Cargo.toml",
-                    "[package]\nname='boundary'\nversion='0.1.0'\n[lib]\npath='lib.rs'\n",
+                    "[package]\nname='boundary'\nversion='0.1.0'\n",
                 ),
             ],
         );

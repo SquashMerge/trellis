@@ -710,7 +710,10 @@ fn boundary_sites_publish_exact_callers_without_guessing_noncall_references() {
         .unwrap();
     assert_eq!(edge["status"], "deviates");
     let site = &edge["evidence"][0];
-    assert_eq!(site["caller"]["stableLookupKey"], "src/store.rs::run");
+    assert_eq!(
+        site["caller"]["stableLookupKey"], "src/store.rs::run",
+        "{site}"
+    );
     assert_eq!(site["caller"]["syntaxId"], site["syntaxId"]);
     assert_eq!(site["caller"]["document"], site["document"]);
     assert!(site["callerReason"].is_null());
