@@ -2783,13 +2783,10 @@ fn full_rejoin_parses_each_document_a_bounded_number_of_times() {
     // One changed caller makes the next native publication rejoin the selected capture.
     fs::write(root.join("src/C0.js"), caller(0) + "// edited\n").unwrap();
     let _ = fs::remove_file(home.join("work-counts.json"));
-    run(&home, &["index", "--workspace", root_string]);
-    // Counts are exported once, by the bounded semantic S that follows native N.
-    trellis::testing::wait_until("semantic catch-up counts", || {
-        home.join("work-counts.json").exists()
-    });
-    let work: Value =
-        serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+    let reply = run(&home, &["index", "--workspace", root_string]);
+    let store = trellis::store::Store::open(roots, identity).unwrap();
+    let pin = caught_up(&store, &reply);
+    let work = work_counts(&home, pin);
     let mut parses = std::collections::BTreeMap::<String, usize>::new();
     for doc in work["parsedRoleSiteDocuments"].as_array().unwrap() {
         *parses
