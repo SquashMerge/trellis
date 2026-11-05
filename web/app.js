@@ -240,7 +240,6 @@ async function readNavigationLocation(force = false) {
       if (entry.kind === "source") return await restoreSourceEntry(entry, current);
       if (entry.kind === "architecture") {
         clearSource(); diagramSequence = null; sequenceBoundary = null;
-        $("sequence-diagram").replaceChildren(); $("sequence-boundary-status").replaceChildren(); $("sequence-boundary-status").hidden = true;
         await setSection("diagrams");
         if (!current()) return;
         showNavigationView("architecture");
@@ -1600,12 +1599,8 @@ function renderIncidentalToggle(data, options) {
 let sequenceFitted = null;
 async function openArchitectureSequence(caller, sites, pin, saved, active) {
   if (!active() || !saved || !IndexPin.equal(pin, status?.revision)) return;
-  const context = navigationContext(), ticket = ++navigationSerial;
-  const current = () => ticket === navigationSerial && navigationCurrent(context) && active();
-  diagramSerial++; diagramSequence = null; sequenceBoundary = null;
-  $("sequence-diagram").replaceChildren(); $("sequence-boundary-status").replaceChildren(); $("sequence-boundary-status").hidden = true;
-  const data = await api("/api/sequence", "POST", {seed:caller.syntaxId, expectedRevision:pin, showAll:false, interactions:true}, current);
-  if (!current()) return;
+  const data = await api("/api/sequence", "POST", {seed:caller.syntaxId, expectedRevision:pin, showAll:false, interactions:true}, active);
+  if (!active()) return;
   if (!IndexPin.equal(data?.revision, pin) || data?.seed?.id !== caller.syntaxId) throw new Error("Sequence provenance mismatch. Nothing displayed.");
   const boundary = {symbolId:caller.syntaxId, callIds:sites.map(site => site.callId)};
   await navigateDiagram(data.seed, pin, "sequence", data, false, boundary, saved);
