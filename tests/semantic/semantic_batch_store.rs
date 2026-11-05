@@ -5909,6 +5909,24 @@ fn whole_publication_validator_runs_over_every_original_of_a_batch() {
     write_files(&world.root, &[("src/D.js", "function more(){ }\n")]);
     world.republish_with_rejoin();
     assert!(world.rejoin_failures() > 0);
+    let status = world.store.status().unwrap();
+    let failed = language_row(&status, "java").coverage.as_ref().unwrap();
+    assert!(failed.failed > 0, "{failed:?}");
+    let summary = failed
+        .summary
+        .as_deref()
+        .expect("failed coverage has a summary");
+    assert!(
+        !summary.contains("unmeasurable source anchor"),
+        "selected raw capture failure was mislabeled: {summary}"
+    );
+    assert!(
+        summary.starts_with(&format!(
+            "failed: {} · raw capture unavailable",
+            failed.failed
+        )),
+        "{summary}"
+    );
 }
 
 /// Two references at one call site that name different symbols.

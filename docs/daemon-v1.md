@@ -121,8 +121,11 @@ whose count is zero, for example
 `not in producer output` means every failed document has diagnostic
 `excluded_failed_by_producer`: the producer excluded it as failed, or `trellis producer run`
 found it missing from the producer's SCIP output. Otherwise the failed part lists each reason
-with its document count, such as `failed: 3 · not in producer output 2, unmeasurable source
-anchor 1`. In the partial part, `native macro/attribute gaps only` means every partial document
+with its document count, such as `failed: 3 · not in producer output 2, raw capture
+unavailable 1`. The reasons are `not in producer output`, `unmeasurable source anchor`
+(diagnostic `unmeasurable_source_anchor`), `raw capture unavailable` (the selected raw capture
+could not be rejoined at this revision) and `other`, for a failed document with none of those
+diagnostics. In the partial part, `native macro/attribute gaps only` means every partial document
 is partial only for macro invocation, attribute or macro definition gaps (`native gaps only`
 when some gap is of kind `other`). When the partial documents have other reasons,
 it lists each reason with its document count, such as

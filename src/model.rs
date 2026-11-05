@@ -408,15 +408,25 @@ pub struct SemanticCoverageSummary {
     /// Omitted, unsupported and not-requested tuples.
     pub unselected: usize,
     pub partial_reasons: PartialReasons,
-    /// Failed tuples whose document the producer excluded as failed or left out of its output
-    /// (`excluded_failed_by_producer`); the rest failed on an unmeasurable source anchor. Read
-    /// only to build `summary`.
+    /// Failed tuples by diagnostic. Read only to build `summary`.
     #[serde(skip)]
-    pub failed_not_in_output: usize,
+    pub failed_reasons: FailedReasons,
     /// One line for people, such as `failed: 106 · not in producer output; partial: 243 ·
     /// native macro/attribute gaps only`; absent when no tuple is failed or partial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+}
+/// A language's failed tuples by the diagnostic that failed them. Failed tuples with none of
+/// these diagnostics count as `other` in the summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FailedReasons {
+    /// `excluded_failed_by_producer`: the producer excluded the document as failed, or
+    /// `trellis producer run` found it missing from the producer's SCIP output.
+    pub not_in_output: usize,
+    /// `unmeasurable_source_anchor`.
+    pub unmeasurable_anchor: usize,
+    /// `selected raw capture unavailable: ...`: the selected raw capture could not be rejoined.
+    pub capture_unavailable: usize,
 }
 /// Why a language's partial tuples are partial (#520). Each count is of partial documents
 /// with that reason; one document can have several. `unrecorded` counts partial tuples no
@@ -445,21 +455,25 @@ pub struct GapOccurrences {
 impl SemanticCoverageSummary {
     /// `failed: N · <reasons>; partial: M · <reasons>`, each part present only when its count
     /// is non-zero. Failed tuples are "not in producer output" when the producer excluded every
-    /// one, else each reason with its document count. Partial tuples are "native
+    /// one, else each reason with its document count, and `other` for any failed tuple without
+    /// a known diagnostic. Partial tuples are "native
     /// macro/attribute gaps only" when every one is partial only for gaps of those kinds, else
     /// each reason with its document count.
     pub fn describe(&self) -> Option<String> {
         let mut parts = Vec::new();
         if self.failed > 0 {
-            let detail = if self.failed_not_in_output == self.failed {
+            let reasons = &self.failed_reasons;
+            let detail = if reasons.not_in_output == self.failed {
                 "not in producer output".to_owned()
             } else {
+                let known = reasons.not_in_output
+                    + reasons.unmeasurable_anchor
+                    + reasons.capture_unavailable;
                 counted(&[
-                    ("not in producer output", self.failed_not_in_output),
-                    (
-                        "unmeasurable source anchor",
-                        self.failed.saturating_sub(self.failed_not_in_output),
-                    ),
+                    ("not in producer output", reasons.not_in_output),
+                    ("unmeasurable source anchor", reasons.unmeasurable_anchor),
+                    ("raw capture unavailable", reasons.capture_unavailable),
+                    ("other", self.failed.saturating_sub(known)),
                 ])
             };
             parts.push(format!("failed: {} · {detail}", self.failed));
@@ -503,7 +517,10 @@ mod coverage_summary_tests {
         SemanticCoverageSummary {
             complete: 19,
             failed,
-            failed_not_in_output: failed,
+            failed_reasons: FailedReasons {
+                not_in_output: failed,
+                ..Default::default()
+            },
             partial,
             partial_reasons: PartialReasons {
                 native_gaps: partial,
@@ -535,17 +552,30 @@ mod coverage_summary_tests {
 
     #[test]
     fn describe_counts_failed_reasons_when_they_differ() {
-        let mut mixed = coverage(3, 0);
-        mixed.failed_not_in_output = 2;
+        let mut mixed = coverage(6, 0);
+        mixed.failed_reasons = FailedReasons {
+            not_in_output: 2,
+            unmeasurable_anchor: 1,
+            capture_unavailable: 2,
+        };
         assert_eq!(
             mixed.describe().as_deref(),
-            Some("failed: 3 · not in producer output 2, unmeasurable source anchor 1")
+            Some(
+                "failed: 6 · not in producer output 2, unmeasurable source anchor 1, \
+                 raw capture unavailable 2, other 1"
+            )
         );
-        mixed.failed_not_in_output = 0;
+        mixed.failed_reasons = FailedReasons {
+            capture_unavailable: 6,
+            ..Default::default()
+        };
         assert_eq!(
             mixed.describe().as_deref(),
-            Some("failed: 3 · unmeasurable source anchor 3")
+            Some("failed: 6 · raw capture unavailable 6")
         );
+        // A failed tuple with no known diagnostic is `other`, never another reason's label.
+        mixed.failed_reasons = FailedReasons::default();
+        assert_eq!(mixed.describe().as_deref(), Some("failed: 6 · other 6"));
     }
 }
 #[cfg(test)]
