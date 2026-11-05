@@ -3291,9 +3291,8 @@ impl EvidenceResponse {
         Ok(value)
     }
     pub fn status(&self) -> Result<IndexStatus> {
-        let mut status = self.store.read_status_for(&self.db, true)?;
-        semantic_display::status_semantics(&self.db, &mut status)?;
-        Ok(status)
+        let status = self.store.read_status_for(&self.db, true)?;
+        self.store.status_with_semantics(&self.db, status)
     }
     /// The admitted head's control status for the browser's `/status/head` digest
     /// (#666): the same validated, per-admission cached read as [`Self::status`],
@@ -14224,9 +14223,8 @@ impl Store {
         before_snapshot(&db)?;
         drop(db);
         self.with_evidence(|db| {
-            let mut status = self.read_status(db)?;
-            semantic_display::status_semantics(db, &mut status)?;
-            Ok(status)
+            let status = self.read_status(db)?;
+            self.status_with_semantics(db, status)
         })
     }
     pub fn publish(

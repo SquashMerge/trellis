@@ -4373,6 +4373,96 @@ fn native_identity_change_external_import_reason_survives_failure_and_clears_on_
     assert_eq!(world.store.semantic_at(first).unwrap(), prior);
 }
 
+/// #672: status's semantic projection is remembered per published head. Repeated status at
+/// one head runs no projection; an N or an S publication is a new head and recomputes it; a
+/// status read while the S commit is open answers the still-published head, from its cache.
+#[test]
+fn status_semantic_projection_is_cached_per_published_head() {
+    use trellis::model::SemanticState;
+    use trellis::store::SemanticPublicationStage;
+
+    let world = definitions_world();
+    let store = &world.store;
+    let (first, _, _) = world.publish(&split_definitions(&world, false)).unwrap();
+    // A fresh Store on the same index computes status with no cache.
+    let uncached = || {
+        Store::open_for_tests(world._state.path(), &world.root)
+            .unwrap()
+            .status()
+            .unwrap()
+    };
+    let projections = || store.status_semantic_projections_for_tests();
+    let before = projections();
+    let imported = store.status().unwrap();
+    assert_eq!(imported.revision, first);
+    assert_eq!(imported.stats.semantic_state, SemanticState::Fresh);
+    assert_eq!(projections() - before, 1);
+    for _ in 0..3 {
+        assert_eq!(store.status().unwrap(), imported);
+        let response = store.evidence_response().unwrap();
+        assert_eq!(response.status().unwrap(), imported);
+        response.finish(()).unwrap();
+        assert_eq!(store.clone().status().unwrap(), imported);
+    }
+    assert_eq!(
+        projections() - before,
+        1,
+        "the same head reuses its projection"
+    );
+    assert_eq!(uncached(), imported);
+
+    // An N publication is a new head: its first status recomputes the projection.
+    write_files(&world.root, &[("src/C.js", "function other(){}\n")]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let native = store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let pending = store.status().unwrap();
+    assert_eq!(pending.revision, native);
+    assert!(store.semantic_catch_up_pending_for_tests().unwrap());
+    assert_eq!(projections() - before, 2);
+    assert_eq!(store.status().unwrap(), pending);
+    assert_eq!(projections() - before, 2);
+    assert_eq!(uncached(), pending);
+
+    // A status while the S commit's transaction is open, on another thread.
+    let (during_tx, during_rx) = std::sync::mpsc::channel();
+    let reader = store.clone();
+    store.set_semantic_publication_observer_for_tests(move |stage, _| {
+        if stage != SemanticPublicationStage::BeforeSemantic {
+            return;
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = reader.clone();
+        std::thread::spawn(move || done_tx.send(reader.status().unwrap()).unwrap());
+        let status = done_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("a status read during the S commit must not wait for it");
+        during_tx.send(status).unwrap();
+    });
+    let caught = store.catch_up_semantic_for_tests(&world.cancel).unwrap();
+    let during = during_rx.try_recv().expect("the S commit ran the observer");
+    assert_eq!(during, pending, "the open S commit is not visible");
+    assert_eq!(
+        projections() - before,
+        2,
+        "and the published head's projection is reused"
+    );
+
+    // The S commit is a new head: recomputed once, then cached.
+    assert_ne!(caught, native);
+    let caught_up = store.status().unwrap();
+    assert_eq!(caught_up.revision, caught);
+    assert!(!store.semantic_catch_up_pending_for_tests().unwrap());
+    assert_eq!(projections() - before, 3);
+    assert_eq!(store.status().unwrap(), caught_up);
+    assert_eq!(projections() - before, 3);
+    assert_eq!(uncached(), caught_up);
+}
+
 #[test]
 fn native_rejoin_after_batch_import_rejoins_every_artifact() {
     let world = mixed_language_world();
