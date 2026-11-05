@@ -266,6 +266,32 @@ test("Architecture keeps distinct measured callers with colliding stable lookup 
   }, new Map(), files);
 });
 
+
+test("Architecture opens the measured inner boundary call inside an argument", {timeout:240000}, async () => {
+  const files = new Map([
+    ["src/lib.rs", "mod low; mod top;\n"],
+    ["src/low.rs", "pub fn nested() { consume(crate::top::target()); } fn consume(_: ()) {}\n"],
+    ["src/top.rs", "pub fn target() {}\n"],
+  ]);
+  const config = 'version=1\n[layers.low]\norder=2\npaths=["src/low.rs"]\n[layers.top]\norder=1\npaths=["src/top.rs"]\n';
+  await published(config, async ({page}) => {
+    await ready(page);
+    const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^1 production sites · upward\s+deviation/});
+    await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
+    const caller = page.locator("#architecture-inspector-content .architecture-caller");
+    assert.equal(await caller.count(), 1);
+    assert.match(await caller.textContent(), /nested.*1 boundary site/s);
+    const selected = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().method() === "POST");
+    await caller.getByRole("button", {name:"Open sequence", exact:true}).click();
+    await selected;
+    await page.locator("#sequence-panel").waitFor({state:"visible"});
+    await page.waitForFunction(() => document.querySelector("#sequence-boundary-status")?.textContent.includes("1 boundary call highlighted"));
+    const highlighted = page.locator("#sequence-diagram [data-boundary-highlight='true']");
+    assert.match(await highlighted.allTextContents().then(rows => rows.join(" ")), /crate::top::target/);
+    assert.doesNotMatch(await highlighted.allTextContents().then(rows => rows.join(" ")), /consume/);
+  }, new Map(), files);
+});
+
 const identityKey = identity => JSON.stringify([identity.sourceSetId, identity.language, identity.path, identity.sid]);
 const siteTotal = edges => edges.reduce((sum, edge) => sum + edge.count, 0);
 const summaryKey = edge => JSON.stringify([edge.sourceLayer, edge.destinationLayer, edge.role, edge.status, edge.excepted, edge.exceptionReason]);
