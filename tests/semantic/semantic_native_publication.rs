@@ -126,6 +126,71 @@ fn work_counts(home: &Path, pin: trellis::model::IndexPin) -> Value {
     });
     work
 }
+
+fn retry_oracle_admission<T>(mut open: impl FnMut() -> anyhow::Result<T>) -> T {
+    let mut result = None;
+    trellis::testing::wait_until("fork oracle admission", || match open() {
+        Ok(store) => {
+            result = Some(store);
+            true
+        }
+        Err(error) if trellis::store::cli_read_retryable_contention(&error) => false,
+        Err(error) => panic!("fork oracle admission failed: {error:#}"),
+    });
+    result.unwrap()
+}
+
+#[test]
+fn fork_oracle_admission_retries_typed_busy_after_the_owner_releases() {
+    use trellis::store::{Store, topology::WorkspaceIdentity};
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("lib.rs"), "fn example() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(root.path()), root.path()).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
+    drop(
+        Store::open(
+            roots.clone(),
+            WorkspaceIdentity::discover(Some(root.path()), root.path()).unwrap(),
+        )
+        .unwrap(),
+    );
+    let mut exclusive = Some(roots.index_use_exclusive_existing(&identity).unwrap());
+    let mut attempts = 0;
+    let store = retry_oracle_admission(|| {
+        attempts += 1;
+        let opened = Store::open(
+            roots.clone(),
+            WorkspaceIdentity::discover(Some(root.path()), root.path()).unwrap(),
+        );
+        if attempts == 1 {
+            assert!(
+                opened
+                    .as_ref()
+                    .is_err_and(|error| trellis::store::cli_read_retryable_contention(error))
+            );
+            drop(exclusive.take());
+        }
+        opened
+    });
+    assert_eq!(attempts, 2);
+    drop(store);
+}
+
+#[test]
+fn fork_oracle_admission_does_not_retry_other_errors() {
+    let mut attempts = 0;
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        retry_oracle_admission::<()>(|| {
+            attempts += 1;
+            Err(anyhow::anyhow!("corrupt: fixture"))
+        });
+    }));
+    assert!(failure.is_err());
+    assert_eq!(attempts, 1);
+}
+
 fn copy_seed(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     fs::set_permissions(to, fs::metadata(from).unwrap().permissions()).unwrap();
@@ -1886,9 +1951,11 @@ fn selected_case(change_b: &str) {
                 fork.join(".local/share/trellis")
             },
         );
-        let identity =
-            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let oracle = trellis::store::Store::open(roots, identity).unwrap();
+        let oracle = retry_oracle_admission(|| {
+            let identity =
+                trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?;
+            trellis::store::Store::open(roots.clone(), identity)
+        });
         let full = caught_up(&oracle, &fork_reply);
         assert_eq!(
             full, next,
