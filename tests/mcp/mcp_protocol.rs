@@ -11626,7 +11626,10 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
         let (identity, topology) = published_inactive_checkout(
             temp.path(),
             &[
-                ("a.js", "import './b.js'; export function a() {}\n"),
+                (
+                    "a.js",
+                    "import {b} from './b.js'; export function a() { b(); }\n",
+                ),
                 ("b.js", "export function b() {}\n"),
             ],
         );
@@ -11691,6 +11694,14 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
         assert_eq!(checked_env["evidenceBasis"], basis);
         assert_eq!(checked_env["data"]["counts"]["conforms"], 1, "{checked}");
         let instance = &checked_env["data"]["instances"][0];
+        let call_site = instance["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|site| !site["callId"].is_null())
+            .expect("native call site");
+        assert_eq!(call_site["caller"]["stableLookupKey"], "a.js::a");
+        assert!(call_site["callerReason"].is_null());
         let explain = ask(
             3,
             "tools/call",
