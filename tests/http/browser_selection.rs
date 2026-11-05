@@ -2980,16 +2980,28 @@ async fn head_with(
     (status, etag, body.to_vec())
 }
 
-// #666: the browser polls the head digest every few seconds. It skips the status's
-// per-language semantic projection, and an unchanged head answers `304` to its ETag.
+/// A provisioned browser over one checkout whose dependency catalog builds are held
+/// (#700): each build waits before it reads the workspace revision until the test sends
+/// on `release`, and reports on `built` once it published. Dropping `release` lets every
+/// later build through. Fields drop in order, so `release` frees a held build before the
+/// router and its checkout go.
 #[cfg(feature = "test-support")]
-#[tokio::test]
-async fn unchanged_status_head_is_a_cheap_conditional_read() {
+struct HeldCatalogBrowser {
+    release: std::sync::mpsc::Sender<()>,
+    built: std::sync::mpsc::Receiver<()>,
+    app: axum::Router,
+    prefix: String,
+    root: std::path::PathBuf,
+    _temp: TempDir,
+}
+
+#[cfg(feature = "test-support")]
+fn held_catalog_browser() -> HeldCatalogBrowser {
     use std::sync::Arc;
     use trellis::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},
         http::ProvisionedBrowser,
-        store::{status_semantic_projections_for_tests as projections, topology::TopologyRoots},
+        store::topology::TopologyRoots,
     };
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("checkout");
@@ -2999,6 +3011,24 @@ async fn unchanged_status_head_is_a_cheap_conditional_read() {
     let roots =
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
     let mut registry = CheckoutRegistry::with_roots(roots);
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (published, built) = std::sync::mpsc::channel::<()>();
+    let (held, published) = (
+        std::sync::Mutex::new(held),
+        std::sync::Mutex::new(published),
+    );
+    registry.set_next_dependency_hook_for_tests(Arc::new(move |phase| match phase {
+        "before_revision" => {
+            let _ = held
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP);
+        }
+        "published" => {
+            let _ = published.lock().unwrap().send(());
+        }
+        _ => {}
+    }));
     registry
         .register(&identity, CheckoutOptions(serde_json::json!({})))
         .unwrap();
@@ -3010,25 +3040,77 @@ async fn unchanged_status_head_is_a_cheap_conditional_read() {
     .unwrap()
     .router();
     let prefix = format!("/api/checkouts/{}", identity.root_key);
-    let head_path = format!("{prefix}/status/head");
-    let full = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+    HeldCatalogBrowser {
+        release,
+        built,
+        app,
+        prefix,
+        root,
+        _temp: temp,
+    }
+}
+
+/// The head digest once the checkout has caught up. It never projects, so the head's
+/// status projection is still unremembered afterwards.
+#[cfg(feature = "test-support")]
+async fn caught_up_head(app: &axum::Router, head_path: &str) -> Value {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
-            let (code, _, body) =
-                selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
-            if code == axum::http::StatusCode::OK && body["catchingUp"] == false {
-                break body;
+            let (code, _, body) = head_with(app.clone(), head_path, None).await;
+            if code == axum::http::StatusCode::OK {
+                let head: Value = serde_json::from_slice(&body).unwrap();
+                if head["catchingUp"] == false {
+                    break head;
+                }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap();
-    // The full status projects at most once per head (#672 remembers it); the head digest
-    // never does.
+    .unwrap()
+}
+
+// #700: the browser's projection count is its own. With the catalog build held, nothing
+// else has projected the head, so the first full status runs the projection itself.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn browser_status_projections_count_the_full_status_itself() {
+    use trellis::store::status_semantic_projections_for_tests as projections;
+    let browser = held_catalog_browser();
+    let (app, prefix) = (&browser.app, &browser.prefix);
+    let full = caught_up_head(app, &format!("{prefix}/status/head")).await;
     let before = projections();
-    selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
-    assert!(projections() <= before + 1);
+    let (code, _, status) =
+        selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{status}");
+    assert_eq!(status["revision"], full["revision"]);
+    assert!(projections() > before, "the full status was not counted");
+}
+
+// #666: the browser polls the head digest every few seconds. It skips the status's
+// per-language semantic projection, and an unchanged head answers `304` to its ETag.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn unchanged_status_head_is_a_cheap_conditional_read() {
+    use trellis::store::status_semantic_projections_for_tests as projections;
+    let HeldCatalogBrowser {
+        _temp,
+        root,
+        app,
+        prefix,
+        release,
+        built,
+    } = held_catalog_browser();
+    let head_path = format!("{prefix}/status/head");
+    let full = caught_up_head(&app, &head_path).await;
+    // The head digest never runs a semantic projection, even while the catalog build,
+    // released here, projects the same head in the background (#700).
     let before = projections();
+    release.send(()).unwrap();
+    tokio::task::spawn_blocking(move || built.recv_timeout(trellis::testing::HANG_BACKSTOP))
+        .await
+        .unwrap()
+        .expect("the catalog build published");
     let (code, etag, body) = head_with(app.clone(), &head_path, None).await;
     assert_eq!(code, axum::http::StatusCode::OK);
     let etag = etag.expect("the head digest carries an ETag");
@@ -3052,6 +3134,14 @@ async fn unchanged_status_head_is_a_cheap_conditional_read() {
         before,
         "head polls ran a semantic projection"
     );
+    // The full status projects at most once per head (#672 remembers it).
+    for _ in 0..2 {
+        let (code, _, status) =
+            selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{status}");
+        assert_eq!(status["revision"], full["revision"]);
+    }
+    assert!(projections() <= before + 1);
     // A new head is a full answer with a new tag, even to the old tag.
     fs::write(root.join("more.js"), "function more() { return 2; }\n").unwrap();
     let (code, _, job) = selected_json(
@@ -3079,4 +3169,6 @@ async fn unchanged_status_head_is_a_cheap_conditional_read() {
     .await
     .unwrap();
     assert_ne!(newer, etag);
+    // Free the new head's held catalog build before the checkout goes.
+    drop(release);
 }

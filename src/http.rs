@@ -230,6 +230,10 @@ pub struct DaemonState {
     /// Runs as a maintenance unit begins, after its priority check passed.
     #[cfg(feature = "test-support")]
     maintenance_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs as a catalog build begins, before it reads the workspace revision
+    /// (`"before_revision"`), and after it published its outcome (`"published"`).
+    #[cfg(feature = "test-support")]
+    dependency_hook: Mutex<Option<Arc<dyn Fn(&'static str) + Send + Sync>>>,
     dependencies: Mutex<DependencyIndex>,
     #[cfg(test)]
     dependency_idle: tokio::sync::Notify,
@@ -433,6 +437,8 @@ pub fn new_with_config(
         closing_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
         maintenance_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        dependency_hook: Mutex::new(None),
         runtime: Mutex::new(RuntimeState::Activating),
         startup_error: Mutex::new(None),
         startup_failures: AtomicU64::new(0),
@@ -1771,6 +1777,8 @@ impl DaemonState {
                         .dependency_options
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("dependency catalog disabled"))?;
+                    #[cfg(feature = "test-support")]
+                    self.run_dependency_hook("before_revision");
                     let revision = self.store.status()?.revision;
                     #[cfg(test)]
                     {
@@ -1791,6 +1799,8 @@ impl DaemonState {
                     Err(anyhow::anyhow!("worker failed")),
                 );
             }
+            #[cfg(feature = "test-support")]
+            self.run_dependency_hook("published");
             let mut index = self.dependencies.lock().unwrap();
             if index.stopped || index.generation == generation {
                 index.worker_running = false;
@@ -1800,6 +1810,21 @@ impl DaemonState {
             }
             // Refresh bursts coalesce to the latest generation. Only this driver
             // can launch catalog work, and its previous build has exited.
+        }
+    }
+    /// Observe or pause catalog builds (#700). Installed before startup begins.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_dependency_hook_for_tests(
+        &self,
+        hook: Arc<dyn Fn(&'static str) + Send + Sync>,
+    ) {
+        *self.dependency_hook.lock().unwrap() = Some(hook);
+    }
+    #[cfg(feature = "test-support")]
+    fn run_dependency_hook(&self, phase: &'static str) {
+        let hook = self.dependency_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(phase);
         }
     }
     fn publish_dependency_index(
