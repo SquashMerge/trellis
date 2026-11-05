@@ -7819,16 +7819,26 @@ forbid = [{ calls = "helper" }]
                     json!({"document":declaration.document,"revisionId":declaration.revision_id,
                         "range":declaration.range,"kind":"declaration",
                         "syntaxId":declaration.syntax_id,"callId":null,
-                        "provenanceId":declaration.provenance_id})
+                        "provenanceId":declaration.provenance_id,
+                        "caller":null,"callerReason":"syntax_only"})
                 } else {
                     let call = native
                         .calls
                         .iter()
                         .find(|call| json!(call.id) == row["callId"])
                         .unwrap();
+                    let caller = native
+                        .declarations
+                        .iter()
+                        .find(|declaration| declaration.syntax_id == call.owner_syntax_id)
+                        .unwrap();
+                    assert_eq!(caller.name.as_deref(), Some("caller"));
                     json!({"document":call.document,"revisionId":call.revision_id,
                         "range":call.range,"kind":"call","syntaxId":call.owner_syntax_id,
-                        "callId":call.id,"provenanceId":call.provenance_id})
+                        "callId":call.id,"provenanceId":call.provenance_id,
+                        "caller":{"stableLookupKey":"src/main.js::caller",
+                            "syntaxId":caller.syntax_id,"name":caller.name,"document":caller.document},
+                        "callerReason":null})
                 };
                 assert_eq!(row, &expected);
             }
