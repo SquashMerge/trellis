@@ -561,7 +561,7 @@
       for (const pair of pairs) for (const site of pair.sites) {
         const caller = site.caller;
         if (!caller?.syntaxId || !caller.stableLookupKey || !site.callId) { unavailable.push(site); continue; }
-        const key = caller.stableLookupKey;
+        const key = JSON.stringify([caller.document.sourceSetId, caller.document.language, caller.document.path, caller.syntaxId]);
         if (!groups.has(key)) groups.set(key, {caller, sites:new Map(), sampled:false});
         const group = groups.get(key);
         group.sites.set(site.callId, site); group.sampled ||= pair.omittedSites > 0;

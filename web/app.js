@@ -161,7 +161,7 @@ async function navigateDiagram(symbol, revision, kind = "sequence", admitted = n
   if (architectureEntry) rememberNavigation({kind:"architecture", architecture:architectureEntry}, true, "#architecture");
   else if (source) rememberNavigation(source, true, "#source");
   else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id && IndexPin.equal(diagramSequence.revision, revision)) {
-    rememberNavigation({kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked}, true, sequenceHash(selectedMethod.id, revision));
+    rememberNavigation({kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked, boundary:sequenceBoundary}, true, sequenceHash(selectedMethod.id, revision));
   } else if (!window.location?.hash) rememberNavigation({kind:"unavailable"}, true, "");
   rememberNavigation({kind, symbol, admitted, showAll, boundary}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
   window.TrellisClasses?.reset();
