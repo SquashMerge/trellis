@@ -86,7 +86,7 @@ async function stopSuiteDaemons({suiteBinary = binary, homes = fixtureHomes, run
   signal = process.kill, pause = delay, grace = HANG_BACKSTOP_MS} = {}) {
   if (!suiteBinary) return;
   const commands = new Set([suiteBinary, realpathSync(suiteBinary)].map(path => `${path} daemon`));
-  async function snapshot(pid) {
+  async function rows(pid) {
     const args = ["eww", ...(pid === undefined ? ["-A"] : ["-p", String(pid)]),
       "-o", "pid=,lstart=,stat=,command="];
     // ps exit 1 means the selected PID has gone. Other failures stay visible.
@@ -96,16 +96,31 @@ async function stopSuiteDaemons({suiteBinary = binary, homes = fixtureHomes, run
     const found = new Map();
     for (const line of listed.stdout.split("\n")) {
       const match = line.trim().match(/^(\d+)\s+((?:\S+\s+){4}\S+)\s+(\S+)\s+(.*)$/);
-      if (!match || Number(match[1]) <= 0 || match[3].startsWith("Z")) continue;
-      const command = match[4];
-      if (![...commands].some(expected => command.startsWith(expected + " "))) continue;
-      const home = command.match(/(?:^| )HOME=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|$)/)?.[1];
-      if (homes.has(home)) found.set(Number(match[1]), match[2].replace(/\s+/g," "));
+      if (match && Number(match[1]) > 0) found.set(Number(match[1]), {start:match[2].replace(/\s+/g," "), stat:match[3], command:match[4]});
     }
+    return found;
+  }
+  // A live suite daemon: its command and HOME are readable and match.
+  const ours = ({stat, command}) => {
+    if (stat.startsWith("Z") || ![...commands].some(expected => command.startsWith(expected + " "))) return false;
+    return homes.has(command.match(/(?:^| )HOME=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|$)/)?.[1]);
+  };
+  async function snapshot(pid) {
+    const found = new Map();
+    for (const [rowPid, row] of await rows(pid)) if (ours(row)) found.set(rowPid, row.start);
     return found;
   }
   const recorded = await snapshot();
   const matches = async (pid, start) => (await snapshot(pid)).get(pid) === start;
+  // #701: a signalled daemon has not exited until its PID is reaped. Dead, it
+  // is <defunct>; while exiting, ps may show only its name, "(trellis)" or
+  // "[trellis]". Either way it keeps its PID and start time, and kill(pid, 0)
+  // still finds it. Only a readable, different identity is another process.
+  const present = async (pid, start) => {
+    const row = (await rows(pid)).get(pid);
+    if (row?.start !== start) return false;
+    return row.stat.startsWith("Z") || ours(row) || /^(\(.*\)|\[.*\])$/.test(row.command.trim());
+  };
   async function send(pid, start, name) {
     if (!await matches(pid,start)) return;
     try { signal(pid,name); } catch (error) { if (error.code !== "ESRCH") throw error; }
@@ -113,7 +128,7 @@ async function stopSuiteDaemons({suiteBinary = binary, homes = fixtureHomes, run
   for (const [pid,start] of recorded) await send(pid,start,"SIGTERM");
   const deadline = Date.now()+grace;
   while (recorded.size) {
-    for (const [pid,start] of recorded) if (!await matches(pid,start)) recorded.delete(pid);
+    for (const [pid,start] of recorded) if (!await present(pid,start)) recorded.delete(pid);
     if (!recorded.size) return;
     if (Date.now() >= deadline) {
       for (const [pid,start] of recorded) await send(pid,start,"SIGKILL");
