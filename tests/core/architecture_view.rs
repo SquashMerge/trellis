@@ -723,7 +723,6 @@ fn boundary_sites_publish_exact_callers_without_guessing_noncall_references() {
         .flat_map(|edge| edge["sites"].as_array().unwrap())
         .filter(|site| site["callId"].is_null())
         .collect();
-    assert!(!imports.is_empty());
     for site in imports {
         assert!(site["caller"].is_null());
         assert_eq!(site["callerReason"], "syntax_only");

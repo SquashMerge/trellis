@@ -11623,18 +11623,21 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
     use trellis::daemon::registry::CheckoutRegistry;
     for legacy in [false, true] {
         let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("checkout/src")).unwrap();
         let (identity, topology) = published_inactive_checkout(
             temp.path(),
             &[
+                ("src/a.rs", "pub fn a() { crate::b::b(); }\n"),
+                ("src/b.rs", "pub fn b() {}\n"),
+                ("src/lib.rs", "mod a; mod b;\n"),
                 (
-                    "a.js",
-                    "import {b} from './b.js'; export function a() { b(); }\n",
+                    "Cargo.toml",
+                    "[package]\nname='boundary'\nversion='0.1.0'\n[lib]\npath='lib.rs'\n",
                 ),
-                ("b.js", "export function b() {}\n"),
             ],
         );
         fs::create_dir(identity.root.join(".trellis")).unwrap();
-        let rules = "version = 1\n[layers.top]\norder = 1\npaths = [\"a.js\"]\n[layers.bottom]\norder = 2\npaths = [\"b.js\"]\n";
+        let rules = "version = 1\n[layers.top]\norder = 2\npaths = [\"src/a.rs\"]\n[layers.bottom]\norder = 1\npaths = [\"src/b.rs\"]\n";
         fs::write(identity.root.join(".trellis/rules.toml"), rules).unwrap();
         let mut registry = CheckoutRegistry::with_roots(topology);
         registry.attach_launch(129, &identity).unwrap();
@@ -11692,7 +11695,7 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
         tool(&checked, None, !legacy);
         let checked_env = &checked["result"]["structuredContent"];
         assert_eq!(checked_env["evidenceBasis"], basis);
-        assert_eq!(checked_env["data"]["counts"]["conforms"], 1, "{checked}");
+        assert_eq!(checked_env["data"]["counts"]["deviates"], 1, "{checked}");
         let instance = &checked_env["data"]["instances"][0];
         let call_site = instance["evidence"]
             .as_array()
@@ -11700,7 +11703,7 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
             .iter()
             .find(|site| !site["callId"].is_null())
             .expect("native call site");
-        assert_eq!(call_site["caller"]["stableLookupKey"], "a.js::a");
+        assert_eq!(call_site["caller"]["stableLookupKey"], "src/a.rs::a");
         assert!(call_site["callerReason"].is_null());
         let explain = ask(
             3,
@@ -11713,6 +11716,42 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
             explain["result"]["structuredContent"]["data"]["instances"],
             checked_env["data"]["instances"]
         );
+        assert_eq!(
+            explain["result"]["structuredContent"]["data"]["instances"][0]["evidence"],
+            instance["evidence"]
+        );
+        let outgoing = ask(
+            20,
+            "tools/call",
+            json!({"name":"trellis_outgoing_calls","arguments":{
+                "schemaVersion":1,"lookupKey":call_site["caller"]["stableLookupKey"],"expectedBasis":basis
+            }}),
+        );
+        tool(&outgoing, None, !legacy);
+        assert_eq!(
+            outgoing["result"]["structuredContent"]["data"]["calls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::write(identity.root.join(".trellis/rules.toml"), format!("{rules}\n[[exceptions]]\nrule='$layers'\ntarget={{language='rust',path='src/a.rs'}}\ndestination={{language='rust',path='src/b.rs'}}\nreason='Reviewed boundary'\n")).unwrap();
+        let excepted = ask(
+            21,
+            "tools/call",
+            json!({"name":"trellis_rules_check","arguments":{
+                "schemaVersion":1,"expectedBasis":basis
+            }}),
+        );
+        tool(&excepted, None, !legacy);
+        let excepted_row = &excepted["result"]["structuredContent"]["data"]["instances"][0];
+        assert_eq!(excepted_row["excepted"], true);
+        assert_eq!(excepted_row["evidence"], instance["evidence"]);
+        validate_structured_content(&[
+            json!({"name":"trellis_rules_check","structuredContent":excepted["result"]["structuredContent"]}),
+            json!({"name":"trellis_outgoing_calls","structuredContent":outgoing["result"]["structuredContent"]}),
+        ]);
+        fs::write(identity.root.join(".trellis/rules.toml"), rules).unwrap();
         let mut absent_destination = instance["destination"].clone();
         absent_destination["sid"] = json!(format!("sid:v1:{}", "f".repeat(32)));
         let not_found = ask(
