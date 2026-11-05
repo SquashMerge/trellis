@@ -460,10 +460,14 @@ async fn a_new_revision_supersedes_a_build_that_is_computing() {
 /// A read for a rules file newer than the running build waits for that file's build.
 #[tokio::test]
 async fn a_rules_edit_during_a_build_is_built_next() {
-    let (base, runtime, browser, key) = fixture().await;
-    write_rules(&base, RULES);
+    let (base, runtime, browser, key) =
+        fixture_with_sources(false, &[(".trellis/fixture", "rules build fixture\n")]).await;
+    let (initial, _) = runtime.evidence_response().unwrap();
+    let initial_pin = initial.status().unwrap().revision;
+    initial.finish(()).unwrap();
     let scheduler = runtime.browser_scheduler().unwrap();
     let hold = Hold::at(&scheduler, "evaluating");
+    write_rules(&base, RULES);
     scheduler.architecture_hint();
     hold.wait_reached();
     write_rules(&base, OTHER_RULES);
@@ -479,6 +483,11 @@ async fn a_rules_edit_during_a_build_is_built_next() {
         "indexRevision": read["payload"]["indexRevision"]
     }))
     .unwrap();
+    assert_eq!(
+        pin, initial_pin,
+        "rules edits do not publish a native revision"
+    );
+    assert_eq!(read["payload"]["modules"].as_array().unwrap().len(), 4);
     let (fresh, _) = runtime.evidence_response().unwrap();
     let computed = fresh
         .architecture_view(
