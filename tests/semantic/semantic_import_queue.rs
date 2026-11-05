@@ -823,8 +823,21 @@ fn two_document_case(change_b: &str) {
             );
             std::thread::yield_now();
         }
+        // Native-first semantic catch-up may publish a same-native head after the native
+        // request returned (#702), so the cutoff binds the native revision, not the pin.
         let before = store.index_baseline().unwrap();
-        assert_eq!(before, advanced_pin);
+        assert_eq!(before.index_generation, advanced_pin.index_generation);
+        assert!(before.index_revision >= advanced_pin.index_revision);
+        assert_eq!(
+            store
+                .retained_native_snapshot_at(before)
+                .unwrap()
+                .0
+                .revision
+                .id,
+            r2_native.revision.id,
+            "the candidate cutoff is at the native request's revision"
+        );
         if change_b == "cutoff" {
             fs::write(
                 root.join("src/A.js"),
@@ -850,7 +863,7 @@ fn two_document_case(change_b: &str) {
         let committed: trellis::model::IndexPin =
             serde_json::from_value(response["publishedRevision"].clone()).unwrap();
         assert!(
-            committed.index_revision >= advanced_pin.index_revision + 2,
+            committed.index_revision >= before.index_revision + 2,
             "native reconciliation must precede semantic publication"
         );
         assert_eq!(
