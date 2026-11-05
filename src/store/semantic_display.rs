@@ -415,15 +415,17 @@ pub(super) fn document_projections(
 }
 
 #[cfg(feature = "test-support")]
-static STATUS_SEMANTIC_PROJECTIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static THREAD_STATUS_SEMANTIC_PROJECTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
-/// How many status semantic projections this process has run (#666), so a test can see
-/// that the browser's head digest skips them.
+/// How many status semantic projections the calling thread has run. A caller brackets
+/// its own read with this, so background work on other threads, such as the dependency
+/// catalog build, is never attributed to it (#700).
 #[cfg(feature = "test-support")]
-#[doc(hidden)]
-pub fn status_semantic_projections_for_tests() -> usize {
-    STATUS_SEMANTIC_PROJECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+pub(crate) fn status_semantic_projections_on_thread_for_tests() -> usize {
+    THREAD_STATUS_SEMANTIC_PROJECTIONS.with(std::cell::Cell::get)
 }
 
 /// Replace status's publication-time semantic counts with each language's selected producer
@@ -434,7 +436,7 @@ pub(super) fn status_semantics(
     status: &mut crate::model::IndexStatus,
 ) -> Result<()> {
     #[cfg(feature = "test-support")]
-    STATUS_SEMANTIC_PROJECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THREAD_STATUS_SEMANTIC_PROJECTIONS.with(|count| count.set(count.get() + 1));
     let key = semantic_pin_key(status.revision);
     let defaults = default_producers(db, &key)?;
     let reimports = super::semantic_retention::semantic_reimport_at(db, &key)?;

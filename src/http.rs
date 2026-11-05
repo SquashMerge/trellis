@@ -233,7 +233,7 @@ pub struct DaemonState {
     /// Runs as a catalog build begins, before it reads the workspace revision
     /// (`"before_revision"`), and after it published its outcome (`"published"`).
     #[cfg(feature = "test-support")]
-    dependency_hook: Mutex<Option<Arc<dyn Fn(&'static str) + Send + Sync>>>,
+    dependency_hook: Mutex<Option<DependencyHook>>,
     dependencies: Mutex<DependencyIndex>,
     #[cfg(test)]
     dependency_idle: tokio::sync::Notify,
@@ -1814,10 +1814,7 @@ impl DaemonState {
     }
     /// Observe or pause catalog builds (#700). Installed before startup begins.
     #[cfg(feature = "test-support")]
-    pub(crate) fn set_dependency_hook_for_tests(
-        &self,
-        hook: Arc<dyn Fn(&'static str) + Send + Sync>,
-    ) {
+    pub(crate) fn set_dependency_hook_for_tests(&self, hook: DependencyHook) {
         *self.dependency_hook.lock().unwrap() = Some(hook);
     }
     #[cfg(feature = "test-support")]
@@ -3457,6 +3454,24 @@ mod maintenance_telemetry_tests;
 /// The socket-only daemon has no HTTP state. This router is constructed only
 /// after a validated explicit serve registration binds a loopback listener.
 type SelectedResponseHook = Arc<dyn Fn(&'static str) + Send + Sync>;
+/// Observes a dependency catalog build's phases (#700).
+#[cfg(feature = "test-support")]
+type DependencyHook = Arc<dyn Fn(&'static str) + Send + Sync>;
+
+/// Status semantic projections run by the browser's `/status` and `/status/head` reads
+/// themselves, counted on their own blocking threads: the dependency catalog build and
+/// other background readers in the same process never count (#700).
+#[cfg(feature = "test-support")]
+static BROWSER_STATUS_PROJECTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many status semantic projections the browser's status reads have run in this
+/// process (#666, #700).
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn browser_status_semantic_projections_for_tests() -> usize {
+    BROWSER_STATUS_PROJECTIONS.load(Ordering::Relaxed)
+}
 
 #[derive(Clone)]
 pub struct ProvisionedBrowser {
@@ -5216,12 +5231,19 @@ async fn provisioned_core_answer(
             let runtime = runtime.clone();
             let (status, catching_up) = tokio::task::spawn_blocking(move || {
                 let (response, catching_up) = runtime.evidence_response()?;
+                #[cfg(feature = "test-support")]
+                let projected = crate::store::status_semantic_projections_on_thread_for_tests();
                 // #666: the head digest needs no per-language semantic projection.
                 let mut status = if head {
                     response.status_head()?
                 } else {
                     response.status()?
                 };
+                #[cfg(feature = "test-support")]
+                BROWSER_STATUS_PROJECTIONS.fetch_add(
+                    crate::store::status_semantic_projections_on_thread_for_tests() - projected,
+                    Ordering::Relaxed,
+                );
                 let catching_up = catching_up || response.semantic_catching_up()?;
                 status.catching_up |= catching_up;
                 if let Some(hook) = hook {

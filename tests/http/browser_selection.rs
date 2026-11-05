@@ -3075,7 +3075,7 @@ async fn caught_up_head(app: &axum::Router, head_path: &str) -> Value {
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn browser_status_projections_count_the_full_status_itself() {
-    use trellis::store::status_semantic_projections_for_tests as projections;
+    use trellis::http::browser_status_semantic_projections_for_tests as projections;
     let browser = held_catalog_browser();
     let (app, prefix) = (&browser.app, &browser.prefix);
     let full = caught_up_head(app, &format!("{prefix}/status/head")).await;
@@ -3092,7 +3092,7 @@ async fn browser_status_projections_count_the_full_status_itself() {
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn unchanged_status_head_is_a_cheap_conditional_read() {
-    use trellis::store::status_semantic_projections_for_tests as projections;
+    use trellis::http::browser_status_semantic_projections_for_tests as projections;
     let HeldCatalogBrowser {
         _temp,
         root,
@@ -3122,7 +3122,12 @@ async fn unchanged_status_head_is_a_cheap_conditional_read() {
         format!("\"other\", {etag}"),
     ] {
         let (code, again, body) = head_with(app.clone(), &head_path, Some(&tag)).await;
-        assert_eq!(code, axum::http::StatusCode::NOT_MODIFIED, "{tag}");
+        assert_eq!(
+            code,
+            axum::http::StatusCode::NOT_MODIFIED,
+            "{tag}: {} after {head}",
+            String::from_utf8_lossy(&body)
+        );
         assert_eq!(again.as_deref(), Some(etag.as_str()));
         assert!(body.is_empty());
     }

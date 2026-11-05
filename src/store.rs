@@ -24,7 +24,7 @@ pub use search::{
 };
 pub use search_startup::RecentSearchCheckout;
 #[cfg(feature = "test-support")]
-pub use semantic_display::status_semantic_projections_for_tests;
+pub(crate) use semantic_display::status_semantic_projections_on_thread_for_tests;
 pub use semantic_display::{
     CallSemantic, LANGUAGE_NOTE, LanguageTier, McpSemantic, NO_PRODUCER_NOTE, ProducerNotPublished,
     ProducerSelection, multiple_producers_note,
