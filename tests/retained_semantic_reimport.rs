@@ -22,17 +22,36 @@ struct World {
     checkout: Checkout,
     _stub: tempfile::TempDir,
     marker: PathBuf,
+    daemon_stderr: PathBuf,
     index: PathBuf,
     requests: PathBuf,
     language: &'static str,
 }
 
 fn reply(operation: &str, output: Output) -> Value {
-    assert!(
-        output.status.success(),
-        "{operation} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    reply_with(operation, output, None)
+}
+
+/// The CLI's JSON reply. A failure shows the reply on stdout (state, errorCode, diagnostics)
+/// and, when the fixture kept one, the tail of the daemon's stderr.
+fn reply_with(operation: &str, output: Output, daemon_stderr: Option<&Path>) -> Value {
+    if !output.status.success() {
+        let daemon = daemon_stderr.map_or_else(String::new, |path| {
+            let text = fs::read(path).unwrap_or_default();
+            let tail = &text[text.len().saturating_sub(16 * 1024)..];
+            format!(
+                "\ndaemon stderr tail ({}):\n{}",
+                path.display(),
+                String::from_utf8_lossy(tail)
+            )
+        });
+        panic!(
+            "{operation} failed ({}): {}\nstdout: {}{daemon}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
+    }
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
@@ -56,7 +75,12 @@ impl World {
     fn for_workspace(language: &'static str, name: &str, hook: Option<&Path>, git: bool) -> Self {
         let stub = tempfile::tempdir().unwrap();
         let marker = stub.path().join("invocations");
+        let daemon_stderr = stub.path().join("daemon.stderr");
         let mut env = support::stub_env(stub.path(), &json!({"marker":marker}));
+        env.push((
+            "TRELLIS_TEST_DAEMON_STDERR".into(),
+            daemon_stderr.to_string_lossy().into_owned(),
+        ));
         env.push((
             "TRELLIS_TEST_PRODUCER_STUB_LANGUAGE".into(),
             language.into(),
@@ -100,10 +124,22 @@ impl World {
             checkout,
             _stub: stub,
             marker,
+            daemon_stderr,
             index,
             requests,
             language,
         }
+    }
+
+    /// The checkout's CLI; a daemon it starts keeps its stderr for failure messages.
+    fn cli(&self) -> std::process::Command {
+        let mut command = self.checkout.cli();
+        command.env("TRELLIS_TEST_DAEMON_STDERR", &self.daemon_stderr);
+        command
+    }
+
+    fn reply(&self, operation: &str, output: Output) -> Value {
+        reply_with(operation, output, Some(&self.daemon_stderr))
     }
 
     fn spawn_run(&self) -> Child {
@@ -147,18 +183,16 @@ impl World {
             "mode.json",
             &json!({"marker":self.marker,"emit":artifact}),
         );
-        let plan = reply(
+        let plan = self.reply(
             "producer plan",
-            self.checkout
-                .cli()
+            self.cli()
                 .args(["producer", "plan", "--workspace"])
                 .arg(&self.checkout.root)
                 .args(["--producer", PRODUCER])
                 .output()
                 .unwrap(),
         );
-        self.checkout
-            .cli()
+        self.cli()
             .args(["producer", "run", "--workspace"])
             .arg(&self.checkout.root)
             .args([
@@ -178,7 +212,7 @@ impl World {
     }
 
     fn run_once_variant(&self, variant: u32) -> (Value, Vec<u8>, Value) {
-        let run = reply(
+        let run = self.reply(
             "producer run",
             self.spawn_run_variant(variant).wait_with_output().unwrap(),
         );
@@ -205,10 +239,9 @@ impl World {
     }
 
     fn status(&self) -> Value {
-        reply(
+        self.reply(
             "status",
-            self.checkout
-                .cli()
+            self.cli()
                 .args(["status", "--workspace"])
                 .arg(&self.checkout.root)
                 .output()
@@ -227,10 +260,9 @@ impl World {
         db.pragma_update(None, "user_version", version - 1).unwrap();
         drop(db);
         // The real daemon establishes the new native head and owns retained FIFO work.
-        reply(
+        self.reply(
             "index after upgrade",
-            self.checkout
-                .cli()
+            self.cli()
                 .args(["index", "--workspace"])
                 .arg(&self.checkout.root)
                 .output()
