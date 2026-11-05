@@ -67,13 +67,7 @@ impl<'a> Callers<'a> {
         let Some(call) = self.calls.get(call_id) else {
             return (None, Some("enclosing_callable_unknown"));
         };
-        // Native callee ranges can be only the final name of a qualified invocation.
-        if *range != call.range
-            && !call.callee_range.as_ref().is_some_and(|callee| {
-                (callee.start <= range.start && range.end <= callee.end)
-                    || (range.start == call.range.start && range.end == callee.end)
-            })
-        {
+        if !matches_site(call, range) {
             return (None, Some("syntax_only"));
         }
         match self.owners.get(call.owner_syntax_id.as_str()) {
@@ -92,6 +86,18 @@ impl<'a> Callers<'a> {
         evidence["caller"] = serde_json::to_value(caller).expect("caller serialization");
         evidence["callerReason"] = serde_json::to_value(reason).expect("reason serialization");
     }
+}
+
+pub(super) fn matches_site(
+    call: &crate::native_evidence::Call,
+    range: &crate::native_evidence::Range,
+) -> bool {
+    // Native callee ranges can be only the final name of a qualified invocation.
+    *range == call.range
+        || call.callee_range.as_ref().is_some_and(|callee| {
+            (callee.start <= range.start && range.end <= callee.end)
+                || (range.start == call.range.start && range.end == callee.end)
+        })
 }
 
 #[cfg(test)]

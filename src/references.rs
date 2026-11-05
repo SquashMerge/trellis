@@ -917,19 +917,26 @@ impl SiteContext<'_> {
             DeclarationRole::Test => "test",
             DeclarationRole::Production => "production",
         });
+        let range = crate::native_evidence::Range { start, end };
         let call_id = match call_id {
             Some(id) => Some(id),
-            None => self
-                .calls
-                .enclosing(start, end, work, check)?
-                .into_iter()
-                .min()
-                .map(|index| doc.calls[index].id.clone()),
+            None => {
+                let candidates = self.calls.enclosing(start, end, work, check)?;
+                let mut exact = None;
+                for &index in &candidates {
+                    owner_step(work, check)?;
+                    if callers::matches_site(&doc.calls[index], &range)
+                        && exact.is_none_or(|previous| index < previous)
+                    {
+                        exact = Some(index);
+                    }
+                }
+                exact
+                    .or_else(|| candidates.into_iter().min())
+                    .map(|index| doc.calls[index].id.clone())
+            }
         };
-        let (caller, caller_reason) = self.callers.get(
-            call_id.as_deref(),
-            &crate::native_evidence::Range { start, end },
-        );
+        let (caller, caller_reason) = self.callers.get(call_id.as_deref(), &range);
         Ok(Site {
             caller,
             caller_reason,
