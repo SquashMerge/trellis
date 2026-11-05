@@ -168,7 +168,7 @@ fn fork_oracle_admission_retries_typed_busy_after_the_owner_releases() {
             assert!(
                 opened
                     .as_ref()
-                    .is_err_and(|error| trellis::store::cli_read_retryable_contention(error))
+                    .is_err_and(trellis::store::cli_read_retryable_contention)
             );
             drop(exclusive.take());
         }
