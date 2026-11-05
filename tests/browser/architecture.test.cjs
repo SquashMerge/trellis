@@ -200,6 +200,14 @@ test("Architecture authored exceptions reach the same caller and preserve the ex
   await entry.waitFor({state:"visible"});
   assert.match(await entry.textContent(), /Reviewed boundary for sequence navigation/);
   await page.locator("#architecture-inspector-content .architecture-caller").first().waitFor({state:"visible"});
+  const exceptedArrow = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation · exception/});
+  await exceptedArrow.focus(); await page.keyboard.press("Enter"); await settled(page);
+  const arrowCaller = page.locator("#architecture-inspector-content .architecture-caller").filter({hasText:/\blow\b/}).first();
+  await arrowCaller.getByRole("button", {name:"Open sequence", exact:true}).click();
+  await page.waitForFunction(() => document.querySelector("#sequence-diagram [data-boundary-highlight='true']") || document.querySelector("#sequence-boundary-status")?.textContent.includes("Show all steps"));
+  await page.goBack();
+  await page.locator("#architecture-panel").waitFor({state:"visible"});
+  assert.equal(await exceptedArrow.getAttribute("aria-pressed"), "true", "excepted arrows have the same round trip as deviations");
 }));
 
 test("Architecture does not invent a caller for syntax-only non-call boundary sites", {timeout:240000}, async () => {
