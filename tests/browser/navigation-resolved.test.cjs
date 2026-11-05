@@ -133,6 +133,12 @@ paths = ["target.rs"]
       const box = node.getBoundingClientRect(), canvas = document.querySelector("#sequence-diagram").getBoundingClientRect();
       return box.bottom > canvas.top && box.top < canvas.bottom;
     }), true);
+    await page.getByRole("button", {name:"Open callee sequence: actual_target", exact:true}).first().click();
+    await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.startsWith("actual_target"));
+    await page.goBack();
+    await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.startsWith("measured"));
+    assert.equal(await page.locator("#sequence-boundary-status").isVisible(), true, "Back from a callee preserves the boundary context");
+    assert.deepEqual(await page.locator("#sequence-diagram .pele-message[data-boundary-highlight='true']").evaluateAll(nodes => nodes.map(node => node.dataset.trellisCallId)), fixture.calls);
     await page.goBack();
     await page.locator("#architecture-panel").waitFor({state:"visible"});
     await page.locator("#architecture-inspector-content .architecture-caller").waitFor({state:"visible"});

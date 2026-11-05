@@ -233,6 +233,39 @@ test("Architecture does not invent a caller for syntax-only non-call boundary si
   }, new Map(), withTypes);
 });
 
+
+test("Architecture keeps distinct measured callers with colliding stable lookup keys separate", {timeout:240000}, async () => {
+  const files = new Map([
+    ["src/lib.rs", "mod low; mod top;\n"],
+    ["src/low.rs", "pub struct Store; pub trait First { fn same(); } pub trait Second { fn same(); } impl First for Store { fn same() { crate::top::target(); } } impl Second for Store { fn same() { crate::top::target(); } }\n"],
+    ["src/top.rs", "pub fn target() {}\n"],
+  ]);
+  const config = 'version=1\n[layers.low]\norder=2\npaths=["src/low.rs"]\n[layers.top]\norder=1\npaths=["src/top.rs"]\n';
+  await published(config, async ({page}) => {
+    await ready(page);
+    const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation/});
+    await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
+    const callers = page.locator("#architecture-inspector-content .architecture-caller");
+    assert.equal(await callers.count(), 2, "a stable lookup key is not an exact callable identity");
+    const ids = await callers.evaluateAll(nodes => nodes.map(node => node.dataset.symbolId));
+    assert.equal(new Set(ids).size, 2);
+    for (const id of ids) {
+      const exact = page.locator(`#architecture-inspector-content .architecture-caller[data-symbol-id="${id}"]`);
+      assert.match(await exact.textContent(), /1 boundary site/);
+      const selected = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().postDataJSON()?.seed === id);
+      await exact.getByRole("button", {name:"Open sequence", exact:true}).click();
+      const response = await selected;
+      assert.equal((await response.json()).seed.id, id);
+      await page.locator("#sequence-panel").waitFor({state:"visible"});
+      await page.waitForFunction(() => document.querySelector("#sequence-boundary-status")?.textContent.includes("1 boundary call highlighted"));
+      assert.doesNotMatch(await page.locator("#sequence-boundary-status").textContent(), /not shown/);
+      await page.goBack();
+      await page.locator("#architecture-panel").waitFor({state:"visible"});
+      await page.locator(`#architecture-inspector-content .architecture-caller[data-symbol-id="${id}"]`).waitFor();
+    }
+  }, new Map(), files);
+});
+
 const identityKey = identity => JSON.stringify([identity.sourceSetId, identity.language, identity.path, identity.sid]);
 const siteTotal = edges => edges.reduce((sum, edge) => sum + edge.count, 0);
 const summaryKey = edge => JSON.stringify([edge.sourceLayer, edge.destinationLayer, edge.role, edge.status, edge.excepted, edge.exceptionReason]);
