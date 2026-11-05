@@ -1085,6 +1085,128 @@ mod tests {
             .unwrap();
     }
 
+    /// A catch-up whose continuation keeps its index read connection across a yield (#671).
+    #[cfg(feature = "test-support")]
+    fn held_read_fixture() -> (
+        tempfile::TempDir,
+        crate::store::Store,
+        Arc<DaemonState>,
+        CancelFlag,
+        SemanticMaintenance,
+    ) {
+        let (tmp, store, state, options, cancel, _native) = two_pending_producers_fixture();
+        let session = state.runtime.lock().unwrap().session().unwrap().clone();
+        state.worker_step().unwrap();
+        state.next_wake();
+        state.inbox.wait(Some(Instant::now()));
+        assert_eq!(state.maintenance_priority_reason(&session, &options), None);
+        drop(session);
+        crate::store::set_semantic_step_slice_for_tests(Duration::ZERO);
+        let mut semantic = SemanticMaintenance::default();
+        // The first unit only creates the continuation; the second opens its connection.
+        assert!(semantic.run_unit(&state, &cancel).is_some());
+        assert_eq!(store.held_semantic_reads_for_tests(), 0);
+        assert!(semantic.run_unit(&state, &cancel).is_some());
+        assert!(semantic.continuation.is_some());
+        assert_eq!(store.held_semantic_reads_for_tests(), 1);
+        // A later unit reuses it: still one connection, and the catch-up still progresses.
+        assert!(semantic.run_unit(&state, &cancel).is_some());
+        assert_eq!(store.held_semantic_reads_for_tests(), 1);
+        (tmp, store, state, cancel, semantic)
+    }
+
+    /// Recreation runs on the worker between S units. Its exclusive use admission closes the
+    /// held read connection first, so the same step recreates instead of deferring as busy.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn recreate_closes_a_held_semantic_read_connection() {
+        let (_tmp, store, state, cancel, mut semantic) = held_read_fixture();
+        let old = state
+            .runtime
+            .lock()
+            .unwrap()
+            .session()
+            .unwrap()
+            .incarnation();
+        store.mark_recreate_pending_for_tests();
+        let at_exclusive = Arc::new(std::sync::Mutex::new(None));
+        let observed = at_exclusive.clone();
+        let hook_store = store.clone();
+        store.set_exclusive_recovery_hook(move || {
+            *observed.lock().unwrap() = Some(hook_store.held_semantic_reads_for_tests());
+        });
+        // No `before_foreground`: the transition itself must release the connection.
+        state.worker_step().unwrap();
+        assert_eq!(
+            *at_exclusive.lock().unwrap(),
+            Some(0),
+            "recreation did not reach exclusive use with the S connection closed"
+        );
+        assert!(!store.is_recreate_pending());
+        let session = state.runtime.lock().unwrap().session().unwrap().clone();
+        assert_ne!(session.incarnation(), old);
+        assert_eq!(store.held_semantic_reads_for_tests(), 0);
+        // The stale continuation belongs to the released session: it is dropped, not resumed.
+        drop(session);
+        semantic.before_foreground(&state);
+        semantic.run_unit(&state, &cancel);
+        assert!(semantic.owner != Some(old));
+    }
+
+    /// A FIFO native publication needs no release: between units the held connection has no
+    /// open transaction, so it holds no SQLite lock. Its next unit sees the new target.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn native_publication_commits_beside_a_held_semantic_read_connection() {
+        let (_tmp, store, state, cancel, mut semantic) = held_read_fixture();
+        let target = store.pending_semantic_target().unwrap().unwrap();
+        let options = state.config().options.clone();
+        std::fs::write(
+            options.workspace_root.join("a.js"),
+            "function f(){g();} // FIFO beside held S\n",
+        )
+        .unwrap();
+        let request = state.enqueue_index(&options, None).unwrap();
+        state.worker_step().unwrap();
+        assert_eq!(
+            store.request_by_id(&request.id).unwrap().unwrap().state,
+            "done"
+        );
+        assert_eq!(store.held_semantic_reads_for_tests(), 1);
+        assert_ne!(store.pending_semantic_target().unwrap().unwrap(), target);
+        state.worker_step().unwrap();
+        state.next_wake();
+        state.inbox.wait(Some(Instant::now()));
+        // The held connection's fresh snapshot sees the new target: the superseded
+        // continuation and its connection are dropped, and a new one starts unopened.
+        assert!(semantic.run_unit(&state, &cancel).is_some());
+        assert!(semantic.continuation.is_some());
+        assert_eq!(store.held_semantic_reads_for_tests(), 0);
+    }
+
+    /// Retirement closes the held read connection before it releases the writer, so a
+    /// retired runtime keeps no index connection while its worker stack still owns S.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn retirement_closes_a_held_semantic_read_connection() {
+        let (_tmp, store, state, _cancel, semantic) = held_read_fixture();
+        assert_eq!(
+            state.request_retire(|_| true),
+            super::super::RetireOutcome::Requested
+        );
+        let at_close = Arc::new(std::sync::Mutex::new(None));
+        let observed = at_close.clone();
+        let hook_store = store.clone();
+        state.set_closing_hook_for_tests(move || {
+            *observed.lock().unwrap() = Some(hook_store.held_semantic_reads_for_tests());
+        });
+        state.worker_step().unwrap();
+        assert!(state.retired());
+        assert_eq!(*at_close.lock().unwrap(), Some(0));
+        assert!(semantic.continuation.is_some());
+        assert_eq!(store.held_semantic_reads_for_tests(), 0);
+    }
+
     #[test]
     fn shutdown_signal_cancels_the_same_unit_flag() {
         let inbox = super::super::WorkerInbox::default();

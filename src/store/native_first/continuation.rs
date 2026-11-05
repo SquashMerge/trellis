@@ -37,8 +37,16 @@ pub fn set_semantic_step_slice_for_tests(slice: std::time::Duration) {
     STEP_SLICE_OVERRIDE.with(|cell| cell.set(Some(slice)));
 }
 
+/// The index read connection, with its use guard, that one S continuation keeps across its
+/// yields (#671): each unit takes a fresh snapshot on it instead of reopening the index.
+/// Dropping the continuation closes it. Exclusive use transitions and retirement close it
+/// first through [`Store::release_semantic_reads`]; the next unit then reopens.
+#[derive(Default)]
+pub(crate) struct HeldIndexRead(Mutex<Option<IndexConnection>>);
+
 pub(crate) struct SemanticContinuation {
     target: PendingSemanticTarget,
+    read: Arc<HeldIndexRead>,
     next: usize,
     current: Option<ProducerContinuation>,
     prepared: Vec<PreparedSemantic>,
@@ -107,6 +115,111 @@ impl SemanticContinuation {
 }
 
 impl Store {
+    /// Close every read connection an S continuation keeps across yields. The worker thread
+    /// never runs a transition inside an S unit, so on that thread the connection is always
+    /// in its slot here. A unit running on another thread keeps its connection to the end of
+    /// its slice, exactly as an unheld connection would.
+    pub(crate) fn release_semantic_reads(&self) {
+        let held: Vec<_> = self
+            .semantic_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        for read in held {
+            let connection = read.0.lock().unwrap().take();
+            drop(connection);
+        }
+    }
+
+    /// How many S continuations keep an open read connection across yields now.
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn held_semantic_reads_for_tests(&self) -> usize {
+        let held: Vec<_> = self
+            .semantic_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        held.iter()
+            .filter(|read| read.0.lock().unwrap().is_some())
+            .count()
+    }
+
+    /// Classify the index for exceptional recreation, as a read finding an obsolete or
+    /// exceptional format does.
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn mark_recreate_pending_for_tests(&self) {
+        self.mark_recovery(RecoveryDisposition::RecreatePending);
+    }
+
+    /// One read snapshot on a continuation's held connection, opened on first use. A
+    /// failed read closes the connection, so the next unit reopens and revalidates it.
+    pub(super) fn with_held_read<T>(
+        &self,
+        held: &HeldIndexRead,
+        read: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let mut connection = held.0.lock().unwrap().take();
+        let result = (|| {
+            let db = match &mut connection {
+                Some(db) => {
+                    // What `connect_index` checks after its open, without reopening.
+                    (|| {
+                        self.ensure_not_recreate_pending()?;
+                        self.identity.verify()?;
+                        db._use_guard.verify()
+                    })()
+                    .inspect_err(|error| {
+                        self.note_index_failure(error);
+                    })?;
+                    READ_GATE
+                        .with(|gate| *gate.borrow_mut() = Arc::downgrade(&self.publication_gate));
+                    db
+                }
+                None => connection.insert(self.cache()?),
+            };
+            let tx = storage_result(db.transaction())?;
+            begin_read_snapshot(
+                &tx,
+                &self.roots.index_db(&self.identity),
+                Duration::from_secs(5),
+            )?;
+            read(&tx)
+        })()
+        .map_err(|error| self.report_index_failure(error));
+        if result.is_ok()
+            && let Some(connection) = connection
+        {
+            *held.0.lock().unwrap() = Some(connection);
+        }
+        result
+    }
+
+    /// `pending_semantic_target` on a continuation's held connection.
+    fn pending_semantic_target_held(
+        &self,
+        held: &HeldIndexRead,
+    ) -> Result<Option<PendingSemanticTarget>> {
+        if self.disposition() == RecoveryDisposition::UpgradePending || self.is_recreate_pending() {
+            return Err(
+                topology::IndexNotReady::new("exceptional index reconciliation pending").into(),
+            );
+        }
+        self.with_held_read(held, |db| {
+            let target = pending_target(db)?;
+            if let Some(target) = &target {
+                selected_ensure!(
+                    target.root_id == self.identity.root_key,
+                    "incompatible_index: pending semantic root differs"
+                );
+            }
+            Ok(target)
+        })
+    }
+
     pub(crate) fn semantic_maintenance_unit(
         &self,
         session: &topology::WriterSession,
@@ -196,7 +309,11 @@ impl Store {
             *continuation = None;
             return Err(error);
         }
-        let target = match self.pending_semantic_target() {
+        let target = match continuation.as_ref() {
+            Some(state) => self.pending_semantic_target_held(&state.read),
+            None => self.pending_semantic_target(),
+        };
+        let target = match target {
             Ok(target) => target,
             Err(error) => {
                 *continuation = None;
@@ -219,10 +336,17 @@ impl Store {
                 &target.native_revision_id,
                 BTreeSet::new(),
             );
+            let read = Arc::new(HeldIndexRead::default());
+            {
+                let mut reads = self.semantic_reads.lock().unwrap();
+                reads.retain(|read| read.strong_count() > 0);
+                reads.push(Arc::downgrade(&read));
+            }
             *continuation = Some(SemanticContinuation {
                 #[cfg(feature = "test-support")]
                 work: crate::semantic_import::publication_work_checkpoint(),
                 target,
+                read,
                 next: 0,
                 current: None,
                 prepared: Vec::new(),
@@ -259,7 +383,8 @@ impl Store {
         let stage_parent = self.semantic_stage_parent()?;
         let limits = batch_publication_limits();
         let target = state.target.clone();
-        let result = self.with_pending_semantic_inputs(&target, |db, destination_read| {
+        let held = state.read.clone();
+        let result = self.with_pending_semantic_inputs(&target, &held, |db, destination_read| {
             // One coherent snapshot serves several bounded steps; it never survives a return
             // to worker selection, and the slice keeps foreground work waiting briefly.
             let started = std::time::Instant::now();

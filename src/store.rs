@@ -509,6 +509,9 @@ pub struct Store {
     test_stream_before_preflight_hook: Arc<Mutex<Option<TestStreamPreflightHook>>>,
     /// The publication page cache in KiB; only tests lower it.
     publication_cache_kib: Arc<std::sync::atomic::AtomicI64>,
+    /// The read connections S continuations keep across yields (#671), so exclusive use
+    /// transitions and retirement can close them first. Each continuation owns its own.
+    semantic_reads: Arc<Mutex<Vec<std::sync::Weak<native_first::HeldIndexRead>>>>,
     writer_before_metadata_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
@@ -12233,6 +12236,7 @@ impl Store {
             publication_cache_kib: Arc::new(std::sync::atomic::AtomicI64::new(
                 PUBLICATION_CACHE_KIB,
             )),
+            semantic_reads: Arc::default(),
             writer_before_metadata_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
@@ -12521,7 +12525,7 @@ impl Store {
         // Never unlink until exclusive admission; inability to prove this
         // leaves a named temporary file rather than leaked deleted-file space.
         let acquired = if exclusive_leader.is_none() {
-            Some(self.roots.index_use_exclusive_existing(&self.identity)?)
+            Some(self.index_use_exclusive()?)
         } else {
             None
         };
@@ -13111,7 +13115,7 @@ impl Store {
     fn recover_hot_index_journal(&self) -> Result<()> {
         let path = self.roots.index_db(&self.identity);
         let journal = path.with_file_name("index.db-journal");
-        let exclusive = self.roots.index_use_exclusive_existing(&self.identity)?;
+        let exclusive = self.index_use_exclusive()?;
         if !index_path_present(&journal)? {
             return Ok(());
         }
@@ -13156,6 +13160,12 @@ impl Store {
         self.published_admission.invalidate();
         drop(exclusive);
         Ok(())
+    }
+    /// Exclusive use of this checkout's index. A held S read connection (#671) closes
+    /// first, so a connection kept across yields never blocks recreation or recovery.
+    fn index_use_exclusive(&self) -> Result<topology::UseGuard> {
+        self.release_semantic_reads();
+        self.roots.index_use_exclusive_existing(&self.identity)
     }
     fn cache_write(&self) -> Result<IndexConnection> {
         self.connect_index(true)
@@ -13925,7 +13935,7 @@ impl Store {
         // publication or claim is admitted until every foreign-root row is
         // confirmed terminal by a separate queue reread.
         self.settle_foreign_root_requests()?;
-        let exclusive = self.roots.index_use_exclusive_existing(&self.identity)?;
+        let exclusive = self.index_use_exclusive()?;
         let mut writer = self
             .roots
             .writer_under_exclusive(self.identity.clone(), exclusive)?;
@@ -15092,7 +15102,7 @@ impl Store {
         cancel: &CancelFlag,
         fail_before_commit: bool,
     ) -> Result<PrivateStageObservation> {
-        let use_guard = self.roots.index_use_exclusive_existing(&self.identity)?;
+        let use_guard = self.index_use_exclusive()?;
         let leader = self
             .roots
             .writer_under_exclusive(self.identity.clone(), use_guard)?;
