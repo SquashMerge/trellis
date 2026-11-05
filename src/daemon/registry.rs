@@ -471,6 +471,8 @@ pub struct CheckoutRegistry {
     test_after_due_release: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(feature = "test-support")]
     test_next_startup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(feature = "test-support")]
+    test_next_dependency_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 impl Default for CheckoutRegistry {
@@ -499,6 +501,8 @@ impl CheckoutRegistry {
             test_after_due_release: None,
             #[cfg(feature = "test-support")]
             test_next_startup_hook: None,
+            #[cfg(feature = "test-support")]
+            test_next_dependency_hook: None,
         }
     }
 
@@ -517,6 +521,17 @@ impl CheckoutRegistry {
     #[doc(hidden)]
     pub fn set_next_startup_hook_for_tests(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
         self.test_next_startup_hook = Some(hook);
+    }
+
+    /// Observe or pause the next activation's dependency catalog builds,
+    /// installed before its worker starts (#700).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_next_dependency_hook_for_tests(
+        &mut self,
+        hook: Arc<dyn Fn(&'static str) + Send + Sync>,
+    ) {
+        self.test_next_dependency_hook = Some(hook);
     }
 
     #[cfg(feature = "test-support")]
@@ -659,6 +674,10 @@ impl CheckoutRegistry {
         #[cfg(feature = "test-support")]
         if let Some(hook) = self.test_next_startup_hook.take() {
             scheduler.set_startup_hook_for_tests(hook);
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = self.test_next_dependency_hook.take() {
+            scheduler.set_dependency_hook_for_tests(hook);
         }
         if let Some(search_fill) = &self.search_fill {
             scheduler.set_search_fill(search_fill.register(&scheduler));
