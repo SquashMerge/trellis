@@ -560,13 +560,14 @@
       const groups = new Map(), unavailable = [];
       for (const pair of pairs) for (const site of pair.sites) {
         const caller = site.caller;
-        if (!caller?.syntaxId || !site.callId) { unavailable.push(site); continue; }
-        const key = caller.stableLookupKey || caller.syntaxId;
-        if (!groups.has(key)) groups.set(key, {caller, sites:[], sampled:false});
+        if (!caller?.syntaxId || !caller.stableLookupKey || !site.callId) { unavailable.push(site); continue; }
+        const key = caller.stableLookupKey;
+        if (!groups.has(key)) groups.set(key, {caller, sites:new Map(), sampled:false});
         const group = groups.get(key);
-        group.sites.push(site); group.sampled ||= pair.omittedSites > 0;
+        group.sites.set(site.callId, site); group.sampled ||= pair.omittedSites > 0;
       }
-      for (const {caller, sites, sampled} of groups.values()) {
+      for (const {caller, sites:byCall, sampled} of groups.values()) {
+        const sites = [...byCall.values()];
         const group = make("div", undefined, "architecture-caller"); group.dataset.symbolId = caller.syntaxId;
         paragraph(group, `${caller.name} · ${caller.document.path} · ${sites.length} ${sampled ? "sampled " : ""}boundary site${sites.length === 1 ? "" : "s"}`);
         paragraph(group, "Measured calling method; destination evidence remains as captured.", "detail");
