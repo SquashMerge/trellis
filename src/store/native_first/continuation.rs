@@ -251,15 +251,14 @@ impl Store {
             let wall_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis());
+            // SQLite allocates from the process heap, so `heap_in_use_mib` includes it;
+            // its own counter is off (`SQLITE_CONFIG_MEMSTATUS=0`, #673).
             let (in_use, allocated) = crate::heap::bytes();
-            // SAFETY: reads SQLite's global memory counter; no connection is involved.
-            let sqlite = unsafe { rusqlite::ffi::sqlite3_memory_used() };
             let _ = writeln!(
                 std::io::stderr().lock(),
-                "semantic-s phase={phase} detail={detail} wall_ms={wall_ms} heap_in_use_mib={} heap_allocated_mib={} sqlite_mib={}",
+                "semantic-s phase={phase} detail={detail} wall_ms={wall_ms} heap_in_use_mib={} heap_allocated_mib={}",
                 in_use >> 20,
-                allocated >> 20,
-                sqlite >> 20
+                allocated >> 20
             );
         }
     }
