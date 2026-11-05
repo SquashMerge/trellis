@@ -142,10 +142,10 @@ test("Architecture boundary callers open their Sequence and Back restores the ar
   await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
   const pair = page.locator("#architecture-inspector-content > details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
   await pair.locator(":scope > summary").click();
-  const callers = pair.locator(".architecture-caller");
+  const callers = page.locator("#architecture-inspector-content .architecture-caller");
   assert.equal(await callers.count(), 2, "both exact measured calling methods get a separate group");
   const caller = callers.filter({hasText:/\blow\b/}).first();
-  assert.match(await caller.textContent(), /1 (?:boundary |call )?site/);
+  assert.match(await caller.textContent(), /1 (?:sampled )?boundary site/);
   const open = caller.getByRole("button", {name:"Open sequence", exact:true});
   await open.click();
   await page.waitForFunction(() => document.querySelector("#sequence-diagram [data-boundary-highlight='true']") || document.querySelector("#sequence-boundary-status")?.textContent.includes("Show all steps"));
@@ -212,11 +212,11 @@ test("Architecture does not invent a caller for syntax-only non-call boundary si
     await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
     const pair = page.locator("#architecture-inspector-content > details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
     await pair.locator(":scope > summary").click();
-    const unknown = pair.locator(".architecture-caller-unavailable");
+    const unknown = page.locator("#architecture-inspector-content .architecture-caller-unavailable");
     await unknown.first().waitFor({state:"visible"});
     assert.match(await unknown.allTextContents().then(rows => rows.join(" ")), /syntax.only|not a measured call|no measured call/i);
     assert.equal(await unknown.getByRole("button", {name:"Open sequence", exact:true}).count(), 0);
-    assert.equal(await pair.locator(".architecture-caller").filter({hasText:/takes_type/}).count(), 0, "enclosing syntax is not a guessed callable link");
+    assert.equal(await page.locator("#architecture-inspector-content .architecture-caller").filter({hasText:/takes_type/}).count(), 0, "enclosing syntax is not a guessed callable link");
   }, new Map(), withTypes);
 });
 
