@@ -416,18 +416,25 @@ fn mode(last: Option<&RunRecord>) -> Value {
 pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Result<Value> {
     let declared = Declared::new(&request.environment)?;
     let head = match store.index_baseline() {
-        // Revision zero is the empty bootstrap a rebuilt index starts from: nothing is
-        // published yet, so there is no head to report (#704).
-        Ok(pin) if pin.index_revision == 0 => None,
-        Ok(pin) => {
-            let revision =
-                store.with_native_reader(pin, |reader| Ok(reader.header()?.revision.id))?;
-            Some(json!({
+        Ok(pin) => match store.with_native_reader(pin, |reader| Ok(reader.header()?.revision.id)) {
+            Ok(revision) => Some(json!({
                 "sourceRevision": revision,
                 "indexGeneration": pin.index_generation.to_string(),
                 "indexRevision": pin.index_revision,
-            }))
-        }
+            })),
+            // The store refuses with this typed error only after validating the exact
+            // empty v8 bootstrap a rebuilt index starts from: nothing is published yet,
+            // so there is no head (#704). A partial or corrupt bootstrap keeps its refusal.
+            Err(error)
+                if pin.index_revision == 0
+                    && error
+                        .downcast_ref::<crate::store::topology::IndexNotReady>()
+                        .is_some() =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        },
         Err(error) if error.to_string().starts_with("index_not_ready") => None,
         Err(error) => return Err(error),
     };

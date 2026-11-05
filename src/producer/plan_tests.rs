@@ -185,3 +185,36 @@ fn plan_request_is_closed_and_bounded() {
         assert!(error.starts_with("invalid_request"), "{error}");
     }
 }
+
+#[cfg(feature = "test-support")]
+#[test]
+fn producer_status_rejects_partial_bootstrap() {
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let store = crate::store::Store::open_for_tests(state.path(), work.path()).unwrap();
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    store
+        .with_index_sql_for_tests(|db| {
+            db.execute(
+                "INSERT INTO native_source_sets(id,root_id) VALUES('partial-bootstrap',?1)",
+                [store.root_id()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let request = plan::StatusRequest {
+        version: 1,
+        run_id: None,
+        environment: Environment {
+            path: "/usr/bin".into(),
+            home: work.path().to_str().unwrap().into(),
+            ..Environment::default()
+        },
+    };
+    let error = plan::status(&store, &request, None)
+        .expect_err("a partial bootstrap must not become a successful null head");
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
+}
