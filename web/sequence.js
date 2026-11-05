@@ -456,6 +456,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     const call = ["call", "boundary"].includes(evidence.kind) && evidence.callId, proof = call ? provenance(evidence) : null;
     const fullLabel = tooltip(step) + displayProjection.earlyReturn(step) + (evidence !== step ? ` · Entry preview only: ${tooltip(evidence)}` : "");
     const control = make("g", {class:"sequence-source", "data-source-step-id":step.id,
+      ...(evidence.callId ? {"data-trellis-call-id":evidence.callId} : {}),
       ...(interactive ? {role:"button", tabindex:0, "aria-label":`${options.onSelect ? "Inspect" : "Read source"}: ${fullLabel}`, "aria-pressed":String(selection.id === step.id)} : {})});
     // Compact controls remain individual, ordered fragments. No matching guard
     // text is treated as equivalent, merged, or removed.
@@ -631,6 +632,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   for (const x of positions.values()) lines.append(make("line", {x1:x, x2:x, y1:54, y2:y-10}));
   svg.setAttribute("viewBox", `0 0 ${width} ${y}`); svg.setAttribute("height", y);
   container.append(svg);
+  options.onRendered?.();
   return groupControls;
 }
 

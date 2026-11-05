@@ -91,3 +91,7 @@
 #architecture-diagram > .architecture-display-footer { padding: 8px 0 0; }
 #architecture-diagram > .architecture-display-footer { flex-wrap: wrap; }
 #architecture-diagram > .architecture-display-footer span { white-space: normal; overflow: visible; }
+
+.architecture-caller { padding:8px 0; border-bottom:1px solid var(--line); }
+.architecture-caller p { margin:4px 0; overflow-wrap:anywhere; }
+.architecture-caller-unavailable { overflow-wrap:anywhere; }

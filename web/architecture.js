@@ -54,7 +54,7 @@
     return [...groups].sort(([a], [b]) => a.localeCompare(b));
   }
   const BUILD_PHASES = {reading:"reading indexed files", resolving:"resolving references", evaluating:"evaluating rules", measuring:"measuring code"};
-  function create({request, context, readSource, openTreemap, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}}) {
+  function create({request, context, readSource, openTreemap, openSequence, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, reviewSerial = 0, view = null, basis = null, buildingTimer = null, buildingWake = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
@@ -63,7 +63,7 @@
     // The hidden-layer note moves into the canvas after each drawing, so keep its nodes.
     const hiddenNote = get("architecture-hidden"), hiddenToggle = get("architecture-hidden-toggle"), hiddenNames = get("architecture-hidden-names");
     // The selected node's identity, re-pressed after a resize re-layout; the width last laid out.
-    let pressed = null, laidOut = null;
+    let pressed = null, laidOut = null, inspection = null;
     const state = (message, kind = "ready") => { get("architecture-state").textContent = message; get("architecture-state").dataset.state = kind; };
     function capture() {
       const c = context();
@@ -76,7 +76,7 @@
     }
     function usable() { return view && current(basis) && view.rulesFile?.contentHash === basis.rulesHash; }
     function clearInspection() {
-      selectionSerial++; pressed = null;
+      selectionSerial++; pressed = null; inspection = null;
       window.TrellisShell?.clearArchitectureInspector();
     }
     function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false) {
@@ -556,8 +556,30 @@
       button.addEventListener("click", () => { if (active()) return readSource({path:identity.path, range}, basis.pin, active); }); target.append(button);
     }
     const NO_PAIRS = "No mapped pairs in this scope. This does not prove absence.";
+    function boundaryCallers(target, pairs, active) {
+      const groups = new Map(), unavailable = [];
+      for (const pair of pairs) for (const site of pair.sites) {
+        const caller = site.caller;
+        if (!caller?.syntaxId || !site.callId) { unavailable.push(site); continue; }
+        const key = caller.stableLookupKey || caller.syntaxId;
+        if (!groups.has(key)) groups.set(key, {caller, sites:[], sampled:false});
+        const group = groups.get(key);
+        group.sites.push(site); group.sampled ||= pair.omittedSites > 0;
+      }
+      for (const {caller, sites, sampled} of groups.values()) {
+        const group = make("div", undefined, "architecture-caller"); group.dataset.symbolId = caller.syntaxId;
+        paragraph(group, `${caller.name} · ${caller.document.path} · ${sites.length} ${sampled ? "sampled " : ""}boundary site${sites.length === 1 ? "" : "s"}`);
+        paragraph(group, "Measured calling method; destination evidence remains as captured.", "detail");
+        if (typeof openSequence === "function") action(group, "Open sequence", () => openSequence(caller, sites, basis.pin, snapshot(), active), active);
+        target.append(group);
+      }
+      for (const site of unavailable) paragraph(target,
+        `${site.spelling} · ${site.callerReason || "No measured calling method is available for this site."}`,
+        "architecture-caller-unavailable detail");
+    }
     function pairs(target, values, active, emptyNote = true) {
       if (!values.length) { if (emptyNote) paragraph(target, NO_PAIRS); return; }
+      boundaryCallers(target, values, active);
       for (const pair of values) {
         const details = make("details"); details.append(make("summary", `${targetLabel(pair.source)} → ${targetLabel(pair.target)} · ${pair.count} reference sites`));
         paragraph(details, `${pair.sites.length} sampled sites · ${pair.omittedSites} omitted sites. Counts remain exact; samples are not exhaustive.`);
@@ -641,7 +663,7 @@
     }
     function inspect(kind, record) {
       if (!usable() || view.state !== "ready") return;
-      clearInspection(); const ticket = selectionSerial, payload = view, c = basis;
+      clearInspection(); inspection = {kind, record}; const ticket = selectionSerial, payload = view, c = basis;
       const active = () => usable() && current(c) && view === payload && ticket === selectionSerial && !get("architecture-inspector").hidden;
       onInspect(); window.TrellisShell?.showArchitectureInspector();
       const target = get("architecture-inspector-content"), title = get("architecture-inspector-title"); target.replaceChildren();
@@ -748,7 +770,7 @@
     }
     function inspectRule(row) {
       if (!usable()) return;
-      clearInspection(); const ticket = selectionSerial, payload = view, c = basis;
+      clearInspection(); inspection = {kind:"rule", record:row}; const ticket = selectionSerial, payload = view, c = basis;
       const active = () => usable() && view === payload && current(c) && ticket === selectionSerial && !get("architecture-inspector").hidden;
       onInspect(); window.TrellisShell?.showArchitectureInspector();
       const r = row.instance, target = get("architecture-inspector-content"); target.replaceChildren();
@@ -830,11 +852,57 @@
         for (const entry of data.exceptions) {
           const row = make("section", undefined, "architecture-rule-row"); row.dataset.exceptionIndex = String(entry.index);
           paragraph(row, `${entry.rule} · ${JSON.stringify(entry.target)}${entry.destination ? ` → ${JSON.stringify(entry.destination)}` : ""} · ${entry.reason}`);
+          if (entry.rule === "$layers" && entry.destination) action(row, "Inspect boundary calls", () => inspectAuthored(entry), () => current(c) && usable());
           action(row, "Edit reason", () => beginDraft({type:"editException", index:entry.index, reason:entry.reason}), () => current(c) && usable());
           action(row, "Remove", () => beginDraft({type:"removeException", index:entry.index}), () => current(c) && usable()); target.append(row);
         }
         if (!data.exceptions.length) paragraph(target, "No authored exceptions. Entries remain editable here even when no current reference matches.");
       } catch (error) { if (current(c)) { target.replaceChildren(); paragraph(target, error.message); } }
+    }
+    function inspectAuthored(entry) {
+      if (!usable()) return;
+      clearInspection(); inspection = {kind:"authored", record:entry};
+      const c = basis, ticket = selectionSerial;
+      const active = () => usable() && current(c) && ticket === selectionSerial && !get("architecture-inspector").hidden;
+      onInspect(); window.TrellisShell?.showArchitectureInspector();
+      get("architecture-inspector-title").textContent = `${entry.target.path} → ${entry.destination.path}`;
+      const target = get("architecture-inspector-content"); target.replaceChildren(); reviewChips(target);
+      paragraph(target, `Authored exception · ${entry.reason}`);
+      detailList(target, {kind:"instances", rule:entry.rule, path:entry.target.path, excepted:"true", exceptionReason:entry.reason}, active, (list, rows) => {
+        const matching = rows.filter(({instance:r}) => r.target?.path === entry.target.path && r.destination?.path === entry.destination.path);
+        for (const row of matching) {
+          paragraph(list, `${row.role} · ${row.instance.referenceCount} exact reference sites`);
+          detailList(list, {kind:"pairs", role:row.role, source:JSON.stringify(row.instance.target), target:JSON.stringify(row.instance.destination)}, active, pairItems(active), NO_PAIRS);
+        }
+      }, "No current reference matches this authored exception. This does not prove absence.");
+    }
+    function snapshot() {
+      return usable() && inspection ? {inspection, pressed:nodeKey(pressedNode()), rulesHash:basis.rulesHash,
+        aggregate, role, reviewMode, reviewScope, reviewOpen:!get("architecture-review-panel").hidden,
+        reviewRole:get("architecture-review-role").value, reviewState:get("architecture-review-state").value} : null;
+    }
+    async function restore(saved, active) {
+      aggregate = saved.aggregate; role = saved.role;
+      get("architecture-aggregate").value = aggregate;
+      await refresh();
+      if (!active() || !usable()) return;
+      if (basis.rulesHash !== saved.rulesHash) throw new Error("Architecture rules changed. Select the boundary again.");
+      if (saved.reviewOpen) {
+        if (saved.reviewMode === "authored") await showAuthored();
+        else {
+          reviewMode = saved.reviewMode; reviewScope = saved.reviewScope;
+          get("architecture-review-panel").hidden = false;
+          get("architecture-review-role").value = saved.reviewRole; get("architecture-review-state").value = saved.reviewState;
+          renderReview();
+        }
+      }
+      if (!active() || !usable()) return;
+      const {kind, record} = saved.inspection;
+      if (kind === "authored") inspectAuthored(record);
+      else if (kind === "rule") inspectRule(record);
+      else inspect(kind, record);
+      pressed = saved.pressed;
+      const node = findNode(pressed); if (node) { node.setAttribute("aria-pressed", "true"); node.focus({preventScroll:true}); }
     }
     function beginDraft(operation) {
       if (!usable() || editBusy) return;
@@ -1025,7 +1093,7 @@
       if (!["max", "sum", "mean"].includes(event.target.value) || event.target.value === aggregate) return;
       aggregate = event.target.value; return refresh();
     });
-    return {refresh, reset, clearInspection};
+    return {refresh, reset, clearInspection, restore};
   }
   window.TrellisArchitecture = {create, moduleKey, quartiles, band, metricValue, commonDirectory, groupModules};
 })();

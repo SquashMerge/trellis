@@ -554,3 +554,10 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 }
 
 .git-marker { margin-left: 6px; flex: 0 0 auto; font: 600 11px/1.5 var(--mono); color: var(--ink); }
+
+#sequence-boundary-status { display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:8px 0; color:var(--ink); }
+#sequence-boundary-status[hidden] { display:none; }
+#sequence-diagram [data-boundary-highlight=true] { outline:2px solid var(--sm-amber); outline-offset:3px; }
+#sequence-diagram :is(path, line)[data-boundary-highlight=true],
+#sequence-diagram .pele-message[data-boundary-highlight=true] :is(path, line) { stroke:var(--sm-amber); stroke-width:3px; }
+#sequence-diagram [data-boundary-highlight=true] text { fill:var(--sm-amber); }

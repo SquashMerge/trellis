@@ -96,7 +96,7 @@ function observePinnedResponse(path, method, body, data) {
 let section = "diagrams", sectionSerial = 0, filesSerial = 0, filesDiffSerial = 0, filesMatchesSerial = 0;
 let filesFile = null, filesSymbol = null, filesBasis = "indexed", filesMini = null, filesMatches = null;
 let filesGitStatus = null, filesDiff = null, filesCatalogLoaded = false;
-let diagramSequence = null;
+let diagramSequence = null, sequenceBoundary = null;
 
 // History owns only opaque keys. Validated source/diagram evidence stays in this session.
 const navigationEntries = new Map();
@@ -151,25 +151,26 @@ function sequenceHash(id, revision) {
   const query = new URLSearchParams({sid:id, rootKey:selectedRootKey, indexGeneration:revision.indexGeneration, indexRevision:String(revision.indexRevision)});
   return `#sequence?${query}`;
 }
-async function navigateDiagram(symbol, revision, kind = "sequence", admitted = null, showAll = false) {
+async function navigateDiagram(symbol, revision, kind = "sequence", admitted = null, showAll = false, boundary = null, architectureEntry = null) {
   IndexPin.copy(revision);
   if (!IndexPin.equal(revision, status?.revision) || !token || !selectedRootKey) throw new Error("Source navigation is stale. Refresh the indexed view.");
   const context = navigationContext(), ticket = ++navigationSerial;
   const current = () => ticket === navigationSerial && navigationCurrent(context);
   diagramSerial++;
   const source = captureSourceEntry();
-  if (source) rememberNavigation(source, true, "#source");
+  if (architectureEntry) rememberNavigation({kind:"architecture", architecture:architectureEntry}, true, "#architecture");
+  else if (source) rememberNavigation(source, true, "#source");
   else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id && IndexPin.equal(diagramSequence.revision, revision)) {
     rememberNavigation({kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked}, true, sequenceHash(selectedMethod.id, revision));
   } else if (!window.location?.hash) rememberNavigation({kind:"unavailable"}, true, "");
-  rememberNavigation({kind, symbol, admitted, showAll}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
+  rememberNavigation({kind, symbol, admitted, showAll, boundary}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
   window.TrellisClasses?.reset();
   clearSource(); diagramSequence = null;
   await setSection("diagrams", kind === "class" ? "classes" : "sequence");
   if (!current()) return;
   $("all-steps").checked = showAll;
   if (kind === "class") return openClasses({seed:symbol.id});
-  return selectMethod(symbol, admitted, current);
+  return selectMethod(symbol, admitted, current, boundary);
 }
 async function restoreSourceEntry(entry, current) {
   // Restore the existing owners before normal section/source rendering rebinds them.
@@ -237,12 +238,19 @@ async function readNavigationLocation(force = false) {
       if (entry.kind === "unavailable") return navigationError("This history entry has no saved source view. The current diagram remains open; use Forward to return to its link.");
       $("error").hidden = true;
       if (entry.kind === "source") return await restoreSourceEntry(entry, current);
+      if (entry.kind === "architecture") {
+        clearSource(); diagramSequence = null; sequenceBoundary = null;
+        await setSection("diagrams");
+        if (!current()) return;
+        showNavigationView("architecture");
+        return await architecture.restore(entry.architecture, current);
+      }
       clearSource(); diagramSequence = null;
       await setSection("diagrams", entry.kind === "class" ? "classes" : "sequence");
       if (!current()) return;
       if (entry.kind === "class") return await openClasses({seed:entry.symbol.id});
       $("all-steps").checked = entry.showAll;
-      return await selectMethod(entry.symbol, entry.admitted, current);
+      return await selectMethod(entry.symbol, entry.admitted, current, entry.boundary);
     }
     const hash = window.location?.hash || "";
     const oldKey = window.history?.state?.trellisNavigation;
@@ -1558,7 +1566,7 @@ async function toggleFile(file) {
     state.error = error.message;
   } finally { if (current()) { state.loading = false; renderFiles(); } }
 }
-async function selectMethod(symbol, admitted = null, callerCurrent = null) {
+async function selectMethod(symbol, admitted = null, callerCurrent = null, boundary = null) {
   if (!callerCurrent) {
     const context = navigationContext(), ticket = ++navigationSerial;
     callerCurrent = () => ticket === navigationSerial && navigationCurrent(context);
@@ -1568,7 +1576,7 @@ async function selectMethod(symbol, admitted = null, callerCurrent = null) {
   viewerMetrics?.clearInspection();
   window.TrellisShell?.showView("sequence");
   if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
-  selectedMethod = symbol; $("method-source").disabled = false;
+  selectedMethod = symbol; sequenceBoundary = boundary; $("method-source").disabled = false;
   renderSequenceStart();
   clearSource(); renderFiles();
   await loadSequence(admitted, false, callerCurrent);
@@ -1589,6 +1597,33 @@ function renderIncidentalToggle(data, options) {
 }
 // The method Fit was asked for: a redraw of it keeps Fit, another opens at its own size (#558).
 let sequenceFitted = null;
+async function openArchitectureSequence(caller, sites, pin, saved, active) {
+  if (!active() || !saved || !IndexPin.equal(pin, status?.revision)) return;
+  const data = await api("/api/sequence", "POST", {seed:caller.syntaxId, expectedRevision:pin, showAll:false, interactions:true}, active);
+  if (!active()) return;
+  if (!IndexPin.equal(data?.revision, pin) || data?.seed?.id !== caller.syntaxId) throw new Error("Sequence provenance mismatch. Nothing displayed.");
+  const boundary = {symbolId:caller.syntaxId, callIds:sites.map(site => site.callId)};
+  await navigateDiagram(data.seed, pin, "sequence", data, false, boundary, saved);
+}
+function highlightSequenceBoundary(data, options) {
+  const notice = $("sequence-boundary-status"), focus = sequenceBoundary;
+  notice.replaceChildren(); notice.hidden = !focus || focus.symbolId !== data.seed.id;
+  if (notice.hidden || !options.isCurrent()) return;
+  const ids = new Set(focus.callIds), diagram = $("sequence-diagram"), highlighted = new Set();
+  let first = null;
+  for (const node of diagram.querySelectorAll("[data-trellis-call-id]")) {
+    const id = node.getAttribute("data-trellis-call-id");
+    if (!ids.has(id)) continue;
+    node.setAttribute("data-boundary-highlight", "true"); highlighted.add(id); first ||= node;
+  }
+  const missing = ids.size - highlighted.size;
+  notice.append(element("span", `${highlighted.size} boundary call${highlighted.size === 1 ? "" : "s"} highlighted.${missing ? ` ${missing} boundary call${missing === 1 ? " is" : "s are"} not shown${options.showDetails ? " in this admitted sequence." : " in Interactions; internal or folded steps may be hidden."}` : ""}`));
+  if (missing && !options.showDetails) {
+    const show = element("button", "Show all steps"); show.type = "button";
+    show.addEventListener("click", () => { if (options.isCurrent()) { $("all-steps").checked = true; void loadSequence(); } }); notice.append(show);
+  }
+  if (first) first.scrollIntoView({block:"nearest", inline:"nearest"});
+}
 async function loadSequence(admitted = null, preserveSource = false, callerCurrent = () => true) {
   viewerMetrics?.clearInspection();
   window.TrellisShell?.resetInspector();
@@ -1601,6 +1636,7 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
   if (!preserveSource) clearSource();
   if (sequenceFitted !== symbol.id) { sequenceFitted = null; $("sequence-diagram").removeAttribute?.("data-fit"); }
   $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
+  $("sequence-boundary-status").hidden = true;
   if ($("sequence-incidental")) $("sequence-incidental").hidden = true;
   $("sequence-state").textContent = `Loading ${symbol.name}…`;
   await browseRequest(async () => {
@@ -1613,6 +1649,7 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
     // Interactions are the default for an enriched view (#636); Show all steps is unchanged.
     const options = {showDetails: !!$("all-steps").checked, interactions:true, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
+    options.onRendered = () => highlightSequenceBoundary(data, options);
     options.onOpenTarget = sequenceTargetAction(data, options.isCurrent);
     // A later group redraw can fail after the initial load succeeded. Preserve
     // the whole pinned DTO rather than leaving an inert, silently folded group.
@@ -1648,6 +1685,7 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     const interactions = window.TrellisSequence.display(data, options);
     $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${interactions.interactions ? ` · Interactions · ${interactions.hiddenSteps} internal steps hidden` : ""}${interactions.omittedInteractions ? ` · truncated: ${interactions.omittedInteractions} later ${interactions.omittedInteractions === 1 ? "interaction" : "interactions"} not shown` : ""}${data.truncated ? " · truncated by sequence limits" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
+    highlightSequenceBoundary(data, options);
     published = true;
   }, current, "sequence-state");
 }
@@ -1910,6 +1948,7 @@ const architecture = window.TrellisArchitecture?.create({
   },
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
   readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
+  openSequence: (caller, sites, pin, saved, active) => perform(() => openArchitectureSequence(caller, sites, pin, saved, active)),
   onConflict: () => unexpectedPair("Architecture snapshot changed. Refresh status before reopening Architecture."),
   openTreemap: (identity, pin) => {
     if (!IndexPin.equal(pin, status?.revision)) return;
