@@ -125,10 +125,15 @@ if (process.env.TRELLIS_SEQUENCE_CLEANUP_CHILD === "1") {
     reaper.stderr.on("data", chunk => { errors += chunk; });
     reaper.stdin.on("error", () => {});
     const reaperExit = once(reaper, "exit");
+    // "exit" can precede the last stdout data (#475); "close" fires only after
+    // stdio has drained, so only then is missing output really missing.
+    const reaperClosed = once(reaper, "close");
     const printed = async text => {
       while (!output.includes(text)) {
         await Promise.race([once(reaper.stdout, "data"),
-          reaperExit.then(([code]) => { throw new Error(`reaper exited ${code} before ${JSON.stringify(text)}: ${errors}`); })]);
+          reaperClosed.then(([code]) => {
+            if (!output.includes(text)) throw new Error(`reaper closed (${code}) before ${JSON.stringify(text)}: ${errors}`);
+          })]);
       }
     };
     const zombie = async () => (await H.run("ps", ["-o", "stat=", "-p", String(pid)])).stdout.trim().startsWith("Z");
