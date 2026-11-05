@@ -133,6 +133,165 @@ async function architecture(selected, aggregate = "max", role = "production") {
     if (answer.data?.payload?.state !== "building") return answer;
   }
 }
+
+// #646: the same pinned boundary sites drive caller navigation, never a name search.
+test("Architecture boundary callers open their Sequence and Back restores the arrow", {timeout:240000}, async () => published(rules, async selected => {
+  const {page, requests} = selected;
+  await ready(page);
+  const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation(?: · .*)?$/});
+  await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
+  const pair = page.locator("#architecture-inspector-content > details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
+  await pair.locator(":scope > summary").click();
+  const callers = page.locator("#architecture-inspector-content .architecture-caller");
+  assert.equal(await callers.count(), 2, "both exact measured calling methods get a separate group");
+  const caller = callers.filter({hasText:/\blow\b/}).first();
+  assert.match(await caller.textContent(), /1 (?:sampled )?boundary site/);
+  const open = caller.getByRole("button", {name:"Open sequence", exact:true});
+  await open.click();
+  await page.waitForFunction(() => document.querySelector("#sequence-diagram [data-boundary-highlight='true']") || document.querySelector("#sequence-boundary-status")?.textContent.includes("Show all steps"));
+  assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true");
+  const sequenceRequest = requests.filter(row => row.url.pathname.endsWith("/sequence") && row.method === "POST").at(-1);
+  assert.ok(sequenceRequest, "opening the caller reads a real published sequence");
+  const response = await H.api(selected.server.base, selected.paths.token, "POST", H.scoped(selected.server.rootKey, "sequence"), sequenceRequest.body);
+  assert.equal(response.status, 200, JSON.stringify(response.data));
+  assert.equal(response.data.seed.name, "low", "the exact enclosing method, not the current explorer method");
+  const status = page.locator("#sequence-boundary-status");
+  if (await status.getByRole("button", {name:"Show all steps", exact:true}).count()) {
+    assert.match(await status.textContent(), /hidden|not (?:shown|visible)/i);
+    await status.getByRole("button", {name:"Show all steps", exact:true}).click();
+  }
+  const highlighted = page.locator("#sequence-diagram [data-boundary-highlight='true']").first();
+  await highlighted.waitFor({state:"visible"});
+  assert.equal(await highlighted.evaluate(node => {
+    const box = node.getBoundingClientRect(), canvas = document.querySelector("#sequence-diagram").getBoundingClientRect();
+    return box.bottom > canvas.top && box.top < canvas.bottom && box.right > canvas.left && box.left < canvas.right;
+  }), true, "the boundary call is scrolled into the diagram viewport");
+  await capture(page, "architecture-boundary-deviation-sequence");
+  await page.goBack();
+  await page.locator("#architecture-panel").waitFor({state:"visible"});
+  assert.equal(await page.locator("#architecture-inspector-title").textContent(), "low → top");
+  await page.locator("#architecture-inspector-content .architecture-caller").first().waitFor({state:"visible"});
+  assert.equal(await edge.getAttribute("aria-pressed"), "true", "Back restores the original Architecture arrow");
+}));
+
+
+test("Architecture authored exceptions reach the same caller and preserve the exception on Back", {timeout:240000}, async () => published(rules, async selected => {
+  const {page} = selected;
+  await ready(page);
+  await page.locator("#architecture-review").click();
+  await page.locator("#architecture-review-role").selectOption("production");
+  await page.locator("#architecture-review-state").selectOption("deviates"); await settled(page);
+  await reviewPair(page, "src/low.rs", "src/top.rs").getByRole("checkbox").check();
+  await page.locator("#architecture-add-selected").click();
+  await page.locator("#architecture-reason").fill("Reviewed boundary for sequence navigation");
+  await confirmChange(selected, await previewChange(selected));
+  await page.locator("#architecture-authored").click();
+  const entry = page.locator("#architecture-exceptions [data-exception-index='0']");
+  await entry.getByRole("button", {name:"Inspect boundary calls", exact:true}).click();
+  const caller = page.locator("#architecture-inspector-content .architecture-caller").filter({hasText:/\blow\b/}).first();
+  await caller.getByRole("button", {name:"Open sequence", exact:true}).click();
+  await page.waitForFunction(() => document.querySelector("#sequence-diagram [data-boundary-highlight='true']") || document.querySelector("#sequence-boundary-status")?.textContent.includes("Show all steps"));
+  const showAll = page.locator("#sequence-boundary-status").getByRole("button", {name:"Show all steps", exact:true});
+  if (await showAll.count()) await showAll.click();
+  await page.locator("#sequence-diagram [data-boundary-highlight='true']").first().waitFor({state:"visible"});
+  await capture(page, "architecture-boundary-exception-sequence");
+  await page.goBack();
+  await page.locator("#architecture-panel").waitFor({state:"visible"});
+  await entry.waitFor({state:"visible"});
+  assert.match(await entry.textContent(), /Reviewed boundary for sequence navigation/);
+  await page.locator("#architecture-inspector-content .architecture-caller").first().waitFor({state:"visible"});
+  const exceptedArrow = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation · exception/});
+  await exceptedArrow.focus(); await page.keyboard.press("Enter"); await settled(page);
+  const arrowCaller = page.locator("#architecture-inspector-content .architecture-caller").filter({hasText:/\blow\b/}).first();
+  const selectedSequence = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().method() === "POST");
+  await arrowCaller.getByRole("button", {name:"Open sequence", exact:true}).click();
+  await selectedSequence;
+  await page.locator("#sequence-panel").waitFor({state:"visible"});
+  await page.waitForFunction(() => document.querySelector("#sequence-diagram [data-boundary-highlight='true']") || document.querySelector("#sequence-boundary-status")?.textContent.includes("Show all steps"));
+  assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true");
+  assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "false");
+  await page.goBack();
+  await page.locator("#architecture-panel").waitFor({state:"visible"});
+  assert.equal(await exceptedArrow.getAttribute("aria-pressed"), "true", "excepted arrows have the same round trip as deviations");
+}));
+
+test("Architecture does not invent a caller for syntax-only non-call boundary sites", {timeout:240000}, async () => {
+  const withTypes = new Map(sources);
+  withTypes.set("src/top.rs", `${withTypes.get("src/top.rs")}pub struct Marker;\n`);
+  withTypes.set("src/low.rs", `${lowSource}pub fn takes_type(value: crate::top::Marker) {}\n`);
+  await published(rules, async ({page}) => {
+    await ready(page);
+    const edge = page.locator("#architecture-diagram").getByRole("button", {name:/production sites · upward\s+deviation/}).first();
+    await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
+    const pair = page.locator("#architecture-inspector-content > details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
+    await pair.locator(":scope > summary").click();
+    const unknown = page.locator("#architecture-inspector-content .architecture-caller-unavailable");
+    await unknown.first().waitFor({state:"visible"});
+    assert.match(await unknown.allTextContents().then(rows => rows.join(" ")), /syntax.only|not a measured call|no measured call/i);
+    assert.equal(await unknown.getByRole("button", {name:"Open sequence", exact:true}).count(), 0);
+    assert.equal(await page.locator("#architecture-inspector-content .architecture-caller").filter({hasText:/takes_type/}).count(), 0, "enclosing syntax is not a guessed callable link");
+  }, new Map(), withTypes);
+});
+
+
+test("Architecture keeps distinct measured callers with colliding stable lookup keys separate", {timeout:240000}, async () => {
+  const files = new Map([
+    ["src/lib.rs", "mod low; mod top;\n"],
+    ["src/low.rs", "pub struct Store; pub trait First { fn same(); } pub trait Second { fn same(); } impl First for Store { fn same() { crate::top::target(); } } impl Second for Store { fn same() { crate::top::target(); } }\n"],
+    ["src/top.rs", "pub fn target() {}\n"],
+  ]);
+  const config = 'version=1\n[layers.low]\norder=2\npaths=["src/low.rs"]\n[layers.top]\norder=1\npaths=["src/top.rs"]\n';
+  await published(config, async ({page}) => {
+    await ready(page);
+    const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation/});
+    await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
+    const callers = page.locator("#architecture-inspector-content .architecture-caller");
+    assert.equal(await callers.count(), 2, "a stable lookup key is not an exact callable identity");
+    const ids = await callers.evaluateAll(nodes => nodes.map(node => node.dataset.symbolId));
+    assert.equal(new Set(ids).size, 2);
+    for (const id of ids) {
+      const exact = page.locator(`#architecture-inspector-content .architecture-caller[data-symbol-id="${id}"]`);
+      assert.match(await exact.textContent(), /1 boundary site/);
+      const selected = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().postDataJSON()?.seed === id);
+      await exact.getByRole("button", {name:"Open sequence", exact:true}).click();
+      const response = await selected;
+      assert.equal((await response.json()).seed.id, id);
+      await page.locator("#sequence-panel").waitFor({state:"visible"});
+      await page.waitForFunction(() => document.querySelector("#sequence-boundary-status")?.textContent.includes("1 boundary call highlighted"));
+      assert.doesNotMatch(await page.locator("#sequence-boundary-status").textContent(), /not shown/);
+      await page.goBack();
+      await page.locator("#architecture-panel").waitFor({state:"visible"});
+      await page.locator(`#architecture-inspector-content .architecture-caller[data-symbol-id="${id}"]`).waitFor();
+    }
+  }, new Map(), files);
+});
+
+
+test("Architecture opens the measured inner boundary call inside an argument", {timeout:240000}, async () => {
+  const files = new Map([
+    ["src/lib.rs", "mod low; mod top;\n"],
+    ["src/low.rs", "pub fn nested() { consume(crate::top::target()); } fn consume(_: ()) {}\n"],
+    ["src/top.rs", "pub fn target() {}\n"],
+  ]);
+  const config = 'version=1\n[layers.low]\norder=2\npaths=["src/low.rs"]\n[layers.top]\norder=1\npaths=["src/top.rs"]\n';
+  await published(config, async ({page}) => {
+    await ready(page);
+    const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^1 production sites · upward\s+deviation/});
+    await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
+    const caller = page.locator("#architecture-inspector-content .architecture-caller");
+    assert.equal(await caller.count(), 1);
+    assert.match(await caller.textContent(), /nested.*1 boundary site/s);
+    const selected = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().method() === "POST");
+    await caller.getByRole("button", {name:"Open sequence", exact:true}).click();
+    await selected;
+    await page.locator("#sequence-panel").waitFor({state:"visible"});
+    await page.waitForFunction(() => document.querySelector("#sequence-boundary-status")?.textContent.includes("1 boundary call highlighted"));
+    const highlighted = page.locator("#sequence-diagram [data-boundary-highlight='true']");
+    assert.match(await highlighted.allTextContents().then(rows => rows.join(" ")), /crate::top::target/);
+    assert.doesNotMatch(await highlighted.allTextContents().then(rows => rows.join(" ")), /consume/);
+  }, new Map(), files);
+});
+
 const identityKey = identity => JSON.stringify([identity.sourceSetId, identity.language, identity.path, identity.sid]);
 const siteTotal = edges => edges.reduce((sum, edge) => sum + edge.count, 0);
 const summaryKey = edge => JSON.stringify([edge.sourceLayer, edge.destinationLayer, edge.role, edge.status, edge.excepted, edge.exceptionReason]);

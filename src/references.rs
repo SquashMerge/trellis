@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser, Tree};
 use work::Work;
 
+pub(crate) mod callers;
 pub mod external;
 mod java;
 mod javascript;
@@ -167,6 +168,8 @@ struct Site {
     relation_kind: &'static str,
     spelling: String,
     call_id: Option<String>,
+    caller: Option<callers::Caller>,
+    caller_reason: Option<&'static str>,
     /// `structural` (captured syntax conventions) or `semantic` (a fresh producer binding).
     mapping: &'static str,
     /// The semantic binding's provenance; null for structural sites.
@@ -612,6 +615,10 @@ fn resolve(
                         site.mapping = "semantic";
                         site.provenance_id = Some(anchor.provenance_id.clone());
                         site.semantic_metadata = anchor.metadata.clone();
+                        if anchor.metadata.get("semanticBoundary") == Some(&json!(true)) {
+                            site.caller = None;
+                            site.caller_reason = Some("semantic_boundary");
+                        }
                         resolution
                     }
                     (None, Some(resolution)) => resolution,
@@ -890,6 +897,7 @@ struct SiteContext<'a> {
     declarations: RangeIndex<'a>,
     calls: RangeIndex<'a>,
     newlines: Vec<usize>,
+    callers: callers::Callers<'a>,
 }
 impl SiteContext<'_> {
     #[allow(clippy::too_many_arguments)]
@@ -909,16 +917,29 @@ impl SiteContext<'_> {
             DeclarationRole::Test => "test",
             DeclarationRole::Production => "production",
         });
+        let range = crate::native_evidence::Range { start, end };
         let call_id = match call_id {
             Some(id) => Some(id),
-            None => self
-                .calls
-                .enclosing(start, end, work, check)?
-                .into_iter()
-                .min()
-                .map(|index| doc.calls[index].id.clone()),
+            None => {
+                let candidates = self.calls.enclosing(start, end, work, check)?;
+                let mut exact = None;
+                for &index in &candidates {
+                    owner_step(work, check)?;
+                    if callers::matches_site(&doc.calls[index], &range)
+                        && exact.is_none_or(|previous| index < previous)
+                    {
+                        exact = Some(index);
+                    }
+                }
+                exact
+                    .or_else(|| candidates.into_iter().min())
+                    .map(|index| doc.calls[index].id.clone())
+            }
         };
+        let (caller, caller_reason) = self.callers.get(call_id.as_deref(), &range);
         Ok(Site {
+            caller,
+            caller_reason,
             owner_syntax_id: owner.map(|d| d.syntax_id.clone()),
             role,
             range: crate::native_evidence::Range { start, end },
@@ -956,6 +977,7 @@ fn prepare_file(
     let raw = extract(doc, tree, &mut work, check)?;
     let context = SiteContext {
         doc,
+        callers: callers::Callers::new(doc),
         declarations: RangeIndex::new(doc.declarations.iter().map(|d| &d.range), &mut work, check)?,
         calls: RangeIndex::new(doc.calls.iter().map(|c| &c.range), &mut work, check)?,
         newlines: doc

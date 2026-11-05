@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const {rmSync} = require("node:fs");
+const {rmSync, mkdirSync, writeFileSync} = require("node:fs");
 const {join, resolve} = require("node:path");
 const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
@@ -92,6 +92,71 @@ for (const mode of ["zero", "sole", "multiple", "unresolved"]) {
     }
   });
 }
+
+
+// #646: fresh semantic targets draw real Interactions arrows, including repeated boundary calls.
+test("Architecture semantic boundary caller focuses every crossing Interactions arrow", {timeout:240000}, async () => {
+  const paths = H.fixture("", "placeholder.txt");
+  rmSync(paths.source);
+  mkdirSync(join(paths.workspace, ".trellis"));
+  writeFileSync(join(paths.workspace, ".trellis/rules.toml"), `version = 1
+[layers.low]
+order = 2
+paths = ["flow.rs"]
+[layers.top]
+order = 1
+paths = ["target.rs"]
+`);
+  let server, browser, context;
+  try {
+    const seeded = await H.run(H.binary, ["navigation-fixture", "--workspace", paths.workspace, "--mode", "sequence-sole"], {env:paths.env});
+    const fixture = seeded.json(), pin = fixture.revision;
+    server = await H.startDaemon(paths, pin.indexRevision);
+    browser = await chromium.launch();
+    context = await browser.newContext({viewport:{width:1440, height:1000}});
+    const page = await context.newPage();
+    await H.connect(page, server, paths.token);
+    await page.locator("#view-architecture").click();
+    await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
+    const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation/});
+    await edge.focus(); await page.keyboard.press("Enter");
+    const caller = page.locator("#architecture-inspector-content .architecture-caller");
+    await caller.getByRole("button", {name:"Open sequence", exact:true}).waitFor();
+    assert.equal(await caller.count(), 1, "repeated boundary calls share their exact caller");
+    assert.match(await caller.textContent(), /measured.*2 boundary sites/s);
+    await caller.getByRole("button", {name:"Open sequence", exact:true}).click();
+    await page.waitForFunction(() => document.querySelectorAll("#sequence-diagram .pele-message[data-boundary-highlight='true']").length === 2);
+    const focusedCalls = await page.locator("#sequence-diagram .pele-message[data-boundary-highlight='true']").evaluateAll(nodes => nodes.map(node => node.dataset.trellisCallId));
+    assert.deepEqual(focusedCalls, fixture.calls, "both original measured call IDs, not nearby calls or same-spelling methods");
+    assert.equal(await page.locator("#sequence-boundary-status").getByRole("button", {name:"Show all steps", exact:true}).count(), 0, "fresh cross-participant calls are visible in default Interactions");
+    assert.equal(await page.locator("#sequence-diagram .pele-message[data-boundary-highlight='true']").first().evaluate(node => {
+      const box = node.getBoundingClientRect(), canvas = document.querySelector("#sequence-diagram").getBoundingClientRect();
+      return box.bottom > canvas.top && box.top < canvas.bottom;
+    }), true);
+    await page.getByRole("button", {name:"Open callee sequence: actual_target", exact:true}).first().click();
+    await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.startsWith("actual_target"));
+    await page.goBack();
+    await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.startsWith("measured"));
+    assert.equal(await page.locator("#sequence-boundary-status").isVisible(), true, "Back from a callee preserves the boundary context");
+    assert.deepEqual(await page.locator("#sequence-diagram .pele-message[data-boundary-highlight='true']").evaluateAll(nodes => nodes.map(node => node.dataset.trellisCallId)), fixture.calls);
+    await page.locator("#method-source").click();
+    await page.locator("#source .source-line").first().waitFor();
+    const sourceBefore = await page.locator("#source").textContent();
+    await page.getByRole("button", {name:"Open callee sequence: actual_target", exact:true}).first().click();
+    await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.startsWith("actual_target"));
+    await page.goBack();
+    await page.waitForFunction(text => document.querySelector("#source")?.textContent === text && !document.querySelector("#workspace-source-panel")?.hidden, sourceBefore);
+    assert.equal(await page.locator("#sequence-boundary-status").isVisible(), true, "source history preserves the boundary context");
+    assert.deepEqual(await page.locator("#sequence-diagram .pele-message[data-boundary-highlight='true']").evaluateAll(nodes => nodes.map(node => node.dataset.trellisCallId)), fixture.calls);
+    await page.goBack();
+    await page.locator("#architecture-panel").waitFor({state:"visible"});
+    await page.locator("#architecture-inspector-content .architecture-caller").waitFor({state:"visible"});
+    assert.equal(await page.locator("#architecture-inspector-title").textContent(), "low → top");
+  } finally {
+    await context?.close(); await browser?.close(); await H.stopDaemon(server);
+    rmSync(paths.temp, {recursive:true, force:true, maxRetries:10, retryDelay:100});
+  }
+});
 
 function sequenceSteps(roots) {
   return roots.flatMap(step => [step, ...sequenceSteps(step.children || []), ...sequenceSteps(step.alternate || [])]);

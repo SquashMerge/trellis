@@ -143,6 +143,20 @@ verdicts, exceptions and source-site samples. Omitted sample counts stay visible
 sampling never changes totals. Explicit source actions read cached indexed text at
 the displayed revision. They never fall back to the live file.
 
+### Boundary calls to Sequence (#646)
+
+For deviating or excepted references, the inspector groups sampled boundary call sites by
+calling method. **Open sequence** opens that exact measured caller in Interactions and
+highlights its boundary calls, scrolling the first visible call into view. If Interactions
+hides a focused call, the notice offers **Show all steps**. Browser Back returns to the
+Architecture selection. Authored exceptions offer **Inspect boundary calls** for the same
+path without changing the exception.
+
+A caller link requires a measured call's captured callable owner and stable lookup key.
+Non-call syntax references and unavailable callers stay listed with a reason, without a
+guessed method. Rules check/explain evidence carries the same caller key for MCP chaining;
+it does not upgrade the target reference's evidence tier. Sampled counts remain sampled.
+
 ## One computation per revision (#556)
 
 The daemon computes what Architecture needs once per published revision and rules file, in the

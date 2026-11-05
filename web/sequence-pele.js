@@ -367,6 +367,7 @@
       }
       const fragment = document.createDocumentFragment(); fragment.append(root); // Adopt the validated node itself; cloning would drop selection listeners.
       container.replaceChildren(fragment);
+      options.onRendered?.();
       return {status:"rendered", controls, source:projection.source};
     } catch (error) {
       if (!current()) return {status:"stale"};

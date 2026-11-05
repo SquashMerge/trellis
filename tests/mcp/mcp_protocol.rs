@@ -5934,13 +5934,26 @@ async fn a_call_expires_from_its_read_while_the_coordinator_is_held() {
 async fn mcp_find_answers_from_its_admitted_snapshot_while_a_publication_is_pending() {
     let temp = tempfile::tempdir().unwrap();
     let (identity, registry, runtime) = ready_registry(temp.path(), 84).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let worker_gate = ReadGate::default();
+    let gate = ReadGate::default();
+    let _release_on_failure = McpFillRelease([worker_gate.clone(), gate.clone()]);
+    let held = worker_gate.clone();
+    let worker_scheduler = scheduler.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let _worker = worker_scheduler.hold_worker_for_tests();
+        (held.hook())();
+    });
+    let held = worker_gate.clone();
+    tokio::task::spawn_blocking(move || held.await_held(1))
+        .await
+        .unwrap();
     let admitted = {
         let (response, _) = runtime.evidence_response().unwrap();
         let revision = response.status().unwrap().revision;
         response.finish(()).unwrap();
         revision
     };
-    let gate = ReadGate::default();
     runtime.set_mcp_admitted_gate_for_tests(gate.hook());
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 84, None);
     let find = |id: u64, query: &str| {
@@ -5958,13 +5971,12 @@ async fn mcp_find_answers_from_its_admitted_snapshot_while_a_publication_is_pend
     // While that read holds its snapshot, change the source so the worker
     // has a newer publication pending.
     fs::write(identity.root.join("a.js"), "function moved() {}\n").unwrap();
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        while !runtime.catching_up() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the watcher never queued the edit");
+    let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Content,
+    )))
+    .add_path(identity.root.join("a.js"));
+    assert!(scheduler.submit_watch_event_for_tests(Ok(event)));
+    assert!(scheduler.checkout_watch_pending());
     gate.open();
     let reply = next_reply(&mut reader);
     tool(&reply, None, true);
@@ -5985,6 +5997,8 @@ async fn mcp_find_answers_from_its_admitted_snapshot_while_a_publication_is_pend
             .all(|c| c["revisionId"] == coverage[0]["revisionId"]),
         "{reply}"
     );
+    worker_gate.open();
+    worker.await.unwrap();
     // Once published, a new call answers from the newer revision.
     let newer = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         for id in 2.. {
@@ -11623,15 +11637,21 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
     use trellis::daemon::registry::CheckoutRegistry;
     for legacy in [false, true] {
         let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("checkout/src")).unwrap();
         let (identity, topology) = published_inactive_checkout(
             temp.path(),
             &[
-                ("a.js", "import './b.js'; export function a() {}\n"),
-                ("b.js", "export function b() {}\n"),
+                ("src/a.rs", "pub fn a() { crate::b::b(); }\n"),
+                ("src/b.rs", "pub fn b() {}\n"),
+                ("src/lib.rs", "mod a; mod b;\n"),
+                (
+                    "Cargo.toml",
+                    "[package]\nname='boundary'\nversion='0.1.0'\n",
+                ),
             ],
         );
         fs::create_dir(identity.root.join(".trellis")).unwrap();
-        let rules = "version = 1\n[layers.top]\norder = 1\npaths = [\"a.js\"]\n[layers.bottom]\norder = 2\npaths = [\"b.js\"]\n";
+        let rules = "version = 1\n[layers.top]\norder = 2\npaths = [\"src/a.rs\"]\n[layers.bottom]\norder = 1\npaths = [\"src/b.rs\"]\n";
         fs::write(identity.root.join(".trellis/rules.toml"), rules).unwrap();
         let mut registry = CheckoutRegistry::with_roots(topology);
         registry.attach_launch(129, &identity).unwrap();
@@ -11689,8 +11709,16 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
         tool(&checked, None, !legacy);
         let checked_env = &checked["result"]["structuredContent"];
         assert_eq!(checked_env["evidenceBasis"], basis);
-        assert_eq!(checked_env["data"]["counts"]["conforms"], 1, "{checked}");
+        assert_eq!(checked_env["data"]["counts"]["deviates"], 1, "{checked}");
         let instance = &checked_env["data"]["instances"][0];
+        let call_site = instance["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|site| !site["callId"].is_null())
+            .expect("native call site");
+        assert_eq!(call_site["caller"]["stableLookupKey"], "src/a.rs::a");
+        assert!(call_site["callerReason"].is_null());
         let explain = ask(
             3,
             "tools/call",
@@ -11702,6 +11730,42 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
             explain["result"]["structuredContent"]["data"]["instances"],
             checked_env["data"]["instances"]
         );
+        assert_eq!(
+            explain["result"]["structuredContent"]["data"]["instances"][0]["evidence"],
+            instance["evidence"]
+        );
+        let outgoing = ask(
+            20,
+            "tools/call",
+            json!({"name":"trellis_outgoing_calls","arguments":{
+                "schemaVersion":1,"lookupKey":call_site["caller"]["stableLookupKey"],"expectedBasis":basis
+            }}),
+        );
+        tool(&outgoing, None, !legacy);
+        assert_eq!(
+            outgoing["result"]["structuredContent"]["data"]["calls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::write(identity.root.join(".trellis/rules.toml"), format!("{rules}\n[[exceptions]]\nrule='$layers'\ntarget={{language='rust',path='src/a.rs'}}\ndestination={{language='rust',path='src/b.rs'}}\nreason='Reviewed boundary'\n")).unwrap();
+        let excepted = ask(
+            21,
+            "tools/call",
+            json!({"name":"trellis_rules_check","arguments":{
+                "schemaVersion":1,"expectedBasis":basis
+            }}),
+        );
+        tool(&excepted, None, !legacy);
+        let excepted_row = &excepted["result"]["structuredContent"]["data"]["instances"][0];
+        assert_eq!(excepted_row["excepted"], true);
+        assert_eq!(excepted_row["evidence"], instance["evidence"]);
+        validate_structured_content(&[
+            json!({"name":"trellis_rules_check","structuredContent":excepted["result"]["structuredContent"]}),
+            json!({"name":"trellis_outgoing_calls","structuredContent":outgoing["result"]["structuredContent"]}),
+        ]);
+        fs::write(identity.root.join(".trellis/rules.toml"), rules).unwrap();
         let mut absent_destination = instance["destination"].clone();
         absent_destination["sid"] = json!(format!("sid:v1:{}", "f".repeat(32)));
         let not_found = ask(
@@ -12940,13 +13004,26 @@ async fn mcp_search_zero_hits_keep_incomplete_native_scope_separate_from_vectors
 async fn mcp_search_keeps_admitted_head_and_followup_pin_conflicts_after_publication() {
     let temp = tempfile::tempdir().unwrap();
     let (identity, registry, runtime) = ready_registry(temp.path(), 211).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let worker_gate = ReadGate::default();
+    let gate = ReadGate::default();
+    let _release_on_failure = McpFillRelease([worker_gate.clone(), gate.clone()]);
+    let held = worker_gate.clone();
+    let worker_scheduler = scheduler.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let _worker = worker_scheduler.hold_worker_for_tests();
+        (held.hook())();
+    });
+    let held = worker_gate.clone();
+    tokio::task::spawn_blocking(move || held.await_held(1))
+        .await
+        .unwrap();
     let admitted = {
         let (response, _) = runtime.evidence_response().unwrap();
         let pin = response.status().unwrap().revision;
         response.finish(()).unwrap();
         pin
     };
-    let gate = ReadGate::default();
     runtime.set_mcp_admitted_gate_for_tests(gate.hook());
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 211, None);
     writeln!(client, "{}", call(false, json!(1), "trellis_search_symbols",
@@ -12956,13 +13033,12 @@ async fn mcp_search_keeps_admitted_head_and_followup_pin_conflicts_after_publica
         .await
         .unwrap();
     fs::write(identity.root.join("a.js"), "function moved() {}\n").unwrap();
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        while !runtime.catching_up() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("watcher did not queue the edit");
+    let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Content,
+    )))
+    .add_path(identity.root.join("a.js"));
+    assert!(scheduler.submit_watch_event_for_tests(Ok(event)));
+    assert!(scheduler.checkout_watch_pending());
     gate.open();
     let reply = next_reply(&mut reader);
     tool(&reply, None, true);
@@ -12971,6 +13047,8 @@ async fn mcp_search_keeps_admitted_head_and_followup_pin_conflicts_after_publica
     assert_eq!(envelope["data"]["hits"].as_array().unwrap().len(), 1);
     assert_eq!(envelope["data"]["hits"][0]["name"], "held");
     let symbol_id = envelope["data"]["hits"][0]["symbolId"].clone();
+    worker_gate.open();
+    worker.await.unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (response, _) = runtime.evidence_response().unwrap();

@@ -721,7 +721,7 @@ fn references_modest_file_with_many_calls_keeps_exact_counts() {
 }
 
 #[test]
-fn references_indexed_owners_preserve_linear_selection_and_call_order() {
+fn references_indexed_owners_preserve_linear_selection_and_prefer_exact_calls() {
     let mut input = snapshot(&[
         ("src/lib.rs", "mod target; fn f() { crate::target::run(); }"),
         ("src/target.rs", "pub fn run() {}"),
@@ -769,6 +769,7 @@ fn references_indexed_owners_preserve_linear_selection_and_call_order() {
     }
     let source = &mut input.documents[source_index];
     source.declarations = original;
+    let exact_call_id = source.calls[0].id.clone();
     let mut outer = source.calls[0].clone();
     outer.id = "occ:v2:first-stored".into();
     outer.range = f.range;
@@ -776,7 +777,7 @@ fn references_indexed_owners_preserve_linear_selection_and_call_order() {
     let data = project(&input);
     assert_eq!(
         edge(&data, "production", "src/lib.rs", "src/target.rs")["sites"][0]["callId"],
-        "occ:v2:first-stored"
+        exact_call_id
     );
 }
 

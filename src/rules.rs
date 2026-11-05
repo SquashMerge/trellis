@@ -1035,6 +1035,8 @@ fn reference_evidence(module: &Value, site: &Value) -> Value {
     };
     let mut evidence = json!({"document":{"sourceSetId":module["identity"]["sourceSetId"],"language":module["identity"]["language"],"path":module["identity"]["path"]},
         "revisionId":module["revisionId"],"range":site["range"],"kind":kind,"syntaxId":site["ownerSyntaxId"],"callId":site["callId"],"provenanceId":provenance});
+    evidence["caller"] = site["caller"].clone();
+    evidence["callerReason"] = site["callerReason"].clone();
     if site["mapping"] == "semantic" {
         for key in [
             "projection",
@@ -1383,6 +1385,7 @@ fn evaluate_document(
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<DocumentRows> {
     let mut work = Work::new(limit);
+    let callers = crate::references::callers::Callers::new(doc);
     let mut instances = Vec::new();
     let mut test_only = Vec::new();
     let bases = if inheritance {
@@ -1429,8 +1432,11 @@ fn evaluate_document(
                     "bounded_work: rule constraint budget"
                 );
                 check()?;
-                let (status, reason, evidence) =
+                let (status, reason, mut evidence) =
                     constraint(config, targets, &anchors, doc, d, c, &mut work, check)?;
+                for site in &mut evidence {
+                    callers.annotate(site);
+                }
                 statuses.push(status);
                 constraints.push(json!({"mode":c.mode,"kind":c.kind,"targetRole":c.role,"status":status,"evidence":evidence,"unresolved":reason.into_iter().collect::<Vec<_>>(),"projection":doc.semantic.projection}));
                 if let Some(reason) = reason

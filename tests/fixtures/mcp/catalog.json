@@ -14516,6 +14516,31 @@
                 "revisionId",
                 "range"
               ]
+            },
+            "caller": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Caller"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "callerReason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "syntax_only",
+                    "enclosing_callable_unknown",
+                    "stable_lookup_unavailable",
+                    "semantic_boundary"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -14913,6 +14938,31 @@
                 "path",
                 "revisionId",
                 "range"
+              ]
+            },
+            "caller": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Caller"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "callerReason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "syntax_only",
+                    "enclosing_callable_unknown",
+                    "stable_lookup_unavailable",
+                    "semantic_boundary"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
               ]
             }
           },
@@ -16006,6 +16056,30 @@
             "factDigest"
           ],
           "type": "object"
+        },
+        "Caller": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "stableLookupKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "syntaxId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "name": {
+              "$ref": "#/$defs/Text"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            }
+          },
+          "required": [
+            "stableLookupKey",
+            "syntaxId",
+            "name",
+            "document"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -17234,6 +17308,31 @@
                 "revisionId",
                 "range"
               ]
+            },
+            "caller": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Caller"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "callerReason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "syntax_only",
+                    "enclosing_callable_unknown",
+                    "stable_lookup_unavailable",
+                    "semantic_boundary"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -17631,6 +17730,31 @@
                 "path",
                 "revisionId",
                 "range"
+              ]
+            },
+            "caller": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Caller"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "callerReason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "syntax_only",
+                    "enclosing_callable_unknown",
+                    "stable_lookup_unavailable",
+                    "semantic_boundary"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
               ]
             }
           },
@@ -18799,6 +18923,30 @@
             "factDigest"
           ],
           "type": "object"
+        },
+        "Caller": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "stableLookupKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "syntaxId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "name": {
+              "$ref": "#/$defs/Text"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            }
+          },
+          "required": [
+            "stableLookupKey",
+            "syntaxId",
+            "name",
+            "document"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -20251,6 +20399,31 @@
                 "revisionId",
                 "range"
               ]
+            },
+            "caller": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Caller"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "callerReason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "syntax_only",
+                    "enclosing_callable_unknown",
+                    "stable_lookup_unavailable",
+                    "semantic_boundary"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -20648,6 +20821,31 @@
                 "path",
                 "revisionId",
                 "range"
+              ]
+            },
+            "caller": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Caller"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "callerReason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "syntax_only",
+                    "enclosing_callable_unknown",
+                    "stable_lookup_unavailable",
+                    "semantic_boundary"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
               ]
             }
           },
@@ -21816,6 +22014,30 @@
             "factDigest"
           ],
           "type": "object"
+        },
+        "Caller": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "stableLookupKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "syntaxId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "name": {
+              "$ref": "#/$defs/Text"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            }
+          },
+          "required": [
+            "stableLookupKey",
+            "syntaxId",
+            "name",
+            "document"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",

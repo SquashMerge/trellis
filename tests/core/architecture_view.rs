@@ -694,3 +694,141 @@ fn workbench_architecture_forwards_population_without_changing_references_or_pol
     }
     response.finish(()).unwrap();
 }
+
+#[test]
+fn boundary_sites_publish_exact_callers_without_guessing_noncall_references() {
+    let (_state, root, store, pin) = fixture();
+    rules(root.path(), RULES);
+    let checked = native(&store, pin, "check");
+    let edge = checked["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["target"]["path"] == "src/store.rs" && row["destination"]["path"] == "src/entry.rs"
+        })
+        .unwrap();
+    assert_eq!(edge["status"], "deviates");
+    let site = &edge["evidence"][0];
+    assert_eq!(
+        site["caller"]["stableLookupKey"], "src/store.rs::run",
+        "{site}"
+    );
+    assert_eq!(site["caller"]["syntaxId"], site["syntaxId"]);
+    assert_eq!(site["caller"]["document"], site["document"]);
+    assert!(site["callerReason"].is_null());
+    let references = native(&store, pin, "references");
+    let imports: Vec<_> = references["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|edge| edge["source"]["path"] == "src/lib.rs")
+        .flat_map(|edge| edge["sites"].as_array().unwrap())
+        .filter(|site| site["callId"].is_null())
+        .collect();
+    for site in imports {
+        assert!(site["caller"].is_null());
+        assert_eq!(site["callerReason"], "syntax_only");
+    }
+}
+
+#[test]
+fn noncall_argument_references_do_not_borrow_the_surrounding_call_owner() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "mod dest; pub fn run() { consume(crate::dest::VALUE); } fn consume(_: i32) {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("src/dest.rs"),
+        "pub const VALUE: i32 = 1;\n",
+    )
+    .unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native_rows, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native_rows, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    let references = native(&store, pin, "references");
+    let site = references["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|edge| edge["sites"].as_array().unwrap())
+        .find(|site| site["spelling"] == "crate::dest::VALUE")
+        .unwrap();
+    assert!(site["caller"].is_null());
+    assert_eq!(site["callerReason"], "syntax_only");
+}
+
+#[test]
+fn nested_boundary_sites_use_the_exact_inner_measured_call() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "mod top; pub fn run() { consume(crate::top::target()); } fn consume(_: ()) {}\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("src/top.rs"), "pub fn target() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native_rows, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let inner = native_rows
+        .calls
+        .iter()
+        .find(|call| call.spelling.as_deref() == Some("target"))
+        .unwrap();
+    let owner = native_rows
+        .declarations
+        .iter()
+        .find(|d| d.syntax_id == inner.owner_syntax_id)
+        .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native_rows, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    rules(
+        root.path(),
+        "version=1\n[layers.low]\norder=2\npaths=['src/lib.rs']\n[layers.top]\norder=1\npaths=['src/top.rs']\n",
+    );
+    let references = native(&store, pin, "references");
+    let site = references["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|edge| edge["sites"].as_array().unwrap())
+        .find(|site| site["spelling"] == "crate::top::target")
+        .unwrap();
+    assert_eq!(site["callId"], inner.id, "{site}");
+    assert_eq!(site["caller"]["syntaxId"], owner.syntax_id);
+    assert_eq!(site["caller"]["stableLookupKey"], "src/lib.rs::run");
+    assert!(site["callerReason"].is_null());
+    let checked = native(&store, pin, "check");
+    let evidence = &checked["instances"][0]["evidence"][0];
+    assert_eq!(evidence["callId"], inner.id);
+    assert_eq!(evidence["caller"], site["caller"]);
+    assert!(evidence["callerReason"].is_null());
+}
