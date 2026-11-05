@@ -666,7 +666,9 @@ impl Emit<'_, '_> {
 /// Rows of one query, each admitted before it is decoded: its per-unit source-set charge and
 /// its column bytes from `bytes_from` (the size `row_reserve` charged when each row was its
 /// own unit), measured on SQLite's borrowed values. Rows a page later leaves unemitted were
-/// still admitted, so the page's reservation covers everything it holds.
+/// still admitted, so the page's reservation covers everything it holds. The per-row allowance
+/// covers the page's output vector, as before batching; the prefetch vector's capacity is
+/// admitted separately.
 fn query_rows<T>(
     db: &Connection,
     sql: &str,
@@ -681,6 +683,16 @@ fn query_rows<T>(
     while let Some(row) = rows.next()? {
         (emit.reserve)(emit.unit)?;
         (emit.reserve)(row_bytes(row, bytes_from)?)?;
+        // The prefetch vector is held beside the page's output while the page is emitted,
+        // so its own layout is admitted too, before it grows: doubling, as `Vec` would.
+        if found.len() == found.capacity() {
+            let grown = found.capacity().saturating_mul(2).max(4);
+            let added = (grown - found.capacity())
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or_else(|| corrupt("witness prefetch size"))?;
+            (emit.reserve)(u64::try_from(added)?)?;
+            found.reserve_exact(grown - found.len());
+        }
         found.push(decode(row)?);
     }
     Ok(found)
@@ -2233,6 +2245,98 @@ mod tests {
         // The denied budget must stop owned child decoding before it starts.
         // Current head instead fails here: left Some(2), right Some(0).
         assert_eq!(decoded_at_first_reservation, Some(0));
+    }
+
+    // Prime's #693 re-review reproduction: the batching path retains the query vector while
+    // moving rows into the output vector. Both requested layouts draw on the existing page
+    // budget.
+    #[test]
+    fn prefetched_parent_capacity_is_admitted_with_output_capacity() {
+        use std::cell::Cell;
+        use std::mem::size_of;
+
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE review_capacity_parents(id INTEGER PRIMARY KEY, ordinal INTEGER, key_scheme TEXT, key_symbol TEXT, key_scope TEXT, key_document_language TEXT, key_document_path TEXT, display_name TEXT, provenance_id TEXT);",
+        )
+        .unwrap();
+        for ordinal in 0..129i64 {
+            db.execute(
+                "INSERT INTO review_capacity_parents VALUES(?1,?2,'scip',?3,'global',NULL,NULL,NULL,'1111111111111111111111111111111111111111111111111111111111111111')",
+                params![ordinal + 1, ordinal, format!("x{ordinal}")],
+            )
+            .unwrap();
+        }
+        let charged = Cell::new(0u64);
+        let mut reserve = |bytes: u64| -> Result<()> {
+            charged.set(charged.get().checked_add(bytes).unwrap());
+            Ok(())
+        };
+        let mut out = Vec::new();
+        let mut emit = Emit {
+            out: &mut out,
+            room: 256,
+            emitted: 0,
+            unit: 2, // Same per-row allowance as source-set ID "s".
+            reserve: &mut reserve,
+        };
+        // Include the association_unit entry charge as well as query_rows' charges.
+        (emit.reserve)(emit.unit).unwrap();
+        let parents = query_rows(
+            &db,
+            "SELECT id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id FROM review_capacity_parents ORDER BY ordinal LIMIT ?1",
+            params![256i64],
+            0,
+            &mut emit,
+            |row| {
+                let id: i64 = row.get(0)?;
+                let ordinal: i64 = row.get(1)?;
+                Ok(ParentRow {
+                    id,
+                    blob: Vec::new(),
+                    order: ordinal,
+                    row: OriginalRow::Symbol(OriginalSymbol {
+                        row_id: id,
+                        ordinal,
+                        key: semantic_symbol_key_read(
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            "s",
+                        )?,
+                        display_name: row.get(7)?,
+                        provenance_id: row.get(8)?,
+                    }),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(parents.len(), 129);
+        let parent_capacity = parents.capacity();
+        // family likewise keeps this IntoIter's backing allocation alive while emitting.
+        let mut parents = parents.into_iter();
+        for _ in 0..129 {
+            let parent = parents.next().unwrap();
+            emit.push(parent.row);
+        }
+        let container_bytes = parent_capacity * size_of::<ParentRow>()
+            + emit.out.capacity() * size_of::<OriginalRow>();
+        // Keep the exhausted iterator alive: it still owns its allocation until drop.
+        std::hint::black_box(&parents);
+        // Even ignoring all owned String storage, the requested container layouts must
+        // fit the reservation. No allocator overhead or process RSS is counted here.
+        assert!(
+            charged.get() >= container_bytes as u64,
+            "charged={} containers={} parent_capacity={} output_capacity={} parent_size={} row_size={}",
+            charged.get(),
+            container_bytes,
+            parent_capacity,
+            emit.out.capacity(),
+            size_of::<ParentRow>(),
+            size_of::<OriginalRow>(),
+        );
     }
 
     #[test]
