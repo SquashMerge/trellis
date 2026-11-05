@@ -604,7 +604,6 @@ struct ParentRow {
     id: i64,
     blob: Vec<u8>,
     order: i64,
-    bytes: u64,
     row: OriginalRow,
 }
 /// One child row, keyed by its parent's integer ID or reference ID.
@@ -612,16 +611,16 @@ struct ChildRow {
     id: i64,
     blob: Vec<u8>,
     ordinal: i64,
-    bytes: u64,
     row: OriginalRow,
 }
 /// A child table of a family. Its query reads the children of a range of parents in
 /// (parent order, child ordinal) order: `?1` the tuple, parents ordered in `[?2, ?3]`, the
 /// parent at `?2` only for child ordinals above `?4`, at most `?5` rows. Column 0 is the
-/// parent's key.
+/// parent's key. A row's reserved size counts its columns from `bytes_from`.
 struct ChildTable {
     sql: &'static str,
     gap: &'static str,
+    bytes_from: usize,
     decode: fn(&rusqlite::Row<'_>, &str) -> Result<ChildRow>,
 }
 
@@ -645,8 +644,8 @@ fn row_bytes(row: &rusqlite::Row<'_>, from: usize) -> Result<u64> {
     Ok(bytes)
 }
 
-/// Emits rows for one page; every emitted row after a unit's first also carries the
-/// per-unit source-set charge, as when each row was its own unit.
+/// Collects one page's rows. Every row a query returns, emitted or not, was reserved by
+/// [`query_rows`] before it was decoded.
 struct Emit<'p, 'r> {
     out: &'p mut Vec<OriginalRow>,
     room: usize,
@@ -658,27 +657,30 @@ impl Emit<'_, '_> {
     fn full(&self) -> bool {
         self.emitted >= self.room
     }
-    fn push(&mut self, row: OriginalRow, bytes: u64) -> Result<()> {
-        if self.emitted > 0 {
-            (self.reserve)(self.unit)?;
-        }
-        (self.reserve)(bytes)?;
+    fn push(&mut self, row: OriginalRow) {
         self.out.push(row);
         self.emitted += 1;
-        Ok(())
     }
 }
 
+/// Rows of one query, each admitted before it is decoded: its per-unit source-set charge and
+/// its column bytes from `bytes_from` (the size `row_reserve` charged when each row was its
+/// own unit), measured on SQLite's borrowed values. Rows a page later leaves unemitted were
+/// still admitted, so the page's reservation covers everything it holds.
 fn query_rows<T>(
     db: &Connection,
     sql: &str,
     values: &[&dyn rusqlite::ToSql],
+    bytes_from: usize,
+    emit: &mut Emit<'_, '_>,
     mut decode: impl FnMut(&rusqlite::Row<'_>) -> Result<T>,
 ) -> Result<Vec<T>> {
     let mut statement = db.prepare_cached(sql)?;
     let mut rows = statement.query(values)?;
     let mut found = Vec::new();
     while let Some(row) = rows.next()? {
+        (emit.reserve)(emit.unit)?;
+        (emit.reserve)(row_bytes(row, bytes_from)?)?;
         found.push(decode(row)?);
     }
     Ok(found)
@@ -719,24 +721,24 @@ fn association_unit(
                 + a.producer.id.len() as u64
                 + a.captured_revision_id.len() as u64
                 + source_set.len() as u64;
+            // Reserved before the row's owned values are built.
+            (emit.reserve)(bytes)?;
             next_parent(c, 1);
-            emit.push(
-                OriginalRow::Coverage(sem::Coverage {
-                    producer_id: a.producer.id.clone(),
-                    language: semantic_enum(w.document.language.clone())?,
-                    source_set_id: source_set.clone(),
-                    document_path: w.document.path.clone(),
-                    revision_id: a.captured_revision_id.clone(),
-                    requested: w.requested,
-                    selected: w.selected,
-                    state: w.state,
-                    supported_roles: Vec::new(),
-                    observed_roles: Vec::new(),
-                    diagnostic: w.diagnostic.clone(),
-                    reasons: w.reasons.clone(),
-                }),
-                bytes,
-            )
+            emit.push(OriginalRow::Coverage(sem::Coverage {
+                producer_id: a.producer.id.clone(),
+                language: semantic_enum(w.document.language.clone())?,
+                source_set_id: source_set.clone(),
+                document_path: w.document.path.clone(),
+                revision_id: a.captured_revision_id.clone(),
+                requested: w.requested,
+                selected: w.selected,
+                state: w.state,
+                supported_roles: Vec::new(),
+                observed_roles: Vec::new(),
+                diagnostic: w.diagnostic.clone(),
+                reasons: w.reasons.clone(),
+            }));
+            Ok(())
         }
         1 => {
             while !emit.full() && c.phase == 1 {
@@ -751,28 +753,21 @@ fn association_unit(
                         c.child_ordinal,
                         i64::try_from(want)?
                     ],
-                    |row| {
-                        Ok((
-                            row_bytes(row, 0)?,
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                        ))
-                    },
+                    0,
+                    &mut emit,
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                 )?;
                 let fetched = rows.len();
-                for (bytes, ordinal, role) in rows {
+                for (ordinal, role) in rows {
                     selected_ensure!(
                         ordinal == c.child_ordinal + 1,
                         "original coverage role ordinal gap"
                     );
-                    emit.push(
-                        OriginalRow::CoverageRole {
-                            observed,
-                            ordinal,
-                            role: semantic_enum(role)?,
-                        },
-                        bytes,
-                    )?;
+                    emit.push(OriginalRow::CoverageRole {
+                        observed,
+                        ordinal,
+                        role: semantic_enum(role)?,
+                    });
                     c.child_ordinal = ordinal;
                 }
                 if fetched == want {
@@ -795,6 +790,8 @@ fn association_unit(
                     db,
                     "SELECT basis_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash FROM semantic_basis WHERE tuple_id=?1 AND basis_id>?2 ORDER BY basis_id LIMIT ?3",
                     params![w.tuple_id, c.after_id, limit],
+                    0,
+                    &mut emit,
                     |row| {
                         let b = OriginalBasis {
                             basis_id: row.get(0)?,
@@ -828,7 +825,6 @@ fn association_unit(
                             id: b.basis_id,
                             blob: Vec::new(),
                             order: b.basis_id,
-                            bytes: row_bytes(row, 0)?,
                             row: OriginalRow::Basis(b),
                         })
                     },
@@ -844,6 +840,7 @@ fn association_unit(
                 &[ChildTable {
                     sql: "SELECT d.basis_id,d.ordinal,d.lookup_key FROM semantic_basis b JOIN semantic_basis_lookup_dependencies d ON d.basis_id=b.basis_id WHERE b.tuple_id=?1 AND b.basis_id>=?2 AND b.basis_id<=?3 AND (b.basis_id>?2 OR d.ordinal>?4) ORDER BY b.basis_id,d.ordinal LIMIT ?5",
                     gap: "original basis dependency ordinal gap",
+                    bytes_from: 1,
                     decode: |row, _| {
                         let id: i64 = row.get(0)?;
                         let ordinal: i64 = row.get(1)?;
@@ -851,7 +848,6 @@ fn association_unit(
                             id,
                             blob: Vec::new(),
                             ordinal,
-                            bytes: row_bytes(row, 1)?,
                             row: OriginalRow::BasisLookupDependency {
                                 basis_id: id,
                                 ordinal,
@@ -876,9 +872,9 @@ fn association_unit(
                     w.document.path,
                     want
                 ],
+                0,
+                &mut emit,
                 |row| {
-                    // The membership column is an integer: it adds nothing to the size.
-                    let bytes = row_bytes(row, 0)?;
                     let capture: Option<i64> = row.get(5)?;
                     let raw: Option<String> = row.get(6)?;
                     let kind: Option<String> = row.get(7)?;
@@ -894,28 +890,25 @@ fn association_unit(
                     );
                     let membership: bool = row.get(9)?;
                     selected_ensure!(membership, "original derivation identity mismatch");
-                    Ok((
-                        bytes,
-                        OriginalProvenance {
-                            id: row.get(0)?,
-                            content_hash: row.get(1)?,
-                            evidence_kind: semantic_enum(row.get(2)?)?,
-                            freshness: semantic_enum(row.get(3)?)?,
-                            basis_id: row.get(4)?,
-                            capture_id,
-                            derived_from: sem::DerivedFrom {
-                                provenance_id: raw,
-                                record_kind: semantic_enum(kind)?,
-                                fact_digest: digest,
-                            },
+                    Ok(OriginalProvenance {
+                        id: row.get(0)?,
+                        content_hash: row.get(1)?,
+                        evidence_kind: semantic_enum(row.get(2)?)?,
+                        freshness: semantic_enum(row.get(3)?)?,
+                        basis_id: row.get(4)?,
+                        capture_id,
+                        derived_from: sem::DerivedFrom {
+                            provenance_id: raw,
+                            record_kind: semantic_enum(kind)?,
+                            fact_digest: digest,
                         },
-                    ))
+                    })
                 },
             )?;
             let fetched = rows.len();
-            for (bytes, proof) in rows {
+            for proof in rows {
                 let id = proof.id.clone();
-                emit.push(OriginalRow::Provenance(proof), bytes)?;
+                emit.push(OriginalRow::Provenance(proof));
                 c.after_text = id;
             }
             if fetched < room {
@@ -932,6 +925,8 @@ fn association_unit(
                     db,
                     "SELECT symbol_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id FROM semantic_symbols WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
                     params![w.tuple_id, c.after_id, limit],
+                    0,
+                    &mut emit,
                     |row| {
                         let ordinal: i64 = row.get(1)?;
                         selected_ensure!(ordinal == prior + 1, "original symbol ordinal gap");
@@ -954,7 +949,6 @@ fn association_unit(
                             id: symbol.row_id,
                             blob: Vec::new(),
                             order: ordinal,
-                            bytes: row_bytes(row, 0)?,
                             row: OriginalRow::Symbol(symbol),
                         })
                     },
@@ -970,6 +964,7 @@ fn association_unit(
                 &[ChildTable {
                     sql: "SELECT t.* FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND s.ordinal>=?2 AND s.ordinal<=?3 AND (s.ordinal>?2 OR t.ordinal>?4) ORDER BY s.ordinal,t.ordinal LIMIT ?5",
                     gap: "original symbol target ordinal gap",
+                    bytes_from: 0,
                     decode: |row, source_set| {
                         let id: i64 = row.get(0)?;
                         let ordinal: i64 = row.get(1)?;
@@ -979,7 +974,6 @@ fn association_unit(
                             id,
                             blob: Vec::new(),
                             ordinal,
-                            bytes: row_bytes(row, 0)?,
                             row: OriginalRow::SymbolTarget {
                                 row_id: id,
                                 ordinal,
@@ -1001,6 +995,8 @@ fn association_unit(
                     db,
                     "SELECT binding_id,ordinal,syntax_id,provenance_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic FROM semantic_declaration_bindings WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
                     params![w.tuple_id, c.after_id, limit],
+                    0,
+                    &mut emit,
                     |row| {
                         let ordinal: i64 = row.get(1)?;
                         selected_ensure!(ordinal == prior + 1, "original declaration ordinal gap");
@@ -1016,7 +1012,6 @@ fn association_unit(
                             id: binding.row_id,
                             blob: Vec::new(),
                             order: ordinal,
-                            bytes: row_bytes(row, 0)?,
                             row: OriginalRow::DeclarationBinding(binding),
                         })
                     },
@@ -1042,6 +1037,8 @@ fn association_unit(
                     db,
                     "SELECT * FROM semantic_references WHERE tuple_id=?1 AND reference_id>?2 ORDER BY reference_id LIMIT ?3",
                     params![w.tuple_id, c.after_blob, limit],
+                    0,
+                    &mut emit,
                     |row| {
                         let start: i64 = row.get(4)?;
                         let end: i64 = row.get(5)?;
@@ -1068,7 +1065,6 @@ fn association_unit(
                             id: 0,
                             blob: row.get(1)?,
                             order: 0,
-                            bytes: row_bytes(row, 0)?,
                             row: OriginalRow::Reference(reference),
                         })
                     },
@@ -1085,6 +1081,7 @@ fn association_unit(
                     ChildTable {
                         sql: "SELECT reference_id,ordinal,role FROM semantic_reference_roles WHERE tuple_id=?1 AND reference_id>=?2 AND reference_id<=?3 AND (reference_id>?2 OR ordinal>?4) ORDER BY reference_id,ordinal LIMIT ?5",
                         gap: "original reference role ordinal gap",
+                        bytes_from: 1,
                         decode: |row, _| {
                             let blob: Vec<u8> = row.get(0)?;
                             let ordinal: i64 = row.get(1)?;
@@ -1098,13 +1095,13 @@ fn association_unit(
                                 id: 0,
                                 blob,
                                 ordinal,
-                                bytes: row_bytes(row, 1)?,
                             })
                         },
                     },
                     ChildTable {
                         sql: "SELECT * FROM semantic_reference_candidates WHERE tuple_id=?1 AND reference_id>=?2 AND reference_id<=?3 AND (reference_id>?2 OR ordinal>?4) ORDER BY reference_id,ordinal LIMIT ?5",
                         gap: "original reference candidate ordinal gap",
+                        bytes_from: 0,
                         decode: |row, source_set| {
                             let blob: Vec<u8> = row.get(1)?;
                             let ordinal: i64 = row.get(2)?;
@@ -1119,7 +1116,6 @@ fn association_unit(
                                 id: 0,
                                 blob,
                                 ordinal,
-                                bytes: row_bytes(row, 0)?,
                             })
                         },
                     },
@@ -1137,6 +1133,8 @@ fn association_unit(
                     db,
                     "SELECT * FROM semantic_call_bindings WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
                     params![w.tuple_id, c.after_id, limit],
+                    0,
+                    &mut emit,
                     |row| {
                         let ordinal: i64 = row.get(2)?;
                         selected_ensure!(ordinal == prior + 1, "original call ordinal gap");
@@ -1157,7 +1155,6 @@ fn association_unit(
                             id: binding.row_id,
                             blob: Vec::new(),
                             order: ordinal,
-                            bytes: row_bytes(row, 0)?,
                             row: OriginalRow::CallBinding(binding),
                         })
                     },
@@ -1176,7 +1173,6 @@ fn association_unit(
                     id,
                     blob: Vec::new(),
                     ordinal,
-                    bytes: row_bytes(row, 0)?,
                     row: if dispatch {
                         OriginalRow::CallDispatch {
                             row_id: id,
@@ -1203,6 +1199,7 @@ fn association_unit(
                     ChildTable {
                         sql: "SELECT x.binding_id,x.ordinal,x.candidate_id FROM semantic_call_bindings b JOIN semantic_call_join_candidates x ON x.binding_id=b.binding_id WHERE b.tuple_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
                         gap: "original call join candidate ordinal gap",
+                        bytes_from: 1,
                         decode: |row, _| {
                             let id: i64 = row.get(0)?;
                             let ordinal: i64 = row.get(1)?;
@@ -1210,7 +1207,6 @@ fn association_unit(
                                 id,
                                 blob: Vec::new(),
                                 ordinal,
-                                bytes: row_bytes(row, 1)?,
                                 row: OriginalRow::CallJoinCandidate {
                                     row_id: id,
                                     ordinal,
@@ -1222,11 +1218,13 @@ fn association_unit(
                     ChildTable {
                         sql: "SELECT x.* FROM semantic_call_bindings b JOIN semantic_call_candidates x ON x.binding_id=b.binding_id WHERE b.tuple_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
                         gap: "original call target ordinal gap",
+                        bytes_from: 0,
                         decode: |row, source_set| call_target(row, source_set, false),
                     },
                     ChildTable {
                         sql: "SELECT x.* FROM semantic_call_bindings b JOIN semantic_call_possible_dispatch x ON x.binding_id=b.binding_id WHERE b.tuple_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
                         gap: "original call target ordinal gap",
+                        bytes_from: 0,
                         decode: |row, source_set| call_target(row, source_set, true),
                     },
                 ],
@@ -1240,12 +1238,13 @@ fn association_unit(
                 db,
                 "SELECT * FROM semantic_type_relationships WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
                 params![w.tuple_id, c.after_id, limit],
+                0,
+                &mut emit,
                 |row| {
                     let ordinal: i64 = row.get(2)?;
                     selected_ensure!(ordinal == prior + 1, "original relationship ordinal gap");
                     prior = ordinal;
                     Ok((
-                        row_bytes(row, 0)?,
                         ordinal,
                         sem::TypeRelationship {
                             kind: semantic_enum(row.get(3)?)?,
@@ -1259,8 +1258,8 @@ fn association_unit(
                 },
             )?;
             let fetched = rows.len();
-            for (bytes, ordinal, row) in rows {
-                emit.push(OriginalRow::TypeRelationship { ordinal, row }, bytes)?;
+            for (ordinal, row) in rows {
+                emit.push(OriginalRow::TypeRelationship { ordinal, row });
                 c.after_id = ordinal;
             }
             if fetched < room {
@@ -1278,6 +1277,7 @@ fn declaration_children() -> [ChildTable; 2] {
         ChildTable {
             sql: "SELECT x.binding_id,x.ordinal,x.scheme,x.symbol,x.scope,x.document_language,x.document_path FROM semantic_declaration_bindings b JOIN semantic_declaration_binding_symbols x ON x.binding_id=b.binding_id WHERE b.tuple_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
             gap: "original declaration symbol ordinal gap",
+            bytes_from: 1,
             decode: |row, source_set| {
                 let id: i64 = row.get(0)?;
                 let ordinal: i64 = row.get(1)?;
@@ -1285,7 +1285,6 @@ fn declaration_children() -> [ChildTable; 2] {
                     id,
                     blob: Vec::new(),
                     ordinal,
-                    bytes: row_bytes(row, 1)?,
                     row: OriginalRow::DeclarationSymbol {
                         row_id: id,
                         ordinal,
@@ -1304,6 +1303,7 @@ fn declaration_children() -> [ChildTable; 2] {
         ChildTable {
             sql: "SELECT x.binding_id,x.ordinal,x.candidate_id FROM semantic_declaration_bindings b JOIN semantic_declaration_join_candidates x ON x.binding_id=b.binding_id WHERE b.tuple_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
             gap: "original declaration candidate ordinal gap",
+            bytes_from: 1,
             decode: |row, _| {
                 let id: i64 = row.get(0)?;
                 let ordinal: i64 = row.get(1)?;
@@ -1311,7 +1311,6 @@ fn declaration_children() -> [ChildTable; 2] {
                     id,
                     blob: Vec::new(),
                     ordinal,
-                    bytes: row_bytes(row, 1)?,
                     row: OriginalRow::DeclarationCandidate {
                         row_id: id,
                         ordinal,
@@ -1384,6 +1383,8 @@ fn family(
                     db,
                     table.sql,
                     params![tuple, low_blob, high_blob, after_child, want],
+                    table.bytes_from,
+                    emit,
                     |row| (table.decode)(row, source_set),
                 )?
             } else {
@@ -1391,6 +1392,8 @@ fn family(
                     db,
                     table.sql,
                     params![tuple, low_int, high_int, after_child, want],
+                    table.bytes_from,
+                    emit,
                     |row| (table.decode)(row, source_set),
                 )?
             }
@@ -1427,7 +1430,7 @@ fn family(
                     "{}",
                     tables[index].gap
                 );
-                emit.push(child.row, child.bytes)?;
+                emit.push(child.row);
                 c.child_ordinal = child.ordinal;
             }
             // A full page may have cut this table's rows short: resume it, not the next.
@@ -1450,7 +1453,7 @@ fn family(
         if emit.full() {
             return Ok(());
         }
-        emit.push(parent.row, parent.bytes)?;
+        emit.push(parent.row);
         if by_blob {
             c.after_blob = parent.blob.clone();
             c.parent_blob = parent.blob.clone();
@@ -2147,6 +2150,91 @@ mod tests {
         assert!(selected_version(&db, pin, &other).unwrap().is_none());
     }
 
+    // Prime's #693 review reproduction: a refused page reservation must come before any owned
+    // child decoding. Adapted only to the reservation moving from decoded rows to the table.
+    #[test]
+    fn family_reserves_before_decoding_prefetched_children() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DECODED_CHILDREN: AtomicUsize = AtomicUsize::new(0);
+        DECODED_CHILDREN.store(0, Ordering::SeqCst);
+
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+        "CREATE TABLE review_parents(id INTEGER PRIMARY KEY, tuple_id INTEGER, ordinal INTEGER);
+         CREATE TABLE review_children(parent_id INTEGER, ordinal INTEGER, value TEXT);
+         INSERT INTO review_parents VALUES(1,7,0);
+         INSERT INTO review_children VALUES(1,0,'first'),(1,1,'second');",
+    ).unwrap();
+        let tables = [ChildTable {
+            sql: "SELECT x.parent_id,x.ordinal,x.value FROM review_parents p JOIN review_children x ON x.parent_id=p.id WHERE p.tuple_id=?1 AND p.ordinal>=?2 AND p.ordinal<=?3 AND (p.ordinal>?2 OR x.ordinal>?4) ORDER BY p.ordinal,x.ordinal LIMIT ?5",
+            gap: "review child ordinal gap",
+            bytes_from: 1,
+            decode: |row, _| {
+                let id = row.get(0)?;
+                let ordinal = row.get(1)?;
+                // row.get::<_, String> is the owned heap allocation under review.
+                let key: String = row.get(2)?;
+                DECODED_CHILDREN.fetch_add(1, Ordering::SeqCst);
+                Ok(ChildRow {
+                    id,
+                    blob: Vec::new(),
+                    ordinal,
+                    row: OriginalRow::BasisLookupDependency {
+                        basis_id: id,
+                        ordinal,
+                        key,
+                    },
+                })
+            },
+        }];
+        let parents = vec![ParentRow {
+            id: 1,
+            blob: Vec::new(),
+            order: 0,
+            row: OriginalRow::BasisLookupDependency {
+                basis_id: 1,
+                ordinal: -1,
+                key: "parent".into(),
+            },
+        }];
+        let mut cursor = OriginalAssociationCursor {
+            phase: 2,
+            after_id: -1,
+            child_ordinal: -1,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let mut decoded_at_first_reservation = None;
+        let mut refused = |_: u64| -> Result<()> {
+            decoded_at_first_reservation = Some(DECODED_CHILDREN.load(Ordering::SeqCst));
+            anyhow::bail!("existing page byte reservation refused")
+        };
+        let mut emit = Emit {
+            out: &mut out,
+            room: 2,
+            emitted: 0,
+            unit: 0,
+            reserve: &mut refused,
+        };
+        assert!(
+            family(
+                &db,
+                7,
+                "sources",
+                &mut cursor,
+                &mut emit,
+                parents,
+                &tables,
+                false,
+                3,
+            )
+            .is_err()
+        );
+        // The denied budget must stop owned child decoding before it starts.
+        // Current head instead fails here: left Some(2), right Some(0).
+        assert_eq!(decoded_at_first_reservation, Some(0));
+    }
+
     #[test]
     fn declaration_families_page_by_set_and_resume_inside_children() {
         let db = Connection::open_in_memory().unwrap();
@@ -2166,7 +2254,6 @@ mod tests {
             id,
             blob: Vec::new(),
             order,
-            bytes: 1,
             row: OriginalRow::BasisLookupDependency {
                 basis_id: id,
                 ordinal: -1,
