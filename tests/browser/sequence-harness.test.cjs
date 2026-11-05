@@ -106,6 +106,56 @@ if (process.env.TRELLIS_SEQUENCE_CLEANUP_CHILD === "1") {
       signal:(...args)=>calls.push(args)}), /ignored SIGTERM/);
     assert.deepEqual(calls,[[123,"SIGTERM"]],"identity changed immediately before escalation");
   });
+  // #701: a signalled daemon that has died but is not yet reaped still holds its
+  // PID: ps shows it as <defunct> (or, while exiting, without readable arguments),
+  // and kill(pid, 0) still finds it. This helper reaps its daemon only when its
+  // stdin closes, and the cleanup's own pause hook closes it once cleanup has
+  // polled the unreaped daemon, so the window is held open on every run.
+  test("detached cleanup waits until a signalled daemon is reaped, not only until it dies", {timeout:150000}, async () => {
+    const paths = H.fixture();
+    // A close-on-exec pipe reaches EOF once the daemon image has replaced the fork.
+    const reaper = spawn("perl", ["-e", [
+      "$| = 1; pipe(my $r, my $w) or die 'pipe';",
+      "my $pid = fork() // die 'fork';",
+      "if (!$pid) { close $r; open STDOUT, '>', '/dev/null'; open STDERR, '>', '/dev/null'; exec @ARGV; exit 127 }",
+      "close $w; my $exec = <$r>; print \"$pid\\n\"; <STDIN>; waitpid($pid, 0); print \"reaped\\n\";",
+    ].join(" "), H.binary, "daemon"], {env:paths.env, stdio:["pipe","pipe","pipe"]});
+    let output = "", errors = "", pid, released = false;
+    reaper.stdout.on("data", chunk => { output += chunk; });
+    reaper.stderr.on("data", chunk => { errors += chunk; });
+    reaper.stdin.on("error", () => {});
+    const reaperExit = once(reaper, "exit");
+    const printed = async text => {
+      while (!output.includes(text)) {
+        await Promise.race([once(reaper.stdout, "data"),
+          reaperExit.then(([code]) => { throw new Error(`reaper exited ${code} before ${JSON.stringify(text)}: ${errors}`); })]);
+      }
+    };
+    const zombie = async () => (await H.run("ps", ["-o", "stat=", "-p", String(pid)])).stdout.trim().startsWith("Z");
+    try {
+      await printed("\n");
+      pid = Number(output.split("\n")[0]);
+      assert.ok(pid > 0 && alive(pid), `reaper started the daemon: ${output}${errors}`);
+      const signals = [];
+      await H.stopSuiteDaemons({homes:new Set([paths.home]),
+        signal:(target, name) => { signals.push([target, name]); process.kill(target, name); },
+        pause:async ms => {
+          if (!released && await zombie()) { released = true; reaper.stdin.end("\n"); }
+          await new Promise(resolve => setTimeout(resolve, ms));
+        }});
+      assert.deepEqual(signals, [[pid, "SIGTERM"]], "cleanup found and signalled the daemon once");
+      assert.equal(alive(pid), false, `test-owned daemon ${pid} leaked after cleanup`);
+      assert.equal(released, true, "cleanup kept waiting while the dead daemon was unreaped");
+      await printed("reaped\n");
+    } finally {
+      if (!released) {
+        if (pid && alive(pid)) process.kill(pid, "SIGKILL");
+        reaper.stdin.end("\n");
+      }
+      await reaperExit;
+      rmSync(paths.temp, {recursive:true,force:true,maxRetries:10,retryDelay:100});
+    }
+  });
   for (const action of ["cleanup", "fail", "SIGTERM", "SIGINT"]) {
     test(`sequence harness cleans its detached daemon on ${action}`, {timeout:150000}, async () => {
       const child = fork(__filename, [], {env:{...process.env,TRELLIS_SEQUENCE_CLEANUP_CHILD:"1"}, stdio:["ignore","pipe","pipe","ipc"]});
