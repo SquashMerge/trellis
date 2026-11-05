@@ -3023,10 +3023,11 @@ async fn unchanged_status_head_is_a_cheap_conditional_read() {
     })
     .await
     .unwrap();
-    // The full status still runs its projection; the head digest never does.
+    // The full status projects at most once per head (#672 remembers it); the head digest
+    // never does.
     let before = projections();
     selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
-    assert_eq!(projections(), before + 1);
+    assert!(projections() <= before + 1);
     let before = projections();
     let (code, etag, body) = head_with(app.clone(), &head_path, None).await;
     assert_eq!(code, axum::http::StatusCode::OK);
