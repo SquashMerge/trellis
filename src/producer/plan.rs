@@ -416,6 +416,9 @@ fn mode(last: Option<&RunRecord>) -> Value {
 pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Result<Value> {
     let declared = Declared::new(&request.environment)?;
     let head = match store.index_baseline() {
+        // Revision zero is the empty bootstrap a rebuilt index starts from: nothing is
+        // published yet, so there is no head to report (#704).
+        Ok(pin) if pin.index_revision == 0 => None,
         Ok(pin) => {
             let revision =
                 store.with_native_reader(pin, |reader| Ok(reader.header()?.revision.id))?;
