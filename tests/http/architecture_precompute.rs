@@ -1,6 +1,8 @@
 #![cfg(feature = "test-support")]
 //! #556: one background Architecture build per revision and rules file, served to every read.
-use super::architecture_http::{RULES, fixture, fixture_with_sources, request, write_rules};
+use super::architecture_http::{
+    RULES, fixture, fixture_with_sources, request, summary, write_rules,
+};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -142,6 +144,77 @@ async fn a_read_during_the_build_answers_building_with_progress_then_the_result(
     assert_eq!(status, StatusCode::OK, "{ready}");
     assert_eq!(ready["payload"]["state"], "ready");
     assert_eq!(scheduler.architecture_builds_for_tests(), 1);
+}
+
+/// #706: a page's summary read samples the head, then waits on the owner. A revision
+/// published during that wait ends it early with the typed `202 building` for the new head,
+/// and the page asks again (docs/architecture-view.md). Both builds are held at a hook, so the
+/// head moves at exactly that point.
+#[tokio::test]
+async fn a_summary_read_whose_head_moves_while_it_waits_answers_building_and_is_asked_again() {
+    let (base, runtime, browser, key) = fixture().await;
+    write_rules(&base, RULES);
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (held_tx, held_rx) = mpsc::channel();
+    let (waiting_tx, waiting_rx) = mpsc::channel();
+    let (release_first, first_gate) = mpsc::channel::<()>();
+    let (release_second, second_gate) = mpsc::channel::<()>();
+    let gates = Mutex::new((first_gate, second_gate));
+    let release_second = Mutex::new(Some(release_second));
+    let builds = std::sync::atomic::AtomicUsize::new(0);
+    let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = waits.clone();
+    scheduler.set_architecture_hook_for_tests(Arc::new(move |point| match point {
+        "architecture_build_started" => {
+            builds.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        // After the build's read: it holds no lease, so a publication goes ahead.
+        "resolving" => {
+            let gates = gates.lock().unwrap();
+            let gate = match builds.load(std::sync::atomic::Ordering::Acquire) {
+                1 => &gates.0,
+                2 => &gates.1,
+                _ => return,
+            };
+            let _ = held_tx.send(());
+            let _ = gate.recv_timeout(trellis::testing::HANG_BACKSTOP);
+        }
+        "architecture_read_waiting" => {
+            // The page asked again, for the new head: let its build finish.
+            if counted.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                release_second.lock().unwrap().take();
+            }
+            let _ = waiting_tx.send(());
+        }
+        _ => {}
+    }));
+    let signalled = |rx: mpsc::Receiver<()>| {
+        tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+            rx
+        })
+    };
+    let (app, page) = (browser.clone().router(), key.clone());
+    let read = tokio::spawn(async move { summary(app, &page, "").await });
+    // The first build is held after its read, and the page's read waits on it.
+    let held_rx = signalled(held_rx).await.unwrap();
+    let _waiting_rx = signalled(waiting_rx).await.unwrap();
+    let root = base.path().join("checkout");
+    std::fs::write(root.join("added.js"), "function added() {}\n").unwrap();
+    let indexing = runtime.clone();
+    tokio::task::spawn_blocking(move || indexing.cli_index(&IndexOptions::new(root)))
+        .await
+        .unwrap()
+        .unwrap();
+    scheduler.architecture_hint();
+    drop(release_first);
+    let (status, body) = read.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payload"]["state"], "ready");
+    assert_eq!(body["payload"]["modules"].as_array().unwrap().len(), 5);
+    // The first read answered `building` for the new head; the page's second read waited.
+    assert!(waits.load(std::sync::atomic::Ordering::Acquire) >= 2);
+    drop(held_rx);
 }
 
 #[tokio::test]

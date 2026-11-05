@@ -34,6 +34,19 @@ pub(super) async fn request(app: axum::Router, key: &str, query: &str) -> (Statu
         .unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
 }
+/// The summary as the page reads it (docs/architecture-view.md): it asks again after a
+/// `202 building`. Each read waits on the owner's signal, so a `202` within that wait means
+/// the head moved past the pin the read sampled (#706), and the next read is for the new head.
+pub(super) async fn summary(app: axum::Router, key: &str, query: &str) -> (StatusCode, Value) {
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+    loop {
+        let (status, body) = request(app.clone(), key, query).await;
+        if status != StatusCode::ACCEPTED || std::time::Instant::now() >= deadline {
+            return (status, body);
+        }
+        assert_eq!(body["payload"]["state"], "building", "{body}");
+    }
+}
 pub(super) async fn fixture() -> (
     tempfile::TempDir,
     Arc<trellis::daemon::registry::CheckoutRuntime>,
@@ -310,7 +323,7 @@ async fn one_file_with_a_syntax_error_is_partial_and_every_whole_checkout_view_i
             "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js','deep/**','zero/**']",
         );
         let app = browser.router();
-        let (status, body) = request(app.clone(), &key, "").await;
+        let (status, body) = summary(app.clone(), &key, "").await;
         assert_eq!(status, StatusCode::OK, "{path}: {body}");
         let payload = &body["payload"];
         assert_eq!(payload["partialFiles"][0]["path"], path, "{payload}");
@@ -400,7 +413,7 @@ async fn one_file_past_the_evidence_budgets_is_a_coverage_gap_and_every_view_is_
             "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js','deep/**','zero/**']",
         );
         let app = browser.router();
-        let (status, body) = request(app.clone(), &key, "").await;
+        let (status, body) = summary(app.clone(), &key, "").await;
         assert_eq!(status, StatusCode::OK, "{path}: {source:.40}: {body}");
         let payload = &body["payload"];
         assert_eq!(payload["partialFiles"][0]["path"], path, "{source:.40}");
@@ -459,7 +472,7 @@ async fn one_source_that_is_not_utf8_is_skipped_and_every_view_is_served() {
             "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js','deep/**','zero/**']",
         );
         let app = browser.router();
-        let (status, body) = request(app.clone(), &key, "").await;
+        let (status, body) = summary(app.clone(), &key, "").await;
         assert_eq!(status, StatusCode::OK, "{path}: {body}");
         let payload = &body["payload"];
         assert_eq!(payload["partialFiles"][0]["path"], path);
@@ -511,7 +524,7 @@ async fn a_small_file_of_escaped_class_text_is_left_out_and_every_view_is_served
         "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js']",
     );
     let app = browser.router();
-    let (status, body) = request(app.clone(), &key, "").await;
+    let (status, body) = summary(app.clone(), &key, "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, metrics) = view(app.clone(), &key, "metrics").await;
     assert_eq!(status, StatusCode::OK, "{metrics}");
@@ -545,7 +558,7 @@ async fn a_class_extraction_past_its_ceiling_is_left_out_and_every_view_is_serve
         "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js']",
     );
     let app = browser.router();
-    let (status, body) = request(app.clone(), &key, "").await;
+    let (status, body) = summary(app.clone(), &key, "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, metrics) = view(app.clone(), &key, "metrics").await;
     assert_eq!(status, StatusCode::OK, "{metrics}");
@@ -581,7 +594,7 @@ async fn a_small_rust_file_with_a_large_impl_elsewhere_keeps_its_class_and_every
         "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js']",
     );
     let app = browser.router();
-    let (status, body) = request(app.clone(), &key, "").await;
+    let (status, body) = summary(app.clone(), &key, "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["payload"]["partialFiles"], serde_json::json!([]));
     let (status, metrics) = view(app.clone(), &key, "metrics").await;
@@ -641,7 +654,7 @@ async fn one_over_deep_file_is_partial_and_every_whole_checkout_view_is_served()
             "version=1\n[layers.app]\norder=1\npaths=['src/**','*.js','deep/**','zero/**']",
         );
         let app = browser.router();
-        let (status, body) = request(app.clone(), &key, "").await;
+        let (status, body) = summary(app.clone(), &key, "").await;
         assert_eq!(status, StatusCode::OK, "{path}: {body}");
         let payload = &body["payload"];
         assert_eq!(payload["partialFiles"][0]["path"], path, "{payload}");
