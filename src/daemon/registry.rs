@@ -473,6 +473,8 @@ pub struct CheckoutRegistry {
     test_next_startup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "test-support")]
     test_next_dependency_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
+    #[cfg(feature = "test-support")]
+    test_next_native_watcher_disabled: bool,
 }
 
 impl Default for CheckoutRegistry {
@@ -503,6 +505,8 @@ impl CheckoutRegistry {
             test_next_startup_hook: None,
             #[cfg(feature = "test-support")]
             test_next_dependency_hook: None,
+            #[cfg(feature = "test-support")]
+            test_next_native_watcher_disabled: false,
         }
     }
 
@@ -532,6 +536,14 @@ impl CheckoutRegistry {
         hook: Arc<dyn Fn(&'static str) + Send + Sync>,
     ) {
         self.test_next_dependency_hook = Some(hook);
+    }
+
+    /// Run the next activation's watchers without asynchronous OS delivery,
+    /// installed before its worker starts (#703).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn disable_next_native_watcher_for_tests(&mut self) {
+        self.test_next_native_watcher_disabled = true;
     }
 
     #[cfg(feature = "test-support")]
@@ -678,6 +690,10 @@ impl CheckoutRegistry {
         #[cfg(feature = "test-support")]
         if let Some(hook) = self.test_next_dependency_hook.take() {
             scheduler.set_dependency_hook_for_tests(hook);
+        }
+        #[cfg(feature = "test-support")]
+        if std::mem::take(&mut self.test_next_native_watcher_disabled) {
+            scheduler.disable_native_watcher_for_tests();
         }
         if let Some(search_fill) = &self.search_fill {
             scheduler.set_search_fill(search_fill.register(&scheduler));
@@ -2217,6 +2233,20 @@ impl CheckoutRuntime {
             .unwrap()
             .scheduler
             .hold_worker_step_for_tests(hold);
+    }
+
+    /// Hold the checkout worker with `event` accepted as a pending watcher hint (#703).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn hold_worker_with_watch_hint_for_tests(
+        &self,
+        event: notify::Result<notify::Event>,
+        hold: impl FnOnce(),
+    ) -> bool {
+        self.resources()
+            .unwrap()
+            .scheduler
+            .hold_worker_with_watch_hint_for_tests(event, hold)
     }
 
     /// Make this checkout's next completion COMMIT durable but report an error.

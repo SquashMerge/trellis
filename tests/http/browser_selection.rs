@@ -2992,7 +2992,17 @@ struct HeldCatalogBrowser {
     app: axum::Router,
     prefix: String,
     root: std::path::PathBuf,
+    registry: std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    key: String,
     _temp: TempDir,
+}
+
+#[cfg(feature = "test-support")]
+impl HeldCatalogBrowser {
+    /// The checkout's runtime, which the first browser read activated.
+    async fn runtime(&self) -> std::sync::Arc<trellis::daemon::registry::CheckoutRuntime> {
+        self.registry.lock().await.runtime(&self.key).unwrap()
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -3029,11 +3039,16 @@ fn held_catalog_browser() -> HeldCatalogBrowser {
         }
         _ => {}
     }));
+    // Catch-up is part of the head digest, and a late OS event for the fixture's own
+    // write above is honest catch-up at an unchanged head (#703). Hints come only from
+    // the tests themselves, through the same watcher ingress.
+    registry.disable_next_native_watcher_for_tests();
     registry
         .register(&identity, CheckoutOptions(serde_json::json!({})))
         .unwrap();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
     let app = ProvisionedBrowser::new(
-        Arc::new(tokio::sync::Mutex::new(registry)),
+        registry.clone(),
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         "127.0.0.1:7331".parse().unwrap(),
     )
@@ -3046,6 +3061,8 @@ fn held_catalog_browser() -> HeldCatalogBrowser {
         app,
         prefix,
         root,
+        registry,
+        key: identity.root_key,
         _temp: temp,
     }
 }
@@ -3087,6 +3104,52 @@ async fn browser_status_projections_count_the_full_status_itself() {
     assert!(projections() > before, "the full status was not counted");
 }
 
+// #703: catch-up is part of the head digest. A watcher hint at an unchanged revision is
+// a new digest while it is pending, and the old tag is current again once the hint's
+// inventory finds nothing changed.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_pending_watcher_hint_is_a_new_head_digest_at_the_same_revision() {
+    use notify::{Event, EventKind, event::CreateKind};
+    let browser = held_catalog_browser();
+    let (app, head_path) = (&browser.app, format!("{}/status/head", browser.prefix));
+    let full = caught_up_head(app, &head_path).await;
+    let (code, etag, _) = head_with(app.clone(), &head_path, None).await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    let etag = etag.expect("the head digest carries an ETag");
+    let (code, _, _) = head_with(app.clone(), &head_path, Some(&etag)).await;
+    assert_eq!(code, axum::http::StatusCode::NOT_MODIFIED);
+    // A late create event for the already-indexed file, held pending by the worker.
+    let hint =
+        Event::new(EventKind::Create(CreateKind::File)).add_path(browser.root.join("core.js"));
+    let (held, holding) = std::sync::mpsc::channel::<()>();
+    let (resume, resumed) = std::sync::mpsc::channel::<()>();
+    let runtime = browser.runtime().await;
+    let worker = tokio::task::spawn_blocking(move || {
+        runtime.hold_worker_with_watch_hint_for_tests(Ok(hint), || {
+            held.send(()).unwrap();
+            let _ = resumed.recv_timeout(trellis::testing::HANG_BACKSTOP);
+        })
+    });
+    tokio::task::spawn_blocking(move || holding.recv_timeout(trellis::testing::HANG_BACKSTOP))
+        .await
+        .unwrap()
+        .expect("the worker holds the hint");
+    let (code, pending_tag, body) = head_with(app.clone(), &head_path, Some(&etag)).await;
+    let pending: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(code, axum::http::StatusCode::OK, "{pending}");
+    assert_eq!(pending["revision"], full["revision"]);
+    assert_eq!(pending["catchingUp"], true);
+    assert_ne!(pending_tag.as_deref(), Some(etag.as_str()));
+    resume.send(()).unwrap();
+    assert!(worker.await.unwrap(), "the checkout has a watcher");
+    let settled = caught_up_head(app, &head_path).await;
+    assert_eq!(settled["revision"], full["revision"]);
+    let (code, again, _) = head_with(app.clone(), &head_path, Some(&etag)).await;
+    assert_eq!(code, axum::http::StatusCode::NOT_MODIFIED, "{settled}");
+    assert_eq!(again.as_deref(), Some(etag.as_str()));
+}
+
 // #666: the browser polls the head digest every few seconds. It skips the status's
 // per-language semantic projection, and an unchanged head answers `304` to its ETag.
 #[cfg(feature = "test-support")]
@@ -3100,6 +3163,7 @@ async fn unchanged_status_head_is_a_cheap_conditional_read() {
         prefix,
         release,
         built,
+        ..
     } = held_catalog_browser();
     let head_path = format!("{prefix}/status/head");
     let full = caught_up_head(&app, &head_path).await;

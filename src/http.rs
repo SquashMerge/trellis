@@ -234,6 +234,9 @@ pub struct DaemonState {
     /// (`"before_revision"`), and after it published its outcome (`"published"`).
     #[cfg(feature = "test-support")]
     dependency_hook: Mutex<Option<DependencyHook>>,
+    /// Install each watcher without asynchronous OS delivery (#703).
+    #[cfg(feature = "test-support")]
+    native_watcher_disabled: AtomicBool,
     dependencies: Mutex<DependencyIndex>,
     #[cfg(test)]
     dependency_idle: tokio::sync::Notify,
@@ -439,6 +442,8 @@ pub fn new_with_config(
         maintenance_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
         dependency_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        native_watcher_disabled: AtomicBool::new(false),
         runtime: Mutex::new(RuntimeState::Activating),
         startup_error: Mutex::new(None),
         startup_failures: AtomicU64::new(0),
@@ -656,6 +661,35 @@ impl DaemonState {
         let _step = self.step_lock.lock().unwrap();
         let _watcher = self.watcher_work.lock().unwrap();
         hold();
+    }
+
+    /// Accept `event` through the watcher's ingress while holding the worker step,
+    /// so the hint stays pending until `hold` returns (#703). False without a
+    /// watcher, and then `hold` does not run.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn hold_worker_with_watch_hint_for_tests(
+        &self,
+        event: notify::Result<notify::Event>,
+        hold: impl FnOnce(),
+    ) -> bool {
+        let _step = self.step_lock.lock().unwrap();
+        let work = self.watcher_work.lock().unwrap();
+        let Some((_, scheduler)) = work.as_ref() else {
+            return false;
+        };
+        scheduler.submit_watch_event_for_tests(event);
+        hold();
+        true
+    }
+
+    /// Install every later watcher without asynchronous OS delivery, before startup
+    /// begins: a late OS event for a fixture's own earlier write is otherwise
+    /// accepted, honest catch-up at an unchanged head (#703). Synthetic ingress,
+    /// generations and acknowledgment are unchanged.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn disable_native_watcher_for_tests(&self) {
+        self.native_watcher_disabled.store(true, Ordering::Release);
     }
 
     /// Watcher health as the current watcher published it. A sticky flag, not
@@ -1566,6 +1600,10 @@ impl DaemonState {
                             &selected_options,
                             self.watcher_health.clone(),
                         )?;
+                        #[cfg(feature = "test-support")]
+                        if self.native_watcher_disabled.load(Ordering::Acquire) {
+                            scheduler.disable_native_watcher_for_tests();
+                        }
                         #[cfg(feature = "test-support")]
                         if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
                             scheduler.attach_causal_witness(
