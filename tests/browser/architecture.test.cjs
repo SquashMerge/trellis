@@ -203,8 +203,13 @@ test("Architecture authored exceptions reach the same caller and preserve the ex
   const exceptedArrow = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation · exception/});
   await exceptedArrow.focus(); await page.keyboard.press("Enter"); await settled(page);
   const arrowCaller = page.locator("#architecture-inspector-content .architecture-caller").filter({hasText:/\blow\b/}).first();
+  const selectedSequence = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().method() === "POST");
   await arrowCaller.getByRole("button", {name:"Open sequence", exact:true}).click();
+  await selectedSequence;
+  await page.locator("#sequence-panel").waitFor({state:"visible"});
   await page.waitForFunction(() => document.querySelector("#sequence-diagram [data-boundary-highlight='true']") || document.querySelector("#sequence-boundary-status")?.textContent.includes("Show all steps"));
+  assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true");
+  assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "false");
   await page.goBack();
   await page.locator("#architecture-panel").waitFor({state:"visible"});
   assert.equal(await exceptedArrow.getAttribute("aria-pressed"), "true", "excepted arrows have the same round trip as deviations");
