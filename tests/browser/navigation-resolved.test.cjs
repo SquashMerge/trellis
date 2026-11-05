@@ -117,7 +117,7 @@ paths = ["target.rs"]
     const page = await context.newPage();
     await H.connect(page, server, paths.token);
     await page.locator("#view-architecture").click();
-    await page.locator("#architecture-state[data-state=ready]").waitFor();
+    await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
     const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation/});
     await edge.focus(); await page.keyboard.press("Enter");
     const caller = page.locator("#architecture-inspector-content .architecture-caller");
