@@ -140,7 +140,7 @@ function captureSourceEntry() {
   const offsets = id => ({top:$(id)?.scrollTop || 0, left:$(id)?.scrollLeft || 0});
   return {kind:"source", source:workspaceSource, sourceNavigation:workspaceSource.navigation?.snapshot?.(), section, method:selectedMethod, diagram:diagramSequence,
     view:["sequence", "classes", "architecture", "treemap"].find(name => $("view-" + name)?.getAttribute?.("aria-selected") === "true") || "sequence",
-    showAll:!!$("all-steps").checked, inspector:sourceInspector,
+    showAll:!!$("all-steps").checked, boundary:sequenceBoundary, inspector:sourceInspector,
     file:filesFile, symbol:filesSymbol, basis:filesBasis, mini:filesMini, matches:filesMatches,
     line:Number($("source").dataset?.navigationLine) || workspaceSource.range?.startLine || 1,
     focus:action ? {symbol:action.dataset.symbolId} : {id:focus?.id || "source"},
@@ -177,7 +177,7 @@ async function restoreSourceEntry(entry, current) {
   filesSerial++; filesDiffSerial++; clearFilesInspector();
   filesFile = entry.file; filesSymbol = entry.symbol; filesBasis = entry.basis;
   filesMini = entry.mini; filesMatches = entry.matches; filesDiff = null;
-  selectedMethod = entry.method; diagramSequence = null; $("all-steps").checked = entry.showAll;
+  selectedMethod = entry.method; diagramSequence = null; sequenceBoundary = entry.boundary; $("all-steps").checked = entry.showAll;
   $("method-source").disabled = !selectedMethod;
   if ($("method-class")) $("method-class").disabled = !selectedMethod || !classLanguage(selectedMethod.path);
   workspaceSource = entry.source;
