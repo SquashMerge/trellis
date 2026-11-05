@@ -12990,13 +12990,26 @@ async fn mcp_search_zero_hits_keep_incomplete_native_scope_separate_from_vectors
 async fn mcp_search_keeps_admitted_head_and_followup_pin_conflicts_after_publication() {
     let temp = tempfile::tempdir().unwrap();
     let (identity, registry, runtime) = ready_registry(temp.path(), 211).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let worker_gate = ReadGate::default();
+    let gate = ReadGate::default();
+    let _release_on_failure = McpFillRelease([worker_gate.clone(), gate.clone()]);
+    let held = worker_gate.clone();
+    let worker_scheduler = scheduler.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let _worker = worker_scheduler.hold_worker_for_tests();
+        (held.hook())();
+    });
+    let held = worker_gate.clone();
+    tokio::task::spawn_blocking(move || held.await_held(1))
+        .await
+        .unwrap();
     let admitted = {
         let (response, _) = runtime.evidence_response().unwrap();
         let pin = response.status().unwrap().revision;
         response.finish(()).unwrap();
         pin
     };
-    let gate = ReadGate::default();
     runtime.set_mcp_admitted_gate_for_tests(gate.hook());
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 211, None);
     writeln!(client, "{}", call(false, json!(1), "trellis_search_symbols",
@@ -13006,13 +13019,12 @@ async fn mcp_search_keeps_admitted_head_and_followup_pin_conflicts_after_publica
         .await
         .unwrap();
     fs::write(identity.root.join("a.js"), "function moved() {}\n").unwrap();
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        while !runtime.catching_up() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("watcher did not queue the edit");
+    let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Content,
+    )))
+    .add_path(identity.root.join("a.js"));
+    assert!(scheduler.submit_watch_event_for_tests(Ok(event)));
+    assert!(scheduler.checkout_watch_pending());
     gate.open();
     let reply = next_reply(&mut reader);
     tool(&reply, None, true);
@@ -13021,6 +13033,8 @@ async fn mcp_search_keeps_admitted_head_and_followup_pin_conflicts_after_publica
     assert_eq!(envelope["data"]["hits"].as_array().unwrap().len(), 1);
     assert_eq!(envelope["data"]["hits"][0]["name"], "held");
     let symbol_id = envelope["data"]["hits"][0]["symbolId"].clone();
+    worker_gate.open();
+    worker.await.unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (response, _) = runtime.evidence_response().unwrap();
