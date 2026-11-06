@@ -1712,19 +1712,13 @@ mod daemon_shutdown_tests {
     async fn retained_shutdown_cannot_race_serve_socket_configuration() {
         let (control, peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let _peer = ControlPeer(peer);
+        // The daemon's stop sweep shuts down every accepted socket before it
+        // publishes shutdown; the serve wait then configures that socket (#625).
+        control.shutdown(std::net::Shutdown::Both).unwrap();
         let (shutdown, stopped) = tokio::sync::watch::channel(true);
-        let (finished, wait) = std::sync::mpsc::channel();
         let runtime = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
-            wait_for_serve_disconnect_ordered(
-                control,
-                stopped,
-                &runtime,
-                Some(ServeDisconnectTestOrder {
-                    shutdown_finished: finished,
-                    wait_for_shutdown: wait,
-                }),
-            )
+            wait_for_serve_disconnect(control, stopped, &runtime)
         })
         .await
         .unwrap();
@@ -1733,6 +1727,65 @@ mod daemon_shutdown_tests {
             "retained shutdown raced socket setup: {result:?}"
         );
         assert!(*shutdown.borrow());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_wait_ends_when_the_peer_disconnects() {
+        let (control, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (shutdown, stopped) = tokio::sync::watch::channel(false);
+        let runtime = tokio::runtime::Handle::current();
+        let (waiting, parked) = tokio::sync::oneshot::channel();
+        let wait = tokio::task::spawn_blocking(move || {
+            wait_for_serve_disconnect_hooked(control, stopped, &runtime, Some(waiting))
+        });
+        parked.await.unwrap();
+        use std::io::Write;
+        (&peer).write_all(b"ignored").unwrap();
+        drop(peer);
+        let result = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, wait)
+            .await
+            .expect("peer disconnect did not end the serve control wait")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!*shutdown.borrow());
+    }
+
+    /// #739: Darwin's `shutdown(2)` on a cloned descriptor can miss a thread
+    /// entering a blocking `read(2)`, so the published shutdown signal must
+    /// end the serve wait by itself. The peer stays open, and the control
+    /// socket must still be usable afterwards, which proves the signal, not a
+    /// socket shutdown, ended the wait.
+    #[tokio::test(flavor = "current_thread")]
+    async fn published_shutdown_ends_the_serve_wait_without_a_socket_shutdown() {
+        let (control, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let probe = control.try_clone().unwrap();
+        let (shutdown, stopped) = tokio::sync::watch::channel(false);
+        let mut connections = tokio::task::JoinSet::new();
+        let runtime = tokio::runtime::Handle::current();
+        let (waiting, parked) = tokio::sync::oneshot::channel();
+        connections.spawn_blocking(move || {
+            wait_for_serve_disconnect_hooked(control, stopped, &runtime, Some(waiting)).unwrap();
+        });
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, parked)
+            .await
+            .expect("serve wait never reached its read")
+            .unwrap();
+        tokio::time::timeout(
+            trellis::testing::HANG_BACKSTOP,
+            stop_daemon_connections(&shutdown, &mut connections),
+        )
+        .await
+        .expect("published shutdown did not end the serve control wait");
+        use std::io::{Read, Write};
+        (&peer).write_all(&[7]).unwrap();
+        let mut byte = [0u8; 1];
+        probe.set_nonblocking(false).unwrap();
+        (&probe).read_exact(&mut byte).unwrap();
+        assert_eq!(
+            byte,
+            [7],
+            "the serve wait shut its socket down instead of observing the signal"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2605,18 +2658,12 @@ fn dispatch_connection(
     Ok(())
 }
 
-#[cfg(test)]
-struct ServeDisconnectTestOrder {
-    shutdown_finished: std::sync::mpsc::Sender<()>,
-    wait_for_shutdown: std::sync::mpsc::Receiver<()>,
-}
-
 fn wait_for_serve_disconnect(
     stream: std::os::unix::net::UnixStream,
     shutdown: tokio::sync::watch::Receiver<bool>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<()> {
-    wait_for_serve_disconnect_ordered(
+    wait_for_serve_disconnect_hooked(
         stream,
         shutdown,
         runtime,
@@ -2625,41 +2672,52 @@ fn wait_for_serve_disconnect(
     )
 }
 
-fn wait_for_serve_disconnect_ordered(
-    mut stream: std::os::unix::net::UnixStream,
+/// Holds the serve registration until the peer closes the control connection
+/// or the daemon publishes shutdown. Both are awaited in one runtime task: on
+/// Darwin, `shutdown(2)` on a cloned descriptor does not reliably wake a
+/// thread entering a blocking `read(2)` on the same socket (#739), so the
+/// shutdown signal must end this wait directly rather than through the socket.
+fn wait_for_serve_disconnect_hooked(
+    stream: std::os::unix::net::UnixStream,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     runtime: &tokio::runtime::Handle,
-    #[cfg(test)] order: Option<ServeDisconnectTestOrder>,
+    #[cfg(test)] waiting: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
-    stream.set_read_timeout(None)?;
-    let closer = stream.try_clone()?;
-    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
-    #[cfg(test)]
-    let (shutdown_finished, wait_for_shutdown) = order
-        .map(|order| (Some(order.shutdown_finished), Some(order.wait_for_shutdown)))
-        .unwrap_or((None, None));
-    let watcher = runtime.spawn(async move {
-        tokio::select! {
-            _ = shutdown.wait_for(|stopped| *stopped) => {
-                let _ = closer.shutdown(std::net::Shutdown::Both);
-                #[cfg(test)]
-                if let Some(finished) = shutdown_finished {
-                    let _ = finished.send(());
+    // fcntl(O_NONBLOCK) also succeeds on a socket the daemon already shut down
+    // (#625), unlike SO_RCVTIMEO on Darwin.
+    stream.set_nonblocking(true)?;
+    let waiter = runtime.spawn(async move {
+        // Registration needs the runtime's reactor, so it happens on the task.
+        let stream = tokio::net::UnixStream::from_std(stream)?;
+        #[cfg(test)]
+        if let Some(waiting) = waiting {
+            let _ = waiting.send(());
+        }
+        let mut one = [0u8; 1];
+        loop {
+            tokio::select! {
+                // A dropped sender also means the daemon is stopping.
+                _ = shutdown.wait_for(|stopped| *stopped) => return Ok::<(), std::io::Error>(()),
+                ready = stream.readable() => {
+                    if ready.is_err() {
+                        return Ok(());
+                    }
+                    match stream.try_read(&mut one) {
+                        Ok(n) if n > 0 => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        // EOF or a read error ends the session, as before.
+                        _ => return Ok(()),
+                    }
                 }
             }
-            _ = closed_rx => {}
         }
     });
-    #[cfg(test)]
-    if let Some(wait) = wait_for_shutdown {
-        wait.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    match runtime.block_on(waiter) {
+        Ok(result) => Ok(result?),
+        // The runtime is shutting down, which also ends the session.
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(anyhow::anyhow!("serve control wait failed: {error}")),
     }
-    let mut one = [0u8; 1];
-    use std::io::Read;
-    while matches!(stream.read(&mut one), Ok(n) if n > 0) {}
-    let _ = closed_tx.send(());
-    let _ = runtime.block_on(watcher);
-    Ok(())
 }
 
 fn write_daemon_reply(
