@@ -224,8 +224,13 @@ From the v0.1.0 eight-task MCP dogfood run (2026-11-05). `toolVersion` is **9**
     the first `limit` callers that are not excluded and stops at the next one,
     which sets `truncationReason:"limit"`. A page therefore holds `limit`
     callers whenever that many remain, and an excluded caller never makes a
-    page look truncated. The scan is bounded by the call's existing deadline,
-    and the 65,536-byte response fit applies to the kept callers as before.
+    page look truncated. Ranked rows are fetched one at a time, each after the
+    call's existing cancellation and deadline check, and the scan stops at the
+    first kept caller beyond `limit`; the query's own ranking before its first
+    row is not interrupted by that check. When no producer is selected for the
+    searched language, nothing can be excluded and the scan reads at most
+    `limit + 1` rows, as before. The 65,536-byte response fit applies to the
+    kept callers as before.
   - Data adds `boundElsewhereOmitted:UInt` when at least one caller is
     excluded. It counts the excluded callers among the ranked matches the scan
     read: all of them when the scan reached the end (no `limit` truncation),

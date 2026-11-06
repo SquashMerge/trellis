@@ -1849,7 +1849,25 @@ pub struct McpIncomingWithLines {
     pub bound_elsewhere_omitted: u64,
 }
 
+#[cfg(feature = "test-support")]
+thread_local! {
+    /// Ranked incoming name-match rows fetched from SQLite on this thread (#724 tests).
+    static INCOMING_ROWS_FETCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one fetched ranked incoming row for tests; nothing in production builds.
+fn note_incoming_row_fetched() {
+    #[cfg(feature = "test-support")]
+    INCOMING_ROWS_FETCHED.with(|rows| rows.set(rows.get() + 1));
+}
+
 impl EvidenceResponse {
+    /// The ranked incoming rows fetched on this thread since the last call (#724 tests).
+    #[cfg(feature = "test-support")]
+    pub fn take_incoming_rows_fetched_for_tests() -> usize {
+        INCOMING_ROWS_FETCHED.with(|rows| rows.replace(0))
+    }
+
     /// Name-matched incoming calls, every caller kept (no semantic exclusion).
     pub fn mcp_incoming_with_lines(
         &self,
@@ -1991,11 +2009,14 @@ impl EvidenceResponse {
         let mut bound_elsewhere_omitted = 0_u64;
         // The same binding reader the emitted callers' annotations use (#466), built only
         // after the selected declaration is found, so `not_found` keeps its precedence.
+        // Without a producer selected for the searched language no caller can be bound
+        // elsewhere, so the semantic reader and the open-ended scan are skipped.
         let mut bindings = exclude
             .map(|producer| {
                 super::semantic_display::SemanticCalls::new(&self.db, &selected, producer)
             })
-            .transpose()?;
+            .transpose()?
+            .filter(|reader| reader.selection.producer(&selected_key.language).is_some());
         if let Some(lookup) = owner.declaration.lookup_key.as_deref() {
             // Count declarations across every eligible selected version, not calls
             // or only the limited response prefix.
@@ -2042,10 +2063,8 @@ impl EvidenceResponse {
                 .map_or("", |(dir, _)| dir);
             // SQLite orders the indexed matches before returning only the
             // required prefix. A directory match must not include descendants.
-            let ranked = self
-                .db
-                .prepare(
-                    "SELECT v.id,c.id,c.owner_syntax_id,m.path,d.role
+            let mut ranked = self.db.prepare(
+                "SELECT v.id,c.id,c.owner_syntax_id,m.path,d.role
                  FROM native_version_calls c
                  JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
                  JOIN document_versions v ON v.vid=c.vid
@@ -2062,37 +2081,39 @@ impl EvidenceResponse {
                      THEN 1 ELSE 2 END,
                    m.path COLLATE BINARY, c.start_byte, c.end_byte, c.id COLLATE BINARY
                  LIMIT ?7",
-                )?
-                .query_map(
-                    params![
-                        selected.key,
-                        selected_key.source_set_id,
-                        selected_key.language,
-                        lookup,
-                        selected_key.path,
-                        directory,
-                        // Excluded callers do not fill the page, so an excluding scan
-                        // reads the ranked list until it has `limit + 1` kept callers.
-                        if bindings.is_some() {
-                            -1
-                        } else {
-                            i64::try_from(limit + 1)?
-                        }
-                    ],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, Vec<u8>>(1)?,
-                            r.get::<_, Vec<u8>>(2)?,
-                            r.get::<_, String>(3)?,
-                            r.get::<_, String>(4)?,
-                        ))
-                    },
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            )?;
+            let mut rows = ranked.query(params![
+                selected.key,
+                selected_key.source_set_id,
+                selected_key.language,
+                lookup,
+                selected_key.path,
+                directory,
+                // Excluded callers do not fill the page, so an excluding scan reads the
+                // ranked rows until it has `limit + 1` kept callers.
+                if bindings.is_some() {
+                    -1
+                } else {
+                    i64::try_from(limit + 1)?
+                }
+            ])?;
             let mut loaded = BTreeMap::new();
-            for (version, id_blob, caller_blob, path, stored_role) in ranked {
+            // #724 review: rows are fetched one at a time, after the deadline check, and
+            // the scan stops at the first kept caller beyond `limit`. SQLite's own ranking
+            // work before the first row is not interrupted by this check.
+            loop {
                 check()?;
+                let Some(row) = rows.next()? else {
+                    break;
+                };
+                note_incoming_row_fetched();
+                let (version, id_blob, caller_blob, path, stored_role) = (
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                );
                 let id = id_codec::decode_occ(&id_blob)?;
                 let caller_id = id_codec::decode_sid(&caller_blob)?;
                 let scope = scopes.get(&version).ok_or_else(|| {

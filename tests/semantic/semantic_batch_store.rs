@@ -10501,6 +10501,69 @@ async fn incoming_calls_keep_unbound_name_matches() {
     mcp.finish();
 }
 
+/// #724 review: the excluding scan fetches ranked name matches one at a time. It stops at
+/// the first kept caller beyond `limit`, stops when the deadline check fails, and without
+/// a published producer reads only `limit + 1` rows, never draining the remaining matches.
+#[test]
+fn incoming_exclusion_scan_fetches_rows_lazily() {
+    use trellis::store::EvidenceResponse;
+    let world = rust_targets_world();
+    drop(world.publish(&rust_targets_batch(&world, None)).unwrap());
+    let library = declaration_in(&world, "run", "src/lib.rs");
+    let other = declaration_in(&world, "run", "tests/other.rs");
+    let response = world.store.evidence_response().unwrap();
+    let mut checks = 0;
+    let mut scan = |symbol: &str, limit: usize, fail_at: usize| {
+        checks = 0;
+        EvidenceResponse::take_incoming_rows_fetched_for_tests();
+        let outcome =
+            response.mcp_incoming_excluding_bound_elsewhere(symbol, limit, None, None, &mut || {
+                checks += 1;
+                if checks == fail_at {
+                    anyhow::bail!("deadline_exceeded: test deadline");
+                }
+                Ok(())
+            });
+        (
+            outcome,
+            EvidenceResponse::take_incoming_rows_fetched_for_tests(),
+        )
+    };
+    // A filled kept prefix: `main` fills `limit:1`, the kept `tests/it.rs` caller proves
+    // more; the excluded `tests/other.rs` row after them is never fetched.
+    let (found, fetched) = scan(&library, 1, usize::MAX);
+    let found = found.unwrap().unwrap();
+    assert_eq!((found.calls.len(), found.has_more), (1, true));
+    assert_eq!(found.bound_elsewhere_omitted, 0);
+    assert_eq!(fetched, 2);
+    // Cancellation before the second fetch stops the scan after one row.
+    let (failed, fetched) = scan(&other, 6, 2);
+    let error = failed.err().expect("cancelled scan fails");
+    assert!(
+        error.to_string().starts_with("deadline_exceeded:"),
+        "{error}"
+    );
+    assert_eq!(fetched, 1);
+    // An exhausted scan reads every match and counts both excluded callers.
+    let (found, fetched) = scan(&other, 6, usize::MAX);
+    let found = found.unwrap().unwrap();
+    assert_eq!((found.calls.len(), found.has_more), (1, false));
+    assert_eq!(found.bound_elsewhere_omitted, 2);
+    assert_eq!(fetched, 3);
+    drop(response);
+    // Without a published producer nothing can be excluded: the scan reads `limit + 1`.
+    let unbound = rust_targets_world();
+    let library = declaration_in(&unbound, "run", "src/lib.rs");
+    let response = unbound.store.evidence_response().unwrap();
+    EvidenceResponse::take_incoming_rows_fetched_for_tests();
+    let found = response
+        .mcp_incoming_excluding_bound_elsewhere(&library, 1, None, None, &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!((found.calls.len(), found.has_more), (1, true));
+    assert_eq!(EvidenceResponse::take_incoming_rows_fetched_for_tests(), 2);
+}
+
 /// Asserts the batch join rejects `descriptor` as a duplicate key, typed, that contract
 /// validation rejects the in-memory oracle's rows alike, and that nothing is published.
 fn assert_duplicate_key_rejected(world: &World, descriptor: &(PathBuf, String), case: &str) {
