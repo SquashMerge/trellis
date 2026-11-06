@@ -982,7 +982,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 9
+                  "const": 10
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -16374,13 +16374,28 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 50,
-          "default": 5
+          "default": 20,
+          "description": "Rule instances per page (instances and testOnly together); each keeps one evidence entry (use trellis_rules_explain for more)."
         },
         "offset": {
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991,
           "default": 0
+        },
+        "status": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "conforms",
+              "deviates",
+              "unknown"
+            ]
+          },
+          "description": "List only instances with these statuses, for example [\"deviates\"]. Counts stay those of the whole check."
         }
       },
       "required": [
@@ -17558,10 +17573,10 @@
                 }
               ]
             },
-            "basis": {
+            "basisRef": {
               "anyOf": [
                 {
-                  "$ref": "#/$defs/SemanticBasis"
+                  "$ref": "#/$defs/UInt"
                 },
                 {
                   "type": "null"
@@ -18956,6 +18971,69 @@
             "name",
             "document"
           ]
+        },
+        "SemanticBasisEntry": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "lookupDependencies": {
+              "items": {
+                "$ref": "#/$defs/Text"
+              },
+              "type": "array"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "ref": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "ref",
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -19043,12 +19121,30 @@
                     },
                     "total": {
                       "$ref": "#/$defs/UInt"
+                    },
+                    "status": {
+                      "anyOf": [
+                        {
+                          "type": "array",
+                          "items": {
+                            "enum": [
+                              "conforms",
+                              "deviates",
+                              "unknown"
+                            ]
+                          }
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   },
                   "required": [
                     "offset",
                     "nextOffset",
-                    "total"
+                    "total",
+                    "status"
                   ]
                 },
                 "semanticDocuments": {
@@ -19059,6 +19155,12 @@
                 },
                 "partial": {
                   "type": "boolean"
+                },
+                "semanticBases": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/SemanticBasisEntry"
+                  }
                 }
               },
               "required": [
@@ -19075,7 +19177,8 @@
                 "partialFiles",
                 "limitations",
                 "externalPackages",
-                "page"
+                "page",
+                "semanticBases"
               ]
             },
             "evidenceBasis": {
@@ -19162,7 +19265,7 @@
       ],
       "type": "object"
     },
-    "description": "Check reviewed architecture rules against pinned evidence without writing files. Call/type constraints use fresh semantic bindings where available; otherwise they remain unknown. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
+    "description": "Check reviewed architecture rules against pinned evidence without writing files. Call/type constraints use fresh semantic bindings where available; otherwise they remain unknown. `limit` (default 20, max 50) counts rule instances per page, each with one evidence entry (trellis_rules_explain shows up to 50); `status`, for example [\"deviates\"], lists only those instances while counts stay whole. Each distinct semantic basis appears once per page in `semanticBases`. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
   },
   {
     "annotations": {
@@ -19200,7 +19303,8 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 50,
-          "default": 5
+          "default": 5,
+          "description": "Evidence entries kept per rule instance; omittedEvidence counts the rest."
         },
         "offset": {
           "type": "integer",
@@ -20649,10 +20753,10 @@
                 }
               ]
             },
-            "basis": {
+            "basisRef": {
               "anyOf": [
                 {
-                  "$ref": "#/$defs/SemanticBasis"
+                  "$ref": "#/$defs/UInt"
                 },
                 {
                   "type": "null"
@@ -22047,6 +22151,69 @@
             "name",
             "document"
           ]
+        },
+        "SemanticBasisEntry": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "lookupDependencies": {
+              "items": {
+                "$ref": "#/$defs/Text"
+              },
+              "type": "array"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "ref": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "ref",
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -22150,6 +22317,12 @@
                 },
                 "partial": {
                   "type": "boolean"
+                },
+                "semanticBases": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/SemanticBasisEntry"
+                  }
                 }
               },
               "required": [
@@ -22166,7 +22339,8 @@
                 "partialFiles",
                 "limitations",
                 "externalPackages",
-                "page"
+                "page",
+                "semanticBases"
               ]
             },
             "evidenceBasis": {
@@ -22253,6 +22427,6 @@
       ],
       "type": "object"
     },
-    "description": "Explain one exact architecture rule instance at a pin, including unknowns and reviewed exceptions. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
+    "description": "Explain one exact architecture rule instance at a pin, including unknowns and reviewed exceptions. `limit` (default 5, max 50) is the evidence entries kept per instance. Each distinct semantic basis appears once per page in `semanticBases`. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
   }
 ]

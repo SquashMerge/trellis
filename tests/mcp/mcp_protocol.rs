@@ -11415,8 +11415,9 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
         .find(|row| row["target"]["path"] == "app_main.js" && row["status"] == "unknown")
         .expect("aggregated unknown instance");
     assert_eq!(unknown["referenceCount"], 300);
-    assert_eq!(unknown["evidence"].as_array().unwrap().len(), 5);
-    assert_eq!(unknown["omittedEvidence"], 295);
+    // #725: check keeps one witness per instance; explain samples by its `limit`.
+    assert_eq!(unknown["evidence"].as_array().unwrap().len(), 1);
+    assert_eq!(unknown["omittedEvidence"], 299);
     assert_eq!(data["page"]["offset"], 0);
     structured.push(json!({"name":"trellis_rules_check","structuredContent":envelope.clone()}));
     // The unscoped check pages too; its concatenated instances keep every row.

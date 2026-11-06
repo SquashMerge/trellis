@@ -255,6 +255,57 @@ From the v0.1.0 eight-task MCP dogfood run (2026-11-05). `toolVersion` is **9**
   the fit can therefore keep fewer or more edge groups, and can set or clear
   `truncationReason:"response_bytes"` and `responseOmitted`.
 
+## Amendment (#725): rule evidence bases, status filter and instance pages
+
+From the 2026-11-05 dogfood (#714): at `limit:50`, a `trellis_rules_check` page held
+one instance. Each evidence row repeated its whole semantic basis, and `limit`
+sampled evidence per instance rather than counting instances. `toolVersion` is
+**10** (previously 9). This section wins over the #129 input table, the check/explain
+`limit` sentence and the paging text below, and over the MCP paragraph of
+[rules.md](rules.md#check-and-explain-data). Evaluation, verdicts, instance order,
+counts and the CLI and browser shapes are unchanged.
+
+- **Basis table.** Check and explain data add the required
+  `semanticBases:SemanticBasisEntry[]`. Each rule evidence row carries
+  `basisRef:UInt|null` instead of `basis`, as the #528 outgoing and incoming tables
+  and the #665 call graph table do. This covers an instance's `evidence` and each
+  constraint's `evidence`. Each distinct basis of the page's rows appears once as
+  `{ref,...SemanticBasis}`, with `ref` contiguous from zero in canonical-serialization
+  order. A null `basis` becomes a null `basisRef`. A row without a `basis` field
+  (structural, declaration and call evidence) has no `basisRef`. The table is per
+  page and lists only the bases that page's rows use. Re-inlining it gives back the
+  rules.md `Evidence` row.
+- **Status filter.** `trellis_rules_check` accepts
+  `status?:("conforms"|"deviates"|"unknown")[]`, with 1–3 distinct values. An empty
+  array, a repeated value or any other value is `invalid_request`. The filter keeps
+  the `instances` and `testOnly` rows whose `status` it lists, excepted rows included
+  (they keep their status), before the paged sequence is formed. `unassigned` and
+  `externalPackages` are not filtered and still follow the instances in the sequence.
+  - `counts`, `testCounts` and the other whole-result fields stay those of the whole
+    evaluation.
+  - `page` adds the required `status:("conforms"|"deviates"|"unknown")[]|null`, the
+    filter as given, or null without one. `page.total` counts the filtered sequence.
+  - The order of the kept items is unchanged. Offsets index the filtered sequence, so
+    the same arguments at the same pin page stably. A different `status` is a
+    different sequence.
+  - The filter is MCP projection only. It never reaches evaluation, the CLI or the
+    browser.
+- **Instance limit.** For `trellis_rules_check`, `limit` (1–50, default **20**, the
+  shared `defaultLimit`) is the most rule instances on one page, `instances` and
+  `testOnly` together. The 24,576-byte page target still applies, so a page can hold
+  fewer. `unassigned` and `externalPackages` items do not count toward it. Each check
+  instance keeps **one** evidence entry, and `omittedEvidence` is the exact
+  remainder; `trellis_rules_explain` shows more of one instance. Explain is otherwise
+  unchanged: its `limit` (default 5) is still the evidence entries kept per instance.
+  References are unchanged.
+- **Measured.** This repository at `18813e60` has 657 files with a rust-analyzer
+  import, and 3,530 rule instances, including 105 production and 108 test-only
+  deviations. Before, finding every deviation meant paging the whole result: 697
+  pages and 14.9 MB at `limit:5`, with 4,751 inline bases. With
+  `status:["deviates"],limit:50` it takes 18 pages and 412 KB. The production
+  deviations fill the first 8 pages (189 KB), each with one basis entry and none
+  inline.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)

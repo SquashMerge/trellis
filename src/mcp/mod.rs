@@ -1101,12 +1101,15 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         name,
                         &serde_json::Value::Object(args.clone()),
                     );
-                    // check/explain sample rule evidence per instance (#448).
-                    let evidence_limit = (kind != "references" && kind != "prompt").then(|| {
-                        args.get("limit").map_or(5, |value| {
+                    // check/explain sample rule evidence per instance (#448). Explain's
+                    // `limit` sets the sample; check's counts instances per page (#725).
+                    let evidence_limit = match kind {
+                        "check" => Some(architecture::CHECK_EVIDENCE_SAMPLE),
+                        "explain" => Some(args.get("limit").map_or(5, |value| {
                             wire::uint(value).expect("validated evidence limit") as usize
-                        })
-                    });
+                        })),
+                        _ => None,
+                    };
                     Some(Box::new(move |runtime, response, _sampled, _query| {
                         let mut check = || {
                             if cancel.load(std::sync::atomic::Ordering::Acquire)
