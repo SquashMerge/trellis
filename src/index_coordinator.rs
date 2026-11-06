@@ -498,6 +498,9 @@ pub struct WatcherWork {
     reconcile_now_for_tests: Option<std::time::Instant>,
     /// Shared with every watcher this owner creates; read without its lock.
     health: Arc<crate::watch::WatcherHealth>,
+    /// Whether this owner's watchers, replacements included, get OS delivery.
+    /// Always true outside fixtures (#720).
+    native: bool,
     last_inventory: std::time::Instant,
     retry_after: Option<std::time::Instant>,
     last_accounted_generation: Option<u64>,
@@ -556,11 +559,29 @@ impl WatcherWork {
         options: &IndexOptions,
         health: Arc<crate::watch::WatcherHealth>,
     ) -> Result<Self> {
+        Self::publishing_with_native(store, session, options, health, true)
+    }
+
+    /// Like `publishing`; `native: false` (fixtures only, #720) installs this
+    /// owner's watchers, replacements included, without asynchronous OS
+    /// delivery. Synthetic ingress, generations and acknowledgment are unchanged.
+    #[doc(hidden)]
+    pub fn publishing_with_native(
+        store: &Store,
+        session: &Arc<WriterSession>,
+        options: &IndexOptions,
+        health: Arc<crate::watch::WatcherHealth>,
+        native: bool,
+    ) -> Result<Self> {
         store.verify_writer_session(session)?;
-        let watch =
-            crate::watch::WatchSignals::publishing(options.workspace_root.clone(), health.clone());
+        let watch = crate::watch::WatchSignals::publishing_with_native(
+            options.workspace_root.clone(),
+            health.clone(),
+            native,
+        );
         Ok(Self {
             health,
+            native,
             watch,
             request_coverage: None,
             queue_gate: false,
@@ -819,6 +840,7 @@ impl WatcherWork {
 
     #[doc(hidden)]
     pub fn disable_native_watcher_for_tests(&mut self) {
+        self.native = false;
         self.watch.disable_native_watcher_for_tests();
     }
 
@@ -986,9 +1008,10 @@ impl WatcherWork {
         // daemon's defaults. Keep its watcher until a new watcher has registered
         // for the new options; its full wake then closes the transition gap.
         if self.options_differ(options) {
-            let next = crate::watch::WatchSignals::publishing(
+            let next = crate::watch::WatchSignals::publishing_with_native(
                 options.workspace_root.clone(),
                 self.health.clone(),
+                self.native,
             );
             if let Some(waker) = &self.waker {
                 next.set_waker(waker.clone());

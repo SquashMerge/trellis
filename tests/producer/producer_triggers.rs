@@ -20,8 +20,8 @@ use trellis::store::{
 
 use crate::support;
 use support::{
-    Checkout, cache_dir, data_dir, start_checkout, state_dir, stop_daemon, stub_env, tripwire_dir,
-    write_mode,
+    Checkout, cache_dir, data_dir, native_watcher, start_checkout, state_dir, stop_daemon,
+    stub_env, tripwire_dir, write_mode,
 };
 
 use crate::semantic_batch_support;
@@ -55,6 +55,7 @@ impl Fixture {
             command.env(key, value);
         }
         command.env("TRELLIS_TEST_PICKUP_INTERVALS", intervals());
+        command.env(trellis::testing::NATIVE_WATCHER_ENV, "on");
         command
     }
 
@@ -180,6 +181,8 @@ fn fixture() -> Fixture {
     let mut daemon_env = stub.clone();
     daemon_env.push(("PATH".into(), path.clone()));
     daemon_env.push(("TRELLIS_TEST_PICKUP_INTERVALS".into(), intervals()));
+    // Native watcher events are one of the triggers under test: real OS delivery.
+    daemon_env.push(native_watcher());
     let checkout = start_checkout(workspace, &daemon_env);
     let artifact = checkout.temp.path().join("index.scip");
     let fixture = Fixture {

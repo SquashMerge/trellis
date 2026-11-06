@@ -38,6 +38,26 @@ pub fn owned(mut command: std::process::Command) -> std::process::Command {
     command
 }
 
+/// Set to `on` to give a test-support daemon's checkout watchers real OS
+/// delivery. Without it they take synthetic ingress only: a late OS event for
+/// a fixture's own setup write would otherwise be honest catch-up at an
+/// unchanged head (#703, #720). Only a test of real watcher delivery sets it.
+pub const NATIVE_WATCHER_ENV: &str = "TRELLIS_TEST_NATIVE_WATCHER";
+
+/// `command`, whose daemon (or the daemon it starts) watches with real OS
+/// delivery. For in-process fixtures, see
+/// `CheckoutRegistry::enable_native_watcher_for_tests`.
+pub fn with_native_watcher(mut command: std::process::Command) -> std::process::Command {
+    command.env(NATIVE_WATCHER_ENV, "on");
+    command
+}
+
+/// Whether this test-support process was asked for real OS watcher delivery.
+#[cfg(feature = "test-support")]
+pub(crate) fn native_watcher_requested() -> bool {
+    std::env::var_os(NATIVE_WATCHER_ENV).is_some_and(|value| value == "on")
+}
+
 /// A fixture process recorded before its PID can become stale. The start time
 /// distinguishes an exited fixture from a later process assigned the same PID.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]

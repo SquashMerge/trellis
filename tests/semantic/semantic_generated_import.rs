@@ -35,7 +35,7 @@ use trellis::{
 };
 
 use crate::support;
-use support::{Checkout, cache_dir, data_dir, start_checkout, state_dir};
+use support::{Checkout, cache_dir, data_dir, native_watcher, start_checkout, state_dir};
 
 use crate::semantic_batch_support;
 use semantic_batch_support::{BatchFixture, edit_descriptor, edit_scip, uniform_workspace};
@@ -868,7 +868,8 @@ fn generated_import_rejected_when_head_moves_at_cutoff() {
 
 #[test]
 fn pickup_batch_with_trailing_slash_survives_full_reuse() {
-    let world = world(&[]);
+    // The watcher publishes the edit below: real OS delivery.
+    let world = world(&[native_watcher()]);
     let root_uri = file_uri(&world.checkout.root);
     // scip-java always takes the FULL path on reuse.
     let artifact = world.java_artifact(Some(format!("{root_uri}/")));
@@ -916,7 +917,8 @@ fn pickup_batch_with_trailing_slash_survives_full_reuse() {
 /// publication moves the head and the store reuses the stored batch.
 #[test]
 fn rust_pickup_batch_survives_store_reuse() {
-    let world = world(&[]);
+    // The watcher publishes the edit below: real OS delivery.
+    let world = world(&[native_watcher()]);
     let root_uri = file_uri(&world.checkout.root);
     let artifact = world.reference_artifact("rust-analyzer", "rust", Some(format!("{root_uri}/")));
     let output = world

@@ -3032,9 +3032,9 @@ fn held_catalog_browser() -> HeldCatalogBrowser {
         _ => {}
     }));
     // Catch-up is part of the head digest, and a late OS event for the fixture's own
-    // write above is honest catch-up at an unchanged head (#703). Hints come only from
-    // the tests themselves, through the same watcher ingress.
-    registry.disable_next_native_watcher_for_tests();
+    // write above would be honest catch-up at an unchanged head (#703). Fixture
+    // watchers have no OS delivery (#720): hints come only from the tests themselves,
+    // through the same watcher ingress.
     registry
         .register(&identity, CheckoutOptions(serde_json::json!({})))
         .unwrap();

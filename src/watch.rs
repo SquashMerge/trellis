@@ -447,6 +447,13 @@ impl WatchSignals {
         Self::construct(root, true, health)
     }
 
+    /// Like `publishing`; `native: false` (fixtures only, #720) installs no OS
+    /// delivery, with the same synthetic ingress, generations and acknowledgment.
+    #[doc(hidden)]
+    pub fn publishing_with_native(root: PathBuf, health: Arc<WatcherHealth>, native: bool) -> Self {
+        Self::construct(root, native, health)
+    }
+
     #[doc(hidden)]
     pub fn synthetic_for_tests(root: PathBuf) -> Self {
         Self::construct(root, false, Arc::new(WatcherHealth::default()))

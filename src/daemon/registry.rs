@@ -474,7 +474,7 @@ pub struct CheckoutRegistry {
     #[cfg(feature = "test-support")]
     test_next_dependency_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     #[cfg(feature = "test-support")]
-    test_next_native_watcher_disabled: bool,
+    test_native_watcher: bool,
 }
 
 impl Default for CheckoutRegistry {
@@ -506,7 +506,7 @@ impl CheckoutRegistry {
             #[cfg(feature = "test-support")]
             test_next_dependency_hook: None,
             #[cfg(feature = "test-support")]
-            test_next_native_watcher_disabled: false,
+            test_native_watcher: false,
         }
     }
 
@@ -538,12 +538,14 @@ impl CheckoutRegistry {
         self.test_next_dependency_hook = Some(hook);
     }
 
-    /// Run the next activation's watchers without asynchronous OS delivery,
-    /// installed before its worker starts (#703).
+    /// Give every later activation's watchers real OS delivery, installed before
+    /// its worker starts. A test-support build's watchers otherwise take
+    /// synthetic ingress only (#703, #720); only a test of real watcher delivery
+    /// opts in.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    pub fn disable_next_native_watcher_for_tests(&mut self) {
-        self.test_next_native_watcher_disabled = true;
+    pub fn enable_native_watcher_for_tests(&mut self) {
+        self.test_native_watcher = true;
     }
 
     #[cfg(feature = "test-support")]
@@ -692,8 +694,8 @@ impl CheckoutRegistry {
             scheduler.set_dependency_hook_for_tests(hook);
         }
         #[cfg(feature = "test-support")]
-        if std::mem::take(&mut self.test_next_native_watcher_disabled) {
-            scheduler.disable_native_watcher_for_tests();
+        if self.test_native_watcher {
+            scheduler.enable_native_watcher_for_tests();
         }
         if let Some(search_fill) = &self.search_fill {
             scheduler.set_search_fill(search_fill.register(&scheduler));

@@ -17,8 +17,8 @@ use tempfile::{Builder, TempDir};
 
 use crate::support;
 use support::{
-    Checkout, cache_dir, data_dir, pickup_entry, request_rows, start_checkout, stop_daemon,
-    tripwire_dir,
+    Checkout, cache_dir, data_dir, native_watcher, pickup_entry, request_rows, start_checkout,
+    stop_daemon, tripwire_dir,
 };
 
 use crate::semantic_batch_support;
@@ -253,9 +253,11 @@ fn pickup_retries_after_stale_basis() {
 
 #[test]
 fn pickup_does_not_retry_deterministic_failure_until_head_changes() {
-    let env = intervals(json!({
+    let mut env = intervals(json!({
         "debounceMs": 100, "stableMs": 100, "checkMs": 200, "retryMs": 200
     }));
+    // The new head below comes from real OS watcher delivery of a source edit.
+    env.push(native_watcher());
     let checkout = start_checkout(workspace, &env);
     let (tripwire, _) = tripwire_dir(checkout.temp.path());
     let bad = checkout.temp.path().join("bad.scip");
