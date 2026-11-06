@@ -77,11 +77,13 @@ throughout.
   changed documents without retained input show `needsReimport`. Graph, Sequence and
   rule traversal stops at a changed or dependent document with a labelled boundary,
   never a negative conclusion. The browser, CLI and MCP share these labels.
-- A `trellis producer run` import keeps what catch-up needs while the producer
-  profile's effective inputs still hold, so later edits don't fall back to a full
-  semantic rejoin.
-- A read that arrives while the semantic commit holds the index waits for it, up to
-  10 seconds, and then reads the new head, instead of failing with
+- An eligible `trellis producer run` import can use witnessed catch-up while its
+  inputs and witness eligibility hold. Multi-artifact batches; changed producer,
+  source set, toolchain, dependencies or capture options; and a missing or released
+  original import still take a full semantic rejoin.
+- A read that arrives during a brief semantic commit waits for it instead of failing
+  immediately, up to the store's wait budget and the caller's own deadline (MCP calls
+  have a 5-second deadline). On expiry it can still fail with the typed
   `rebuild_in_progress`.
   ([#682](https://github.com/SquashMerge/trellis/pull/682))
 
@@ -116,11 +118,12 @@ Medians of three rounds (two for `Cargo.toml`), in seconds of semantic catch-up:
 | Later edits (four) | 11.3–15.8 | 9.4–13.4 |
 | `Cargo.toml`, fresh daemon | 127.3 | 112.8 |
 
-Native results were readable in mostly 1–3 s. No read failed in any run, and the
-reader completed about twice as many reads during catch-up. Peak RSS was 3.6–7.4 GiB.
-**The host load was not controlled** (1-minute load average 4–24), and single runs
-varied up to 2×, so only the direction of these results is firm. They are not a
-benchmark or a latency guarantee.
+Native results were readable in mostly 1–3 s. No read failed during the measured
+catch-up windows, and the reader completed about twice as many reads during edit
+catch-ups (about 1.4× for `Cargo.toml`). Peak RSS was 3.6–7.4 GiB. **The host load
+was not controlled** (1-minute load average 4–24), and single runs varied up to 2×.
+These are observations from a loaded host, not a controlled benchmark or a latency
+guarantee.
 
 ## Optional semantics and local search
 
@@ -135,9 +138,12 @@ benchmark or a latency guarantee.
   [#533](https://github.com/SquashMerge/trellis/pull/533),
   [#569](https://github.com/SquashMerge/trellis/pull/569))
 - **One bad document no longer fails an import:** a SCIP document over a
-  per-document cap, or with an invalid range, is admitted with no claims and reported
-  partial (`document_cap_exceeded` or `invalid_range`); the rest of the artifact
-  imports. A committed JavaScript bundle no longer blocks evidence for every other
+  per-document wire/count cap, or with a reversed or empty non-marker range, is
+  admitted with no claims and reported partial (`document_cap_exceeded` or
+  `invalid_range`); the rest of the artifact imports. A document over the occurrence
+  cap keeps its symbol information, relationships and definition occurrences and
+  reports `occurrence_cap_exceeded`. Other malformed positions or enums still reject
+  the artifact. A committed JavaScript bundle no longer blocks evidence for every other
   file. `scip-typescript` runs with a generated ES2022 `tsconfig.json` in its private
   worktree unless the checkout has its own.
   ([#635](https://github.com/SquashMerge/trellis/pull/635),
@@ -272,8 +278,8 @@ particular:
 - **MCP call answers ([#724](https://github.com/SquashMerge/trellis/issues/724),
   fix planned for 0.1.1):** `trellis_incoming_calls` can list a caller as `resolved`
   when its semantic binding targets a different function with the same name; this
-  was seen with test helpers that share a name. Check the caller's `targetId` before
-  relying on it. `trellis_call_graph` edge text is not capped at the advertised
+  was seen with test helpers that share a name. Compare each caller's `targetId` with the
+  requested symbol's ID before relying on it. `trellis_call_graph` edge text is not capped at the advertised
   1 KiB (`calleeTextBytes: 1024`), even with `compact:true`.
 - Classes draws no proven relationship edges. TypeScript/TSX/JSX parsing, remote
   SSH, Herdr integration and design handoff are not included. Producer imports do not

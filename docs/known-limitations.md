@@ -24,9 +24,9 @@ The [owner's macOS memory ruling](https://github.com/SquashMerge/trellis/issues/
 
 Trellis publishes native results first and catches semantic evidence up in the background ([native-first publication, #668](https://github.com/SquashMerge/trellis/pull/668)). Reads stay available, and responses label older-basis, catching-up and needs-re-import evidence until catch-up finishes. Catch-up time is **not bounded**.
 
-In a 2026-11-05 dogfood run on a copy of the Trellis checkout with Rust and JavaScript imported, native results were readable in mostly 1–3 s. Median semantic catch-up was about 32 s for the first edit after daemon start, 9–13 s for later edits, and about 113 s for a `Cargo.toml` edit on a fresh daemon, with peak RSS of 3.6–7.4 GiB. The host load was not controlled and single runs varied up to 2×, so these are observations, not a benchmark or a latency guarantee. See the [0.1.0 release notes](release-notes-0.1.md#catch-up-performance).
+In a 2026-11-05 dogfood run on a copy of the Trellis checkout with Rust and JavaScript imported, native results were readable in mostly 1–3 s. Median semantic catch-up was about 32 s for the first edit after daemon start, 9–13 s for later edits, and about 113 s for a `Cargo.toml` edit on a fresh daemon, with peak RSS of 3.6–7.4 GiB. The host load was not controlled and single runs varied up to 2×. These are observations from a loaded host, not a controlled benchmark or a latency guarantee. See the [0.1.0 release notes](release-notes-0.1.md#catch-up-performance).
 
-Config, toolchain or extractor changes, and imports whose producer inputs no longer hold, can still take a full semantic rejoin, which costs more time and memory than catch-up.
+An eligible `producer run` import uses witnessed catch-up only while its inputs and witness eligibility hold. Multi-artifact batches; changed producer, source set, toolchain, dependencies or capture options; and a missing or released original import still take a full semantic rejoin.
 
 ## Evidence
 
