@@ -1622,13 +1622,19 @@ async fn run_daemon() -> Result<()> {
     if let Some(stop) = &stop {
         sockets.remove(&stop.session);
     }
-    // Socket shutdown wakes idle MCP readers and incomplete ingress too; aborting
-    // a spawn_blocking task would leave those readers running.
+    // Every connection read (request ingress, idle MCP readers and the serve
+    // control wait) waits on this signal together with its socket's
+    // readability, so publishing it ends them; aborting a spawn_blocking task
+    // would leave those readers running. Darwin's shutdown(2) on a cloned
+    // descriptor can miss a thread entering read(2) (#739, #741), so no read
+    // depends on the socket shutdown below. It still makes a stopping daemon's
+    // remaining writes fail fast instead of answering after the stop, and it
+    // gives each peer end of input before the daemon exits.
+    browser_shutdown.send_replace(true);
     for stream in sockets.values() {
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
     if stop.is_some() {
-        browser_shutdown.send_replace(true);
         registry::CheckoutRegistry::cancel_producers(registry.clone()).await?;
     }
     stop_daemon_connections(&browser_shutdown, &mut connections).await;
@@ -1712,8 +1718,8 @@ mod daemon_shutdown_tests {
     async fn retained_shutdown_cannot_race_serve_socket_configuration() {
         let (control, peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let _peer = ControlPeer(peer);
-        // The daemon's stop sweep shuts down every accepted socket before it
-        // publishes shutdown; the serve wait then configures that socket (#625).
+        // The daemon's stop sweep can shut down an accepted socket before the
+        // serve wait configures it (#625).
         control.shutdown(std::net::Shutdown::Both).unwrap();
         let (shutdown, stopped) = tokio::sync::watch::channel(true);
         let runtime = tokio::runtime::Handle::current();
@@ -1786,6 +1792,60 @@ mod daemon_shutdown_tests {
             [7],
             "the serve wait shut its socket down instead of observing the signal"
         );
+    }
+
+    /// #741: the stop sweep ends an incomplete request by publishing shutdown,
+    /// not by a cross-thread socket shutdown. The peer has sent part of a
+    /// plain or a prefaced frame and stays open; the socket still carries data
+    /// after the read ends, so no socket shutdown ended it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn published_shutdown_ends_an_incomplete_request_without_a_socket_shutdown() {
+        for partial in [&[0u8, 0, 0, 9, b'{'][..], &[0xff, 0, 0, 0, 9, b'{'][..]] {
+            let (connection, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let probe = connection.try_clone().unwrap();
+            use std::io::{Read, Write};
+            (&peer).write_all(partial).unwrap();
+            let (shutdown, stopped) = tokio::sync::watch::channel(false);
+            let mut connections = tokio::task::JoinSet::new();
+            let (parked, waiting) = std::sync::mpsc::channel();
+            let (read, result) = tokio::sync::oneshot::channel();
+            connections.spawn_blocking(move || {
+                let request = read_daemon_request(
+                    &connection,
+                    stopped,
+                    Instant::now() + trellis::testing::HANG_BACKSTOP,
+                    Some(Box::new(move || {
+                        let _ = parked.send(());
+                    })),
+                );
+                let _ = read.send(request.map(|_| ()));
+            });
+            // The read parks only once the buffered partial frame is consumed.
+            tokio::task::spawn_blocking(move || {
+                waiting.recv_timeout(trellis::testing::HANG_BACKSTOP)
+            })
+            .await
+            .unwrap()
+            .expect("request read never parked");
+            tokio::time::timeout(
+                trellis::testing::HANG_BACKSTOP,
+                stop_daemon_connections(&shutdown, &mut connections),
+            )
+            .await
+            .expect("published shutdown did not end the incomplete request read");
+            let error = result.await.unwrap().unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(std::io::ErrorKind::UnexpectedEof),
+                "{error:#}"
+            );
+            (&peer).write_all(&[7]).unwrap();
+            let mut byte = [0u8; 1];
+            (&probe).read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [7], "the request read was ended by a socket shutdown");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1930,11 +1990,6 @@ fn dispatch_connection(
         stop_sender,
     } = control;
     let runtime = tokio::runtime::Handle::current();
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-    use std::io::{Cursor, Read};
-    let mut first = [0u8; 1];
-    stream.read_exact(&mut first)?;
-    let prefaced = first[0] == 0xff;
     let ingress_deadline = accepted_at + Duration::from_secs(20);
     #[cfg(feature = "test-support")]
     let ingress_deadline = std::env::var("TRELLIS_TEST_METRICS_INGRESS_DEADLINE_MS")
@@ -1942,11 +1997,13 @@ fn dispatch_connection(
         .and_then(|value| value.parse::<u64>().ok())
         .map(|milliseconds| accepted_at + Duration::from_millis(milliseconds))
         .unwrap_or(ingress_deadline);
-    let request: protocol::Request = if prefaced {
-        protocol::read_prefaced_frame_until(&mut stream, ingress_deadline)?
-    } else {
-        protocol::read_frame(&mut Cursor::new(first).chain(&mut stream))?
-    };
+    let (request, prefaced) = read_daemon_request(
+        &stream,
+        browser_shutdown.subscribe(),
+        ingress_deadline,
+        #[cfg(test)]
+        None,
+    )?;
     if prefaced {
         ensure!(
             request.operation == "metrics",
@@ -2080,33 +2137,18 @@ fn dispatch_connection(
         };
         let delivered = protocol::write_frame(&mut stream, &reply);
         let served = match (result, delivered) {
-            (Ok(workspace), Ok(())) => {
-                // The CLI request deadline must not end an idle MCP attachment.
-                stream
-                    .set_read_timeout(None)
-                    .and_then(|()| {
-                        // `trellis mcp`'s relay frames each line with its own
-                        // relay ID (Decision 0009 §7).
-                        if relayed {
-                            mcp::run_relayed_socket(
-                                workspace,
-                                stream,
-                                registry.clone(),
-                                session,
-                                runtime.clone(),
-                            )
-                        } else {
-                            mcp::run_socket(
-                                workspace,
-                                stream,
-                                registry.clone(),
-                                session,
-                                runtime.clone(),
-                            )
-                        }
-                    })
-                    .map_err(anyhow::Error::from)
-            }
+            // An idle MCP attachment has no read deadline. Its reader ends at
+            // end of input or on the published daemon shutdown (#741).
+            (Ok(workspace), Ok(())) => mcp::run_daemon_socket(
+                workspace,
+                stream,
+                relayed,
+                browser_shutdown.subscribe(),
+                registry.clone(),
+                session,
+                runtime.clone(),
+            )
+            .map_err(anyhow::Error::from),
             (Err(error), _) => Err(error),
             (_, Err(error)) => Err(error.into()),
         };
@@ -2656,6 +2698,39 @@ fn dispatch_connection(
         wait_for_serve_disconnect(stream, browser_shutdown.subscribe(), &runtime)?;
     }
     Ok(())
+}
+
+/// Reads one request from an accepted connection, and whether it was
+/// prefaced (metrics admission). Each read also ends, as at end of input, on
+/// the daemon's published shutdown, so the stop sweep never relies on a
+/// cross-thread socket shutdown to end an incomplete request (#741).
+fn read_daemon_request(
+    stream: &std::os::unix::net::UnixStream,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    ingress_deadline: Instant,
+    #[cfg(test)] waiting: Option<trellis::daemon::shutdown_read::WaitHookForTests>,
+) -> Result<(protocol::Request, bool)> {
+    use std::io::{Cursor, Read};
+    let mut reader =
+        trellis::daemon::shutdown_read::ShutdownReader::new(stream.try_clone()?, shutdown)?;
+    #[cfg(test)]
+    if let Some(waiting) = waiting {
+        reader = reader.on_wait_for_tests(waiting);
+    }
+    reader.set_idle_timeout(Some(Duration::from_secs(15)));
+    let mut first = [0u8; 1];
+    reader.read_exact(&mut first)?;
+    let prefaced = first[0] == 0xff;
+    let request = if prefaced {
+        // The reserved preface is consumed. The frame that follows has one
+        // absolute budget, including a peer that sends one byte at a time.
+        reader.set_idle_timeout(None);
+        reader.set_deadline(Some(ingress_deadline));
+        protocol::read_frame(&mut reader)?
+    } else {
+        protocol::read_frame(&mut Cursor::new(first).chain(&mut reader))?
+    };
+    Ok((request, prefaced))
 }
 
 fn wait_for_serve_disconnect(

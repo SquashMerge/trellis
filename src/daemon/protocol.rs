@@ -254,12 +254,3 @@ pub fn write_preface_until(stream: &mut UnixStream, deadline: Instant) -> io::Re
     remaining(deadline)?;
     Ok(())
 }
-
-/// The daemon has already consumed the reserved preface. The following four
-/// bytes are the ordinary length prefix, with no change to the frame format.
-pub fn read_prefaced_frame_until<T: for<'a> Deserialize<'a>>(
-    stream: &mut UnixStream,
-    deadline: Instant,
-) -> io::Result<T> {
-    read_frame_until(stream, deadline)
-}

@@ -184,6 +184,51 @@ mod tests {
         assert_eq!(context.check(), Err(IdentityError::StoreUnavailable));
         assert!(!marker.exists());
     }
+
+    /// #741: an idle daemon MCP session ends on the published shutdown while
+    /// its client stays connected. The socket still carries data afterwards,
+    /// so no socket shutdown ended the session.
+    #[tokio::test(flavor = "current_thread")]
+    async fn published_shutdown_ends_an_idle_daemon_session_without_a_socket_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("selected");
+        std::fs::create_dir(&root).unwrap();
+        let workspace =
+            OpenedWorkspace::new(WorkspaceIdentity::discover(Some(&root), temp.path()).unwrap());
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let probe = server.try_clone().unwrap();
+        let (shutdown, stopped) = tokio::sync::watch::channel(false);
+        let (parked, waiting) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let session = tokio::task::spawn_blocking(move || {
+            run_daemon_socket_hooked(
+                workspace,
+                server,
+                false,
+                stopped,
+                None,
+                runtime,
+                Some(Box::new(move || {
+                    let _ = parked.send(());
+                })),
+            )
+        });
+        tokio::task::spawn_blocking(move || waiting.recv_timeout(crate::testing::HANG_BACKSTOP))
+            .await
+            .unwrap()
+            .expect("idle session reader never parked");
+        shutdown.send_replace(true);
+        let ended = tokio::time::timeout(crate::testing::HANG_BACKSTOP, session)
+            .await
+            .expect("published shutdown did not end the idle MCP session")
+            .unwrap();
+        assert!(ended.is_ok(), "{ended:?}");
+        use std::io::{Read, Write};
+        (&client).write_all(&[7]).unwrap();
+        let mut byte = [0];
+        (&probe).read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [7], "the session was ended by a socket shutdown");
+    }
 }
 
 /// Run the line-framed transport. The reader owns stdin; this coordinator alone owns stdout.
@@ -199,7 +244,8 @@ pub fn run_stdio(workspace: OpenedWorkspace) -> std::io::Result<()> {
     )
 }
 
-/// Run the same protocol coordinator on a daemon-owned session socket.
+/// Run the same protocol coordinator on a daemon-owned session socket. Its
+/// reader ends when this call returns.
 pub fn run_socket(
     workspace: OpenedWorkspace,
     stream: std::os::unix::net::UnixStream,
@@ -207,34 +253,64 @@ pub fn run_socket(
     session_id: u64,
     daemon_handle: tokio::runtime::Handle,
 ) -> std::io::Result<()> {
-    let reader = stream.try_clone()?;
-    run_transport(
+    let (_session, ended) = tokio::sync::watch::channel(false);
+    run_daemon_socket(
         workspace,
-        reader,
         stream,
-        Some((registry, session_id)),
-        Some(daemon_handle),
         false,
+        ended,
+        registry,
+        session_id,
+        daemon_handle,
     )
 }
 
-/// The daemon side of `trellis mcp`'s relay (Decision 0009 §7): every frame
-/// and reply carries the relay's own ID before the unchanged MCP line.
-pub fn run_relayed_socket(
+/// Run the coordinator on a daemon session socket whose reader also ends,
+/// as at end of input, when the daemon publishes `shutdown` (#741). With
+/// `relayed`, this is the daemon side of `trellis mcp`'s relay (Decision 0009
+/// §7): every frame and reply carries the relay's own ID before the unchanged
+/// MCP line.
+pub fn run_daemon_socket(
     workspace: OpenedWorkspace,
     stream: std::os::unix::net::UnixStream,
+    relayed: bool,
+    shutdown: tokio::sync::watch::Receiver<bool>,
     registry: std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
     session_id: u64,
     daemon_handle: tokio::runtime::Handle,
 ) -> std::io::Result<()> {
-    let reader = stream.try_clone()?;
+    run_daemon_socket_hooked(
+        workspace,
+        stream,
+        relayed,
+        shutdown,
+        Some((registry, session_id)),
+        daemon_handle,
+        None,
+    )
+}
+
+fn run_daemon_socket_hooked(
+    workspace: OpenedWorkspace,
+    stream: std::os::unix::net::UnixStream,
+    relayed: bool,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    registry: Registry,
+    daemon_handle: tokio::runtime::Handle,
+    waiting: Option<crate::daemon::shutdown_read::WaitHookForTests>,
+) -> std::io::Result<()> {
+    let mut reader =
+        crate::daemon::shutdown_read::ShutdownReader::new(stream.try_clone()?, shutdown)?;
+    if let Some(waiting) = waiting {
+        reader = reader.on_wait_for_tests(waiting);
+    }
     run_transport(
         workspace,
         reader,
         stream,
-        Some((registry, session_id)),
+        registry,
         Some(daemon_handle),
-        true,
+        relayed,
     )
 }
 
