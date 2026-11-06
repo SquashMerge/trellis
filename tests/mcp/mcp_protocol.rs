@@ -303,6 +303,10 @@ impl Peer {
                 "TRELLIS_TEST_DAEMON_PID_FILE",
                 home.path().join("auto-daemon.pid"),
             )
+            .env(
+                crate::child::DAEMON_STDERR,
+                home.path().join("daemon-stderr.log"),
+            )
             .envs(env.iter().copied())
             .process_group(0)
             .stdin(Stdio::piped())
@@ -316,10 +320,7 @@ impl Peer {
                 .env("TRELLIS_TEST_MCP_PHASE_SOCKET", socket);
         }
         if let Some(socket) = causal_socket {
-            cmd.env("TRELLIS_TEST_MCP_CAUSAL_SOCKET", socket).env(
-                "TRELLIS_TEST_DAEMON_STDERR",
-                home.path().join("daemon-stderr.log"),
-            );
+            cmd.env("TRELLIS_TEST_MCP_CAUSAL_SOCKET", socket);
         }
         let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -393,6 +394,19 @@ impl Peer {
         assert!(!expired, "MCP subprocess exceeded 10-second deadline");
         let stderr = String::from_utf8_lossy(&capture_file(&self.stderr_path)).into_owned();
         (status, stderr)
+    }
+    /// [`Peer::finish`], asserting the MCP child succeeded. A failure carries the child's
+    /// stderr and the tail of the daemon stderr it kept.
+    #[track_caller]
+    fn assert_success(self, context: &str) {
+        let daemon = self._home.path().join("daemon-stderr.log");
+        let (status, stderr) = self.finish();
+        let output = std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: stderr.into_bytes(),
+        };
+        crate::child::assert_cli_success_with(&output, context, Some(&daemon));
     }
 }
 impl Drop for Peer {
@@ -691,11 +705,7 @@ for (const {name, structuredContent} of inputs) {
         .write_all(&serde_json::to_vec(pairs).unwrap())
         .unwrap();
     let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "structuredContent schema validation: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "structuredContent schema validation");
 }
 fn expected_envelope(
     id: &Value,
@@ -1170,7 +1180,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
             )
         };
         error(&peer.ask(opposite), -32600, json!(42));
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
     }
 }
 #[test]
@@ -1282,7 +1292,7 @@ fn framing_ids_negotiation_and_application_validation() {
             true,
         );
     }
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 #[test]
 fn legacy_title_recovery_max_id_and_root_selection() {
@@ -1315,7 +1325,7 @@ fn legacy_title_recovery_max_id_and_root_selection() {
             .len(),
         11
     );
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
     // Topology overlap is refused before marker attachment.
     let overlap = tmp.path().join("managed-home");
     fs::create_dir_all(overlap.join(".git")).unwrap();
@@ -1352,7 +1362,7 @@ fn eof_and_cancellation_are_silent_for_no_pending_request() {
         peer.ask(modern(json!(1), "server/discover", json!({})))["result"]["resultType"],
         "complete"
     );
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 
 #[test]
@@ -1390,7 +1400,7 @@ fn modern_legacy_client_info_title() {
         -32600,
         json!(9),
     );
-    assert!(modern_peer.finish().0.success());
+    modern_peer.assert_success("trellis mcp");
     let mut legacy_peer = Peer::start(Some(&root));
     let mut legacy_bad = fixture()["legacyInitialize"].clone();
     legacy_bad["clientInfo"]["title"] = json!(42);
@@ -1411,7 +1421,7 @@ fn modern_legacy_client_info_title() {
         -32600,
         json!(9),
     );
-    assert!(legacy_peer.finish().0.success());
+    legacy_peer.assert_success("trellis mcp");
     for bad_modern in [true, false] {
         let mut peer = Peer::start(Some(&root));
         if bad_modern {
@@ -1444,7 +1454,7 @@ fn modern_legacy_client_info_title() {
                 "complete"
             );
         }
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
     }
     let implicit = Peer::start(None);
     let diagnostic = silent_failure(implicit);
@@ -1558,7 +1568,7 @@ fn id_boundaries_binary_both_modes_and_unselected() {
                     assert!(!reply.to_string().contains(&rejected));
                 }
             }
-            assert!(peer.finish().0.success());
+            peer.assert_success("trellis mcp");
         }
     }
     for (good, bad) in [
@@ -1574,7 +1584,7 @@ fn id_boundaries_binary_both_modes_and_unselected() {
             error(&peer.reply(), -32600, Value::Null);
             peer.send_raw(&boundary_request(&alternate_token(&good), legacy));
             assert_eq!(peer.reply()["id"], good);
-            assert!(peer.finish().0.success());
+            peer.assert_success("trellis mcp");
         }
     }
     for legacy in [false, true] {
@@ -1605,7 +1615,7 @@ fn id_boundaries_binary_both_modes_and_unselected() {
             peer.send_raw(line.as_bytes());
             assert_eq!(peer.reply()["id"], integer);
         }
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
     }
     // Distinct scalar spelling, decomposed Unicode, escaped literal and unescaped slash/U+2028.
     let mut peer = Peer::start(Some(&root));
@@ -1625,7 +1635,7 @@ fn id_boundaries_binary_both_modes_and_unselected() {
         peer.send_raw(&boundary_request(bad, false));
         error(&peer.reply(), -32700, Value::Null);
     }
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
     // Neither rejected first request can select a mode or echo the unsafe ID.
     for initial_legacy in [false, true] {
         let mut peer = Peer::start(Some(&root));
@@ -1644,7 +1654,7 @@ fn id_boundaries_binary_both_modes_and_unselected() {
             ))
         };
         assert!(response["result"].is_object());
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
     }
 }
 
@@ -1743,11 +1753,7 @@ async fn wire_lines_remain_when_source_line_or_byte_cap_refuses() {
         .env("XDG_CACHE_HOME", home.join("cache"))
         .env("XDG_DATA_HOME", home.join("data"));
     let indexed = bounded_output(command);
-    assert!(
-        indexed.status.success(),
-        "index: {}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "index");
     let publication: Value = serde_json::from_slice(&indexed.stdout).unwrap();
     let current = &publication["publishedRevision"];
     assert_ne!(current, &pin);
@@ -1779,7 +1785,7 @@ async fn wire_lines_remain_when_source_line_or_byte_cap_refuses() {
         wrong_hash["result"]["structuredContent"]["error"]["currentContentHash"],
         *old_hash.as_ref().unwrap()
     );
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2057,7 +2063,7 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             -32602,
             json!(11),
         );
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
     }
 }
 
@@ -2191,7 +2197,7 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
             });
             error(&response, -32602, json!(heavy_id));
         }
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
     }
     assert_eq!(
         fs::read(root.join("src-sentinel.txt")).unwrap(),
@@ -2208,7 +2214,7 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
         "checkout",
         peer._home.path(),
     );
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 
 fn bounded_output(mut command: Command) -> std::process::Output {
@@ -2275,7 +2281,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
     let ancestor_marker = ancestor.join(".git/trellis/workspace-id");
     let first_marker = fs::read(&ancestor_marker).unwrap();
     assert!(!nearer.join(".git/trellis/workspace-id").exists());
-    assert!(explicit.finish().0.success());
+    explicit.assert_success("trellis mcp");
     // Adopt the same marker on restart; never regenerate a valid existing UUID.
     let mut adopted = Peer::start(Some(&ancestor));
     exact_tool(
@@ -2289,7 +2295,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         "ancestor",
         adopted._home.path(),
     );
-    assert!(adopted.finish().0.success());
+    adopted.assert_success("trellis mcp");
     assert_eq!(fs::read(&ancestor_marker).unwrap(), first_marker);
     // Implicit selection walks to the closest Git directory, not a farther ancestor.
     let mut implicit = Peer::start_in(None, Some(&nested));
@@ -2306,7 +2312,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
     );
     let nearer_marker = fs::read(nearer.join(".git/trellis/workspace-id")).unwrap();
     assert_ne!(first_marker, nearer_marker);
-    assert!(implicit.finish().0.success());
+    implicit.assert_success("trellis mcp");
     // A non-Git cwd cannot acquire a daemon checkout attachment or marker.
     let plain = tmp.path().join("plain");
     fs::create_dir(&plain).unwrap();
@@ -2349,7 +2355,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         Path::new("escape"),
     );
     no_db_under(marker_lost._home.path());
-    assert!(marker_lost.finish().0.success());
+    marker_lost.assert_success("trellis mcp");
     let mut root_changed = Peer::start(Some(&nearer));
     assert!(
         root_changed.ask(modern(json!(41), "server/discover", json!({})))["result"].is_object()
@@ -2368,7 +2374,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         "identity_changed",
         &ancestor.canonicalize().unwrap().join("nearer"),
     );
-    assert!(root_changed.finish().0.success());
+    root_changed.assert_success("trellis mcp");
 }
 
 #[test]
@@ -2421,7 +2427,7 @@ fn exact_frames_split_utf8_crlf_and_eof() {
     peer.stdin.as_mut().unwrap().flush().unwrap();
     peer.send_raw(&tail);
     assert_eq!(peer.reply()["id"], "é😀");
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
     let mut incomplete = Peer::start(Some(&root));
     incomplete
         .stdin
@@ -2436,7 +2442,7 @@ fn exact_frames_split_utf8_crlf_and_eof() {
         .unwrap();
     let (_tx, substitute) = mpsc::channel();
     let lines = std::mem::replace(&mut incomplete.lines, substitute);
-    assert!(incomplete.finish().0.success());
+    incomplete.assert_success("trellis mcp");
     assert!(
         drain_stdout(lines).is_empty(),
         "unterminated input cannot be dispatched"
@@ -2452,7 +2458,7 @@ fn exact_frames_split_utf8_crlf_and_eof() {
     completed.send_raw(serde_json::to_string(&cancelled).unwrap().as_bytes());
     let (_tx, substitute) = mpsc::channel();
     let lines = std::mem::replace(&mut completed.lines, substitute);
-    assert!(completed.finish().0.success());
+    completed.assert_success("trellis mcp");
     assert!(
         drain_stdout(lines).is_empty(),
         "cancelled completed request/EOF emitted a response"
@@ -2522,7 +2528,7 @@ fn unusable_index_sentinels_do_not_change_unavailable_projection_or_get_repaired
         assert!(!index.with_extension("db-shm").exists());
     }
     assert!(!root.join(".git/trellis/requests.db").exists());
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 
 #[test]
@@ -2574,7 +2580,7 @@ fn golden_modern_legacy_transcripts() {
             "checkout",
             peer._home.path(),
         );
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
     }
 }
 
@@ -2623,7 +2629,7 @@ fn ordinary_cancellation_and_eof_without_private_race_hook() {
         assert!(reply["result"].is_object());
         let (_tx, substitute) = mpsc::channel();
         let lines = std::mem::replace(&mut peer.lines, substitute);
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
         assert!(
             drain_stdout(lines).is_empty(),
             "cancellation/EOF emitted an extra response"
@@ -2636,7 +2642,7 @@ fn ordinary_cancellation_and_eof_without_private_race_hook() {
     peer.send_raw(serde_json::to_string(&active).unwrap().as_bytes());
     let (_tx, substitute) = mpsc::channel();
     let lines = std::mem::replace(&mut peer.lines, substitute);
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
     let all = drain_stdout(lines);
     assert!(all.len() <= 1, "EOF cannot cause duplicate outcomes");
     for line in all {
@@ -2732,7 +2738,7 @@ fn linked_git_worktrees_get_distinct_selected_markers() {
             !root.join(".git/trellis/workspace-id").exists(),
             "pointer file must not be treated as directory"
         );
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
         let mut reopened = Peer::start_in(None, Some(root));
         let result = reopened.ask(call(
             false,
@@ -2741,7 +2747,7 @@ fn linked_git_worktrees_get_distinct_selected_markers() {
             json!({"schemaVersion":1}),
         ));
         exact_tool_for_id(&result, &json!(2), None, true, label, reopened._home.path());
-        assert!(reopened.finish().0.success());
+        reopened.assert_success("trellis mcp");
         assert_eq!(
             fs::read(&marker).unwrap(),
             *ids.last().unwrap(),
@@ -2960,7 +2966,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
             describe(&mut peer, 17, json!({"schemaVersion":1}))["result"]["structuredContent"]["workspace"],
             json!(main)
         );
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
     }
 }
 
@@ -3083,10 +3089,7 @@ fn selected_clone_failure_is_resolved_and_does_not_kill_the_session() {
             reply["result"]["structuredContent"]["error"]["currentBasis"],
             Value::Null
         );
-        assert!(
-            peer.finish().0.success(),
-            "daemon panic cannot interrupt thin client"
-        );
+        peer.assert_success("daemon panic cannot interrupt thin client");
     }
 }
 
@@ -3161,7 +3164,7 @@ fn final_resolved_drift_is_attributed_for_five_tools_and_both_modes() {
                     );
                     fs::rename(moved, root).unwrap();
                 }
-                assert!(peer.finish().0.success());
+                peer.assert_success("trellis mcp");
             }
         }
     }
@@ -3432,7 +3435,7 @@ fn a_stalled_final_check_does_not_hold_other_calls() {
     tool(&first, None, true);
     assert_eq!(second["id"], "A", "{second}");
     tool(&second, Some("deadline_exceeded"), true);
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 
 /// Serve every phase pause on `listener` until the test ends, each on its own
@@ -3769,7 +3772,7 @@ fn earlier_call_is_decided_while_a_later_final_check_stalls(hold_stage: &'static
     assert_eq!((b["id"].as_str(), a["id"].as_str()), (Some("B"), Some("A")));
     tool(&b, None, true);
     tool(&a, Some("deadline_exceeded"), true);
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 
 #[test]
@@ -3827,7 +3830,7 @@ fn a_root_replaced_after_its_final_check_is_root_changed_at_send() {
         reply["result"]["structuredContent"]["workspace"],
         json!(linked)
     );
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 
 #[test]
@@ -3866,7 +3869,7 @@ fn a_selection_failure_does_not_reach_the_selected_send_phase() {
         "a preselection failure reached the selected send phase: {reply}"
     );
     assert!(linked.exists(), "the live rename target was moved: {reply}");
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 
 #[test]
@@ -3930,7 +3933,7 @@ fn an_unreadable_common_dir_at_send_is_retried_not_root_changed() {
         "B was never rechecked: {reply}"
     );
     tool(&reply, None, true);
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 
 #[test]
@@ -3995,7 +3998,7 @@ fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
         reply["result"]["structuredContent"]["error"]["currentBasis"],
         Value::Null
     );
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 
 /// One bounded, read-only causal event per private fixture socket connection.
@@ -4208,11 +4211,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
         .env("XDG_CACHE_HOME", home.join("cache"))
         .env("XDG_DATA_HOME", home.join("data"));
     let indexed = bounded_output(command);
-    assert!(
-        indexed.status.success(),
-        "index: {}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "index");
     let cli: Value = serde_json::from_slice(&indexed.stdout).expect("CLI index response");
     let published = &cli["publishedRevision"];
     assert!(published["indexGeneration"].is_string());
@@ -4295,7 +4294,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
         if data["catchingUp"] == false {
             // Describe has evidenceBasis:null; this proves the selected checkout
             // is now settled, not that ID3 atomically returned the CLI pin.
-            assert!(peer.finish().0.success());
+            peer.assert_success("trellis mcp");
             return;
         }
         assert_eq!(data["catchingUp"], true);
@@ -4360,11 +4359,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
             command.arg("--max-file-bytes").arg(size.to_string());
         }
         let output = bounded_output(command);
-        assert!(
-            output.status.success(),
-            "index: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "index");
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();
         result["publishedRevision"].clone()
     };
@@ -4462,7 +4457,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
         selected["result"]["structuredContent"]["workspace"]
     );
     assert!(final_reply["result"]["structuredContent"]["catchingUp"].is_boolean());
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
 }
 
 /// Synthetic event ordering checks the fixture collector without a daemon.
@@ -5530,7 +5525,7 @@ fn invalid_calls_and_non_w1_stubs_never_open_derived_databases() {
             tool(&reply, Some("index_not_ready"), !legacy);
             no_db_under(peer._home.path());
         }
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
     }
 }
 
@@ -10806,7 +10801,7 @@ async fn incoming_many_documents_fixture(long_name: bool, limit: Option<usize>) 
     }
     let incoming = peer.ask(call(false, json!(4), "trellis_incoming_calls", args));
     tool(&incoming, None, true);
-    assert!(peer.finish().0.success());
+    peer.assert_success("trellis mcp");
     (declaration, incoming)
 }
 
@@ -11017,7 +11012,7 @@ async fn incoming_escaped_javascript_declarations_keep_wire_labels_and_later_cal
         assert_eq!(later_callers.len(), 1, "{later_incoming}");
         assert_eq!(later_callers[0]["calleeText"], later_name);
         assert_eq!(later_callers[0]["ownerSyntaxId"], caller_id);
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
     }
 }
 
@@ -11710,7 +11705,7 @@ fn architecture_catalog_prompt_and_closed_inputs_use_both_protocol_modes() {
             ));
             tool(&reply, Some("index_not_ready"), !legacy);
         }
-        assert!(peer.finish().0.success());
+        peer.assert_success("trellis mcp");
     }
 }
 
