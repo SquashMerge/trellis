@@ -269,6 +269,12 @@ particular:
   mismatched inputs leave **needs re-import**, and Trellis never runs a producer by
   itself. There is no old-index migration. See
   [upgrade recovery](quickstart.md#upgrading-trellis).
+- **MCP call answers ([#724](https://github.com/SquashMerge/trellis/issues/724),
+  fix planned for 0.1.1):** `trellis_incoming_calls` can list a caller as `resolved`
+  when its semantic binding targets a different function with the same name; this
+  was seen with test helpers that share a name. Check the caller's `targetId` before
+  relying on it. `trellis_call_graph` edge text is not capped at the advertised
+  1 KiB (`calleeTextBytes: 1024`), even with `compact:true`.
 - Classes draws no proven relationship edges. TypeScript/TSX/JSX parsing, remote
   SSH, Herdr integration and design handoff are not included. Producer imports do not
   imply complete coverage or runtime dispatch resolution.
