@@ -218,14 +218,23 @@ From the v0.1.0 eight-task MCP dogfood run (2026-11-05). `toolVersion` is **9**
   `sameNameDeclarations` limitation still holds for unbound callers. A binding to
   the selected symbol, a `dispatch` boundary (dispatch is not proven direct), a
   stale or possibly stale binding, and a caller with no binding keep their
-  dispositions as before. `boundElsewhere` adds no warning and does not change
-  `partial`. Outgoing calls and the call graph are unchanged.
+  dispositions as before. `boundElsewhere` adds no warning. Caller selection,
+  order, `limit` and `has_more` are unchanged, but the existing 65,536-byte
+  prefix fit applies to the labelled callers: the longer label can make a page
+  near the cap emit a shorter prefix, with `truncationReason:"response_bytes"`
+  and `partial:true`. Outgoing calls and the call graph are unchanged.
 - **Bounded graph spellings.** `trellis_call_graph` clips each edge call's
   `spelling` to the advertised `calleeTextBytes` (1024 UTF-8 bytes) on a scalar
   boundary, as outgoing calls clip `calleeText`, in full and compact form. A
   clipped call adds `spellingTruncated:true`; a spelling that fits is unchanged
-  and carries no flag. Clipping changes no node, edge, visit, boundary,
-  `truncated` or `truncationReason`: the graph answer itself is complete.
+  and carries no flag. Clipping is a projection step: the raw traversal (its
+  nodes, edges, visits, boundaries, frontiers and `GraphResult.truncated`) is
+  unchanged, and no `callee_text` truncation reason is added. The existing
+  response byte fit applies to the clipped representation, so the emitted wire
+  answer can differ: a spelling of 1025 ASCII bytes becomes 1024 bytes plus the
+  25-byte flag (net +24), while a much longer one shrinks. Near the response cap
+  the fit can therefore keep fewer or more edge groups, and can set or clear
+  `truncationReason:"response_bytes"` and `responseOmitted`.
 
 ## Tool catalog
 

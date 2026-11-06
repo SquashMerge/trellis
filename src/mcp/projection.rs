@@ -4686,6 +4686,22 @@ for (const output of outputs) {
         }
     }
 
+    /// #724: a scalar that crosses byte 1024 is dropped whole, not split: 1023 ASCII bytes
+    /// then a two-byte `é` (bytes 1023..1025) clip to the 1023 ASCII bytes.
+    #[test]
+    fn call_graph_spelling_clip_backs_off_a_scalar_crossing_the_cap() {
+        let mut answer = graph(1, 150, 500);
+        let spelling = format!("{}é", "x".repeat(1023));
+        assert_eq!(spelling.len(), 1025);
+        answer.outcome.as_mut().unwrap().edges[0].call.spelling = Some(spelling);
+        for compact in [false, true] {
+            let page = project_graph(&mut answer, compact);
+            let call = &page["data"]["result"]["edges"][0]["call"];
+            assert_eq!(call["spelling"], json!("x".repeat(1023)));
+            assert_eq!(call["spellingTruncated"], true);
+        }
+    }
+
     /// #724: a graph edge's call spelling is clipped to `calleeTextBytes` (1024) on a
     /// scalar boundary and flagged `spellingTruncated:true`, in full and compact form. An
     /// edge that fits, even exactly, is byte-identical and carries no flag.
