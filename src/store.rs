@@ -13819,6 +13819,7 @@ impl Store {
         self.test_before_request_terminal_commit_hook.set(hook);
     }
 
+    #[cfg(feature = "test-support")]
     #[cfg(test)]
     pub(crate) fn set_before_evidence_snapshot_hook_for_tests(
         &self,
