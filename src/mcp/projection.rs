@@ -144,11 +144,11 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":8,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":9,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
-        "maxLimit":50,"pageBytes":super::architecture::PAGE_BYTES,"calleeTextBytes":1024,
+        "maxLimit":50,"pageBytes":super::architecture::PAGE_BYTES,"calleeTextBytes":CALLEE_TEXT_BYTES,
         "hintWorkMs":1000,"deadlineMs":deadline_ms,"concurrency":super::MAX_CONNECTION_CALLS}},
       "warnings":[],"partial":partial,"truncated":false,"truncationReason":null})
 }
@@ -199,7 +199,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 8);
+        assert_eq!(ready["data"]["toolVersion"], 9);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -2222,6 +2222,7 @@ pub fn call_graph(
             {
                 proof["evidence"] = evidence;
             }
+            clip_edge_spellings(&mut projected);
             let omitted = json!({"nodes":nodes - result.nodes.len(),
                 "edges":edges - result.edges.len()});
             let mut data = json!({"stableLookupKey":stable_lookup_key,"requested":requested,
@@ -2253,6 +2254,32 @@ pub fn call_graph(
         fits,
     )
 }
+
+/// #724: clip each edge call's `spelling` to `calleeTextBytes` (1024 UTF-8 bytes) on a
+/// scalar boundary, as outgoing calls clip `calleeText`, and mark a clipped call with
+/// `spellingTruncated:true`. A spelling that fits is unchanged and carries no flag.
+fn clip_edge_spellings(result: &mut Value) {
+    for edge in result["edges"].as_array_mut().into_iter().flatten() {
+        let Some(call) = edge["call"].as_object_mut() else {
+            continue;
+        };
+        let Some(Value::String(spelling)) = call.get_mut("spelling") else {
+            continue;
+        };
+        if spelling.len() <= CALLEE_TEXT_BYTES {
+            continue;
+        }
+        let end = (0..=CALLEE_TEXT_BYTES)
+            .rev()
+            .find(|&end| spelling.is_char_boundary(end))
+            .unwrap_or(0);
+        spelling.truncate(end);
+        call.insert("spellingTruncated".into(), Value::Bool(true));
+    }
+}
+
+/// The advertised `calleeTextBytes` cap on exported callee text.
+const CALLEE_TEXT_BYTES: usize = 1024;
 
 /// #665 compact graph: keep the graph (node keys, names, kinds, roles, paths and ranges; edge
 /// endpoints, call sites, visits, boundaries and binding resolutions), frontiers, omissions,
@@ -2484,6 +2511,11 @@ pub fn incoming(
             "callers":callers,"documents":documents,"semanticBases":bases,"coverage":coverage,
             "scopeCoverage":language_status(&result.scope, tiers),
             "provenance":provenance,"semanticDocuments":semantic.documents});
+        // #724: callers excluded because their fresh, direct binding targets another
+        // declaration. Present only when some were excluded.
+        if result.bound_elsewhere_omitted > 0 {
+            data["boundElsewhereOmitted"] = json!(result.bound_elsewhere_omitted);
+        }
         if compact {
             compact_data(&mut data, "callers");
         }
@@ -3037,6 +3069,7 @@ mod incoming_tests {
             same_name_declarations: 3,
             scope: [[0; 5], [0; 5], [0; 5], [2, 2, 0, 0, 4]],
             has_more,
+            bound_elsewhere_omitted: 0,
         }
     }
     fn project(result: McpIncomingWithLines, modern: bool) -> Option<Value> {
@@ -3680,6 +3713,7 @@ mod size_tests {
                 same_name_declarations: 1,
                 scope: [[0; 5], [355, 22, 333, 0, 0], [0; 5], [0; 5]],
                 has_more: true,
+                bound_elsewhere_omitted: 0,
             },
             crate::store::McpSemantic {
                 documents: vec![],
@@ -4503,6 +4537,178 @@ for (const output of JSON.parse(readFileSync(0,'utf8'))) {
                     120 - edges
                 )
             );
+        }
+    }
+
+    /// Validate tool outputs against the reviewed catalog fixture's closed output schema.
+    fn assert_catalog_valid(tool: &str, outputs: &[&Value]) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let script = r#"
+const {createRequire} = require('node:module');
+const {readFileSync} = require('node:fs');
+const local = createRequire(process.cwd() + '/tests/mcp/package.json');
+const Ajv = local('ajv/dist/2020.js').default;
+const [tool, outputs] = JSON.parse(readFileSync(0,'utf8'));
+const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json','utf8'));
+const validate = new Ajv({strict:false}).compile(catalog.find(t => t.name === tool).outputSchema);
+for (const output of outputs) {
+  if (!validate(output)) throw Error(JSON.stringify(validate.errors));
+}
+"#;
+        let mut child = Command::new("node")
+            .args(["-e", script])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Node is required by tools/verify");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&json!([tool, outputs])).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// #724: only a fresh, direct binding to another located declaration excludes a caller.
+    /// A binding to the selected symbol, a dispatch boundary, a possibly stale or stale
+    /// binding and a binding without a located target keep the caller listed.
+    #[test]
+    fn only_a_fresh_direct_binding_elsewhere_excludes_a_caller() {
+        use crate::graph_query::BoundaryReason;
+        use crate::semantic_evidence::Freshness;
+        let (result, semantic) = incoming(1);
+        let selected = result.selected.selected.declaration.syntax_id.clone();
+        let elsewhere = Some("sid:v1:2301cdb0e7c351db88fecd8aa523edc9".to_owned());
+        let base = semantic.calls[0].clone().unwrap();
+        let case = |target: Option<String>, boundary, freshness| {
+            let mut bound = base.clone();
+            bound.target_id = target;
+            bound.boundary_reason = boundary;
+            bound.effective_freshness = freshness;
+            bound.bound_elsewhere(&selected)
+        };
+        assert!(case(
+            elsewhere.clone(),
+            BoundaryReason::None,
+            Freshness::Fresh
+        ));
+        assert!(!case(
+            Some(selected.clone()),
+            BoundaryReason::None,
+            Freshness::Fresh
+        ));
+        assert!(!case(
+            elsewhere.clone(),
+            BoundaryReason::Dispatch,
+            Freshness::Fresh
+        ));
+        assert!(!case(
+            elsewhere.clone(),
+            BoundaryReason::None,
+            Freshness::PossiblyStale
+        ));
+        assert!(!case(
+            elsewhere.clone(),
+            BoundaryReason::Stale,
+            Freshness::Stale
+        ));
+        assert!(!case(None, BoundaryReason::None, Freshness::Fresh));
+    }
+
+    /// #724: the store's count of callers excluded as bound elsewhere is emitted as
+    /// `data.boundElsewhereOmitted`, in full and compact form, and validates against the
+    /// closed schema. Without exclusions the field is absent and the page is unchanged.
+    #[test]
+    fn incoming_reports_callers_omitted_as_bound_elsewhere() {
+        let run = |omitted: u64, compact: bool| {
+            let (mut result, semantic) = incoming(4);
+            result.bound_elsewhere_omitted = omitted;
+            super::incoming(
+                &json!(1),
+                result,
+                &semantic,
+                &super::tests::rust_semantic("fresh", [326, 14, 312, 0, 29]),
+                compact,
+                std::path::Path::new("/Users/someone/projects/trellis"),
+                false,
+                true,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        for compact in [false, true] {
+            let none = run(0, compact);
+            assert!(none["data"].get("boundElsewhereOmitted").is_none());
+            let page = run(2, compact);
+            assert_eq!(page["data"]["boundElsewhereOmitted"], 2);
+            let mut expected = none.clone();
+            expected["data"]["boundElsewhereOmitted"] = json!(2);
+            assert_eq!(page, expected, "only the count is added");
+            assert_catalog_valid("trellis_incoming_calls", &[&none, &page]);
+        }
+    }
+
+    /// #724: a scalar that crosses byte 1024 is dropped whole, not split: 1023 ASCII bytes
+    /// then a two-byte `é` (bytes 1023..1025) clip to the 1023 ASCII bytes.
+    #[test]
+    fn call_graph_spelling_clip_backs_off_a_scalar_crossing_the_cap() {
+        let mut answer = graph(1, 150, 500);
+        let spelling = format!("{}é", "x".repeat(1023));
+        assert_eq!(spelling.len(), 1025);
+        answer.outcome.as_mut().unwrap().edges[0].call.spelling = Some(spelling);
+        for compact in [false, true] {
+            let page = project_graph(&mut answer, compact);
+            let call = &page["data"]["result"]["edges"][0]["call"];
+            assert_eq!(call["spelling"], json!("x".repeat(1023)));
+            assert_eq!(call["spellingTruncated"], true);
+        }
+    }
+
+    /// #724: a graph edge's call spelling is clipped to `calleeTextBytes` (1024) on a
+    /// scalar boundary and flagged `spellingTruncated:true`, in full and compact form. An
+    /// edge that fits, even exactly, is byte-identical and carries no flag.
+    #[test]
+    fn call_graph_edge_spelling_is_clipped_to_the_callee_text_cap() {
+        let spell = |answer: &mut crate::graph_query::GraphAnswer, edge: usize, text: String| {
+            answer.outcome.as_mut().unwrap().edges[edge].call.spelling = Some(text);
+        };
+        for compact in [false, true] {
+            let mut baseline = graph(2, 150, 500);
+            spell(&mut baseline, 1, "x".repeat(1024));
+            let baseline = project_graph(&mut baseline, compact);
+            let mut answer = graph(2, 150, 500);
+            // 768 two-byte scalars: 1536 bytes, the dogfood closure's size.
+            spell(&mut answer, 0, "é".repeat(768));
+            spell(&mut answer, 1, "x".repeat(1024));
+            let page = project_graph(&mut answer, compact);
+            let edges = page["data"]["result"]["edges"].as_array().unwrap();
+            assert_eq!(edges[0]["call"]["spelling"], json!("é".repeat(512)));
+            assert_eq!(edges[0]["call"]["spellingTruncated"], true);
+            assert_eq!(edges[1]["call"]["spelling"], json!("x".repeat(1024)));
+            for edge in &edges[1..] {
+                assert!(edge["call"].get("spellingTruncated").is_none());
+            }
+            let mut expected = baseline.clone();
+            let call = &mut expected["data"]["result"]["edges"][0]["call"];
+            call["spelling"] = json!("é".repeat(512));
+            call["spellingTruncated"] = json!(true);
+            assert_eq!(page, expected, "only the clipped edge changes");
+            assert_catalog_valid("trellis_call_graph", &[&page]);
+            // Before #724 the whole spelling was emitted: clipping 512 bytes adds the flag.
+            let mut before = baseline.clone();
+            before["data"]["result"]["edges"][0]["call"]["spelling"] = json!("é".repeat(768));
+            let (before, after) = (graph_frame_bytes(&before), graph_frame_bytes(&page));
+            eprintln!("#724 graph compact={compact}: before {before} B, after {after} B");
+            assert_eq!(after + 512, before + r#","spellingTruncated":true"#.len());
         }
     }
 }

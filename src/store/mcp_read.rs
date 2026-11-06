@@ -1843,14 +1843,66 @@ pub struct McpIncomingWithLines {
     /// partial, failed, unselected. Includes zero-hit scope documents.
     pub scope: [[u64; 5]; 4],
     pub has_more: bool,
+    /// #724: name-matched callers left out because their fresh, direct binding targets
+    /// another declaration, counted over the ranked callers scanned: those before the first
+    /// kept caller beyond `limit`, or all of them when `has_more` is false.
+    pub bound_elsewhere_omitted: u64,
+}
+
+#[cfg(feature = "test-support")]
+thread_local! {
+    /// Ranked incoming name-match rows fetched from SQLite on this thread (#724 tests).
+    static INCOMING_ROWS_FETCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one fetched ranked incoming row for tests; nothing in production builds.
+fn note_incoming_row_fetched() {
+    #[cfg(feature = "test-support")]
+    INCOMING_ROWS_FETCHED.with(|rows| rows.set(rows.get() + 1));
 }
 
 impl EvidenceResponse {
+    /// The ranked incoming rows fetched on this thread since the last call (#724 tests).
+    #[cfg(feature = "test-support")]
+    pub fn take_incoming_rows_fetched_for_tests() -> usize {
+        INCOMING_ROWS_FETCHED.with(|rows| rows.replace(0))
+    }
+
+    /// Name-matched incoming calls, every caller kept (no semantic exclusion).
     pub fn mcp_incoming_with_lines(
         &self,
         symbol_id: &str,
         limit: usize,
         expected: Option<IndexPin>,
+    ) -> Result<Option<McpIncomingWithLines>> {
+        self.mcp_incoming_scan(symbol_id, limit, expected, None, &mut || Ok(()))
+    }
+
+    /// #724 (owner ruling 2026-11-06): name-matched incoming calls without the callers
+    /// whose fresh, direct binding under `producer`'s selection targets another declaration.
+    /// The exclusion runs while the ranked callers are scanned, before `limit` and
+    /// `has_more` are decided, so a page is full whenever enough callers remain. `check`
+    /// runs once per scanned caller and bounds the scan by the call's deadline.
+    pub fn mcp_incoming_excluding_bound_elsewhere(
+        &self,
+        symbol_id: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+        producer: Option<&str>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<McpIncomingWithLines>> {
+        self.mcp_incoming_scan(symbol_id, limit, expected, Some(producer), check)
+    }
+
+    /// `exclude` is `None` to keep every caller, or the explicit producer (itself optional)
+    /// whose selected bindings decide exclusion.
+    fn mcp_incoming_scan(
+        &self,
+        symbol_id: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+        exclude: Option<Option<&str>>,
+        check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<McpIncomingWithLines>> {
         use crate::native_evidence::{DeclarationRole, DocumentKey, Provenance};
         let selected = self.selected(None)?;
@@ -1954,6 +2006,17 @@ impl EvidenceResponse {
         let mut calls = Vec::new();
         let mut same_name_declarations = 0;
         let mut has_more = false;
+        let mut bound_elsewhere_omitted = 0_u64;
+        // The same binding reader the emitted callers' annotations use (#466), built only
+        // after the selected declaration is found, so `not_found` keeps its precedence.
+        // Without a producer selected for the searched language no caller can be bound
+        // elsewhere, so the semantic reader and the open-ended scan are skipped.
+        let mut bindings = exclude
+            .map(|producer| {
+                super::semantic_display::SemanticCalls::new(&self.db, &selected, producer)
+            })
+            .transpose()?
+            .filter(|reader| reader.selection.producer(&selected_key.language).is_some());
         if let Some(lookup) = owner.declaration.lookup_key.as_deref() {
             // Count declarations across every eligible selected version, not calls
             // or only the limited response prefix.
@@ -2000,10 +2063,8 @@ impl EvidenceResponse {
                 .map_or("", |(dir, _)| dir);
             // SQLite orders the indexed matches before returning only the
             // required prefix. A directory match must not include descendants.
-            let ranked = self
-                .db
-                .prepare(
-                    "SELECT v.id,c.id,c.owner_syntax_id,m.path,d.role
+            let mut ranked = self.db.prepare(
+                "SELECT v.id,c.id,c.owner_syntax_id,m.path,d.role
                  FROM native_version_calls c
                  JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
                  JOIN document_versions v ON v.vid=c.vid
@@ -2020,31 +2081,39 @@ impl EvidenceResponse {
                      THEN 1 ELSE 2 END,
                    m.path COLLATE BINARY, c.start_byte, c.end_byte, c.id COLLATE BINARY
                  LIMIT ?7",
-                )?
-                .query_map(
-                    params![
-                        selected.key,
-                        selected_key.source_set_id,
-                        selected_key.language,
-                        lookup,
-                        selected_key.path,
-                        directory,
-                        i64::try_from(limit + 1)?
-                    ],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, Vec<u8>>(1)?,
-                            r.get::<_, Vec<u8>>(2)?,
-                            r.get::<_, String>(3)?,
-                            r.get::<_, String>(4)?,
-                        ))
-                    },
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            has_more = ranked.len() > limit;
+            )?;
+            let mut rows = ranked.query(params![
+                selected.key,
+                selected_key.source_set_id,
+                selected_key.language,
+                lookup,
+                selected_key.path,
+                directory,
+                // Excluded callers do not fill the page, so an excluding scan reads the
+                // ranked rows until it has `limit + 1` kept callers.
+                if bindings.is_some() {
+                    -1
+                } else {
+                    i64::try_from(limit + 1)?
+                }
+            ])?;
             let mut loaded = BTreeMap::new();
-            for (version, id_blob, caller_blob, path, stored_role) in ranked {
+            // #724 review: rows are fetched one at a time, after the deadline check, and
+            // the scan stops at the first kept caller beyond `limit`. SQLite's own ranking
+            // work before the first row is not interrupted by this check.
+            loop {
+                check()?;
+                let Some(row) = rows.next()? else {
+                    break;
+                };
+                note_incoming_row_fetched();
+                let (version, id_blob, caller_blob, path, stored_role) = (
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                );
                 let id = id_codec::decode_occ(&id_blob)?;
                 let caller_id = id_codec::decode_sid(&caller_blob)?;
                 let scope = scopes.get(&version).ok_or_else(|| {
@@ -2094,6 +2163,14 @@ impl EvidenceResponse {
                         "store_unavailable: incoming call or caller proof mismatch",
                     ));
                 }
+                if let Some(bindings) = bindings.as_mut()
+                    && bindings
+                        .call(call)?
+                        .is_some_and(|bound| bound.bound_elsewhere(&owner.declaration.syntax_id))
+                {
+                    bound_elsewhere_omitted += 1;
+                    continue;
+                }
                 let provenance = Provenance {
                     id: scope.proof_id(),
                     producer_id: scope.producer_id.clone(),
@@ -2134,6 +2211,10 @@ impl EvidenceResponse {
                         coverage: coverages[&version].clone(),
                         provenance,
                     });
+                } else {
+                    // The first kept caller beyond `limit`: there are more callers.
+                    has_more = true;
+                    break;
                 }
             }
         }
@@ -2146,6 +2227,7 @@ impl EvidenceResponse {
             same_name_declarations,
             scope: scope_counts,
             has_more,
+            bound_elsewhere_omitted,
         }))
     }
 }

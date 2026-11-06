@@ -153,6 +153,20 @@ pub struct CallSemantic {
     pub proofs: Vec<sem::Provenance>,
 }
 
+impl CallSemantic {
+    /// #724: a fresh binding the graph would traverse directly (`boundaryReason:"none"`)
+    /// whose located target is not `selected`. A dispatch boundary, a stale or possibly
+    /// stale binding and a binding without a located target never qualify.
+    pub fn bound_elsewhere(&self, selected: &str) -> bool {
+        self.boundary_reason == BoundaryReason::None
+            && self.effective_freshness == sem::Freshness::Fresh
+            && self
+                .target_id
+                .as_deref()
+                .is_some_and(|target| target != selected)
+    }
+}
+
 /// Only `locate` is read by `call_disposition`; it checks an exact target's location.
 struct Locate<'a> {
     db: &'a Connection,
