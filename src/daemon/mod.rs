@@ -8,6 +8,7 @@ pub mod search;
 pub mod search_fill;
 pub mod search_head;
 pub mod search_startup;
+pub mod shutdown_read;
 
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
