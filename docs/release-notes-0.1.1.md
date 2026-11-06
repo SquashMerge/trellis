@@ -21,9 +21,10 @@ see [Upgrade notes](#upgrade-notes).
   - `data.boundElsewhereOmitted` counts the callers left out, and appears only when
     there is at least one. It is exact when the response is not truncated, and a
     lower bound otherwise.
-  - Paging stays correct: a page holds `limit` callers whenever that many remain,
-    and a left-out caller never makes a page look truncated. Ranking and `match`
-    are unchanged.
+  - Paging stays correct: left-out callers are skipped before `limit` is applied,
+    so a page holds `limit` callers whenever that many remain, unless the existing
+    65,536-byte response fit cuts it shorter. A left-out caller never makes a page
+    look truncated. Ranking and `match` are unchanged.
   ([#730](https://github.com/SquashMerge/trellis/pull/730))
 - **Call-graph edge text is capped:** `trellis_call_graph` clips each edge call's
   `spelling` to the advertised 1 KiB (`calleeTextBytes: 1024`) in full and
@@ -43,35 +44,38 @@ see [Upgrade notes](#upgrade-notes).
   - Measured on the Trellis repository with a rust-analyzer import, finding every
     deviation took 697 pages and 14.9 MB (at `limit:5`, with 4,751 inline bases)
     before the change. With `status:["deviates"], limit:50` it takes 18 pages and
-    412 KB, and the production deviations fill the first 8 pages (189 KB).
+    412 KB. The first 8 of those pages hold all 105 production deviations, plus 14
+    test-only ones, in 189 KB of whole responses.
   - The CLI and the browser are unchanged.
   ([#737](https://github.com/SquashMerge/trellis/pull/737))
-- **Symlinked workspace ancestors:** MCP `--workspace` and per-call `workspace`
-  paths that pass through a symlinked directory, such as `/tmp` on macOS (a link to
-  `/private/tmp`), now select the canonical checkout. Before, every tool failed with
-  `workspace_selection_failed`. A symlink as the final path component is still
-  refused with `not_checkout`. CLI `--workspace` already worked.
+- **Symlinked workspace ancestors:** an explicit per-call MCP `workspace` path that
+  passes through a symlinked directory, such as `/tmp` on macOS (a link to
+  `/private/tmp`), now selects the canonical checkout. Before, such a call failed
+  with `workspace_selection_failed` (reason `not_checkout`), so a client that sends
+  `workspace` on every call, such as the release smoke runner, failed every tool.
+  Calls that omit `workspace` already worked, as did CLI `--workspace`. A per-call
+  path whose final component is a symlink is still refused.
   ([#734](https://github.com/SquashMerge/trellis/pull/734))
 
 ## Reliability fixes
 
-- **`trellis daemon stop` on macOS:** stop no longer hangs while a `trellis serve`
-  connection or an idle MCP client stays connected. On macOS, shutting a socket down
-  from another thread can fail to wake a read that is just starting, so the daemon
-  could wait forever. The `serve` wait
+- **`trellis daemon stop` on macOS:** on macOS, shutting a socket down from another
+  thread can fail to wake a read that is just starting, so stop could wait forever
+  while a `trellis serve` connection or an idle MCP client stayed connected. Stop no
+  longer hangs because of this read race. The `serve` wait
   ([#740](https://github.com/SquashMerge/trellis/pull/740)), idle MCP session reads
   and partly received requests
   ([#743](https://github.com/SquashMerge/trellis/pull/743)) now end on the daemon's
   own shutdown signal.
 - **`trellis producer status` during the first publication:** status no longer
   fails with `revision conflict: foreign or missing native pin` when the first index
-  publication after a rebuild lands while it is reading. It now reads the producer
-  pin and the native index in one snapshot.
+  publication after a rebuild lands while it is reading. It now reads the control
+  baseline (its native pin) and the native header in one snapshot.
   ([#733](https://github.com/SquashMerge/trellis/pull/733))
 
 ## Dependencies
 
-Patch updates of the Rust crates `ignore`, `globset` and `rusqlite`
+Updates of the Rust crates `ignore`, `globset` and `rusqlite`
 ([#728](https://github.com/SquashMerge/trellis/pull/728)), of npm packages used by
 repository tooling under `tools/`
 ([#726](https://github.com/SquashMerge/trellis/pull/726)), and of a CI action
