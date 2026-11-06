@@ -871,7 +871,11 @@ their arrays hold one page of the
 check/explain `Instance` keeps at most `limit` (default 5) `evidence` entries and adds
 `omittedEvidence:UInt`, the exact number not shown. Counts, statuses and
 `referenceCount` are those of the whole evaluation. The CLI and the browser's detail
-reads return the complete arrays above.
+reads return the complete arrays above. The
+[#725 amendment](mcp-readonly-pilot-contract.md#amendment-725-rule-evidence-bases-status-filter-and-instance-pages)
+supersedes this paragraph for MCP: evidence rows refer to a per-page `semanticBases`
+table by `basisRef`; check accepts a `status` filter, its `limit` counts instances
+per page and each check instance keeps one evidence entry.
 
 ## Proposal workflow
 

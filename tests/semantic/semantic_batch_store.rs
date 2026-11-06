@@ -6917,7 +6917,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
     // #528: describe and scopeCoverage report the imported JavaScript evidence beside the
     // native coverage, which keeps its syntax tier; other languages have no producer.
     let describe = mcp.call("trellis_workspace_describe", json!({"schemaVersion":1}));
-    assert_eq!(describe["data"]["toolVersion"], 9);
+    assert_eq!(describe["data"]["toolVersion"], 10);
     for (scope, rows) in [
         ("describe", &describe["data"]["languages"]),
         ("incoming", &incoming["data"]["scopeCoverage"]),
@@ -7905,7 +7905,7 @@ forbid = [{ calls = "helper" }]
             assert_eq!(site["mapping"], "semantic");
             assert_eq!(site["callId"], helper_call.id);
         }
-        let mut evidence = sites;
+        let mut evidence: Vec<Value> = sites.into_iter().cloned().collect();
         for reply in [&checked, &explained] {
             let constraint = &reply["data"]["instances"][0]["constraints"][0];
             let rows = constraint["evidence"].as_array().unwrap();
@@ -7914,7 +7914,19 @@ forbid = [{ calls = "helper" }]
                 .filter(|row| row["provenanceId"] == proof.id)
                 .collect();
             assert!(!semantic.is_empty(), "{reply}");
-            evidence.extend(semantic);
+            // #725: rule rows refer to the page's basis table; put the basis back.
+            let bases = reply["data"]["semanticBases"].as_array().unwrap();
+            evidence.extend(semantic.into_iter().map(|row| {
+                let mut row = row.clone();
+                let fields = row.as_object_mut().unwrap();
+                assert!(!fields.contains_key("basis"), "{reply}");
+                let index = fields.remove("basisRef").unwrap().as_u64().unwrap() as usize;
+                let mut basis = bases[index].clone();
+                assert_eq!(basis["ref"], index);
+                basis.as_object_mut().unwrap().remove("ref");
+                fields.insert("basis".into(), basis);
+                row
+            }));
             // Native declarations and calls remain measured N facts, not derived proofs.
             for kind in ["declaration", "call"] {
                 let row = rows.iter().find(|row| row["kind"] == kind).unwrap();

@@ -60,7 +60,7 @@
         },
         "watcherDegraded": false,
         "languages": [],
-        "toolVersion": 9,
+        "toolVersion": 10,
         "schemaVersion": 1,
         "limits": {
           "requestBytes": 16384,

@@ -1101,12 +1101,15 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         name,
                         &serde_json::Value::Object(args.clone()),
                     );
-                    // check/explain sample rule evidence per instance (#448).
-                    let evidence_limit = (kind != "references" && kind != "prompt").then(|| {
-                        args.get("limit").map_or(5, |value| {
+                    // check/explain sample rule evidence per instance (#448). Explain's
+                    // `limit` sets the sample; check's counts instances per page (#725).
+                    let evidence_limit = match kind {
+                        "check" => Some(architecture::CHECK_EVIDENCE_SAMPLE),
+                        "explain" => Some(args.get("limit").map_or(5, |value| {
                             wire::uint(value).expect("validated evidence limit") as usize
-                        })
-                    });
+                        })),
+                        _ => None,
+                    };
                     Some(Box::new(move |runtime, response, _sampled, _query| {
                         let mut check = || {
                             if cancel.load(std::sync::atomic::Ordering::Acquire)
@@ -1746,14 +1749,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
             tool.response = if architecture::is_tool(&name) || name == architecture::PROMPT_NAME {
                 // Tools page their arrays into the response cap; the prompt never pages.
-                let offset = architecture::is_tool(&name).then(|| {
-                    arguments
-                        .as_ref()
-                        .and_then(|arguments| arguments.get("offset"))
-                        .and_then(wire::uint)
-                        .unwrap_or(0)
-                });
-                architecture::capped(id, &name, envelope, offset, modern)
+                let paging = architecture::is_tool(&name)
+                    .then(|| architecture::Paging::from_arguments(&name, arguments.as_ref()));
+                architecture::capped(id, &name, envelope, paging, modern)
             } else {
                 tools::result(&name, envelope, modern)
             };

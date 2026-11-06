@@ -11415,8 +11415,9 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
         .find(|row| row["target"]["path"] == "app_main.js" && row["status"] == "unknown")
         .expect("aggregated unknown instance");
     assert_eq!(unknown["referenceCount"], 300);
-    assert_eq!(unknown["evidence"].as_array().unwrap().len(), 5);
-    assert_eq!(unknown["omittedEvidence"], 295);
+    // #725: check keeps one witness per instance; explain samples by its `limit`.
+    assert_eq!(unknown["evidence"].as_array().unwrap().len(), 1);
+    assert_eq!(unknown["omittedEvidence"], 299);
     assert_eq!(data["page"]["offset"], 0);
     structured.push(json!({"name":"trellis_rules_check","structuredContent":envelope.clone()}));
     // The unscoped check pages too; its concatenated instances keep every row.
@@ -11477,6 +11478,87 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
         "structuredContent":references["result"]["structuredContent"]}));
     validate_structured_content(&structured);
     drop(ask);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #725: through the daemon, `status` pages only the matching instances, `limit` counts
+/// instances per page, and every page keeps the whole evaluation's counts.
+#[tokio::test(flavor = "current_thread")]
+async fn rules_check_status_filter_and_instance_limit_page_deviations() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let mut files: Vec<(String, String)> = (0..20)
+        .map(|i| {
+            (
+                format!("lib_{i:03}.js"),
+                format!("import './app_main.js';\nimport('external_{i}');\n"),
+            )
+        })
+        .collect();
+    files.push(("app_main.js".into(), "export const y = 1;\n".into()));
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let (identity, topology) = published_inactive_checkout(temp.path(), &borrowed);
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 1\npaths = [\"app_main.js\"]\n[layers.lib]\norder = 2\npaths = [\"lib_*.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(725, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 725, None);
+    let mut structured = Vec::new();
+    let mut ask = |id: i64, arguments: Value| {
+        let frame = modern(
+            json!(id),
+            "tools/call",
+            json!({"name":"trellis_rules_check","arguments":arguments}),
+        );
+        writeln!(client, "{frame}").unwrap();
+        next_reply(&mut reader)
+    };
+    let whole = ask(1, json!({"schemaVersion":1}));
+    tool(&whole, None, true);
+    let counts = whole["result"]["structuredContent"]["data"]["counts"].clone();
+    assert_eq!(counts["deviates"], 20, "{counts}");
+    assert!(counts["unknown"].as_u64().unwrap() > 0, "{counts}");
+    let mut offset = 0;
+    let mut deviations = Vec::new();
+    let mut sizes = Vec::new();
+    for id in 10.. {
+        let reply = ask(
+            id,
+            json!({"schemaVersion":1,"status":["deviates"],"limit":3,"offset":offset}),
+        );
+        tool(&reply, None, true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        let data = &envelope["data"];
+        assert_eq!(data["counts"], counts, "counts stay global");
+        assert_eq!(data["page"]["status"], json!(["deviates"]));
+        assert!(data["semanticBases"].is_array(), "{data}");
+        let rows = data["instances"].as_array().unwrap();
+        assert!(rows.iter().all(|row| row["status"] == "deviates"), "{data}");
+        sizes.push(rows.len());
+        deviations.extend(rows.iter().map(|row| row["target"]["path"].clone()));
+        structured.push(json!({"name":"trellis_rules_check","structuredContent":envelope.clone()}));
+        match data["page"]["nextOffset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert_eq!(deviations.len(), 20);
+    assert!(sizes[..6].iter().all(|size| *size == 3), "{sizes:?}");
+    let invalid = ask(2, json!({"schemaVersion":1,"status":["violates"]}));
+    tool(&invalid, Some("invalid_request"), true);
+    drop(ask);
+    validate_structured_content(&structured);
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();

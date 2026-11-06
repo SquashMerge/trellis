@@ -77,6 +77,18 @@ fn offset(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
         _ => Ok(()),
     }
 }
+/// A rules check `status` filter (#725): absent, or 1–3 distinct instance statuses.
+fn status_filter(o: &serde_json::Map<String, Value>) -> bool {
+    o.get("status").is_none_or(|status| {
+        status.as_array().is_some_and(|statuses| {
+            !statuses.is_empty()
+                && statuses.iter().enumerate().all(|(index, status)| {
+                    matches!(status.as_str(), Some("conforms" | "deviates" | "unknown"))
+                        && !statuses[..index].contains(status)
+                })
+        })
+    })
+}
 fn valid_path(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 4096
@@ -114,6 +126,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "paths",
                 "limit",
                 "offset",
+                "status",
             ],
             &["schemaVersion"],
         ),
@@ -237,6 +250,9 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                     })
                 })
             }) {
+                return Err("invalid_request");
+            }
+            if !status_filter(o) {
                 return Err("invalid_request");
             }
             limit(o).and_then(|()| offset(o))
@@ -1083,7 +1099,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":9,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":10,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
@@ -1530,6 +1546,45 @@ mod tests {
                     Err("invalid_request")
                 );
             }
+        }
+        // #725: check alone takes a nonempty, duplicate-free status filter.
+        for status in [
+            json!(["deviates"]),
+            json!(["deviates", "unknown"]),
+            json!(["conforms", "deviates", "unknown"]),
+        ] {
+            assert_eq!(
+                validate(
+                    "trellis_rules_check",
+                    Some(&json!({"schemaVersion":1,"status":status}))
+                ),
+                Ok(())
+            );
+        }
+        for status in [
+            json!(null),
+            json!("deviates"),
+            json!([]),
+            json!(["violates"]),
+            json!(["deviates", "deviates"]),
+            json!([1]),
+        ] {
+            assert_eq!(
+                validate(
+                    "trellis_rules_check",
+                    Some(&json!({"schemaVersion":1,"status":status}))
+                ),
+                Err("invalid_request"),
+                "{status}"
+            );
+        }
+        for name in ["trellis_references", "trellis_rules_explain"] {
+            let mut arguments = json!({"schemaVersion":1,"status":["deviates"]});
+            if name == "trellis_rules_explain" {
+                arguments["rule"] = json!("$layers");
+                arguments["target"] = identity.clone();
+            }
+            assert_eq!(validate(name, Some(&arguments)), Err("invalid_request"));
         }
         assert_eq!(
             validate(
