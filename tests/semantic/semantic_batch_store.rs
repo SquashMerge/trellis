@@ -5909,6 +5909,24 @@ fn whole_publication_validator_runs_over_every_original_of_a_batch() {
     write_files(&world.root, &[("src/D.js", "function more(){ }\n")]);
     world.republish_with_rejoin();
     assert!(world.rejoin_failures() > 0);
+    let status = world.store.status().unwrap();
+    let failed = language_row(&status, "java").coverage.as_ref().unwrap();
+    assert!(failed.failed > 0, "{failed:?}");
+    let summary = failed
+        .summary
+        .as_deref()
+        .expect("failed coverage has a summary");
+    assert!(
+        !summary.contains("unmeasurable source anchor"),
+        "selected raw capture failure was mislabeled: {summary}"
+    );
+    assert!(
+        summary.starts_with(&format!(
+            "failed: {} · raw capture unavailable",
+            failed.failed
+        )),
+        "{summary}"
+    );
 }
 
 /// Two references at one call site that name different symbols.
@@ -10591,6 +10609,40 @@ fn head_producers(world: &World) -> Vec<String> {
         .iter()
         .map(|producer| producer.id.clone())
         .collect()
+}
+
+/// Status names a language's failed documents before its partial ones: a document the producer
+/// excluded as failed is `not in producer output` in the one-line coverage summary.
+#[test]
+fn coverage_summary_names_failed_documents_first() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"gaps\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+                ("src/lib.rs", GAPS_RS),
+                ("src/gated.rs", "pub fn gated() {}\n"),
+            ],
+        )
+    });
+    let mut fixture = world.fixture();
+    fixture.artifact("rust", vec![gaps_doc()]);
+    fixture.exclude("rust", "src/gated.rs", "failed");
+    let descriptor = world.write(&fixture);
+    world.publish(&descriptor).unwrap();
+    let status = world.store.status().unwrap();
+    let coverage = language_row(&status, "rust").coverage.clone().unwrap();
+    assert_eq!(
+        (coverage.complete, coverage.partial, coverage.failed),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        coverage.summary.as_deref(),
+        Some("failed: 1 · not in producer output; partial: 1 · native macro/attribute gaps only")
+    );
 }
 
 fn language_row<'s>(

@@ -639,7 +639,10 @@ pub(super) fn coverage_summary(
                 coalesce(sum(r.capped),0), coalesce(sum(r.omitted),0),
                 coalesce(sum(r.captured_diagnostics),0),
                 coalesce(sum(r.macro_invocation),0), coalesce(sum(r.attribute_item),0),
-                coalesce(sum(r.macro_definition),0), coalesce(sum(r.other),0)
+                coalesce(sum(r.macro_definition),0), coalesce(sum(r.other),0),
+                coalesce(sum(c.diagnostic='excluded_failed_by_producer'),0),
+                coalesce(sum(c.diagnostic='unmeasurable_source_anchor'),0),
+                coalesce(sum(c.diagnostic LIKE 'selected raw capture unavailable:%'),0)
          FROM semantic_coverage c LEFT JOIN semantic_coverage_reasons r ON r.tuple_id=c.tuple_id
          WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3
          GROUP BY c.state",
@@ -650,7 +653,14 @@ pub(super) fn coverage_summary(
         let count = row.get::<_, i64>(1)? as usize;
         match state.as_str() {
             "complete" => summary.complete += count,
-            "failed" => summary.failed += count,
+            "failed" => {
+                summary.failed += count;
+                let documents =
+                    |index| -> rusqlite::Result<usize> { Ok(row.get::<_, i64>(index)? as usize) };
+                summary.failed_reasons.not_in_output += documents(12)?;
+                summary.failed_reasons.unmeasurable_anchor += documents(13)?;
+                summary.failed_reasons.capture_unavailable += documents(14)?;
+            }
             "partial" => {
                 let documents =
                     |index| -> rusqlite::Result<usize> { Ok(row.get::<_, i64>(index)? as usize) };
