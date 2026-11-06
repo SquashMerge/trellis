@@ -545,7 +545,7 @@ fn generation_recorded_in_retained_descriptor() {
     let world = world(&[]);
     let artifact = world.java_artifact(None);
     let (output, reply) = world.pickup(&artifact);
-    assert!(output.status.success(), "{reply}");
+    crate::child::assert_cli_success(&output, format_args!("{reply}"));
     let head = world.head();
     let descriptor_bytes: Vec<u8> = world
         .store
@@ -642,11 +642,7 @@ fn external_import_cannot_claim_generation() {
         value["generation"] = Value::Null;
     });
     let output = import(&world, &plain, &sha);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "output");
     assert_eq!(world.batches(), 1);
 }
 
@@ -877,11 +873,7 @@ fn pickup_batch_with_trailing_slash_survives_full_reuse() {
     // scip-java always takes the FULL path on reuse.
     let artifact = world.java_artifact(Some(format!("{root_uri}/")));
     let (output, reply) = world.pickup(&artifact);
-    assert!(
-        output.status.success(),
-        "{reply} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, format_args!("{reply}"));
     let imported = world.head();
     assert_eq!(
         world.store.selected_raw_inputs_at(imported).unwrap().len(),
@@ -931,11 +923,10 @@ fn rust_pickup_batch_survives_store_reuse() {
         .pickup_command_for("rust-analyzer", &artifact)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{} {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    crate::child::assert_cli_success_with(
+        &output,
+        "rust-analyzer pickup",
+        Some(&world.checkout.daemon_stderr()),
     );
     let imported = world.head();
     assert_eq!(

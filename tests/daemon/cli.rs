@@ -394,11 +394,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
         .output()
         .unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
+    crate::child::assert_cli_success(&first, "first");
     let dbpath = real_index_db(&home);
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r1, old_ids) = pin_and_ids(&db);
@@ -432,11 +428,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     // replacement runtime and no new startup reconciliation, so an unchanged
     // workspace publishes nothing.
     let attached = command(&root, &home, "status").output().unwrap();
-    assert!(
-        attached.status.success(),
-        "{}",
-        String::from_utf8_lossy(&attached.stderr)
-    );
+    crate::child::assert_cli_success(&attached, "attached");
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r2, ids) = pin_and_ids(&db);
     assert_eq!(r2, 1, "unchanged serve publishes no new pin");
@@ -457,11 +449,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
             .contains("Evidence unavailable")
     );
     let status = command(&root, &home, "status").output().unwrap();
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
+    crate::child::assert_cli_success(&status, "status");
     assert_eq!(
         serde_json::from_slice::<Value>(&status.stdout).unwrap()["revision"]["indexRevision"],
         1
@@ -504,11 +492,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     // A repeated serve registration is inert. Explicit index owns a deliberate
     // same-mtime edit; a status read cannot publish it on demand.
     let published = command(&root, &home, "index").output().unwrap();
-    assert!(
-        published.status.success(),
-        "{}",
-        String::from_utf8_lossy(&published.stderr)
-    );
+    crate::child::assert_cli_success(&published, "published");
     let result: Value = serde_json::from_slice(&published.stdout).unwrap();
     let published_rev = result["publishedRevision"]["indexRevision"]
         .as_i64()
@@ -518,11 +502,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         "one Q publication, with at most one watcher publication of the edit: {result}"
     );
     let attached = command(&root, &home, "status").output().unwrap();
-    assert!(
-        attached.status.success(),
-        "{}",
-        String::from_utf8_lossy(&attached.stderr)
-    );
+    crate::child::assert_cli_success(&attached, "attached");
     // Restart, reconcile and watcher publication share a loaded verify host;
     // a 10 s bound failed intermittently (#131).
     let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
@@ -536,11 +516,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
             "changed bytes did not publish"
         );
         let attached = command(&root, &home, "status").output().unwrap();
-        assert!(
-            attached.status.success(),
-            "{}",
-            String::from_utf8_lossy(&attached.stderr)
-        );
+        crate::child::assert_cli_success(&attached, "attached");
         std::thread::sleep(Duration::from_millis(20));
     }
     let db = rusqlite::Connection::open(&dbpath).unwrap();
@@ -624,19 +600,11 @@ fn daemon_status_uses_selected_head_and_reports_typed_contention() {
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}\n").unwrap();
     let indexed = command(&root, &home, "index").output().unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let pin =
         serde_json::from_slice::<Value>(&indexed.stdout).unwrap()["publishedRevision"].clone();
     let status = command(&root, &home, "status").output().unwrap();
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
+    crate::child::assert_cli_success(&status, "status");
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["revision"], pin);
     assert!(status["catchingUp"].is_boolean());
@@ -661,13 +629,7 @@ fn daemon_status_uses_selected_head_and_reports_typed_contention() {
         .args(["gc", "--report"])
         .output()
         .unwrap();
-    assert!(
-        report.status.success(),
-        "gc --report failed: {}\nstdout: {}\nstderr: {}",
-        report.status,
-        String::from_utf8_lossy(&report.stdout),
-        String::from_utf8_lossy(&report.stderr)
-    );
+    crate::child::assert_cli_success(&report, "gc --report");
     let report: Value = serde_json::from_slice(&report.stdout).unwrap();
     assert_eq!(report["derived"][0]["status"], "busy");
 }
@@ -690,11 +652,7 @@ fn cli_workspace_through_symlinked_ancestor_uses_canonical_root() {
         ("status", "/workspaceRoot"),
     ] {
         let output = command(&via_link, &home, sub).output().unwrap();
-        assert!(
-            output.status.success(),
-            "{sub}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, format_args!("{sub}"));
         let output: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(output.pointer(field), Some(&canonical), "{sub}: {output}");
     }
@@ -722,25 +680,13 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
         );
     }
     let absent = cmd.output().unwrap();
-    assert!(
-        absent.status.success(),
-        "{}",
-        String::from_utf8_lossy(&absent.stderr)
-    );
+    crate::child::assert_cli_success(&absent, "absent");
     let first: Value = serde_json::from_slice(&absent.stdout).unwrap();
     assert!(first["revision"]["indexRevision"].as_u64().unwrap() >= 1);
     let indexed = command(&workspace, &home, "index").output().unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let output = command(&workspace, &home, "status").output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "output");
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["stats"]["files"], 0);
     // The unchanged request completes at the isolated home's current pair.
@@ -768,11 +714,7 @@ fn daemon_index_records_nondefault_file_cap() {
         .arg("3145728")
         .output()
         .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
     assert_eq!(indexed["status"]["stats"]["files"], 1);
     let indexes = if cfg!(target_os = "macos") {
@@ -799,7 +741,7 @@ fn daemon_index_records_nondefault_file_cap() {
     drop(db);
 
     let status = command(&root, &home, "status").output().unwrap();
-    assert!(status.status.success());
+    crate::child::assert_cli_success(&status, "status");
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["revision"], indexed["publishedRevision"]);
     assert_eq!(status["stats"]["files"], 1);
@@ -851,11 +793,7 @@ fn explicit_cli_index_preserves_custom_options_after_bounded_read_recovery() {
         .arg("2097152")
         .output()
         .unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
+    crate::child::assert_cli_success(&first, "first");
     let first: Value = serde_json::from_slice(&first.stdout).unwrap();
     assert!(home.join("auto-daemon.pid").exists());
     // The old daemon must release its live SQLite handles before the fixture
@@ -933,11 +871,7 @@ fn explicit_cli_index_preserves_custom_options_after_bounded_read_recovery() {
         .arg("2097152")
         .output()
         .unwrap();
-    assert!(
-        recovered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&recovered.stderr)
-    );
+    crate::child::assert_cli_success(&recovered, "recovered");
     let output: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     assert_eq!(output["publishedRevision"], output["status"]["revision"]);
     // A bounded read can already have recreated with configured defaults.
@@ -1005,11 +939,7 @@ fn corrupt_read_activation_then_accepted_cli_options_share_the_same_daemon() {
         .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
         .output()
         .unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
+    crate::child::assert_cli_success(&first, "first");
     FixtureDaemon::new(&home).stop_attested().unwrap();
     let index = real_index_db(&home);
     let dir = index.parent().unwrap();
@@ -1057,11 +987,7 @@ fn corrupt_read_activation_then_accepted_cli_options_share_the_same_daemon() {
         .arg("3145728")
         .output()
         .unwrap();
-    assert!(
-        recovered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&recovered.stderr)
-    );
+    crate::child::assert_cli_success(&recovered, "recovered");
     assert_eq!(fs::read_to_string(&marker).unwrap(), daemon_pid);
     let result: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     assert_eq!(result["publishedRevision"], result["status"]["revision"]);
@@ -1122,11 +1048,7 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
         .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
         .output()
         .unwrap();
-    assert!(
-        initial.status.success(),
-        "{}",
-        String::from_utf8_lossy(&initial.stderr)
-    );
+    crate::child::assert_cli_success(&initial, "initial");
     FixtureDaemon::new(&home).stop_attested().unwrap();
     let index = real_index_db(&home);
     let dir = index.parent().unwrap();
@@ -1307,20 +1229,12 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
             .arg("--max-file-bytes")
             .arg("1048576"),
     );
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "output");
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["status"]["stats"]["files"], 1);
     assert_eq!(result["status"]["stats"]["semanticState"], "unavailable");
     let status = bounded_cli(temp.path(), "status", &mut command(&root, &state, "status"));
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
+    crate::child::assert_cli_success(&status, "status");
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["stats"]["files"], 1);
     let output = bounded_cli(
@@ -1330,7 +1244,7 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
             .arg("--search")
             .arg("start"),
     );
-    assert!(output.status.success());
+    crate::child::assert_cli_success(&output, "output");
     let symbols: Value = serde_json::from_slice(&output.stdout).unwrap();
     let symbols = &symbols["data"];
     let seed = symbols["items"][0]["id"].as_str().unwrap();
@@ -1339,7 +1253,7 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
         "query",
         command(&root, &state, "query").arg("--seed").arg(seed),
     );
-    assert!(output.status.success());
+    crate::child::assert_cli_success(&output, "output");
     let view: Value = serde_json::from_slice(&output.stdout).unwrap();
     let view = &view["data"];
     assert_eq!(view["nodes"].as_array().unwrap().len(), 1);
@@ -1376,7 +1290,7 @@ fn cli_refuses_remote_bind_and_invalid_limits() {
         .arg("--help")
         .output()
         .unwrap();
-    assert!(output.status.success());
+    crate::child::assert_cli_success(&output, "output");
 }
 
 #[test]
@@ -1459,19 +1373,11 @@ fn fixed_locations_and_removed_flag() {
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
     let absent = bounded_cli(temp.path(), "status-absent", &mut cli("status"));
-    assert!(
-        absent.status.success(),
-        "{}",
-        String::from_utf8_lossy(&absent.stderr)
-    );
+    crate::child::assert_cli_success(&absent, "absent");
     let observed: Value = serde_json::from_slice(&absent.stdout).unwrap();
     assert!(observed["revision"]["indexRevision"].as_u64().unwrap() >= 1);
     let status = bounded_cli(temp.path(), "index", &mut cli("index"));
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
+    crate::child::assert_cli_success(&status, "status");
     let first: Value = serde_json::from_slice(&status.stdout).unwrap();
     let first = &first["status"];
     // The unchanged index completes at the head the status read observed.
@@ -1522,11 +1428,7 @@ fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
         .env_remove("TRELLIS_INDEX_DIAGNOSTICS")
         .output()
         .unwrap();
-    assert!(
-        quiet.status.success(),
-        "{}",
-        String::from_utf8_lossy(&quiet.stderr)
-    );
+    crate::child::assert_cli_success(&quiet, "quiet");
     let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
     for marker in ["index-phase ", "index-mode ", "index-writer "] {
         assert!(
@@ -1543,11 +1445,7 @@ fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
         .env("TRELLIS_INDEX_DIAGNOSTICS", "1")
         .output()
         .unwrap();
-    assert!(
-        diagnostic.status.success(),
-        "{}",
-        String::from_utf8_lossy(&diagnostic.stderr)
-    );
+    crate::child::assert_cli_success(&diagnostic, "diagnostic");
     // Index work runs in the detached daemon; the thin CLI has no local
     // capture, publication, or writer timings to print.
     assert!(!String::from_utf8_lossy(&diagnostic.stderr).contains("index-phase "));
@@ -1568,11 +1466,7 @@ fn index_forwards_pair_and_reports_pair() {
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
     let absent = command(&root, &home, "status").output().unwrap();
-    assert!(
-        absent.status.success(),
-        "{}",
-        String::from_utf8_lossy(&absent.stderr)
-    );
+    crate::child::assert_cli_success(&absent, "absent");
     let prior: Value = serde_json::from_slice(&absent.stdout).unwrap();
     // A real edit, so the forwarded request publishes past the prior pair.
     fs::write(root.join("a.js"), "function seed() { edited(); }").unwrap();
@@ -1580,11 +1474,7 @@ fn index_forwards_pair_and_reports_pair() {
         .env("TRELLIS_INDEX_DIAGNOSTICS", "1")
         .output()
         .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
+    crate::child::assert_cli_success(&result, "result");
     let published: Value = serde_json::from_slice(&result.stdout).unwrap();
     // The detached daemon owns capture and publication diagnostics; the CLI
     // only prints its correlated selected response.
@@ -1668,11 +1558,7 @@ fn current_commands_pair_matrix() {
             stdout: fs::read(stdout).unwrap(),
             stderr: fs::read(stderr).unwrap(),
         };
-        assert!(
-            output.status.success(),
-            "pair-matrix phase=failed:{phase} stderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, format_args!("pair-matrix phase=failed:{phase}"));
         output
     }
 
@@ -1832,11 +1718,7 @@ fn gc_report_without_workspace_does_not_create_state() {
         .args(["gc", "--report"])
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "output");
     let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(inventory["derived"], serde_json::json!([]));
     assert!(inventory.get("records").is_none());
@@ -1871,7 +1753,7 @@ fn gc_report_without_workspace_does_not_create_state() {
         .args(["gc", "--report"])
         .output()
         .unwrap();
-    assert!(output.status.success());
+    crate::child::assert_cli_success(&output, "output");
     let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(inventory["derived"].as_array().unwrap().len(), 1);
     assert_eq!(inventory["derived"][0]["status"], "busy");
@@ -1894,21 +1776,13 @@ fn gc_cli_reports_multiple_indexes_in_sorted_order() {
     workspaces.sort_by(|a, b| b.0.cmp(&a.0));
     for (_, root) in &workspaces {
         let status = command(root, &home, "index").output().unwrap();
-        assert!(
-            status.status.success(),
-            "{}",
-            String::from_utf8_lossy(&status.stderr)
-        );
+        crate::child::assert_cli_success(&status, "status");
     }
     let output = isolated_command(&home)
         .args(["gc", "--report"])
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "output");
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     let actual = report["derived"]
         .as_array()
@@ -2707,11 +2581,7 @@ def sink():
             .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
             .output()
             .unwrap();
-        assert!(
-            indexed.status.success(),
-            "{name}: {}",
-            String::from_utf8_lossy(&indexed.stderr)
-        );
+        crate::child::assert_cli_success(&indexed, format_args!("{name}"));
         let first: Value = serde_json::from_slice(&indexed.stdout).unwrap();
         let old_pin = first["publishedRevision"].clone();
         assert_eq!(first["status"]["revision"], old_pin, "{name}");
@@ -2839,7 +2709,7 @@ def sink():
                 .unwrap();
         assert_eq!(follower_status["revision"], post_start_pin, "{name}");
         let follower_symbols = command(&root, &home, "symbols").output().unwrap();
-        assert!(follower_symbols.status.success(), "{name}");
+        crate::child::assert_cli_success(&follower_symbols, format_args!("{name}"));
         let follower_symbols: Value = serde_json::from_slice(&follower_symbols.stdout).unwrap();
         let follower_symbols = &follower_symbols["data"];
         assert_eq!(follower_symbols["revision"], post_start_pin, "{name}");
@@ -2853,7 +2723,7 @@ def sink():
                 .arg(follower_seed)
                 .output()
                 .unwrap();
-            assert!(follower_query.status.success(), "{name}");
+            crate::child::assert_cli_success(&follower_query, format_args!("{name}"));
             let follower_query: Value = serde_json::from_slice(&follower_query.stdout).unwrap();
             assert_eq!(follower_query["data"]["revision"], post_start_pin, "{name}");
         }
@@ -3559,11 +3429,7 @@ fn virgin_cli_activation_contention_expires_before_enqueue_and_new_index_succeed
         .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
         .output()
         .unwrap();
-    assert!(
-        fresh.status.success(),
-        "{}",
-        String::from_utf8_lossy(&fresh.stderr)
-    );
+    crate::child::assert_cli_success(&fresh, "fresh");
     let result: Value = serde_json::from_slice(&fresh.stdout).unwrap();
     assert_eq!(result["publishedRevision"], result["status"]["revision"]);
     // Startup reconciliation publishes r1; the unchanged claimed request completes at it.
@@ -3664,11 +3530,7 @@ fn explicit_cli_unchanged_claim_acks_done_without_new_revision() {
     // Startup reconciliation publishes r1; each unchanged claim completes at it.
     for expected in [1_i64, 1] {
         let output = command(&root, &home, "index").output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "output");
         let db = rusqlite::Connection::open(real_index_db(&home)).unwrap();
         let actual: i64 = db
             .query_row("SELECT index_revision FROM index_metadata", [], |r| {
@@ -3720,11 +3582,7 @@ fn rules_check_path_filter_scopes_the_unassigned_list() {
     )
     .unwrap();
     let indexed = command(&root, &home, "index").output().unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let unassigned = |paths: &[&str]| -> Vec<String> {
         let mut check = isolated_command(&home);
         check
@@ -3734,11 +3592,7 @@ fn rules_check_path_filter_scopes_the_unassigned_list() {
             check.args(["--path", path]);
         }
         let output = check.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "output");
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["payload"]["unassignedFileCount"], 2, "{paths:?}");
         value["payload"]["unassigned"]
@@ -3791,11 +3645,7 @@ paths = ["src/low.rs"]
 "#;
     fs::write(root.join(".trellis/rules.toml"), config).unwrap();
     let indexed = command(&root, &home, "index").output().unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
     let basis = &indexed["publishedRevision"];
     let pin = format!(
@@ -3832,11 +3682,7 @@ paths = ["src/low.rs"]
         .args(["--pin", &pin, "--path", "src/low.rs", "--limit", "1"])
         .output()
         .unwrap();
-    assert!(
-        references.status.success(),
-        "{}",
-        String::from_utf8_lossy(&references.stderr)
-    );
+    crate::child::assert_cli_success(&references, "references");
     let references: Value = serde_json::from_slice(&references.stdout).unwrap();
     let references = &references["payload"];
     assert_eq!(references["indexGeneration"], basis["indexGeneration"]);
@@ -3881,11 +3727,7 @@ reason = "Reviewed upward adapter"
         .args(["--pin", &pin, "--path", "src/low.rs"])
         .output()
         .unwrap();
-    assert!(
-        excepted.status.success(),
-        "{}",
-        String::from_utf8_lossy(&excepted.stderr)
-    );
+    crate::child::assert_cli_success(&excepted, "excepted");
     let excepted: Value = serde_json::from_slice(&excepted.stdout).unwrap();
     let excepted = &excepted["payload"];
     assert_eq!(excepted["indexGeneration"], basis["indexGeneration"]);
@@ -3906,7 +3748,7 @@ reason = "Reviewed upward adapter"
         "current configuration is identified separately from the code pin"
     );
     let status = command(&root, &home, "status").output().unwrap();
-    assert!(status.status.success());
+    crate::child::assert_cli_success(&status, "status");
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(
         status["revision"], *basis,
@@ -3963,22 +3805,14 @@ require = [{ calls = "destination" }]
     )
     .unwrap();
     let indexed = command(&root, &home, "index").output().unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
     let checked = isolated_command(&home)
         .args(["rules", "check", "--format", "json", "--workspace"])
         .arg(&root)
         .output()
         .unwrap();
-    assert!(
-        checked.status.success(),
-        "unknown-only evaluation must succeed: {}",
-        String::from_utf8_lossy(&checked.stderr)
-    );
+    crate::child::assert_cli_success(&checked, "unknown-only evaluation must succeed");
     let checked: Value = serde_json::from_slice(&checked.stdout).unwrap();
     let payload = &checked["payload"];
     assert_eq!(
@@ -4031,11 +3865,7 @@ require = [{ calls = "source" }]
 "#;
     fs::write(root.join(".trellis/rules.toml"), config).unwrap();
     let indexed = command(&root, &home, "index").output().unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let checked = isolated_command(&home)
         .args(["rules", "check", "--format", "json", "--workspace"])
         .arg(&root)
@@ -4082,11 +3912,7 @@ async fn architecture_cli_waits_for_startup_reconciliation_after_typed_admission
     )
     .unwrap();
     let indexed = command(&root, &home, "index").output().unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
     let initial_identity = trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid"))
         .expect("initial fixture daemon identity");
@@ -4224,11 +4050,7 @@ fn file_metrics_selectors(root: &std::path::Path, home: &std::path::Path) -> Vec
         .arg("--json")
         .output()
         .unwrap();
-    assert!(
-        revision.status.success(),
-        "{}",
-        String::from_utf8_lossy(&revision.stderr)
-    );
+    crate::child::assert_cli_success(&revision, "revision");
     let revision: Value = serde_json::from_slice(&revision.stdout).unwrap();
     let payload = &revision["payload"];
     let file = &payload["files"][0];
@@ -4275,11 +4097,7 @@ async fn read_under_index_use_contention(
     fs::write(root.join("flow.js"), "function start() {}\n").unwrap();
     let daemon = FixtureDaemon::new(&home);
     let indexed = command(&root, &home, "index").output().unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
     let selectors = selectors(&root, &home);
     // A checkout's admitted writer holds the index-use lock shared, so

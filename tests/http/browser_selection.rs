@@ -286,11 +286,7 @@ async fn production_git_routes_read_cold_checkout_and_enrich_discovered_rows() {
         .arg(&discovered)
         .output()
         .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     drop(FixtureDaemon::new(&home));
     let cold = cold.canonicalize().unwrap();
     let cold_key = WorkspaceIdentity::discover(Some(&cold), &cold)
@@ -584,11 +580,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .arg(root)
             .output()
             .unwrap();
-        assert!(
-            result.status.success(),
-            "index: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        crate::child::assert_cli_success(&result, "index");
     }
     let a_key = WorkspaceIdentity::discover(Some(&a), &a).unwrap().root_key;
     let b_key = WorkspaceIdentity::discover(Some(&b), &b).unwrap().root_key;
@@ -602,7 +594,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
                 .arg(root)
                 .output()
                 .unwrap();
-            assert!(output.status.success());
+            crate::child::assert_cli_success(&output, "output");
             let symbols: Value = serde_json::from_slice(&output.stdout).unwrap();
             symbols["data"]["items"]
                 .as_array()

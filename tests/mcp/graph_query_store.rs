@@ -2034,21 +2034,16 @@ fn frozen_answer_prefixes_preserve_ancestor_closure_without_sql() {
 
 fn cli(home: &Path, args: &[&str]) -> serde_json::Value {
     let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
-    let output = cmd
-        .env("HOME", home)
-        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"))
-        .env_remove("XDG_CACHE_HOME")
-        .env_remove("XDG_DATA_HOME")
-        .stdin(std::process::Stdio::null())
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
+    crate::child::run_cli_json(
+        cmd.env("HOME", home)
+            .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"))
+            .env(crate::child::DAEMON_STDERR, home.join("daemon.stderr"))
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .stdin(std::process::Stdio::null())
+            .args(args),
+        format_args!("trellis {}", args.first().copied().unwrap_or_default()),
+    )
 }
 
 /// A real SCIP capture of `run() -> target()` at r1, imported as a batch against the live r1 native revision.

@@ -71,12 +71,11 @@ impl Fixture {
     /// launch carries the tripwire `PATH`, the stub registration and the test intervals.
     fn status(&self) -> Value {
         let output = self.run(&["producer", "status"]);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        serde_json::from_slice(&output.stdout).unwrap()
+        crate::child::cli_json_with(
+            &output,
+            "producer status",
+            Some(&self.checkout.daemon_stderr()),
+        )
     }
 
     /// The pid of the serving daemon.
@@ -351,11 +350,7 @@ fn no_trigger_starts_a_producer() {
         "--artifact",
         fx.artifact.to_str().unwrap(),
     ]);
-    assert!(
-        set.status.success(),
-        "{}",
-        String::from_utf8_lossy(&set.stderr)
-    );
+    crate::child::assert_cli_success(&set, "set");
     fx.assert_no_producer_started("pickup set");
 
     // A residue directory no request names, then a restart: the startup sweep removes it and

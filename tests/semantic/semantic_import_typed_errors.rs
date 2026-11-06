@@ -83,11 +83,7 @@ impl World {
             }
         };
         let output = world.index(env);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "fixture index");
         world
     }
 
@@ -278,7 +274,7 @@ fn typed_code_persists_after_restart() {
     let failed = world.last_row();
     world.stop_daemon();
     let restarted = world.index(&[]);
-    assert!(restarted.status.success());
+    crate::child::assert_cli_success(&restarted, "restarted");
     let rows = world.rows();
     let row = rows.iter().find(|row| row.0 == failed.0).unwrap();
     assert_eq!(row, &(failed.0.clone(), "failed".to_owned(), Some(code)));

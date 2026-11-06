@@ -121,6 +121,17 @@ impl Checkout {
     pub fn cli(&self) -> Command {
         cli(&self.home)
     }
+
+    /// Where a daemon this checkout's CLI starts writes its stderr, unless the test chose
+    /// another `TRELLIS_TEST_DAEMON_STDERR`.
+    pub fn daemon_stderr(&self) -> PathBuf {
+        daemon_stderr(&self.home)
+    }
+}
+
+/// The default daemon stderr file under `home`; CLI failure messages show its tail.
+pub fn daemon_stderr(home: &Path) -> PathBuf {
+    home.join("daemon.stderr")
 }
 
 pub fn cli(home: &Path) -> Command {
@@ -128,6 +139,7 @@ pub fn cli(home: &Path) -> Command {
     command
         .env("HOME", home)
         .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"))
+        .env(crate::child::DAEMON_STDERR, daemon_stderr(home))
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")
         .stdin(Stdio::null());
@@ -150,14 +162,9 @@ pub fn start_checkout(setup: impl FnOnce(&Path), daemon_env: &[(String, String)]
     for (key, value) in daemon_env {
         index.env(key, value);
     }
-    let output = index
-        .args(["index", "--workspace", root.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "index failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+    crate::child::run_cli(
+        index.args(["index", "--workspace", root.to_str().unwrap()]),
+        "fixture index",
     );
     Checkout { temp, home, root }
 }
@@ -263,18 +270,13 @@ pub fn request_rows(checkout: &Checkout) -> Vec<(String, String, Option<String>)
 
 /// `trellis producer status` of `checkout`, parsed.
 pub fn producer_status(checkout: &Checkout) -> Value {
-    let output = checkout
-        .cli()
-        .args(["producer", "status", "--workspace"])
-        .arg(&checkout.root)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
+    crate::child::run_cli_json(
+        checkout
+            .cli()
+            .args(["producer", "status", "--workspace"])
+            .arg(&checkout.root),
+        "producer status",
+    )
 }
 
 /// The `pickup` object of `producer` in the status reply (`null` when none is configured).

@@ -86,11 +86,7 @@ fn help_version_and_unstartable_daemon_never_open_standalone_store() {
     let marker = home.join("auto-daemon.pid");
     for flag in ["--help", "--version"] {
         let output = cli(&home).arg(flag).output().unwrap();
-        assert!(
-            output.status.success(),
-            "{flag}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, format_args!("{flag}"));
         assert!(!output.stdout.is_empty(), "{flag} printed no response");
         assert!(!paths.run.exists(), "{flag} started the daemon");
         assert!(!marker.exists(), "{flag} elected a daemon");
@@ -294,18 +290,7 @@ fn serve(home: &Path, root: &Path, bind: SocketAddr, token: &Path) -> Command {
     command
 }
 fn run(home: &Path, command: &str, root: &Path) -> Value {
-    let output = cli(home)
-        .arg(command)
-        .arg("--workspace")
-        .arg(root)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{command} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
+    crate::child::run_cli_json(cli(home).arg(command).arg("--workspace").arg(root), command)
 }
 const REVIEWED_MODEL_NAME: &str = "voyageai/voyage-4-nano";
 const REVIEWED_MODEL_REVISION: &str = "5fb34e870f49f19e79c94d5e118f5ee730133279";
@@ -360,11 +345,7 @@ fn model_list_reads_user_configuration_without_workspace_or_runtime_state() {
             .current_dir(&home)
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "model list failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "model list failed");
         let listing: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(listing["configuration"], expected);
         assert_eq!(listing["installed"], serde_json::json!([]));
@@ -384,11 +365,7 @@ fn daemon_stop_without_a_daemon_creates_no_runtime_state() {
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
     let output = cli(&home).args(["daemon", "stop"]).output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "output");
     let stopped: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stopped["stopped"], false);
     assert!(!fixture_roots(&home).data.exists());
@@ -431,11 +408,7 @@ fn daemon_stop_waits_past_the_cli_reply_bound_for_accepted_index() {
         .env("TRELLIS_TEST_DAEMON_INDEX_CLAIM_SOCKET", &claim_socket)
         .output()
         .unwrap();
-    assert!(
-        initial.status.success(),
-        "{}",
-        String::from_utf8_lossy(&initial.stderr)
-    );
+    crate::child::assert_cli_success(&initial, "initial");
     let original = trellis::testing::daemon_marker_identity(&home.join("auto-daemon.pid")).unwrap();
     let socket = fixture_socket_paths(&home).socket;
     let identity =
@@ -605,11 +578,7 @@ fn daemon_stop_closes_idle_mcp_and_recaptures_model_configuration() {
         "model_not_configured"
     );
     let output = cli(&home).args(["daemon", "stop"]).output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "output");
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["stopped"],
         true
@@ -1141,7 +1110,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         "socket-only startup provisioned a browser token"
     );
     let duplicate = cli(&home).arg("daemon").output().unwrap();
-    assert!(duplicate.status.success(), "second daemon election failed");
+    crate::child::assert_cli_success(&duplicate, "second daemon election failed");
     assert!(
         daemon.0.try_wait().unwrap().is_none(),
         "second daemon displaced socket owner"
@@ -1392,11 +1361,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         .arg(&first)
         .output()
         .unwrap();
-    assert!(
-        indexed.status.success(),
-        "socket index failed: {}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "socket index failed");
     assert!(
         run(&home, "status", &first)["revision"]["indexRevision"]
             .as_u64()
@@ -1411,11 +1376,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         .arg("firstSymbol")
         .output()
         .unwrap();
-    assert!(
-        symbols.status.success(),
-        "socket symbols failed: {}",
-        String::from_utf8_lossy(&symbols.stderr)
-    );
+    crate::child::assert_cli_success(&symbols, "socket symbols failed");
     assert!(
         !serde_json::from_slice::<Value>(&symbols.stdout).unwrap()["data"]["items"]
             .as_array()
@@ -1467,11 +1428,7 @@ fn cold_cli_commands_start_and_reuse_daemon() {
         .arg(&root)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "index daemon start failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "index daemon start failed");
     let status = run(&home, "status", &root);
     assert!(status["revision"]["indexRevision"].as_u64().unwrap() >= 1);
     // Daemon status carries the watcher-health witness (Decision 0009 §5),
@@ -1495,11 +1452,7 @@ fn cold_cli_commands_start_and_reuse_daemon() {
         .arg("fallbackSymbol")
         .output()
         .unwrap();
-    assert!(
-        symbols.status.success(),
-        "symbols daemon call failed: {}",
-        String::from_utf8_lossy(&symbols.stderr)
-    );
+    crate::child::assert_cli_success(&symbols, "symbols daemon call failed");
     let symbols: Value = serde_json::from_slice(&symbols.stdout).unwrap();
     assert!(!symbols["data"]["items"].as_array().unwrap().is_empty());
 }
@@ -1731,12 +1684,7 @@ fn concurrent_cold_cli_indexes_share_one_daemon_and_keep_fifo_results() {
     let second = start();
     for child in [first, second] {
         let output = child.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}\ndaemon diagnostics:\n{}",
-            String::from_utf8_lossy(&output.stderr),
-            fs::read_to_string(&daemon_log).unwrap_or_default()
-        );
+        crate::child::assert_cli_success_with(&output, "cold index", Some(&daemon_log));
         let response: Value = serde_json::from_slice(&output.stdout).unwrap();
         // status is the checkout's current head, sampled after this request
         // published. The other concurrent request (FIFO-after) may already
@@ -2240,20 +2188,12 @@ fn cold_cli_reads_start_daemon_and_keep_data_envelopes() {
         .arg(seed)
         .output()
         .unwrap();
-    assert!(
-        query.status.success(),
-        "{}",
-        String::from_utf8_lossy(&query.stderr)
-    );
+    crate::child::assert_cli_success(&query, "query");
     let query: Value = serde_json::from_slice(&query.stdout).unwrap();
     assert!(query["catchingUp"].is_boolean());
     assert!(query["data"]["nodes"].is_array());
     let gc = cli(&home).arg("gc").arg("--report").output().unwrap();
-    assert!(
-        gc.status.success(),
-        "{}",
-        String::from_utf8_lossy(&gc.stderr)
-    );
+    crate::child::assert_cli_success(&gc, "gc");
     assert!(serde_json::from_slice::<Value>(&gc.stdout).is_ok());
 }
 
@@ -2276,11 +2216,7 @@ fn elected_daemon_exits_after_its_test_owner_process_ends() {
         .arg(&root)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "output");
     let daemon: i32 = fs::read_to_string(home.join("auto-daemon.pid"))
         .unwrap()
         .parse()
@@ -2317,11 +2253,7 @@ fn metrics_cli_scores_callables_inside_measured_macros() {
         .arg(&root)
         .output()
         .unwrap();
-    assert!(
-        response.status.success(),
-        "{}",
-        String::from_utf8_lossy(&response.stderr)
-    );
+    crate::child::assert_cli_success(&response, "response");
     let envelope: Value = serde_json::from_slice(&response.stdout).unwrap();
     let files = envelope["payload"]["files"].as_array().unwrap();
     assert!(files.iter().any(|file| file["path"] == "macros.rs"));
@@ -2340,11 +2272,7 @@ fn metrics_cli_reports_pinned_envelope_and_typed_selectors() {
         .arg(&root)
         .output()
         .unwrap();
-    assert!(
-        response.status.success(),
-        "{}",
-        String::from_utf8_lossy(&response.stderr)
-    );
+    crate::child::assert_cli_success(&response, "response");
     let envelope: Value = serde_json::from_slice(&response.stdout).unwrap();
     assert!(envelope["catchingUp"].is_boolean());
     assert_eq!(envelope["payload"]["metricsVersion"], "metrics:v1");
@@ -2377,11 +2305,7 @@ fn metrics_cli_reports_pinned_envelope_and_typed_selectors() {
         ])
         .output()
         .unwrap();
-    assert!(
-        selected.status.success(),
-        "{}",
-        String::from_utf8_lossy(&selected.stderr)
-    );
+    crate::child::assert_cli_success(&selected, "selected");
     let selected: Value = serde_json::from_slice(&selected.stdout).unwrap();
     assert_eq!(
         selected["payload"]["selectedMetrics"],
@@ -2394,7 +2318,7 @@ fn metrics_cli_reports_pinned_envelope_and_typed_selectors() {
         .arg(&root)
         .output()
         .unwrap();
-    assert!(text.status.success());
+    crate::child::assert_cli_success(&text, "text");
     assert!(String::from_utf8_lossy(&text.stdout).contains("catchingUp="));
     let bad = cli(&home)
         .args(["metrics", "--workspace"])
@@ -2609,11 +2533,7 @@ fn metrics_cli_work_timeout_is_typed_and_does_not_poison_daemon() {
         .env("TRELLIS_TEST_METRICS_WORK_DELAY_MS", "40")
         .output()
         .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let timed_out = cli(&home)
         .arg("metrics")
         .arg("--json")
@@ -2749,11 +2669,7 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
         .args(["--pin", &pin])
         .output()
         .unwrap();
-    assert!(
-        initial.status.success(),
-        "{}",
-        String::from_utf8_lossy(&initial.stderr)
-    );
+    crate::child::assert_cli_success(&initial, "initial");
     let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
     assert_eq!(initial["payload"], http["payload"]);
     assert_eq!(initial["payload"]["role"], "all");
@@ -2769,11 +2685,7 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
             .args(["--pin", &pin, "--role", role, "--aggregate", "sum"])
             .output()
             .unwrap();
-        assert!(
-            cli_selected.status.success(),
-            "{}",
-            String::from_utf8_lossy(&cli_selected.stderr)
-        );
+        crate::child::assert_cli_success(&cli_selected, "cli_selected");
         let cli_selected: Value = serde_json::from_slice(&cli_selected.stdout).unwrap();
         assert_eq!(cli_selected["payload"], http_selected["payload"]);
         assert_eq!(cli_selected["payload"]["role"], role);
@@ -2834,11 +2746,7 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
         ])
         .output()
         .unwrap();
-    assert!(
-        selected.status.success(),
-        "{}",
-        String::from_utf8_lossy(&selected.stderr)
-    );
+    crate::child::assert_cli_success(&selected, "selected");
     let selected: Value = serde_json::from_slice(&selected.stdout).unwrap();
     assert_eq!(selected["payload"], pinned_file["payload"]);
     assert_eq!(selected["payload"]["indexGeneration"], generation);
@@ -2903,11 +2811,7 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
         ])
         .output()
         .unwrap();
-    assert!(
-        directory.status.success(),
-        "{}",
-        String::from_utf8_lossy(&directory.stderr)
-    );
+    crate::child::assert_cli_success(&directory, "directory");
     let directory: Value = serde_json::from_slice(&directory.stdout).unwrap();
     assert_eq!(directory["payload"], http_directory["payload"]);
     assert_eq!(directory["payload"]["files"].as_array().unwrap().len(), 1);
@@ -2950,11 +2854,7 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
         ])
         .output()
         .unwrap();
-    assert!(
-        declaration.status.success(),
-        "{}",
-        String::from_utf8_lossy(&declaration.stderr)
-    );
+    crate::child::assert_cli_success(&declaration, "declaration");
     let declaration: Value = serde_json::from_slice(&declaration.stdout).unwrap();
     assert_eq!(declaration["payload"], http_declaration["payload"]);
     assert_eq!(
@@ -2991,11 +2891,7 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
         ])
         .output()
         .unwrap();
-    assert!(
-        text.status.success(),
-        "{}",
-        String::from_utf8_lossy(&text.stderr)
-    );
+    crate::child::assert_cli_success(&text, "text");
     let text = String::from_utf8(text.stdout).unwrap();
     assert!(text.contains(&pin));
     assert!(text.contains("catchingUp="));
@@ -3312,11 +3208,7 @@ fn metrics_held_daemon_work_returns_complete_multiframe_revision() {
         .env("TRELLIS_TEST_METRICS_WORK_GATE", &gate)
         .output()
         .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let release = ReleaseGate(gate.join("release"));
     let start = Instant::now();
     let mut process = cli(&home)
@@ -3345,11 +3237,7 @@ fn metrics_held_daemon_work_returns_complete_multiframe_revision() {
     std::thread::sleep(held);
     fs::write(&release.0, b"release").unwrap();
     let result = process.wait_with_output().unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
+    crate::child::assert_cli_success(&result, "result");
     assert!(start.elapsed() > held);
     let envelope: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(
@@ -3406,11 +3294,7 @@ fn metrics_cli_parser_and_serialization_timeouts_are_atomic() {
             .env("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES", "0")
             .output()
             .unwrap();
-        assert!(
-            indexed.status.success(),
-            "{stage}: {}",
-            String::from_utf8_lossy(&indexed.stderr)
-        );
+        crate::child::assert_cli_success(&indexed, format_args!("{stage}"));
         let output = cli(&home)
             .arg("metrics")
             .arg("--json")
@@ -3453,11 +3337,7 @@ fn metrics_prefaced_trickle_expires_whole_daemon_ingress_without_ack() {
         .env("TRELLIS_TEST_METRICS_WORK_GATE", &gate)
         .output()
         .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let mut stream = UnixStream::connect(fixture_socket_paths(&home).socket).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(1)))
@@ -3507,11 +3387,7 @@ fn metrics_peer_closes_at_parser_hook_without_poisoning_daemon() {
         .env("TRELLIS_TEST_METRICS_PARSE_HIT_FILE", &hit)
         .output()
         .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let mut stream = UnixStream::connect(fixture_socket_paths(&home).socket).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     protocol::write_preface_until(&mut stream, deadline).unwrap();
@@ -3535,11 +3411,7 @@ fn metrics_peer_closes_at_parser_hook_without_poisoning_daemon() {
         .arg(&root)
         .output()
         .unwrap();
-    assert!(
-        later.status.success(),
-        "{}",
-        String::from_utf8_lossy(&later.stderr)
-    );
+    crate::child::assert_cli_success(&later, "later");
     let envelope: Value = serde_json::from_slice(&later.stdout).unwrap();
     assert_eq!(envelope["payload"]["files"].as_array().unwrap().len(), 1);
 }
@@ -3568,11 +3440,7 @@ fn metrics_cli_low_cap_and_last_row_timeout_never_emit_partial_success() {
         .env("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS", "500")
         .output()
         .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let metrics = || {
         cli(&home)
             .args(["metrics", "--json", "--workspace"])
@@ -3581,11 +3449,7 @@ fn metrics_cli_low_cap_and_last_row_timeout_never_emit_partial_success() {
             .unwrap()
     };
     let baseline = metrics();
-    assert!(
-        baseline.status.success(),
-        "{}",
-        String::from_utf8_lossy(&baseline.stderr)
-    );
+    crate::child::assert_cli_success(&baseline, "baseline");
     let envelope: Value = serde_json::from_slice(&baseline.stdout).unwrap();
     let bytes = serde_json::to_vec(&envelope).unwrap();
     assert!(bytes.len() > 80);
@@ -3741,11 +3605,7 @@ fn metrics_file_and_declaration_work_deadlines_are_typed() {
         .env("TRELLIS_TEST_METRICS_WORK_DELAY_MS", "800")
         .output()
         .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let file = cli(&home)
         .args(["metrics", "--json", "--workspace"])
         .arg(&root)
@@ -3761,11 +3621,7 @@ fn metrics_file_and_declaration_work_deadlines_are_typed() {
         ])
         .output()
         .unwrap();
-    assert!(
-        file.status.success(),
-        "{}",
-        String::from_utf8_lossy(&file.stderr)
-    );
+    crate::child::assert_cli_success(&file, "file");
     let file: Value = serde_json::from_slice(&file.stdout).unwrap();
     let sid = file["payload"]["declarations"][0]["sid"].as_str().unwrap();
     assert!(sid.starts_with("sid:v1:"));
@@ -3777,11 +3633,7 @@ fn metrics_file_and_declaration_work_deadlines_are_typed() {
         .arg(&root)
         .output()
         .unwrap();
-    assert!(
-        revision.status.success(),
-        "{}",
-        String::from_utf8_lossy(&revision.stderr)
-    );
+    crate::child::assert_cli_success(&revision, "revision");
     for scope in ["file", "declaration"] {
         let mut command = cli(&home);
         command
@@ -3892,11 +3744,7 @@ fn metrics_real_near_ingress_ack_and_late_multiframe_preserve_original_end() {
         .env("TRELLIS_TEST_METRICS_CHUNK_COUNT_FILE", &chunks)
         .output()
         .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let metrics = || {
         cli(&home)
             .args(["metrics", "--json", "--workspace"])
@@ -3911,11 +3759,7 @@ fn metrics_real_near_ingress_ack_and_late_multiframe_preserve_original_end() {
     let began = Instant::now();
     let complete = metrics();
     let received = began.elapsed();
-    assert!(
-        complete.status.success(),
-        "{}",
-        String::from_utf8_lossy(&complete.stderr)
-    );
+    crate::child::assert_cli_success(&complete, "complete");
     assert!(
         received > Duration::from_millis(7_500),
         "final frame arrived before the no-ingress end budget: {received:?}"
@@ -3992,11 +3836,7 @@ fn gc_report_counts_vectors_without_checkout_state_or_cache_mutation() {
         .current_dir(&home)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "output");
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(report["derived"].as_array().unwrap().is_empty());
     assert_eq!(report["vectors"]["entries"], 2);

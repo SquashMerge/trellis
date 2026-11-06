@@ -57,7 +57,8 @@ fn import_args<'a>(root: &'a str, descriptor: &'a str, sha: &'a str) -> [&'a str
 fn cli(home: &Path) -> Command {
     let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     cmd.env("HOME", home)
-        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"));
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"))
+        .env(crate::child::DAEMON_STDERR, home.join("daemon.stderr"));
     if home.join("full-oracle").exists() {
         cmd.env("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
         cmd.env(
@@ -91,14 +92,20 @@ fn run(home: &Path, args: &[&str]) -> Value {
         .unwrap();
     trellis::testing::wait_until("CLI completion", || child.try_wait().unwrap().is_some());
     let status = child.wait().unwrap();
-    let mut diagnostics = String::new();
+    let mut output = std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
     stderr.rewind().unwrap();
-    stderr.read_to_string(&mut diagnostics).unwrap();
-    assert!(status.success(), "command failed: {diagnostics}");
-    let mut bytes = Vec::new();
+    stderr.read_to_end(&mut output.stderr).unwrap();
     stdout.rewind().unwrap();
-    stdout.read_to_end(&mut bytes).unwrap();
-    serde_json::from_slice(&bytes).unwrap()
+    stdout.read_to_end(&mut output.stdout).unwrap();
+    crate::child::cli_json_with(
+        &output,
+        format_args!("trellis {}", args.first().copied().unwrap_or_default()),
+        Some(&home.join("daemon.stderr")),
+    )
 }
 /// Native N completes the CLI index request; wait for the daemon's bounded semantic S.
 fn caught_up(store: &trellis::store::Store, reply: &Value) -> trellis::model::IndexPin {
