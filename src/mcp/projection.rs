@@ -2443,20 +2443,7 @@ pub fn incoming(
             boundary |= bound.is_none_or(|bound| {
                 bound.boundary_reason != crate::graph_query::BoundaryReason::None
             });
-            let mut evidence = call_evidence(bound, call_projection(semantic, &call.document))?;
-            // #724: a fresh, direct binding to another declaration is not a resolved call
-            // of the selected one. The name-matched caller stays listed with its binding
-            // and target; only its disposition says where the binding points.
-            if bound.is_some_and(|bound| {
-                bound.boundary_reason == crate::graph_query::BoundaryReason::None
-                    && bound.effective_freshness == crate::semantic_evidence::Freshness::Fresh
-                    && bound
-                        .target_id
-                        .as_ref()
-                        .is_some_and(|target| *target != owner.declaration.syntax_id)
-            }) {
-                evidence.disposition = "boundElsewhere";
-            }
+            let evidence = call_evidence(bound, call_projection(semantic, &call.document))?;
             callers.push(
                 json!({"callId":call.id,"ownerSyntaxId":call.owner_syntax_id,
                 "callerDisplayKey":display_key(&item.caller),"callerRole":item.caller.role,
@@ -2524,6 +2511,11 @@ pub fn incoming(
             "callers":callers,"documents":documents,"semanticBases":bases,"coverage":coverage,
             "scopeCoverage":language_status(&result.scope, tiers),
             "provenance":provenance,"semanticDocuments":semantic.documents});
+        // #724: callers excluded because their fresh, direct binding targets another
+        // declaration. Present only when some were excluded.
+        if result.bound_elsewhere_omitted > 0 {
+            data["boundElsewhereOmitted"] = json!(result.bound_elsewhere_omitted);
+        }
         if compact {
             compact_data(&mut data, "callers");
         }
@@ -3077,6 +3069,7 @@ mod incoming_tests {
             same_name_declarations: 3,
             scope: [[0; 5], [0; 5], [0; 5], [2, 2, 0, 0, 4]],
             has_more,
+            bound_elsewhere_omitted: 0,
         }
     }
     fn project(result: McpIncomingWithLines, modern: bool) -> Option<Value> {
@@ -3720,6 +3713,7 @@ mod size_tests {
                 same_name_declarations: 1,
                 scope: [[0; 5], [355, 22, 333, 0, 0], [0; 5], [0; 5]],
                 has_more: true,
+                bound_elsewhere_omitted: 0,
             },
             crate::store::McpSemantic {
                 documents: vec![],
@@ -4584,19 +4578,60 @@ for (const output of outputs) {
         );
     }
 
-    /// #724: a caller whose fresh, direct binding resolves to a different same-name
-    /// declaration is `boundElsewhere`, not a `resolved` caller of the selected symbol. It
-    /// stays listed with its binding and target. A binding to the selected symbol, a
-    /// dispatch boundary and a non-fresh binding keep their resolution, and every other
-    /// field is unchanged.
+    /// #724: only a fresh, direct binding to another located declaration excludes a caller.
+    /// A binding to the selected symbol, a dispatch boundary, a possibly stale or stale
+    /// binding and a binding without a located target keep the caller listed.
     #[test]
-    fn incoming_caller_bound_to_another_same_name_declaration_is_bound_elsewhere() {
+    fn only_a_fresh_direct_binding_elsewhere_excludes_a_caller() {
         use crate::graph_query::BoundaryReason;
         use crate::semantic_evidence::Freshness;
-        let elsewhere = "sid:v1:2301cdb0e7c351db88fecd8aa523edc9".to_owned();
-        let run = |mutate: &dyn Fn(&mut crate::store::McpSemantic), compact: bool| {
-            let (result, mut semantic) = incoming(4);
-            mutate(&mut semantic);
+        let (result, semantic) = incoming(1);
+        let selected = result.selected.selected.declaration.syntax_id.clone();
+        let elsewhere = Some("sid:v1:2301cdb0e7c351db88fecd8aa523edc9".to_owned());
+        let base = semantic.calls[0].clone().unwrap();
+        let case = |target: Option<String>, boundary, freshness| {
+            let mut bound = base.clone();
+            bound.target_id = target;
+            bound.boundary_reason = boundary;
+            bound.effective_freshness = freshness;
+            bound.bound_elsewhere(&selected)
+        };
+        assert!(case(
+            elsewhere.clone(),
+            BoundaryReason::None,
+            Freshness::Fresh
+        ));
+        assert!(!case(
+            Some(selected.clone()),
+            BoundaryReason::None,
+            Freshness::Fresh
+        ));
+        assert!(!case(
+            elsewhere.clone(),
+            BoundaryReason::Dispatch,
+            Freshness::Fresh
+        ));
+        assert!(!case(
+            elsewhere.clone(),
+            BoundaryReason::None,
+            Freshness::PossiblyStale
+        ));
+        assert!(!case(
+            elsewhere.clone(),
+            BoundaryReason::Stale,
+            Freshness::Stale
+        ));
+        assert!(!case(None, BoundaryReason::None, Freshness::Fresh));
+    }
+
+    /// #724: the store's count of callers excluded as bound elsewhere is emitted as
+    /// `data.boundElsewhereOmitted`, in full and compact form, and validates against the
+    /// closed schema. Without exclusions the field is absent and the page is unchanged.
+    #[test]
+    fn incoming_reports_callers_omitted_as_bound_elsewhere() {
+        let run = |omitted: u64, compact: bool| {
+            let (mut result, semantic) = incoming(4);
+            result.bound_elsewhere_omitted = omitted;
             super::incoming(
                 &json!(1),
                 result,
@@ -4610,79 +4645,15 @@ for (const output of outputs) {
             .unwrap()
             .unwrap()
         };
-        let bind = |semantic: &mut crate::store::McpSemantic| {
-            let owner = semantic.calls[0].as_ref().unwrap().target_id.clone();
-            // 0: direct to the selected symbol; 1: direct elsewhere (the defect);
-            // 2: dispatch elsewhere; 3: direct elsewhere but possibly stale.
-            for (index, (target, boundary, freshness)) in [
-                (owner.clone(), BoundaryReason::None, Freshness::Fresh),
-                (
-                    Some(elsewhere.clone()),
-                    BoundaryReason::None,
-                    Freshness::Fresh,
-                ),
-                (
-                    Some(elsewhere.clone()),
-                    BoundaryReason::Dispatch,
-                    Freshness::Fresh,
-                ),
-                (
-                    Some(elsewhere.clone()),
-                    BoundaryReason::None,
-                    Freshness::PossiblyStale,
-                ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let call = semantic.calls[index].as_mut().unwrap();
-                call.target_id = target;
-                call.boundary_reason = boundary;
-                call.effective_freshness = freshness;
-            }
-        };
-        let unchanged = |semantic: &mut crate::store::McpSemantic| {
-            bind(semantic);
-            semantic.calls[1].as_mut().unwrap().target_id =
-                semantic.calls[0].as_ref().unwrap().target_id.clone();
-        };
         for compact in [false, true] {
-            let page = run(&bind, compact);
-            let callers = page["data"]["callers"].as_array().unwrap();
-            assert_eq!(callers.len(), 4, "a bound-elsewhere caller stays listed");
-            let dispositions: Vec<_> = callers.iter().map(|c| c["disposition"].clone()).collect();
-            assert_eq!(
-                dispositions,
-                [
-                    json!("resolved"),
-                    json!("boundElsewhere"),
-                    json!("resolved"),
-                    json!("resolved")
-                ]
-            );
-            assert_eq!(callers[1]["targetId"], json!(elsewhere));
-            assert_eq!(callers[1]["boundaryReason"], "none");
-            assert_eq!(callers[1]["matchedBy"], "name");
-            // Only the disposition and target differ from a caller bound to the selected
-            // symbol.
-            let mut expected = run(&unchanged, compact);
-            let caller = &mut expected["data"]["callers"][1];
-            caller["disposition"] = json!("boundElsewhere");
-            caller["targetId"] = json!(elsewhere);
-            assert_eq!(page, expected);
-            assert_catalog_valid("trellis_incoming_calls", &[&page]);
-            // Before #724 the same caller said `resolved`.
-            let mut before = page.clone();
-            before["data"]["callers"][1]["disposition"] = json!("resolved");
-            let (before, after) = (frame_bytes(&before), frame_bytes(&page));
-            eprintln!("#724 incoming compact={compact}: before {before} B, after {after} B");
-            assert_eq!(after, before + "boundElsewhere".len() - "resolved".len());
-            let summary = crate::mcp::tools::result("trellis_incoming_calls", page, true);
-            assert_eq!(
-                summary["content"][0]["text"],
-                "trellis_incoming_calls: 4 calls, truncated: limit; full result in \
-                 structuredContent."
-            );
+            let none = run(0, compact);
+            assert!(none["data"].get("boundElsewhereOmitted").is_none());
+            let page = run(2, compact);
+            assert_eq!(page["data"]["boundElsewhereOmitted"], 2);
+            let mut expected = none.clone();
+            expected["data"]["boundElsewhereOmitted"] = json!(2);
+            assert_eq!(page, expected, "only the count is added");
+            assert_catalog_valid("trellis_incoming_calls", &[&none, &page]);
         }
     }
 

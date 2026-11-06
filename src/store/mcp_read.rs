@@ -1843,14 +1843,48 @@ pub struct McpIncomingWithLines {
     /// partial, failed, unselected. Includes zero-hit scope documents.
     pub scope: [[u64; 5]; 4],
     pub has_more: bool,
+    /// #724: name-matched callers left out because their fresh, direct binding targets
+    /// another declaration, counted over the ranked callers scanned: those before the first
+    /// kept caller beyond `limit`, or all of them when `has_more` is false.
+    pub bound_elsewhere_omitted: u64,
 }
 
 impl EvidenceResponse {
+    /// Name-matched incoming calls, every caller kept (no semantic exclusion).
     pub fn mcp_incoming_with_lines(
         &self,
         symbol_id: &str,
         limit: usize,
         expected: Option<IndexPin>,
+    ) -> Result<Option<McpIncomingWithLines>> {
+        self.mcp_incoming_scan(symbol_id, limit, expected, None, &mut || Ok(()))
+    }
+
+    /// #724 (owner ruling 2026-11-06): name-matched incoming calls without the callers
+    /// whose fresh, direct binding under `producer`'s selection targets another declaration.
+    /// The exclusion runs while the ranked callers are scanned, before `limit` and
+    /// `has_more` are decided, so a page is full whenever enough callers remain. `check`
+    /// runs once per scanned caller and bounds the scan by the call's deadline.
+    pub fn mcp_incoming_excluding_bound_elsewhere(
+        &self,
+        symbol_id: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+        producer: Option<&str>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<McpIncomingWithLines>> {
+        self.mcp_incoming_scan(symbol_id, limit, expected, Some(producer), check)
+    }
+
+    /// `exclude` is `None` to keep every caller, or the explicit producer (itself optional)
+    /// whose selected bindings decide exclusion.
+    fn mcp_incoming_scan(
+        &self,
+        symbol_id: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+        exclude: Option<Option<&str>>,
+        check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<McpIncomingWithLines>> {
         use crate::native_evidence::{DeclarationRole, DocumentKey, Provenance};
         let selected = self.selected(None)?;
@@ -1954,6 +1988,14 @@ impl EvidenceResponse {
         let mut calls = Vec::new();
         let mut same_name_declarations = 0;
         let mut has_more = false;
+        let mut bound_elsewhere_omitted = 0_u64;
+        // The same binding reader the emitted callers' annotations use (#466), built only
+        // after the selected declaration is found, so `not_found` keeps its precedence.
+        let mut bindings = exclude
+            .map(|producer| {
+                super::semantic_display::SemanticCalls::new(&self.db, &selected, producer)
+            })
+            .transpose()?;
         if let Some(lookup) = owner.declaration.lookup_key.as_deref() {
             // Count declarations across every eligible selected version, not calls
             // or only the limited response prefix.
@@ -2029,7 +2071,13 @@ impl EvidenceResponse {
                         lookup,
                         selected_key.path,
                         directory,
-                        i64::try_from(limit + 1)?
+                        // Excluded callers do not fill the page, so an excluding scan
+                        // reads the ranked list until it has `limit + 1` kept callers.
+                        if bindings.is_some() {
+                            -1
+                        } else {
+                            i64::try_from(limit + 1)?
+                        }
                     ],
                     |r| {
                         Ok((
@@ -2042,9 +2090,9 @@ impl EvidenceResponse {
                     },
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            has_more = ranked.len() > limit;
             let mut loaded = BTreeMap::new();
             for (version, id_blob, caller_blob, path, stored_role) in ranked {
+                check()?;
                 let id = id_codec::decode_occ(&id_blob)?;
                 let caller_id = id_codec::decode_sid(&caller_blob)?;
                 let scope = scopes.get(&version).ok_or_else(|| {
@@ -2094,6 +2142,14 @@ impl EvidenceResponse {
                         "store_unavailable: incoming call or caller proof mismatch",
                     ));
                 }
+                if let Some(bindings) = bindings.as_mut()
+                    && bindings
+                        .call(call)?
+                        .is_some_and(|bound| bound.bound_elsewhere(&owner.declaration.syntax_id))
+                {
+                    bound_elsewhere_omitted += 1;
+                    continue;
+                }
                 let provenance = Provenance {
                     id: scope.proof_id(),
                     producer_id: scope.producer_id.clone(),
@@ -2134,6 +2190,10 @@ impl EvidenceResponse {
                         coverage: coverages[&version].clone(),
                         provenance,
                     });
+                } else {
+                    // The first kept caller beyond `limit`: there are more callers.
+                    has_more = true;
+                    break;
                 }
             }
         }
@@ -2146,6 +2206,7 @@ impl EvidenceResponse {
             same_name_declarations,
             scope: scope_counts,
             has_more,
+            bound_elsewhere_omitted,
         }))
     }
 }

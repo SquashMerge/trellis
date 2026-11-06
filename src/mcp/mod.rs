@@ -1514,7 +1514,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let compact = args.get("compact").and_then(|v| v.as_bool()) == Some(true);
                     let expected = validated_expected_basis(args);
                     let producer = args.get("semanticProducerId").and_then(|v| v.as_str());
-                    Some(Box::new(move |_, response, sampled, _query| {
+                    Some(Box::new(move |runtime, response, sampled, _query| {
                         let resolved;
                         let symbol_id = if let Some(key) = lookup_key {
                             resolved = match lookup_root(
@@ -1534,9 +1534,25 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         } else {
                             symbol_id.expect("validated symbol ID")
                         };
-                        let Some(found) =
-                            response.mcp_incoming_with_lines(symbol_id, limit, expected)?
-                        else {
+                        // #724: callers proven bound elsewhere are left out while the
+                        // ranked callers are scanned; the deadline bounds that scan.
+                        let mut check = || {
+                            if cancel.load(std::sync::atomic::Ordering::Acquire)
+                                || runtime.mcp_clock_now() >= deadline
+                            {
+                                anyhow::bail!("deadline_exceeded: MCP incoming calls deadline");
+                            }
+                            Ok(())
+                        };
+                        let found = match response.mcp_incoming_excluding_bound_elsewhere(
+                            symbol_id, limit, expected, producer, &mut check,
+                        ) {
+                            Err(error) if error.is::<crate::store::ProducerNotPublished>() => {
+                                return Ok(producer_failure(id));
+                            }
+                            found => found?,
+                        };
+                        let Some(found) = found else {
                             return Ok(tools::failure(id, "not_found"));
                         };
                         let semantic = match response.mcp_call_semantics(

@@ -10369,6 +10369,138 @@ fn real_rust_analyzer_keys_repeated_across_cargo_targets_import_per_target() {
     );
 }
 
+/// The multi-target fixture as an MCP-servable world.
+fn rust_targets_mcp_world() -> World {
+    world_with(
+        |root| {
+            fs::create_dir_all(root.join(".git")).unwrap();
+            WorkspaceIdentity::discover(Some(root), root)
+                .unwrap()
+                .attach_marker()
+                .unwrap();
+            copy_tree(&Path::new(RUST_ANALYZER_TARGETS).join("workspace"), root);
+        },
+        true,
+    )
+}
+
+/// The caller declaration (`ownerSyntaxId`) of each emitted incoming caller, in order.
+fn incoming_owners(envelope: &Value) -> Vec<String> {
+    envelope["data"]["callers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{envelope}"))
+        .iter()
+        .map(|caller| caller["ownerSyntaxId"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// #724 (owner ruling 2026-11-06), real rust-analyzer bindings: `run` is declared in the
+/// library and in `tests/other.rs`. `fixture::run()` in `src/main.rs` and `tests/it.rs` binds
+/// to the library's, `run()` in `tests/other.rs` to its own. Incoming calls for one `run`
+/// leave out the callers proven bound to the other and count them in
+/// `boundElsewhereOmitted`, before `limit` and `has_more` are decided.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_calls_exclude_and_count_callers_bound_to_another_same_name_declaration() {
+    let world = rust_targets_mcp_world();
+    drop(world.publish(&rust_targets_batch(&world, None)).unwrap());
+    let library = declaration_in(&world, "run", "src/lib.rs");
+    let other = declaration_in(&world, "run", "tests/other.rs");
+    let main = declaration_in(&world, "main", "src/main.rs");
+    let library_runs = declaration_in(&world, "library_runs", "tests/it.rs");
+    let local_run = declaration_in(&world, "local_run", "tests/other.rs");
+    let mut mcp = McpSession::start(&world, 724);
+    let mut incoming = |symbol: &str, limit: u64, compact: bool| {
+        mcp.call(
+            "trellis_incoming_calls",
+            json!({"schemaVersion":1,"symbolId":symbol,"limit":limit,"compact":compact}),
+        )
+    };
+    for compact in [false, true] {
+        // Exclusion and count: of three name matches, only `local_run` calls this `run`.
+        let page = incoming(&other, 6, compact);
+        assert_eq!(
+            incoming_owners(&page),
+            std::slice::from_ref(&local_run),
+            "{page}"
+        );
+        assert_eq!(page["data"]["boundElsewhereOmitted"], 2, "{page}");
+        assert_eq!(page["data"]["match"]["sameNameDeclarations"], 2, "{page}");
+        assert_eq!(page["truncated"], false, "{page}");
+        let caller = &page["data"]["callers"][0];
+        assert_eq!(caller["disposition"], "resolved");
+        assert_eq!(caller["targetId"], json!(other));
+        // Paging: the production `main` caller ranks first but is excluded, so a one-caller
+        // page still holds `local_run`, and the excluded `tests/it.rs` caller after it
+        // leaves nothing more: no `limit` truncation.
+        let page = incoming(&other, 1, compact);
+        assert_eq!(
+            incoming_owners(&page),
+            std::slice::from_ref(&local_run),
+            "{page}"
+        );
+        assert_eq!(page["truncated"], false, "{page}");
+        assert_eq!(page["truncationReason"], Value::Null, "{page}");
+        assert_eq!(page["data"]["boundElsewhereOmitted"], 2, "{page}");
+        // The library's `run`: a full page with a kept caller beyond it has more; the
+        // excluded `tests/other.rs` caller ranks last, so it is not scanned yet.
+        let page = incoming(&library, 1, compact);
+        assert_eq!(
+            incoming_owners(&page),
+            std::slice::from_ref(&main),
+            "{page}"
+        );
+        assert_eq!(page["truncationReason"], "limit", "{page}");
+        assert!(
+            page["data"].get("boundElsewhereOmitted").is_none(),
+            "{page}"
+        );
+        // Two kept callers fill the page; the trailing excluded one is counted and does
+        // not make the page look truncated.
+        let page = incoming(&library, 2, compact);
+        assert_eq!(
+            incoming_owners(&page),
+            [main.clone(), library_runs.clone()],
+            "{page}"
+        );
+        assert_eq!(page["truncationReason"], Value::Null, "{page}");
+        assert_eq!(page["data"]["boundElsewhereOmitted"], 1, "{page}");
+        for caller in page["data"]["callers"].as_array().unwrap() {
+            assert_eq!(caller["targetId"], json!(library), "{page}");
+        }
+    }
+    mcp.finish();
+}
+
+/// #724: with no semantic binding, every name match stays a caller and nothing is counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_calls_keep_unbound_name_matches() {
+    let world = rust_targets_mcp_world();
+    let library = declaration_in(&world, "run", "src/lib.rs");
+    let mut mcp = McpSession::start(&world, 725);
+    let page = mcp.call(
+        "trellis_incoming_calls",
+        json!({"schemaVersion":1,"symbolId":library}),
+    );
+    assert_eq!(
+        incoming_owners(&page),
+        [
+            declaration_in(&world, "main", "src/main.rs"),
+            declaration_in(&world, "library_runs", "tests/it.rs"),
+            declaration_in(&world, "local_run", "tests/other.rs"),
+        ],
+        "{page}"
+    );
+    assert!(
+        page["data"].get("boundElsewhereOmitted").is_none(),
+        "{page}"
+    );
+    for caller in page["data"]["callers"].as_array().unwrap() {
+        assert_eq!(caller["binding"], Value::Null, "{page}");
+        assert_eq!(caller["evidenceTier"], "syntax", "{page}");
+    }
+    mcp.finish();
+}
+
 /// Asserts the batch join rejects `descriptor` as a duplicate key, typed, that contract
 /// validation rejects the in-memory oracle's rows alike, and that nothing is published.
 fn assert_duplicate_key_rejected(world: &World, descriptor: &(PathBuf, String), case: &str) {

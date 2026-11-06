@@ -205,24 +205,38 @@ contract-v1 graph records, traversal, warnings and byte-fit rules are unchanged.
 ## Amendment (#724): callers bound elsewhere and bounded graph spellings
 
 From the v0.1.0 eight-task MCP dogfood run (2026-11-05). `toolVersion` is **9**
-(previously 8). **Pending owner review:** the `boundElsewhere` value amends the
-#467 rule that an incoming caller's `disposition` is its binding's resolution.
+(previously 8).
 
-- **Callers bound elsewhere.** In `trellis_incoming_calls`, a name-matched
-  caller whose selected binding is fresh (`freshness:"fresh"`), direct
-  (`boundaryReason:"none"`) and has a `targetId` other than the selected
-  `symbolId` has `disposition:"boundElsewhere"` instead of `resolved`. Its
-  binding, `targetId`, `boundaryReason`, evidence and position are unchanged, and
-  it still counts toward `limit`. Callers are still found by name; a binding
-  annotates a found caller and neither adds nor removes one, so the
-  `sameNameDeclarations` limitation still holds for unbound callers. A binding to
-  the selected symbol, a `dispatch` boundary (dispatch is not proven direct), a
-  stale or possibly stale binding, and a caller with no binding keep their
-  dispositions as before. `boundElsewhere` adds no warning. Caller selection,
-  order, `limit` and `has_more` are unchanged, but the existing 65,536-byte
-  prefix fit applies to the labelled callers: the longer label can make a page
-  near the cap emit a shorter prefix, with `truncationReason:"response_bytes"`
-  and `partial:true`. Outgoing calls and the call graph are unchanged.
+- **Callers bound elsewhere (owner ruling 2026-11-06).** Callers whose fresh
+  direct binding targets a different same-name declaration are excluded from
+  incoming results and counted. This amends the #467 sentence "the binding
+  annotates each found call and adds no callers" to "the binding annotates each
+  found call, adds no callers, and removes callers proven bound elsewhere".
+  - *Proven bound elsewhere* means the call's selected binding (the shared
+    #466 reader, under the request's producer selection) has effective
+    freshness `fresh`, `boundaryReason:"none"`, and a located `targetId` other
+    than the selected `symbolId`. These callers stay listed exactly as before:
+    a binding to the selected symbol, a `dispatch` boundary (dispatch is not
+    proven direct), a stale or possibly stale binding, a binding without a
+    located target, and a caller with no binding.
+  - The exclusion runs while the ranked name matches are scanned, before
+    `limit` and `has_more` are decided. Ranking is unchanged. The scan keeps
+    the first `limit` callers that are not excluded and stops at the next one,
+    which sets `truncationReason:"limit"`. A page therefore holds `limit`
+    callers whenever that many remain, and an excluded caller never makes a
+    page look truncated. The scan is bounded by the call's existing deadline,
+    and the 65,536-byte response fit applies to the kept callers as before.
+  - Data adds `boundElsewhereOmitted:UInt` when at least one caller is
+    excluded. It counts the excluded callers among the ranked matches the scan
+    read: all of them when the scan reached the end (no `limit` truncation),
+    otherwise those ranked before the first kept caller beyond `limit`. It is
+    exact when `truncated` is false and a lower bound of the total otherwise.
+    The field is absent when nothing is excluded, and that response is
+    unchanged.
+  - `match` (basis `name`, `sameNameDeclarations`, limitations) is unchanged.
+    Unbound callers can still call another same-name declaration. Exclusion
+    adds no warning and does not by itself set `partial`. Outgoing calls and
+    the call graph are unchanged.
 - **Bounded graph spellings.** `trellis_call_graph` clips each edge call's
   `spelling` to the advertised `calleeTextBytes` (1024 UTF-8 bytes) on a scalar
   boundary, as outgoing calls clip `calleeText`, in full and compact form. A
@@ -422,7 +436,7 @@ The [#22 advisory-native-candidates rule](semantic-evidence/contract-v1.md#advis
 
 **Owner amendment (2026-10-23, #194 item 3 option (a); native-v9):** Rust may measure the final segment of a `scoped_identifier` callee as the single verified token, using only the parser's `name` field when it is a lone `identifier`. Unwrap a parser-recognized `generic_function` via its `function` field first. Thus `Self::foo()`, `module::foo()`, `Type::foo()`, `Type::<T>::foo()` and `Type::foo::<T>()` can expose exactly `foo` as `Call.spelling` / `calleeRange`. This eligibility applies to outgoing advisory hints and incoming name matching. It is not path resolution and never suffix-splits source text or a compound expression. A final segment not proved to be an identifier yields no verified token. Keep the fixed limitations tuple and all wire shapes unchanged. Tests cover each form and a parser-proved non-identifier negative. This records the existing [owner ruling](https://github.com/SquashMerge/trellis/issues/194#issuecomment-6375543246), not a new ratification request or the unrelated #194 read/publication optimizations.
 
-**Amendment (#467): published semantic bindings.** Both `trellis_outgoing_calls` and `trellis_incoming_calls` also accept an optional `semanticProducerId:string` of 1–512 UTF-8 bytes. An empty, oversized or non-string value, explicit null, or a NUL fails `invalid_request`. A well-formed ID that the admitted revision does not publish fails `not_found` with `Semantic producer not published for the admitted revision`, as `trellis_call_graph` does. Without the field, the per-language default applies at the admitted head (owner ruling 2026-10-30, #483, amending #392/#409): each call uses the sole published producer whose profile covers its document's language. A language that none or several cover selects nothing, and producers are never merged. An explicit producer applies to the languages it covers. When a call's language has a selected producer, its emitted item carries the call's binding. The binding is selected by the reader that the call graph, sequence and line navigation share (#466). `binding` is the published `CallBinding`: resolution, declared target, dispatch, and the whole candidate union for an ambiguous call. `disposition` is its resolution, or `staleTarget` for a stale boundary. `boundaryReason` is the call graph's reason (`none` means the graph would traverse the call; `dispatch` means dispatch is not proven direct). `targetId` is a resolved binding's declared internal target when it is located exactly in the admitted snapshot and is not stale. `evidenceTier` is `semantic`, and `semanticBasis` and `freshness` come from the binding's provenance. A call with no binding keeps the syntax-only values above. The data's `coverage` and `provenance` add the producer's coverage tuple and every proof of each emitted binding. Warnings follow warnings-v1: `coverageIncomplete`, `staleEvidence`, `staleTarget`, `bindingAmbiguous` for an emitted ambiguous binding, and no `syntaxOnly`. An item whose language has no selected producer keeps the syntax-only values. `syntaxOnly` then carries the reason of each such language of the emitted calls (the selected declaration's language when there are none), joined by `; `: `no semantic producer published; showing syntax`, `multiple semantic producers for <language>; showing syntax` or `semantic producer does not cover this language; showing syntax`. `partial` counts any emitted call whose `boundaryReason` is not `none` as a boundary. Incoming callers are still found by name (`matchedBy:"name"`); the binding annotates each found call and adds no callers.
+**Amendment (#467): published semantic bindings.** Both `trellis_outgoing_calls` and `trellis_incoming_calls` also accept an optional `semanticProducerId:string` of 1–512 UTF-8 bytes. An empty, oversized or non-string value, explicit null, or a NUL fails `invalid_request`. A well-formed ID that the admitted revision does not publish fails `not_found` with `Semantic producer not published for the admitted revision`, as `trellis_call_graph` does. Without the field, the per-language default applies at the admitted head (owner ruling 2026-10-30, #483, amending #392/#409): each call uses the sole published producer whose profile covers its document's language. A language that none or several cover selects nothing, and producers are never merged. An explicit producer applies to the languages it covers. When a call's language has a selected producer, its emitted item carries the call's binding. The binding is selected by the reader that the call graph, sequence and line navigation share (#466). `binding` is the published `CallBinding`: resolution, declared target, dispatch, and the whole candidate union for an ambiguous call. `disposition` is its resolution, or `staleTarget` for a stale boundary. `boundaryReason` is the call graph's reason (`none` means the graph would traverse the call; `dispatch` means dispatch is not proven direct). `targetId` is a resolved binding's declared internal target when it is located exactly in the admitted snapshot and is not stale. `evidenceTier` is `semantic`, and `semanticBasis` and `freshness` come from the binding's provenance. A call with no binding keeps the syntax-only values above. The data's `coverage` and `provenance` add the producer's coverage tuple and every proof of each emitted binding. Warnings follow warnings-v1: `coverageIncomplete`, `staleEvidence`, `staleTarget`, `bindingAmbiguous` for an emitted ambiguous binding, and no `syntaxOnly`. An item whose language has no selected producer keeps the syntax-only values. `syntaxOnly` then carries the reason of each such language of the emitted calls (the selected declaration's language when there are none), joined by `; `: `no semantic producer published; showing syntax`, `multiple semantic producers for <language>; showing syntax` or `semantic producer does not cover this language; showing syntax`. `partial` counts any emitted call whose `boundaryReason` is not `none` as a boundary. Incoming callers are still found by name (`matchedBy:"name"`); the binding annotates each found call and adds no callers. The [#724 owner ruling](#amendment-724-callers-bound-elsewhere-and-bounded-graph-spellings) also removes callers proven bound elsewhere.
 
 ### Incoming calls (syntax tier)
 

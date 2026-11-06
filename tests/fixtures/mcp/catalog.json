@@ -8894,8 +8894,7 @@
                 "unsupported",
                 "dynamic",
                 "declarationOnly",
-                "staleTarget",
-                "boundElsewhere"
+                "staleTarget"
               ]
             },
             "targetId": {
@@ -9837,6 +9836,9 @@
                   "items": {
                     "$ref": "#/$defs/DocumentSemanticStatus"
                   }
+                },
+                "boundElsewhereOmitted": {
+                  "$ref": "#/$defs/UInt"
                 }
               },
               "required": [
@@ -10037,7 +10039,7 @@
       ],
       "type": "object"
     },
-    "description": "Find call sites whose callee name matches one declaration (name match, not proof), each annotated with its semantic binding where one is selected. Default limit 6 (max 50); production callers first. Each distinct semantic basis appears once in `semanticBases`; `compact:true` omits bindings, coverage and provenance, so 50 callers fit easily."
+    "description": "Find call sites whose callee name matches one declaration (name match, not proof), each annotated with its semantic binding where one is selected. Callers whose fresh direct binding targets another same-name declaration are left out and counted in `boundElsewhereOmitted`. Default limit 6 (max 50); production callers first. Each distinct semantic basis appears once in `semanticBases`; `compact:true` omits bindings, coverage and provenance, so 50 callers fit easily."
   },
   {
     "annotations": {
