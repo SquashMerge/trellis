@@ -199,8 +199,12 @@ impl Fixture {
             assert!(Instant::now() < deadline, "{label} CLI did not exit");
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert!(status.success(), "{}", fs::read_to_string(stderr).unwrap());
-        serde_json::from_slice(&fs::read(stdout).unwrap()).unwrap()
+        let output = std::process::Output {
+            status,
+            stdout: fs::read(stdout).unwrap(),
+            stderr: fs::read(stderr).unwrap(),
+        };
+        crate::child::cli_json(&output, format_args!("{label} CLI"))
     }
 
     fn daemon(&self) -> Process {

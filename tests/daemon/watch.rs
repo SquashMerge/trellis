@@ -572,11 +572,7 @@ fn daemon_watcher_keeps_cli_file_cap_and_selected_source_after_edit() {
         .arg("128")
         .output()
         .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
+    crate::child::assert_cli_success(&indexed, "indexed");
     let first: serde_json::Value = serde_json::from_slice(&indexed.stdout).unwrap();
     assert_eq!(first["status"]["stats"]["files"], 1);
     let previous = first["publishedRevision"]["indexRevision"]
@@ -586,11 +582,7 @@ fn daemon_watcher_keeps_cli_file_cap_and_selected_source_after_edit() {
     let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         let current = cli(&root, &home, "status").output().unwrap();
-        assert!(
-            current.status.success(),
-            "{}",
-            String::from_utf8_lossy(&current.stderr)
-        );
+        crate::child::assert_cli_success(&current, "current");
         let current: serde_json::Value = serde_json::from_slice(&current.stdout).unwrap();
         if current["revision"]["indexRevision"]
             .as_u64()

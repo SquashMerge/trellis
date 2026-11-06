@@ -43,13 +43,9 @@ fn with_path(checkout: &Checkout, dirs: &[&Path], args: &[&str]) -> Output {
         .unwrap()
 }
 
+#[track_caller]
 fn json_out(output: &Output) -> Value {
-    assert!(
-        output.status.success(),
-        "failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
+    crate::child::cli_json(output, "producer CLI")
 }
 
 fn stderr(output: &Output) -> String {
@@ -278,7 +274,7 @@ fn plan_is_stable_until_basis_changes() {
         .arg(&checkout.root)
         .output()
         .unwrap();
-    assert!(index.status.success());
+    crate::child::assert_cli_success(&index, "index");
     let third = json_out(&plan(
         &checkout,
         &[],

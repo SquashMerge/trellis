@@ -441,7 +441,7 @@ async fn large_diff_returns_typed_complete_failure() {
         .args(["--path", "large.txt"])
         .output()
         .unwrap();
-    assert!(output.status.success());
+    crate::child::assert_cli_success(&output, "output");
     assert!(output.stdout.len() <= RESPONSE_LIMIT);
     let _: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 }
@@ -809,8 +809,7 @@ fn captured_summary(f: &Fixture) -> serde_json::Value {
         .arg(f.root())
         .output()
         .unwrap();
-    assert!(output.status.success());
-    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["result"].clone()
+    crate::child::cli_json(&output, "git-read summary")["result"].clone()
 }
 
 #[cfg(unix)]

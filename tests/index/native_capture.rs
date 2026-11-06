@@ -12,12 +12,9 @@ fn cli(args: &[&str]) -> Output {
         .output()
         .unwrap()
 }
+#[track_caller]
 fn success(output: Output) -> Vec<u8> {
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "trellis capture");
     output.stdout
 }
 fn node(mode: &str, root: &Path, descriptor: Option<&Path>) {
@@ -394,11 +391,7 @@ fn opaque_rust_capture_surfaces_partial_coverage_and_keeps_measured_output() {
         "--output",
         output.to_str().unwrap(),
     ]);
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
+    crate::child::assert_cli_success(&result, "result");
     let diagnostic = String::from_utf8_lossy(&result.stderr);
     assert!(
         diagnostic.contains("partial main/rust/a.rs@r0"),

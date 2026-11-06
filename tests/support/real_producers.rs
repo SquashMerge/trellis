@@ -179,7 +179,14 @@ pub fn plan(
     let error = stderr_of(&output);
     match error.split_once("producer_unavailable: ") {
         Some((_, reason)) => Err(reason.trim().to_owned()),
-        None => panic!("plan failed without a typed unavailability: {error}"),
+        None => panic!(
+            "{}",
+            crate::child::failure(
+                format_args!("{producer} plan failed without a typed unavailability"),
+                &output,
+                Some(&checkout.daemon_stderr()),
+            )
+        ),
     }
 }
 
@@ -224,14 +231,25 @@ pub fn run_case(case: &Case, availability: Availability) -> Option<String> {
     )
     .output()
     .unwrap();
-    let reply: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
-        panic!("no JSON on stdout; stderr: {}", stderr_of(&output));
+    let daemon = checkout.daemon_stderr();
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{}",
+            crate::child::failure(
+                format_args!("{} run: no JSON on stdout ({error})", case.producer),
+                &output,
+                Some(&daemon),
+            )
+        );
     });
     assert!(
         output.status.success() && reply["state"] == "done",
-        "{} run failed: {reply} {}",
-        case.producer,
-        stderr_of(&output)
+        "{}",
+        crate::child::failure(
+            format_args!("{} run did not finish done", case.producer),
+            &output,
+            Some(&daemon),
+        )
     );
     assert_eq!(reply["outcome"], "imported", "{reply}");
     assert_eq!(reply["producer"], case.producer);

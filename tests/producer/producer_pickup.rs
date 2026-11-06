@@ -116,10 +116,10 @@ fn configured(daemon_env: &[(String, String)]) -> Configured {
     let artifact = checkout.temp.path().join("index.scip");
     fs::write(&artifact, java_bytes(&checkout, None)).unwrap();
     let output = set(&checkout, &tripwire, &artifact);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    crate::child::assert_cli_success_with(
+        &output,
+        "producer pickup set",
+        Some(&checkout.daemon_stderr()),
     );
     let first = last(&checkout);
     assert_eq!(first["state"], "done");
@@ -329,7 +329,7 @@ fn pickup_activation_check_imports_changed_artifact() {
         .arg(&checkout.root)
         .output()
         .unwrap();
-    assert!(output.status.success());
+    crate::child::assert_cli_success(&output, "output");
     let imported = wait_last(checkout, "the activation check to import", |last| {
         last["sha256"] == digest.as_str() && last["state"] == "done"
     });
@@ -527,11 +527,7 @@ fn pickup_reimports_unchanged_artifact_after_rebuild() {
     held.set_nonblocking(false).unwrap();
     held.read_exact(&mut [0]).unwrap();
     let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, "output");
     let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(reply["head"], Value::Null, "{reply}");
     held.write_all(&[1]).unwrap();
@@ -657,11 +653,7 @@ fn pickup_reimports_unchanged_artifact_after_live_recovery() {
         .arg(&checkout.root)
         .output()
         .unwrap();
-    assert!(
-        index.status.success(),
-        "{}",
-        String::from_utf8_lossy(&index.stderr)
-    );
+    crate::child::assert_cli_success(&index, "index");
     assert_reimported(&world, &pid);
 }
 

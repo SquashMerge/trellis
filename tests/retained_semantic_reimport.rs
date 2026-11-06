@@ -1,5 +1,7 @@
 //! Real generated-run retention and automatic upgrade recovery. No manual import after restart.
 #![cfg(feature = "test-support")]
+#[path = "support/child.rs"]
+mod child;
 #[path = "support/semantic_batch.rs"]
 mod semantic_batch_support;
 #[path = "support/producer.rs"]
@@ -34,25 +36,9 @@ fn reply(operation: &str, output: Output) -> Value {
 
 /// The CLI's JSON reply. A failure shows the reply on stdout (state, errorCode, diagnostics)
 /// and, when the fixture kept one, the tail of the daemon's stderr.
+#[track_caller]
 fn reply_with(operation: &str, output: Output, daemon_stderr: Option<&Path>) -> Value {
-    if !output.status.success() {
-        let daemon = daemon_stderr.map_or_else(String::new, |path| {
-            let text = fs::read(path).unwrap_or_default();
-            let tail = &text[text.len().saturating_sub(16 * 1024)..];
-            format!(
-                "\ndaemon stderr tail ({}):\n{}",
-                path.display(),
-                String::from_utf8_lossy(tail)
-            )
-        });
-        panic!(
-            "{operation} failed ({}): {}\nstdout: {}{daemon}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout),
-        );
-    }
-    serde_json::from_slice(&output.stdout).unwrap()
+    child::cli_json_with(&output, operation, daemon_stderr)
 }
 
 impl World {

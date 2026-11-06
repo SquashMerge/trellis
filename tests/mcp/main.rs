@@ -3,6 +3,8 @@
 //! Each former `tests/<name>.rs` crate is a module here, so one binary links
 //! the library once. nextest still runs every test in its own process.
 
+#[path = "../support/child.rs"]
+mod child;
 // Only test-support modules use these helpers, which need its hooks.
 #[cfg(feature = "test-support")]
 #[path = "../common/graph_fixtures.rs"]

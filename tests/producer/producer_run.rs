@@ -169,12 +169,11 @@ impl World {
         let mut args = vec!["--producer", STUB];
         args.extend_from_slice(extra);
         let output = self.producer("plan", &args);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        serde_json::from_slice(&output.stdout).unwrap()
+        crate::child::cli_json_with(
+            &output,
+            "producer plan",
+            Some(&self.checkout.daemon_stderr()),
+        )
     }
 
     /// The `producer run` arguments for the plan of `extra`.
@@ -205,12 +204,11 @@ impl World {
 
     fn status(&self) -> Value {
         let output = self.producer("status", &[]);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        serde_json::from_slice(&output.stdout).unwrap()
+        crate::child::cli_json_with(
+            &output,
+            "producer status",
+            Some(&self.checkout.daemon_stderr()),
+        )
     }
 
     fn stub_entry(&self) -> Value {

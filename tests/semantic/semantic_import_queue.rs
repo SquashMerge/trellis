@@ -61,19 +61,18 @@ fn cli(home: &Path) -> Command {
     let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     cmd.env("HOME", home)
         .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"))
+        .env(crate::child::DAEMON_STDERR, home.join("daemon.stderr"))
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")
         .stdin(Stdio::null());
     cmd
 }
+#[track_caller]
 fn run(home: &Path, args: &[&str]) -> Value {
-    let output = cli(home).args(args).output().unwrap();
-    assert!(
-        output.status.success(),
-        "command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
+    crate::child::run_cli_json(
+        cli(home).args(args),
+        format_args!("trellis {}", args.first().copied().unwrap_or_default()),
+    )
 }
 
 /// Writes a reference-producer batch of hand-built artifacts into the fresh directory
@@ -198,11 +197,7 @@ fn two_document_case(change_b: &str) {
                 .output()
                 .unwrap()
         };
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "output");
         serde_json::from_slice(&output.stdout).unwrap()
     } else {
         run(&home, &["index", "--workspace", root_string])
@@ -370,11 +365,7 @@ fn two_document_case(change_b: &str) {
             }
             std::thread::yield_now();
         };
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "output");
         let committed: Value = serde_json::from_slice(&output.stdout).unwrap();
         let replayed = store.request_by_id(&original.id).unwrap().unwrap();
         assert_eq!(replayed.state, "done");
@@ -389,11 +380,7 @@ fn two_document_case(change_b: &str) {
     } else if change_b == "commit_ambiguous" {
         let before = store.index_baseline().unwrap();
         let first = cli(&home).args(args).output().unwrap();
-        assert!(
-            first.status.success(),
-            "{}",
-            String::from_utf8_lossy(&first.stderr)
-        );
+        crate::child::assert_cli_success(&first, "first");
         assert!(home.join("semantic-commit.marker").exists());
         let committed: Value = serde_json::from_slice(&first.stdout).unwrap();
         let after: trellis::model::IndexPin =
@@ -443,11 +430,7 @@ fn two_document_case(change_b: &str) {
         committed
     } else if change_b == "near_bound" {
         let output = cli(&home).args(args).output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "output");
         let committed: Value = serde_json::from_slice(&output.stdout).unwrap();
         let report = serde_json::to_vec(&committed["report"]).unwrap();
         assert!(
@@ -582,11 +565,7 @@ fn two_document_case(change_b: &str) {
             }
             std::thread::yield_now();
         };
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "output");
         let repeated: Value = serde_json::from_slice(&output.stdout).unwrap();
         let resumed = store.request_by_id(&claimed.id).unwrap().unwrap();
         assert_eq!(resumed.state, "done");
@@ -854,11 +833,7 @@ fn two_document_case(change_b: &str) {
         let stream = UnixStream::connect(&socket).unwrap();
         drop(stream);
         let output = child.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "output");
         let response: Value = serde_json::from_slice(&output.stdout).unwrap();
         let committed: trellis::model::IndexPin =
             serde_json::from_value(response["publishedRevision"].clone()).unwrap();
@@ -895,11 +870,7 @@ fn two_document_case(change_b: &str) {
             _ => "TRELLIS_TEST_SEMANTIC_MISSING_A_REFERENCE",
         };
         let output = command.env(hook, "1").args(args).output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "output");
         serde_json::from_slice(&output.stdout).unwrap()
     } else {
         run(&home, &args)

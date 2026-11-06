@@ -42,13 +42,9 @@ fn cache_dir(home: &Path) -> PathBuf {
     }
 }
 
+#[track_caller]
 fn succeeded(output: &Output) -> Value {
-    assert!(
-        output.status.success(),
-        "command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
+    crate::child::cli_json(output, "trellis CLI")
 }
 
 /// One checkout with its published native revision, a running daemon and an open store.

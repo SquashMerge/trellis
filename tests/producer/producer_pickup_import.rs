@@ -54,18 +54,13 @@ fn pickup(checkout: &Checkout, tripwire: &Path, args: &[&str]) -> Output {
 }
 
 fn status(checkout: &Checkout) -> Value {
-    let output = checkout
-        .cli()
-        .args(["producer", "status", "--workspace"])
-        .arg(&checkout.root)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
+    crate::child::run_cli_json(
+        checkout
+            .cli()
+            .args(["producer", "status", "--workspace"])
+            .arg(&checkout.root),
+        "producer status",
+    )
 }
 
 fn pickup_status(checkout: &Checkout, producer: &str) -> Value {
@@ -117,11 +112,7 @@ fn pickup_set_imports_artifact_without_producer() {
         ],
     );
     let reply = json_out(&output);
-    assert!(
-        output.status.success(),
-        "{reply} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::child::assert_cli_success(&output, format_args!("{reply}"));
     assert_eq!(reply["state"], "done");
     assert_eq!(reply["errorCode"], Value::Null);
     assert_eq!(reply["producer"], "scip-java");
@@ -277,7 +268,7 @@ fn pickup_clear_removes_entry() {
             artifact.to_str().unwrap(),
         ],
     );
-    assert!(set.status.success());
+    crate::child::assert_cli_success(&set, "set");
     assert_ne!(pickup_status(&checkout, "scip-java"), Value::Null);
     assert!(state_dir(&checkout).join("pickup.json").exists());
 
@@ -286,7 +277,7 @@ fn pickup_clear_removes_entry() {
         &tripwire,
         &["--producer", "scip-java", "--clear"],
     );
-    assert!(cleared.status.success());
+    crate::child::assert_cli_success(&cleared, "cleared");
     assert_eq!(json_out(&cleared)["cleared"], true);
     assert_eq!(pickup_status(&checkout, "scip-java"), Value::Null);
     assert!(!state_dir(&checkout).join("pickup.json").exists());
@@ -295,7 +286,7 @@ fn pickup_clear_removes_entry() {
         &tripwire,
         &["--producer", "scip-java", "--clear"],
     );
-    assert!(again.status.success());
+    crate::child::assert_cli_success(&again, "again");
     assert_eq!(json_out(&again)["cleared"], false);
 
     // Neither action alone nor both together is a command.
@@ -322,7 +313,7 @@ fn pickup_config_survives_daemon_restart() {
             artifact.to_str().unwrap(),
         ],
     );
-    assert!(set.status.success());
+    crate::child::assert_cli_success(&set, "set");
     let before = pickup_status(&checkout, "scip-java");
     assert_eq!(before["lastImported"]["state"], "done");
 
@@ -334,7 +325,7 @@ fn pickup_config_survives_daemon_restart() {
         &tripwire,
         &["--producer", "scip-java", "--clear"],
     );
-    assert!(cleared.status.success());
+    crate::child::assert_cli_success(&cleared, "cleared");
     stop_daemon(&checkout.home);
     assert_eq!(pickup_status(&checkout, "scip-java"), Value::Null);
 }
@@ -398,18 +389,14 @@ fn duplicate_pickup_at_same_head_is_idempotent() {
         artifact.to_str().unwrap(),
     ];
     let first = pickup(&checkout, &tripwire, &args);
-    assert!(first.status.success());
+    crate::child::assert_cli_success(&first, "first");
     let first = json_out(&first);
     assert_eq!(first["state"], "done");
     let head = status(&checkout)["head"]["indexRevision"].as_u64().unwrap();
 
     let second = pickup(&checkout, &tripwire, &args);
     let reply = json_out(&second);
-    assert!(
-        second.status.success(),
-        "{reply} {}",
-        String::from_utf8_lossy(&second.stderr)
-    );
+    crate::child::assert_cli_success(&second, format_args!("{reply}"));
     assert_eq!(reply["state"], "done", "{reply}");
     assert_eq!(reply["unchanged"], true, "{reply}");
     assert_eq!(reply["sha256"], first["sha256"]);
@@ -439,7 +426,7 @@ fn duplicate_pickup_at_same_head_is_idempotent() {
     fs::write(&artifact, fixture.scip_bytes("java", &docs[..1])).unwrap();
     let changed = pickup(&checkout, &tripwire, &args);
     let changed_reply = json_out(&changed);
-    assert!(changed.status.success(), "{changed_reply}");
+    crate::child::assert_cli_success(&changed, format_args!("{changed_reply}"));
     assert_eq!(changed_reply["state"], "done");
     assert_eq!(changed_reply.get("unchanged"), None, "{changed_reply}");
     assert_ne!(changed_reply["sha256"], first["sha256"]);

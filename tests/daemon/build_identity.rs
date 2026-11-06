@@ -15,7 +15,7 @@ fn executable_version_reports_compiled_identity_without_starting_a_daemon() {
         .env("TRELLIS_BUILD_COMMIT", "not-the-compiled-commit")
         .output()
         .unwrap();
-    assert!(output.status.success(), "{:?}", output);
+    crate::child::assert_cli_success(&output, "trellis --version");
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         format!("trellis {}\n", build_info::version())
