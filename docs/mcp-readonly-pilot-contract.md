@@ -202,6 +202,31 @@ contract-v1 graph records, traversal, warnings and byte-fit rules are unchanged.
   within each class the exact, prefix, substring, role, name and ID order is
   unchanged. Lookup-key resolution and search are unchanged.
 
+## Amendment (#724): callers bound elsewhere and bounded graph spellings
+
+From the v0.1.0 eight-task MCP dogfood run (2026-11-05). `toolVersion` is **9**
+(previously 8). **Pending owner review:** the `boundElsewhere` value amends the
+#467 rule that an incoming caller's `disposition` is its binding's resolution.
+
+- **Callers bound elsewhere.** In `trellis_incoming_calls`, a name-matched
+  caller whose selected binding is fresh (`freshness:"fresh"`), direct
+  (`boundaryReason:"none"`) and has a `targetId` other than the selected
+  `symbolId` has `disposition:"boundElsewhere"` instead of `resolved`. Its
+  binding, `targetId`, `boundaryReason`, evidence and position are unchanged, and
+  it still counts toward `limit`. Callers are still found by name; a binding
+  annotates a found caller and neither adds nor removes one, so the
+  `sameNameDeclarations` limitation still holds for unbound callers. A binding to
+  the selected symbol, a `dispatch` boundary (dispatch is not proven direct), a
+  stale or possibly stale binding, and a caller with no binding keep their
+  dispositions as before. `boundElsewhere` adds no warning and does not change
+  `partial`. Outgoing calls and the call graph are unchanged.
+- **Bounded graph spellings.** `trellis_call_graph` clips each edge call's
+  `spelling` to the advertised `calleeTextBytes` (1024 UTF-8 bytes) on a scalar
+  boundary, as outgoing calls clip `calleeText`, in full and compact form. A
+  clipped call adds `spellingTruncated:true`; a spelling that fits is unchanged
+  and carries no flag. Clipping changes no node, edge, visit, boundary,
+  `truncated` or `truncationReason`: the graph answer itself is complete.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)

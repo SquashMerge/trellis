@@ -982,7 +982,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 8
+                  "const": 9
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -8894,7 +8894,8 @@
                 "unsupported",
                 "dynamic",
                 "declarationOnly",
-                "staleTarget"
+                "staleTarget",
+                "boundElsewhere"
               ]
             },
             "targetId": {
@@ -12268,6 +12269,9 @@
                 }
               ]
             },
+            "spellingTruncated": {
+              "const": true
+            },
             "regionIds": {
               "items": {
                 "$ref": "#/$defs/Text"
@@ -13284,6 +13288,9 @@
                   "type": "null"
                 }
               ]
+            },
+            "spellingTruncated": {
+              "const": true
             }
           },
           "required": [
