@@ -672,6 +672,38 @@ fn daemon_status_uses_selected_head_and_reports_typed_contention() {
     assert_eq!(report["derived"][0]["status"], "busy");
 }
 
+/// #729: a CLI `--workspace` spelled through a symlinked ancestor resolves to
+/// the canonical checkout root; a final-component symlink is still refused.
+#[test]
+fn cli_workspace_through_symlinked_ancestor_uses_canonical_root() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let real = temp.path().join("real");
+    let root = real.join("workspace");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.js"), "function seed() {}\n").unwrap();
+    std::os::unix::fs::symlink(&real, temp.path().join("link")).unwrap();
+    let via_link = temp.path().join("link/workspace");
+    let canonical = serde_json::json!(root.canonicalize().unwrap());
+    for (sub, field) in [
+        ("index", "/status/workspaceRoot"),
+        ("status", "/workspaceRoot"),
+    ] {
+        let output = command(&via_link, &home, sub).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{sub}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.pointer(field), Some(&canonical), "{sub}: {output}");
+    }
+    let final_link = temp.path().join("final-link");
+    std::os::unix::fs::symlink(&root, &final_link).unwrap();
+    let refused = command(&final_link, &home, "status").output().unwrap();
+    assert!(!refused.status.success());
+}
+
 #[test]
 fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
     let temp = TempDir::new().unwrap();

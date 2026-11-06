@@ -2700,3 +2700,58 @@ fn a_reply_settled_past_the_deadline_is_not_a_success() {
     );
     finish_peer(peer, daemon, &phase_path);
 }
+
+/// #729: a workspace spelled through a symlinked ancestor (macOS `/tmp`,
+/// `/var`, a symlinked projects folder) selects its canonical checkout, both
+/// as the launch `--workspace` and as an explicit per-call `workspace`. A
+/// final-component symlink is still refused (T01).
+#[test]
+fn symlinked_ancestor_workspace_selects_its_canonical_checkout() {
+    let home = tempfile::tempdir().unwrap();
+    let real = home.path().join("real");
+    let root = real.join("checkout");
+    fs::create_dir_all(&root).unwrap();
+    let output = Command::new("git")
+        .current_dir(&root)
+        .args(["init", "--quiet"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git init failed");
+    let canonical = root.canonicalize().unwrap();
+    std::os::unix::fs::symlink(&real, home.path().join("link")).unwrap();
+    let via_link = home.path().join("link/checkout");
+    let final_link = home.path().join("final-link");
+    std::os::unix::fs::symlink(&root, &final_link).unwrap();
+    let meta = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}});
+    let describe = |peer: &mut Peer, id: u64, workspace: Option<&Path>| {
+        let mut arguments = json!({"schemaVersion":1});
+        if let Some(workspace) = workspace {
+            arguments["workspace"] = json!(workspace);
+        }
+        peer.ask(
+            id,
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":arguments,"_meta":meta}),
+        )
+    };
+    let mut peer = Peer::start(home.path(), &via_link);
+    for (id, workspace) in [(1, None), (2, Some(via_link.as_path()))] {
+        let reply = describe(&mut peer, id, workspace);
+        assert_eq!(reply["id"], id);
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(
+            reply["result"]["structuredContent"]["workspace"],
+            json!(canonical),
+            "{reply}"
+        );
+    }
+    let refused = describe(&mut peer, 3, Some(&final_link));
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    let error = &refused["result"]["structuredContent"]["error"];
+    assert_eq!(error["code"], "workspace_selection_failed", "{refused}");
+    assert_eq!(error["reason"], "not_checkout", "{refused}");
+    drop(peer);
+}

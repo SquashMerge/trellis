@@ -3192,18 +3192,28 @@ fn common_identity_unattached_with_executable(
     Ok((common.dev(), common.ino()))
 }
 
-/// Walk the literal selected pathname. In particular, do not canonicalize a
-/// symlink (including one in an intermediate component) into a different root.
+/// Resolve the selected pathname as T01 discovery does: canonicalize its
+/// ancestors once (so `/tmp/x` on macOS selects `/private/tmp/x`, #729), but
+/// never follow a final-component symlink into a different root.
 fn checkout_root(selected: &Path) -> Result<PathBuf, SelectionError> {
     if !selected.is_absolute() {
         return Err(SelectionError::NotAbsolute);
     }
+    if selected
+        .components()
+        .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(SelectionError::NotCheckout);
+    }
+    let selected = match (selected.parent(), selected.file_name()) {
+        (Some(parent), Some(name)) => fs::canonicalize(parent)
+            .map_err(|_| SelectionError::Unavailable)?
+            .join(name),
+        _ => selected.to_path_buf(),
+    };
     let mut literal = PathBuf::new();
     for component in selected.components() {
-        match component {
-            Component::RootDir | Component::Normal(_) => literal.push(component),
-            _ => return Err(SelectionError::NotCheckout),
-        }
+        literal.push(component);
         let metadata = fs::symlink_metadata(&literal).map_err(|_| SelectionError::Unavailable)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(SelectionError::NotCheckout);
