@@ -358,10 +358,40 @@ fn context_failure(id: &Value, name: &str, envelope: &Value, code: &str, modern:
     super::tools::result(name, failure, modern)
 }
 
-pub fn capped(id: &Value, name: &str, envelope: Value, offset: Option<u64>, modern: bool) -> Value {
-    match offset {
-        Some(offset) if is_tool(name) && envelope.get("data").is_some() => {
-            paged(id, name, envelope, offset, modern)
+/// How one architecture tool page is selected from the tool's arguments.
+#[derive(Clone, Debug, Default)]
+pub struct Paging {
+    pub offset: u64,
+}
+
+impl Paging {
+    /// The validated paging arguments of `name`.
+    pub fn from_arguments(_name: &str, arguments: Option<&Value>) -> Self {
+        let field = |key: &str| arguments.and_then(|arguments| arguments.get(key));
+        Self {
+            offset: field("offset").and_then(super::wire::uint).unwrap_or(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn at(offset: u64) -> Self {
+        Self {
+            offset,
+            ..Self::default()
+        }
+    }
+}
+
+pub fn capped(
+    id: &Value,
+    name: &str,
+    envelope: Value,
+    paging: Option<Paging>,
+    modern: bool,
+) -> Value {
+    match paging {
+        Some(paging) if is_tool(name) && envelope.get("data").is_some() => {
+            paged(id, name, envelope, paging.offset, modern)
         }
         _ => capped_whole(id, name, envelope, modern),
     }
@@ -557,7 +587,7 @@ mod tests {
                     &id,
                     "trellis_references",
                     whole.clone(),
-                    Some(offset),
+                    Some(Paging::at(offset)),
                     modern,
                 );
                 let line = serde_json::to_vec(&response(&id, result.clone())).unwrap();
@@ -579,7 +609,13 @@ mod tests {
             let mut expected = vec![json!({"m":1})];
             expected.extend(data["unresolved"].as_array().unwrap().iter().cloned());
             assert_eq!(seen, expected);
-            let past = capped(&id, "trellis_references", whole.clone(), Some(902), modern);
+            let past = capped(
+                &id,
+                "trellis_references",
+                whole.clone(),
+                Some(Paging::at(902)),
+                modern,
+            );
             assert_eq!(
                 past["structuredContent"]["error"]["code"],
                 "range_too_large"
@@ -587,13 +623,19 @@ mod tests {
             // An item larger than the page target still gets a page of its own.
             let mut large = whole.clone();
             large["data"]["unresolved"] = json!(["z".repeat(40_000), "small"]);
-            let alone = capped(&id, "trellis_references", large, Some(1), modern);
+            let alone = capped(
+                &id,
+                "trellis_references",
+                large,
+                Some(Paging::at(1)),
+                modern,
+            );
             let data = &alone["structuredContent"]["data"];
             assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
             assert_eq!(data["page"]["nextOffset"], 2);
             let mut huge = whole.clone();
             huge["data"]["unresolved"] = json!(["y".repeat(super::super::wire::RESPONSE_BYTES)]);
-            let failed = capped(&id, "trellis_references", huge, Some(1), modern);
+            let failed = capped(&id, "trellis_references", huge, Some(Paging::at(1)), modern);
             assert_eq!(
                 failed["structuredContent"]["error"]["code"],
                 "response_too_large"
@@ -605,6 +647,284 @@ mod tests {
         assert_eq!(rules["instances"][0]["evidence"], json!([1, 2, 3, 4, 5]));
         assert_eq!(rules["instances"][0]["omittedEvidence"], 2);
         assert_eq!(rules["instances"][1]["omittedEvidence"], 0);
+    }
+
+    /// A rust-analyzer-shaped semantic basis; `n` varies its revision.
+    fn rule_basis(n: usize) -> Value {
+        json!({"producerId":"rust-analyzer","producerVersion":"1.98.1",
+            "producerHash":"a".repeat(64),"artifactHash":"b".repeat(64),"language":"rust",
+            "sourceSetId":"app","revisionId":format!("revision-{n}"),
+            "sourceManifestHash":"c".repeat(64),"toolchainHash":"d".repeat(64),
+            "configHash":"e".repeat(64),"dependencyHash":"f".repeat(64),
+            "lookupDependencies":[]})
+    }
+
+    /// One evidence row, semantic with `basis` or structural without one.
+    fn rule_evidence(line: usize, basis: Option<Value>) -> Value {
+        let mut row = json!({"document":{"sourceSetId":"app","language":"rust","path":"src/a.rs"},
+            "revisionId":"native","range":{"startByte":line,"endByte":line + 1},
+            "kind":"structuralReference","syntaxId":null,"callId":null,"provenanceId":"p"});
+        if let Some(basis) = basis {
+            row["kind"] = json!("semanticBinding");
+            row["basis"] = basis;
+        }
+        row
+    }
+
+    fn rule_instance(i: usize, status: &str, evidence: Vec<Value>) -> Value {
+        json!({"rule":"$layers","target":{"sourceSetId":"app","language":"rust",
+            "path":format!("src/m{i:03}.rs"),"sid":format!("sid:v1:{i:032x}")},
+            "destination":null,"sourceLayer":"a","destinationLayer":null,"status":status,
+            "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,
+            "unresolved":[],"referenceCount":1,"omittedEvidence":0})
+    }
+
+    fn rules_envelope(instances: Vec<Value>, test_only: Vec<Value>) -> Value {
+        let counts = json!({"comparable":instances.len(),"conforms":1,"deviates":2,"unknown":3,"excepted":0});
+        let mut whole = envelope(
+            &json!(7),
+            json!({"rulesVersion":"rules:v2","indexGeneration":"g","indexRevision":1,
+                "rulesFile":{"path":".trellis/rules.toml","source":"checkout-config","contentHash":"h"},
+                "externalPackages":[],"instances":instances,"testOnly":test_only,
+                "counts":counts,"testCounts":counts,"unassigned":[{"path":"loose.rs"}],
+                "unassignedFileCount":1,"partialFiles":[],"limitations":[]}),
+        );
+        whole["workspace"] = json!("/checkout");
+        whole["catchingUp"] = json!(false);
+        whole
+    }
+
+    /// Every page of one rules call with `arguments`, as structured data.
+    fn rules_pages(name: &str, whole: &Value, arguments: Value) -> Vec<Value> {
+        let id = json!(7);
+        let mut pages = Vec::new();
+        let mut offset = 0;
+        loop {
+            let mut arguments = arguments.clone();
+            arguments["offset"] = json!(offset);
+            let paging = Paging::from_arguments(name, Some(&arguments));
+            let result = capped(&id, name, whole.clone(), Some(paging), true);
+            let line = serde_json::to_vec(&response(&id, result.clone())).unwrap();
+            assert!(line.len() < super::super::wire::RESPONSE_BYTES);
+            let data = result["structuredContent"]["data"].clone();
+            assert!(data.is_object(), "{result}");
+            let next = data["page"]["nextOffset"].as_u64();
+            pages.push(data);
+            match next {
+                Some(next) => offset = next,
+                None => return pages,
+            }
+        }
+    }
+
+    /// Put each `basisRef` back as the `basis` it names, as the contract shape had it.
+    fn reinline(data: &Value, field: &str) -> Vec<Value> {
+        let bases = data["semanticBases"]
+            .as_array()
+            .expect("semanticBases table");
+        let mut items = data[field].as_array().unwrap().clone();
+        let put_back = |row: &mut Value| {
+            let row = row.as_object_mut().unwrap();
+            assert!(!row.contains_key("basis"), "a basis is inlined");
+            if let Some(reference) = row.remove("basisRef") {
+                let basis = match reference.as_u64() {
+                    Some(index) => {
+                        let mut basis = bases[index as usize].clone();
+                        assert_eq!(basis["ref"], index);
+                        basis.as_object_mut().unwrap().remove("ref");
+                        basis
+                    }
+                    None => Value::Null,
+                };
+                row.insert("basis".into(), basis);
+            }
+        };
+        for item in &mut items {
+            for row in item["evidence"].as_array_mut().into_iter().flatten() {
+                put_back(row);
+            }
+            for constraint in item["constraints"].as_array_mut().into_iter().flatten() {
+                for row in constraint["evidence"].as_array_mut().into_iter().flatten() {
+                    put_back(row);
+                }
+            }
+        }
+        items
+    }
+
+    /// #725: each distinct semantic basis appears once per page in `semanticBases`, in
+    /// canonical order from ref 0, and evidence rows (constraint evidence too) refer to
+    /// it by `basisRef`. A null basis is a null ref; a structural row gets no ref.
+    #[test]
+    fn rules_pages_list_each_semantic_basis_once() {
+        let mut shared = rule_instance(
+            0,
+            "deviates",
+            vec![
+                rule_evidence(1, Some(rule_basis(2))),
+                rule_evidence(2, None),
+                rule_evidence(3, Some(Value::Null)),
+            ],
+        );
+        shared["constraints"] = json!([{"mode":"forbid","kind":"calls","targetRole":"r",
+            "status":"deviates","evidence":[rule_evidence(4, Some(rule_basis(1)))],"unresolved":[]}]);
+        let other = rule_instance(1, "deviates", vec![rule_evidence(5, Some(rule_basis(2)))]);
+        let instances = vec![shared, other];
+        let whole = rules_envelope(instances.clone(), vec![]);
+        for name in ["trellis_rules_check", "trellis_rules_explain"] {
+            let pages = rules_pages(name, &whole, json!({"schemaVersion":1}));
+            assert_eq!(pages.len(), 1);
+            let data = &pages[0];
+            let bases = data["semanticBases"].as_array().expect("semanticBases");
+            // Two distinct bases, sorted by their canonical serialization.
+            assert_eq!(bases.len(), 2, "{data}");
+            for (index, revision) in ["revision-1", "revision-2"].into_iter().enumerate() {
+                assert_eq!(bases[index]["ref"], index);
+                assert_eq!(bases[index]["revisionId"], revision);
+            }
+            let rows = &data["instances"];
+            // Two rows in two instances share one basis.
+            assert_eq!(rows[0]["evidence"][0]["basisRef"], 1);
+            assert_eq!(rows[1]["evidence"][0]["basisRef"], 1);
+            assert!(rows[0]["evidence"][1].get("basisRef").is_none());
+            assert_eq!(rows[0]["evidence"][2]["basisRef"], Value::Null);
+            assert_eq!(rows[0]["constraints"][0]["evidence"][0]["basisRef"], 0);
+            let text = serde_json::to_string(data).unwrap();
+            assert_eq!(text.matches("producerHash").count(), 2, "{text}");
+            assert_eq!(reinline(data, "instances"), instances);
+        }
+        // A page lists only the bases its own rows use, renumbered from zero.
+        let many: Vec<_> = (0..40)
+            .map(|i| {
+                rule_instance(
+                    i,
+                    "unknown",
+                    vec![rule_evidence(i, Some(rule_basis(i % 3)))],
+                )
+            })
+            .collect();
+        let whole = rules_envelope(many.clone(), vec![]);
+        let pages = rules_pages(
+            "trellis_rules_check",
+            &whole,
+            json!({"schemaVersion":1,"limit":2}),
+        );
+        assert_eq!(pages.len(), 20);
+        let mut seen = Vec::new();
+        for data in &pages {
+            let bases = data["semanticBases"].as_array().unwrap();
+            assert_eq!(bases.len(), 2, "{data}");
+            seen.extend(reinline(data, "instances"));
+        }
+        assert_eq!(seen, many);
+    }
+
+    /// #725: `status` keeps the instances (and test-only instances) with those statuses.
+    /// Counts stay those of the whole evaluation, the page reports the filter, and
+    /// offsets page the filtered sequence stably.
+    #[test]
+    fn rules_check_status_filter_pages_matching_instances_with_global_counts() {
+        let statuses = ["conforms", "deviates", "unknown"];
+        let instances: Vec<_> = (0..60)
+            .map(|i| rule_instance(i, statuses[i % 3], vec![rule_evidence(i, None)]))
+            .collect();
+        let test_only: Vec<_> = (60..66)
+            .map(|i| rule_instance(i, statuses[i % 3], vec![rule_evidence(i, None)]))
+            .collect();
+        let whole = rules_envelope(instances.clone(), test_only.clone());
+        let unfiltered = rules_pages("trellis_rules_check", &whole, json!({"schemaVersion":1}));
+        assert_eq!(unfiltered[0]["page"]["status"], Value::Null);
+        assert_eq!(unfiltered[0]["page"]["total"], 67);
+        for filter in [vec!["deviates"], vec!["deviates", "unknown"]] {
+            let arguments = json!({"schemaVersion":1,"status":filter,"limit":7});
+            let pages = rules_pages("trellis_rules_check", &whole, arguments.clone());
+            let keep = |rows: &[Value]| -> Vec<Value> {
+                rows.iter()
+                    .filter(|row| filter.contains(&row["status"].as_str().unwrap()))
+                    .cloned()
+                    .collect()
+            };
+            let (mut shown, mut tests, mut unassigned) = (Vec::new(), Vec::new(), Vec::new());
+            for data in &pages {
+                assert_eq!(data["counts"], whole["data"]["counts"]);
+                assert_eq!(data["testCounts"], whole["data"]["testCounts"]);
+                assert_eq!(data["page"]["status"], json!(filter));
+                assert_eq!(
+                    data["page"]["total"],
+                    keep(&instances).len() + keep(&test_only).len() + 1
+                );
+                shown.extend(data["instances"].as_array().unwrap().iter().cloned());
+                tests.extend(data["testOnly"].as_array().unwrap().iter().cloned());
+                unassigned.extend(data["unassigned"].as_array().unwrap().iter().cloned());
+            }
+            assert_eq!(shown, keep(&instances));
+            assert_eq!(tests, keep(&test_only));
+            assert_eq!(unassigned, vec![json!({"path":"loose.rs"})]);
+            // The same arguments and offset give the same page.
+            for data in &pages {
+                let mut again = arguments.clone();
+                again["offset"] = data["page"]["offset"].clone();
+                let page = capped(
+                    &json!(7),
+                    "trellis_rules_check",
+                    whole.clone(),
+                    Some(Paging::from_arguments("trellis_rules_check", Some(&again))),
+                    true,
+                );
+                assert_eq!(&page["structuredContent"]["data"], data);
+            }
+        }
+    }
+
+    /// #725: a rules check page holds at most `limit` rule instances (instances and
+    /// test-only instances together); explain's `limit` still samples evidence.
+    #[test]
+    fn rules_check_limit_counts_rule_instances_per_page() {
+        let instances: Vec<_> = (0..12)
+            .map(|i| rule_instance(i, "unknown", vec![rule_evidence(i, None)]))
+            .collect();
+        let test_only: Vec<_> = (12..15)
+            .map(|i| rule_instance(i, "unknown", vec![rule_evidence(i, None)]))
+            .collect();
+        let whole = rules_envelope(instances, test_only);
+        let pages = rules_pages(
+            "trellis_rules_check",
+            &whole,
+            json!({"schemaVersion":1,"limit":5}),
+        );
+        let sizes: Vec<_> = pages
+            .iter()
+            .map(|data| {
+                data["instances"].as_array().unwrap().len()
+                    + data["testOnly"].as_array().unwrap().len()
+            })
+            .collect();
+        // The unassigned module fits after the last five instances.
+        assert_eq!(sizes, [5, 5, 5]);
+        let offsets: Vec<_> = pages
+            .iter()
+            .map(|data| data["page"]["offset"].clone())
+            .collect();
+        assert_eq!(offsets, [json!(0), json!(5), json!(10)]);
+        assert_eq!(pages[2]["unassigned"].as_array().unwrap().len(), 1);
+        // Without a limit a check page holds 20 instances, the default.
+        let many: Vec<_> = (0..45)
+            .map(|i| rule_instance(i, "unknown", vec![]))
+            .collect();
+        let whole = rules_envelope(many, vec![]);
+        let pages = rules_pages("trellis_rules_check", &whole, json!({"schemaVersion":1}));
+        let sizes: Vec<_> = pages
+            .iter()
+            .map(|data| data["instances"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(sizes, [20, 20, 5]);
+        // Explain pages by bytes only: its limit is the evidence sample.
+        let pages = rules_pages(
+            "trellis_rules_explain",
+            &whole,
+            json!({"schemaVersion":1,"limit":5}),
+        );
+        assert_eq!(pages[0]["instances"].as_array().unwrap().len(), 45);
     }
 
     /// A lone first item is admitted exactly when its complete line plus LF fits
@@ -634,15 +954,33 @@ mod tests {
                         .unwrap()
                         .len()
                 };
-                let empty = capped(&id, "trellis_references", whole(0), Some(0), modern);
+                let empty = capped(
+                    &id,
+                    "trellis_references",
+                    whole(0),
+                    Some(Paging::at(0)),
+                    modern,
+                );
                 // Each added ASCII byte of the reason adds one byte to the line.
                 // The empty frame can hold the tail item too, so converge on the
                 // singleton frame's own length.
                 let mut at_cap = super::super::wire::RESPONSE_BYTES - 1 - line(&empty);
-                let mut fits = capped(&id, "trellis_references", whole(at_cap), Some(0), modern);
+                let mut fits = capped(
+                    &id,
+                    "trellis_references",
+                    whole(at_cap),
+                    Some(Paging::at(0)),
+                    modern,
+                );
                 for _ in 0..4 {
                     at_cap += super::super::wire::RESPONSE_BYTES - 1 - line(&fits);
-                    fits = capped(&id, "trellis_references", whole(at_cap), Some(0), modern);
+                    fits = capped(
+                        &id,
+                        "trellis_references",
+                        whole(at_cap),
+                        Some(Paging::at(0)),
+                        modern,
+                    );
                 }
                 let data = &fits["structuredContent"]["data"];
                 assert_eq!(data["unresolved"].as_array().unwrap().len(), 1, "{modern}");
@@ -655,7 +993,7 @@ mod tests {
                     &id,
                     "trellis_references",
                     whole(at_cap + 1),
-                    Some(0),
+                    Some(Paging::at(0)),
                     modern,
                 );
                 assert_eq!(

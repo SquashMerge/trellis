@@ -1746,14 +1746,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
             tool.response = if architecture::is_tool(&name) || name == architecture::PROMPT_NAME {
                 // Tools page their arrays into the response cap; the prompt never pages.
-                let offset = architecture::is_tool(&name).then(|| {
-                    arguments
-                        .as_ref()
-                        .and_then(|arguments| arguments.get("offset"))
-                        .and_then(wire::uint)
-                        .unwrap_or(0)
-                });
-                architecture::capped(id, &name, envelope, offset, modern)
+                let paging = architecture::is_tool(&name)
+                    .then(|| architecture::Paging::from_arguments(&name, arguments.as_ref()));
+                architecture::capped(id, &name, envelope, paging, modern)
             } else {
                 tools::result(&name, envelope, modern)
             };

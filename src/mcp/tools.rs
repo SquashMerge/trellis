@@ -1531,6 +1531,45 @@ mod tests {
                 );
             }
         }
+        // #725: check alone takes a nonempty, duplicate-free status filter.
+        for status in [
+            json!(["deviates"]),
+            json!(["deviates", "unknown"]),
+            json!(["conforms", "deviates", "unknown"]),
+        ] {
+            assert_eq!(
+                validate(
+                    "trellis_rules_check",
+                    Some(&json!({"schemaVersion":1,"status":status}))
+                ),
+                Ok(())
+            );
+        }
+        for status in [
+            json!(null),
+            json!("deviates"),
+            json!([]),
+            json!(["violates"]),
+            json!(["deviates", "deviates"]),
+            json!([1]),
+        ] {
+            assert_eq!(
+                validate(
+                    "trellis_rules_check",
+                    Some(&json!({"schemaVersion":1,"status":status}))
+                ),
+                Err("invalid_request"),
+                "{status}"
+            );
+        }
+        for name in ["trellis_references", "trellis_rules_explain"] {
+            let mut arguments = json!({"schemaVersion":1,"status":["deviates"]});
+            if name == "trellis_rules_explain" {
+                arguments["rule"] = json!("$layers");
+                arguments["target"] = identity.clone();
+            }
+            assert_eq!(validate(name, Some(&arguments)), Err("invalid_request"));
+        }
         assert_eq!(
             validate(
                 "trellis_rules_explain",
