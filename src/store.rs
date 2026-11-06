@@ -14126,45 +14126,53 @@ impl Store {
     /// snapshot. The root and selected revision are rechecked at finish.
     pub fn evidence_response_daemon_local(&self) -> Result<EvidenceResponse> {
         (|| {
-            if self.disposition() == RecoveryDisposition::UpgradePending
-                || self.is_recreate_pending()
-            {
-                return Err(topology::IndexNotReady::new(
-                    "exceptional index reconciliation pending",
-                )
-                .into());
-            }
-            self.identity.verify()?;
-            #[cfg(test)]
-            self.test_before_evidence_snapshot_hook.run();
-            let db = self
-                .cache()
-                .map_err(|error| self.report_index_failure(error))?;
-            storage_result(db.execute_batch("BEGIN DEFERRED"))?;
-            begin_read_snapshot(
-                &db,
-                &self.roots.index_db(&self.identity),
-                Duration::from_secs(5),
-            )?;
-            let schema: u32 =
-                storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
-            if schema != DATABASE_SCHEMA_VERSION {
-                return Err(topology::IndexNotReady::new("reconciliation required").into());
-            }
-            let selected = self.read_revision_for(&db, None, true)?;
-            self.identity.verify()?;
-            let mut store = self.clone();
-            store.admitted = Some((selected.pin, selected.headers));
-            let optional_recovery = OptionalRecovery::new(&store);
-            Ok(EvidenceResponse {
-                store,
-                db,
-                fence: ReadFence(selected.pin),
-                optional_recovery,
-                stable_lookup_keys: std::cell::RefCell::new(BTreeMap::new()),
-            })
+            self.ensure_evidence_admissible()?;
+            let db = self.open_evidence_snapshot()?;
+            self.admit_evidence(db)
         })()
         .map_err(|error| self.report_index_failure(error))
+    }
+    fn ensure_evidence_admissible(&self) -> Result<()> {
+        if self.disposition() == RecoveryDisposition::UpgradePending || self.is_recreate_pending() {
+            return Err(
+                topology::IndexNotReady::new("exceptional index reconciliation pending").into(),
+            );
+        }
+        self.identity.verify()
+    }
+    /// A read-only index connection inside a deferred transaction that holds its snapshot.
+    fn open_evidence_snapshot(&self) -> Result<IndexConnection> {
+        #[cfg(test)]
+        self.test_before_evidence_snapshot_hook.run();
+        let db = self
+            .cache()
+            .map_err(|error| self.report_index_failure(error))?;
+        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        begin_read_snapshot(
+            &db,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
+        Ok(db)
+    }
+    fn admit_evidence(&self, db: IndexConnection) -> Result<EvidenceResponse> {
+        let schema: u32 =
+            storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+        if schema != DATABASE_SCHEMA_VERSION {
+            return Err(topology::IndexNotReady::new("reconciliation required").into());
+        }
+        let selected = self.read_revision_for(&db, None, true)?;
+        self.identity.verify()?;
+        let mut store = self.clone();
+        store.admitted = Some((selected.pin, selected.headers));
+        let optional_recovery = OptionalRecovery::new(&store);
+        Ok(EvidenceResponse {
+            store,
+            db,
+            fence: ReadFence(selected.pin),
+            optional_recovery,
+            stable_lookup_keys: std::cell::RefCell::new(BTreeMap::new()),
+        })
     }
 
     pub fn evidence_response(&self) -> Result<EvidenceResponse> {
@@ -14218,7 +14226,20 @@ impl Store {
         before_finish: impl FnOnce() -> Result<()>,
         observe_finish: impl FnOnce(&Result<()>),
     ) -> Result<T> {
-        let response = self.evidence_response()?;
+        self.finish_evidence_response(
+            self.evidence_response()?,
+            read,
+            before_finish,
+            observe_finish,
+        )
+    }
+    fn finish_evidence_response<T>(
+        &self,
+        response: EvidenceResponse,
+        read: impl FnOnce(&EvidenceResponse) -> Result<T>,
+        before_finish: impl FnOnce() -> Result<()>,
+        observe_finish: impl FnOnce(&Result<()>),
+    ) -> Result<T> {
         let value = read(&response).map_err(|error| self.report_index_failure(error));
         let hook = before_finish();
         let fence = response.finish(());
@@ -18352,15 +18373,56 @@ impl Store {
         pin: IndexPin,
         read: impl FnOnce(&NativeReader<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.native_at(pin, |db, selected| {
-            // The response connection is per request: bound its page cache for batch staging.
-            let kib = crate::semantic_batch::limits::NATIVE_READER_CACHE_KIB;
-            storage_result(db.pragma_update(None, "cache_size", -i64::try_from(kib)?))?;
-            read(&NativeReader {
-                store: self,
-                db,
-                selected,
-            })
+        self.with_evidence(|db| self.native_reader_on(db, pin, read))
+    }
+
+    /// [`Self::index_baseline`], then [`Self::with_native_reader`] at that pin, both in one
+    /// SQLite snapshot, so no publication can commit between the two reads (#731). The
+    /// outer error is the baseline's; the inner result is the native read's.
+    pub fn with_baseline_native_reader<T>(
+        &self,
+        read: impl FnOnce(&NativeReader<'_>) -> Result<T>,
+    ) -> Result<(IndexPin, Result<T>)> {
+        let (db, pin) = (|| {
+            self.ensure_not_recreate_pending()?;
+            let db = self.open_evidence_snapshot()?;
+            let pin = self
+                .recovery_baseline(&db)?
+                .pin
+                .context("index_not_ready: prior index pin is not decodable")?;
+            Ok((db, pin))
+        })()
+        .map_err(|error| self.report_index_failure(error))?;
+        let read = (|| {
+            self.ensure_evidence_admissible()?;
+            self.admit_evidence(db)
+        })()
+        .map_err(|error| self.report_index_failure(error))
+        .and_then(|response| {
+            self.finish_evidence_response(
+                response,
+                |response| self.native_reader_on(&response.db, pin, read),
+                || Ok(()),
+                |_| {},
+            )
+        });
+        Ok((pin, read))
+    }
+
+    fn native_reader_on<T>(
+        &self,
+        db: &Connection,
+        pin: IndexPin,
+        read: impl FnOnce(&NativeReader<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let selected = self.read_revision(db, Some(pin))?;
+        // The response connection is per request: bound its page cache for batch staging.
+        let kib = crate::semantic_batch::limits::NATIVE_READER_CACHE_KIB;
+        storage_result(db.pragma_update(None, "cache_size", -i64::try_from(kib)?))?;
+        read(&NativeReader {
+            store: self,
+            db,
+            selected: &selected,
         })
     }
 

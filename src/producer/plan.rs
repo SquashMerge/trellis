@@ -415,8 +415,10 @@ fn mode(last: Option<&RunRecord>) -> Value {
 /// filled by their owners.
 pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Result<Value> {
     let declared = Declared::new(&request.environment)?;
-    let head = match store.index_baseline() {
-        Ok(pin) => match store.with_native_reader(pin, |reader| Ok(reader.header()?.revision.id)) {
+    // One snapshot for the pin and its header: the first publication after a rebuild
+    // cannot pair a stale revision-0 pin with the new head (#731).
+    let head = match store.with_baseline_native_reader(|reader| Ok(reader.header()?.revision.id)) {
+        Ok((pin, read)) => match read {
             Ok(revision) => Some(json!({
                 "sourceRevision": revision,
                 "indexGeneration": pin.index_generation.to_string(),
