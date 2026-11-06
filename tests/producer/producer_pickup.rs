@@ -7,8 +7,8 @@
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::Read,
-    os::unix::net::UnixStream,
+    io::{Read, Write},
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::Duration,
@@ -496,20 +496,45 @@ fn pickup_reimports_unchanged_artifact_after_rebuild() {
         }
     }
 
+    // The restarted daemon's startup is held before its first publication, so the
+    // status read always meets the empty bootstrap head (#704): it reports no head
+    // instead of failing.
+    let gate = Builder::new()
+        .prefix("startup-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = gate.path().join("startup.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
     let mut status = checkout.cli();
     for (key, value) in fast() {
         status.env(key, value);
     }
-    let output = status
+    let child = status
+        .env("TRELLIS_TEST_DAEMON_STARTUP_SOCKET", &socket)
         .args(["producer", "status", "--workspace"])
         .arg(&checkout.root)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    let mut held = None;
+    trellis::testing::wait_until("the restarted startup to reach its hook", || {
+        held = listener.accept().ok().map(|(stream, _)| stream);
+        held.is_some()
+    });
+    let mut held = held.unwrap();
+    held.set_nonblocking(false).unwrap();
+    held.read_exact(&mut [0]).unwrap();
+    let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply["head"], Value::Null, "{reply}");
+    held.write_all(&[1]).unwrap();
     let imported = wait_last(checkout, "the rebuilt index to re-import", |last| {
         last["requestId"] != first["requestId"] && last["state"] == "done"
     });
