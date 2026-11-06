@@ -497,6 +497,9 @@ pub struct Store {
     test_after_claim_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_before_request_terminal_commit_hook: Arc<TestOneShotHook>,
+    /// Runs before an evidence read opens its SQLite snapshot (#731).
+    #[cfg(test)]
+    test_before_evidence_snapshot_hook: Arc<TestOneShotHook>,
     maintenance_before_writer_hook: Arc<TestOneShotHook>,
     maintenance_after_first_delete_hook: Arc<TestOneShotHook>,
     /// `MAINTENANCE_UNIT_BUDGET` in microseconds; tests may shorten or lengthen it.
@@ -12222,6 +12225,8 @@ impl Store {
             test_after_claim_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_before_request_terminal_commit_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_before_evidence_snapshot_hook: Arc::new(TestOneShotHook::default()),
             maintenance_before_writer_hook: Arc::new(TestOneShotHook::default()),
             maintenance_after_first_delete_hook: Arc::new(TestOneShotHook::default()),
             maintenance_unit_budget_us: Arc::new(AtomicU64::new(
@@ -13814,6 +13819,14 @@ impl Store {
         self.test_before_request_terminal_commit_hook.set(hook);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_before_evidence_snapshot_hook_for_tests(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.test_before_evidence_snapshot_hook.set(hook);
+    }
+
     #[cfg(feature = "test-support")]
     pub fn set_after_claim_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
         self.test_after_claim_hook.set(hook);
@@ -14122,6 +14135,8 @@ impl Store {
                 .into());
             }
             self.identity.verify()?;
+            #[cfg(test)]
+            self.test_before_evidence_snapshot_hook.run();
             let db = self
                 .cache()
                 .map_err(|error| self.report_index_failure(error))?;

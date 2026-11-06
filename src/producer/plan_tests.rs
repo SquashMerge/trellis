@@ -218,3 +218,63 @@ fn producer_status_rejects_partial_bootstrap() {
         "{error:#}"
     );
 }
+
+/// #731: the first publication after a rebuild commits while status runs, after status
+/// has started on the revision-0 bootstrap and before it reads the native header. Status
+/// reports the head it read, never `revision conflict: foreign or missing native pin`.
+#[cfg(feature = "test-support")]
+#[test]
+fn producer_status_survives_the_first_publication_mid_read() {
+    use crate::indexer::{IndexOptions, index_workspace_bundle};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(work.path()).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.js"), "function a(){}\n").unwrap();
+    let store = crate::store::Store::open_for_tests(state.path(), &root).unwrap();
+    let request = plan::StatusRequest {
+        version: 1,
+        run_id: None,
+        environment: Environment {
+            path: "/usr/bin".into(),
+            home: root.to_str().unwrap().into(),
+            ..Environment::default()
+        },
+    };
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    assert_eq!(
+        plan::status(&store, &request, None).unwrap()["head"],
+        Value::Null
+    );
+
+    // The hook runs on status's own thread just before its evidence read opens a SQLite
+    // snapshot, so the first publication has committed by the time that read starts.
+    let published = Arc::new(Mutex::new(None));
+    let (publisher, slot) = (store.clone(), published.clone());
+    store.set_before_evidence_snapshot_hook_for_tests(move || {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(publisher.workspace_root().into()),
+            publisher.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let leader = publisher.publication_for_tests().unwrap();
+        let expected = publisher.index_baseline().unwrap();
+        assert_eq!(expected.index_revision, 0);
+        let pin = publisher
+            .publish_native(&graph, &capture, &native, &leader, expected, &cancel)
+            .unwrap();
+        *slot.lock().unwrap() = Some(pin);
+    });
+    let status = plan::status(&store, &request, None).unwrap();
+    let pin = published.lock().unwrap().expect("the hook published");
+    assert_eq!(pin.index_revision, 1);
+    assert_eq!(status["head"]["indexRevision"], json!(pin.index_revision));
+    assert_eq!(
+        status["head"]["indexGeneration"],
+        json!(pin.index_generation.to_string())
+    );
+}
