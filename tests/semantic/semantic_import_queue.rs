@@ -322,14 +322,7 @@ fn two_document_case(change_b: &str) {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let start = Instant::now();
-        while !socket.exists() {
-            assert!(
-                start.elapsed() < Duration::from_secs(12),
-                "semantic publication barrier not reached"
-            );
-            std::thread::yield_now();
-        }
+        trellis::testing::wait_until("semantic publication barrier", || socket.exists());
         let published = store.index_baseline().unwrap();
         assert!(published.index_revision > r1.index_revision);
         let original = store.earliest_unfinished_request().unwrap().unwrap();
@@ -350,12 +343,14 @@ fn two_document_case(change_b: &str) {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let start = Instant::now();
+        // The CLI exits once the daemon owning the reclaimed request has published its
+        // terminal row; only a hang trips the backstop.
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         let output = loop {
             if recovering.try_wait().unwrap().is_some() {
                 break recovering.wait_with_output().unwrap();
             }
-            if start.elapsed() > Duration::from_secs(10) {
+            if Instant::now() >= deadline {
                 recovering.kill().unwrap();
                 panic!(
                     "semantic publication recovery stalled: original={:?} head={:?}",
@@ -363,7 +358,7 @@ fn two_document_case(change_b: &str) {
                     store.earliest_unfinished_request()
                 );
             }
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(10));
         };
         crate::child::assert_cli_success(&output, "output");
         let committed: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -518,14 +513,7 @@ fn two_document_case(change_b: &str) {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let start = Instant::now();
-        while !socket.exists() {
-            assert!(
-                start.elapsed() < Duration::from_secs(15),
-                "semantic claim barrier not reached"
-            );
-            std::thread::yield_now();
-        }
+        trellis::testing::wait_until("semantic claim barrier", || socket.exists());
         let claimed = store.earliest_unfinished_request().unwrap().unwrap();
         assert_eq!(claimed.state, "running");
         crash_daemon.as_mut().unwrap().kill_and_wait(&home);
@@ -540,13 +528,15 @@ fn two_document_case(change_b: &str) {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let start = Instant::now();
+        // The CLI exits once the daemon owning the reclaimed request has published its
+        // terminal row; only a hang trips the backstop.
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         let output = loop {
             if repeated_child.try_wait().unwrap().is_some() {
                 break repeated_child.wait_with_output().unwrap();
             }
-            let row = store.request_by_id(&claimed.id).unwrap().unwrap();
-            if start.elapsed() > Duration::from_secs(8) {
+            if Instant::now() >= deadline {
+                let row = store.request_by_id(&claimed.id).unwrap().unwrap();
                 eprintln!(
                     "RECOVERY_FIXTURE={} CLAIMED={claimed:?} DAEMON_PID={:?} ORIGINAL_ROW={row:?} NEXT_ROW={:?} MARKER={:?}",
                     temp.path().display(),
@@ -563,7 +553,7 @@ fn two_document_case(change_b: &str) {
                 let _ = temp.keep();
                 panic!("recovery CLI stuck");
             }
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(10));
         };
         crate::child::assert_cli_success(&output, "output");
         let repeated: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -753,7 +743,6 @@ fn two_document_case(change_b: &str) {
     }
     let joined = if matches!(change_b, "cutoff" | "whole_cas") {
         use std::os::unix::net::UnixStream;
-        use std::time::{Duration, Instant};
         let prior_report = store
             .semantic_batch_report_at(advanced_pin, &digest)
             .unwrap()
@@ -794,14 +783,9 @@ fn two_document_case(change_b: &str) {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let start = Instant::now();
-        while !socket.with_extension("ready").exists() {
-            assert!(
-                start.elapsed() < Duration::from_secs(10),
-                "semantic candidate cutoff was not reached"
-            );
-            std::thread::yield_now();
-        }
+        trellis::testing::wait_until("semantic candidate cutoff", || {
+            socket.with_extension("ready").exists()
+        });
         // Native-first semantic catch-up may publish a same-native head after the native
         // request returned (#702), so the cutoff binds the native revision, not the pin.
         let before = store.index_baseline().unwrap();
