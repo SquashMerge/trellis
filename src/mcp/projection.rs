@@ -2029,6 +2029,70 @@ mod compact_symbol_tests {
         );
     }
 
+    /// PR #767 review: the empty prefix lists every searched language, a hit only its own.
+    /// A large unrelated Rust row that overflows the empty frame must not reject a
+    /// JavaScript hit that fits; a genuinely zero-hit answer still keeps the Rust row and,
+    /// too large, is `range_too_large`.
+    #[test]
+    fn a_large_unrelated_scope_row_does_not_reject_a_fitting_hit() {
+        let mut tiers: Tiers = Default::default();
+        tiers[1].documents = (0..700)
+            .map(|i| {
+                serde_json::from_value(json!({"producerId":"rust-analyzer","language":"rust",
+                "path":format!("src/projected/module_{i:04}.rs"),
+                "projection":{"currentPin":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":2},
+                    "semanticBasisPin":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1},
+                    "basisNativeRevisionId":"revision:v2:historical","semanticStatus":"olderBasis"}}))
+                .unwrap()
+            })
+            .collect();
+        let rust_row = serde_json::to_vec(&language_status(&SCOPE, &tiers)[1])
+            .unwrap()
+            .len();
+        assert!(rust_row > crate::mcp::wire::RESPONSE_BYTES, "{rust_row}");
+        let hit = || {
+            fixture(
+                &[("navigationAt", "javascript", "web/app.js", false)],
+                false,
+            )
+        };
+        for compact in [false, true] {
+            let found = find(&json!(1), hit(), &tiers, root(), false, true, compact)
+                .unwrap()
+                .expect("the JavaScript hit fits");
+            assert_eq!(found["data"]["symbols"].as_array().unwrap().len(), 1);
+            assert_eq!(languages(&found), ["javascript"]);
+            assert_eq!(found["truncated"], false);
+            assert_eq!(found["partial"], true, "the Rust scope is still partial");
+            let searched = search(
+                &json!(1),
+                search_result(hit()),
+                &tiers,
+                root(),
+                false,
+                true,
+                compact,
+            )
+            .unwrap()
+            .expect("the JavaScript hit fits");
+            assert_eq!(searched["data"]["hits"].as_array().unwrap().len(), 1);
+            assert_eq!(languages(&searched), ["javascript"]);
+            let empty = find(
+                &json!(1),
+                fixture(&[], false),
+                &tiers,
+                root(),
+                false,
+                true,
+                compact,
+            );
+            assert!(
+                empty.unwrap().is_none(),
+                "zero hits keep the oversized Rust row"
+            );
+        }
+    }
+
     /// Full find and search list each distinct coverage diagnostic once in
     /// `coverageDiagnostics`; each coverage row refers to it by `diagnosticRef`, and
     /// re-inlining gives back the native coverage rows.
