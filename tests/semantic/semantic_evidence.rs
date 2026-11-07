@@ -405,6 +405,25 @@ fn required_nullable_and_nested_keys_are_closed() {
 }
 
 #[test]
+fn language_names_round_trip_including_typescript() {
+    for (language, name) in [
+        (s::Language::Java, "java"),
+        (s::Language::Rust, "rust"),
+        (s::Language::Python, "python"),
+        (s::Language::Javascript, "javascript"),
+        (s::Language::Typescript, "typescript"),
+    ] {
+        let value = serde_json::to_value(language).unwrap();
+        assert_eq!(value, json!(name));
+        assert_eq!(
+            serde_json::from_value::<s::Language>(value).unwrap(),
+            language
+        );
+    }
+    assert!(s::Language::Javascript < s::Language::Typescript);
+}
+
+#[test]
 fn six_coverage_states_and_roles() {
     let (base, native, bytes) = fixture();
     for (state, requested, selected, diagnostic) in [

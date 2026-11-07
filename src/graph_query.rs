@@ -690,6 +690,7 @@ fn language_name(language: sem::Language) -> &'static str {
         sem::Language::Rust => "rust",
         sem::Language::Python => "python",
         sem::Language::Javascript => "javascript",
+        sem::Language::Typescript => "typescript",
     }
 }
 

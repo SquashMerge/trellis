@@ -360,6 +360,19 @@ fn rows_must_strictly_increase_across_pages() {
 }
 
 #[test]
+fn typescript_rows_follow_javascript() {
+    let mut source = RowOrder::source();
+    source.push("javascript", "b.js").unwrap();
+    source.push("typescript", "a.ts").unwrap();
+    let mut reversed = RowOrder::source();
+    reversed.push("typescript", "a.ts").unwrap();
+    assert_eq!(
+        admission_detail(reversed.push("javascript", "b.js").unwrap_err()),
+        "unsorted source rows"
+    );
+}
+
+#[test]
 fn coverage_row_requires_exactly_one_disposition() {
     let row = |artifact: Value, exclusion: Value| {
         serde_json::from_value::<CoverageRow>(json!({

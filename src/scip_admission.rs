@@ -113,6 +113,7 @@ fn semantic_language(name: &str) -> Option<Language> {
         "rust" => Some(Language::Rust),
         "python" => Some(Language::Python),
         "javascript" => Some(Language::Javascript),
+        "typescript" => Some(Language::Typescript),
         _ => None,
     }
 }
@@ -352,13 +353,7 @@ pub(crate) fn file_uri(root: &Path) -> Result<String, ScipCaptureError> {
     Ok(out)
 }
 pub(crate) fn order(language: &str) -> usize {
-    match language {
-        "java" => 0,
-        "rust" => 1,
-        "python" => 2,
-        "javascript" => 3,
-        _ => usize::MAX,
-    }
+    crate::semantic_evidence::language_order(language).unwrap_or(usize::MAX)
 }
 #[cfg(test)]
 mod tests {
