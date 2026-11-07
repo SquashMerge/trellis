@@ -781,7 +781,11 @@ fn symbols(
     };
     let mut last = None;
     // The empty prefix carries only the fixed envelope and the scope rows; if
-    // even it cannot fit, the answer is range_too_large.
+    // neither it nor any hit prefix fits, the answer is range_too_large.
+    // #715: the empty prefix lists every searched language while a hit prefix
+    // lists only its own, so the empty frame is no lower bound on a hit frame:
+    // it may overflow where one hit fits. From one hit on, each longer prefix
+    // adds items and never drops a scope row, so its frame only grows.
     let start = if atomic { result.symbols.len() } else { 0 };
     for n in start..=result.symbols.len() {
         let (documents, refs) = document_table(
@@ -911,7 +915,7 @@ fn symbols(
             < super::wire::RESPONSE_BYTES
         {
             last = Some(envelope);
-        } else {
+        } else if n > 0 {
             break;
         }
     }

@@ -323,6 +323,10 @@ incoming `scopeCoverage` and the lookup alternatives other tools return keep the
   native tuples (the #528 `syntaxOnly` rule), and with neither it is empty. Row contents are
   unchanged. `partial` and the aggregate `coverageIncomplete` warning still cover every
   searched language, so an answer can be partial because of a language it does not list.
+  Because the empty prefix lists more rows than a hit prefix may, the W2 byte fit no longer
+  treats it as a lower bound: the longest fitting hit prefix is returned even when the
+  empty prefix alone would not fit, and `range_too_large` means neither the empty prefix
+  nor the first hit fits.
 - **Coverage diagnostic table.** Full find and search data add the required
   `coverageDiagnostics:Text[]`: each distinct coverage `diagnostic` of the page's rows once,
   in first-row order. Each `coverage` row carries `diagnosticRef:UInt|null` instead of
