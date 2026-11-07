@@ -1301,6 +1301,49 @@ mod tests {
         );
     }
 
+    /// #582: an input over its cap that is not admitted unread fails as the typed
+    /// `limit_exceeded: input bytes`, never an untyped error, and is never opened.
+    #[test]
+    fn an_input_over_its_cap_is_typed_limit_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input");
+        fs::write(&path, "x".repeat(300)).unwrap();
+        let (mut identities, mut inputs, mut input_bytes) =
+            (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let opened = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = opened.clone();
+        let error = with_source_read_hook(
+            move |_: &Path, phase: &str| {
+                if phase == "open" {
+                    seen.set(seen.get() + 1);
+                }
+            },
+            || {
+                admit_input(
+                    path.clone(),
+                    256,
+                    None,
+                    &Arc::new(AtomicBool::new(false)),
+                    &BTreeSet::new(),
+                    &mut identities,
+                    &mut inputs,
+                    &mut input_bytes,
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(opened.get(), 0);
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::store::requests::TypedFailure>())
+            .expect("typed failure");
+        assert_eq!(
+            (typed.code, typed.detail.as_str()),
+            ("limit_exceeded", "input bytes")
+        );
+        assert!(inputs.is_empty() && input_bytes.is_empty());
+    }
+
     /// #581: a config input over its cap is admitted unread. It is never opened, its stat is
     /// kept and the placeholder is its bytes; the capture verifies without reading it, and a
     /// change to it is still drift.
