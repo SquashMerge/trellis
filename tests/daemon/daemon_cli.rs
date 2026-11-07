@@ -1458,6 +1458,45 @@ fn cold_cli_commands_start_and_reuse_daemon() {
     assert!(!symbols["data"]["items"].as_array().unwrap().is_empty());
 }
 
+/// #582: a fresh daemon's startup reconciliation runs at the default file cap. The first
+/// `index --max-file-bytes N` then captures at N, and an input only N refuses (an ignore file
+/// over N) failed as the untyped `index_failed: internal error`. It is the typed
+/// `limit_exceeded: input bytes`, with no path in the reply, and the head is unchanged.
+#[test]
+fn first_index_with_smaller_file_cap_types_an_input_over_the_cap() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "capped");
+    let ignore = "target/\n".repeat(60);
+    assert!(ignore.len() > 300);
+    fs::write(root.join(".gitignore"), ignore).unwrap();
+    let index = |cap: Option<&str>| {
+        let mut command = cli(&home);
+        command.arg("index").arg("--workspace").arg(&root);
+        if let Some(cap) = cap {
+            command.arg("--max-file-bytes").arg(cap);
+        }
+        command.output().unwrap()
+    };
+    let first = crate::child::cli_json(&index(None), "default-cap index failed");
+    let head = first["publishedRevision"].clone();
+    assert!(head["indexRevision"].as_u64().is_some(), "{first}");
+    let capped = index(Some("300"));
+    let stderr = String::from_utf8_lossy(&capped.stderr);
+    assert!(!capped.status.success(), "{stderr}");
+    let message = stderr.trim();
+    assert!(
+        message.starts_with("Error: limit_exceeded: request ")
+            && message.ends_with(" failed: input bytes; inspect job status"),
+        "{message}"
+    );
+    assert!(!message.contains(".gitignore"), "{message}");
+    let status = run(&home, "status", &root);
+    assert_eq!(status["revision"], head, "{status}");
+}
+
 #[tokio::test]
 async fn long_home_socket_names_are_private_distinct_connectable_and_recover_after_crash() {
     use std::os::unix::{

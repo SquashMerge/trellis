@@ -301,6 +301,17 @@ fn identity(_item: &Stamp) -> Option<(u64, u64)> {
     None
 }
 
+/// An input over its cap that is not admitted unread fails the capture as the typed
+/// `limit_exceeded: input bytes` (#582), not `index_failed: internal error`. The path stays
+/// in the diagnostics chain; the terminal row records only the code and reason.
+fn input_over_cap(path: &Path) -> anyhow::Error {
+    anyhow::Error::from(crate::store::requests::TypedFailure {
+        code: "limit_exceeded",
+        detail: "input bytes".to_owned(),
+    })
+    .context(format!("oversized input: {}", path.display()))
+}
+
 /// Where an input over its cap goes: `None` fails the capture; a config input is instead
 /// admitted unread, with the placeholder as its bytes, and recorded here (#581).
 type SkippedInputs<'a> = Option<&'a mut BTreeSet<PathBuf>>;
@@ -320,12 +331,11 @@ fn admit_input(
     let bytes = match &state {
         None => None,
         Some(item) => {
-            let unread = item.kind == 2 && item.len > cap && skipped.is_some();
-            ensure!(
-                item.kind == 2 && (item.len <= cap || unread),
-                "unsafe or oversized input: {}",
-                path.display()
-            );
+            ensure!(item.kind == 2, "unsafe input: {}", path.display());
+            let unread = item.len > cap && skipped.is_some();
+            if item.len > cap && !unread {
+                return Err(input_over_cap(&path));
+            }
             let key = identity(item);
             ensure!(
                 !key.is_some_and(|key| source_identities.contains(&key)),

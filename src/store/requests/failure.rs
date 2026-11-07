@@ -73,6 +73,7 @@ const REASONS: &[&str] = &[
     "generation origin",
     "head revision changed",
     "index entries",
+    "input bytes",
     "invalid document list",
     "invalid role path",
     "lookup steps",
