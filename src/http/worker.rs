@@ -1048,6 +1048,8 @@ impl DaemonState {
             other_intent: watcher.intent_besides_generation(options),
             capturing: watcher.capturing_handle(),
         });
+        // Only now does the public status name a replacement's generation.
+        watcher.status_published();
     }
 }
 

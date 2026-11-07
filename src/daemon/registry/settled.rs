@@ -116,7 +116,8 @@ impl CheckoutRuntime {
     /// (#752). Owners raise a pending flag before the work it covers publishes:
     /// ingress bumps the watcher generation, a watcher reconciliation that can
     /// publish (a periodic inventory included) publishes `capturing` until it
-    /// returns, and enqueue sets FIFO pending.
+    /// returns, a replaced watcher keeps it raised until its own status is
+    /// published, and enqueue sets FIFO pending.
     /// Its one bound is `HANG_BACKSTOP`, and
     /// the error names the component still busy. It holds an admission lease, so
     /// the checkout cannot be released while it waits.
