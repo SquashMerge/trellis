@@ -74,7 +74,7 @@ fn world(populate: impl FnOnce(&Path)) -> World {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     populate(&root);
-    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = index_workspace_bundle(
         &IndexOptions::new(root.clone()),

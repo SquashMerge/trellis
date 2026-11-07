@@ -5,7 +5,9 @@ cases each. Normal runs use per-suite defaults (4–40); set
 `TRELLIS_PROPTEST_CASES` to override all of them. `PROPTEST_RNG_SEED` can make
 generated runs reproducible. The nightly sets it to the GitHub run ID, so an
 attempt can be replayed without fixing the same seed across different runs.
-Proptest also replays checked-in regression seeds.
+Proptest also replays checked-in regression seeds. The weekly stress lane
+(`docs/releases.md#stress-lane`) adds a deeper pass: the same properties, once,
+at 1024 cases each (`proptest_cases` dispatch input), seeded with the run ID.
 
 For a local deep run, use the selection in
 `.github/workflows/proptest-nightly.yml`. The witnessed-rejoin tests run their
@@ -21,7 +23,10 @@ history and its completed duration; normal test runs do not emit this trace.
 The suite compares individual unchanged-source reference sites after degradation
 in JavaScript, Python, Rust and Java; compares witnessed LOCAL rejoin against
 FULL; checks the Decision 0006 head-rooted retention model with two producer
-slots; compares Architecture/metrics cached results and synchronized races with
+slots; checks native-first publication (`proptest_native_first`: N readable
+before S, pending and older-basis labels, supersession, copied rows, typed
+failures) against an independent model, with the in-S LOCAL-vs-FULL oracle on;
+compares Architecture/metrics cached results and synchronized races with
 fresh computation; and exercises SCIP ranges, encodings, enums and bounds.
 The reference projections are structural rather than semantic bindings, and the
 cache and FULL differentials share some production components. These bounded

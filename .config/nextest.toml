@@ -25,8 +25,22 @@ test-group = 'producer-e2e'
 filter = 'binary_id(=trellis::semantic) & test(=semantic_batch_store::proptest_retention::decision_0006_multi_slot_histories)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 
+# 256 native-first histories take about 6 minutes on an M-series Mac (#757).
+[[profile.nightly.overrides]]
+filter = 'binary_id(=trellis::semantic) & test(=proptest_native_first::native_first_generated_histories)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+
 # tools/stress (the stress workflow) runs the suite under CPU load. Each
 # repetition's JUnit report names the failed tests and keeps their output.
 # Everything else, including the test groups above, comes from the default.
 [profile.stress.junit]
+path = "junit.xml"
+
+# The stress workflow's deep property pass (tools/stress --proptest-cases)
+# reruns the property tests at a much higher case count (#757). One generated
+# test then runs many histories, so its hang backstop is two hours.
+[profile.deep]
+slow-timeout = { period = "60s", terminate-after = 120 }
+
+[profile.deep.junit]
 path = "junit.xml"

@@ -186,20 +186,34 @@ report, which keeps the failed tests' output, as a `stress-<os>-attempt-<n>`
 artifact. Nothing is filed automatically: a human or supervisor triages the
 failures as defects (see the concurrency rules in `CLAUDE.md`).
 
+After the repetitions, a deep property pass reruns the curated property tests
+(`tests/property-testing.md`) once, without load, at `proptest_cases` cases
+each (default 1024; `0` skips it), under the `deep` nextest profile, seeded
+with `PROPTEST_RNG_SEED` set to the run ID. Its failures get their own job
+summary section, and its log, JUnit report, seed and proptest regression files
+are uploaded as a `proptest-deep-<os>-attempt-<n>` artifact (#757). `repeat=0`
+runs only the deep pass.
+
 To dispatch it, from the Actions tab or with:
 
 ```sh
 gh workflow run stress.yml -f repeat=3 -f load=2 -f os=both \
-  [-f test_threads=8] [-f filter='binary_id(trellis::http)']
+  [-f test_threads=8] [-f filter='binary_id(trellis::http)'] [-f proptest_cases=1024]
 ```
 
-A default run takes about 1–2 hours per runner. To run the same loop locally,
-under the verify lock:
+A default run takes about 1–2 hours per runner, plus the deep pass. At 1024
+cases the deep pass takes about 22 minutes on an 18-core M-series Mac, set by
+its longest property (native-first); expect roughly 40–60 minutes on a hosted
+runner. To run the same loop locally, under the verify lock:
 
 ```sh
 /usr/bin/lockf -k /tmp/trellis-factory-verify.lock \
   ./tools/stress --repeat 2 --load 2 -- -E 'test(/watcher/)'
+# Only the deep property pass:
+/usr/bin/lockf -k /tmp/trellis-factory-verify.lock \
+  ./tools/stress --repeat 0 --proptest-cases 1024
 ```
 
 Output goes to `target-test-support/stress/`: `rep-<n>.log`,
-`rep-<n>-junit.xml` and `summary.md`.
+`rep-<n>-junit.xml` and `summary.md`, and for the deep pass `deep/deep.log`,
+`deep/junit.xml`, `deep/seed.txt` and, on failure, `deep/regressions/`.
