@@ -4817,14 +4817,22 @@ async fn describe_replies_at_its_deadline_while_the_read_is_still_running() {
         true
     );
     // The released read now succeeds in the background; its result must not
-    // reach the client.
-    client
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .unwrap();
-    let mut stray = String::new();
-    assert!(
-        reader.read_line(&mut stray).is_err(),
-        "late result was written after the deadline reply: {stray}"
+    // reach the client. Once its worker has exited, the next line on the
+    // connection is the next call's reply, not a late result.
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while trellis::mcp::live_call_workers_for_tests() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the timed-out worker did not exit");
+    writeln!(client, "{}", modern(json!(62), "tools/list", json!({}))).unwrap();
+    let mut next = String::new();
+    reader.read_line(&mut next).unwrap();
+    let next: Value = serde_json::from_str(&next).unwrap();
+    assert_eq!(
+        next["id"], 62,
+        "late result was written after the deadline reply: {next}"
     );
     drop(reader);
     drop(client);
@@ -5859,14 +5867,12 @@ async fn cancelled_call_writes_nothing_and_its_worker_exits() {
     })
     .await
     .expect("the cancelled worker did not exit");
-    client
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    let mut stray = String::new();
-    assert!(
-        reader.read_line(&mut stray).is_err(),
-        "the cancelled call wrote: {stray}"
-    );
+    // The worker has exited, so the next line is the next call's reply unless
+    // the cancelled call wrote one.
+    let tools_list = modern(json!(3), "tools/list", json!({}));
+    writeln!(client, "{tools_list}").unwrap();
+    let next = next_reply(&mut reader);
+    assert_eq!(next["id"], 3, "the cancelled call wrote: {next}");
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();

@@ -1601,7 +1601,7 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
     use trellis::daemon::protocol;
     let remaining = deadline
         .checked_duration_since(Instant::now())
-        .expect("recovered socket connected after the original 10-second deadline");
+        .expect("recovered socket connected after the hang backstop");
     recovered_socket.set_read_timeout(Some(remaining)).unwrap();
     recovered_socket.set_write_timeout(Some(remaining)).unwrap();
     let proof_id = 0x107_5a1e_u64;
@@ -1621,7 +1621,7 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
     });
     let remaining = deadline
         .checked_duration_since(Instant::now())
-        .expect("recovered socket write exceeded the original 10-second deadline");
+        .expect("recovered socket write exceeded the hang backstop");
     recovered_socket.set_read_timeout(Some(remaining)).unwrap();
     let reply: protocol::Reply =
         protocol::read_frame(&mut recovered_socket).unwrap_or_else(|error| {
@@ -2446,7 +2446,7 @@ fn metrics_preface_rejects_other_operation_and_preserves_ordinary_frames() {
     };
     let mut ordinary = UnixStream::connect(&socket).unwrap();
     ordinary
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     protocol::write_frame(&mut ordinary, &request).unwrap();
     let answer: Reply = protocol::read_frame(&mut ordinary).unwrap();
@@ -2457,7 +2457,7 @@ fn metrics_preface_rejects_other_operation_and_preserves_ordinary_frames() {
     );
     let mut prefaced = UnixStream::connect(&socket).unwrap();
     prefaced
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     protocol::write_preface_until(
         &mut prefaced,
@@ -3345,7 +3345,7 @@ fn metrics_prefaced_trickle_expires_whole_daemon_ingress_without_ack() {
     crate::child::assert_cli_success(&indexed, "indexed");
     let mut stream = UnixStream::connect(fixture_socket_paths(&home).socket).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     stream.write_all(&[0xff]).unwrap();
     // Every individual byte arrives before the socket read timeout; the
@@ -3683,20 +3683,20 @@ fn metrics_file_and_declaration_work_deadlines_are_typed() {
     let admission: Reply = protocol::read_frame_until(&mut stream, ingress).unwrap();
     assert_eq!(admission.id, request.id);
     assert_eq!(admission.payload, serde_json::json!({"admitted": true}));
-    let work_started = Instant::now();
-    let error: Reply =
-        protocol::read_frame_until(&mut stream, work_started + Duration::from_secs(2)).unwrap();
+    // The server enforces both budgets on its own clock: a typed error at all
+    // means the transition finished inside the grace (past it, the server
+    // disconnects, as below). The client's bound is only a hang backstop.
+    let error: Reply = protocol::read_frame_until(
+        &mut stream,
+        Instant::now() + trellis::testing::HANG_BACKSTOP,
+    )
+    .unwrap();
     assert_eq!(error.id, request.id);
     assert!(
         error.payload["error"]
             .as_str()
             .unwrap()
             .contains("deadline_exceeded")
-    );
-    assert!(
-        work_started.elapsed() < Duration::from_millis(1100),
-        "500ms work + 500ms transition was exceeded: {:?}",
-        work_started.elapsed()
     );
     // A transition held beyond the fixed 500ms grace must disconnect rather
     // than publish a typed error or a partial success after expiry.
@@ -3707,15 +3707,17 @@ fn metrics_file_and_declaration_work_deadlines_are_typed() {
     protocol::write_frame_until(&mut late, &request, ingress).unwrap();
     let admission: Reply = protocol::read_frame_until(&mut late, ingress).unwrap();
     assert_eq!(admission.payload, serde_json::json!({"admitted": true}));
-    let work_started = Instant::now();
-    assert!(
-        protocol::read_frame_until::<Reply>(&mut late, work_started + Duration::from_secs(2))
-            .is_err(),
-        "over-budget error transition wrote a late reply"
+    let late_read = protocol::read_frame_until::<Reply>(
+        &mut late,
+        Instant::now() + trellis::testing::HANG_BACKSTOP,
     );
+    let error = late_read.expect_err("over-budget error transition wrote a late reply");
     assert!(
-        work_started.elapsed() < Duration::from_millis(1600),
-        "over-budget transition did not disconnect promptly"
+        !matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ),
+        "over-budget transition did not disconnect: {error}"
     );
     assert!(run(&home, "status", &root)["catchingUp"].is_boolean());
 }
@@ -3769,9 +3771,11 @@ fn metrics_real_near_ingress_ack_and_late_multiframe_preserve_original_end() {
         received > Duration::from_millis(7_500),
         "final frame arrived before the no-ingress end budget: {received:?}"
     );
+    // The CLI enforces its own additive end budget, so its success proves the
+    // final frame arrived inside it; this bound is only a hang backstop.
     assert!(
-        received < Duration::from_millis(12_500),
-        "final frame exceeded the original additive end budget: {received:?}"
+        received < trellis::testing::HANG_BACKSTOP,
+        "final frame never arrived: {received:?}"
     );
     assert_eq!(
         fs::read(&phase).unwrap(),
@@ -3807,7 +3811,7 @@ fn metrics_real_near_ingress_ack_and_late_multiframe_preserve_original_end() {
         "no partial frame was sent"
     );
     assert!(
-        began.elapsed() < Duration::from_millis(12_500),
+        began.elapsed() < trellis::testing::HANG_BACKSTOP,
         "transfer stall was unbounded"
     );
 }

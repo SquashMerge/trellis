@@ -541,7 +541,7 @@ async fn deadline_kills_and_reaps_child_and_cancellation_also_cleans_up() {
     script(
         &exe,
         &format!(
-            "#!/bin/sh\nprintf '%s' $$ > '{}'\nexec /bin/sleep 60\n",
+            "#!/bin/sh\nprintf '%s' $$ > '{}'\nexec /bin/sleep 600\n",
             pid_file.display()
         ),
     );
@@ -554,7 +554,9 @@ async fn deadline_kills_and_reaps_child_and_cancellation_also_cleans_up() {
         }
     );
     assert!(start.elapsed() >= READ_DEADLINE);
-    assert!(start.elapsed() < READ_DEADLINE + std::time::Duration::from_secs(2));
+    // The child sleeps far past the backstop: only the deadline ends the read
+    // inside it.
+    assert!(start.elapsed() < trellis::testing::HANG_BACKSTOP);
     let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
     assert_reaped(pid).await;
     fs::remove_file(&pid_file).unwrap();

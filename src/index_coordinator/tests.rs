@@ -889,15 +889,14 @@ fn full_publication_never_rebuilds_its_own_fresh_artifact() {
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let job = IndexJobCoordinator::prepare(&store, None).unwrap();
     let _session = job.session();
-    let before = crate::native_evidence::full_validations_for_tests();
+    let extractions = || crate::native_evidence::document_extractions_for_tests(store.root_id());
+    assert_eq!(extractions(), 0);
     let pin = job.run_observed(&options, &cancel, |_| {}, |_| {}).unwrap();
-    // The artifact is this process's own build of the capture (#199 I-4b):
-    // measurement and publication keep the structural and bundle checks, and
-    // neither rebuilds it to compare.
-    assert_eq!(
-        crate::native_evidence::full_validations_for_tests() - before,
-        0
-    );
+    // The artifact is this process's own build of the capture (#199 I-4b,
+    // #225): measurement and publication keep the structural and bundle
+    // checks, and neither re-extracts a document to compare. One document,
+    // one extraction.
+    assert_eq!(extractions(), 1);
     assert_eq!(store.status().unwrap().revision, pin);
 }
 

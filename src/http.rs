@@ -267,6 +267,9 @@ pub struct DaemonState {
     watcher_cancel: CancelFlag,
     #[cfg(feature = "test-support")]
     startup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// A failed startup reconciliation's backoff stays open until retirement.
+    #[cfg(feature = "test-support")]
+    hold_startup_backoff: AtomicBool,
     /// Startup reconciliation captures begun, for the single-owner tests.
     #[cfg(feature = "test-support")]
     startup_captures: AtomicU64,
@@ -494,6 +497,8 @@ pub fn new_with_config(
         watcher_cancel: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "test-support")]
         startup_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        hold_startup_backoff: AtomicBool::new(false),
         #[cfg(feature = "test-support")]
         startup_captures: AtomicU64::new(0),
         maintenance_telemetry: Mutex::new(MaintenanceTelemetry::default()),

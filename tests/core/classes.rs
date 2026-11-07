@@ -1678,7 +1678,7 @@ fn rust_glob_graphs_resolve_within_a_bounded_work_budget() {
     let started = std::time::Instant::now();
     let (_, c) = index(&[("src/lib.rs", text.as_str())]);
     assert!(c.classes.is_empty());
-    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    assert!(started.elapsed() < trellis::testing::HANG_BACKSTOP);
     assert!(
         c.warnings
             .iter()

@@ -279,9 +279,13 @@ impl World {
             cache_dir(&self.checkout.home),
             data_dir(&self.checkout.home),
         );
-        let identity =
-            WorkspaceIdentity::discover(Some(&self.checkout.root), &self.checkout.root).unwrap();
-        let store = trellis::store::Store::open(roots, identity).unwrap();
+        // The status CLI's daemon is still running beside this open.
+        let store = trellis::testing::retry_admission(|| {
+            trellis::store::Store::open(
+                roots.clone(),
+                WorkspaceIdentity::discover(Some(&self.checkout.root), &self.checkout.root)?,
+            )
+        });
         let pin = serde_json::from_value(status["revision"].clone()).unwrap();
         let (seed, target) = store
             .with_native_reader(pin, |reader| {
