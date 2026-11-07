@@ -522,6 +522,10 @@ pub struct WatcherWork {
     waker: Option<crate::watch::Waker>,
     /// Set only for retirement's attempt: the batch must be exactly this generation.
     generation_limit: Option<u64>,
+    /// Test-support hold after a watcher reconciliation published and before it
+    /// acknowledges its batch (#752).
+    #[cfg(feature = "test-support")]
+    before_ack_hook: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// The retirement attempt found ingress past its cutoff: it captures nothing.
@@ -609,7 +613,17 @@ impl WatcherWork {
             witness_reported_generation: None,
             waker: None,
             generation_limit: None,
+            #[cfg(feature = "test-support")]
+            before_ack_hook: None,
         })
+    }
+
+    /// Run `hook` once, after the next watcher reconciliation has published
+    /// and before it acknowledges its batch.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_before_ack_hook_for_tests(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.before_ack_hook = Some(Box::new(hook));
     }
 
     /// Retirement's one attempt (Decision 0009 §5): reconcile only while the
@@ -1134,6 +1148,10 @@ impl WatcherWork {
                 #[cfg(not(feature = "test-support"))]
                 let witnessed_pin = None;
                 after_cutoff(&self.watch);
+                #[cfg(feature = "test-support")]
+                if let Some(hook) = self.before_ack_hook.take() {
+                    hook();
+                }
                 let accounted = self.watch.acknowledge(&batch);
                 if accounted {
                     self.last_accounted_generation = Some(batch.generation);

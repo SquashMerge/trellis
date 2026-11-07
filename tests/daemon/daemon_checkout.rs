@@ -3802,3 +3802,53 @@ async fn settled_wait_names_the_busy_component_and_waits_for_the_owner() {
     assert_eq!(moved.index_generation, head.index_generation);
     assert!(moved.index_revision > head.index_revision, "{moved:?}");
 }
+
+/// The settled wait never pairs idle flags sampled before its read with a pin the worker
+/// published after them (#752): idle at N0, a hint is accepted and N1 published, and its
+/// acknowledgment (and the iteration-end notification) is still held when the read opens.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn settled_sample_rechecks_the_owner_after_its_read() {
+    use trellis::daemon::registry::{NotSettled, SettleBusy};
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function before() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let head = runtime.settled_for_tests(None).await.unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+
+    // The worker publishes the hint's head, then holds before acknowledging it.
+    let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    assert!(scheduler.set_before_watch_ack_hook_for_tests(move || {
+        published_tx.send(()).unwrap();
+        let _ = ack_rx.recv_timeout(trellis::testing::HANG_BACKSTOP);
+    }));
+    // The helper's selected read has sampled catchingUp (idle at N0); only then is the
+    // hint accepted and published, before the read opens its snapshot.
+    let path = checkout.join("a.js");
+    let hinted = scheduler.clone();
+    runtime.set_evidence_sampled_hook_for_tests(move || {
+        fs::write(&path, "function after() {}\n").unwrap();
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(path);
+        assert!(hinted.submit_due_watch_event_for_tests(Ok(event)));
+        published_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("the hint did not publish");
+    });
+    let sampler = runtime.clone();
+    let sampled = tokio::task::spawn_blocking(move || sampler.sample_settled_for_tests(None))
+        .await
+        .unwrap();
+    ack_tx.send(()).unwrap();
+    assert_eq!(sampled, Err(NotSettled::Hang(SettleBusy::Watcher)));
+    let moved = runtime.settled_for_tests(None).await.unwrap();
+    assert!(moved.index_revision > head.index_revision, "{moved:?}");
+}

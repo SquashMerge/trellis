@@ -734,6 +734,36 @@ impl DaemonState {
         true
     }
 
+    /// [`Self::submit_watch_event_for_tests`], with the hint due at once: the
+    /// worker's next iteration reconciles it without a debounce iteration first.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn submit_due_watch_event_for_tests(&self, event: notify::Result<notify::Event>) -> bool {
+        let mut work = self.watcher_work.lock().unwrap();
+        let Some((_, scheduler)) = work.as_mut() else {
+            return false;
+        };
+        scheduler.submit_watch_event_for_tests(event);
+        scheduler.force_periodic_inventory_for_tests();
+        true
+    }
+
+    /// Run `hook` once on the worker, after its next watcher reconciliation has
+    /// published and before it acknowledges the hint. False without a watcher.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_before_watch_ack_hook_for_tests(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) -> bool {
+        let mut work = self.watcher_work.lock().unwrap();
+        let Some((_, watcher)) = work.as_mut() else {
+            return false;
+        };
+        watcher.set_before_ack_hook_for_tests(hook);
+        true
+    }
+
     /// Arm a queue-read race only after CLI enqueue has committed. Enqueue
     /// itself opens the queue, so arming earlier would pause the wrong read.
     #[cfg(feature = "test-support")]

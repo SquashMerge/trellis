@@ -678,6 +678,8 @@ impl CheckoutRegistry {
             mcp_read_gate: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
             mcp_admitted_gate: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            evidence_sampled_hook: std::sync::Mutex::new(None),
         });
         #[cfg(feature = "test-support")]
         if let Some(reporter) = super::causal_witness::CausalWitness::from_env(key.to_owned()) {
@@ -1819,6 +1821,10 @@ pub struct CheckoutRuntime {
     /// Test-support gate run once read admission has sampled `catchingUp`.
     #[cfg(feature = "test-support")]
     mcp_admitted_gate: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-support hold, once, in the next evidence admission after it sampled
+    /// `catchingUp` and before it opens the selected snapshot (#752).
+    #[cfg(feature = "test-support")]
+    evidence_sampled_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
     search: Option<Arc<super::search::SearchService>>,
     /// Released because its root was lost: a stale handle answers root_changed.
@@ -2462,6 +2468,14 @@ impl CheckoutRuntime {
         *self.mcp_admitted_gate.lock().unwrap() = Some(gate);
     }
 
+    /// Run `hook` once, in the next evidence admission on this checkout, after it
+    /// sampled `catchingUp` and before it opens the selected snapshot.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_evidence_sampled_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.evidence_sampled_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
     #[cfg(feature = "test-support")]
     pub(crate) fn run_mcp_admitted_gate_for_tests(&self) {
         let gate = self.mcp_admitted_gate.lock().unwrap().clone();
@@ -2554,6 +2568,13 @@ impl CheckoutRuntime {
         let resources = self.resources()?;
         let lease = resources.scheduler.admission_lease()?;
         let catching_up = Self::catching_up_in(&resources, resources.scheduler.runtime_phase());
+        #[cfg(feature = "test-support")]
+        {
+            let hook = self.evidence_sampled_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let response = resources.store.evidence_response_daemon_local()?;
         let catching_up = catching_up || response.semantic_catching_up()?;
         Ok((
@@ -3280,6 +3301,7 @@ mod selection_tests {
             mcp_read_hook: std::sync::Mutex::new(None),
             mcp_read_gate: std::sync::Mutex::new(None),
             mcp_admitted_gate: std::sync::Mutex::new(None),
+            evidence_sampled_hook: std::sync::Mutex::new(None),
         };
         let queued = resources
             .store

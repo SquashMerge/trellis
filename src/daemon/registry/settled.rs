@@ -109,7 +109,12 @@ impl CheckoutRuntime {
     /// It waits on the runtime's published state version, which the worker bumps
     /// after every iteration, and never sleeps; only external SQLite contention
     /// is retried after a bounded wait. A sample counts only if no state change
-    /// was published while it was taken. Its one bound is `HANG_BACKSTOP`, and
+    /// was published while it was taken, and the owner's pending state is
+    /// checked again after the selected read, with the head still the read's pin:
+    /// the version is an iteration-end notification, not a mutation epoch, so
+    /// idle flags sampled before a read never certify a pin published after them
+    /// (#752). Owners raise a pending flag before the work it covers publishes.
+    /// Its one bound is `HANG_BACKSTOP`, and
     /// the error names the component still busy. It holds an admission lease, so
     /// the checkout cannot be released while it waits.
     ///
@@ -182,52 +187,12 @@ impl CheckoutRuntime {
     }
 
     fn settle_sample(&self, resources: &ActiveResources) -> Sample {
-        let scheduler = &resources.scheduler;
-        let read = |error: anyhow::Error| Sample::Busy {
-            contended: crate::store::cli_read_retryable_contention(&error)
-                || crate::store::transient_storage_contention(&error),
-            busy: SettleBusy::Read(format!("{error:#}")),
-        };
-        match scheduler.runtime_phase() {
-            RuntimePhase::Ready => {}
-            RuntimePhase::Closing | RuntimePhase::Retired => {
-                return Sample::Released(format!("{:?}", scheduler.runtime_phase()));
-            }
-            phase => {
-                return Sample::Busy {
-                    busy: SettleBusy::Startup {
-                        phase: format!("{phase:?}"),
-                        error: scheduler.startup_error(),
-                    },
-                    contended: false,
-                };
-            }
-        }
-        if scheduler.checkout_watch_pending() {
-            return Sample::Busy {
-                busy: SettleBusy::Watcher,
-                contended: false,
-            };
-        }
-        if scheduler.fifo_pending() {
-            return Sample::Busy {
-                busy: SettleBusy::Fifo,
-                contended: false,
-            };
-        }
-        match resources.store.pending_semantic_target() {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                return Sample::Busy {
-                    busy: SettleBusy::Semantic,
-                    contended: false,
-                };
-            }
-            Err(error) => return read(error),
+        if let Some(busy) = Self::owner_busy(resources) {
+            return busy;
         }
         let (response, catching_up) = match self.evidence_response() {
             Ok(admitted) => admitted,
-            Err(error) => return read(error),
+            Err(error) => return read_refused(error),
         };
         if catching_up {
             return Sample::Busy {
@@ -235,12 +200,69 @@ impl CheckoutRuntime {
                 contended: false,
             };
         }
-        match response
+        let pin = match response
             .status()
             .and_then(|status| response.finish(status.revision))
         {
-            Ok(pin) => Sample::Idle(pin),
-            Err(error) => read(error),
+            Ok(pin) => pin,
+            Err(error) => return read_refused(error),
+        };
+        drop(response);
+        // Again after the read: work accepted while it was taken has its flag
+        // raised by now, and a publication since has moved the head.
+        if let Some(busy) = Self::owner_busy(resources) {
+            return busy;
         }
+        match resources.store.index_baseline() {
+            Ok(head) if head == pin => Sample::Idle(pin),
+            Ok(_) => Sample::Busy {
+                busy: SettleBusy::Changing,
+                contended: false,
+            },
+            Err(error) => read_refused(error),
+        }
+    }
+
+    /// The owner's published pending state: startup, watcher, FIFO and S.
+    fn owner_busy(resources: &ActiveResources) -> Option<Sample> {
+        let scheduler = &resources.scheduler;
+        let busy = |busy| {
+            Some(Sample::Busy {
+                busy,
+                contended: false,
+            })
+        };
+        match scheduler.runtime_phase() {
+            RuntimePhase::Ready => {}
+            phase @ (RuntimePhase::Closing | RuntimePhase::Retired) => {
+                return Some(Sample::Released(format!("{phase:?}")));
+            }
+            phase => {
+                return busy(SettleBusy::Startup {
+                    phase: format!("{phase:?}"),
+                    error: scheduler.startup_error(),
+                });
+            }
+        }
+        if scheduler.checkout_watch_pending() {
+            return busy(SettleBusy::Watcher);
+        }
+        if scheduler.fifo_pending() {
+            return busy(SettleBusy::Fifo);
+        }
+        match resources.store.pending_semantic_target() {
+            Ok(None) => None,
+            Ok(Some(_)) => busy(SettleBusy::Semantic),
+            Err(error) => Some(read_refused(error)),
+        }
+    }
+}
+
+/// A refused read; external contention is retried after a bounded wait.
+fn read_refused(error: anyhow::Error) -> Sample {
+    Sample::Busy {
+        contended: crate::store::cli_read_retryable_contention(&error)
+            || crate::store::transient_storage_contention(&error),
+        busy: SettleBusy::Read(format!("{error:#}")),
     }
 }
