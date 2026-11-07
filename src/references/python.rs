@@ -78,6 +78,7 @@ pub(super) struct Catalog {
     module_proofs: BTreeMap<usize, BTreeSet<usize>>,
     child_names: BTreeMap<usize, BTreeSet<String>>,
     roots: BTreeSet<(String, String)>,
+    source_roots: BTreeMap<String, BTreeSet<String>>,
     file_declarations: BTreeMap<usize, DeclarationId>,
     test_modules: BTreeSet<usize>,
     results: BTreeMap<(usize, usize, usize), SiteResolution>,
@@ -88,7 +89,7 @@ impl Catalog {
     pub(super) fn new(
         docs: &[&DocumentInput],
         trees: &[Tree],
-        _documents: &BTreeMap<DocumentKey, usize>,
+        manifests: &[external::ManifestInput],
         selected: &[usize],
         work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
@@ -101,6 +102,7 @@ impl Catalog {
             module_proofs: BTreeMap::new(),
             child_names: BTreeMap::new(),
             roots: BTreeSet::new(),
+            source_roots: source_roots(manifests, work, check)?,
             file_declarations: BTreeMap::new(),
             test_modules: BTreeSet::new(),
             results: BTreeMap::new(),
@@ -131,7 +133,10 @@ impl Catalog {
                         .push(declaration);
                 }
             }
-            if let Some((path, package)) = module_path(&doc.key.path) {
+            for (path, package) in module_paths(
+                &doc.key.path,
+                result.source_roots.get(&doc.key.source_set_id),
+            ) {
                 if let Some(first) = path.first() {
                     owner_step(work, check)?;
                     result
@@ -165,10 +170,19 @@ impl Catalog {
         for (&document, doc) in &result.file_declarations {
             owner_step(work, check)?;
             let input = docs[doc.document];
-            if let Some((mut path, package)) = module_path(&input.key.path)
-                && let Ok(layout) = result.layout(&input.key.source_set_id, &path, work, check)?
+            let source_set = &input.key.source_set_id;
+            // A file proved under two roots has no unique package for relative imports.
+            let mut proved = Vec::new();
+            for (path, package) in
+                module_paths(&input.key.path, result.source_roots.get(source_set))
             {
-                result.module_proofs.insert(document, layout.proof);
+                if let Ok(layout) = result.layout(source_set, &path, work, check)? {
+                    proved.push((path, package, layout.proof));
+                }
+            }
+            if proved.len() == 1 {
+                let (mut path, package, proof) = proved.pop().expect("one proved module path");
+                result.module_proofs.insert(document, proof);
                 if !package {
                     path.pop();
                 }
@@ -1138,6 +1152,94 @@ fn add_bucket(
     }
     Ok(())
 }
+/// Literal source-root directories the captured root `pyproject.toml` declares (#771):
+/// uv workspace `members`, setuptools `package-dir` `""` and `packages.find.where`, and
+/// the parent directories of hatch wheel `packages`. A malformed manifest, a non-string
+/// entry or an absolute, traversing or glob entry declares nothing. No nested manifest,
+/// installed distribution or `sys.path` is read.
+fn source_roots(
+    manifests: &[external::ManifestInput],
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut result = BTreeMap::new();
+    for manifest in manifests {
+        owner_step(work, check)?;
+        let Some(bytes) = manifest
+            .bytes
+            .as_ref()
+            .filter(|_| manifest.path == "pyproject.toml")
+        else {
+            continue;
+        };
+        charge(bytes.len(), work, check)?;
+        let table = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Table>(text).ok());
+        check()?;
+        let Some(table) = table else { continue };
+        let strings = |path: &[&str]| -> Vec<&str> {
+            let mut value = table.get(path[0]);
+            for key in &path[1..] {
+                value = value.and_then(|value| value.get(key));
+            }
+            match value {
+                Some(toml::Value::Array(items)) => {
+                    items.iter().filter_map(toml::Value::as_str).collect()
+                }
+                Some(toml::Value::String(item)) if path.last() == Some(&"") => vec![item],
+                _ => Vec::new(),
+            }
+        };
+        let mut roots = BTreeSet::new();
+        for (entries, parent) in [
+            (strings(&["tool", "uv", "workspace", "members"]), false),
+            (strings(&["tool", "setuptools", "package-dir", ""]), false),
+            (
+                strings(&["tool", "setuptools", "packages", "find", "where"]),
+                false,
+            ),
+            (
+                strings(&["tool", "hatch", "build", "targets", "wheel", "packages"]),
+                true,
+            ),
+        ] {
+            for entry in entries {
+                charge(entry.len(), work, check)?;
+                let entry = entry.strip_prefix("./").unwrap_or(entry);
+                let entry = entry.strip_suffix('/').unwrap_or(entry);
+                let literal = entry.split('/').all(|segment| {
+                    !matches!(segment, "" | "." | "..")
+                        && !segment.contains(['\\', ':', '*', '?', '[', ']', '{', '}', '!'])
+                });
+                let root = if parent {
+                    entry.rsplit_once('/').map(|(root, _)| root)
+                } else {
+                    Some(entry)
+                };
+                if let Some(root) = root.filter(|_| literal) {
+                    roots.insert(root.to_owned());
+                }
+            }
+        }
+        if !roots.is_empty() {
+            result.insert(manifest.source_set_id.clone(), roots);
+        }
+    }
+    Ok(result)
+}
+/// A file's checkout-root module path, then its path under each declared source root.
+fn module_paths(path: &str, roots: Option<&BTreeSet<String>>) -> Vec<(Vec<String>, bool)> {
+    std::iter::once(path)
+        .chain(
+            roots
+                .into_iter()
+                .flatten()
+                .filter_map(|root| path.strip_prefix(root.as_str())?.strip_prefix('/')),
+        )
+        .filter_map(module_path)
+        .collect()
+}
 fn module_path(path: &str) -> Option<(Vec<String>, bool)> {
     let package = path.ends_with("/__init__.py");
     let stem = if package {
@@ -1792,15 +1894,8 @@ mod tests {
             .position(|doc| doc.key.path == "use.py")
             .unwrap();
         let mut work = Work::new(work::reference_limit(docs.len(), 0));
-        let catalog = Catalog::new(
-            &docs,
-            &trees,
-            &BTreeMap::new(),
-            &[source],
-            &mut work,
-            &mut || Ok(()),
-        )
-        .unwrap();
+        let catalog =
+            Catalog::new(&docs, &trees, &[], &[source], &mut work, &mut || Ok(())).unwrap();
         catalog.export_memo.borrow_mut().clear();
         test(
             &catalog,
@@ -1864,5 +1959,51 @@ mod tests {
             );
             assert_eq!(checks, 3);
         });
+    }
+
+    fn roots(path: &str, text: &str) -> Vec<String> {
+        let manifest = external::ManifestInput {
+            source_set_id: "set".into(),
+            native_revision_id: "revision".into(),
+            dependency_hash: "dependencies".into(),
+            path: path.into(),
+            content_hash: Some("hash".into()),
+            bytes: Some(text.as_bytes().to_vec()),
+        };
+        let mut work = Work::new(work::reference_limit(1, text.len()));
+        source_roots(&[manifest], &mut work, &mut || Ok(()))
+            .unwrap()
+            .remove("set")
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn pyproject_declares_only_literal_relative_source_roots() {
+        let declared = r#"
+[tool.uv.workspace]
+members = ["plugins/a", "./plugins/b/", "packages/*", "../outside", "/abs", ".", "", 7]
+[tool.setuptools]
+package-dir = { "" = "src", "named" = "lib/named" }
+[tool.setuptools.packages.find]
+where = ["lib"]
+[tool.hatch.build.targets.wheel]
+packages = ["core", "pkgs/one/one", "pkgs/two/two"]
+"#;
+        assert_eq!(
+            roots("pyproject.toml", declared),
+            [
+                "lib",
+                "pkgs/one",
+                "pkgs/two",
+                "plugins/a",
+                "plugins/b",
+                "src"
+            ]
+        );
+        assert!(roots("Cargo.toml", declared).is_empty());
+        assert!(roots("pyproject.toml", "[tool.uv.workspace\nmembers = ['a']").is_empty());
+        assert!(roots("pyproject.toml", "[project]\nname = 'x'\n").is_empty());
     }
 }

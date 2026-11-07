@@ -304,10 +304,17 @@ Supported mapping is deliberately narrow:
   literals use the resolver's documented decoding subset, not runtime execution.
   Bare imports can label captured npm dependencies or the exact reviewed Node
   catalog below. Relative misses never fall back to builtin or npm labels.
-- **Python:** captured checkout-root `m.py` or `m/__init__.py` layouts require
-  unique module ownership and proved `__init__.py` package prefixes. Relative
-  imports follow captured package membership; absolute imports use only that
-  proved root convention. No suffix search, namespace-package or `sys.path`
+- **Python:** captured `m.py` or `m/__init__.py` layouts at the checkout root or
+  a declared source root require unique module ownership and proved `__init__.py`
+  package prefixes. Declared source roots (#771) are the literal relative
+  directories the captured root `pyproject.toml` names in `tool.uv.workspace.members`,
+  `tool.setuptools.package-dir` key `""` and `tool.setuptools.packages.find.where`,
+  plus the parent directory of each `tool.hatch.build.targets.wheel.packages` entry.
+  Glob, absolute or traversing entries, malformed TOML and nested manifests declare
+  nothing. One module path claimed by files under two roots is ambiguous; a file
+  proved under two roots has no package membership. Relative
+  imports follow captured package membership; absolute imports use only those
+  proved root conventions. No suffix search, namespace-package or `sys.path`
   discovery is performed. A single unconditional literal `__all__` list of
   supported string literals selects exactly its proved names, including private
   spellings. Without `__all__`, proved public top-level names are exposed.
@@ -713,7 +720,7 @@ detected installed runtime. No precise source range is invented. Package evidenc
 is capture/catalog evidence, not native measured syntax provenance; actual source
 sites and native intermediate-module proof remain separate.
 
-Captured root Cargo and package.json bytes come from the selected revision's retained dependencies
+Captured root Cargo, package.json and pyproject.toml bytes come from the selected revision's retained dependencies
 through the same admitted read and transaction as source. There are no live
 manifest reads, Cargo invocations, installed-library reads or parallel caches.
 Malformed repository manifests stay unproved, not empty dependencies. Malformed
