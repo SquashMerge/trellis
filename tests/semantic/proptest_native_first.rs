@@ -414,19 +414,115 @@ impl Model {
             .collect()
     }
 
-    fn rows_of(&self, path: &str) -> BTreeSet<String> {
-        snapshot_ids(&self.basis_snapshot, Some(path))
+    /// P's rows for `path` as a per-document answer projection serves them.
+    fn rows_of(&self, path: &str) -> Vec<String> {
+        snapshot_rows(&document_answer(&self.basis_snapshot, path))
     }
 }
 
-/// Canonical identity of a snapshot's provenance rows, optionally for one document.
-fn snapshot_ids(snapshot: &SemanticSnapshot, path: Option<&str>) -> BTreeSet<String> {
-    snapshot
+/// Canonical form of every semantic row in `snapshot`, all eight kinds: a sorted multiset
+/// of kind-tagged canonical JSON (the store's `native_ids::canonical` encoding). A missing,
+/// extra, duplicated or changed row of any kind changes it. IDs are kept as they are:
+/// every comparison made with it is between reads of the same semantic basis rows, whose
+/// IDs the contract keeps stable (re-keyed copies are checked by `check_rekeyed`).
+fn snapshot_rows(snapshot: &SemanticSnapshot) -> Vec<String> {
+    fn tagged<T: serde::Serialize>(kind: &str, rows: &[T], out: &mut Vec<String>) {
+        for row in rows {
+            let value = serde_json::to_value(row).unwrap();
+            let bytes = trellis::native_ids::canonical(&value);
+            out.push(format!("{kind}:{}", String::from_utf8(bytes).unwrap()));
+        }
+    }
+    let SemanticSnapshot {
+        producers,
+        coverage,
+        provenance,
+        symbols,
+        declaration_bindings,
+        references,
+        call_bindings,
+        type_relationships,
+    } = snapshot;
+    let mut out = vec![];
+    tagged("producer", producers, &mut out);
+    tagged("coverage", coverage, &mut out);
+    tagged("provenance", provenance, &mut out);
+    tagged("symbol", symbols, &mut out);
+    tagged("declaration", declaration_bindings, &mut out);
+    tagged("reference", references, &mut out);
+    tagged("call", call_bindings, &mut out);
+    tagged("type", type_relationships, &mut out);
+    out.sort();
+    out
+}
+
+/// The per-document answer projection of one document of a whole-revision snapshot:
+/// its coverage tuple, the producers covering it, its proofs and every row those proofs
+/// own. Import-time coverage reasons belong to whole-revision snapshots only, never to an
+/// answer projection, so they are dropped.
+fn document_answer(snapshot: &SemanticSnapshot, path: &str) -> SemanticSnapshot {
+    let coverage: Vec<_> = snapshot
+        .coverage
+        .iter()
+        .filter(|c| c.document_path == path)
+        .cloned()
+        .map(|mut c| {
+            c.reasons = None;
+            c
+        })
+        .collect();
+    let producers: BTreeSet<&str> = coverage.iter().map(|c| c.producer_id.as_str()).collect();
+    let provenance: Vec<_> = snapshot
         .provenance
         .iter()
-        .filter(|p| path.is_none_or(|path| p.document.path == path))
-        .map(|p| serde_json::to_string(p).unwrap())
-        .collect()
+        .filter(|p| p.document.path == path)
+        .cloned()
+        .collect();
+    let owned: BTreeSet<&str> = provenance.iter().map(|p| p.id.as_str()).collect();
+    fn owned_by<T: Clone>(rows: &[T], owned: &BTreeSet<&str>, id: fn(&T) -> &str) -> Vec<T> {
+        rows.iter()
+            .filter(|r| owned.contains(id(r)))
+            .cloned()
+            .collect()
+    }
+    SemanticSnapshot {
+        producers: snapshot
+            .producers
+            .iter()
+            .filter(|p| producers.contains(p.id.as_str()))
+            .cloned()
+            .collect(),
+        symbols: owned_by(&snapshot.symbols, &owned, |r| &r.provenance_id),
+        declaration_bindings: owned_by(&snapshot.declaration_bindings, &owned, |r| {
+            &r.provenance_id
+        }),
+        references: owned_by(&snapshot.references, &owned, |r| &r.provenance_id),
+        call_bindings: owned_by(&snapshot.call_bindings, &owned, |r| &r.provenance_id),
+        type_relationships: owned_by(&snapshot.type_relationships, &owned, |r| &r.provenance_id),
+        coverage,
+        provenance,
+    }
+}
+
+/// Property 3's row check: an older-basis document read serves exactly P's rows for it.
+fn check_older_basis_rows(
+    label: &str,
+    path: &str,
+    rows: &SemanticSnapshot,
+    expected: &[String],
+) -> Result<(), String> {
+    let actual = snapshot_rows(rows);
+    if actual != expected {
+        let missing: Vec<_> = expected.iter().filter(|r| !actual.contains(r)).collect();
+        let extra: Vec<_> = actual.iter().filter(|r| !expected.contains(r)).collect();
+        return Err(format!(
+            "{label}: older-basis {path} rows differ from P ({} served, {} expected)\n\
+             missing {missing:#?}\nextra {extra:#?}",
+            actual.len(),
+            expected.len()
+        ));
+    }
+    Ok(())
 }
 
 /// A later pin of the same generation.
@@ -688,14 +784,17 @@ fn projections(
 }
 
 /// Everything a pinned reader can observe at `pin`; it must never change once published.
-/// A projected document read: its label and, when eligible, its row identities.
-type ProjectedRows = (SemanticProjection, Option<BTreeSet<String>>);
+/// A projected document read: its label and, when eligible, every row it serves.
+type ProjectedRows = (SemanticProjection, Option<Vec<String>>);
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct PinnedView {
     sources: BTreeMap<String, Option<String>>,
     projections: Projections,
     documents: BTreeMap<String, Option<ProjectedRows>>,
+    /// Every row of the whole-revision semantic read, at a pin with no projected document
+    /// (a projected pin refuses that unlabelled read; its rows are in `documents`).
+    semantic: Option<Vec<String>>,
     native: String,
 }
 
@@ -722,7 +821,7 @@ fn pinned_view(world: &World, pin: IndexPin, producer: &str) -> Result<PinnedVie
                 .store
                 .projected_semantic_document_at(pin, producer, &key)
                 .map_err(|e| format!("projected document {path} at {pin:?} failed: {e:#}"))?
-                .map(|(projection, rows)| (projection, rows.map(|r| snapshot_ids(&r, None))));
+                .map(|(projection, rows)| (projection, rows.map(|r| snapshot_rows(&r))));
             documents.insert(path.clone(), document);
         }
         sources.insert(path.clone(), source);
@@ -732,10 +831,20 @@ fn pinned_view(world: &World, pin: IndexPin, producer: &str) -> Result<PinnedVie
         .filter(|(_, s)| s.is_some())
         .map(|(p, _)| p.clone())
         .collect();
+    let semantic = match world.store.semantic_at(pin) {
+        Ok(snapshot) => Some(snapshot_rows(&snapshot)),
+        Err(_) if documents.values().any(Option::is_some) => None,
+        Err(e) => {
+            return Err(format!(
+                "semantic read at unprojected {pin:?} failed: {e:#}"
+            ));
+        }
+    };
     Ok(PinnedView {
         projections: projections(world, pin, producer, &present)?,
         sources,
         documents,
+        semantic,
         native: native_id(world, pin)?,
     })
 }
@@ -1122,8 +1231,8 @@ impl<'w> Harness<'w> {
                 // A same-native copy of a validated pin is itself validated: the next N
                 // projects from it. Its rows must equal the prior basis rows exactly.
                 let copied = Model::at(world, n)?;
-                if snapshot_ids(&copied.basis_snapshot, None)
-                    != snapshot_ids(&self.model.basis_snapshot, None)
+                if snapshot_rows(&copied.basis_snapshot)
+                    != snapshot_rows(&self.model.basis_snapshot)
                 {
                     return Err(format!("{label}: same-native copy changed semantic rows"));
                 }
@@ -1245,10 +1354,7 @@ impl<'w> Harness<'w> {
                 // Property 3: the unchanged document keeps exactly P's evidence, never fresh.
                 let rows =
                     rows.ok_or_else(|| format!("{label}: older-basis {path} hid its evidence"))?;
-                let ids = snapshot_ids(&rows, Some(path));
-                if ids != self.model.rows_of(path) {
-                    return Err(format!("{label}: older-basis {path} rows differ from P"));
-                }
+                check_older_basis_rows(label, path, &rows, &self.model.rows_of(path))?;
                 for proof in &rows.provenance {
                     if projection.effective_freshness(proof.freshness) == Freshness::Fresh {
                         return Err(format!(
@@ -1840,6 +1946,124 @@ fn native_first_copy_controls() {
         let corrupt = run_history(&[Op::CorruptCopy { pick: 2, write }]).unwrap();
         eprintln!("corruption control (write {write}) stats: {corrupt:?}");
         assert_eq!(corrupt.corruptions_typed, 1, "{corrupt:?}");
+    }
+}
+
+/// #759 mutation control: the older-basis document-read check and the retained-pin view
+/// see every row kind, so a served row set with any row missing, extra, duplicated or
+/// changed is caught. The rows are a real older-basis read (C, while only B changed).
+#[test]
+fn native_first_document_rows_control() {
+    let world = world(populate);
+    let mut harness = Harness::new(&world).unwrap();
+    harness
+        .apply(
+            0,
+            &Op::Edit {
+                path: 1,
+                choice: 1,
+                defer: true,
+            },
+        )
+        .unwrap();
+    assert!(harness.stats.older_basis_docs > 0, "{:?}", harness.stats);
+    let n = world.store.index_baseline().unwrap();
+    let path = PATHS[2];
+    let key = trellis::native_evidence::DocumentKey {
+        source_set_id: source_set(&world, n).unwrap(),
+        language: LANGUAGE.into(),
+        path: path.into(),
+    };
+    let (projection, rows) = world
+        .store
+        .projected_semantic_document_at(n, &harness.model.producer, &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.semantic_status, SemanticStatus::OlderBasis);
+    let rows = rows.expect("older-basis rows");
+    let expected = harness.model.rows_of(path);
+    check_older_basis_rows("control", path, &rows, &expected).unwrap();
+    let view = pinned_view(&world, n, &harness.model.producer).unwrap();
+    assert_eq!(
+        view,
+        pinned_view(&world, n, &harness.model.producer).unwrap()
+    );
+    assert!(
+        view.semantic.is_none(),
+        "projected N served an unlabelled read"
+    );
+    // The validated import pin is retained with its whole-revision rows.
+    assert!(
+        harness
+            .retained
+            .iter()
+            .any(|(_, v)| v.semantic.as_ref().is_some_and(|rows| !rows.is_empty())),
+        "no retained validated pin carries its semantic rows"
+    );
+
+    type Mutation = fn(&mut SemanticSnapshot) -> bool;
+    fn drop_last<T>(rows: &mut Vec<T>) -> bool {
+        rows.pop().is_some()
+    }
+    let mutations: [(&str, Mutation); 14] = [
+        ("clear references", |s| {
+            !std::mem::take(&mut s.references).is_empty()
+        }),
+        ("clear call bindings", |s| {
+            !std::mem::take(&mut s.call_bindings).is_empty()
+        }),
+        ("drop producer", |s| drop_last(&mut s.producers)),
+        ("drop coverage", |s| drop_last(&mut s.coverage)),
+        ("drop provenance", |s| drop_last(&mut s.provenance)),
+        ("drop symbol", |s| drop_last(&mut s.symbols)),
+        ("drop declaration", |s| {
+            drop_last(&mut s.declaration_bindings)
+        }),
+        ("drop reference", |s| drop_last(&mut s.references)),
+        ("drop call binding", |s| drop_last(&mut s.call_bindings)),
+        ("duplicate reference", |s| {
+            let first = s.references.first().cloned();
+            first.map(|r| s.references.push(r)).is_some()
+        }),
+        ("change reference spelling", |s| {
+            s.references
+                .first_mut()
+                .map(|r| r.spelling.push('x'))
+                .is_some()
+        }),
+        ("change call dispatch completeness", |s| {
+            s.call_bindings
+                .first_mut()
+                .map(|c| c.possible_dispatch_complete = !c.possible_dispatch_complete)
+                .is_some()
+        }),
+        ("change symbol display name", |s| {
+            s.symbols
+                .first_mut()
+                .map(|r| r.display_name = Some("mutated".into()))
+                .is_some()
+        }),
+        ("change coverage diagnostic", |s| {
+            s.coverage
+                .first_mut()
+                .map(|c| c.diagnostic = Some("mutated".into()))
+                .is_some()
+        }),
+    ];
+    for (name, mutate) in mutations {
+        let mut altered = rows.clone();
+        // Every mutation must bite on this document, or the control proves nothing.
+        assert!(mutate(&mut altered), "{name}: {path} has no row to alter");
+        assert!(
+            check_older_basis_rows("control", path, &altered, &expected).is_err(),
+            "{name}: older-basis check missed it"
+        );
+        let mut changed = view.clone();
+        let Some(Some((_, served))) = changed.documents.get_mut(path) else {
+            panic!("{name}: {path} is not a projected document read at {n:?}");
+        };
+        *served = Some(snapshot_rows(&altered));
+        assert_ne!(changed, view, "{name}: retained-pin view missed it");
     }
 }
 
