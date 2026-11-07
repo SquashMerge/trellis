@@ -1,17 +1,39 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // One helper target per checkout: concurrent runs in different checkouts must
-// not rebuild each other's tree-sitter outputs mid-read. CI pins it for caching.
+// not rebuild each other's tree-sitter outputs mid-read. It lives beside the
+// workspace's cargo target, not under the OS temp dir, whose cleanup can drop
+// single build-script outputs that cargo still considers fresh (#747). The
+// checkout hash keeps checkouts apart when they share one CARGO_TARGET_DIR.
+// CI pins it for caching.
 const compositionTarget = process.env.TRELLIS_COMPOSITION_TARGET ??
-  join(tmpdir(), `trellis-synthetic-composition-cargo-target-${createHash("sha256").update(here).digest("hex").slice(0, 12)}`);
+  join(resolve(process.env.CARGO_TARGET_DIR ?? join(here, "..", "..", "..", "target")),
+    `synthetic-composition-${createHash("sha256").update(here).digest("hex").slice(0, 12)}`);
+// Build-script outputs that cargo does not re-check while its fingerprints are
+// fresh. If one is gone the cached target is damaged: clear it, and the next
+// cargo run rebuilds it once from scratch.
+const expectedBuildOutputs = [{ crate: /^tree-sitter-[0-9a-f]{16}$/, file: "stdlib-symbols.txt" }];
+function healCompositionTarget() {
+  const build = join(compositionTarget, "debug", "build");
+  if (!existsSync(build)) return;
+  for (const entry of readdirSync(build)) {
+    const out = join(build, entry, "out");
+    const lost = expectedBuildOutputs.find(e => e.crate.test(entry) && existsSync(out) && !existsSync(join(out, e.file)));
+    if (lost) {
+      process.stderr.write(`composition target ${compositionTarget} lost ${entry}/out/${lost.file}; clearing it to rebuild\n`);
+      rmSync(compositionTarget, { recursive: true, force: true });
+      return;
+    }
+  }
+}
 const generator = join(here, "..", "generate.mjs");
 const helper = join(here, "composition", "Cargo.toml");
 const policy = join(here, "..", "..", "..", "docs", "semantic-evidence", "cohorts-v1.json");
@@ -55,6 +77,7 @@ function outcome(result) { return result.stderr || result.stdout || result.error
 
 test("all generated source parses with pinned grammars and meets source-derived composition", { timeout: 1200000 }, () => {
   assert.deepEqual(JSON.parse(readFileSync(policy)).synthetic.minimumComposition, pinned);
+  healCompositionTarget();
   const temp = mkdtempSync(join(tmpdir(), "trellis-cohort-composition-"));
   const root = join(temp, "corpus");
   try {
