@@ -480,6 +480,15 @@ struct RequestCoverage {
     verified: bool,
 }
 
+/// Clears a watcher's published `capturing` flag on every exit.
+struct CapturingGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CapturingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// The elected owner alone drives the advisory watcher and the durable FIFO.
 /// This is an in-memory scheduler, not a second request queue.
 pub struct WatcherWork {
@@ -522,6 +531,11 @@ pub struct WatcherWork {
     waker: Option<crate::watch::Waker>,
     /// Set only for retirement's attempt: the batch must be exactly this generation.
     generation_limit: Option<u64>,
+    /// Set from the moment a reconciliation decides to capture until it has
+    /// finished, acknowledgment included. Published with the watch status, so
+    /// work with no accepted hint (a periodic inventory) is pending before it
+    /// can publish (#752).
+    capturing: Arc<std::sync::atomic::AtomicBool>,
     /// Test-support hold after a watcher reconciliation published and before it
     /// acknowledges its batch (#752).
     #[cfg(feature = "test-support")]
@@ -613,9 +627,15 @@ impl WatcherWork {
             witness_reported_generation: None,
             waker: None,
             generation_limit: None,
+            capturing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-support")]
             before_ack_hook: None,
         })
+    }
+
+    /// Whether a reconciliation is capturing, publishing or acknowledging now.
+    pub fn capturing_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.capturing.clone()
     }
 
     /// Run `hook` once, after the next watcher reconciliation has published
@@ -1079,6 +1099,10 @@ impl WatcherWork {
         {
             return Ok(false);
         }
+        // From here this reconciliation can publish: it is pending watcher work
+        // until it returns, whether or not a hint was accepted (#752).
+        self.capturing.store(true, Ordering::SeqCst);
+        let _capturing = CapturingGuard(self.capturing.clone());
         // The first post-registration full inventory closes the startup/watch gap.
         // An identical selected capture needs no gratuitous new revision.
         let outcome: Result<PublishPermit> = (|| {

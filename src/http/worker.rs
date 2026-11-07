@@ -486,6 +486,8 @@ pub(super) struct WatchStatus {
     pub(super) generation: Arc<std::sync::atomic::AtomicU64>,
     pub(super) acknowledged: u64,
     pub(super) other_intent: bool,
+    /// Live: a reconciliation that can publish is running (#752).
+    pub(super) capturing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A failed or panicked step is retried after this delay.
@@ -1044,6 +1046,7 @@ impl DaemonState {
             generation: watcher.generation_handle(),
             acknowledged: watcher.acknowledged_generation(),
             other_intent: watcher.intent_besides_generation(options),
+            capturing: watcher.capturing_handle(),
         });
     }
 }

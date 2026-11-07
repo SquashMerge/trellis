@@ -3852,3 +3852,48 @@ async fn settled_sample_rechecks_the_owner_after_its_read() {
     let moved = runtime.settled_for_tests(None).await.unwrap();
     assert!(moved.index_revision > head.index_revision, "{moved:?}");
 }
+
+/// The same for a periodic inventory with no accepted hint (#752): an edit no OS event
+/// reported is published by the inventory, which is watcher work until it has finished,
+/// although the ingress generation never moved.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn settled_sample_sees_a_periodic_inventory_without_a_hint() {
+    use trellis::daemon::registry::{NotSettled, SettleBusy};
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function before() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let head = runtime.settled_for_tests(None).await.unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+
+    let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    assert!(scheduler.set_before_watch_ack_hook_for_tests(move || {
+        published_tx.send(()).unwrap();
+        let _ = ack_rx.recv_timeout(trellis::testing::HANG_BACKSTOP);
+    }));
+    // Idle at N0 when the read sampled catchingUp; then, with no hint, the periodic
+    // inventory finds the edit and publishes before the read opens its snapshot.
+    let path = checkout.join("a.js");
+    let inventory = scheduler.clone();
+    runtime.set_evidence_sampled_hook_for_tests(move || {
+        fs::write(&path, "function after() {}\n").unwrap();
+        assert!(inventory.run_periodic_inventory_for_tests());
+        published_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("the periodic inventory did not publish");
+    });
+    let sampler = runtime.clone();
+    let sampled = tokio::task::spawn_blocking(move || sampler.sample_settled_for_tests(None))
+        .await
+        .unwrap();
+    ack_tx.send(()).unwrap();
+    assert_eq!(sampled, Err(NotSettled::Hang(SettleBusy::Watcher)));
+    let moved = runtime.settled_for_tests(None).await.unwrap();
+    assert!(moved.index_revision > head.index_revision, "{moved:?}");
+}

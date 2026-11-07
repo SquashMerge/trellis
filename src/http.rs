@@ -714,6 +714,7 @@ impl DaemonState {
         match &*self.watch_status.lock().unwrap() {
             Some(status) => {
                 status.other_intent
+                    || status.capturing.load(Ordering::SeqCst)
                     || status.generation.load(Ordering::SeqCst) != status.acknowledged
             }
             // A serving session's first watcher has not run its full inventory.
@@ -745,6 +746,22 @@ impl DaemonState {
         };
         scheduler.submit_watch_event_for_tests(event);
         scheduler.force_periodic_inventory_for_tests();
+        true
+    }
+
+    /// Make the periodic inventory due now, with no hint accepted, and wake the
+    /// worker to run it. False without a watcher.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn run_periodic_inventory_for_tests(&self) -> bool {
+        {
+            let mut work = self.watcher_work.lock().unwrap();
+            let Some((_, scheduler)) = work.as_mut() else {
+                return false;
+            };
+            scheduler.force_periodic_inventory_for_tests();
+        }
+        self.inbox.wake();
         true
     }
 

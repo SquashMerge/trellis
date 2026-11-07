@@ -113,7 +113,10 @@ impl CheckoutRuntime {
     /// checked again after the selected read, with the head still the read's pin:
     /// the version is an iteration-end notification, not a mutation epoch, so
     /// idle flags sampled before a read never certify a pin published after them
-    /// (#752). Owners raise a pending flag before the work it covers publishes.
+    /// (#752). Owners raise a pending flag before the work it covers publishes:
+    /// ingress bumps the watcher generation, a watcher reconciliation that can
+    /// publish (a periodic inventory included) publishes `capturing` until it
+    /// returns, and enqueue sets FIFO pending.
     /// Its one bound is `HANG_BACKSTOP`, and
     /// the error names the component still busy. It holds an admission lease, so
     /// the checkout cannot be released while it waits.
