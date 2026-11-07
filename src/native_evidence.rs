@@ -814,13 +814,20 @@ pub fn from_capture(
     Ok(artifact)
 }
 
+/// Document extractions per root id. Keyed by root, so tests running in
+/// parallel on their own temporary roots never see each other's counts.
 #[cfg(test)]
-static FULL_VALIDATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DOCUMENT_EXTRACTIONS: std::sync::Mutex<std::collections::BTreeMap<String, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Full rebuild-and-compare validations run by this process.
+/// How many times this process has extracted a document of `root_id`, on any
+/// thread and by any entry point (full build, spool or selected measurement).
 #[cfg(test)]
-pub(crate) fn full_validations_for_tests() -> usize {
-    FULL_VALIDATIONS.load(std::sync::atomic::Ordering::SeqCst)
+pub(crate) fn document_extractions_for_tests(root_id: &str) -> usize {
+    let counts = DOCUMENT_EXTRACTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    counts.get(root_id).copied().unwrap_or(0)
 }
 
 /// Call-scoped evidence from the full native pipeline. `Measured` fires only
@@ -2555,6 +2562,14 @@ fn extract_document(
     header_witness: &mut dyn FnMut(&str, String, Range),
     expand_macros: bool,
 ) -> Result<()> {
+    #[cfg(test)]
+    {
+        *DOCUMENT_EXTRACTIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(a.source_set.root_id.clone())
+            .or_default() += 1;
+    }
     language_order(&f.language)?;
     safe_path(&f.path)?;
     // Occurrence identity binds this captured document version. Authenticate its content hash
