@@ -1,0 +1,99 @@
+name: Stress tests
+# The Rust tests under CPU load, repeated, so flaky-test classes (timing
+# assumptions, missing settled waits, unbounded waits) show up here before they
+# reach a release PR (#720). It never gates a PR: there is no pull_request
+# trigger and it is not a required check. A failure files nothing; a human or
+# supervisor triages the uploaded logs. See docs/releases.md#stress-lane.
+on:
+  schedule:
+    # Weekly, Sunday 06:23 UTC.
+    - cron: '23 6 * * 0'
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: Repetitions of the suite per runner
+        default: '3'
+        type: string
+      load:
+        description: Busy loops per core, running for the whole suite (0 = none)
+        default: '2'
+        type: string
+      test_threads:
+        description: nextest test threads (empty = one per core)
+        default: ''
+        type: string
+      filter:
+        description: Optional nextest filterset, e.g. test(watcher) (empty = the whole suite)
+        default: ''
+        type: string
+      os:
+        description: Runners
+        default: both
+        type: choice
+        options: [both, macos-latest, ubuntu-latest]
+permissions:
+  contents: read
+concurrency:
+  group: stress-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  # The job id and cache key match rust.yml's tests job, so this restores the
+  # tests job's warm cache from main. It never saves one.
+  verify:
+    name: stress (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.os == 'macos-latest' && '["macos-latest"]' || inputs.os == 'ubuntu-latest' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      # The setup below is rust.yml's, for its tests job: the same toolchain,
+      # linker, nextest and cache, so this builds exactly what CI builds.
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: npm ci --prefix tests/mcp --ignore-scripts
+      # Keep in step with rust-toolchain.toml and rust.yml.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+        if: runner.os == 'Linux'
+        with:
+          mold-version: 2.42.1
+      - name: Link Rust with mold
+        if: runner.os == 'Linux'
+        run: echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        with:
+          tool: cargo-nextest@0.9.150
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: tests
+          workspaces: . -> target-test-support
+          save-if: false
+      # Builds first, then runs the suite under load REPEAT times and writes a
+      # per-test, per-repetition failure summary to the job summary.
+      - name: Run the tests under load
+        env:
+          REPEAT: ${{ inputs.repeat || '3' }}
+          LOAD: ${{ inputs.load || '2' }}
+          TEST_THREADS: ${{ inputs.test_threads }}
+          FILTER: ${{ inputs.filter }}
+        run: |
+          set -- --repeat "$REPEAT" --load "$LOAD"
+          if [ -n "$TEST_THREADS" ]; then set -- "$@" --test-threads "$TEST_THREADS"; fi
+          if [ -n "$FILTER" ]; then set -- "$@" -- -E "$FILTER"; fi
+          ./tools/stress "$@"
+      # Each repetition's full nextest log and JUnit report (which keeps every
+      # failed test's output), plus the summary.
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: stress-${{ matrix.os }}-attempt-${{ github.run_attempt }}
+          path: target-test-support/stress/
+          retention-days: 14
+          if-no-files-found: warn
