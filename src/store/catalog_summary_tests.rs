@@ -251,7 +251,7 @@ fn select_clipped_catalog(store: &Store, pin: IndexPin, limits: Limits) -> Catal
         .prepare(
             "SELECT m.path,m.gid,g.graph_hash FROM revision_documents m
          JOIN graph_projections g ON g.gid=m.gid WHERE m.revision_id=?1
-         AND m.language IN ('java','python','javascript','rust') ORDER BY m.path",
+         AND m.language IN ('java','python','javascript','rust','typescript') ORDER BY m.path",
         )
         .unwrap()
         .query_map([&selected.key], |row| {

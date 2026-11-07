@@ -16,7 +16,7 @@ macro_rules! closed {
         pub enum $name { $(#[serde(rename = $value)] $variant),+ }
     };
 }
-closed!(Language { Java => "java", Rust => "rust", Python => "python", Javascript => "javascript" });
+closed!(Language { Java => "java", Rust => "rust", Python => "python", Javascript => "javascript", Typescript => "typescript" });
 closed!(PositionEncoding { Utf8 => "utf8", Utf16 => "utf16", UnicodeScalar => "unicodeScalar" });
 closed!(Role { Definition => "definition", Read => "read", Write => "write", Call => "call", Type => "type", Import => "import", Alias => "alias" });
 closed!(CoverageState { NotRequested => "notRequested", Omitted => "omitted", Unsupported => "unsupported", Failed => "failed", Partial => "partial", Complete => "complete" });
@@ -273,7 +273,7 @@ fn key(key: &native::DocumentKey, revision: &native::Revision) -> Result<()> {
         key.source_set_id == revision.source_set_id
             && matches!(
                 key.language.as_str(),
-                "java" | "rust" | "python" | "javascript"
+                "java" | "rust" | "python" | "javascript" | "typescript"
             ),
         "foreign semantic document"
     );
@@ -912,14 +912,14 @@ fn original_reference<'a>(
     Ok(original)
 }
 
+pub const LANGUAGE_ORDER: [&str; 5] = ["java", "rust", "python", "javascript", "typescript"];
+
+pub fn language_order(language: &str) -> Option<usize> {
+    LANGUAGE_ORDER.iter().position(|name| *name == language)
+}
+
 fn language_rank(language: &str) -> usize {
-    match language {
-        "java" => 0,
-        "rust" => 1,
-        "python" => 2,
-        "javascript" => 3,
-        _ => unreachable!("validated language"),
-    }
+    language_order(language).unwrap_or_else(|| unreachable!("validated language"))
 }
 
 fn native_revision_id(captured: &CapturedComponents) -> String {
@@ -3384,6 +3384,18 @@ mod coverage_reason_tests {
         assert_eq!(kind("opaque Rust token_tree skipped; contents"), 3);
         assert_eq!(kind("family unavailable"), 3);
         assert_eq!(CoverageReasons::gap_kind(None), 3);
+    }
+
+    #[test]
+    fn language_order_is_contract_order() {
+        for (index, name) in ["java", "rust", "python", "javascript", "typescript"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(language_order(name), Some(index));
+            assert_eq!(LANGUAGE_ORDER[index], name);
+        }
+        assert_eq!(language_order("TypeScript"), None);
     }
 
     #[test]

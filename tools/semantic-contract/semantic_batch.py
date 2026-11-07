@@ -12,7 +12,7 @@ from pathlib import Path
 FORMAT_VERSION = 1
 MAX_PAGE_ROWS = 1000
 MAX_PAGE_BYTES = 1 << 20
-LANGUAGE_ORDER = {"java": 0, "rust": 1, "python": 2, "javascript": 3}
+LANGUAGE_ORDER = {"java": 0, "rust": 1, "python": 2, "javascript": 3, "typescript": 4}
 EXCLUSIONS = ("notRequested", "unsupported", "failed")
 
 DESCRIPTOR_KEYS = frozenset({

@@ -9,7 +9,7 @@ fn pin(revision: u64) -> IndexPin {
 }
 fn fixture() -> Connection {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V40).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V41).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
         "INSERT INTO semantic_producers VALUES('producer','1',?1,'semantic','utf8','executable')",
