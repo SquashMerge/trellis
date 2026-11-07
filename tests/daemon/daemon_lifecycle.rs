@@ -205,7 +205,9 @@ async fn lost_active_index_wakes_cli_index_waiter_without_recreating_queue() {
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
     // Stores for this root share the queue's in-process wait generation.
-    let store = trellis::store::Store::open(roots, identity(&id.root)).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open(roots.clone(), identity(&id.root))
+    });
     let (held_tx, held_rx) = tokio::sync::oneshot::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     let holder = runtime.clone();
@@ -592,7 +594,9 @@ fn leftover_index_state_never_keeps_an_idle_daemon_alive() {
     let id = identity(&checkout);
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = trellis::store::Store::open(roots.clone(), identity(&checkout)).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open(roots.clone(), identity(&checkout))
+    });
     let accepted = store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout), None)
         .unwrap();
@@ -765,7 +769,9 @@ async fn active_writer_and_protected_reader_keep_activated_checkout_pending() {
     let (base, id, mut registry, now) = fixture();
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = trellis::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open(roots.clone(), identity(&id.root))
+    });
     let options = trellis::indexer::IndexOptions::new(id.root.clone());
     let first = store.enqueue_request(&options, None).unwrap();
     assert_eq!(
@@ -905,7 +911,9 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_daemon_drai
     ready(&runtime).await;
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = trellis::store::Store::open(roots, identity(&id.root)).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open(roots.clone(), identity(&id.root))
+    });
     let options = trellis::indexer::IndexOptions::new(id.root.clone());
     // The live worker claims the first request as soon as it is committed:
     // hold it there, so the committed queue is observed before it drains.
@@ -1001,10 +1009,11 @@ fn deleted_or_replaced_orphan_root_with_empty_queue_allows_exit() {
         let base = tempfile::tempdir().unwrap();
         let checkout = base.path().join("work");
         fs::create_dir(&checkout).unwrap();
-        let id = identity(&checkout);
         let roots =
             TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-        drop(trellis::store::Store::open(roots.clone(), id).unwrap());
+        drop(trellis::testing::retry_admission(|| {
+            trellis::store::Store::open(roots.clone(), identity(&checkout))
+        }));
         fs::remove_dir_all(&checkout).unwrap();
         if replace {
             fs::create_dir(&checkout).unwrap();

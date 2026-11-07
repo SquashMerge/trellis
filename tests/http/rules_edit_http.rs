@@ -127,14 +127,15 @@ async fn fixture(with_exception: bool) -> Fixture {
         .unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = Store::open(
-        roots.clone(),
-        WorkspaceIdentity::discover(Some(&root), &root)
-            .unwrap()
-            .attach_marker()
-            .unwrap(),
-    )
-    .unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        Store::open(
+            roots.clone(),
+            WorkspaceIdentity::discover(Some(&root), &root)
+                .unwrap()
+                .attach_marker()
+                .unwrap(),
+        )
+    });
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let leader = trellis::index_coordinator::establish_serving_session(
         &store,

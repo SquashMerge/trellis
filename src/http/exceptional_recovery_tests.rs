@@ -12,7 +12,7 @@ fn startup_queue_fixture(old_schema: bool, changed_device: bool) {
     let roots =
         TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let old = Store::open_for_tests(&state_root, &root).unwrap();
+    let old = crate::testing::retry_admission(|| Store::open_for_tests(&state_root, &root));
     let options = IndexOptions::new(root.clone());
     let cancel = Arc::new(AtomicBool::new(false));
     let (prior, owner) =
@@ -49,7 +49,7 @@ fn startup_queue_fixture(old_schema: bool, changed_device: bool) {
         }
     }
 
-    let store = Store::open_for_tests(&state_root, &root).unwrap();
+    let store = crate::testing::retry_admission(|| Store::open_for_tests(&state_root, &root));
     let state = new(
         store.clone(),
         options,
@@ -118,14 +118,16 @@ pub(super) fn fixture() -> (
         tmp.path().join("state/data"),
     );
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let old = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+    let old =
+        crate::testing::retry_admission(|| Store::open_for_tests(&tmp.path().join("state"), &root));
     // An accepted Q0 creates the durable queue witness before damage to
     // derived index.db. Recovery must retain and drain it ahead of later IDs.
     old.enqueue_request(&IndexOptions::new(root.clone()), None)
         .unwrap();
     drop(old);
     std::fs::write(roots.index_db(&identity), b"bad sqlite index header").unwrap();
-    let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(&tmp.path().join("state"), &root));
     assert!(store.is_recreate_pending());
     let state = new(
         store.clone(),
@@ -149,7 +151,7 @@ fn damaged_index_without_accepted_head_uses_configured_startup_options() {
     let roots =
         TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let old = Store::open_for_tests(&state_root, &root).unwrap();
+    let old = crate::testing::retry_admission(|| Store::open_for_tests(&state_root, &root));
     let options = IndexOptions::new(root.clone());
     let (_, owner) = crate::index_coordinator::reconcile_workspace(
         &old,
@@ -164,7 +166,7 @@ fn damaged_index_without_accepted_head_uses_configured_startup_options() {
     let index = roots.index_db(&identity);
     let damaged = b"bad sqlite index header";
     std::fs::write(&index, damaged).unwrap();
-    let store = Store::open_for_tests(&state_root, &root).unwrap();
+    let store = crate::testing::retry_admission(|| Store::open_for_tests(&state_root, &root));
     assert!(store.is_recreate_pending());
     assert!(store.earliest_unfinished_request().unwrap().is_none());
     let state = new(
@@ -273,7 +275,8 @@ fn paused_recovery_fixture() -> PausedRecoveryFixture {
     );
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let index_path = roots.index_db(&identity);
-    let old = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+    let old =
+        crate::testing::retry_admission(|| Store::open_for_tests(&tmp.path().join("state"), &root));
     let options = IndexOptions::new(root.clone());
     let cancel = Arc::new(AtomicBool::new(false));
     let (pin, old_owner) =
@@ -283,7 +286,8 @@ fn paused_recovery_fixture() -> PausedRecoveryFixture {
     let q1 = old.enqueue_request(&options, None).unwrap();
     assert!(q2.seq < q1.seq);
     std::fs::write(&index_path, b"bad sqlite index header").unwrap();
-    let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(&tmp.path().join("state"), &root));
     assert!(store.is_recreate_pending());
     let state = new(
         store.clone(),
@@ -316,11 +320,12 @@ async fn browser_q1_then_cli_q2_exceptional_fifo_survives_reader_contention() {
         .unwrap();
     assert_eq!(status, StatusCode::ACCEPTED);
     let q1 = store.request_by_id(&browser.id).unwrap().unwrap();
-    let cli = Store::open_for_tests(
-        &_tmp.path().join("state"),
-        &state.config().options.workspace_root,
-    )
-    .unwrap();
+    let cli = crate::testing::retry_admission(|| {
+        Store::open_for_tests(
+            &_tmp.path().join("state"),
+            &state.config().options.workspace_root,
+        )
+    });
     let q2 = cli.enqueue_request(&state.config().options, None).unwrap();
     assert!(q0.seq < q1.seq && q1.seq < q2.seq);
     assert_eq!(
@@ -511,7 +516,8 @@ async fn idle_tick_cannot_drain_request_admitted_after_empty_pending_snapshot() 
     );
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let index_path = roots.index_db(&identity);
-    let old = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+    let old =
+        crate::testing::retry_admission(|| Store::open_for_tests(&tmp.path().join("state"), &root));
     let options = IndexOptions::new(root.clone());
     let (prior, old_owner) = crate::index_coordinator::reconcile_workspace(
         &old,
@@ -522,7 +528,8 @@ async fn idle_tick_cannot_drain_request_admitted_after_empty_pending_snapshot() 
     .unwrap();
     std::fs::write(&index_path, b"bad sqlite index header").unwrap();
     let corrupt_bytes = std::fs::read(&index_path).unwrap();
-    let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(&tmp.path().join("state"), &root));
     assert!(store.is_recreate_pending());
     let state = new(
         store.clone(),
@@ -1261,7 +1268,8 @@ async fn multiple_posts_commit_fifo_with_local_writer() {
     let root = tmp.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
-    let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(&tmp.path().join("state"), &root));
     let state = new(
         store.clone(),
         IndexOptions::new(root),
@@ -1313,7 +1321,8 @@ pub(super) fn serving_queue_watch_fixture()
     let root = tmp.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
-    let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(&tmp.path().join("state"), &root));
     let options = IndexOptions::new(root);
     let (_, owner) = crate::index_coordinator::reconcile_workspace(
         &store,

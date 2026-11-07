@@ -522,10 +522,7 @@ fn check_daemon_catalog_mismatch(initial: bool) {
     let listener = owner.listener().try_clone().unwrap();
     let (release, released) = mpsc::sync_channel(1);
     let fake = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-            .unwrap();
+        let mut stream = trellis::testing::accept_within_backstop(&listener);
         let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
         assert_eq!(attach.payload["mcpIdentity"], protocol::mcp_identity());
         protocol::write_frame(
@@ -1248,10 +1245,7 @@ fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
             "arguments":{"schemaVersion":1},"_meta":meta["_meta"]}})
     )
     .unwrap();
-    let (mut phase, _) = listener.accept().unwrap();
-    phase
-        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-        .unwrap();
+    let mut phase = trellis::testing::accept_within_backstop(&listener);
     let mut stage = String::new();
     BufReader::new(phase.try_clone().unwrap())
         .read_line(&mut stage)
@@ -1350,10 +1344,7 @@ fn stdin_eof_cancels_in_flight_call_without_stdout() {
         })
     )
     .unwrap();
-    let (mut phase, _) = listener.accept().unwrap();
-    phase
-        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-        .unwrap();
+    let mut phase = trellis::testing::accept_within_backstop(&listener);
     let mut stage = String::new();
     BufReader::new(phase.try_clone().unwrap())
         .read_line(&mut stage)
@@ -1412,10 +1403,7 @@ fn canceled_read_is_not_replayed_after_daemon_death() {
         })
     )
     .unwrap();
-    let (phase, _) = listener.accept().unwrap();
-    phase
-        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-        .unwrap();
+    let phase = trellis::testing::accept_within_backstop(&listener);
     let mut stage = String::new();
     BufReader::new(phase.try_clone().unwrap())
         .read_line(&mut stage)
@@ -1520,10 +1508,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
     let (connected_tx, connected_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let fake = std::thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
-        socket
-            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-            .unwrap();
+        let mut socket = trellis::testing::accept_within_backstop(&listener);
         let attach: protocol::Request = protocol::read_frame(&mut socket).unwrap();
         assert_eq!(attach.operation, "mcp");
         connected_tx.send(()).unwrap();
@@ -1771,10 +1756,7 @@ fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let fake = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-                .unwrap();
+            let mut stream = trellis::testing::accept_within_backstop(&listener);
             let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
             assert_eq!(attach.operation, "mcp");
             entered_tx.send(()).unwrap();
@@ -1902,10 +1884,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         .expect("the killed daemon released its lock");
     let listener = owner.listener().try_clone().unwrap();
     let fake = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-            .unwrap();
+        let mut stream = trellis::testing::accept_within_backstop(&listener);
         let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
         assert_eq!(attach.operation, "mcp");
         protocol::write_frame(
@@ -1993,10 +1972,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     );
     let listener = owner.listener().try_clone().unwrap();
     let failed_attach = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-            .unwrap();
+        let mut stream = trellis::testing::accept_within_backstop(&listener);
         let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
         assert_eq!(attach.operation, "mcp");
         protocol::write_frame(
@@ -2160,10 +2136,7 @@ fn cancel_after_relay_reads_reply_suppresses_that_reply() {
         peer.stdin.as_mut().unwrap().flush().unwrap();
     };
     let pause = |listener: &UnixListener| {
-        let (phase, _) = listener.accept().unwrap();
-        phase
-            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-            .unwrap();
+        let phase = trellis::testing::accept_within_backstop(listener);
         let mut stage = String::new();
         BufReader::new(phase.try_clone().unwrap())
             .read_line(&mut stage)
@@ -2229,10 +2202,7 @@ fn cancel_after_the_relay_decides_cannot_recall_the_reply() {
         peer.stdin.as_mut().unwrap().flush().unwrap();
     };
     let pause = |listener: &UnixListener| {
-        let (phase, _) = listener.accept().unwrap();
-        phase
-            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-            .unwrap();
+        let phase = trellis::testing::accept_within_backstop(listener);
         let mut stage = String::new();
         BufReader::new(phase.try_clone().unwrap())
             .read_line(&mut stage)
@@ -2317,9 +2287,7 @@ fn relay_answers_at_its_deadline_and_drops_the_late_reply() {
             "arguments":{"schemaVersion":1},"_meta":meta}});
     writeln!(peer.stdin.as_mut().unwrap(), "{call}").unwrap();
     // The daemon holds A at its send decision.
-    let (mut held, _) = listener.accept().unwrap();
-    held.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-        .unwrap();
+    let mut held = trellis::testing::accept_within_backstop(&listener);
     let mut stage = String::new();
     BufReader::new(held.try_clone().unwrap())
         .read_line(&mut stage)

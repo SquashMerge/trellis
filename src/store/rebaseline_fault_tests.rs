@@ -44,7 +44,8 @@ fn local_edit_fixture() -> (
     .unwrap();
     let options = IndexOptions::new(work.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let job = IndexJobCoordinator::prepare(&store, None).unwrap();
     let first = job.run(&options, &cancel, |_| {}).unwrap();
     (state, work, store, options, first)
@@ -111,7 +112,8 @@ fn selective_publication_faults_rollback_and_retry_same_expected_pin() {
         .unwrap();
         let options = IndexOptions::new(work.path().to_owned());
         let cancel = Arc::new(AtomicBool::new(false));
-        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let store =
+            crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
         let job = IndexJobCoordinator::prepare(&store, None).unwrap();
         let session = job.session();
         let first = job.run(&options, &cancel, |_| {}).unwrap();
@@ -289,7 +291,7 @@ fn persisted_local_classifier_accepts_inventory_partial_and_surface_changes() {
         .unwrap();
         let options = IndexOptions::new(path.to_owned());
         let cancel = Arc::new(AtomicBool::new(false));
-        let store = Store::open_for_tests(state.path(), path).unwrap();
+        let store = crate::testing::retry_admission(|| Store::open_for_tests(state.path(), path));
         let job = IndexJobCoordinator::prepare(&store, None).unwrap();
         let session = job.session();
         let first = job.run(&options, &cancel, |_| {}).unwrap();
@@ -364,7 +366,8 @@ fn persisted_local_classifier_accepts_inventory_partial_and_surface_changes() {
             "{label}: old pin preserved"
         );
         let cold_state = tempfile::tempdir().unwrap();
-        let cold = Store::open_for_tests(cold_state.path(), path).unwrap();
+        let cold =
+            crate::testing::retry_admission(|| Store::open_for_tests(cold_state.path(), path));
         let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
         let _cold_session = cold_job.session();
         let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
@@ -405,7 +408,7 @@ fn canonical_medium_local_update_writes_only_changed_fact_families() {
     );
     let root = output.join("medium");
     let state = tempfile::tempdir().unwrap();
-    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    let store = crate::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
     let options = IndexOptions::new(root.clone());
     let cancel = Arc::new(AtomicBool::new(false));
     let job = IndexJobCoordinator::prepare(&store, None).unwrap();
@@ -479,7 +482,7 @@ fn canonical_medium_local_update_writes_only_changed_fact_families() {
         original
     );
     let cold_state = tempfile::tempdir().unwrap();
-    let cold = Store::open_for_tests(cold_state.path(), &root).unwrap();
+    let cold = crate::testing::retry_admission(|| Store::open_for_tests(cold_state.path(), &root));
     let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
     let _cold_session = cold_job.session();
     let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
@@ -522,7 +525,7 @@ fn canonical_cohort_produced_native_fact_floors() {
         }
         let state = tempfile::tempdir().unwrap();
         let root = output.join(size);
-        let store = Store::open_for_tests(state.path(), &root).unwrap();
+        let store = crate::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
         let job = IndexJobCoordinator::prepare(&store, None).unwrap();
         let _session = job.session();
         let started = std::time::Instant::now();
@@ -621,7 +624,8 @@ fn local_class_projection_refreshes_unchanged_file_when_cap_moves() {
     .unwrap();
     let options = IndexOptions::new(work.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let (before, before_native, _) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     fs::write(
@@ -676,7 +680,8 @@ fn local_writer_counters_exclude_unchanged_occurrence_access() {
     .unwrap();
     let options = IndexOptions::new(work.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let first_job = IndexJobCoordinator::prepare(&store, None).unwrap();
     let session = first_job.session();
     let first = first_job.run(&options, &cancel, |_| {}).unwrap();
@@ -714,7 +719,8 @@ fn local_writer_counters_exclude_unchanged_occurrence_access() {
 fn wal_header_without_sidecars_is_not_corruption_authority() {
     let state = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let index = store.roots.index_db(&store.identity);
     drop(store);
     let db = Connection::open(&index).unwrap();
@@ -752,14 +758,16 @@ fn only_short_or_invalid_magic_headers_request_typed_recreation() {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
         fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
-        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let store =
+            crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
         let index = store.roots.index_db(&store.identity);
         drop(store);
         fs::write(&index, bytes).unwrap();
         let error = verify_index_file(&index).unwrap_err();
         assert!(error.is::<ExceptionalIndexFormat>());
         assert_eq!(recovery_class(&error), RecoveryClass::RecreatePending);
-        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let recovering =
+            crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
         assert_eq!(
             recovering.disposition(),
             RecoveryDisposition::RecreatePending
@@ -791,12 +799,14 @@ fn exceptional_corrupt_recreate_refuses_busy_use_without_unlinking_index() {
     let state = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let path = store.roots.index_db(&store.identity);
     drop(store);
     fs::write(&path, b"short").unwrap();
     let inode = fs::metadata(&path).unwrap().ino();
-    let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let recovering =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     assert_eq!(
         recovering.disposition(),
         RecoveryDisposition::RecreatePending
@@ -837,7 +847,8 @@ fn old_native_producer_waits_for_automatic_reconciliation_without_corruption() {
             .unwrap();
     }
     drop(store);
-    let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let recovering =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let error = recovering.evidence_response_daemon_local().err().unwrap();
     assert!(error.is::<topology::IndexNotReady>(), "{error:#}");
     let cold = Store::status_existing_readonly(roots, identity).unwrap_err();
@@ -906,7 +917,8 @@ fn old_schema_discovery_is_selectable_and_automatic_recovery_keeps_queue() {
         registry.browser_identity(&key).unwrap().root,
         fs::canonicalize(work.path()).unwrap()
     );
-    let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let recovering =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let scheduler = crate::http::new(
         recovering.clone(),
         options,
@@ -948,7 +960,8 @@ fn assert_obsolete_index_recreates_and_preserves_requests(earlier_schema: bool) 
     fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
     let options = IndexOptions::new(work.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let owner = store.writer().unwrap();
@@ -982,7 +995,8 @@ fn assert_obsolete_index_recreates_and_preserves_requests(earlier_schema: bool) 
     }
     drop(db);
     let inode = fs::metadata(&index).unwrap().ino();
-    let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let recovering =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     assert_eq!(
         recovering.disposition(),
         RecoveryDisposition::RecreatePending
@@ -1021,7 +1035,8 @@ fn earlier_schema_changed_before_rename_refuses_replacement_and_preserves_reques
         fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
         let options = IndexOptions::new(work.path().to_owned());
         let cancel = Arc::new(AtomicBool::new(false));
-        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let store =
+            crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
         let request = store.enqueue_request(&options, None).unwrap();
         let index = store.roots.index_db(&store.identity);
         drop(store);
@@ -1030,7 +1045,8 @@ fn earlier_schema_changed_before_rename_refuses_replacement_and_preserves_reques
             .unwrap();
         drop(db);
         let inode = fs::metadata(&index).unwrap().ino();
-        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let recovering =
+            crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
         assert_eq!(
             recovering.disposition(),
             RecoveryDisposition::RecreatePending
@@ -1082,7 +1098,8 @@ fn current_schema_obsolete_markers_still_refuse_root_spelling_mismatch() {
     for obsolete_extractor in [false, true] {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
-        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let store =
+            crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
         store
             .enqueue_request(&IndexOptions::new(work.path().to_owned()), None)
             .unwrap();
@@ -1115,7 +1132,8 @@ fn current_schema_obsolete_markers_still_refuse_root_spelling_mismatch() {
         drop(db);
         let inode = fs::metadata(&index).unwrap().ino();
         let before = fs::read(&index).unwrap();
-        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let recovering =
+            crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
         assert_eq!(
             recovering.disposition(),
             RecoveryDisposition::RecreatePending
@@ -1144,7 +1162,8 @@ fn private_stage_uses_paired_writer_without_admitting_corrupt_live_evidence() {
         "function changed() { return 1; }\n",
     )
     .unwrap();
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let options = IndexOptions::new(work.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) =
@@ -1166,7 +1185,8 @@ fn private_stage_uses_paired_writer_without_admitting_corrupt_live_evidence() {
     drop(store);
     fs::write(&live_path, b"corrupt index, not sqlite").unwrap();
     let original = fs::read(&live_path).unwrap();
-    let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let recovering =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     assert_eq!(
         recovering.disposition(),
         RecoveryDisposition::RecreatePending
@@ -1280,13 +1300,15 @@ fn staged_hot_journal_after_validation_refuses_without_deleting_sidecar() {
     let state = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let index = store.roots.index_db(&store.identity);
     let dir = store.roots.index_dir(&store.identity);
     drop(store);
     fs::write(&index, b"short").unwrap();
     let before = fs::read(&index).unwrap();
-    let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let recovering =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let exclusive = recovering
         .roots
         .index_use_exclusive_existing(&recovering.identity)
@@ -1349,7 +1371,8 @@ fn exceptional_activation_is_atomic_and_keeps_pending_on_ambiguous_failure() {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
         fs::write(work.path().join("a.js"), "function a() { return 1; }\n").unwrap();
-        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let store =
+            crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
         let options = IndexOptions::new(work.path().to_owned());
         let cancel = Arc::new(AtomicBool::new(false));
         let (graph, native, capture) =
@@ -1386,7 +1409,8 @@ fn exceptional_activation_is_atomic_and_keeps_pending_on_ambiguous_failure() {
         drop(store);
         fs::write(&index, b"corrupt-index-header").unwrap();
         let old_bytes = fs::read(&index).unwrap();
-        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let recovering =
+            crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
         assert_eq!(
             recovering.disposition(),
             RecoveryDisposition::RecreatePending
@@ -1578,7 +1602,8 @@ fn cancellation_at_before_commit_rolls_back_entire_native_class_graph_pair() {
     let path = work.path().join("Types.java");
     let original = "class A { void go() { helper(); } void helper() {} }\nclass B {}\n";
     fs::write(&path, original).unwrap();
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let options = IndexOptions::new(work.path().to_owned());
     let initial_cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) =
@@ -1837,7 +1862,8 @@ fn large_real_native_pair_cancels_at_before_commit_without_partial_rows() {
     let path = work.path().join("a.js");
     let original = "function a() { b(); c(); }\nfunction b() { c(); }\nfunction c() { a(); }\n";
     fs::write(&path, original).unwrap();
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let options = IndexOptions::new(work.path().to_owned());
     let initial_cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) =
@@ -2048,7 +2074,8 @@ fn captured_long_call_exceeds_injected_small_graph_cap_and_remains_selectable() 
     let work = tempfile::tempdir().unwrap();
     let source = format!("function hello() {{ obj.{}(); }}\n", "a".repeat(48 * 1024));
     fs::write(work.path().join("flow.js"), &source).unwrap();
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let cancel = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(work.path().to_owned());
     let (graph, native, capture) =
@@ -2098,7 +2125,8 @@ fn one_byte_over_encoded_source_cap_never_enters_paired_cas() {
     let work = tempfile::tempdir().unwrap();
     let source_path = work.path().join("flow.js");
     fs::write(&source_path, "function old() {}\n").unwrap();
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let cancel = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(work.path().to_owned());
     let (old_graph, old_native, old_capture) =
@@ -2165,7 +2193,8 @@ fn captured_sixfold_escaped_source_is_selectable_below_explicit_json_ceiling() {
     let work = tempfile::tempdir().unwrap();
     let source = format!("/*{}*/", "\u{0001}".repeat(64 * 1024));
     fs::write(work.path().join("flow.js"), &source).unwrap();
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let cancel = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(work.path().to_owned());
     let (graph, native, capture) =
@@ -2210,7 +2239,8 @@ fn real_source_above_injected_ancillary_cap_keeps_selected_source_available() {
     let work = tempfile::tempdir().unwrap();
     let source = format!("/*{}*/", "a".repeat(64 * 1024));
     fs::write(work.path().join("flow.js"), &source).unwrap();
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let cancel = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(work.path().to_owned());
     let (graph, native, capture) =
@@ -2332,7 +2362,8 @@ fn a_local_publication_keeps_the_class_fit_of_the_revision() {
     write("other.js", "function other() { return 1; }\n".into());
     let options = IndexOptions::new(work.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let publish = || {
         IndexJobCoordinator::prepare(&store, None)
             .unwrap()
@@ -2394,14 +2425,16 @@ fn a_fit_hidden_by_full_warnings_survives_a_local_publication() {
         let selected = store.read_revision_for(&db, None, true).unwrap();
         class_metadata(&db, &selected).unwrap()
     };
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     assert!(metadata(&store).1);
     for index in 0..100 {
         fs::remove_file(work.path().join(format!("broken{index}.py"))).unwrap();
     }
     let local = metadata(&store);
     let fresh_state = tempfile::tempdir().unwrap();
-    let fresh = Store::open_for_tests(fresh_state.path(), work.path()).unwrap();
+    let fresh =
+        crate::testing::retry_admission(|| Store::open_for_tests(fresh_state.path(), work.path()));
     assert_eq!(local, metadata(&fresh));
     assert!(local.1 && local.0.iter().any(|w| w.contains("evidence budget")));
 }
@@ -2423,7 +2456,8 @@ fn local_class_only_refresh_writes_new_class_rows_and_rolls_back_atomically() {
     .unwrap();
     let options = IndexOptions::new(work.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let job = IndexJobCoordinator::prepare(&store, None).unwrap();
     let first = job.run(&options, &cancel, |_| {}).unwrap();
     let old_graph = store.graph_at(Some(first)).unwrap();

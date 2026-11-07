@@ -219,7 +219,12 @@ fn two_document_case(change_b: &str) {
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let index_db = roots.index_db(&identity);
-    let store = trellis::store::Store::open(roots, identity).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open(
+            roots.clone(),
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+        )
+    });
     let (native, _) = store.retained_native_snapshot_at(r1).unwrap();
     let mut binary = scip::types::Index::new();
     for (path, text) in [("src/A.js", a), ("src/B.js", b)] {
@@ -1202,7 +1207,12 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let index_db = roots.index_db(&identity);
-    let store = trellis::store::Store::open(roots, identity).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open(
+            roots.clone(),
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+        )
+    });
     let (native, _) = store.retained_native_snapshot_at(pin).unwrap();
     let binary = hex::decode(WIRE).unwrap();
     let (descriptor_path, digest) = write_batch(
@@ -1550,7 +1560,12 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
             let identity =
                 trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
             let index_db = roots.index_db(&identity);
-            let store = trellis::store::Store::open(roots, identity).unwrap();
+            let store = trellis::testing::retry_admission(|| {
+                trellis::store::Store::open(
+                    roots.clone(),
+                    trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+                )
+            });
             let start = source.rfind(symbol).unwrap();
             let line = source[..start].bytes().filter(|b| *b == b'\n').count();
             let prefix = source[..start].rsplit('\n').next().unwrap();
@@ -2152,9 +2167,12 @@ fn replaced_root_fails_old_accepted_semantic_row_before_new_root_claim() {
             home.join(".local/share/trellis")
         },
     );
-    let old_identity =
-        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let old = trellis::store::Store::open(roots.clone(), old_identity).unwrap();
+    let old = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open(
+            roots.clone(),
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+        )
+    });
     fs::write(root.join("descriptor.json"), b"queued descriptor").unwrap();
     let options = SemanticImportOptions {
         version: 2,
@@ -2168,10 +2186,13 @@ fn replaced_root_fails_old_accepted_semantic_row_before_new_root_claim() {
     fs::write(root.join("A.js"), "function g(){}\n").unwrap();
     fs::write(root.join("descriptor.json"), b"new root descriptor").unwrap();
     assert_eq!(old.fail_changed_root_requests().unwrap(), 1);
-    let fresh_identity =
-        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     drop(old);
-    let fresh = trellis::store::Store::open(roots, fresh_identity).unwrap();
+    let fresh = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open(
+            roots.clone(),
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+        )
+    });
     let prior = fresh
         .request_any_root_for_tests(&accepted.id)
         .unwrap()
@@ -2225,7 +2246,12 @@ fn genuine_published_rust_macro_gap_reports_unsupported_without_losing_ordinary(
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let index_db = roots.index_db(&identity);
-    let store = trellis::store::Store::open(roots, identity).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open(
+            roots.clone(),
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+        )
+    });
     let (native, _) = store.retained_native_snapshot_at(pin).unwrap();
     let doc = native
         .revision
@@ -2406,7 +2432,8 @@ fn replacing_one_selected_raw_capture_copies_the_other_producer() {
     let root = fs::canonicalize(root).unwrap();
     let state = temp.path().join("state");
     fs::create_dir(&state).unwrap();
-    let store = trellis::store::Store::open_for_tests(&state, &root).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| trellis::store::Store::open_for_tests(&state, &root));
     let index_db = trellis::store::topology::TopologyRoots::isolated_for_tests(
         state.join("cache"),
         state.join("data"),

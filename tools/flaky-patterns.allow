@@ -1,0 +1,108 @@
+# Justified exceptions to tools/flaky-patterns.py (#720). One per line:
+#   <pattern> <path> <fn-name|*> -- <one-line reason>
+# <fn-name> is the innermost named fn around the site; * covers the whole file.
+# An entry that matches nothing fails the check.
+
+# store-open: files with no concurrent owner. Nothing else can hold admission,
+# so typed storage_busy here would be the test's own ordering, not a peer's.
+store-open src/http/dependency_lifecycle_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/http/normal_post_capture_cancellation_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/http/rebuild_recovery_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/http/recovery_blocked_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/http/serving_holder_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/http/worker/semantic.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/index_coordinator/queue_completion_retry_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/index_coordinator/tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/mcp/find_trigram_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/native_evidence.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/producer/batch_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/producer/plan_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/producer/retention.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/producer/run_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/semantic_import/staged/continuation.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/admit_once_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/catalog_summary_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/corruption_recovery_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/mcp_read.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/preflight_hash_reuse_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/prior_corruption_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/rebuild_in_progress_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/recreate_spool_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/requests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/requests/foreign_root_settlement_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/requests/recovery_blocked_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/requests/root_failure_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/requests/stale_claim_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/review_recovery_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/search_matrix_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/search_startup_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/selected_manifest_query_plan_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/selected_read_once_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/selected_source_budget_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/sqlite_schema_race_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/symbol_trigrams.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/symbol_lookup.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/common/graph_fixtures.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/core/architecture_external.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/core/architecture_semantic.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/core/architecture_store.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/core/architecture_view.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/core/metrics_store.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/core/search_store.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/core/store.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/daemon/index_coordinator.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/daemon/pre_startup_read.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/index/anchors.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/index/index_atomic.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/index/indexer.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/index/native_store.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/index/native_whitespace.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/index/schema11_recreate.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/index/schema12_recreate.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/index/schema13_recreate.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/index/schema14_recreate.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/mcp/navigation_resolved.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/producer/producer_e2e.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/semantic/semantic_generated_import.rs inproc -- the in-process fixture has no daemon, registry or Trellis child; its own code is the only index owner
+store-open tests/semantic/semantic_history.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/semantic/semantic_store.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+
+# store-open, tracking (#720 follow-up): these files also run a Trellis child
+# (a CLI, a re-executed contender) or an in-process scheduler. Each site still
+# needs to be checked for whether that owner can hold admission at the open.
+store-open src/store/live_sqlite_witness_tests.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open src/store/published_admission_tests.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open src/store/sqlite_deleted_witness_tests.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open src/store/topology.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open tests/daemon/requests.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open tests/daemon/watch.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open tests/http/class_diagram_http.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open tests/http/http.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open tests/http/navigation_http.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open tests/index/sqlite_witness.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open tests/mcp/graph_query_store.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open tests/retained_semantic_reimport.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open tests/semantic/proptest_witness_rejoin.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open tests/semantic/semantic_import_typed_errors.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+store-open tests/semantic/semantic_publication_paths.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+
+# global-counter
+global-counter src/http.rs * -- #700: counts only the browser status reads' own blocking threads, never other readers
+global-counter src/native_evidence.rs * -- #720 follow-up: never incremented, so its one assertion (index_coordinator tests) is vacuous
+global-counter src/references.rs * -- a test-support limit that tests set, not a count
+global-counter src/semantic_batch/testing.rs * -- unique stage and join id allocators; never asserted on
+global-counter src/store/native_first/witness.rs family_reserves_before_decoding_prefetched_children -- local to one single-threaded test; its decode fn pointer cannot capture a counter
+global-counter tests/daemon/daemon_cli.rs detached_with_log -- unique log file id allocator; never asserted on
+
+# short-wait: the duration is the input under test, not a bound on a wait
+short-wait tests/daemon/daemon_cli.rs metrics_protocol_deadline_covers_whole_frame_not_each_read -- the test expects this protocol deadline to expire
+short-wait src/daemon/client.rs settling_ends_by_the_calls_bound -- the bound is the call's settle deadline under test
+short-wait src/http/serving_holder_tests.rs failed_startup_reconciliation_backs_off_without_failing_fifo_head -- an upper bound on the computed retry deadline; nothing waits
+short-wait src/store/sqlite_contention_type_tests.rs * -- read-scope deadline values under test; nothing waits
+short-wait tests/daemon/daemon_checkout.rs failed_startup_backs_off_and_empty_idle_checkout_can_release -- #720 follow-up: release must land inside the startup backoff window; prove it with a hook, not wall time
+
+# blocking-accept: the accept cannot hang the test
+blocking-accept tests/daemon/daemon_mcp.rs try_paused_at -- accepts on a detached thread; the test waits on it only via recv_timeout(HANG_BACKSTOP)
+blocking-accept tests/mcp/mcp_protocol.rs bind -- accepts on a detached thread; release() waits on it only via recv_timeout(HANG_BACKSTOP)
+blocking-accept tests/mcp/mcp_protocol.rs serve_pauses -- a detached hook server for the test's lifetime; never joined
+blocking-accept tests/mcp/mcp_protocol.rs earlier_call_is_decided_while_a_later_final_check_stalls -- a detached hook server for the test's lifetime; never joined

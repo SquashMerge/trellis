@@ -111,12 +111,12 @@ fn interrupted_read_retries_once_but_ambiguous_mutation_is_not_replayed() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let count = attempts.clone();
         let server = thread::spawn(move || {
-            let (mut first, _) = listener.accept().unwrap();
+            let mut first = trellis::testing::accept_within_backstop(&listener);
             let received: Request = protocol::read_frame(&mut first).unwrap();
             assert_eq!(received.id, 42);
             drop(first); // Crash after receipt, before acknowledgement.
             if read_only {
-                let (mut second, _) = listener.accept().unwrap();
+                let mut second = trellis::testing::accept_within_backstop(&listener);
                 let retried: Request = protocol::read_frame(&mut second).unwrap();
                 assert_eq!(retried, received);
                 protocol::write_frame(

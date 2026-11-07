@@ -560,7 +560,7 @@ async fn deadline_kills_and_reaps_child_and_cancellation_also_cleans_up() {
     fs::remove_file(&pid_file).unwrap();
     let root = dir.path().to_owned();
     let task = tokio::spawn(async move { GitReader::new(exe).summary(&root).await });
-    let pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let pid = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok(text) = fs::read_to_string(&pid_file)
                 && let Ok(pid) = text.parse::<i32>()
@@ -578,7 +578,7 @@ async fn deadline_kills_and_reaps_child_and_cancellation_also_cleans_up() {
 }
 #[cfg(unix)]
 async fn assert_reaped(pid: i32) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             // ESRCH proves the PID is gone, not merely that a kill was sent.
             if unsafe { libc::kill(pid, 0) } == -1

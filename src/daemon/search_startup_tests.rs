@@ -59,7 +59,7 @@ fn startup_checkout(state: &std::path::Path, opened_at: u64) -> (tempfile::TempD
     let checkout = tempfile::tempdir().unwrap();
     git2::Repository::init(checkout.path()).unwrap();
     fs::write(checkout.path().join("orchard.rs"), "fn orchard() {}\n").unwrap();
-    let store = Store::open_for_tests(state, checkout.path()).unwrap();
+    let store = crate::testing::retry_admission(|| Store::open_for_tests(state, checkout.path()));
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = index_workspace_bundle(
         &IndexOptions::new(checkout.path().to_owned()),
@@ -159,7 +159,9 @@ fn startup_owner_prewarms_cached_head_without_activation_or_document_inference()
     fs::write(checkout_root.path().join("orchard.rs"), "fn orchard() {}\n").unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
-    let store = Store::open_for_tests(state.path(), checkout_root.path()).unwrap();
+    let store = crate::testing::retry_admission(|| {
+        Store::open_for_tests(state.path(), checkout_root.path())
+    });
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = index_workspace_bundle(
         &IndexOptions::new(checkout_root.path().to_owned()),

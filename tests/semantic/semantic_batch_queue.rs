@@ -91,7 +91,12 @@ impl World {
         let identity =
             trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
         let index_db = roots.index_db(&identity);
-        let store = Store::open(roots, identity).unwrap();
+        let store = trellis::testing::retry_admission(|| {
+            Store::open(
+                roots.clone(),
+                trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+            )
+        });
         Self {
             daemon: std::cell::Cell::new(trellis::testing::daemon_marker_identity(
                 &home.join("daemon.pid"),
@@ -1555,10 +1560,12 @@ fn replaced_root_settles_batch_request_root_changed() {
     assert_eq!(world.store.fail_changed_root_requests().unwrap(), 1);
     // The terminal row stays put when the same options are queued again for the new root.
     let roots = TopologyRoots::isolated_for_tests(cache_dir(&world.home), data_dir(&world.home));
-    let identity =
-        trellis::store::topology::WorkspaceIdentity::discover(Some(&world.root), &world.root)
-            .unwrap();
-    let fresh_store = Store::open(roots, identity).unwrap();
+    let fresh_store = trellis::testing::retry_admission(|| {
+        Store::open(
+            roots.clone(),
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&world.root), &world.root)?,
+        )
+    });
     let settled = fresh_store
         .request_any_root_for_tests(&accepted.id)
         .unwrap()

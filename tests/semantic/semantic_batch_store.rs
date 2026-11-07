@@ -119,7 +119,7 @@ fn world_with(populate: impl FnOnce(&Path), mcp: bool) -> World {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     populate(&root);
-    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
     if mcp {
         store.mcp_prepare_virgin_queue_for_tests().unwrap();
     }
@@ -4386,10 +4386,11 @@ fn status_semantic_projection_is_cached_per_published_head() {
     let (first, _, _) = world.publish(&split_definitions(&world, false)).unwrap();
     // A fresh Store on the same index computes status with no cache.
     let uncached = || {
-        Store::open_for_tests(world._state.path(), &world.root)
-            .unwrap()
-            .status()
-            .unwrap()
+        trellis::testing::retry_admission(|| {
+            Store::open_for_tests(world._state.path(), &world.root)
+        })
+        .status()
+        .unwrap()
     };
     let projections = || store.status_semantic_projections_for_tests();
     let before = projections();

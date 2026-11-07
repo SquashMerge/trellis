@@ -451,7 +451,14 @@ fn world(env: &[(String, String)]) -> World {
         TopologyRoots::isolated_for_tests(cache_dir(&checkout.home), data_dir(&checkout.home));
     let identity = WorkspaceIdentity::discover(Some(&checkout.root), &checkout.root).unwrap();
     let index_db = roots.index_db(&identity);
-    let store = Store::open(roots, identity).unwrap();
+    drop(identity);
+    // The fixture daemon start_checkout launched can hold admission here (#712).
+    let store = trellis::testing::retry_admission(|| {
+        Store::open(
+            roots.clone(),
+            WorkspaceIdentity::discover(Some(&checkout.root), &checkout.root)?,
+        )
+    });
     World {
         checkout,
         store,

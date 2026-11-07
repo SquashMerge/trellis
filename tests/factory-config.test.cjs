@@ -236,6 +236,8 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       semantic: [["node", "tools/semantic-contract/test/run.mjs"]],
       cohorts: [["node", "--test", "tools/synthetic-cohorts/test/cohorts.test.mjs"]],
       checks: [
+        ["python3", "tools/flaky-patterns-test.py"],
+        ["python3", "tools/flaky-patterns.py"],
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs", "tests/mcp-smoke.test.mjs"],
         ["python3", "tools/stage3-watcher-runner-test.py"],
         ["python3", "tools/verify-67-mixed-performance-test.py"],
