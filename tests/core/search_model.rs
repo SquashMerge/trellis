@@ -48,7 +48,7 @@ fn missing_or_unverified_model_is_lexical_only_with_selected_backend() {
         assert_eq!(owner.backend(), Backend::Cpu);
         let status = owner.status_handle();
         let initial = status.snapshot("test-card-format.v1", 4, 3, LexicalState::Complete, false);
-        assert_eq!(initial.state, SearchIndexState::Unavailable);
+        assert!(matches!(initial.state, SearchIndexState::Unavailable(_)));
         assert_eq!(initial.backend, Some(Backend::Cpu));
         assert_eq!(initial.lexical, LexicalState::Complete);
         assert_eq!(initial.declarations, 4);
@@ -60,13 +60,19 @@ fn missing_or_unverified_model_is_lexical_only_with_selected_backend() {
                 panic!("unverified model cannot run")
             });
         assert!(matches!(result, Err(EmbedError::ModelUnavailable(_))));
+        // An untried configured model is not a fault, but this snapshot has
+        // no ready model, so it names that cause rather than null (#777).
         assert_eq!(
-            initial.unavailable_reason,
-            (!configured).then_some(SearchUnavailableReason::ModelNotConfigured)
+            initial.unavailable_reason(),
+            Some(if configured {
+                SearchUnavailableReason::ModelNotReady
+            } else {
+                SearchUnavailableReason::ModelNotConfigured
+            })
         );
         let failed = status.snapshot("test-card-format.v1", 4, 3, LexicalState::Complete, false);
         assert_eq!(
-            failed.unavailable_reason,
+            failed.unavailable_reason(),
             Some(if configured {
                 SearchUnavailableReason::ModelLoadFailed
             } else {

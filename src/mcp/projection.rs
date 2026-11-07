@@ -1534,7 +1534,6 @@ mod search_tests {
                 declarations: 3,
                 embedded: 1,
                 lexical: LexicalState::Complete,
-                unavailable_reason: None,
             },
         }
     }
@@ -1592,7 +1591,9 @@ mod search_tests {
             assert_wire(&envelope, modern);
 
             let mut unavailable = fixture(&[], COMPLETE, false);
-            unavailable.search_index.state = SearchIndexState::Unavailable;
+            unavailable.search_index.state = SearchIndexState::Unavailable(
+                crate::search_model::SearchUnavailableReason::ModelNotConfigured,
+            );
             unavailable.search_index.model_id = None;
             unavailable.search_index.model_name = None;
             unavailable.search_index.backend = None;
@@ -1830,14 +1831,15 @@ mod compact_symbol_tests {
                 .collect(),
             symbols,
             search_index: SearchIndexStatus {
-                state: SearchIndexState::Unavailable,
+                state: SearchIndexState::Unavailable(
+                    crate::search_model::SearchUnavailableReason::ModelNotConfigured,
+                ),
                 model_id: None,
                 model_name: None,
                 backend: None,
                 declarations: 261,
                 embedded: 0,
                 lexical: LexicalState::Complete,
-                unavailable_reason: None,
             },
         }
     }

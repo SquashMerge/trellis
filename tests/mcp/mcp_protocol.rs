@@ -12572,7 +12572,8 @@ async fn mcp_search_both_modes_use_real_lexical_cards_without_optional_cache() {
                 envelope["data"]["searchIndex"],
                 json!({
                     "state":"unavailable","modelId":null,"modelName":null,"backend":null,
-                    "declarations":51,"embedded":0,"lexical":"complete","unavailableReason":null
+                    "declarations":51,"embedded":0,"lexical":"complete",
+                    "unavailableReason":"model_not_configured"
                 })
             );
             assert_eq!(envelope["warnings"].as_array().unwrap().len(), 1);
@@ -12624,7 +12625,8 @@ async fn mcp_search_model_configuration_reasons_reach_describe_and_status() {
         let models_dir = home.path().join("custom-models");
         let mut expected_status = json!({
             "backend":"cpu",
-            "unavailableReason":if configured { "model_load_failed" } else { "model_not_configured" }
+            "unavailableReason":if configured { "model_load_failed" } else { "model_not_configured" },
+            "state":"unavailable","declarations":1,"embedded":0
         });
         if scenario == "managed_missing" {
             fs::create_dir_all(config_file.parent().unwrap()).unwrap();
@@ -13297,7 +13299,7 @@ async fn mcp_search_without_model_ignores_stale_and_corrupt_optional_cache() {
                 json!({
                     "state":"unavailable", "modelId":null, "modelName":null,
                     "backend":backend, "declarations":1, "embedded":0, "lexical":"complete",
-                    "unavailableReason":if configured_service { json!("model_not_configured") } else { Value::Null }
+                    "unavailableReason":"model_not_configured"
                 })
             );
             assert_eq!(envelope["partial"], false);
@@ -13874,10 +13876,12 @@ async fn mcp_search_fill_serves_queued_query_between_real_batches_and_reports_bu
         cold_envelope["evidenceBasis"],
         SearchMcpFixture::basis(fixture.current)
     );
+    // The owner is building this head (held before its model load), so the
+    // lexical-only answer reports building with the measured empty cache.
     assert_eq!(
         cold_envelope["data"]["searchIndex"],
         json!({
-            "state":"unavailable","modelId":null,"modelName":null,"backend":"cpu",
+            "state":"building","modelId":null,"modelName":null,"backend":"cpu",
             "declarations":17,"embedded":0,"lexical":"complete","unavailableReason":null
         })
     );
@@ -14062,6 +14066,162 @@ async fn mcp_search_fill_serves_queued_query_between_real_batches_and_reports_bu
     drop(client);
     session.join().unwrap().unwrap();
     validate_structured_content(&schema_pairs);
+}
+
+/// #777: right after a publication the owner has not yet built the new head's
+/// matrix. Search, describe and CLI status report `building` with the measured
+/// cache count, never `unavailable` without a reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_reports_building_with_counts_before_owner_builds_new_head() {
+    let first_batch = ReadGate::default();
+    let second_batch = ReadGate::default();
+    first_batch.open();
+    second_batch.open();
+    let factory = std::sync::Arc::new(McpFillEmbedderFactory {
+        before_load: None,
+        first_batch,
+        second_batch,
+        loads: Default::default(),
+        batches: Default::default(),
+        queries: Default::default(),
+    });
+    let (fixture, service, fill) = SearchMcpFixture::with_search(
+        &[("a.js", "function orchard() {}\nfunction unrelated() {}\n")],
+        |roots| {
+            std::sync::Arc::new(
+                trellis::daemon::search::SearchService::with_embedder_for_tests(
+                    roots.clone(),
+                    factory.clone(),
+                )
+                .unwrap(),
+            )
+        },
+        true,
+    )
+    .await;
+    // The prior head's two cards already have cached vectors.
+    fixture.seed_vectors(&service);
+    let fill = fill.unwrap();
+    let build = ReadGate::default();
+    let _release_on_failure = McpFillRelease([build.clone(), ReadGate::default()]);
+    fixture
+        .head()
+        .await
+        .set_before_build_hook_for_tests(build.hook());
+    let runtime = fixture
+        .registry
+        .lock()
+        .await
+        .runtime(&fixture.identity.root_key)
+        .unwrap();
+    // Change the checkout while startup reconciliation is held, so releasing
+    // it publishes a newer revision. Appending keeps the two existing cards
+    // (and their cached vectors) intact.
+    fs::write(
+        fixture.identity.root.join("a.js"),
+        "function orchard() {}\nfunction unrelated() {}\nfunction orchardnew() {}\n",
+    )
+    .unwrap();
+    fixture.startup.open();
+    // The owner holds here only after the worker published the new revision
+    // and hinted it: it has read the new head but not built its matrix. A
+    // hint during reconciliation defers before reading a head, so it cannot
+    // reach this hook.
+    let waiter = build.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    let mut pairs = Vec::new();
+    let held = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        1,
+        json!({"schemaVersion":1,"query":"orchard","limit":50}),
+    );
+    tool(&held, None, true);
+    let envelope = &held["result"]["structuredContent"];
+    let basis = envelope["evidenceBasis"].clone();
+    assert_ne!(basis, SearchMcpFixture::basis(fixture.current), "{held}");
+    assert_eq!(
+        envelope["data"]["searchIndex"],
+        json!({
+            "state":"building","modelId":null,"modelName":null,"backend":"cpu",
+            "declarations":3,"embedded":2,"lexical":"complete","unavailableReason":null
+        }),
+        "{held}"
+    );
+    let hits = envelope["data"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["name"], "orchard");
+    assert_eq!(hits[0]["matchedBy"], json!(["lexical"]));
+    pairs.push(search_schema_pair(&held));
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(2),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1})
+        )
+    )
+    .unwrap();
+    let describe = next_reply(&mut reader);
+    let expected = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"building","declarations":3,"embedded":2
+    });
+    assert_eq!(
+        describe["result"]["structuredContent"]["data"]["searchIndex"], expected,
+        "{describe}"
+    );
+    pairs.push(json!({"name":"trellis_workspace_describe",
+        "structuredContent":describe["result"]["structuredContent"]}));
+    let status_runtime = runtime.clone();
+    let status = tokio::task::spawn_blocking(move || status_runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status["searchIndex"], expected, "{status}");
+    build.open();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    assert_eq!(*factory.batches.lock().unwrap(), [1]);
+    let complete = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        3,
+        json!({"schemaVersion":1,"query":"orchard","limit":50}),
+    );
+    tool(&complete, None, true);
+    let envelope = &complete["result"]["structuredContent"];
+    assert_eq!(envelope["evidenceBasis"], basis);
+    let index = &envelope["data"]["searchIndex"];
+    assert_eq!(index["state"], "complete", "{complete}");
+    assert!(index["modelId"].is_string());
+    assert_eq!(index["declarations"], 3);
+    assert_eq!(index["embedded"], 3);
+    assert_eq!(index["unavailableReason"], Value::Null);
+    pairs.push(search_schema_pair(&complete));
+    let status = tokio::task::spawn_blocking(move || runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        status["searchIndex"],
+        json!({
+            "backend":"cpu","unavailableReason":null,
+            "state":"complete","declarations":3,"embedded":3
+        })
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&pairs);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14250,11 +14410,13 @@ async fn mcp_search_residency_lost_before_rank_stays_lexical_at_admitted_pin() {
         envelope["evidenceBasis"],
         SearchMcpFixture::basis(fixture.current)
     );
+    // Nothing is resident and the owner has no work for this head.
     assert_eq!(
         envelope["data"]["searchIndex"],
         json!({
             "state":"unavailable","modelId":null,"modelName":null,"backend":"cpu",
-            "declarations":2,"embedded":0,"lexical":"complete","unavailableReason":null
+            "declarations":2,"embedded":0,"lexical":"complete",
+            "unavailableReason":"matrix_not_resident"
         })
     );
     let hits = envelope["data"]["hits"].as_array().unwrap();
@@ -14333,7 +14495,8 @@ async fn mcp_search_oversized_head_stays_lexical_without_query_embedding() {
             envelope["data"]["searchIndex"],
             json!({
                 "state":"unavailable","modelId":null,"modelName":null,"backend":"cpu",
-                "declarations":2,"embedded":0,"lexical":"complete","unavailableReason":null
+                "declarations":2,"embedded":0,"lexical":"complete",
+                "unavailableReason":"matrix_not_resident"
             })
         );
         let hits = envelope["data"]["hits"].as_array().unwrap();
@@ -14603,10 +14766,12 @@ async fn mcp_search_during_startup_defers_background_head_and_serves_valid_prior
     assert_eq!(envelope["partial"], false);
     assert_eq!(envelope["truncated"], false);
     assert_eq!(envelope["data"]["searchIndex"]["declarations"], 1);
+    // The owner deferred this head until reconciliation finishes; that work
+    // is still pending, so lexical-only search reports building (#777).
     assert_eq!(
         envelope["data"]["searchIndex"],
         json!({
-            "state":"unavailable","modelId":null,"modelName":null,"backend":"cpu",
+            "state":"building","modelId":null,"modelName":null,"backend":"cpu",
             "declarations":1,"embedded":0,"lexical":"complete","unavailableReason":null
         })
     );

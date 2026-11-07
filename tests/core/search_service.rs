@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicBool;
 use trellis::{
     daemon::search::SearchService,
     search_embed::{Backend, EmbedError},
-    search_model::{LexicalState, SearchConfig, SearchIndexState},
+    search_model::{LexicalState, SearchConfig, SearchIndexState, SearchUnavailableReason},
     store::topology::TopologyRoots,
 };
 
@@ -23,7 +23,10 @@ fn daemon_search_is_machine_wide_and_never_opens_a_checkout_index() {
             .status_handle()
             .snapshot("test-card.v1", 0, 0, LexicalState::Unavailable, false);
     assert_eq!(status.backend, Some(Backend::Cpu));
-    assert_eq!(status.state, SearchIndexState::Unavailable);
+    assert_eq!(
+        status.state,
+        SearchIndexState::Unavailable(SearchUnavailableReason::ModelNotConfigured)
+    );
     assert_eq!(service.gc_report().unwrap().vectors.entries, 0);
     assert!(!roots.cache.exists());
     let result: Result<(), EmbedError> =

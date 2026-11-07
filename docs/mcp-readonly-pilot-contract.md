@@ -405,22 +405,34 @@ it never enters card hashes, lookup, ranking, ordering or joins.
 `SearchIndexStatus` is exactly:
 `{state:"complete"|"building"|"partial"|"unavailable",modelId:Hash|null,
 modelName:Text|null,backend:"cpu"|"metal"|null,declarations:UInt,embedded:UInt,
-lexical:"complete"|"unavailable",unavailableReason:null|"model_not_configured"|"model_load_failed"|"vector_budget_exceeded"}`.
+lexical:"complete"|"unavailable",unavailableReason:null|"model_not_configured"|"model_load_failed"|"vector_budget_exceeded"|"model_not_ready"|"matrix_not_resident"}`.
 `declarations` counts eligible candidate declarations at the admitted head; `embedded` counts
 those with a current decoded vector for the active model and satisfies
 `embedded<=declarations`. These are admitted-head counts, independent of the role filter;
 `scopeCoverage` also remains unfiltered. No configured/verified/ready model, or no matching admitted
 resident matrix (including first search, eviction, head-change races or an oversized head),
-gives `unavailable`, null `modelId`, null `modelName`, and `embedded:0`. The zero is an
-unavailable sentinel, not a measured vector count. `unavailableReason` is
-`model_not_configured` when no model path is configured, or `model_load_failed` after a
-verification/loading failure, cleared by a successful load. Loading, idle residency or a
-missing matrix alone leave the reason null. Backend selection is independent: report the
+gives a lexical-only answer with null `modelId` and null `modelName`. Its state is `building`
+while the background owner works on this head (below), otherwise `unavailable` with
+`embedded:0`, an unavailable sentinel rather than a measured vector count.
+**Amendment (#777):** `unavailable` always has a non-null `unavailableReason`; there is no
+reasonless `unavailable`. The reason is `model_not_configured` when no model path is configured
+(including a standalone registry with no search service), or `model_load_failed` after a
+verification/loading failure, cleared by a successful load. Otherwise it is `model_not_ready`
+when this query got no query vector (the model was loading for another job, or query inference
+failed), or `matrix_not_resident` when there is no matching resident matrix and the owner has
+no work for this head (memory policy, an eviction no request has rearmed, or a head race). Model
+diagnostics and `vector_budget_exceeded` take precedence over `building`. Backend selection is independent: report the
 backend actually selected whenever known, including while loading/building or when the model
 is unavailable; `backend:null` means only that no backend has been selected. With a ready
 model and an admitted matching resident matrix, `complete` means
 all candidates have vectors, `building` means vectors are missing and a background job is
-running, and `partial` means vectors are missing and no job is running. Missing or evicted
+running, and `partial` means vectors are missing and no job is running. Without a used matrix,
+the state is `building` while the owner has queued, running or deferred work for this checkout's
+head. That covers right after a publication, before the new head's matrix exists, and work
+deferred until reconciliation ends. A no-op hint for an evicted or memory-declined head does not
+count. The hits are then lexical-only, model identity is null, and `embedded` counts the admitted
+candidates with a current decoded vector in one vector-cache snapshot. That count is read under
+the optional vector budget and may equal `declarations`. Missing or evicted
 vectors do not change native coverage or evidence completeness. A candidate without a vector
 can still be returned by the lexical arm. If this call exhausts its optional vector budget,
 that query-specific reason takes precedence over model diagnostics. Then the complete vector arm is discarded, state is
@@ -487,8 +499,9 @@ and stops at cap admission failure without evicting matrices for more startup wo
 Other checkouts return complete lexical results on first search while the independent
 background owner builds their matrices. A single head that cannot fit remains lexical-only.
 When no matching matrix is retained or acquisition races with a head change, search also
-returns lexical-only with unavailable status, null model identity, embedded:0, selected
-backend and unavailableReason:null. It never waits for the owner or embeds a query without
+returns lexical-only with null model identity and the selected backend: `building` with the
+cached count while the owner works on this head, else `unavailable`, embedded:0 and
+`matrix_not_resident` (#777). It never waits for the owner or embeds a query without
 an admitted resident matrix; the streaming scorer cannot bypass the cap. This supersedes
 the earlier missing-matrix streaming fallback. Exact admitted declaration counts and lexical
 retrieval remain mandatory, and observed store faults remain typed failures rather than
@@ -528,6 +541,21 @@ Database-level vector-cache failures, including corruption, schema mismatch and 
 unsafe storage, fail store_unavailable. A vector-cache row that fails typed decoding is a
 specified miss under T00/T02, excluded from the selected cache snapshot's embedded count and
 re-embedded outside the read. This does not invalidate a valid retained published matrix.
+A cache file the owner is still creating (no version and no schema yet) reads as an absent
+cache, not a schema mismatch (#777).
+
+**Amendment (#777): head coverage in describe and CLI status.** Workspace describe and CLI
+status `searchIndex` (`SearchAvailability`) add optional `state:"complete"|"building"|"partial"|"unavailable"`,
+`declarations:UInt` and `embedded:UInt`: this checkout's coverage at the admitted head. Its
+precedence follows search without the per-query causes. A model diagnostic gives `unavailable`
+with that reason. Otherwise the matrix the owner published for that pin gives `complete`, or
+`building` while the owner runs for that pin, else `partial`. Otherwise owner work for the head
+gives `building` with the cached count, and no owner work gives `unavailable` with
+`matrix_not_resident`. With these fields, `unavailableReason` is the state's reason, so it can
+also be `matrix_not_resident`, and it is non-null exactly when the state is `unavailable`. The
+fields are omitted without a search service or matrix owner (a standalone registry keeps
+`{backend:null,unavailableReason:null}`) and without an admitted head. The other describe
+`SearchAvailability` text stands.
 
 The tool description states: “Find candidate declarations by lexical and local vector
 retrieval. Relevance is not evidence. Inspect hits with trellis_declaration at the returned

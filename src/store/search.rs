@@ -625,6 +625,36 @@ impl EvidenceResponse {
         })
     }
 
+    /// Card hashes of the canonical head cards `mcp_search_head_count` counts,
+    /// for counting cached vectors while the owner builds this head (#777).
+    pub fn mcp_search_head_card_hashes(
+        &self,
+        expected: IndexPin,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<String>> {
+        self.search_read(check, |check| {
+            let selected = self.store.read_revision_for(&self.db, None, true)?;
+            ensure!(
+                selected.pin == expected,
+                "revision conflict: expected basis differs from admitted head"
+            );
+            let mut statement = self.db.prepare(
+                "SELECT c.card_hash
+                 FROM native_version_search_cards c
+                 JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
+                 JOIN document_versions v ON v.vid=c.vid
+                 JOIN native_version_declarations d ON d.vid=c.vid AND d.syntax_id=c.syntax_id",
+            )?;
+            let mut rows = statement.query([&selected.key])?;
+            let mut hashes = Vec::new();
+            while let Some(row) = rows.next()? {
+                check()?;
+                hashes.push(row.get(0)?);
+            }
+            Ok(hashes)
+        })
+    }
+
     /// Exact-name metadata from this admitted head, without loading source
     /// or card text. Candidate and matrix roles provide the role filter.
     pub fn mcp_search_policy(

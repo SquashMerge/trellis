@@ -156,7 +156,9 @@ any stale socket left by the stopped process.
 ## Configuration diagnostics, availability and lexical fallback
 
 CLI status, `trellis_workspace_describe` and browser diagnostics expose
-`searchIndex: {backend, unavailableReason, configuration}`. The daemon's immutable
+`searchIndex: {backend, unavailableReason, configuration}`. CLI status and describe also add
+`state`, `declarations` and `embedded`, the checkout's search coverage at its admitted head
+(#777); a standalone registry without a search service omits them. The daemon's immutable
 `configuration` snapshot records `configFile`, `modelsDir`, `modelName`, `modelRevision`,
 `modelPath`, the requested `backend`, and `sources` for `modelsDir`, `model` and `backend`.
 Each source is `default`, `config_file` or `environment`. The top-level diagnostic `backend`
@@ -172,11 +174,16 @@ A managed `modelPath` records where startup looked even when files were missing.
   missing files at an explicit nonempty `TRELLIS_SEARCH_MODEL` path, or a managed snapshot
   whose files were all present but failed the loader's hash/content checks. File presence
   never substitutes for the verified loader.
-- `null`: no model configuration/load failure is known. Temporary loading or a missing
-  matching resident matrix alone still uses `null`; this does not promise vector readiness.
+- `matrix_not_resident`: no matching resident matrix exists for the admitted head and the
+  background owner has no work for it (memory policy, an eviction no search has rearmed yet,
+  or a head race). While the owner is building that head, the state is `building` instead.
+- `null`: the state is not `unavailable`. `unavailable` always carries a reason (#777); a null
+  reason does not promise vector readiness.
 
 Search results also retain `vector_budget_exceeded`, the existing query vector-budget
-fallback reason. This query-specific reason is not part of describe/status diagnostics.
+fallback reason, and `model_not_ready`, when that query got no query vector (the model was
+loading for another job, or inference failed). These query-specific reasons are not part of
+describe/status diagnostics.
 
 Configuration diagnostics do not report search readiness, coverage or process RSS.
 Search results carry the separate query metadata: an unavailable model yields
@@ -199,7 +206,8 @@ proxy; discovery uses it read-only without activating checkouts, refreshing open
 creating a durable MRU catalog. This low-priority background work yields to normal work,
 never delays daemon socket acceptance and stops at matrix-cap admission failure without
 evicting matrices for another startup checkout. Search result state remains unavailable while
-the model is not ready. CLI status/GC do not fabricate search coverage.
+the model is not ready, unless the owner is building the head. CLI status and describe report
+only owner-published coverage and measured cache counts; GC does not report search coverage.
 
 Under the [#358 owner ruling](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6441405819),
 one immutable published matrix snapshot supplies vector ranks and embedded counts for the
@@ -215,9 +223,10 @@ A checkout not warmed at startup returns complete lexical results on first searc
 the independent background owner builds its matrix. No query waits for that build or
 embeds a query without an admitted resident matrix. A missing matching matrix after
 eviction or a head-change race also yields lexical-only results, not a streaming scorer
-that bypasses the cap. When only matrix availability prevents vector retrieval, the
-unavailable status keeps null model identity, embedded:0, selected backend and
-unavailableReason:null. Mandatory declaration counts and lexical
+that bypasses the cap. When only matrix availability prevents vector retrieval, the status
+keeps null model identity and the selected backend. It is `building` with the cached vector
+count while the owner builds the head, else `unavailable` with embedded:0 and
+`matrix_not_resident`. Mandatory declaration counts and lexical
 retrieval remain exact; observed storage faults remain typed failures. This supersedes
 the earlier missing-matrix streaming fallback. Backing-cache eviction need not invalidate
 an already published resident snapshot. Query fallback at the 3,000ms vector

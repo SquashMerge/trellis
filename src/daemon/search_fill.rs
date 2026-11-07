@@ -261,6 +261,8 @@ impl FillBackend for LocalBackend {
                 head.settle();
                 return Ok(());
             }
+            #[cfg(any(test, feature = "test-support"))]
+            head.run_before_build_hook_for_tests();
             // No checkout snapshot or owner inbox survives model loading.
             self.0.with_model_job(cancel, |_| Ok(()))?;
             let epoch = self.0.cache_epoch();

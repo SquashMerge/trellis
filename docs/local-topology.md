@@ -109,8 +109,10 @@ second copy. Normal work uses LRU eviction of eligible matrices. The 600-second 
 that cannot fit is lexical-only. A first search without a warmed matrix returns complete
 lexical results while the background owner builds. If no matching matrix is retained or
 acquisition races with a head change, search also returns lexical-only without query
-embedding or waiting for the owner, never streaming around the cap. These unavailable
-results have null model identity, embedded:0, selected backend and unavailableReason:null;
+embedding or waiting for the owner, never streaming around the cap. These lexical-only
+results have null model identity and the selected backend; they report `building` with the
+cached vector count while the owner works on that head, else `unavailable` with embedded:0 and
+a non-null reason such as `matrix_not_resident` (#777);
 mandatory declaration counts/lexical reads and typed observed storage faults are unchanged.
 This supersedes the earlier missing-matrix streaming fallback. A valid retained matrix
 survives backing-cache eviction; owner updates and residency changes may change retrieval between calls at one

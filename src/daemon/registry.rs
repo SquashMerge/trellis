@@ -1949,6 +1949,66 @@ impl CheckoutRuntime {
             .unwrap_or_default()
     }
 
+    /// This checkout's retrieval coverage at `pin`, read inside the caller's
+    /// selected snapshot (#777), with search's precedence minus the per-query
+    /// causes: model diagnostics, then the matrix the owner published for this
+    /// pin, then owner work pending (counted from the cache), else
+    /// `matrix_not_resident`. `None` without a search service or matrix owner.
+    pub(crate) fn search_head_coverage(
+        &self,
+        response: &crate::store::EvidenceResponse,
+        pin: crate::model::IndexPin,
+        mut check: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<crate::search_model::SearchHeadCoverage>> {
+        use crate::search_model::{SearchHeadCoverage, SearchIndexState, SearchUnavailableReason};
+        let Some(search) = self.search.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(reason) = search.status_handle().unavailable_reason() {
+            return Ok(Some(SearchHeadCoverage {
+                state: SearchIndexState::Unavailable(reason),
+                declarations: response.mcp_search_head_count(pin, &mut check)? as u64,
+                embedded: 0,
+            }));
+        }
+        let scheduler = self.browser_scheduler()?;
+        let Some(head) = scheduler.search_head_slot(false) else {
+            return Ok(None);
+        };
+        let model_id = crate::search_embed::model_id_for_card_format(
+            crate::search_card::CardFormat::V1.as_str(),
+        );
+        let running = scheduler.search_fill_building(pin);
+        if let Some((declarations, embedded)) = head.coverage(pin, &model_id, search.cache_epoch())
+        {
+            let declarations = declarations as u64;
+            return Ok(Some(SearchHeadCoverage {
+                state: if embedded == declarations {
+                    SearchIndexState::Complete
+                } else if running {
+                    SearchIndexState::Building
+                } else {
+                    SearchIndexState::Partial
+                },
+                declarations,
+                embedded,
+            }));
+        }
+        if running || head.pending_for(pin) {
+            let hashes = response.mcp_search_head_card_hashes(pin, &mut check)?;
+            return Ok(Some(SearchHeadCoverage {
+                state: SearchIndexState::Building,
+                declarations: hashes.len() as u64,
+                embedded: search.cached_embedded(&hashes, None, check)?,
+            }));
+        }
+        Ok(Some(SearchHeadCoverage {
+            state: SearchIndexState::Unavailable(SearchUnavailableReason::MatrixNotResident),
+            declarations: response.mcp_search_head_count(pin, &mut check)? as u64,
+            embedded: 0,
+        }))
+    }
+
     /// Invoked through a weak edge AFTER a queue tick releases all stream and
     /// watcher locks. This is a snapshot of the current verified startup reconciliation owner, not a
     /// claim that startup reconciliation ran again when a serving watcher gets a new epoch.
@@ -2002,9 +2062,11 @@ impl CheckoutRuntime {
         let mut status = response.status()?;
         status.catching_up = catching_up;
         status.watcher = Some(self.resources()?.scheduler.checkout_watcher_witness());
+        let search_head = self.search_head_coverage(&response, status.revision, &mut || Ok(()))?;
         let mut status = serde_json::to_value(response.finish(status)?)?;
         status["build"] = serde_json::to_value(crate::build_info::current())?;
-        status["searchIndex"] = serde_json::to_value(self.search_availability())?;
+        status["searchIndex"] =
+            serde_json::to_value(self.search_availability().with_head(search_head))?;
         Ok(status)
     }
 
