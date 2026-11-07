@@ -611,9 +611,10 @@ pub fn capped(
     }
 }
 
-/// Bytes of overview rows the prompt carries (#770), counted as escaped inside the
-/// prompt text. A directory row costs about 45 to 70 bytes, so 12 KiB holds roughly 200
-/// rows: every production directory pair of mimir (74) and Trellis (67). With about
+/// Bytes of overview rows the prompt carries (#770): their JSON array without brackets,
+/// separators included, as escaped inside the prompt text (`overview_bytes`). A
+/// directory row costs about 45 to 70 bytes, so 12 KiB holds roughly 200 rows: every
+/// production directory pair of mimir (72) and Trellis (67). With about
 /// 12 KB of instructions and typical rules the prompt stays near the #528 24 KiB agent
 /// page target, far below the frame; agents page `trellis_references` for the rest.
 pub const PROMPT_OVERVIEW_BYTES: usize = 12 * 1024;
@@ -674,32 +675,46 @@ fn reference_summary(references: &Value) -> (Value, Vec<Value>) {
 fn fitted_prompt(id: &Value, mut envelope: Value, modern: bool) -> Value {
     let (summary, rows) = reference_summary(&envelope["data"]["references"]);
     envelope["data"]["references"] = summary;
-    let line = serde_json::to_vec(&response(
-        id,
-        super::tools::result(PROMPT_NAME, envelope.clone(), modern),
-    ))
-    .map_or(usize::MAX, |bytes| bytes.len());
-    // `capped_whole` admits a line shorter than the cap: it leaves the LF its byte.
-    let Some(room) = (super::wire::RESPONSE_BYTES - 1).checked_sub(line) else {
-        return envelope;
+    let with = |shown: usize| {
+        let mut envelope = envelope.clone();
+        let overview = &mut envelope["data"]["references"]["overview"];
+        overview["omitted"] = json!(rows.len() - shown);
+        overview["rows"] = Value::Array(rows[..shown].to_vec());
+        envelope
     };
-    let mut budget = room.min(PROMPT_OVERVIEW_BYTES);
-    let total = rows.len();
-    let mut shown = Vec::new();
-    for row in rows {
-        // The row's bytes as escaped inside the prompt text, plus a separator.
-        let cost = serde_json::to_string(&Value::String(row.to_string()))
-            .map_or(usize::MAX, |text| text.len() - 1);
-        if cost > budget {
-            break;
-        }
-        budget -= cost;
-        shown.push(row);
+    // Both measures serialize exactly what is sent (#770 review): no per-row estimate,
+    // so the first row's missing separator and a shorter omitted count are accounted.
+    // `capped_whole` admits a line shorter than the cap: it leaves the LF its byte.
+    let fits = |shown: usize| {
+        overview_bytes(&rows[..shown]) <= PROMPT_OVERVIEW_BYTES
+            && serde_json::to_vec(&response(
+                id,
+                super::tools::result(PROMPT_NAME, with(shown), modern),
+            ))
+            .is_ok_and(|line| line.len() < super::wire::RESPONSE_BYTES)
+    };
+    if !fits(0) {
+        return with(0); // The fixed part overflows; the caller fails atomically.
     }
-    let overview = &mut envelope["data"]["references"]["overview"];
-    overview["omitted"] = json!(total - shown.len());
-    overview["rows"] = Value::Array(shown);
-    envelope
+    // Both measures grow with every added row (a row adds far more bytes than a
+    // shorter omitted count saves), so the longest fitting prefix is found by bisection.
+    let (mut fitting, mut over) = (0, rows.len() + 1);
+    while over - fitting > 1 {
+        let middle = fitting + (over - fitting) / 2;
+        if fits(middle) {
+            fitting = middle;
+        } else {
+            over = middle;
+        }
+    }
+    with(fitting)
+}
+
+/// The overview rows' bytes as sent: their JSON array, separators included and
+/// brackets excluded, as escaped inside the prompt text.
+fn overview_bytes(rows: &[Value]) -> usize {
+    let array = Value::Array(rows.to_vec()).to_string();
+    serde_json::to_string(&Value::String(array)).map_or(usize::MAX, |text| text.len() - 4)
 }
 
 fn capped_whole(id: &Value, name: &str, envelope: Value, modern: bool) -> Value {
@@ -930,11 +945,36 @@ mod tests {
         serde_json::from_str(text.split("UNTRUSTED REPOSITORY DATA\n").nth(1).unwrap()).unwrap()
     }
 
-    fn row_cost(row: &Value) -> usize {
-        serde_json::to_string(&Value::String(row.to_string()))
-            .unwrap()
-            .len()
-            - 1
+    /// An independent oracle for the overview rows' bytes as sent: each row escaped
+    /// inside the prompt string, joined by one separator byte per gap.
+    fn sent_bytes(rows: &[Value]) -> usize {
+        let escaped = |row: &Value| {
+            serde_json::to_string(&Value::String(row.to_string()))
+                .unwrap()
+                .len()
+                - 2
+        };
+        rows.iter().map(escaped).sum::<usize>() + rows.len().saturating_sub(1)
+    }
+
+    /// Production references with one edge per `(source path, target path, count)`.
+    fn edge_references(edges: &[(String, &str, usize)]) -> Value {
+        let production: Vec<Value> = edges
+            .iter()
+            .map(|(source, target, count)| {
+                json!({"source":module(source),"target":module(target),"count":count,"sites":[],
+                    "omittedSites":count,"evidenceTier":"syntax","semanticSites":0})
+            })
+            .collect();
+        json!({"referencesVersion":"references:v2","indexGeneration":"g","indexRevision":1,
+            "evidenceTier":"syntax","semanticComplete":false,"semanticProducers":[],
+            "partial":false,"modules":[],"externalPackages":[],"production":production,
+            "tests":[],"unresolved":[],"partialFiles":[],"limitations":[],
+            "counts":{"scannedDocuments":2,"mappedSites":1,"unresolvedSites":0,"semanticSites":0}})
+    }
+
+    fn overview(result: &Value) -> Value {
+        prompt_context(result)["payload"]["references"]["overview"].clone()
     }
 
     fn prompt_line(id: &Value, result: &Value) -> usize {
@@ -1013,12 +1053,11 @@ mod tests {
         assert_eq!(overview["total"], 400);
         assert_eq!(rows.len() as u64 + omitted, 400);
         assert!(omitted > 0);
-        let used: usize = rows.iter().map(row_cost).sum();
-        assert!(used <= PROMPT_OVERVIEW_BYTES);
+        assert!(sent_bytes(rows) <= PROMPT_OVERVIEW_BYTES);
         let all = reference_summary(&oversized_references(40)).1;
         assert_eq!(rows.as_slice(), &all[..rows.len()]);
         assert!(
-            used + row_cost(&all[rows.len()]) > PROMPT_OVERVIEW_BYTES,
+            sent_bytes(&all[..=rows.len()]) > PROMPT_OVERVIEW_BYTES,
             "longest prefix"
         );
         assert_eq!(
@@ -1042,7 +1081,90 @@ mod tests {
         let rows = context["payload"]["references"]["overview"]["rows"]
             .as_array()
             .unwrap();
-        assert!(rows.iter().map(row_cost).sum::<usize>() < PROMPT_OVERVIEW_BYTES);
+        assert!(sent_bytes(rows) < PROMPT_OVERVIEW_BYTES);
+    }
+
+    /// #770 review: a row whose complete frame fits with no byte to spare is shown, and
+    /// one byte more of rules omits it. The first row carries no separator, and adding it
+    /// changes `omitted` from 1 to 0 at the same width.
+    #[test]
+    fn prompt_frame_boundary_row_that_fits_exactly_is_shown() {
+        let id = json!(770);
+        let references = edge_references(&[("src/a/x.rs".to_owned(), "src/b/y.rs", 1)]);
+        let row = json!({"source":"src/a","target":"src/b","sites":1});
+        let padded = |pad: usize| {
+            let rules = format!("version = 1\n# {}\n", "r".repeat(pad));
+            let envelope = prompt_envelope(&id, Some(&rules), references.clone());
+            capped(&id, PROMPT_NAME, envelope, None, true)
+        };
+        // Rules bytes reach the line one for one, so this pad makes it exactly the cap
+        // less its LF byte.
+        let probe = padded(50_000);
+        assert_eq!(overview(&probe)["rows"], json!([row]));
+        let pad = 50_000 + super::super::wire::RESPONSE_BYTES - 1 - prompt_line(&id, &probe);
+        let exact = padded(pad);
+        assert!(exact.get("_promptError").is_none(), "{exact}");
+        assert_eq!(
+            prompt_line(&id, &exact),
+            super::super::wire::RESPONSE_BYTES - 1
+        );
+        assert_eq!(
+            overview(&exact),
+            json!({"rows":[row],"total":1,"omitted":0})
+        );
+        let over = padded(pad + 1);
+        assert!(over.get("_promptError").is_none(), "{over}");
+        assert_eq!(overview(&over), json!({"rows":[],"total":1,"omitted":1}));
+        // The row's complete frame would be one byte over: it was the longest prefix.
+        assert_eq!(
+            prompt_line(&id, &over) + sent_bytes(&[row]),
+            super::super::wire::RESPONSE_BYTES
+        );
+    }
+
+    /// #770 review: rows whose bytes as sent equal `PROMPT_OVERVIEW_BYTES` exactly are
+    /// all shown; the budget counts separators between rows, not one per row.
+    #[test]
+    fn prompt_budget_boundary_row_that_fits_exactly_is_shown() {
+        let id = json!(775);
+        let uniform: Vec<(String, &str, usize)> = (0..400)
+            .map(|i| (format!("src/a{i:03}/m.rs"), "src/b/n.rs", 1))
+            .collect();
+        // A first, larger row whose source width tunes the prefix sums onto the budget.
+        let (references, shown) = (0..80)
+            .find_map(|width| {
+                let mut edges = vec![(
+                    format!("src/{}/m.rs", "x".repeat(width + 1)),
+                    "src/b/n.rs",
+                    5,
+                )];
+                edges.extend(uniform.iter().cloned());
+                let references = edge_references(&edges);
+                let rows = reference_summary(&references).1;
+                (1..=rows.len())
+                    .find(|&n| sent_bytes(&rows[..n]) == PROMPT_OVERVIEW_BYTES)
+                    .map(|n| (references, n))
+            })
+            .expect("a width landing on the budget");
+        let result = capped(
+            &id,
+            PROMPT_NAME,
+            prompt_envelope(&id, None, references),
+            None,
+            true,
+        );
+        assert!(result.get("_promptError").is_none(), "{result}");
+        let overview = overview(&result);
+        assert_eq!(
+            overview["rows"].as_array().unwrap().len(),
+            shown,
+            "{overview}"
+        );
+        assert_eq!(overview["omitted"], 401 - shown);
+        assert_eq!(
+            sent_bytes(overview["rows"].as_array().unwrap()),
+            PROMPT_OVERVIEW_BYTES
+        );
     }
 
     /// #770: when rules bytes alone cannot fit, the prompt fails atomically however

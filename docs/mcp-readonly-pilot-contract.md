@@ -392,11 +392,12 @@ existing tools for detail.
     target directory. A file's directory is its path up to the last slash, or `.` at the
     root. Package destinations have no directory and are only counted.
   - Rows are ordered by `sites` descending, then by source and target.
-  - The overview keeps the longest prefix whose rows, as escaped in the prompt text, fit
-    a fixed budget of 12,288 bytes (`PROMPT_OVERVIEW_BYTES`). If large rules bytes leave
-    less room in the frame, it keeps the smaller remaining room instead.
-    `rows.length + omitted = total`, and the result is deterministic for one pin and
-    rules text.
+  - The overview keeps the longest prefix whose rows fit a fixed budget of 12,288 bytes
+    (`PROMPT_OVERVIEW_BYTES`). The rows' bytes are their JSON array as escaped in the
+    prompt text, with separators and without brackets. If large rules bytes leave less
+    room, it keeps the longest prefix whose complete response line still fits the frame.
+    Both limits are measured on the serialized bytes. `rows.length + omitted = total`,
+    and the result is deterministic for one pin and rules text.
   - Why 12 KiB: a directory row costs about 45 to 70 bytes, so the budget holds roughly
     200 rows. That covers every production directory pair of mimir (74) and Trellis (67).
     It also keeps the prompt near the #528 24 KiB agent page target.
