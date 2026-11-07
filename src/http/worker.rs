@@ -486,6 +486,8 @@ pub(super) struct WatchStatus {
     pub(super) generation: Arc<std::sync::atomic::AtomicU64>,
     pub(super) acknowledged: u64,
     pub(super) other_intent: bool,
+    /// Live: a reconciliation that can publish is running (#752).
+    pub(super) capturing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A failed or panicked step is retried after this delay.
@@ -1044,7 +1046,10 @@ impl DaemonState {
             generation: watcher.generation_handle(),
             acknowledged: watcher.acknowledged_generation(),
             other_intent: watcher.intent_besides_generation(options),
+            capturing: watcher.capturing_handle(),
         });
+        // Only now does the public status name a replacement's generation.
+        watcher.status_published();
     }
 }
 
@@ -1122,6 +1127,10 @@ fn worker_loop_with_wait(
                 Some(state.failed_step_retry())
             }
         };
+        // This iteration's publications (FIFO drained, watcher hint
+        // acknowledged, S target cleared, a maintenance unit) wake state
+        // waiters, such as the test-support settled wait (#720).
+        state.note_state_change();
     }
 }
 

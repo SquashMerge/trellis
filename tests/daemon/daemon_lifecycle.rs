@@ -63,20 +63,12 @@ fn fixture() -> (
         .unwrap();
     (base, id, registry, now)
 }
-async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            if let Ok((response, catching_up)) = runtime.evidence_response() {
-                let finished = response.finish(()).is_ok();
-                if finished && !catching_up {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+/// H committed and the watcher, FIFO and S are idle at the published head (#720).
+async fn ready(runtime: &std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>) {
+    runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("H did not finish: {error}"));
 }
 
 async fn await_idle_release(registry: &mut CheckoutRegistry, at: Instant, key: &str) {
@@ -749,28 +741,10 @@ async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_startup
         "{error:#}"
     );
     resume_tx.send(()).unwrap();
-    let recovered = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            if let Ok((response, catching_up)) = resumed.evidence_response() {
-                let finished = response.finish(()).is_ok();
-                if finished && !catching_up {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-    if recovered.is_err() {
-        let diagnostic = resumed
-            .evidence_response()
-            .err()
-            .map(|error| format!("{error:#}"));
+    if let Err(error) = resumed.settled_for_tests(None).await {
         panic!(
-            "H did not recover invalid selected head: catching_up={}, retry_waiting={}, reconciliation_error={:?}, admission={diagnostic:?}",
-            resumed.catching_up(),
+            "H did not recover invalid selected head: {error}, retry_waiting={}",
             resumed.retry_waiting_for_tests(),
-            resumed.reconciliation_error()
         );
     }
     let (response, catching_up) = resumed.evidence_response().unwrap();

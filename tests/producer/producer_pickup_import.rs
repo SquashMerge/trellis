@@ -317,7 +317,10 @@ fn pickup_config_survives_daemon_restart() {
     let before = pickup_status(&checkout, "scip-java");
     assert_eq!(before["lastImported"]["state"], "done");
 
+    // A restarted daemon refuses reads while startup reconciliation runs, and a loaded host can
+    // keep it there past a read's own wait (#736). Read only once the checkout has settled.
     stop_daemon(&checkout.home);
+    settle_through_held_startup(&checkout);
     assert_eq!(pickup_status(&checkout, "scip-java"), before);
 
     let cleared = pickup(
@@ -327,7 +330,44 @@ fn pickup_config_survives_daemon_restart() {
     );
     crate::child::assert_cli_success(&cleared, "cleared");
     stop_daemon(&checkout.home);
+    crate::child::settled(checkout.cli(), &checkout.root, None);
     assert_eq!(pickup_status(&checkout, "scip-java"), Value::Null);
+}
+
+/// Restart the stopped daemon through a settled wait, holding its startup reconciliation where
+/// reads are refused (after it latched them, before it publishes) until the wait is under way.
+/// A loaded host delays startup there; the settled wait returns only once startup has committed.
+fn settle_through_held_startup(checkout: &Checkout) -> Value {
+    use std::io::{Read, Write};
+    let gate = tempfile::Builder::new()
+        .prefix("startup-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = gate.path().join("latched.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut command = checkout.cli();
+    command.env("TRELLIS_TEST_STARTUP_LATCHED_SOCKET", &socket);
+    let root = checkout.root.clone();
+    let settling = std::thread::spawn(move || crate::child::settled(command, &root, None));
+    let mut held = None;
+    trellis::testing::wait_until("the restarted startup to reach its latched hold", || {
+        held = listener.accept().ok().map(|(stream, _)| stream);
+        held.is_some() || settling.is_finished()
+    });
+    let Some(mut held) = held else {
+        let settled = settling.join().unwrap();
+        panic!("the settled wait ended before startup reached its hold: {settled}");
+    };
+    held.set_nonblocking(false).unwrap();
+    held.read_exact(&mut [0]).unwrap();
+    assert!(
+        !settling.is_finished(),
+        "the settled wait returned while startup reconciliation was held"
+    );
+    held.write_all(&[1]).unwrap();
+    drop(listener);
+    settling.join().unwrap()
 }
 
 #[test]

@@ -714,6 +714,7 @@ impl DaemonState {
         match &*self.watch_status.lock().unwrap() {
             Some(status) => {
                 status.other_intent
+                    || status.capturing.load(Ordering::SeqCst)
                     || status.generation.load(Ordering::SeqCst) != status.acknowledged
             }
             // A serving session's first watcher has not run its full inventory.
@@ -732,6 +733,77 @@ impl DaemonState {
         };
         scheduler.submit_watch_event_for_tests(event);
         true
+    }
+
+    /// [`Self::submit_watch_event_for_tests`], with the hint due at once: the
+    /// worker's next iteration reconciles it without a debounce iteration first.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn submit_due_watch_event_for_tests(&self, event: notify::Result<notify::Event>) -> bool {
+        let mut work = self.watcher_work.lock().unwrap();
+        let Some((_, scheduler)) = work.as_mut() else {
+            return false;
+        };
+        scheduler.submit_watch_event_for_tests(event);
+        scheduler.force_periodic_inventory_for_tests();
+        true
+    }
+
+    /// Make the periodic inventory due now, with no hint accepted, and wake the
+    /// worker to run it. False without a watcher.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn run_periodic_inventory_for_tests(&self) -> bool {
+        {
+            let mut work = self.watcher_work.lock().unwrap();
+            let Some((_, scheduler)) = work.as_mut() else {
+                return false;
+            };
+            scheduler.force_periodic_inventory_for_tests();
+        }
+        self.inbox.wake();
+        true
+    }
+
+    /// Run `hook` once on the worker, after its next watcher reconciliation has
+    /// published and before it acknowledges the hint. False without a watcher.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_before_watch_ack_hook_for_tests(
+        &self,
+        hook: impl FnOnce(&dyn Fn(notify::Event)) + Send + 'static,
+    ) -> bool {
+        let mut work = self.watcher_work.lock().unwrap();
+        let Some((_, watcher)) = work.as_mut() else {
+            return false;
+        };
+        watcher.set_before_ack_hook_for_tests(hook);
+        true
+    }
+
+    /// Run `hook` once on the worker, after its next watcher reconciliation
+    /// returns and before it publishes the watch status. False without a watcher.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_after_watch_reconcile_hook_for_tests(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) -> bool {
+        let mut work = self.watcher_work.lock().unwrap();
+        let Some((_, watcher)) = work.as_mut() else {
+            return false;
+        };
+        watcher.set_after_reconcile_hook_for_tests(hook);
+        true
+    }
+
+    /// Select explicit index options for the watcher, as a `serve` registration
+    /// applied in place does, and wake the worker.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn select_watch_options_for_tests(&self, options: IndexOptions) {
+        *self.explicit_pending.lock().unwrap() = Some(Arc::new(options));
+        self.inbox.wake();
     }
 
     /// Arm a queue-read race only after CLI enqueue has committed. Enqueue
@@ -1375,6 +1447,16 @@ impl DaemonState {
         let _held = self.worker_hold.read().unwrap();
         let result = self.worker_step_inner();
         self.publish_fifo_pending();
+        // A path that replaced the watcher's signals without publishing its
+        // status (a FIFO or import drain, an error exit) publishes it here.
+        {
+            let work = self.watcher_work.lock().unwrap();
+            if let Some((_, watcher)) = work.as_ref()
+                && watcher.status_stale()
+            {
+                self.publish_watch_status(watcher, &watcher.options());
+            }
+        }
         // The authoritative worker has released its step/watcher/publication
         // guards. The fill owner only receives a coalescing in-memory hint.
         if let Some(fill) = self.search_fill.lock().unwrap().as_ref() {
@@ -1650,6 +1732,10 @@ impl DaemonState {
                                 false,
                             )
                         };
+                        #[cfg(feature = "test-support")]
+                        if let Some(hook) = scheduler.take_after_reconcile_hook_for_tests() {
+                            hook();
+                        }
                         self.publish_watch_status(scheduler, &selected_options);
                         let accounted = reconciled?;
                         if accounted {

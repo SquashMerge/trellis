@@ -480,6 +480,26 @@ struct RequestCoverage {
     verified: bool,
 }
 
+/// Clears a watcher's published `capturing` flag on every exit, unless a
+/// replaced watcher's status is not yet published: the owner's status
+/// publication clears it then.
+struct CapturingGuard {
+    capturing: Arc<std::sync::atomic::AtomicBool>,
+    status_stale: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for CapturingGuard {
+    fn drop(&mut self) {
+        if !self.status_stale.load(Ordering::SeqCst) {
+            self.capturing.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// A watcher-reconciliation test hook, given the current watcher's ingress.
+#[cfg(feature = "test-support")]
+type WatchHookForTests = Box<dyn FnOnce(&dyn Fn(notify::Event)) + Send>;
+
 /// The elected owner alone drives the advisory watcher and the durable FIFO.
 /// This is an in-memory scheduler, not a second request queue.
 pub struct WatcherWork {
@@ -522,6 +542,26 @@ pub struct WatcherWork {
     waker: Option<crate::watch::Waker>,
     /// Set only for retirement's attempt: the batch must be exactly this generation.
     generation_limit: Option<u64>,
+    /// Set from the moment a reconciliation decides to capture until it has
+    /// finished, acknowledgment included. Published with the watch status, so
+    /// work with no accepted hint (a periodic inventory) is pending before it
+    /// can publish (#752).
+    capturing: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when an options change replaced the watch signals, until the owner
+    /// publishes a status with the replacement's generation. Until then the
+    /// public status holds the old generation, so `capturing` stays raised.
+    status_stale: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-support hold after a watcher reconciliation published and before it
+    /// acknowledges its batch (#752).
+    #[cfg(feature = "test-support")]
+    before_ack_hook: Option<WatchHookForTests>,
+    /// Test-support hold after a reconciliation returned, before the worker
+    /// publishes the watch status (#752).
+    #[cfg(feature = "test-support")]
+    after_reconcile_hook: Option<Box<dyn FnOnce() + Send>>,
+    /// The armed hook's reconciliation decided to capture.
+    #[cfg(feature = "test-support")]
+    after_reconcile_captured: bool,
 }
 
 /// The retirement attempt found ingress past its cutoff: it captures nothing.
@@ -609,7 +649,63 @@ impl WatcherWork {
             witness_reported_generation: None,
             waker: None,
             generation_limit: None,
+            capturing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            status_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-support")]
+            before_ack_hook: None,
+            #[cfg(feature = "test-support")]
+            after_reconcile_hook: None,
+            #[cfg(feature = "test-support")]
+            after_reconcile_captured: false,
         })
+    }
+
+    /// Whether a reconciliation is capturing, publishing or acknowledging now,
+    /// or a replacement's status is not yet published.
+    pub fn capturing_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.capturing.clone()
+    }
+
+    /// Whether the public watch status still names a replaced generation.
+    pub(crate) fn status_stale(&self) -> bool {
+        self.status_stale.load(Ordering::SeqCst)
+    }
+
+    /// The owner published a status with this watcher's current generation.
+    /// Called under the same lock as reconciliation, so never mid-capture.
+    pub(crate) fn status_published(&self) {
+        if self.status_stale.swap(false, Ordering::SeqCst) {
+            self.capturing.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn take_after_reconcile_hook_for_tests(
+        &mut self,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        if !std::mem::take(&mut self.after_reconcile_captured) {
+            return None;
+        }
+        self.after_reconcile_hook.take()
+    }
+
+    /// Run `hook` once, after the next reconciliation that captured returns and
+    /// before the worker publishes the watch status.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_after_reconcile_hook_for_tests(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.after_reconcile_hook = Some(Box::new(hook));
+    }
+
+    /// Run `hook` once, after the next watcher reconciliation has published
+    /// and before it acknowledges its batch.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_before_ack_hook_for_tests(
+        &mut self,
+        hook: impl FnOnce(&dyn Fn(notify::Event)) + Send + 'static,
+    ) {
+        self.before_ack_hook = Some(Box::new(hook));
     }
 
     /// Retirement's one attempt (Decision 0009 §5): reconcile only while the
@@ -1017,6 +1113,10 @@ impl WatcherWork {
                 next.set_waker(waker.clone());
             }
             self.watch = next;
+            // The public status still holds the replaced generation: keep this
+            // watcher pending until the owner publishes the replacement's (#752).
+            self.status_stale.store(true, Ordering::SeqCst);
+            self.capturing.store(true, Ordering::SeqCst);
             self.request_coverage = None;
             // New options need their own capture before an armed gate opens.
             self.gate_attempted = false;
@@ -1065,6 +1165,17 @@ impl WatcherWork {
         {
             return Ok(false);
         }
+        // From here this reconciliation can publish: it is pending watcher work
+        // until it returns, whether or not a hint was accepted (#752).
+        self.capturing.store(true, Ordering::SeqCst);
+        #[cfg(feature = "test-support")]
+        {
+            self.after_reconcile_captured = self.after_reconcile_hook.is_some();
+        }
+        let _capturing = CapturingGuard {
+            capturing: self.capturing.clone(),
+            status_stale: self.status_stale.clone(),
+        };
         // The first post-registration full inventory closes the startup/watch gap.
         // An identical selected capture needs no gratuitous new revision.
         let outcome: Result<PublishPermit> = (|| {
@@ -1134,6 +1245,10 @@ impl WatcherWork {
                 #[cfg(not(feature = "test-support"))]
                 let witnessed_pin = None;
                 after_cutoff(&self.watch);
+                #[cfg(feature = "test-support")]
+                if let Some(hook) = self.before_ack_hook.take() {
+                    hook(&|event| self.watch.submit_event(Ok(event)));
+                }
                 let accounted = self.watch.acknowledge(&batch);
                 if accounted {
                     self.last_accounted_generation = Some(batch.generation);
@@ -2216,6 +2331,18 @@ pub fn establish_serving_session(
         return Ok(session);
     }
     let session = store.writer_session()?;
+    // Hold startup reconciliation where a loaded host delays it: this session
+    // has latched public reads and has not yet published (#736). A missing
+    // listener skips the hold, so a later startup in the same daemon runs on.
+    #[cfg(feature = "test-support")]
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_STARTUP_LATCHED_SOCKET")
+        && let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path)
+    {
+        use std::io::{Read, Write};
+        let _ = stream.set_read_timeout(Some(crate::testing::HANG_BACKSTOP));
+        let _ = stream.write_all(&[1]);
+        let _ = stream.read_exact(&mut [0]);
+    }
     let publication = store.enter_publication(cancel, std::time::Duration::from_millis(250))?;
     let expected = store.publication_index_baseline()?;
     let options = match explicit_options {

@@ -16,20 +16,12 @@ fn identity(root: &Path) -> WorkspaceIdentity {
 fn roots(state: &Path) -> TopologyRoots {
     TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"))
 }
-async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            if let Ok((response, catching_up)) = runtime.evidence_response() {
-                let finished = response.finish(()).is_ok();
-                if finished && !catching_up {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("H did not finish: {:?}", runtime.reconciliation_error()));
+/// H committed and the watcher, FIFO and S are idle at the published head (#720).
+async fn ready(runtime: &std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>) {
+    runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("H did not finish: {error}"));
 }
 
 async fn release_when_idle(registry: &mut CheckoutRegistry, key: &str) {
@@ -3737,4 +3729,236 @@ async fn root_loss_between_cli_queue_check_and_shared_use_returns_root_changed()
         .unwrap()
         .expect_err("old-root request cannot succeed");
     assert!(error.to_string().starts_with("root_changed"), "{error:#}");
+}
+
+/// The settled wait (#720): one sample names the busy component; a wait returns once startup
+/// reconciliation commits and a watcher hint is published, and refuses another head.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn settled_wait_names_the_busy_component_and_waits_for_the_owner() {
+    use trellis::daemon::registry::{NotSettled, SettleBusy};
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function before() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.lock().unwrap().recv().unwrap();
+    }));
+    let runtime = registry.activate(&id.root_key).unwrap();
+    tokio::task::spawn_blocking(move || {
+        entered_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("startup reconciliation did not reach its hook")
+    })
+    .await
+    .unwrap();
+
+    // Startup is held: a single sample names it.
+    match runtime.sample_settled_for_tests(None) {
+        Err(NotSettled::Hang(SettleBusy::Startup { .. })) => {}
+        other => panic!("expected startup to be busy: {other:?}"),
+    }
+    let waiting = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.settled_for_tests(None).await })
+    };
+    resume_tx.send(()).unwrap();
+    let head = waiting.await.unwrap().unwrap();
+    assert_eq!(runtime.sample_settled_for_tests(Some(head)), Ok(head));
+    let other = trellis::model::IndexPin {
+        index_revision: head.index_revision + 1,
+        ..head
+    };
+    assert_eq!(
+        runtime.sample_settled_for_tests(Some(other)),
+        Err(NotSettled::OtherHead {
+            expected: other,
+            published: head,
+        })
+    );
+
+    // A source change the worker has not yet taken keeps the watcher busy.
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let worker = scheduler.hold_worker_for_tests();
+    fs::write(checkout.join("a.js"), "function after() {}\n").unwrap();
+    let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Content,
+    )))
+    .add_path(checkout.join("a.js"));
+    assert!(scheduler.submit_watch_event_for_tests(Ok(event)));
+    assert_eq!(
+        runtime.sample_settled_for_tests(None),
+        Err(NotSettled::Hang(SettleBusy::Watcher))
+    );
+    drop(worker);
+    let moved = runtime.settled_for_tests(None).await.unwrap();
+    assert_eq!(moved.index_generation, head.index_generation);
+    assert!(moved.index_revision > head.index_revision, "{moved:?}");
+}
+
+/// The settled wait never pairs idle flags sampled before its read with a pin the worker
+/// published after them (#752): idle at N0, a hint is accepted and N1 published, and its
+/// acknowledgment (and the iteration-end notification) is still held when the read opens.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn settled_sample_rechecks_the_owner_after_its_read() {
+    use trellis::daemon::registry::{NotSettled, SettleBusy};
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function before() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let head = runtime.settled_for_tests(None).await.unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+
+    // The worker publishes the hint's head, then holds before acknowledging it.
+    let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    assert!(scheduler.set_before_watch_ack_hook_for_tests(move |_| {
+        published_tx.send(()).unwrap();
+        let _ = ack_rx.recv_timeout(trellis::testing::HANG_BACKSTOP);
+    }));
+    // The helper's selected read has sampled catchingUp (idle at N0); only then is the
+    // hint accepted and published, before the read opens its snapshot.
+    let path = checkout.join("a.js");
+    let hinted = scheduler.clone();
+    runtime.set_evidence_sampled_hook_for_tests(move || {
+        fs::write(&path, "function after() {}\n").unwrap();
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(path);
+        assert!(hinted.submit_due_watch_event_for_tests(Ok(event)));
+        published_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("the hint did not publish");
+    });
+    let sampler = runtime.clone();
+    let sampled = tokio::task::spawn_blocking(move || sampler.sample_settled_for_tests(None))
+        .await
+        .unwrap();
+    ack_tx.send(()).unwrap();
+    assert_eq!(sampled, Err(NotSettled::Hang(SettleBusy::Watcher)));
+    let moved = runtime.settled_for_tests(None).await.unwrap();
+    assert!(moved.index_revision > head.index_revision, "{moved:?}");
+}
+
+/// The same for a periodic inventory with no accepted hint (#752): an edit no OS event
+/// reported is published by the inventory, which is watcher work until it has finished,
+/// although the ingress generation never moved.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn settled_sample_sees_a_periodic_inventory_without_a_hint() {
+    use trellis::daemon::registry::{NotSettled, SettleBusy};
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function before() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let head = runtime.settled_for_tests(None).await.unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+
+    let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    assert!(scheduler.set_before_watch_ack_hook_for_tests(move |_| {
+        published_tx.send(()).unwrap();
+        let _ = ack_rx.recv_timeout(trellis::testing::HANG_BACKSTOP);
+    }));
+    // Idle at N0 when the read sampled catchingUp; then, with no hint, the periodic
+    // inventory finds the edit and publishes before the read opens its snapshot.
+    let path = checkout.join("a.js");
+    let inventory = scheduler.clone();
+    runtime.set_evidence_sampled_hook_for_tests(move || {
+        fs::write(&path, "function after() {}\n").unwrap();
+        assert!(inventory.run_periodic_inventory_for_tests());
+        published_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("the periodic inventory did not publish");
+    });
+    let sampler = runtime.clone();
+    let sampled = tokio::task::spawn_blocking(move || sampler.sample_settled_for_tests(None))
+        .await
+        .unwrap();
+    ack_tx.send(()).unwrap();
+    assert_eq!(sampled, Err(NotSettled::Hang(SettleBusy::Watcher)));
+    let moved = runtime.settled_for_tests(None).await.unwrap();
+    assert!(moved.index_revision > head.index_revision, "{moved:?}");
+}
+
+/// The same across a watcher replacement (#752): new explicit options replace the watch
+/// signals, the replacement publishes, and an event reaches it after its cutoff, so its
+/// acknowledgment fails. Until the worker publishes the replacement's status, the public
+/// status still names the old, acknowledged generation; the watcher stays pending.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn settled_sample_sees_a_replaced_watcher_before_its_status() {
+    use trellis::daemon::registry::{NotSettled, SettleBusy};
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function before() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let head = runtime.settled_for_tests(None).await.unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+
+    // After the replacement publishes, an edit's event reaches it before its ACK.
+    let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+    let edited = checkout.join("a.js");
+    assert!(
+        scheduler.set_before_watch_ack_hook_for_tests(move |submit| {
+            fs::write(&edited, "function after() {}\n").unwrap();
+            submit(
+                notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )))
+                .add_path(edited),
+            );
+            published_tx.send(()).unwrap();
+        })
+    );
+    // Hold after the reconciliation returns, before the worker publishes its status.
+    let (returned_tx, returned_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    assert!(scheduler.set_after_watch_reconcile_hook_for_tests(move || {
+        returned_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(trellis::testing::HANG_BACKSTOP);
+    }));
+    let mut options = trellis::indexer::IndexOptions::new(checkout.clone());
+    options.max_file_bytes = 4096;
+    scheduler.select_watch_options_for_tests(options);
+    tokio::task::spawn_blocking(move || {
+        returned_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("the replacement reconciliation did not return");
+    })
+    .await
+    .unwrap();
+    published_rx
+        .try_recv()
+        .expect("the replacement reconciliation did not reach its acknowledgment");
+
+    let sampler = runtime.clone();
+    let sampled = tokio::task::spawn_blocking(move || sampler.sample_settled_for_tests(None))
+        .await
+        .unwrap();
+    release_tx.send(()).unwrap();
+    assert_eq!(sampled, Err(NotSettled::Hang(SettleBusy::Watcher)));
+    let moved = runtime.settled_for_tests(None).await.unwrap();
+    assert!(moved.index_revision > head.index_revision, "{moved:?}");
 }
