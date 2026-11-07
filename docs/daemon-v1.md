@@ -22,9 +22,15 @@ daemon. `--token-file` is required and must be outside the selected checkout. Th
 disposable path-keyed index uses fixed per-user cache locations. A Git workspace UUID marker is written inside the selected Git directory;
 there are no other checkout topology writes.
 
-`serve` does **not** index at startup. Use **Index workspace** to refresh; **Refresh status
-& view** only reloads the already published data. Ctrl-C or SIGTERM cancels an active index job and
-stops serving. A cancellation request cannot undo a revision already committed.
+`serve` starts the listener and registers the checkout; registration alone does not index.
+The first browser data request, CLI operation or MCP request for the checkout activates it,
+which starts background indexing, and the daemon's watcher then keeps the active checkout
+current: it re-publishes a few seconds after a file change or branch switch, with no user
+action (see [local topology](local-topology.md) and Decision 0009 §6). **Index workspace** queues an explicit index
+request; **Refresh status & view** only reloads the already published data. Ctrl-C or SIGTERM
+ends `serve`, but the per-user daemon keeps running and keeps answering on the port until
+`trellis daemon stop` or its idle exit (see the [quickstart](quickstart.md)). A cancellation
+request cannot undo a revision already committed.
 
 `--state-dir` is removed; there is no placement override or automatic old-state migration.
 Keep the token at an explicit private path outside the selected checkout and fixed topology.
@@ -83,7 +89,8 @@ not a general compatibility claim for every SCIP producer.
 
 Parse-error files retain recovered syntax with unavailable semantic provenance. Global
 `semanticState` reports manifest freshness, not parse completeness or live working-tree
-freshness. There is **no watcher**: the source may have changed since indexing.
+freshness. The watcher re-publishes native evidence after source edits, but it never
+regenerates SCIP: an imported snapshot can describe source that has since changed.
 
 **Status of a published import (#467).** `trellis status` and `GET /api/status` read the
 head revision's published semantic producers per language (owner ruling 2026-10-30, #483,
@@ -324,7 +331,7 @@ For DTO details, see [the frontend handoff](daemon-v1-api-handoff.md).
 ## Current limits
 
 The Tools tab, question planning, Jev selection, ACP answers and saved records are retired.
-Java/Python native indexing, class diagrams and static sequence diagrams remain available. There is no watcher or #39 reconciliation/read fencing, automatic
-GC (#16), rich durable anchor model (#38), TypeScript grammar, LSP, terminal, Tauri
+Java/Python native indexing, class diagrams and static sequence diagrams remain available. There is no
+rich durable anchor model (#38), TypeScript grammar, LSP, terminal, Tauri
 shell, ORM or external database connection. See [local topology](local-topology.md)
 for the shipped-versus-future boundary.

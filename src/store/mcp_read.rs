@@ -640,6 +640,29 @@ impl EvidenceResponse {
             .cloned())
     }
 
+    /// #715: the stable lookup keys of `declarations` at `pin`, by syntax ID, for a compact
+    /// call graph. Each document's keys are derived once; a declaration without a stable key
+    /// (a partial Rust impl parse) is left out.
+    pub fn mcp_stable_lookup_keys<'a>(
+        &self,
+        declarations: impl IntoIterator<Item = &'a crate::native_evidence::Declaration>,
+        pin: IndexPin,
+    ) -> Result<BTreeMap<String, String>> {
+        let selected = self.selected(Some(pin))?;
+        let mut keys = BTreeMap::new();
+        for declaration in declarations {
+            let scope = v8_native_scope_for(&self.db, &declaration.document, &selected)?
+                .ok_or_else(|| self.corrupt_evidence("store_unavailable: lookup scope absent"))?;
+            if let Some(key) = self
+                .mcp_document_lookup_keys(&selected, &scope, None)?
+                .get(&declaration.syntax_id)
+            {
+                keys.insert(declaration.syntax_id.clone(), key.clone());
+            }
+        }
+        Ok(keys)
+    }
+
     /// Enumerate the complete exact-key set before deciding whether a selector is unique.
     /// Every possible path prefix is considered: valid repository paths may contain `::`.
     pub fn mcp_resolve_lookup_with_lines(

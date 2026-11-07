@@ -539,7 +539,7 @@ async fn selected_startup_failure_must_not_fail_valid_q1_before_reconciliation()
     std::os::unix::fs::symlink("a.js", root.join(".gitignore")).unwrap();
     drop(old_owner);
     let error = state.worker_step().unwrap_err();
-    assert!(format!("{error:#}").contains("unsafe or oversized input"));
+    assert!(format!("{error:#}").contains("unsafe input"));
     let row = store.request_by_id(&q1.id).unwrap().unwrap();
     assert_eq!(
         (

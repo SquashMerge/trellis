@@ -19,7 +19,7 @@ silently rebound to this different workspace. See [workspace correction](workspa
 The tree endpoint returns filenames and metadata, not file content. It does not execute
 repository code, follow symlinks, start indexing, or make model calls. The existing source
 viewer continues to use cached indexed source. Directory pagination and scan limits are
-explicit. A live file tree can differ from the older cached index until an explicit refresh.
+explicit. A live file tree can differ from the cached index until the watcher re-publishes it.
 
 
 ## External participants

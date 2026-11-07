@@ -132,7 +132,9 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
   const configuredLanguages = new Set([...describedLanguages, ...scopeLanguages]
     .filter(row => row.semantic?.producerId).map(row => row.language));
   const semanticCapabilities = ['java', 'rust', 'python', 'javascript'].map(language => {
-    const semantic = scopeLanguages.find(row => row.language === language)?.semantic;
+    // #715: find's `scopeCoverage` lists only the returned languages; describe covers the rest.
+    const semantic = (scopeLanguages.find(row => row.language === language)
+      ?? describedLanguages.find(row => row.language === language))?.semantic;
     const configured = configuredLanguages.has(language);
     const ready = semantic?.producerId && semantic.available && semantic.freshness === 'fresh';
     return {language, status: !configured ? 'not_configured' : ready ? 'ready' : 'unavailable'};
