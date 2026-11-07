@@ -26,6 +26,16 @@ Patterns:
                    that asserts nothing is pending (unwrap_err / is_err), and one
                    in a function that makes the listener non-blocking or bounds it
                    with poll(2), is not flagged.
+  speed-assert     An assert! whose condition bounds elapsed time from above
+                   (`x.elapsed() < N`, or `t < N` where `let t = x.elapsed()..`)
+                   by anything but HANG_BACKSTOP. Test bounds are hang backstops
+                   only (owner ruling); assert the outcome, and gate performance
+                   separately.
+  short-read-timeout
+                   set_read_timeout(Some(Duration::from_secs/millis(N))) below
+                   HANG_BACKSTOP. A short read window either flakes under load or
+                   proves absence only by waiting; bound the read by HANG_BACKSTOP
+                   and prove absence with a later reply.
 
 Exceptions live in tools/flaky-patterns.allow, one per line:
 
@@ -47,6 +57,8 @@ PATTERNS = {
     "global-counter": "scope the count to the thread, store or call under test, not the process (#700, #702)",
     "short-wait": "wait with trellis::testing::wait_until, the settled helper, or HANG_BACKSTOP (#720)",
     "blocking-accept": "bound the accept: trellis::testing::accept_within_backstop (#742)",
+    "speed-assert": "assert the outcome; bound elapsed time only by HANG_BACKSTOP (#755)",
+    "short-read-timeout": "bound the read by HANG_BACKSTOP; prove absence with a later reply (#755)",
 }
 # HANG_BACKSTOP in src/testing.rs, in milliseconds.
 BACKSTOP_MS = 120_000
@@ -276,6 +288,40 @@ COUNTER = re.compile(
 DEADLINE = re.compile(r"Instant::now\(\)\s*\+\s*(?:std::time::)?" + DURATION)
 TOKIO_TIMEOUT = re.compile(r"\btimeout\(\s*(?:std::time::)?" + DURATION + r"\s*,")
 ACCEPT = re.compile(r"\.(accept|incoming)\(\s*\)")
+ASSERT = re.compile(r"\b(?:debug_)?assert!\s*\(")
+ELAPSED = r"\.elapsed\(\)(?:\.as_[a-z0-9_]+\(\))?"
+# An upper bound on elapsed time: `<` or `<=`, never `<<` or a `<-` arrow.
+UPPER = r"\s*<=?(?![<-])\s*"
+READ_TIMEOUT = re.compile(r"\.set_read_timeout\(\s*Some\(\s*(?:std::time::)?" + DURATION + r"\s*\)")
+
+
+def first_argument(code, open_at):
+    """The text of a macro call's first top-level argument."""
+    end = matching(code, open_at) - 1
+    depth, i = 0, open_at + 1
+    while i < end:
+        c = code[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            break
+        i += 1
+    return code[open_at + 1:i]
+
+
+def speed_bound(condition, body):
+    """Whether an assert condition bounds elapsed time above by anything but HANG_BACKSTOP."""
+    for m in re.finditer(ELAPSED + UPPER, condition):
+        if "HANG_BACKSTOP" not in condition[m.end():]:
+            return True
+    for m in re.finditer(r"\b([a-z_][a-z0-9_]*)" + UPPER, condition):
+        name = m.group(1)
+        bound = re.search(r"\blet\s+(?:mut\s+)?" + name + r"\s*=[^;]*" + ELAPSED + r"\s*;", body)
+        if bound and "HANG_BACKSTOP" not in condition[m.end():]:
+            return True
+    return False
 
 
 def findings(src):
@@ -312,6 +358,14 @@ def findings(src):
         if re.search(r"\bpoll\s*\(|set_nonblocking\(\s*true\s*\)", src.fn_body(m.start())):
             continue
         add("blocking-accept", m.start())
+    for m in ASSERT.finditer(code):
+        if src.kind_at(m.start()) != "test":
+            continue
+        if speed_bound(first_argument(code, m.end() - 1), src.fn_body(m.start())):
+            add("speed-assert", m.start())
+    for m in READ_TIMEOUT.finditer(code):
+        if src.kind_at(m.start()) == "test" and duration_ms(m.group(1), m.group(2)) < BACKSTOP_MS:
+            add("short-read-timeout", m.start())
     return found
 
 

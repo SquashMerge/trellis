@@ -1918,14 +1918,14 @@ fn call_graph_node_hook_fires_once_per_dequeued_node() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut seen = 0;
     while seen < 3 {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
                     .unwrap();
                 let mut line = Vec::new();
                 let mut byte = [0u8; 1];

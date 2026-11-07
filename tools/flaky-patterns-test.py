@@ -108,6 +108,38 @@ class Patterns(unittest.TestCase):
         """}).flagged()
         self.assertEqual(flagged, ["blocking-accept blocking", "blocking-accept served"])
 
+    def test_upper_bounds_on_elapsed_time_below_the_backstop(self):
+        flagged = Tree({"tests/a.rs": """
+            fn direct() { assert!(started.elapsed() < Duration::from_millis(1100), "slow"); }
+            fn computed() { assert!(start.elapsed() <= READ_DEADLINE + Duration::from_secs(2)); }
+            fn bound() { let waited = started.elapsed(); assert!(waited < Duration::from_secs(4)); }
+            fn seconds() { let s = t.elapsed().as_secs_f64(); assert!(
+                s <= upper,
+                "too slow"
+            ); }
+            fn backstop() { assert!(started.elapsed() < trellis::testing::HANG_BACKSTOP); }
+            fn bound_backstop() { let r = began.elapsed(); assert!(r < HANG_BACKSTOP, "hang"); }
+            fn lower() { assert!(start.elapsed() >= READ_DEADLINE); assert!(r > held); }
+            fn unrelated() { let n = v.len(); assert!(n < 3); assert!(a << 2 < b); }
+            fn message() { assert!(ok, "took {:?} < {:?}", t.elapsed(), limit); }
+            fn production_loop() { while started.elapsed() < Duration::from_millis(5) {} }
+        """}).flagged()
+        self.assertEqual(flagged, ["speed-assert direct", "speed-assert computed",
+                                   "speed-assert bound", "speed-assert seconds"])
+
+    def test_short_socket_read_timeouts(self):
+        flagged = Tree({
+            "tests/a.rs": """
+                fn short() { s.set_read_timeout(Some(Duration::from_millis(500))).unwrap(); }
+                fn secs() { s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap(); }
+                fn backstop() { s.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP)).unwrap(); }
+                fn computed() { s.set_read_timeout(Some(remaining)).unwrap(); }
+                fn long() { s.set_read_timeout(Some(Duration::from_secs(120))).unwrap(); }
+            """,
+            "src/lib.rs": "fn client() { s.set_read_timeout(Some(Duration::from_secs(5))).unwrap(); }\n",
+        }).flagged()
+        self.assertEqual(flagged, ["short-read-timeout short", "short-read-timeout secs"])
+
 
 class Allowlist(unittest.TestCase):
     FILES = {"tests/a.rs": """

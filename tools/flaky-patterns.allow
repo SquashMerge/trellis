@@ -183,3 +183,10 @@ blocking-accept tests/daemon/daemon_mcp.rs try_paused_at -- accepts on a detache
 blocking-accept tests/mcp/mcp_protocol.rs bind -- accepts on a detached thread; release() waits on it only via recv_timeout(HANG_BACKSTOP)
 blocking-accept tests/mcp/mcp_protocol.rs serve_pauses -- a detached hook server for the test's lifetime; never joined
 blocking-accept tests/mcp/mcp_protocol.rs earlier_call_is_decided_while_a_later_final_check_stalls -- a detached hook server for the test's lifetime; never joined
+
+# speed-assert: not a functional bound
+speed-assert tests/http/class_diagram_http.rs selected_class_pages_medium_release_latency -- intentional performance gate: #[ignore]d, run only in release mode on the reference host
+speed-assert src/store/rebuild_in_progress_tests.rs a_read_held_past_the_spill_budget_fails_rebuild_in_progress -- tells the 400 ms spill budget (the value under test) from the 5 s busy wait; no outcome distinguishes them
+
+# short-read-timeout: the timeout is the value under test
+short-read-timeout tests/daemon/daemon_cli.rs client_read_timeout_does_not_retry_but_connect_failure_does -- the client's own read timeout must fire; the test asserts that a timed-out read is not retried

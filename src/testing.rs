@@ -36,8 +36,10 @@
 //! code and names the helper to use: an unwrapped `Store::open` (use
 //! [`retry_admission`]), a process-global static counter (scope it to the
 //! thread, store or call), a functional deadline shorter than
-//! [`HANG_BACKSTOP`] (use [`wait_until`], settled, or the backstop), and a
-//! blocking `accept()` (use [`accept_within_backstop`]). Justified exceptions
+//! [`HANG_BACKSTOP`] (use [`wait_until`], settled, or the backstop), a
+//! blocking `accept()` (use [`accept_within_backstop`]), an assert that bounds
+//! elapsed time by anything but the backstop, and a socket read timeout below
+//! it (prove absence with a later reply instead). Justified exceptions
 //! go in `tools/flaky-patterns.allow`, each with a one-line reason.
 
 use std::time::{Duration, Instant};
