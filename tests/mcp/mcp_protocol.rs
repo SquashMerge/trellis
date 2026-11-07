@@ -15159,6 +15159,22 @@ async fn call_graph_compact_and_basis_table_through_mcp() {
     assert_eq!(mcp.shape(whole), mcp.shape(small));
     assert!(small.get("provenance").is_none() && small.get("coverage").is_none());
     assert!(compact["data"].get("semanticBases").is_none());
+    // #715: every compact node keeps its stable lookup key; the full declaration is the
+    // contract record and has none.
+    let nodes = small["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 4, "{compact}");
+    for node in nodes {
+        let declaration = &node["declaration"];
+        let name = declaration["name"].as_str().unwrap();
+        assert_eq!(declaration["stableLookupKey"], format!("a.rs::{name}"));
+    }
+    assert!(
+        whole["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["declaration"].get("stableLookupKey").is_none())
+    );
     for edge in small["edges"].as_array().unwrap() {
         assert!(edge.get("binding").is_none());
         assert_eq!(edge["resolution"], "resolved");
@@ -15168,6 +15184,85 @@ async fn call_graph_compact_and_basis_table_through_mcp() {
             envelope["data"]["responseOmitted"],
             json!({"nodes":0,"edges":0})
         );
+    }
+    mcp.finish();
+}
+
+/// #715: `compact` reaches find (query and lookup key) and search through MCP. Each item
+/// keeps its stable lookup key and path, the answer drops documents, coverage and
+/// provenance, and full and compact `scopeCoverage` list only the result languages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_find_and_search_through_mcp() {
+    let spec = graph_fixtures::Spec::new(&[
+        (
+            "src/lib.rs",
+            "fn navigation_at() {}\nfn navigation_in() {}\n",
+        ),
+        ("web/app.js", "function navigationAt() {}\n"),
+    ]);
+    let mut mcp = GraphMcp::start(715, &[spec], Default::default()).await;
+    let languages = |envelope: &Value| -> Vec<String> {
+        envelope["data"]["scopeCoverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["language"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    for (name, items, arguments) in [
+        (
+            "trellis_find_symbols",
+            "symbols",
+            json!({"schemaVersion":1,"query":"navigation_"}),
+        ),
+        (
+            "trellis_find_symbols",
+            "symbols",
+            json!({"schemaVersion":1,"lookupKey":"src/lib.rs::navigation_at"}),
+        ),
+        (
+            "trellis_search_symbols",
+            "hits",
+            json!({"schemaVersion":1,"query":"navigation"}),
+        ),
+    ] {
+        let full = mcp.call_tool(name, arguments.clone());
+        let mut compact_args = arguments;
+        compact_args["compact"] = json!(true);
+        let compact = mcp.call_tool(name, compact_args);
+        let shown = compact["data"][items].as_array().unwrap();
+        assert!(!shown.is_empty(), "{full}");
+        assert_eq!(shown.len(), full["data"][items].as_array().unwrap().len());
+        for item in shown {
+            let key = item["stableLookupKey"].as_str().unwrap();
+            let path = item["path"].as_str().unwrap();
+            assert_eq!(key, format!("{path}::{}", item["name"].as_str().unwrap()));
+            assert!(item.get("doc").is_none() && item.get("range").is_none());
+        }
+        for field in ["documents", "coverage", "provenance", "coverageDiagnostics"] {
+            assert!(compact["data"].get(field).is_none(), "{field}");
+            assert!(full["data"].get(field).is_some(), "{field}");
+        }
+        assert_eq!(
+            compact["data"]["scopeCoverage"],
+            full["data"]["scopeCoverage"]
+        );
+        let mut expected: Vec<String> = shown
+            .iter()
+            .map(|item| {
+                if item["path"].as_str().unwrap().ends_with(".rs") {
+                    "rust".to_owned()
+                } else {
+                    "javascript".to_owned()
+                }
+            })
+            .collect();
+        expected.sort_by_key(|language| language != "rust");
+        expected.dedup();
+        assert_eq!(languages(&full), expected, "{full}");
+        for field in ["warnings", "partial", "truncated", "truncationReason"] {
+            assert_eq!(compact[field], full[field], "{name} {field}");
+        }
     }
     mcp.finish();
 }

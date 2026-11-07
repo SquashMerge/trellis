@@ -982,7 +982,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 10
+                  "const": 11
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1147,6 +1147,10 @@
         "lookupKey": {
           "type": "string",
           "minLength": 1
+        },
+        "compact": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -2312,6 +2316,148 @@
             "path",
             "projection"
           ]
+        },
+        "SymbolCoverage": {
+          "additionalProperties": false,
+          "properties": {
+            "documentPath": {
+              "$ref": "#/$defs/Path"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "observedRoles": {
+              "items": {
+                "$ref": "#/$defs/Role"
+              },
+              "type": "array"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "requested": {
+              "type": "boolean"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "selected": {
+              "type": "boolean"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "state": {
+              "enum": [
+                "notRequested",
+                "omitted",
+                "unsupported",
+                "failed",
+                "partial",
+                "complete"
+              ]
+            },
+            "supportedRoles": {
+              "items": {
+                "$ref": "#/$defs/Role"
+              },
+              "type": "array"
+            },
+            "diagnosticRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "sourceSetId",
+            "documentPath",
+            "revisionId",
+            "requested",
+            "selected",
+            "state",
+            "supportedRoles",
+            "observedRoles",
+            "diagnosticRef"
+          ],
+          "type": "object"
+        },
+        "CompactSymbol": {
+          "additionalProperties": false,
+          "type": "object",
+          "properties": {
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "displayKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            }
+          },
+          "required": [
+            "symbolId",
+            "name",
+            "displayKey",
+            "stableLookupKey",
+            "kind",
+            "role",
+            "path",
+            "lines",
+            "evidenceTier"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2320,49 +2466,84 @@
           "additionalProperties": false,
           "properties": {
             "data": {
-              "additionalProperties": false,
-              "properties": {
-                "coverage": {
-                  "items": {
-                    "$ref": "#/$defs/Coverage"
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "coverage": {
+                      "items": {
+                        "$ref": "#/$defs/SymbolCoverage"
+                      },
+                      "type": "array"
+                    },
+                    "provenance": {
+                      "items": {
+                        "$ref": "#/$defs/Provenance"
+                      },
+                      "type": "array"
+                    },
+                    "scopeCoverage": {
+                      "items": {
+                        "$ref": "#/$defs/LanguageStatus"
+                      },
+                      "maxItems": 4,
+                      "minItems": 0,
+                      "type": "array"
+                    },
+                    "symbols": {
+                      "items": {
+                        "$ref": "#/$defs/Symbol"
+                      },
+                      "type": "array"
+                    },
+                    "documents": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/DocumentRef"
+                      }
+                    },
+                    "coverageDiagnostics": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/Text"
+                      }
+                    }
                   },
-                  "type": "array"
+                  "required": [
+                    "symbols",
+                    "coverage",
+                    "scopeCoverage",
+                    "provenance",
+                    "documents",
+                    "coverageDiagnostics"
+                  ],
+                  "type": "object"
                 },
-                "provenance": {
-                  "items": {
-                    "$ref": "#/$defs/Provenance"
+                {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "symbols": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/CompactSymbol"
+                      }
+                    },
+                    "scopeCoverage": {
+                      "items": {
+                        "$ref": "#/$defs/LanguageStatus"
+                      },
+                      "maxItems": 4,
+                      "minItems": 0,
+                      "type": "array"
+                    }
                   },
-                  "type": "array"
-                },
-                "scopeCoverage": {
-                  "items": {
-                    "$ref": "#/$defs/LanguageStatus"
-                  },
-                  "maxItems": 4,
-                  "minItems": 4,
-                  "type": "array"
-                },
-                "symbols": {
-                  "items": {
-                    "$ref": "#/$defs/Symbol"
-                  },
-                  "type": "array"
-                },
-                "documents": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentRef"
-                  }
+                  "required": [
+                    "symbols",
+                    "scopeCoverage"
+                  ]
                 }
-              },
-              "required": [
-                "symbols",
-                "coverage",
-                "scopeCoverage",
-                "provenance",
-                "documents"
-              ],
-              "type": "object"
+              ]
             },
             "evidenceBasis": {
               "anyOf": [
@@ -2445,7 +2626,7 @@
       ],
       "type": "object"
     },
-    "description": "Find declarations by literal name or ID substring (no regex). Returns symbol IDs for the other tools, with line ranges. Results are native declarations; `scopeCoverage` also reports each language's selected semantic evidence, and `syntaxOnly` appears only for returned languages without it. Callables and types rank before fields, parameters and variables."
+    "description": "Find declarations by literal name or ID substring (no regex). Returns symbol IDs for the other tools, with line ranges. Results are native declarations; `scopeCoverage` also reports each language's selected semantic evidence, and `syntaxOnly` appears only for returned languages without it. Callables and types rank before fields, parameters and variables. `scopeCoverage` lists only the languages of the returned items. `compact:true` returns only each symbol's ID, name, display and stable lookup keys, kind, role, path, lines and evidence tier, plus `scopeCoverage`; it drops documents, coverage and provenance."
   },
   {
     "annotations": {
@@ -2512,6 +2693,10 @@
             "test"
           ],
           "default": "any"
+        },
+        "compact": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -3862,6 +4047,185 @@
             "path",
             "projection"
           ]
+        },
+        "SymbolCoverage": {
+          "additionalProperties": false,
+          "properties": {
+            "documentPath": {
+              "$ref": "#/$defs/Path"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "observedRoles": {
+              "items": {
+                "$ref": "#/$defs/Role"
+              },
+              "type": "array"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "requested": {
+              "type": "boolean"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "selected": {
+              "type": "boolean"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "state": {
+              "enum": [
+                "notRequested",
+                "omitted",
+                "unsupported",
+                "failed",
+                "partial",
+                "complete"
+              ]
+            },
+            "supportedRoles": {
+              "items": {
+                "$ref": "#/$defs/Role"
+              },
+              "type": "array"
+            },
+            "diagnosticRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "sourceSetId",
+            "documentPath",
+            "revisionId",
+            "requested",
+            "selected",
+            "state",
+            "supportedRoles",
+            "observedRoles",
+            "diagnosticRef"
+          ],
+          "type": "object"
+        },
+        "CompactSearchHit": {
+          "additionalProperties": false,
+          "type": "object",
+          "properties": {
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "displayKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "rank": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "matchedBy": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "lexical",
+                  "vector"
+                ]
+              },
+              "minItems": 1,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "oneOf": [
+                {
+                  "const": [
+                    "lexical"
+                  ]
+                },
+                {
+                  "const": [
+                    "vector"
+                  ]
+                },
+                {
+                  "const": [
+                    "lexical",
+                    "vector"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "symbolId",
+            "name",
+            "displayKey",
+            "stableLookupKey",
+            "kind",
+            "role",
+            "path",
+            "lines",
+            "evidenceTier",
+            "rank",
+            "matchedBy"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3870,62 +4234,110 @@
           "additionalProperties": false,
           "properties": {
             "data": {
-              "additionalProperties": false,
-              "properties": {
-                "coverage": {
-                  "items": {
-                    "$ref": "#/$defs/Coverage"
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "coverage": {
+                      "items": {
+                        "$ref": "#/$defs/SymbolCoverage"
+                      },
+                      "type": "array"
+                    },
+                    "provenance": {
+                      "items": {
+                        "$ref": "#/$defs/Provenance"
+                      },
+                      "type": "array"
+                    },
+                    "scopeCoverage": {
+                      "items": {
+                        "$ref": "#/$defs/LanguageStatus"
+                      },
+                      "maxItems": 4,
+                      "minItems": 0,
+                      "type": "array"
+                    },
+                    "documents": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/DocumentRef"
+                      }
+                    },
+                    "hits": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/SearchHit"
+                      }
+                    },
+                    "searchIndex": {
+                      "$ref": "#/$defs/SearchIndexStatus"
+                    },
+                    "role": {
+                      "type": "string",
+                      "enum": [
+                        "any",
+                        "production",
+                        "test"
+                      ]
+                    },
+                    "coverageDiagnostics": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/Text"
+                      }
+                    }
                   },
-                  "type": "array"
+                  "required": [
+                    "hits",
+                    "documents",
+                    "coverage",
+                    "scopeCoverage",
+                    "provenance",
+                    "searchIndex",
+                    "role",
+                    "coverageDiagnostics"
+                  ],
+                  "type": "object"
                 },
-                "provenance": {
-                  "items": {
-                    "$ref": "#/$defs/Provenance"
+                {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "hits": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/CompactSearchHit"
+                      }
+                    },
+                    "scopeCoverage": {
+                      "items": {
+                        "$ref": "#/$defs/LanguageStatus"
+                      },
+                      "maxItems": 4,
+                      "minItems": 0,
+                      "type": "array"
+                    },
+                    "searchIndex": {
+                      "$ref": "#/$defs/SearchIndexStatus"
+                    },
+                    "role": {
+                      "type": "string",
+                      "enum": [
+                        "any",
+                        "production",
+                        "test"
+                      ]
+                    }
                   },
-                  "type": "array"
-                },
-                "scopeCoverage": {
-                  "items": {
-                    "$ref": "#/$defs/LanguageStatus"
-                  },
-                  "maxItems": 4,
-                  "minItems": 4,
-                  "type": "array"
-                },
-                "documents": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentRef"
-                  }
-                },
-                "hits": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/SearchHit"
-                  }
-                },
-                "searchIndex": {
-                  "$ref": "#/$defs/SearchIndexStatus"
-                },
-                "role": {
-                  "type": "string",
-                  "enum": [
-                    "any",
-                    "production",
-                    "test"
+                  "required": [
+                    "hits",
+                    "scopeCoverage",
+                    "searchIndex",
+                    "role"
                   ]
                 }
-              },
-              "required": [
-                "hits",
-                "documents",
-                "coverage",
-                "scopeCoverage",
-                "provenance",
-                "searchIndex",
-                "role"
-              ],
-              "type": "object"
+              ]
             },
             "evidenceBasis": {
               "anyOf": [
@@ -4008,7 +4420,7 @@
       ],
       "type": "object"
     },
-    "description": "Rank declarations for a natural-language or code query (lexical plus local vector search when available). Returns symbol IDs for the other tools. Relevance is not proof; `scopeCoverage` reports each language's selected semantic evidence."
+    "description": "Rank declarations for a natural-language or code query (lexical plus local vector search when available). Returns symbol IDs for the other tools. Relevance is not proof; `scopeCoverage` reports each language's selected semantic evidence. `scopeCoverage` lists only the languages of the returned items. `compact:true` returns only each hit's ID, name, display and stable lookup keys, kind, role, path, lines, evidence tier, rank and arms, plus `scopeCoverage`, `searchIndex` and `role`; it drops documents, coverage and provenance."
   },
   {
     "annotations": {
@@ -13243,6 +13655,17 @@
             },
             "range": {
               "$ref": "#/$defs/Range"
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -13252,7 +13675,8 @@
             "kind",
             "name",
             "lookupKey",
-            "range"
+            "range",
+            "stableLookupKey"
           ],
           "type": "object"
         },
@@ -13547,7 +13971,7 @@
       ],
       "type": "object"
     },
-    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Defaults: depth 2, maxNodes 8, maxCalls 10 with full proofs; `compact:true` keeps node keys, names, paths, edge kinds and resolutions, drops bindings, coverage and provenance, and defaults to maxNodes 50, maxCalls 60. Each distinct semantic basis appears once in `semanticBases`; `responseOmitted` counts nodes and edges cut to fit the response. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead."
+    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Defaults: depth 2, maxNodes 8, maxCalls 10 with full proofs; `compact:true` keeps node keys (with each node's `stableLookupKey`), names, paths, edge kinds and resolutions, drops bindings, coverage and provenance, and defaults to maxNodes 50, maxCalls 60. Each distinct semantic basis appears once in `semanticBases`; `responseOmitted` counts nodes and edges cut to fit the response. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead."
   },
   {
     "annotations": {

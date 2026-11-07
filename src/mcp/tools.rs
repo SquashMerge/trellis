@@ -1099,7 +1099,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":10,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":11,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
@@ -1424,15 +1424,20 @@ mod tests {
             }
         }
     }
-    /// #528: `compact` is an optional boolean on the two call tools only.
+    /// #528, #715: `compact` is an optional boolean on the call tools and on find and
+    /// search (query and lookup-key find alike); other tools reject it.
     #[test]
-    fn compact_is_a_closed_boolean_on_the_call_tools() {
-        for name in [
-            "trellis_outgoing_calls",
-            "trellis_incoming_calls",
-            "trellis_call_graph",
+    fn compact_is_a_closed_boolean_on_the_call_and_symbol_tools() {
+        let lookup = json!({"schemaVersion":1,"lookupKey":"src/a.rs::a"});
+        for (name, base) in [
+            ("trellis_outgoing_calls", good("trellis_outgoing_calls")),
+            ("trellis_incoming_calls", good("trellis_incoming_calls")),
+            ("trellis_call_graph", good("trellis_call_graph")),
+            ("trellis_find_symbols", good("trellis_find_symbols")),
+            ("trellis_find_symbols", lookup),
+            ("trellis_search_symbols", good("trellis_search_symbols")),
         ] {
-            let mut valid = good(name);
+            let mut valid = base;
             for compact in [json!(true), json!(false)] {
                 valid["compact"] = compact;
                 assert_eq!(validate(name, Some(&valid)), Ok(()), "{name}");
@@ -1442,7 +1447,7 @@ mod tests {
                 check(name, &valid, "invalid_request");
             }
         }
-        for name in ["trellis_find_symbols", "trellis_declaration"] {
+        for name in ["trellis_declaration", "trellis_read_source"] {
             let mut other = good(name);
             other["compact"] = json!(true);
             check(name, &other, "invalid_request");
