@@ -123,3 +123,10 @@ Item 5 pinned one rust-analyzer hash, the `aarch64-apple-darwin` binary, so `tre
 | `aarch64-unknown-linux-gnu` | `a0c3f11a153e5d5f12a6de6ceabd2def60c2793293e901a4a045946050456e2f` | `a0fd960a9ab36193ae9ba4310e5f780f6ca38fa86160fae739be4ac541b6d10c` |
 
 A rust-analyzer re-pin now records every target. `scip-java`'s launcher hash stays a known limitation, to verify during the release candidate.
+
+## Amendment 7 (2026-11-07): TypeScript corpus
+
+- **Status:** owner-ratified 2026-11-07 (#683; [Decision 0020](0020-typescript-language.md)).
+
+1. A TypeScript corpus may start as `profile:"draft"` with source, production native captures and annotations, as decision 3 allows for JavaScript. Semantic captures and outcome answers wait for corpus certification.
+2. TypeScript floors equal JavaScript's: ambiguous 20, unresolved 20, type relationships 20, unsupported documents 0, alias role required.
