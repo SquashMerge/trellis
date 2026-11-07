@@ -2661,6 +2661,7 @@ pub fn outgoing(
 /// #665: each distinct semantic basis is emitted once in `data.semanticBases` and proofs
 /// carry `basisRef`, as outgoing and incoming calls do. `compact` drops the proof detail
 /// (see [`compact_graph`]) and is fitted on its own, smaller frame.
+#[allow(clippy::too_many_arguments)]
 pub fn call_graph(
     id: &Value,
     answer: &mut crate::graph_query::GraphAnswer,
