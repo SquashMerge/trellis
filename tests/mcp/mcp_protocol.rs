@@ -793,6 +793,11 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str, home: &P
         envelope["catchingUp"] = actual["catchingUp"].clone();
         assert!(actual["catchingUp"].is_boolean());
         if state == "ready" {
+            // #777: a ready describe projects the admitted head's search
+            // coverage; the missing model decides it, with its reason.
+            envelope["data"]["searchIndex"]["state"] = json!("unavailable");
+            envelope["data"]["searchIndex"]["declarations"] = json!(0);
+            envelope["data"]["searchIndex"]["embedded"] = json!(0);
             let languages = actual["data"]["languages"].as_array().unwrap();
             assert_eq!(languages.len(), 4);
             for (row, language) in languages
@@ -14208,16 +14213,35 @@ async fn mcp_search_reports_building_with_counts_before_owner_builds_new_head() 
     assert_eq!(index["embedded"], 3);
     assert_eq!(index["unavailableReason"], Value::Null);
     pairs.push(search_schema_pair(&complete));
+    // All three surfaces agree once complete: describe and CLI status project
+    // the same state and counts that search reports.
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(4),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1})
+        )
+    )
+    .unwrap();
+    let describe = next_reply(&mut reader);
+    let expected = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"complete","declarations":3,"embedded":3
+    });
+    let described = &describe["result"]["structuredContent"]["data"]["searchIndex"];
+    assert_eq!(described, &expected, "{describe}");
+    for field in ["state", "declarations", "embedded", "unavailableReason"] {
+        assert_eq!(described[field], index[field], "{field}");
+    }
+    pairs.push(json!({"name":"trellis_workspace_describe",
+        "structuredContent":describe["result"]["structuredContent"]}));
     let status = tokio::task::spawn_blocking(move || runtime.cli_status().unwrap())
         .await
         .unwrap();
-    assert_eq!(
-        status["searchIndex"],
-        json!({
-            "backend":"cpu","unavailableReason":null,
-            "state":"complete","declarations":3,"embedded":3
-        })
-    );
+    assert_eq!(status["searchIndex"], expected);
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
