@@ -394,11 +394,14 @@ async fn queued_request_is_durable_and_non_cancellable_during_lock_contention() 
     assert_eq!(code, StatusCode::OK);
     assert_eq!(again, done);
     drop(state);
-    let reopened = Store::open_for_tests(
-        &dir.path().join("state"),
-        std::path::Path::new(store.workspace_root()),
-    )
-    .unwrap();
+    // The router still holds the scheduler, so its worker can still be running
+    // post-job maintenance on this index.
+    let reopened = trellis::testing::retry_admission(|| {
+        Store::open_for_tests(
+            &dir.path().join("state"),
+            std::path::Path::new(store.workspace_root()),
+        )
+    });
     assert_eq!(reopened.request_by_id(id).unwrap().unwrap().state, "done");
 }
 

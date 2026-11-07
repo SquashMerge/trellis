@@ -2104,12 +2104,14 @@ fn rejoined_binding_on_edited_workspace_is_a_stale_boundary_with_its_binding() {
             home.join(".local/share/trellis"),
         )
     };
+    // The CLI's daemon stays up (watcher, semantic catch-up) beside these opens.
     let open = || {
-        Store::open(
-            TopologyRoots::isolated_for_tests(cache.clone(), data.clone()),
-            WorkspaceIdentity::discover(Some(&root), &root).unwrap(),
-        )
-        .unwrap()
+        trellis::testing::retry_admission(|| {
+            Store::open(
+                TopologyRoots::isolated_for_tests(cache.clone(), data.clone()),
+                WorkspaceIdentity::discover(Some(&root), &root)?,
+            )
+        })
     };
     let index_db = TopologyRoots::isolated_for_tests(cache.clone(), data.clone())
         .index_db(&WorkspaceIdentity::discover(Some(&root), &root).unwrap());

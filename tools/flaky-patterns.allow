@@ -67,24 +67,103 @@ store-open tests/semantic/semantic_generated_import.rs inproc -- the in-process 
 store-open tests/semantic/semantic_history.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open tests/semantic/semantic_store.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 
-# store-open, tracking (#720 follow-up): these files also run a Trellis child
-# (a CLI, a re-executed contender) or an in-process scheduler. Each site still
-# needs to be checked for whether that owner can hold admission at the open.
-store-open src/store/live_sqlite_witness_tests.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open src/store/published_admission_tests.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open src/store/sqlite_deleted_witness_tests.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open src/store/topology.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open tests/daemon/requests.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open tests/daemon/watch.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open tests/http/class_diagram_http.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open tests/http/http.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open tests/http/navigation_http.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open tests/index/sqlite_witness.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open tests/mcp/graph_query_store.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open tests/retained_semantic_reimport.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open tests/semantic/proptest_witness_rejoin.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open tests/semantic/semantic_import_typed_errors.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
-store-open tests/semantic/semantic_publication_paths.rs * -- #720 follow-up: runs a Trellis child or scheduler beside its opens; not yet audited per site
+# store-open, audited per site (#755): these files also run a Trellis child,
+# daemon or http::new scheduler somewhere, but none of these opens can meet it.
+store-open src/store/live_sqlite_witness_tests.rs index_fixture -- opens before any child exists; the later child is a raw-SQLite contender that never opens a Store
+store-open src/store/published_admission_tests.rs same_pin_commit_child -- re-executed child; its parent only waits for it to exit
+store-open src/store/sqlite_deleted_witness_tests.rs idle_retirement_defers_sqlite_witness_until_last_managed_connection_closes -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/sqlite_deleted_witness_tests.rs gc_report_releases_witnesses_for_inactive_checkouts -- runs in its own re-executed child on a private state dir; the parent only waits for it
+store-open src/store/sqlite_deleted_witness_tests.rs exclusive_release_closes_only_deleted_index_after_all_sqlite_connections -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/sqlite_deleted_witness_tests.rs aborted_stage_retries_and_successful_recreations_do_not_accumulate_witnesses -- runs in its own re-executed child on a private state dir; the parent only waits for it
+store-open src/store/sqlite_deleted_witness_tests.rs isolated_filesystem_returns_allocated_blocks_only_after_verified_release -- runs in its own re-executed child on a private state dir; the parent only waits for it
+store-open src/store/sqlite_deleted_witness_tests.rs foreign_replacement_stage_refuses_release_and_preserves_foreign_inode -- runs in its own re-executed child on a private state dir; the parent only waits for it
+store-open src/store/topology.rs extra_view_after_readonly_open_before_snapshot_never_attests_gc_or_deletion -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs old_schema_index_is_collected_regardless_of_layout_root_or_age -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs old_schema_report_is_eligible_and_writes_nothing -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs exact_v20_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs stale_v8_extractor_marker_is_refused_without_gc_writes_or_deletion -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs automatic_gc_retries_after_borrowed_witness_is_released -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs gc_lost_guard_restores_suspended_retirement_without_closing_witnesses -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs report_failure_retires_witness_opened_before_sidecar_check -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs automatic_gc_retires_witness_when_recent_candidate_is_skipped -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs automatic_gc_error_retires_index_and_queue_witnesses -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs inspection_retirement_defers_for_live_connection_and_borrower -- opens before its raw-SQLite contender child, which never opens a Store
+store-open src/store/topology.rs inspection_retirement_keeps_witness_if_use_lock_identity_is_lost -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs borrowed_and_live_sqlite_witnesses_skip_at_final_unlink_without_close -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs extant_v0_queue_readers_refuse_incompatible_without_initializing_schema -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs absent_queue_readers_are_existing_only_and_leave_home_bytes_unchanged -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs first_startup_bootstraps_virgin_queue_but_published_missing_queue_is_refused -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs durable_fifo_and_writer_session_fence -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs published_pin_before_completion_crash_child -- re-executed child; its parent only waits for it to exit
+store-open tests/daemon/requests.rs real_process_death_after_request_publish_reclaims_without_false_done -- opens before spawning the crash child and after it has exited
+store-open tests/daemon/requests.rs daemon_restart_reclaims_running_head_before_later_queued_row -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs request_rejects_relative_external_input_before_ack -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs request_rejects_symlink_to_captured_workspace -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs first_daemon_activation_reconciles_then_claims_fifo_head -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs concurrent_first_queue_open_is_atomic_and_fifo -- opens before its two enqueue threads start
+store-open tests/daemon/requests.rs incompatible_or_corrupt_existing_queue_never_gets_fresh_ack -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs hot_journal_rolls_back_before_queue_identity_and_ack -- opens before its raw-SQLite journal child, which never opens a Store
+store-open tests/daemon/requests.rs old_holder_fails_queued_and_running_rows_after_root_is_moved -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs replacement_activation_settles_old_root_before_startup_and_new_fifo -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs unchanged_root_with_changed_workspace_marker_cannot_fail_queue_rows -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs replacement_rechecks_old_index_under_ex_before_any_rename -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs replacement_queue_write_refusal_preserves_old_index_before_ex -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs replacement_refuses_foreign_index_marker_and_sidecars_without_queue_transition -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs replacement_refuses_missing_or_foreign_queue_without_swapping_index -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs root_failure_commit_error_never_authorizes_index_swap -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs live_old_holder_rejects_replaced_same_key_queue_inode -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs replacement_writer_never_recreates_deleted_accepted_queue_on_enqueue -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs unchanged_startup_keeps_head_and_adds_no_rows -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs claimed_unchanged_fifo_completes_done_without_new_revision -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs pin_taken_before_noop_request_still_reads_and_cas_holds -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs changed_claimed_source_uses_local_publication_not_unchanged -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs claimed_unchanged_guard_failure_never_acks_or_changes_selected_pair -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs changed_capture_input_and_options_take_full_claimed_fallback -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/daemon/requests.rs executable_drift_claim_child -- re-executed child; its parent only waits for it to exit
+store-open tests/daemon/requests.rs asserted_claim_under_real_executable_drift -- opens only after the drift child has exited
+store-open tests/daemon/requests.rs maintenance_probe_external_child -- re-executed child; its parent waits on it over a pipe and holds only fixed, ordered locks
+store-open tests/daemon/requests.rs maintenance_probe_virgin_blocks_first_publication_and_v0_is_unknown -- opens before each probe child starts or after it exits
+store-open tests/daemon/requests.rs maintenance_probe_external_fifo_busy_and_inode_replacement -- opens before any probe child starts
+store-open tests/daemon/requests.rs maintenance_probe_rejects_wal_with_and_without_sidecars_without_mutation -- opens before its raw-SQLite probe child starts
+store-open tests/daemon/requests.rs maintenance_probe_detects_uncommitted_journal_after_initial_guard -- opens before its raw-SQLite probe child starts
+store-open tests/daemon/watch.rs leader_reconciles_edit_without_explicit_request -- watcher work runs on the test thread; no Trellis child, daemon or scheduler
+store-open tests/daemon/watch.rs watcher_skips_an_unreadable_source_and_recovers_when_it_changes_back -- watcher work runs on the test thread; no Trellis child, daemon or scheduler
+store-open tests/daemon/watch.rs delayed_snapshot_does_not_publish_after_pre_cutoff_edit -- watcher work runs on the test thread; no Trellis child, daemon or scheduler
+store-open tests/daemon/watch.rs post_cutoff_hint_stays_pending_after_first_publication -- watcher work runs on the test thread; no Trellis child, daemon or scheduler
+store-open tests/daemon/watch.rs failed_capture_keeps_dirty_generation_for_successful_retry -- watcher work runs on the test thread; no Trellis child, daemon or scheduler
+store-open tests/daemon/watch.rs edits_creates_renames_atomic_saves_and_deletes_match_cold_full -- watcher work runs on the test thread; no Trellis child, daemon or scheduler
+store-open tests/daemon/watch.rs empty_checkout_explicit_request_completes_done_at_unchanged_head -- watcher work runs on the test thread; no Trellis child, daemon or scheduler
+store-open tests/daemon/watch.rs periodic_inventory_recovers_unhinted_source_and_absent_ignore_input -- watcher work runs on the test thread; no Trellis child, daemon or scheduler
+store-open tests/daemon/watch.rs moved_root_stops_old_work_and_new_spelling_has_distinct_writer -- watcher work runs on the test thread; no Trellis child, daemon or scheduler
+store-open tests/daemon/watch.rs daemon_root_loss_busy_transition_retains_resources_until_terminal_commit -- sync test: without a Tokio runtime http::new starts no worker, and every tick is forced on the test thread
+store-open tests/daemon/watch.rs accepted_watcher_intent_before_debounce_preempts_writer_unit -- opens before its maintenance thread starts
+store-open tests/daemon/watch.rs failed_ack_keeps_periodic_inventory_due_until_certified_full_ack -- watcher work runs on the test thread; no Trellis child, daemon or scheduler
+store-open tests/http/class_diagram_http.rs incompatible_index_refuses_without_migrating_durable_data -- sync test: http::new started no worker, and the router is dropped before this open
+store-open tests/http/http.rs queued_request_is_durable_and_non_cancellable_during_lock_contention -- its first open precedes http::new; the reopen beside the worker uses retry_admission
+store-open tests/http/http.rs corrupt_recovery_fixture -- both opens precede http::new
+store-open tests/http/http.rs gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/http/navigation_http.rs cached_java_source_budget_and_unproven_member_shape_do_not_guess -- no request here starts the checkout worker (no index POST or retained session), so no scheduler thread runs
+store-open tests/http/navigation_http.rs retained_navigation_uses_selected_full_rewrite_source_nodes_and_class_projection -- no request here starts the checkout worker (no index POST or retained session), so no scheduler thread runs
+store-open tests/index/sqlite_witness.rs live_index_writer_survives_transient_verification_and_status -- opens before its raw-SQLite contender child, which never opens a Store
+store-open tests/index/sqlite_witness.rs live_request_writer_survives_queue_worker_reads -- opens before its raw-SQLite contender child, which never opens a Store
+store-open tests/index/sqlite_witness.rs corrupt_index_recreation_child -- runs in its own re-executed child on a private state dir; the parent only waits for it
+store-open tests/index/sqlite_witness.rs gc_releases_only_deleted_candidate_witnesses_child -- runs in its own re-executed child on a private state dir; the parent only waits for it
+store-open tests/index/sqlite_witness.rs gc_fault_after_first_unlink_reports_partial_failure_not_success -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/index/sqlite_witness.rs gc_fault_after_parent_sync_reports_error_before_last_lock_removal -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/mcp/graph_query_store.rs sequence_zero_and_multiple_producers_are_syntax_only -- in-process Publisher fixture; no Trellis child, daemon or scheduler
+store-open tests/mcp/graph_query_store.rs sequence_corrupt_binding_fails_without_partial_result -- in-process Publisher fixture; no Trellis child, daemon or scheduler
+store-open tests/mcp/graph_query_store.rs published_freshness_is_trusted_not_recomputed -- in-process Publisher fixture; no Trellis child, daemon or scheduler
+store-open tests/mcp/graph_query_store.rs corrupt_stored_row_is_typed_without_partial_result -- in-process Publisher fixture; no Trellis child, daemon or scheduler
+store-open tests/mcp/graph_query_store.rs in_scope_missing_coverage_row_is_typed_corruption -- in-process Publisher fixture; no Trellis child, daemon or scheduler
+store-open tests/mcp/graph_query_store.rs non_ambiguous_multi_match_for_one_call_stays_typed_corruption -- in-process Publisher fixture; no Trellis child, daemon or scheduler
+store-open tests/mcp/graph_query_store.rs corrupt_stored_coverage_reason_count_schedules_a_rebuild -- in-process Publisher fixture; no Trellis child, daemon or scheduler
+store-open tests/retained_semantic_reimport.rs ordinary_retained_edit -- opens only after stop_daemon waits for the daemon to exit and release its election lock
+store-open tests/semantic/proptest_witness_rejoin.rs world -- in-process fixture on a fresh state dir, inside the re-executed child
+store-open tests/semantic/semantic_import_typed_errors.rs new -- opens a fresh home before the first CLI index starts a daemon
+store-open tests/semantic/semantic_publication_paths.rs setup -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/semantic/semantic_publication_paths.rs explicit_producer_without_applicable_documents_survives_pins_and_supplied_refresh -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/semantic/semantic_publication_paths.rs semantic_executable_drift_child -- re-executed child; its parent only waits for it to exit
+store-open tests/semantic/semantic_publication_paths.rs rebuilt_executable_retains_semantic_head_context_without_reusing_evidence -- opens before spawning the drift child and after it has exited
 
 # global-counter
 global-counter src/http.rs * -- #700: counts only the browser status reads' own blocking threads, never other readers

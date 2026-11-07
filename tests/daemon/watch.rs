@@ -666,8 +666,14 @@ fn daemon_watcher_keeps_cli_file_cap_and_selected_source_after_edit() {
                 )
             };
             let roots = TopologyRoots::isolated_for_tests(cache, data);
-            let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-            let store = Store::open(roots, identity).unwrap();
+            // The daemon closes its socket before it exits and drops its index
+            // admission, so this open can meet its shutdown.
+            let store = trellis::testing::retry_admission(|| {
+                Store::open(
+                    roots.clone(),
+                    WorkspaceIdentity::discover(Some(&root), &root)?,
+                )
+            });
             assert_eq!(
                 store.graph().unwrap().files[0].text,
                 "function after() { return 2; }\n"
