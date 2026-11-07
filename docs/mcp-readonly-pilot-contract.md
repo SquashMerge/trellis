@@ -365,6 +365,41 @@ incoming `scopeCoverage` and the lookup alternatives other tools return keep the
   | find by lookup key `src/mcp/projection.rs::compact_graph` | 4,080 (1) | 2,949 (1) | 1,298 (1) |
   | compact call graph `src/http/worker.rs::DaemonState::enqueue_index` | 6,924 (5 nodes) | n/a | 7,260 (5 nodes, all keyed) |
 
+## Amendment (#770): a bounded prompt reference view
+
+**Status: proposed in #770, awaiting owner ratification.** `trellis_propose_layers`
+inlined the whole `references:v2` result, so on any non-trivial checkout the prompt
+exceeded the 65,536-byte frame and failed with `response_too_large`. This section wins
+over the [proposal prompt](#one-no-argument-proposal-prompt) and
+[rules proposal workflow](rules.md#proposal-workflow) text only for what "structural
+references" means inside the prompt. The tools, their pages, the pin, the rules bytes and
+descriptor, the atomic failures and the frame are unchanged.
+
+- `payload.references` is a summary of the pinned references result. It keeps
+  `referencesVersion`, `evidenceTier`, `semanticComplete`, `semanticProducers`,
+  `partial`, `counts` and `limitations` as they are, and adds
+  `totals:{productionEdges,productionSites,testEdges,testSites,externalPackages,partialFiles}`.
+- Four groups, each `{rows,total,omitted}`:
+  - `directories.production` and `directories.tests` hold
+    `{source,target,sites,filePairs}`, with native edges summed by
+    source and target directory. A file's directory is its path up to the last slash,
+    or `.` at the root.
+  - `packages.production` holds `{language,package,standardLibrary,sites,filePairs}`,
+    with production package edges summed by package identity.
+  - `filePairs.production` holds native production edges as
+    `{source:{language,path},target:{language,path},sites}`. These are the endpoints of
+    a `$layers` exception.
+- Each group is ordered by `sites` descending, then by key. They are filled in the order
+  listed above. Each keeps the longest prefix whose rows fit the complete frame after the
+  instructions, rules bytes, pin and envelope; `rows.length + omitted = total`. The
+  result is deterministic for one pin and rules text.
+- Site samples, module and package descriptors, unresolved sites and partial files are
+  counted, not listed. The server instructions name `trellis_references` (with
+  `expectedBasis`, `paths` and `offset`) and `trellis_rules_check` /
+  `trellis_rules_explain` for detail.
+- Rules bytes are never clipped. If the fixed part alone does not fit, the prompt still
+  fails atomically with `response_too_large`.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)
@@ -784,7 +819,8 @@ complete-frame cap applies, not the catalog cap.
 
 Prompt content separates server-authored task instructions from untrusted
 repository data. It supplies the verified checkout, one code pin, sampled
-`catchingUp`, structural references/limitations and production/test split; it also
+`catchingUp`, structural references/limitations and production/test split (as the
+bounded summary of [Amendment (#770)](#amendment-770-a-bounded-prompt-reference-view)); it also
 supplies current exact rules bytes and the separate checkout-config descriptor,
 or explicit absence. Missing rules permits a new proposal; malformed rules fails
 atomically, just as check/explain do. The index pin does not identify current

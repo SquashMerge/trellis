@@ -11,6 +11,7 @@ const names = [
   'trellis_read_source', 'trellis_call_graph', 'trellis_references',
   'trellis_rules_check', 'trellis_rules_explain',
 ];
+const promptName = 'trellis_propose_layers';
 const callableKinds = new Set(['function', 'method', 'constructor']);
 const failureCodes = new Set(['invalid_request', 'range_too_large', 'unsupported_encoding',
   'revision_conflict', 'index_not_ready', 'not_found', 'too_many_requests', 'deadline_exceeded',
@@ -24,6 +25,7 @@ function dependencies() {
     Client: require('@modelcontextprotocol/sdk/client/index.js').Client,
     StdioClientTransport: require('@modelcontextprotocol/sdk/client/stdio.js').StdioClientTransport,
     CallToolResultSchema: require('@modelcontextprotocol/sdk/types.js').CallToolResultSchema,
+    GetPromptResultSchema: require('@modelcontextprotocol/sdk/types.js').GetPromptResultSchema,
     Ajv2020: require('ajv/dist/2020.js').default,
   };
 }
@@ -123,6 +125,34 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
       row.elapsedMs = Math.round((performance.now() - started) * 100) / 100;
     }
   }
+  // #770: the no-argument proposal prompt must fit the frame on a real checkout.
+  async function prompt() {
+    const started = performance.now();
+    const row = {tool: promptName, kind: 'prompt', status: 'fail', reason: 'transport_error', elapsedMs: 0};
+    results.push(row);
+    try {
+      const result = await client.request({method: 'prompts/get', params: {name: promptName, arguments: {}}},
+        deps.GetPromptResultSchema);
+      row.resultBytes = Buffer.byteLength(JSON.stringify(result));
+      if (typeof result.messages?.[0]?.content?.text !== 'string') {
+        row.reason = 'prompt_shape_invalid';
+      } else if (row.resultBytes > 65_536) {
+        row.reason = 'response_too_large';
+      } else {
+        row.status = 'pass';
+        delete row.reason;
+      }
+    } catch (error) {
+      if (error?.code === -32001) row.reason = 'client_timeout';
+      if (error?.code === -32603) {
+        row.reason = 'prompt_error';
+        const code = error.data?.code;
+        row.code = failureCodes.has(code) ? code : 'other';
+      }
+    } finally {
+      row.elapsedMs = Math.round((performance.now() - started) * 100) / 100;
+    }
+  }
   const describe = await call('trellis_workspace_describe', {});
   const basis = describe?.evidenceBasis;
   const pin = basis ? {expectedBasis: basis} : {};
@@ -196,6 +226,7 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
   } else {
     missing('trellis_rules_explain', 'missing_rule_instance');
   }
+  await prompt();
   return {ok: results.length > 0 && results.every(row => row.status === 'pass'),
     catalogTools: tools.length, calls, distinctToolsCalled: called.size, semanticCapabilities,
     blockedTools: [...catalog.keys()].filter(name => !called.has(name)).length, results};

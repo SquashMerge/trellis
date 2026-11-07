@@ -884,7 +884,9 @@ Its static list is workspace-independent; get uses the same evidence admission,
 deadline, cancellation and final-root lifecycle as tools. It supplies server task
 instructions separately from untrusted repository data: the pinned structural
 reference view, limitations and production/test split, plus current exact rules
-bytes/digest or explicit absence.
+bytes/digest or explicit absence. The reference view is a bounded summary: directory
+and file-pair edges with counts, the largest that fit, and exact omitted counts
+([MCP amendment #770](mcp-readonly-pilot-contract.md#amendment-770-a-bounded-prompt-reference-view)).
 
 Ask the agent for integer layer orders, explicit peer/shared policy choices,
 placement justifications, exact reviewed baseline exceptions and a `rules.toml`
