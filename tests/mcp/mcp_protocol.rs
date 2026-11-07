@@ -387,6 +387,11 @@ impl Peer {
         raw
     }
     fn finish(mut self) -> (std::process::ExitStatus, String) {
+        self.stop()
+    }
+    /// Close stdin, stop this HOME's daemon and reap the MCP child, keeping the Peer (and so
+    /// its HOME) alive for the caller.
+    fn stop(&mut self) -> (std::process::ExitStatus, String) {
         self.stdin.take();
         stop_fixture_daemon(self._home.path());
         let (status, expired) = bounded_group_wait(&mut self.child);
@@ -396,16 +401,16 @@ impl Peer {
         (status, stderr)
     }
     /// [`Peer::finish`], asserting the MCP child succeeded. A failure carries the child's
-    /// stderr and the tail of the daemon stderr it kept.
+    /// stderr and the tail of the daemon stderr it kept, read while HOME still exists.
     #[track_caller]
-    fn assert_success(self, context: &str) {
-        let daemon = self._home.path().join("daemon-stderr.log");
-        let (status, stderr) = self.finish();
+    fn assert_success(mut self, context: &str) {
+        let (status, stderr) = self.stop();
         let output = std::process::Output {
             status,
             stdout: Vec::new(),
             stderr: stderr.into_bytes(),
         };
+        let daemon = self._home.path().join("daemon-stderr.log");
         crate::child::assert_cli_success_with(&output, context, Some(&daemon));
     }
 }
@@ -420,6 +425,30 @@ impl Drop for Peer {
             let _ = self.child.wait();
         }
     }
+}
+
+// #744 review: a failed peer's message carries its daemon stderr tail, read while the
+// peer's HOME still exists. A successful exit never reads it, so the peer is killed here.
+#[test]
+fn failed_peer_message_carries_the_daemon_stderr_tail() {
+    let peer = Peer::start(None);
+    let line = "fixture daemon stderr line 7f3a";
+    fs::write(
+        peer._home.path().join("daemon-stderr.log"),
+        format!("{line}\n"),
+    )
+    .unwrap();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        peer.assert_success("forced peer failure")
+    }))
+    .expect_err("a killed peer is a failure");
+    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        message.contains("forced peer failure: child failed"),
+        "{message}"
+    );
+    assert!(message.contains(line), "{message}");
 }
 
 #[test]
