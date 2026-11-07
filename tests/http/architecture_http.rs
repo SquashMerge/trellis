@@ -156,22 +156,10 @@ async fn fixture_with_bytes(
         .unwrap();
     registry.attach_launch(1, &identity).unwrap();
     let runtime = registry.activate(&identity.root_key).unwrap();
-    {
-        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-            loop {
-                if let Ok((response, catching_up)) = runtime.evidence_response()
-                    && response.status().is_ok()
-                    && response.finish(()).is_ok()
-                    && !catching_up
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
+    runtime
+        .settled_for_tests(None)
         .await
-        .unwrap();
-    }
+        .unwrap_or_else(|error| panic!("{error}"));
     let browser = ProvisionedBrowser::new(
         Arc::new(tokio::sync::Mutex::new(registry)),
         TOKEN.into(),

@@ -1122,6 +1122,10 @@ fn worker_loop_with_wait(
                 Some(state.failed_step_retry())
             }
         };
+        // This iteration's publications (FIFO drained, watcher hint
+        // acknowledged, S target cleared, a maintenance unit) wake state
+        // waiters, such as the test-support settled wait (#720).
+        state.note_state_change();
     }
 }
 

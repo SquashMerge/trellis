@@ -22,6 +22,11 @@ pub const DAEMON_IDLE_DELAY: Duration = Duration::from_secs(30 * 60);
 /// handles); activation waits this long for it before reporting not ready.
 const RETIRED_WAIT: Duration = Duration::from_secs(5);
 
+// The settled wait reads published state only and installs no hooks, so tests
+// built without test-support use it too (#720).
+mod settled;
+pub use settled::{NotSettled, SettleBusy};
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct LifecycleTick {
     pub released: Vec<String>,

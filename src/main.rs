@@ -38,6 +38,10 @@ enum Command {
     #[cfg(feature = "test-support")]
     #[command(hide = true)]
     NavigationFixture(NavigationFixtureArgs),
+    /// Wait until a checkout's watcher, FIFO and semantic catch-up are idle (#720).
+    #[cfg(feature = "test-support")]
+    #[command(hide = true)]
+    TestSettled(TestSettledArgs),
     /// Build and atomically publish a complete index. Does not execute repository code.
     Index(IndexArgs),
     /// Explicitly import pinned SCIP evidence into the selected native index.
@@ -83,6 +87,15 @@ struct NativeCaptureArgs {
     source_set: Option<String>,
     #[arg(long)]
     revision: Option<String>,
+}
+#[cfg(feature = "test-support")]
+#[derive(Args)]
+struct TestSettledArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    /// The published head to settle at, as `trellis status` prints `revision`.
+    #[arg(long)]
+    at: Option<String>,
 }
 #[cfg(feature = "test-support")]
 #[derive(Args)]
@@ -438,6 +451,8 @@ async fn main() -> Result<()> {
             )?)?;
         }
         Command::Daemon(_) | Command::Serve(_) | Command::GitRead(_) => unreachable!(),
+        #[cfg(feature = "test-support")]
+        command @ Command::TestSettled(_) => dispatch_cli(&command)?,
         Command::Mcp(args) => {
             let (_, identity) = args.resolve_unattached()?;
             let socket = socket_path()?;
@@ -804,6 +819,13 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
     let cli_bound = CLI_REPLY_BOUND;
     #[cfg(feature = "test-support")]
     let cli_bound = metrics_test_duration("TRELLIS_TEST_CLI_REPLY_BOUND_MS").unwrap_or(cli_bound);
+    // The settled wait's own bound is the hang backstop.
+    #[cfg(feature = "test-support")]
+    let cli_bound = if request.operation == "settled_for_tests" {
+        trellis::testing::HANG_BACKSTOP + Duration::from_secs(30)
+    } else {
+        cli_bound
+    };
     let reply_bound = if request.operation == "producer_run" {
         // The run's own timeout, plus the termination grace and the import's wait.
         let timeout_secs = request.payload["args"]["limits"]["timeoutSecs"]
@@ -873,6 +895,21 @@ fn producer_plan_payload(args: &ProducerPlanArgs) -> Result<serde_json::Value> {
 fn dispatch_cli(command: &Command) -> Result<()> {
     let (operation, workspace, mut payload, read_only) = match command {
         Command::Status(args) => ("status", args, serde_json::json!({}), true),
+        #[cfg(feature = "test-support")]
+        Command::TestSettled(args) => {
+            let at = args
+                .at
+                .as_deref()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .transpose()
+                .context("invalid_argument: --at is not a revision")?;
+            (
+                "settled_for_tests",
+                &args.workspace,
+                serde_json::json!({ "at": at }),
+                true,
+            )
+        }
         Command::Rules(RulesArgs {
             command: RulesCommand::Check(args),
         }) => (
@@ -2200,6 +2237,9 @@ fn dispatch_connection(
             metrics_work
         } else if architecture {
             CLI_ARCHITECTURE_WAIT
+        } else if request.operation == "settled_for_tests" {
+            // Only activation contention shares this; the wait has its own bound.
+            trellis::testing::HANG_BACKSTOP
         } else {
             CLI_READ_WAIT
         };
@@ -2276,6 +2316,7 @@ fn dispatch_connection(
                     | "producer_pickup"
                     | "producer_run"
                     | "producer_cancel"
+                    | "settled_for_tests"
             ),
             "unknown daemon operation"
         );
@@ -2291,7 +2332,7 @@ fn dispatch_connection(
         };
         let identity = if matches!(
             request.operation.as_str(),
-            "status" | "producer_plan" | "producer_status"
+            "status" | "producer_plan" | "producer_status" | "settled_for_tests"
         ) {
             identity.attach_existing_marker_readonly()?
         } else {
@@ -2352,6 +2393,14 @@ fn dispatch_connection(
             let state_version = checkout.state_version();
             let selected = match request.operation.as_str() {
                 "status" => checkout.cli_status(),
+                #[cfg(feature = "test-support")]
+                "settled_for_tests" => (|| {
+                    let at: Option<trellis::model::IndexPin> =
+                        serde_json::from_value(args["at"].clone())
+                            .context("invalid_argument: at is not a revision")?;
+                    let pin = checkout.await_settled_for_tests(at)?;
+                    Ok(serde_json::json!({ "revision": pin }))
+                })(),
                 "producer_plan" => checkout.cli_producer_plan(args),
                 "producer_status" => checkout.cli_producer_status(args),
                 "producer_pickup" => checkout.cli_producer_pickup(args),

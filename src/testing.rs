@@ -3,6 +3,32 @@
 //! backstop. Performance is measured and gated separately. A test that needs
 //! progress waits for it; a test that needs ordering or non-blocking behavior
 //! proves it with hooks, not elapsed time.
+//!
+//! # Settled, or the snapshot a reply rendered from (#720)
+//!
+//! Publication is not synchronous with a request. After a request returns, the
+//! watcher and semantic catch-up (S) can still advance the pin or flip the
+//! advisory `catchingUp`, and a restarted daemon may still be in startup
+//! reconciliation. Two separately sampled readings of a checkout can differ.
+//!
+//! - **Wait for settled** when a test needs the checkout at rest: before it
+//!   compares two separate reads, before it reads after a daemon restart, or
+//!   before it asserts that some work left nothing behind. Settled means startup
+//!   reconciliation has committed, and the watcher, FIFO and S are idle at one
+//!   published head. In process, call
+//!   `CheckoutRuntime::await_settled_for_tests` (`settled_for_tests` from async
+//!   code). Against a subprocess daemon, run
+//!   the hidden `trellis test-settled --workspace <root> [--at <revision>]`
+//!   (`settled` in `tests/support/child.rs`). Both wait on the runtime's
+//!   published state version, never sleep, and are bounded only by
+//!   [`HANG_BACKSTOP`]. A timeout names the component that was still busy.
+//! - **Compare against the rendered snapshot** when a test checks one reply, or
+//!   one page, for consistency: take the revision the reply itself reports and
+//!   assert against that, not against a later status read (#697, #698). This
+//!   needs no wait, and stays correct while the checkout keeps moving.
+//!
+//! Settled describes the moment it was sampled: work a test starts after it
+//! returns, or a late watcher event, can make the checkout busy again.
 
 use std::time::{Duration, Instant};
 

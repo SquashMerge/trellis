@@ -2694,19 +2694,10 @@ async fn browser_request_pins_one_configuration_version() {
         checked.attach_launch(7, &identity).unwrap();
         checked.activate(&identity.root_key).unwrap()
     };
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            if let Ok((response, catching_up)) = runtime.evidence_response()
-                && response.finish(()).is_ok()
-                && !catching_up
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
     let browser = ProvisionedBrowser::new(
         registry.clone(),
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
@@ -2791,19 +2782,10 @@ async fn dependency_refresh_is_fenced_to_its_configuration_version() {
         checked.attach_launch(7, &identity).unwrap();
         checked.activate(&identity.root_key).unwrap()
     };
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            if let Ok((response, catching_up)) = runtime.evidence_response()
-                && response.finish(()).is_ok()
-                && !catching_up
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
     let browser = ProvisionedBrowser::new(
         registry.clone(),
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),

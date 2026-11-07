@@ -2216,6 +2216,18 @@ pub fn establish_serving_session(
         return Ok(session);
     }
     let session = store.writer_session()?;
+    // Hold startup reconciliation where a loaded host delays it: this session
+    // has latched public reads and has not yet published (#736). A missing
+    // listener skips the hold, so a later startup in the same daemon runs on.
+    #[cfg(feature = "test-support")]
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_STARTUP_LATCHED_SOCKET")
+        && let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path)
+    {
+        use std::io::{Read, Write};
+        let _ = stream.set_read_timeout(Some(crate::testing::HANG_BACKSTOP));
+        let _ = stream.write_all(&[1]);
+        let _ = stream.read_exact(&mut [0]);
+    }
     let publication = store.enter_publication(cancel, std::time::Duration::from_millis(250))?;
     let expected = store.publication_index_baseline()?;
     let options = match explicit_options {

@@ -123,6 +123,26 @@ pub fn run_cli(command: &mut Command, context: impl Display) -> Output {
     output
 }
 
+/// Waits until the daemon `command` reaches has settled the checkout at `workspace`: startup
+/// reconciliation committed, and its watcher, FIFO and semantic catch-up idle (#720). Starts
+/// the daemon if none runs. `command` is a test-support `trellis` command with the test's
+/// environment and no arguments. With `at`, a revision as `trellis status` prints it, the
+/// checkout must settle at that published head. Returns the settled revision.
+///
+/// The wait is on the daemon's published state, bounded only by the hang backstop; a failure
+/// names the component still busy. See `trellis::testing` for when to use it.
+#[track_caller]
+pub fn settled(mut command: Command, workspace: &Path, at: Option<&Value>) -> Value {
+    command
+        .arg("test-settled")
+        .arg("--workspace")
+        .arg(workspace);
+    if let Some(at) = at {
+        command.arg("--at").arg(at.to_string());
+    }
+    run_cli_json(&mut command, "settled")["revision"].clone()
+}
+
 /// [`run_cli`], returning the child's JSON reply.
 #[track_caller]
 pub fn run_cli_json(command: &mut Command, context: impl Display) -> Value {

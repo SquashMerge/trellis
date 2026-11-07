@@ -16,20 +16,12 @@ fn identity(root: &Path) -> WorkspaceIdentity {
 fn roots(state: &Path) -> TopologyRoots {
     TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"))
 }
-async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            if let Ok((response, catching_up)) = runtime.evidence_response() {
-                let finished = response.finish(()).is_ok();
-                if finished && !catching_up {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("H did not finish: {:?}", runtime.reconciliation_error()));
+/// H committed and the watcher, FIFO and S are idle at the published head (#720).
+async fn ready(runtime: &std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>) {
+    runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("H did not finish: {error}"));
 }
 
 async fn release_when_idle(registry: &mut CheckoutRegistry, key: &str) {
@@ -3737,4 +3729,76 @@ async fn root_loss_between_cli_queue_check_and_shared_use_returns_root_changed()
         .unwrap()
         .expect_err("old-root request cannot succeed");
     assert!(error.to_string().starts_with("root_changed"), "{error:#}");
+}
+
+/// The settled wait (#720): one sample names the busy component; a wait returns once startup
+/// reconciliation commits and a watcher hint is published, and refuses another head.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn settled_wait_names_the_busy_component_and_waits_for_the_owner() {
+    use trellis::daemon::registry::{NotSettled, SettleBusy};
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function before() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.lock().unwrap().recv().unwrap();
+    }));
+    let runtime = registry.activate(&id.root_key).unwrap();
+    tokio::task::spawn_blocking(move || {
+        entered_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("startup reconciliation did not reach its hook")
+    })
+    .await
+    .unwrap();
+
+    // Startup is held: a single sample names it.
+    match runtime.sample_settled_for_tests(None) {
+        Err(NotSettled::Hang(SettleBusy::Startup { .. })) => {}
+        other => panic!("expected startup to be busy: {other:?}"),
+    }
+    let waiting = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.settled_for_tests(None).await })
+    };
+    resume_tx.send(()).unwrap();
+    let head = waiting.await.unwrap().unwrap();
+    assert_eq!(runtime.sample_settled_for_tests(Some(head)), Ok(head));
+    let other = trellis::model::IndexPin {
+        index_revision: head.index_revision + 1,
+        ..head
+    };
+    assert_eq!(
+        runtime.sample_settled_for_tests(Some(other)),
+        Err(NotSettled::OtherHead {
+            expected: other,
+            published: head,
+        })
+    );
+
+    // A source change the worker has not yet taken keeps the watcher busy.
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let worker = scheduler.hold_worker_for_tests();
+    fs::write(checkout.join("a.js"), "function after() {}\n").unwrap();
+    let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Content,
+    )))
+    .add_path(checkout.join("a.js"));
+    assert!(scheduler.submit_watch_event_for_tests(Ok(event)));
+    assert_eq!(
+        runtime.sample_settled_for_tests(None),
+        Err(NotSettled::Hang(SettleBusy::Watcher))
+    );
+    drop(worker);
+    let moved = runtime.settled_for_tests(None).await.unwrap();
+    assert_eq!(moved.index_generation, head.index_generation);
+    assert!(moved.index_revision > head.index_revision, "{moved:?}");
 }
