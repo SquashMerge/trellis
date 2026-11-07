@@ -63,7 +63,7 @@ store-open tests/index/schema13_recreate.rs * -- no daemon, registry or Trellis 
 store-open tests/index/schema14_recreate.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open tests/mcp/navigation_resolved.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open tests/producer/producer_e2e.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
-store-open tests/semantic/semantic_generated_import.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open tests/semantic/semantic_generated_import.rs inproc -- the in-process fixture has no daemon, registry or Trellis child; its own code is the only index owner
 store-open tests/semantic/semantic_history.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open tests/semantic/semantic_store.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 
