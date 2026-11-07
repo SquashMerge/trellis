@@ -1458,8 +1458,9 @@ fn cold_cli_commands_start_and_reuse_daemon() {
     assert!(!symbols["data"]["items"].as_array().unwrap().is_empty());
 }
 
-/// #586: an ignore file over the 16 MiB config input cap no longer fails the index. Its
-/// directory isn't indexed, status names it with a typed diagnostic, and the rest indexes.
+/// #586: an ignore file over the 16 MiB config input cap no longer fails the index. It is
+/// not read and is treated as absent (owner ruling 2026-11-07): its directory indexes under
+/// the remaining rules, and status names it with a typed diagnostic.
 #[test]
 fn an_oversized_ignore_file_is_a_diagnostic_not_a_failed_index() {
     let temp = short_temp();
@@ -1469,9 +1470,13 @@ fn an_oversized_ignore_file_is_a_diagnostic_not_a_failed_index() {
     let root = checkout(temp.path(), "ignored");
     let sub = root.join("generated");
     fs::create_dir(&sub).unwrap();
-    fs::write(sub.join("hidden.js"), "function hiddenSymbol() {}\n").unwrap();
+    fs::write(sub.join("kept.js"), "function keptSymbol() {}\n").unwrap();
+    fs::write(sub.join("excluded.js"), "function excludedSymbol() {}\n").unwrap();
+    fs::write(root.join(".gitignore"), "excluded.js\n").unwrap();
     let cap = trellis::skipped_config::CONFIG_INPUT_MAX_BYTES as usize;
-    fs::write(sub.join(".gitignore"), vec![b'#'; cap + 1]).unwrap();
+    let mut oversized = b"kept.js\n".to_vec();
+    oversized.resize(cap + 1, b'#');
+    fs::write(sub.join(".gitignore"), oversized).unwrap();
     let output = cli(&home)
         .arg("index")
         .arg("--workspace")
@@ -1501,7 +1506,9 @@ fn an_oversized_ignore_file_is_a_diagnostic_not_a_failed_index() {
             .len()
     };
     assert!(symbols("ignoredSymbol") > 0);
-    assert_eq!(symbols("hiddenSymbol"), 0);
+    // The unread file's rule is not applied; the parent's rule still is.
+    assert!(symbols("keptSymbol") > 0);
+    assert_eq!(symbols("excludedSymbol"), 0);
 }
 
 #[tokio::test]

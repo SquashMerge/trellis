@@ -298,7 +298,7 @@ Identity-equivalent non-source inputs reuse one captured buffer after metadata c
 Drift, unreadable or unsafe inputs, excess size, and cancellation
 fail the indexing call rather than publishing its result, except for the inputs later rulings
 admit unread: a source over `--max-file-bytes` (#576), a config input over its cap (#581), and
-an ignore file over the config input cap, whose directory is then not descended (#586). Ambient ancestor, global,
+an ignore file over the config input cap, which is then treated as absent (#586). Ambient ancestor, global,
 and Git-info ignore files do not participate in admission.
 
 This is a non-adversarial writer check, not a filesystem security sandbox. A writer
