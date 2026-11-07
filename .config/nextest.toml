@@ -24,3 +24,9 @@ test-group = 'producer-e2e'
 [[profile.nightly.overrides]]
 filter = 'binary_id(=trellis::semantic) & test(=semantic_batch_store::proptest_retention::decision_0006_multi_slot_histories)'
 slow-timeout = { period = "60s", terminate-after = 15 }
+
+# tools/stress (the stress workflow) runs the suite under CPU load. Each
+# repetition's JUnit report names the failed tests and keeps their output.
+# Everything else, including the test groups above, comes from the default.
+[profile.stress.junit]
+path = "junit.xml"

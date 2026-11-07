@@ -167,3 +167,39 @@ The workflow does not bundle or download model weights. Per-release native
 builds and archived-byte smoke do not claim fresh full-model parity or actual
 Metal inference. No tag creation or release publication is implied by a local
 workflow edit; a real tagged CI run and its assets must be observed separately.
+
+## Stress lane
+
+`stress.yml` runs the Rust tests under CPU load, several times over, on
+`ubuntu-latest` and `macos-latest`. It is there to surface flaky-test classes
+(timing assumptions, missing settled waits, unbounded waits) before they reach a
+release PR (#720). It never gates a PR: it has no `pull_request` trigger and is
+not a required check. It runs weekly (Sunday 06:23 UTC) and on manual dispatch.
+
+Each runner builds exactly what the `tests` job in `rust.yml` builds, and
+restores that job's cache. It then starts busy loops (`yes > /dev/null`, `load`
+per core) and runs `cargo nextest run --profile stress` `repeat` times, with
+`--no-fail-fast`. The `stress` nextest profile is the default profile plus a
+JUnit report. The job summary lists each failed test and the repetitions it
+failed in. On failure, the run uploads each repetition's full log and JUnit
+report, which keeps the failed tests' output, as a `stress-<os>-attempt-<n>`
+artifact. Nothing is filed automatically: a human or supervisor triages the
+failures as defects (see the concurrency rules in `CLAUDE.md`).
+
+To dispatch it, from the Actions tab or with:
+
+```sh
+gh workflow run stress.yml -f repeat=3 -f load=2 -f os=both \
+  [-f test_threads=8] [-f filter='binary_id(trellis::http)']
+```
+
+A default run takes about 1–2 hours per runner. To run the same loop locally,
+under the verify lock:
+
+```sh
+/usr/bin/lockf -k /tmp/trellis-factory-verify.lock \
+  ./tools/stress --repeat 2 --load 2 -- -E 'test(/watcher/)'
+```
+
+Output goes to `target-test-support/stress/`: `rep-<n>.log`,
+`rep-<n>-junit.xml` and `summary.md`.

@@ -1,0 +1,138 @@
+#!/bin/sh
+# Runs the Rust tests under CPU load, several times over, to surface flaky-test
+# classes (timing assumptions, missing settled waits, unbounded waits) before
+# they reach a release PR. The stress workflow (.github/workflows/stress.yml)
+# runs this; it never gates a PR. See docs/releases.md#stress-lane.
+#
+# Usage: ./tools/stress [--repeat N] [--load K] [--test-threads N] [--out DIR] [-- NEXTEST_ARGS...]
+#   --repeat N        run the suite N times (default 3)
+#   --load K          start K busy loops per core for the whole run (default 2; 0 = none)
+#   --test-threads N  nextest test threads (default: nextest's, one per core)
+#   --out DIR         where per-repetition logs, JUnit reports and the summary go
+#                     (default <target>-test-support/stress, emptied first)
+#   NEXTEST_ARGS      extra `cargo nextest run` arguments, e.g. -E 'test(watcher)'
+#
+# It builds what the verify tests lane builds (same target directory, features
+# and flags), before the load starts. Each repetition runs with --no-fail-fast.
+# The exit status is non-zero if any repetition failed; the summary names each
+# failed test and the repetitions it failed in.
+set -eu
+workspace=$(cd "$(dirname "$0")/.." && pwd)
+cd "$workspace"
+
+repeat=3
+load=2
+threads=""
+out=""
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --repeat) repeat=${2:?--repeat needs a count}; shift 2 ;;
+    --load) load=${2:?--load needs a count}; shift 2 ;;
+    --test-threads) threads=${2:?--test-threads needs a count}; shift 2 ;;
+    --out) out=${2:?--out needs a directory}; shift 2 ;;
+    --) shift; break ;;
+    *) echo "stress: unknown argument: $1 (see the usage at the top of tools/stress)" >&2; exit 2 ;;
+  esac
+done
+for value in "$repeat" "$load" ${threads:+"$threads"}; do
+  case $value in
+    '' | *[!0-9]*) echo "stress: counts must be non-negative integers, got '$value'" >&2; exit 2 ;;
+  esac
+done
+[ "$repeat" -ge 1 ] || { echo "stress: --repeat must be at least 1" >&2; exit 2; }
+
+# The same target directory as `./tools/verify --lane tests`.
+target_dir=${CARGO_TARGET_DIR:-target}
+case $target_dir in
+  /*) ;;
+  *) target_dir=$PWD/$target_dir ;;
+esac
+test_target=$target_dir-test-support
+out=${out:-$test_target/stress}
+rm -rf "$out"
+mkdir -p "$out"
+
+cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
+busy=$((cores * load))
+echo "stress: $cores cores, $busy busy loops, $repeat repetitions, test threads ${threads:-default}, output in $out"
+
+# Build first, without load, so the load presses on the tests and not rustc.
+CARGO_TARGET_DIR="$test_target" cargo nextest run --profile stress --locked --all-targets --features test-support --no-run "$@"
+
+load_pids=""
+stop_load() {
+  # shellcheck disable=SC2086 # one word per pid
+  [ -z "$load_pids" ] || kill $load_pids 2>/dev/null || true
+  load_pids=""
+}
+trap stop_load EXIT
+trap 'exit 130' INT TERM
+i=0
+while [ "$i" -lt "$busy" ]; do
+  yes >/dev/null &
+  load_pids="$load_pids $!"
+  i=$((i + 1))
+done
+
+# nextest writes its reports under the workspace's target/nextest, whatever
+# CARGO_TARGET_DIR says.
+junit=$workspace/target/nextest/stress/junit.xml
+failed_reps=""
+rep=1
+while [ "$rep" -le "$repeat" ]; do
+  rm -f "$junit"
+  start=$(date +%s)
+  code=0
+  CARGO_TARGET_DIR="$test_target" cargo nextest run --profile stress --locked --all-targets --no-fail-fast --features test-support --color never ${threads:+--test-threads "$threads"} "$@" >"$out/rep-$rep.log" 2>&1 || code=$?
+  if [ -f "$junit" ]; then
+    cp "$junit" "$out/rep-$rep-junit.xml"
+  fi
+  echo "==> stress repetition $rep/$repeat: exit $code in $(($(date +%s) - start)) s"
+  # nextest's final summary lists every failed test; print it, not the whole log.
+  sed -n '/^ *Summary \[/,$p' "$out/rep-$rep.log" | tail -n 60
+  [ "$code" -eq 0 ] || failed_reps="$failed_reps $rep"
+  rep=$((rep + 1))
+done
+stop_load
+
+# Name each failed test and the repetitions it failed in, from the JUnit reports.
+python3 -I - "$out" "$repeat" "$failed_reps" <<'PY'
+import os, sys, xml.etree.ElementTree as ET
+
+out, repeat, failed_reps = sys.argv[1], int(sys.argv[2]), sys.argv[3].split()
+failures = {}
+missing = []
+for rep in range(1, repeat + 1):
+    path = os.path.join(out, f"rep-{rep}-junit.xml")
+    if not os.path.exists(path):
+        missing.append(rep)
+        continue
+    for case in ET.parse(path).getroot().iter("testcase"):
+        for child in case:
+            if child.tag in ("failure", "error"):
+                name = f"{case.get('classname')} {case.get('name')}"
+                kind = child.get("type") or child.tag
+                failures.setdefault(name, []).append((rep, kind))
+                break
+
+lines = [f"## Stress lane: {len(failed_reps)} of {repeat} repetitions failed", ""]
+if failures:
+    lines += ["| Test | Failed in repetition |", "| --- | --- |"]
+    for name in sorted(failures):
+        reps = ", ".join(f"{rep} ({kind})" for rep, kind in failures[name])
+        lines.append(f"| `{name}` | {reps} |")
+for rep in missing:
+    lines.append(f"\nRepetition {rep} wrote no JUnit report (a build or setup failure?); see rep-{rep}.log.")
+if not failures and not missing:
+    lines.append("No test failed.")
+text = "\n".join(lines) + "\n"
+print(text)
+with open(os.path.join(out, "summary.md"), "w") as f:
+    f.write(text)
+summary = os.environ.get("GITHUB_STEP_SUMMARY")
+if summary:
+    with open(summary, "a") as f:
+        f.write(text)
+PY
+
+[ -z "$failed_reps" ] || { echo "stress: failed repetition(s):$failed_reps" >&2; exit 1; }
