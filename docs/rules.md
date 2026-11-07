@@ -311,7 +311,8 @@ Supported mapping is deliberately narrow:
   `tool.setuptools.package-dir` key `""` and `tool.setuptools.packages.find.where`,
   plus the parent directory of each `tool.hatch.build.targets.wheel.packages` entry.
   Glob, absolute or traversing entries, malformed TOML and nested manifests declare
-  nothing. One module path claimed by files under two roots is ambiguous; a file
+  nothing. A top-level module name claimed under two roots is ambiguous; deeper
+  segments continue only under the root that proved their prefix, and a file
   proved under two roots has no package membership. Relative
   imports follow captured package membership; absolute imports use only those
   proved root conventions. No suffix search, namespace-package or `sys.path`

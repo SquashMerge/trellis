@@ -73,7 +73,9 @@ struct Unit {
 pub(super) struct Catalog {
     units: BTreeMap<usize, Unit>,
     source_sets: BTreeMap<usize, String>,
-    modules: BTreeMap<ModuleKey, Vec<(usize, bool)>>,
+    /// Files of each module path: document, package initializer and source root (0 is the
+    /// checkout root).
+    modules: BTreeMap<ModuleKey, Vec<(usize, bool, usize)>>,
     membership: BTreeMap<usize, Vec<String>>,
     module_proofs: BTreeMap<usize, BTreeSet<usize>>,
     child_names: BTreeMap<usize, BTreeSet<String>>,
@@ -133,7 +135,7 @@ impl Catalog {
                         .push(declaration);
                 }
             }
-            for (path, package) in module_paths(
+            for (path, package, root) in module_paths(
                 &doc.key.path,
                 result.source_roots.get(&doc.key.source_set_id),
             ) {
@@ -148,7 +150,7 @@ impl Catalog {
                     .modules
                     .entry((doc.key.source_set_id.clone(), path))
                     .or_default()
-                    .push((document, package));
+                    .push((document, package, root));
             }
             // A hazard or binding inside a parser error goes unseen, so the file proves nothing.
             let mut unit = Unit {
@@ -173,10 +175,12 @@ impl Catalog {
             let source_set = &input.key.source_set_id;
             // A file proved under two roots has no unique package for relative imports.
             let mut proved = Vec::new();
-            for (path, package) in
+            for (path, package, _) in
                 module_paths(&input.key.path, result.source_roots.get(source_set))
             {
-                if let Ok(layout) = result.layout(source_set, &path, work, check)? {
+                if let Ok(layout) = result.layout(source_set, &path, work, check)?
+                    && layout.document == doc.document
+                {
                     proved.push((path, package, layout.proof));
                 }
             }
@@ -431,6 +435,7 @@ impl Catalog {
     ) -> Result<std::result::Result<Layout, &'static str>> {
         let mut proof = BTreeSet::new();
         let mut found = None;
+        let mut root = None;
         for end in 1..=path.len() {
             charge(end, work, check)?;
             let Some(rows) = self
@@ -439,10 +444,16 @@ impl Catalog {
             else {
                 return Ok(Err("module_path_not_indexed"));
             };
-            if rows.len() != 1 {
-                return Ok(Err("module_path_ambiguous"));
-            }
-            let (document, package) = rows[0];
+            // Below the top level, only rows under the proved prefix's root continue it.
+            let mut live = rows
+                .iter()
+                .filter(|row| root.is_none_or(|root| row.2 == root));
+            let &(document, package, row_root) = match (live.next(), live.next()) {
+                (Some(row), None) => row,
+                (None, _) => return Ok(Err("module_path_not_indexed")),
+                (Some(_), Some(_)) => return Ok(Err("module_path_ambiguous")),
+            };
+            root = Some(row_root);
             if end < path.len() && !package {
                 return Ok(Err("python_package_prefix_unproved"));
             }
@@ -1228,16 +1239,19 @@ fn source_roots(
     }
     Ok(result)
 }
-/// A file's checkout-root module path, then its path under each declared source root.
-fn module_paths(path: &str, roots: Option<&BTreeSet<String>>) -> Vec<(Vec<String>, bool)> {
-    std::iter::once(path)
-        .chain(
-            roots
-                .into_iter()
-                .flatten()
-                .filter_map(|root| path.strip_prefix(root.as_str())?.strip_prefix('/')),
-        )
-        .filter_map(module_path)
+/// A file's module path under the checkout root (root 0), then under each declared source
+/// root that contains it (root 1 onward, in sorted order).
+fn module_paths(path: &str, roots: Option<&BTreeSet<String>>) -> Vec<(Vec<String>, bool, usize)> {
+    let nested = roots
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(i, root)| {
+            Some((path.strip_prefix(root.as_str())?.strip_prefix('/')?, i + 1))
+        });
+    std::iter::once((path, 0))
+        .chain(nested)
+        .filter_map(|(path, root)| module_path(path).map(|(path, package)| (path, package, root)))
         .collect()
 }
 fn module_path(path: &str) -> Option<(Vec<String>, bool)> {

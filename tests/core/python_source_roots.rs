@@ -147,6 +147,21 @@ fn same_module_under_two_roots_stays_unknown() {
 }
 
 #[test]
+fn nested_file_without_a_proved_package_under_its_root_does_not_compete() {
+    // `plugins/x/shared/` has no `__init__.py`, so `shared.util` there is not a module.
+    let (_state, _root, store, pin) = fixture(&[
+        ("pyproject.toml", WORKSPACE),
+        ("core/app.py", "from shared.util import run\n"),
+        ("shared/__init__.py", ""),
+        ("shared/util.py", "def run():\n    pass\n"),
+        ("plugins/x/shared/util.py", "def run():\n    pass\n"),
+    ]);
+    let data = read(&store, "references", pin);
+    assert!(has_edge(&data, "core/app.py", "shared/util.py"), "{data}");
+    assert!(unresolved(&data, "core/app.py", "shared.util").is_none());
+}
+
+#[test]
 fn nested_pyproject_without_a_declaring_root_stays_unknown() {
     let (_state, _root, store, pin) = fixture(&[("pyproject.toml", "[project]\nname = 'core'\n")]);
     let data = read(&store, "references", pin);
