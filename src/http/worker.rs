@@ -175,6 +175,15 @@ impl DaemonState {
         *self.startup_hook.lock().unwrap() = Some(hook);
     }
 
+    /// Hold every failed startup reconciliation's backoff open: the worker
+    /// sleeps in it until woken and never retries, so a test can act inside
+    /// the backoff window without racing its expiry.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn hold_startup_backoff_for_tests(&self) {
+        self.hold_startup_backoff.store(true, Ordering::Release);
+    }
+
     /// Whether the worker step should run startup reconciliation now. A
     /// standalone scheduler that was never asked to reconcile does so only
     /// when `work_pending` reports accepted work (`None`: undecided, retry).
@@ -388,6 +397,12 @@ impl DaemonState {
                     let mut backoff = self.startup_backoff.lock().unwrap();
                     let delay = *backoff;
                     *backoff = backoff.saturating_mul(2).min(STARTUP_BACKOFF_MAX);
+                    delay
+                };
+                #[cfg(feature = "test-support")]
+                let delay = if self.hold_startup_backoff.load(Ordering::Acquire) {
+                    Duration::from_secs(24 * 60 * 60)
+                } else {
                     delay
                 };
                 *self.recovery_retry_after.lock().unwrap() = Some(self.worker_now() + delay);

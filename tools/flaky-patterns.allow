@@ -177,7 +177,6 @@ short-wait tests/daemon/daemon_cli.rs metrics_protocol_deadline_covers_whole_fra
 short-wait src/daemon/client.rs settling_ends_by_the_calls_bound -- the bound is the call's settle deadline under test
 short-wait src/http/serving_holder_tests.rs failed_startup_reconciliation_backs_off_without_failing_fifo_head -- an upper bound on the computed retry deadline; nothing waits
 short-wait src/store/sqlite_contention_type_tests.rs * -- read-scope deadline values under test; nothing waits
-short-wait tests/daemon/daemon_checkout.rs failed_startup_backs_off_and_empty_idle_checkout_can_release -- #720 follow-up: release must land inside the startup backoff window; prove it with a hook, not wall time
 
 # blocking-accept: the accept cannot hang the test
 blocking-accept tests/daemon/daemon_mcp.rs try_paused_at -- accepts on a detached thread; the test waits on it only via recv_timeout(HANG_BACKSTOP)

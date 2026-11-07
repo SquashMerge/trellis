@@ -1278,16 +1278,19 @@ async fn failed_startup_backs_off_and_empty_idle_checkout_can_release() {
     registry.set_next_startup_hook_for_tests(std::sync::Arc::new(|| {
         panic!("injected startup reconciliation failure")
     }));
+    // The backoff never expires here, so the release below can only land
+    // inside it, never after a successful retry.
+    registry.hold_next_startup_backoff_for_tests();
     let runtime = registry.activate(&id.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        while runtime.reconciliation_error().is_none() {
+        while runtime.reconciliation_error().is_none() || !runtime.retry_waiting_for_tests() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .unwrap();
     registry.disconnect(1);
-    tokio::time::timeout(Duration::from_millis(180), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while !registry.release(&id.root_key).unwrap() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
