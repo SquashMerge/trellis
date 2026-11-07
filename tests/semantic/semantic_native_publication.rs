@@ -134,21 +134,8 @@ fn work_counts(home: &Path, pin: trellis::model::IndexPin) -> Value {
     work
 }
 
-fn retry_oracle_admission<T>(mut open: impl FnMut() -> anyhow::Result<T>) -> T {
-    let mut result = None;
-    trellis::testing::wait_until("fork oracle admission", || match open() {
-        Ok(store) => {
-            result = Some(store);
-            true
-        }
-        Err(error) if trellis::store::cli_read_retryable_contention(&error) => false,
-        Err(error) => panic!("fork oracle admission failed: {error:#}"),
-    });
-    result.unwrap()
-}
-
 #[test]
-fn fork_oracle_admission_retries_typed_busy_after_the_owner_releases() {
+fn retry_admission_retries_typed_busy_after_the_owner_releases() {
     use trellis::store::{Store, topology::WorkspaceIdentity};
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -156,16 +143,15 @@ fn fork_oracle_admission_retries_typed_busy_after_the_owner_releases() {
     let identity = WorkspaceIdentity::discover(Some(root.path()), root.path()).unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
-    drop(
+    drop(trellis::testing::retry_admission(|| {
         Store::open(
             roots.clone(),
             WorkspaceIdentity::discover(Some(root.path()), root.path()).unwrap(),
         )
-        .unwrap(),
-    );
+    }));
     let mut exclusive = Some(roots.index_use_exclusive_existing(&identity).unwrap());
     let mut attempts = 0;
-    let store = retry_oracle_admission(|| {
+    let store = trellis::testing::retry_admission(|| {
         attempts += 1;
         let opened = Store::open(
             roots.clone(),
@@ -186,10 +172,10 @@ fn fork_oracle_admission_retries_typed_busy_after_the_owner_releases() {
 }
 
 #[test]
-fn fork_oracle_admission_does_not_retry_other_errors() {
+fn retry_admission_does_not_retry_other_errors() {
     let mut attempts = 0;
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        retry_oracle_admission::<()>(|| {
+        trellis::testing::retry_admission::<()>(|| {
             attempts += 1;
             Err(anyhow::anyhow!("corrupt: fixture"))
         });
@@ -305,7 +291,12 @@ fn selected_case(change_b: &str) {
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let index_db = roots.index_db(&identity);
-    let store = trellis::store::Store::open(roots, identity).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open(
+            roots.clone(),
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+        )
+    });
     let (native, _) = store.retained_native_snapshot_at(r1).unwrap();
     let mut binary = scip::types::Index::new();
     for (path, text) in [("src/A.js", a), ("src/B.js", b)] {
@@ -615,9 +606,12 @@ fn selected_case(change_b: &str) {
                     home.join(".local/share/trellis")
                 },
             );
-            let identity =
-                trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-            trellis::store::Store::open(roots, identity).unwrap()
+            trellis::testing::retry_admission(|| {
+                trellis::store::Store::open(
+                    roots.clone(),
+                    trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+                )
+            })
         } else {
             prior = seeded;
             store
@@ -657,11 +651,14 @@ fn selected_case(change_b: &str) {
                 home.join(".local/share/trellis")
             },
         );
-        let identity =
-            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
         (
             Some(fork),
-            trellis::store::Store::open(roots, identity).unwrap(),
+            trellis::testing::retry_admission(|| {
+                trellis::store::Store::open(
+                    roots.clone(),
+                    trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+                )
+            }),
         )
     } else {
         (None, store)
@@ -849,7 +846,9 @@ fn selected_case(change_b: &str) {
         // Seed a fresh generation with the same direct extractor that will
         // publish LOCAL, rather than inheriting the CLI extractor's identity.
         let state = tempfile::tempdir_in(temp.path()).unwrap();
-        let store = trellis::store::Store::open_for_tests(state.path(), &root).unwrap();
+        let store = trellis::testing::retry_admission(|| {
+            trellis::store::Store::open_for_tests(state.path(), &root)
+        });
         let direct_index_db = TopologyRoots::isolated_for_tests(
             state.path().join("cache"),
             state.path().join("data"),
@@ -1040,9 +1039,12 @@ fn selected_case(change_b: &str) {
                 home.join(".local/share/trellis")
             },
         );
-        let identity =
-            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let rebaselined = trellis::store::Store::open(roots, identity).unwrap();
+        let rebaselined = trellis::testing::retry_admission(|| {
+            trellis::store::Store::open(
+                roots.clone(),
+                trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,
+            )
+        });
         let options = trellis::indexer::IndexOptions::new(root.clone());
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (next, session) = trellis::index_coordinator::reconcile_workspace(
@@ -1958,7 +1960,7 @@ fn selected_case(change_b: &str) {
                 fork.join(".local/share/trellis")
             },
         );
-        let oracle = retry_oracle_admission(|| {
+        let oracle = trellis::testing::retry_admission(|| {
             let identity =
                 trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?;
             trellis::store::Store::open(roots.clone(), identity)
@@ -2860,7 +2862,7 @@ fn full_rejoin_parses_each_document_a_bounded_number_of_times() {
     let reply = run(&home, &["index", "--workspace", root_string]);
     // The test's own daemon may hold the index briefly: admission contention is typed
     // and retried, and nothing else is (#712).
-    let store = retry_oracle_admission(|| {
+    let store = trellis::testing::retry_admission(|| {
         trellis::store::Store::open(
             roots.clone(),
             trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)?,

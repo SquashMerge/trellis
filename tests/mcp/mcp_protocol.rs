@@ -5140,7 +5140,7 @@ async fn obsolete_cold_index_recovers_over_mcp_without_explicit_options_or_fifo(
         .unwrap();
     let topology =
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -5293,7 +5293,7 @@ async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     let baseline = store.index_baseline().unwrap();
     assert_eq!(baseline.index_revision, 0);
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
@@ -6610,7 +6610,7 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     let baseline = store.index_baseline().unwrap();
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -6967,7 +6967,7 @@ fn mcp_find_cold_prior_head_uses_registry_roots_without_creating_index() {
             .contains("index_not_ready")
     );
     assert!(!index.exists(), "cold read created a derived database");
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -7021,7 +7021,7 @@ fn published_inactive_checkout(
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp, &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp, &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -7233,7 +7233,7 @@ async fn mcp_find_corrupt_scope_row_fails_only_when_hydrated() {
         let root = checkout(temp.path());
         fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
         fs::write(root.join("b.js"), "function Beta() {}\n").unwrap();
-        let store = Store::open_for_tests(temp.path(), &root).unwrap();
+        let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
         store.mcp_prepare_virgin_queue_for_tests().unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -7364,7 +7364,7 @@ async fn mcp_find_required_rows_and_coverage_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let root = checkout(temp.path());
         fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
-        let store = Store::open_for_tests(temp.path(), &root).unwrap();
+        let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
         store.mcp_prepare_virgin_queue_for_tests().unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -7478,7 +7478,7 @@ fn linked_find_registry(
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp, &linked).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp, &linked));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -7609,7 +7609,7 @@ fn mcp_find_null_name_and_id_byte_ties_are_ranked() {
     let root = checkout(temp.path());
     fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
     fs::write(root.join("b.js"), "function Beta() {}\n").unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -7701,7 +7701,7 @@ async fn mcp_find_cold_coordinator_admits_prior_head_only_under_configured_roots
     drop(client);
     session.join().unwrap().unwrap();
 
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -7827,7 +7827,7 @@ async fn mcp_declaration_selected_identity_and_measured_record() {
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -8085,7 +8085,7 @@ fn mcp_declaration_body_edit_retains_id_but_changes_selected_hash_and_pin() {
     let root = checkout(temp.path());
     let path = root.join("a.js");
     fs::write(&path, "function Alpha(first, second) { return first; }\n").unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = store.publication_for_tests().unwrap();
@@ -8176,7 +8176,7 @@ fn mcp_declaration_corrupt_required_proof_refuses_whole_result() {
         let temp = tempfile::tempdir().unwrap();
         let root = checkout(temp.path());
         fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
-        let store = Store::open_for_tests(temp.path(), &root).unwrap();
+        let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
         store.mcp_prepare_virgin_queue_for_tests().unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -8253,7 +8253,7 @@ async fn mcp_declaration_refuses_oversized_whole_wire_dto() {
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -8360,7 +8360,7 @@ async fn mcp_outgoing_selected_direct_calls_and_unresolved_hints() {
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -8549,7 +8549,7 @@ fn mcp_outgoing_wire_fixture_delayed(
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -8751,7 +8751,7 @@ async fn mcp_corrupt_find_declaration_outgoing_omit_current_basis_but_stale_pin_
     let temp = tempfile::tempdir().unwrap();
     let root = checkout(temp.path());
     fs::write(root.join("a.js"), "function Alpha() { Alpha(); }\n").unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -8808,7 +8808,8 @@ async fn mcp_corrupt_find_declaration_outgoing_omit_current_basis_but_stale_pin_
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     for corrupt in [false, true] {
         if corrupt {
-            let store = Store::open_for_tests(temp.path(), &root).unwrap();
+            let store =
+                trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
             let writer = store.publication_for_tests().unwrap();
             store
                 .mcp_corrupt_find_for_tests(&writer, "missing_header")
@@ -8905,7 +8906,7 @@ async fn mcp_wire_valid_basis_and_uint_are_not_silently_dropped() {
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -9754,7 +9755,7 @@ fn mcp_outgoing_corrupt_boundary_fixture(fault: &str) -> Value {
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -9919,7 +9920,7 @@ async fn mcp_outgoing_prior_revision_target_is_not_a_selected_candidate() {
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = store.publication_for_tests().unwrap();
@@ -10026,7 +10027,7 @@ async fn mcp_source_selected_cached_bytes_not_disk() {
         .unwrap()
         .attach_marker()
         .unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -10135,7 +10136,7 @@ async fn mcp_source_post_validation_invalid_bytes_only_selected_range_fails() {
     let temp = tempfile::tempdir().unwrap();
     let root = checkout(temp.path());
     fs::write(root.join("a.js"), "a\nb\n").unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -10295,7 +10296,7 @@ fn mcp_source_lf_ranges_exact_caps_and_hash_before_range() {
     let temp = tempfile::tempdir().unwrap();
     let root = checkout(temp.path());
     fs::write(root.join("a.js"), "a\r\nb\n").unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -10371,7 +10372,7 @@ async fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
         let temp = tempfile::tempdir().unwrap();
         let root = checkout(temp.path());
         fs::write(root.join("a.js"), "a\n").unwrap();
-        let store = Store::open_for_tests(temp.path(), &root).unwrap();
+        let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
         store.mcp_prepare_virgin_queue_for_tests().unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -10542,7 +10543,7 @@ async fn mcp_source_cold_coordinator_admits_prior_head_then_rejects_stale_pin() 
     drop(client);
     session.join().unwrap().unwrap();
 
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(temp.path(), &root));
     store.mcp_prepare_virgin_queue_for_tests().unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -12305,7 +12306,9 @@ impl SearchMcpFixture {
         let temp = tempfile::tempdir().unwrap();
         let (identity, topology) = published_inactive_checkout(temp.path(), files);
         let vectors = topology.vectors_db();
-        let store = trellis::store::Store::open_for_tests(temp.path(), &identity.root).unwrap();
+        let store = trellis::testing::retry_admission(|| {
+            trellis::store::Store::open_for_tests(temp.path(), &identity.root)
+        });
         let previous = store.index_baseline().unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
@@ -12426,8 +12429,9 @@ impl SearchMcpFixture {
     }
 
     fn seed_vectors(&self, service: &trellis::daemon::search::SearchService) {
-        let store =
-            trellis::store::Store::open_for_tests(self._temp.path(), &self.identity.root).unwrap();
+        let store = trellis::testing::retry_admission(|| {
+            trellis::store::Store::open_for_tests(self._temp.path(), &self.identity.root)
+        });
         let mut cards = Vec::new();
         let mut after = None;
         loop {
@@ -13458,9 +13462,9 @@ async fn mcp_search_inference_budget_returns_complete_lexical_and_keeps_required
         }
         // Inject only after resident-head inference has actually started.
         if scenario == "native_fts" {
-            let store =
+            let store = trellis::testing::retry_admission(|| {
                 trellis::store::Store::open_for_tests(fixture._temp.path(), &fixture.identity.root)
-                    .unwrap();
+            });
             let writer = store.publication_for_tests().unwrap();
             store.corrupt_search_fts_for_tests(&writer).unwrap();
         }
@@ -13589,8 +13593,9 @@ async fn mcp_search_hybrid_ranks_both_arms_and_vector_only_with_partial_then_com
         .model_id()
         .unwrap()
         .to_owned();
-    let store = trellis::store::Store::open_for_tests(fixture._temp.path(), &fixture.identity.root)
-        .unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open_for_tests(fixture._temp.path(), &fixture.identity.root)
+    });
     let cards = store
         .head_search_cards(Some(fixture.current), None, 16)
         .unwrap()
@@ -14799,7 +14804,9 @@ impl GraphMcp {
     /// shape: each proof's `basis` becomes its `basisRef` into the canonical basis table.
     fn store_answer(&self, arguments: &Value, prefix: Option<usize>) -> Value {
         let query = trellis::mcp::tools::call_graph_query(arguments);
-        let store = trellis::store::Store::open_for_tests(self.temp.path(), &self.root).unwrap();
+        let store = trellis::testing::retry_admission(|| {
+            trellis::store::Store::open_for_tests(self.temp.path(), &self.root)
+        });
         let answer = store
             .evidence_response()
             .unwrap()
@@ -15188,7 +15195,9 @@ fn malformed_semantic_freshness_or_state_fails_language_tiers() {
         publisher.publish(&spec);
         drop(publisher);
         // Healthy first: rust has fresh selected semantic evidence.
-        let store = trellis::store::Store::open_for_tests(state.path(), root.path()).unwrap();
+        let store = trellis::testing::retry_admission(|| {
+            trellis::store::Store::open_for_tests(state.path(), root.path())
+        });
         let tiers = store
             .evidence_response()
             .unwrap()
@@ -15202,7 +15211,9 @@ fn malformed_semantic_freshness_or_state_fails_language_tiers() {
         ))
         .unwrap();
         drop(db);
-        let store = trellis::store::Store::open_for_tests(state.path(), root.path()).unwrap();
+        let store = trellis::testing::retry_admission(|| {
+            trellis::store::Store::open_for_tests(state.path(), root.path())
+        });
         let error = store
             .evidence_response()
             .unwrap()

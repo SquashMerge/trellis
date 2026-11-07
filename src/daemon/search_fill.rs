@@ -2022,8 +2022,12 @@ mod tests {
         })
         .await
         .unwrap();
-        let store_identity = WorkspaceIdentity::discover(Some(&checkout), &checkout).unwrap();
-        let store = Store::open(roots, store_identity).unwrap();
+        let store = crate::testing::retry_admission(|| {
+            Store::open(
+                roots.clone(),
+                WorkspaceIdentity::discover(Some(&checkout), &checkout)?,
+            )
+        });
         assert_eq!(store.status().unwrap().revision, startup);
         assert!(
             !store
@@ -2911,7 +2915,9 @@ mod tests {
     fn index_read_contention_and_model_runtime_faults_remain_retryable() {
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::open_for_tests(state.path(), root.path()).unwrap();
+        let store = crate::testing::retry_admission(|| {
+            crate::store::Store::open_for_tests(state.path(), root.path())
+        });
         let identity =
             crate::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
                 .unwrap();

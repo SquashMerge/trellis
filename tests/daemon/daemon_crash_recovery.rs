@@ -183,7 +183,7 @@ fn queued_requests_daemon_child() {
     let Some((state, root)) = child_paths() else {
         return;
     };
-    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open(roots(&state), identity(&root)));
     let options = IndexOptions::new(root.clone());
     let (_, session) =
         trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel(), |_| {})
@@ -207,7 +207,7 @@ async fn killed_daemon_with_accepted_queue_restarts_to_one_fifo_terminal_result_
     let root = base.path().join("work");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function queued() {}\n").unwrap();
-    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open(roots(&state), identity(&root)));
     let options = IndexOptions::new(root.clone());
     let accepted: Vec<Request> = (0..4)
         .map(|_| store.enqueue_request(&options, None).unwrap())
@@ -220,7 +220,7 @@ async fn killed_daemon_with_accepted_queue_restarts_to_one_fifo_terminal_result_
     );
 
     // Durable state at the instant of death: one done, one running, two only queued.
-    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open(roots(&state), identity(&root)));
     let at_death: Vec<Request> = accepted
         .iter()
         .map(|r| store.request_by_id(&r.id).unwrap().unwrap())
@@ -273,7 +273,7 @@ fn index_commit_hot_journal_daemon_child() {
     let Some((state, root)) = child_paths() else {
         return;
     };
-    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open(roots(&state), identity(&root)));
     let options = IndexOptions::new(root.clone());
     let (head, session) =
         trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel(), |_| {})
@@ -333,7 +333,7 @@ async fn killed_mid_index_commit_recovers(torn_header: bool) {
     let root = base.path().join("work");
     fs::create_dir(&root).unwrap();
     rewrite_workspace(&root, "before");
-    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open(roots(&state), identity(&root)));
     let accepted = store
         .enqueue_request(&IndexOptions::new(root.clone()), None)
         .unwrap();
@@ -399,7 +399,7 @@ async fn killed_mid_index_commit_recovers(torn_header: bool) {
     // The queue resumes: the restarted daemon reclaims and finishes the request.
     let (_registry, _runtime) =
         restart_daemon_until_terminal(&state, &root, &accepted.id, |_| {}).await;
-    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open(roots(&state), identity(&root)));
     let done = store.request_by_id(&accepted.id).unwrap().unwrap();
     assert_eq!(done.state, "done", "{done:?}");
     // Recovery rolled the hot journal back to exactly the prior committed head.
@@ -428,7 +428,7 @@ fn index_write_cold_journal_daemon_child() {
     let Some((state, root)) = child_paths() else {
         return;
     };
-    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open(roots(&state), identity(&root)));
     let options = IndexOptions::new(root.clone());
     let (head, session) =
         trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel(), |_| {})
@@ -461,7 +461,7 @@ async fn killed_before_index_commit_leaves_cold_journal_then_queue_resumes() {
     let root = base.path().join("work");
     fs::create_dir(&root).unwrap();
     rewrite_workspace(&root, "before");
-    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open(roots(&state), identity(&root)));
     let accepted = store
         .enqueue_request(&IndexOptions::new(root.clone()), None)
         .unwrap();
@@ -487,7 +487,7 @@ async fn killed_before_index_commit_leaves_cold_journal_then_queue_resumes() {
 
     let (_registry, _runtime) =
         restart_daemon_until_terminal(&state, &root, &accepted.id, |_| {}).await;
-    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open(roots(&state), identity(&root)));
     let done = store.request_by_id(&accepted.id).unwrap().unwrap();
     assert_eq!(done.state, "done", "{done:?}");
     assert!(
@@ -522,7 +522,9 @@ fn short_cold_journal_does_not_defer_first_activation() {
         let root = base.path().join("work");
         fs::create_dir(&root).unwrap();
         fs::write(root.join("a.js"), "function a() {}\n").unwrap();
-        drop(Store::open(roots(&state), identity(&root)).unwrap());
+        drop(trellis::testing::retry_admission(|| {
+            Store::open(roots(&state), identity(&root))
+        }));
         let index = index_db(&state, &root);
         let file = fs::OpenOptions::new().write(true).open(&index).unwrap();
         file.write_all_at(&[0u8; 100], 0).unwrap();
@@ -550,7 +552,7 @@ fn live_publication_journal_is_contention_for_a_reader_outside_the_lease() {
     let root = base.path().join("work");
     fs::create_dir(&root).unwrap();
     rewrite_workspace(&root, "before");
-    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open(roots(&state), identity(&root)));
     let accepted = store
         .enqueue_request(&IndexOptions::new(root.clone()), None)
         .unwrap();
@@ -563,7 +565,7 @@ fn live_publication_journal_is_contention_for_a_reader_outside_the_lease() {
     .unwrap();
     // A second Store stands in for another Trellis process: its own
     // publication gate, no writer lease.
-    let reader = Store::open(roots(&state), identity(&root)).unwrap();
+    let reader = trellis::testing::retry_admission(|| Store::open(roots(&state), identity(&root)));
     rewrite_workspace(&root, "after");
     store.set_publication_cache_kib_for_tests(2000);
     let journal = index_db(&state, &root).with_file_name("index.db-journal");

@@ -1284,11 +1284,12 @@ fn global_discovery_reuses_live_sqlite_witness_and_never_repairs() {
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-    let store = Store::open(
-        roots.clone(),
-        WorkspaceIdentity::discover(Some(&root), &root).unwrap(),
-    )
-    .unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        Store::open(
+            roots.clone(),
+            WorkspaceIdentity::discover(Some(&root), &root).unwrap(),
+        )
+    });
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (_, session) = trellis::index_coordinator::reconcile_workspace(
         &store,
@@ -2356,7 +2357,9 @@ async fn virgin_queue_use_lock_contention_retries_startup_before_claiming_fifo()
     let roots =
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
     // Store::open creates only the virgin revision-0 index, not the queue.
-    let store = Store::open(roots.clone(), identity.verified_clone_for_tests().unwrap()).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        Store::open(roots.clone(), identity.verified_clone_for_tests().unwrap())
+    });
     let queue_path = roots.requests_db(&identity);
     assert!(!queue_path.exists());
     let use_lock = roots.index_use(&identity).unwrap();
@@ -2537,11 +2540,12 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-    let published = Store::open(
-        roots.clone(),
-        WorkspaceIdentity::discover(Some(&root), &root).unwrap(),
-    )
-    .unwrap();
+    let published = trellis::testing::retry_admission(|| {
+        Store::open(
+            roots.clone(),
+            WorkspaceIdentity::discover(Some(&root), &root).unwrap(),
+        )
+    });
     let options = IndexOptions::new(root.clone());
     let old_owner = establish_serving_session(
         &published,

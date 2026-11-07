@@ -1841,8 +1841,12 @@ fn selected_graph(root: &std::path::Path, home: &std::path::Path) -> Value {
         )
     };
     let roots = TopologyRoots::isolated_for_tests(cache, data);
-    let identity = WorkspaceIdentity::discover(Some(root), root).unwrap();
-    let store = Store::open(roots, identity).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        Store::open(
+            roots.clone(),
+            WorkspaceIdentity::discover(Some(root), root)?,
+        )
+    });
     serde_json::to_value(store.graph().unwrap()).unwrap()
 }
 
@@ -2192,8 +2196,12 @@ impl LegacyClient {
             )
         };
         let roots = TopologyRoots::isolated_for_tests(cache, data);
-        let identity = WorkspaceIdentity::discover(Some(root), root).unwrap();
-        let store = Store::open(roots, identity).unwrap();
+        let store = trellis::testing::retry_admission(|| {
+            Store::open(
+                roots.clone(),
+                WorkspaceIdentity::discover(Some(root), root)?,
+            )
+        });
         let mut options = IndexOptions::new(root.to_owned());
         options.max_file_bytes = max_file_bytes;
         let address = url.strip_prefix("http://").unwrap().parse().unwrap();
@@ -3376,7 +3384,12 @@ fn virgin_cli_activation_contention_expires_before_enqueue_and_new_index_succeed
     let roots = TopologyRoots::isolated_for_tests(cache, data);
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let use_lock = roots.index_use_lock(&identity);
-    let store = Store::open(roots, identity).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        Store::open(
+            roots.clone(),
+            WorkspaceIdentity::discover(Some(&root), &root)?,
+        )
+    });
     assert_eq!(store.index_baseline().unwrap().index_revision, 0);
     let queue_path = store.request_db_path();
     assert!(

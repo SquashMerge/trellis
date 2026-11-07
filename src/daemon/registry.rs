@@ -3278,7 +3278,9 @@ mod selection_tests {
         fs::write(root.join("a.js"), "function a() {}\n").unwrap();
         // A standalone scheduler has no background worker; each fault and
         // recovery transition below is driven explicitly by this test.
-        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let store = crate::testing::retry_admission(|| {
+            Store::open_for_tests(&tmp.path().join("state"), &root)
+        });
         let scheduler = http::new(
             store.clone(),
             IndexOptions::new(root.clone()),
@@ -3371,7 +3373,9 @@ mod selection_tests {
     fn cli_index_contention_retries_the_same_accepted_request() {
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let store = crate::testing::retry_admission(|| {
+            Store::open_for_tests(state.path(), workspace.path())
+        });
         let options = IndexOptions::new(workspace.path().to_owned());
         let accepted = store.enqueue_request(&options, None).unwrap();
         let mut attempts = 0;
@@ -3404,7 +3408,9 @@ mod selection_tests {
     fn cli_index_expired_contention_is_typed_and_keeps_accepted_row_pending() {
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let store = crate::testing::retry_admission(|| {
+            Store::open_for_tests(state.path(), workspace.path())
+        });
         let options = IndexOptions::new(workspace.path().to_owned());
         let accepted = store.enqueue_request(&options, None).unwrap();
         let before = store.request_by_id(&accepted.id).unwrap().unwrap();

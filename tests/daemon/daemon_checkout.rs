@@ -120,7 +120,8 @@ fn browser_listing_cold_index_reports_pin_without_claiming_freshness() {
     fs::write(checkout.join("a.js"), "function coldHead() {}\n").unwrap();
     let id = identity(&checkout);
     let topology = roots(base.path());
-    let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let owner = trellis::index_coordinator::establish_serving_session(
         &store,
         None,
@@ -166,7 +167,8 @@ fn browser_listing_cold_index_distinguishes_busy_and_corrupt_from_no_head() {
     fs::write(checkout.join("a.js"), "function coldHead() {}\n").unwrap();
     let id = identity(&checkout);
     let topology = roots(base.path());
-    let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let owner = trellis::index_coordinator::establish_serving_session(
         &store,
         None,
@@ -262,7 +264,8 @@ async fn separate_store_writer_does_not_downgrade_daemon_read() {
     .unwrap();
     let id = identity(&checkout);
     let topology = roots(base.path());
-    let standalone = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let standalone =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let leader = trellis::index_coordinator::establish_serving_session(
         &standalone,
@@ -460,7 +463,8 @@ async fn fresh_registry_restart_serves_prior_head_without_startup_mutation_or_fi
     prior.finish(()).unwrap();
     drop(prior);
 
-    let store = Store::open(topology, identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let queued = store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
         .unwrap();
@@ -637,14 +641,16 @@ async fn committed_queue_survives_runtime_restart() {
     .unwrap();
     let id = identity(&checkout);
     let topology = roots(base.path());
-    let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let options = trellis::indexer::IndexOptions::new(checkout.clone());
     let accepted = store.enqueue_request(&options, None).unwrap();
     drop(store);
     let mut restarted = CheckoutRegistry::with_roots(topology.clone());
     restarted.attach_launch(1, &id).unwrap();
     let _runtime = restarted.activate(&id.root_key).unwrap();
-    let observed = Store::open(topology, identity(&checkout)).unwrap();
+    let observed =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if observed
@@ -682,7 +688,8 @@ async fn replacement_settles_old_queue_before_startup_then_claims_distinct_fifo_
     ready(&old_runtime).await;
     registry.disconnect(1);
     release_when_idle(&mut registry, &old_id.root_key).await;
-    let old_store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let old_store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let old = old_store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
         .unwrap();
@@ -695,7 +702,8 @@ async fn replacement_settles_old_queue_before_startup_then_claims_distinct_fifo_
     )
     .unwrap();
     let new_id = identity(&checkout);
-    let new_store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let new_store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let mut a_options = trellis::indexer::IndexOptions::new(checkout.clone());
     a_options.max_file_bytes = 7000;
     let mut b_options = a_options.clone();
@@ -804,7 +812,8 @@ async fn replacement_settles_old_queue_before_startup_then_claims_distinct_fifo_
         serde_json::from_str::<serde_json::Value>(&b_row.options_json).unwrap()["maxFileBytes"],
         8192
     );
-    let selected_store = Store::open(topology, identity(&checkout)).unwrap();
+    let selected_store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     for pin in [a_pin, b_pin] {
         assert!(
             selected_store
@@ -825,9 +834,9 @@ async fn ambiguous_root_settlement_blocks_startup_and_fifo_until_queue_reread() 
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function oldRoot() {}\n").unwrap();
-    let old_id = identity(&checkout);
     let topology = roots(base.path());
-    let old_store = Store::open(topology.clone(), old_id).unwrap();
+    let old_store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let old = old_store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
         .unwrap();
@@ -836,7 +845,8 @@ async fn ambiguous_root_settlement_blocks_startup_and_fifo_until_queue_reread() 
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function newRoot() {}\n").unwrap();
     let new_id = identity(&checkout);
-    let new_store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let new_store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let accepted = new_store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
         .unwrap();
@@ -909,7 +919,8 @@ async fn ambiguous_root_settlement_blocks_startup_and_fifo_until_queue_reread() 
     .expect("queued request did not complete after confirmed H");
     let row = new_store.request_by_id(&accepted.id).unwrap().unwrap();
     assert_eq!(row.state, "done");
-    let selected = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let selected =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
     let pin = row.revision.unwrap();
     assert!(
         selected
@@ -1028,7 +1039,8 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
     // The row is still accepted, not yet claimed, when the root moves.
     let scheduler = old.browser_scheduler().unwrap();
     let held = scheduler.hold_worker_for_tests();
-    let store = Store::open(topology, identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let row = store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
         .unwrap();
@@ -1191,7 +1203,8 @@ async fn cold_activation_preserves_recorded_native_limit() {
     .unwrap();
     let id = identity(&checkout);
     let topology = roots(base.path());
-    let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let mut options = trellis::indexer::IndexOptions::new(checkout.clone());
     options.max_file_bytes = 8192;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1205,11 +1218,11 @@ async fn cold_activation_preserves_recorded_native_limit() {
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
     ready(&runtime).await;
-    let observed = Store::open(topology.clone(), identity(&checkout))
-        .unwrap()
-        .recorded_index_options()
-        .unwrap()
-        .unwrap();
+    let observed =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)))
+            .recorded_index_options()
+            .unwrap()
+            .unwrap();
     assert_eq!(observed.max_file_bytes, options.max_file_bytes);
 
     registry.disconnect(1);
@@ -1224,11 +1237,11 @@ async fn cold_activation_preserves_recorded_native_limit() {
     registry.attach_launch(2, &id).unwrap();
     let explicit_default = registry.activate(&id.root_key).unwrap();
     ready(&explicit_default).await;
-    let default_selected = Store::open(topology.clone(), identity(&checkout))
-        .unwrap()
-        .recorded_index_options()
-        .unwrap()
-        .unwrap();
+    let default_selected =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)))
+            .recorded_index_options()
+            .unwrap()
+            .unwrap();
     assert_eq!(
         default_selected.max_file_bytes, 2_097_152,
         "explicit default is an instruction, not implicit fallback"
@@ -1245,11 +1258,11 @@ async fn cold_activation_preserves_recorded_native_limit() {
     registry.attach_launch(3, &id).unwrap();
     let explicit = registry.activate(&id.root_key).unwrap();
     ready(&explicit).await;
-    let selected = Store::open(topology, identity(&checkout))
-        .unwrap()
-        .recorded_index_options()
-        .unwrap()
-        .unwrap();
+    let selected =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)))
+            .recorded_index_options()
+            .unwrap()
+            .unwrap();
     assert_eq!(selected.max_file_bytes, 4096);
 }
 
@@ -1292,7 +1305,8 @@ async fn failed_startup_backoff_never_releases_accepted_fifo_work() {
     fs::create_dir(&checkout).unwrap();
     let id = identity(&checkout);
     let topology = roots(base.path());
-    let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let queued = store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout), None)
         .unwrap();
@@ -1745,7 +1759,8 @@ async fn browser_listing_and_discovery_do_not_reopen_released_sqlite_witnesses()
         0,
         "discovery must not pin released index"
     );
-    let independent = Store::open(topology, identity(&checkout)).unwrap();
+    let independent =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let owner = trellis::index_coordinator::establish_serving_session(
         &independent,
         None,
@@ -1985,11 +2000,12 @@ async fn serve_registers_in_place_while_an_accepted_index_runs() {
         claimed_tx.send(()).unwrap();
         let _ = resume_rx.recv();
     });
-    let store = Store::open(
-        roots(base.path()),
-        crate::daemon_checkout::identity(&checkout),
-    )
-    .unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        Store::open(
+            roots(base.path()),
+            crate::daemon_checkout::identity(&checkout),
+        )
+    });
     let accepted = store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
         .unwrap();
@@ -2135,9 +2151,10 @@ async fn work_accepted_during_startup_reconciliation_never_starts_a_second_one()
     let index = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
     let queued = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
-            if let Ok(Some(row)) = Store::open(roots(base.path()), identity(&checkout))
-                .unwrap()
-                .current_request()
+            if let Ok(Some(row)) = trellis::testing::retry_admission(|| {
+                Store::open(roots(base.path()), identity(&checkout))
+            })
+            .current_request()
             {
                 break row;
             }
@@ -2205,7 +2222,8 @@ async fn enqueue_from_another_store_wakes_the_idle_worker() {
     let id = identity(&checkout);
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     let _runtime = idle_without_periodic_inventory(&mut registry, &id).await;
-    let other = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let other =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
     let accepted = other
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
         .unwrap();
@@ -2344,7 +2362,8 @@ async fn release_waits_for_accepted_fifo_work() {
         claimed_tx.send(()).unwrap();
         let _ = resume_rx.recv();
     });
-    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
     let options = trellis::indexer::IndexOptions::new(checkout.clone());
     let first = store.enqueue_request(&options, None).unwrap();
     entered(claimed_rx, "first claim").await;
@@ -2456,7 +2475,8 @@ async fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
     let runtime = registry.activate(&id.root_key).unwrap();
     ready(&runtime).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
     let options = trellis::indexer::IndexOptions::new(checkout.clone());
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Keep the activated worker at its gate while creating genuine retention
@@ -2575,7 +2595,8 @@ async fn cli_index_wakes_on_its_terminal_commit() {
     let indexer = runtime.clone();
     let options = trellis::indexer::IndexOptions::new(checkout.clone());
     let index = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
-    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while store.current_request().unwrap().is_none() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2825,7 +2846,8 @@ async fn enqueue_from_another_store_before_closing_cancels_retirement() {
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     let runtime = idle_detached(&mut registry, &id).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
     let (row_tx, row_rx) = std::sync::mpsc::sync_channel(1);
     let enqueuer = store.clone();
     let options = trellis::indexer::IndexOptions::new(checkout.clone());
@@ -2863,7 +2885,8 @@ async fn root_replaced_as_retirement_begins_settles_before_closing() {
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     let runtime = idle_detached(&mut registry, &id).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    let enqueuer = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let enqueuer =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
     let (row_tx, row_rx) = std::sync::mpsc::sync_channel(1);
     let options = trellis::indexer::IndexOptions::new(checkout.clone());
     let (work, moved) = (checkout.clone(), base.path().join("moved"));
@@ -2966,7 +2989,8 @@ async fn retirement_attempt_never_captures_past_its_cutoff() {
     holder.join().unwrap();
     retired(&scheduler).await;
     drop(runtime);
-    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
     assert!(
         store.source_at("late.js", None).unwrap().is_none(),
         "the retirement attempt captured a change after its cutoff"
@@ -3035,7 +3059,8 @@ async fn ambiguous_completion_confirmed_later_wakes_the_index_waiter() {
     let runtime = registry.activate(&id.root_key).unwrap();
     ready(&runtime).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
     runtime.fail_next_completion_after_commit_for_tests();
     let (release_worker, holder) = hold_worker(scheduler).await;
     let indexer = runtime.clone();
@@ -3071,7 +3096,8 @@ async fn enqueue_committed_before_its_wake_cancels_retirement() {
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     let runtime = idle_detached(&mut registry, &id).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
     let (committed_tx, committed_rx) = std::sync::mpsc::sync_channel(1);
     let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
     store.set_after_enqueue_commit_hook_for_tests(move || {
@@ -3177,11 +3203,12 @@ async fn explicit_serve_options_apply_once() {
     };
     ready(&runtime).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    let store = Store::open(
-        roots(base.path()),
-        crate::daemon_checkout::identity(&checkout),
-    )
-    .unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        Store::open(
+            roots(base.path()),
+            crate::daemon_checkout::identity(&checkout),
+        )
+    });
     let recorded = |bytes: u64| {
         let store = store.clone();
         async move {
@@ -3261,7 +3288,8 @@ async fn enqueue_after_closing_runs_at_next_activation() {
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     let runtime = idle_detached(&mut registry, &id).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
     let (row_tx, row_rx) = std::sync::mpsc::sync_channel(1);
     let enqueuer = store.clone();
     let options = trellis::indexer::IndexOptions::new(checkout.clone());
@@ -3339,7 +3367,8 @@ async fn live_same_path_replacement_settles_old_rows_before_new_root_startup_and
     // Hold the running worker so both old-root rows are accepted, not
     // claimed, when the root is replaced.
     let (release_hold, holder) = hold_worker(old_scheduler.clone()).await;
-    let enqueuer = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let enqueuer =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&checkout)));
     let options = trellis::indexer::IndexOptions::new(checkout.clone());
     let old_rows = [
         enqueuer.enqueue_request(&options, None).unwrap().id,
@@ -3509,7 +3538,8 @@ async fn gc_abandons_unserviced_pending_request_and_later_lookup_is_not_found() 
         assert!(!runtime.has_active_resources());
     }
     // Accepted durably (as before a daemon crash); no client activates it.
-    let store = Store::open(topology.clone(), identity(&lost)).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(topology.clone(), identity(&lost)));
     let pending = store
         .enqueue_request(&trellis::indexer::IndexOptions::new(lost.clone()), None)
         .unwrap();
@@ -3564,7 +3594,9 @@ fn queue_read_during_root_loss_is_root_changed_not_a_vanished_queue() {
     let root = base.path().join("lost");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function lost() {}\n").unwrap();
-    let store = trellis::store::Store::open_for_tests(&base.path().join("state"), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| {
+        trellis::store::Store::open_for_tests(&base.path().join("state"), &root)
+    });
     let accepted = store
         .enqueue_request(&trellis::indexer::IndexOptions::new(root.clone()), None)
         .unwrap();
