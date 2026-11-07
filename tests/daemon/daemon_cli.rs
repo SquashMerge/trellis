@@ -1458,6 +1458,60 @@ fn cold_cli_commands_start_and_reuse_daemon() {
     assert!(!symbols["data"]["items"].as_array().unwrap().is_empty());
 }
 
+/// #582: a fresh daemon's startup reconciliation runs at the default file cap; the next
+/// `index --max-file-bytes N` captures at N. A source only N refuses failed that request as
+/// `index_failed: internal error` before #580. It is skipped with a typed diagnostic, and the
+/// request succeeds. An input that must still be refused over its cap is typed (see
+/// `capture::tests::an_input_over_its_cap_is_typed_limit_exceeded`).
+#[test]
+fn first_index_with_smaller_file_cap_skips_a_source_over_it() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "capped");
+    let big = format!("function bigSymbol() {{}}\n{}", "// x\n".repeat(60));
+    assert!(big.len() > 300);
+    fs::write(root.join("big.js"), big).unwrap();
+    let index = |cap: Option<&str>| {
+        let mut command = cli(&home);
+        command.arg("index").arg("--workspace").arg(&root);
+        if let Some(cap) = cap {
+            command.arg("--max-file-bytes").arg(cap);
+        }
+        command.output().unwrap()
+    };
+    let first = crate::child::cli_json(&index(None), "default-cap index failed");
+    let head = first["publishedRevision"]["indexRevision"]
+        .as_u64()
+        .unwrap();
+    let capped = crate::child::cli_json(&index(Some("300")), "capped index failed");
+    assert!(
+        capped["publishedRevision"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+            > head,
+        "{capped}"
+    );
+    let diagnostics = capped["status"]["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d["path"] == "big.js" && d["code"] == "native-coverage-partial"),
+        "{capped}"
+    );
+    let symbols = cli(&home)
+        .arg("symbols")
+        .arg("--workspace")
+        .arg(&root)
+        .arg("--search")
+        .arg("cappedSymbol")
+        .output()
+        .unwrap();
+    let symbols = crate::child::cli_json(&symbols, "symbols after capped index failed");
+    assert!(!symbols["data"]["items"].as_array().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn long_home_socket_names_are_private_distinct_connectable_and_recover_after_crash() {
     use std::os::unix::{

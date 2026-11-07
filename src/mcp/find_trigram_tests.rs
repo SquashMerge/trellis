@@ -149,6 +149,7 @@ fn w2_output_is_byte_identical_through_the_prefilter_and_the_literal_scan() {
                     workspace.path(),
                     false,
                     true,
+                    false,
                 )
                 .unwrap();
                 read.finish(()).unwrap();
@@ -334,6 +335,7 @@ fn id_shaped_queries_are_identical_with_and_without_the_shortcut() {
                 workspace.path(),
                 false,
                 true,
+                false,
             )
             .unwrap();
             read.finish(()).unwrap();
@@ -356,6 +358,7 @@ fn id_shaped_queries_are_identical_with_and_without_the_shortcut() {
                     workspace.path(),
                     false,
                     true,
+                    false,
                 )
                 .unwrap();
                 read.finish(()).unwrap();

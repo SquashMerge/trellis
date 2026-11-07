@@ -74,7 +74,7 @@ cd /path/to/your/repo
 trellis serve --token-file ~/.trellis-private/token
 ```
 
-`serve` prints the address, and indexes the checkout in the background. Then open **http://127.0.0.1:8877/**.
+`serve` prints the address. Then open **http://127.0.0.1:8877/**. Trellis indexes the checkout in the background once the web app, a CLI command or an MCP client first uses it.
 
 **How the token file works.** The web app needs a token to talk to Trellis. If the file doesn't exist, `serve` creates it with a random token, readable only by you. If it exists, `serve` reuses it. The file must:
 

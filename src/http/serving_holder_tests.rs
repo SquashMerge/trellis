@@ -541,7 +541,7 @@ async fn selected_startup_failure_must_not_fail_valid_q1_before_reconciliation()
     fs::write(root.join(".gitignore"), large).unwrap();
     drop(old_owner);
     let error = state.worker_step().unwrap_err();
-    assert!(format!("{error:#}").contains("unsafe or oversized input"));
+    assert!(format!("{error:#}").contains("oversized input"));
     let row = store.request_by_id(&q1.id).unwrap().unwrap();
     assert_eq!(
         (

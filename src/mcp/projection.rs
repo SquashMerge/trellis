@@ -144,7 +144,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":10,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":11,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
@@ -199,7 +199,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 10);
+        assert_eq!(ready["data"]["toolVersion"], 11);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -287,11 +287,14 @@ mod tests {
             std::path::Path::new("/selected"),
             false,
             true,
+            false,
         )
         .unwrap()
         .unwrap();
+        // #715: a zero-hit find shows the searched languages only, here Rust.
+        assert_eq!(found["data"]["scopeCoverage"][0]["language"], "rust");
         assert_eq!(
-            found["data"]["scopeCoverage"][1]["semantic"]["reimport"],
+            found["data"]["scopeCoverage"][0]["semantic"]["reimport"],
             described["data"]["languages"][1]["semantic"]["reimport"]
         );
         let script = r#"
@@ -577,6 +580,7 @@ pub fn find(
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
+    compact: bool,
 ) -> Result<Option<Value>, &'static str> {
     symbols(
         id,
@@ -586,6 +590,7 @@ pub fn find(
         catching_up,
         modern,
         SymbolMode::Find,
+        compact,
     )
 }
 
@@ -597,6 +602,7 @@ pub fn find_lookup(
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
+    compact: bool,
 ) -> Result<Option<Value>, &'static str> {
     symbols(
         id,
@@ -606,6 +612,7 @@ pub fn find_lookup(
         catching_up,
         modern,
         SymbolMode::ExactFind,
+        compact,
     )
 }
 
@@ -628,6 +635,7 @@ pub fn lookup_candidates(
         catching_up,
         modern,
         SymbolMode::Candidates(name, key),
+        false,
     )
 }
 
@@ -647,6 +655,7 @@ pub fn search(
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
+    compact: bool,
 ) -> Result<Option<Value>, &'static str> {
     let _phase = crate::search_model::SearchPhaseTimer::start("search_projection");
     if result.matched_by.len() != result.symbols.symbols.len()
@@ -672,10 +681,44 @@ pub fn search(
         catching_up,
         modern,
         SymbolMode::Search(&result.matched_by, &status, result.role),
+        compact,
     )
 }
 
+/// #715: each distinct coverage diagnostic once, in first-row order, with each row's
+/// `diagnostic` replaced by `diagnosticRef` (null without one). Re-inlining the table gives
+/// back the native coverage rows.
+fn coverage_diagnostics(
+    rows: &[&crate::native_evidence::Coverage],
+) -> Result<(Vec<Value>, Vec<String>), &'static str> {
+    let mut diagnostics: Vec<String> = Vec::new();
+    let rows = rows
+        .iter()
+        .map(|row| {
+            let mut value =
+                serde_json::to_value(row).map_err(|_| "store_unavailable: coverage projection")?;
+            let fields = value
+                .as_object_mut()
+                .ok_or("store_unavailable: coverage projection")?;
+            fields.remove("diagnostic");
+            let reference = row.diagnostic.as_ref().map(|diagnostic| {
+                diagnostics
+                    .iter()
+                    .position(|seen| seen == diagnostic)
+                    .unwrap_or_else(|| {
+                        diagnostics.push(diagnostic.clone());
+                        diagnostics.len() - 1
+                    })
+            });
+            fields.insert("diagnosticRef".into(), json!(reference));
+            Ok(value)
+        })
+        .collect::<Result<_, &'static str>>()?;
+    Ok((rows, diagnostics))
+}
+
 /// Budget the actual structured-plus-summary JSON-RPC frame, not the structured envelope alone.
+#[allow(clippy::too_many_arguments)]
 fn symbols(
     id: &Value,
     result: crate::store::mcp_read::McpFindWithLines,
@@ -684,6 +727,7 @@ fn symbols(
     catching_up: bool,
     modern: bool,
     mode: SymbolMode<'_>,
+    compact: bool,
 ) -> Result<Option<Value>, &'static str> {
     let search = match mode {
         SymbolMode::Search(matched_by, status, role) => Some((matched_by, status, role)),
@@ -704,22 +748,28 @@ fn symbols(
         .filter(|(_, row)| row[0] != 0)
         .map(|(language, _)| language)
         .collect();
-    let warnings_for = |n: usize| -> Vec<Value> {
-        let mut warnings = Vec::new();
-        if incomplete {
-            warnings.push(json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}));
-        }
-        let languages: Vec<&str> = if n == 0 {
+    let languages_for = |n: usize| -> Vec<&str> {
+        if n == 0 {
             scope_languages.clone()
         } else {
             result.symbols[..n]
                 .iter()
                 .map(|symbol| symbol.symbol.declaration.document.language.as_str())
                 .collect()
-        };
-        warnings.extend(syntax_only(tiers, languages));
+        }
+    };
+    let warnings_for = |n: usize| -> Vec<Value> {
+        let mut warnings = Vec::new();
+        if incomplete {
+            warnings.push(json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}));
+        }
+        warnings.extend(syntax_only(tiers, languages_for(n)));
         warnings
     };
+    // #715: lookup alternatives for the other tools keep the contract shape; find and
+    // search trim the scope rows, share coverage diagnostics and take `compact`.
+    let alternatives = matches!(mode, SymbolMode::Candidates(..));
+    let compact = compact && !alternatives;
     let scope = language_status(&result.scope, tiers);
     let basis = json!({"indexGeneration":result.pin.index_generation.to_string(),
         "indexRevision":result.pin.index_revision});
@@ -731,7 +781,11 @@ fn symbols(
     };
     let mut last = None;
     // The empty prefix carries only the fixed envelope and the scope rows; if
-    // even it cannot fit, the answer is range_too_large.
+    // neither it nor any hit prefix fits, the answer is range_too_large.
+    // #715: the empty prefix lists every searched language while a hit prefix
+    // lists only its own, so the empty frame is no lower bound on a hit frame:
+    // it may overflow where one hit fits. From one hit on, each longer prefix
+    // adds items and never drops a scope row, so its frame only grows.
     let start = if atomic { result.symbols.len() } else { 0 };
     for n in start..=result.symbols.len() {
         let (documents, refs) = document_table(
@@ -741,11 +795,17 @@ fn symbols(
         )?;
         let mut symbols: Vec<Value> = result.symbols[..n].iter().map(|symbol| {
             let d = &symbol.symbol.declaration;
-            Ok(json!({"symbolId":d.syntax_id,"name":d.name,"displayKey":display_key(d),"stableLookupKey":symbol.source.stable_lookup_key,
-                "kind":d.kind,"role":d.role,"doc":document_ref(&refs, &symbol.source.document).ok_or("store_unavailable: missing document ref")?,
-                "range":d.range,"nameRange":d.name_range,
-                "lines":symbol.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),
-                "evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]}))
+            let lines = symbol.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end}));
+            let doc = document_ref(&refs, &symbol.source.document).ok_or("store_unavailable: missing document ref")?;
+            // #715 compact: the follow-up handles only; the path replaces the document ref.
+            Ok(if compact {
+                json!({"symbolId":d.syntax_id,"name":d.name,"stableLookupKey":symbol.source.stable_lookup_key,
+                    "kind":d.kind,"role":d.role,"path":d.document.path,"lines":lines,"evidenceTier":"syntax"})
+            } else {
+                json!({"symbolId":d.syntax_id,"name":d.name,"displayKey":display_key(d),"stableLookupKey":symbol.source.stable_lookup_key,
+                    "kind":d.kind,"role":d.role,"doc":doc,"range":d.range,"nameRange":d.name_range,"lines":lines,
+                    "evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]})
+            })
         }).collect::<Result<Vec<_>, &'static str>>()?;
         if let Some((matched_by, _, _)) = search {
             for (index, symbol) in symbols.iter_mut().enumerate() {
@@ -806,9 +866,28 @@ fn symbols(
                 ))
         });
         let truncated = n < result.symbols.len() || result.has_more;
+        let data = if alternatives {
+            json!({"symbols":symbols,"documents":documents,"coverage":coverage,"scopeCoverage":scope,"provenance":closure})
+        } else {
+            // #715: only the scope rows of the emitted items' languages (with none, the
+            // searched languages), in #22 order. Completeness still covers every row.
+            let languages = languages_for(n);
+            let scope: Vec<&Value> = LANGUAGES
+                .iter()
+                .zip(&scope)
+                .filter(|(language, _)| languages.contains(language))
+                .map(|(_, row)| row)
+                .collect();
+            if compact {
+                json!({"symbols":symbols,"scopeCoverage":scope})
+            } else {
+                let (coverage, diagnostics) = coverage_diagnostics(&coverage)?;
+                json!({"symbols":symbols,"documents":documents,"coverage":coverage,
+                    "coverageDiagnostics":diagnostics,"scopeCoverage":scope,"provenance":closure})
+            }
+        };
         let mut envelope = json!({"schemaVersion":1,"requestId":id,"workspace":root,
-            "catchingUp":catching_up,"evidenceBasis":basis,
-            "data":{"symbols":symbols,"documents":documents,"coverage":coverage,"scopeCoverage":scope,"provenance":closure},
+            "catchingUp":catching_up,"evidenceBasis":basis,"data":data,
             "warnings":warnings_for(n),"partial":incomplete || truncated,"truncated":truncated,
             "truncationReason": if n < result.symbols.len() {Some("response_bytes")}
                 else if result.has_more {Some("limit")} else {None}});
@@ -836,7 +915,7 @@ fn symbols(
             < super::wire::RESPONSE_BYTES
         {
             last = Some(envelope);
-        } else {
+        } else if n > 0 {
             break;
         }
     }
@@ -1026,6 +1105,7 @@ mod find_tests {
                 root,
                 false,
                 modern,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -1053,7 +1133,8 @@ mod find_tests {
                 &Default::default(),
                 root,
                 false,
-                true
+                true,
+                false
             )
             .unwrap()
             .is_none()
@@ -1066,7 +1147,8 @@ mod find_tests {
                 &Default::default(),
                 root,
                 false,
-                true
+                true,
+                false
             )
             .is_err()
         );
@@ -1077,6 +1159,7 @@ mod find_tests {
             root,
             false,
             true,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -1097,6 +1180,7 @@ mod find_tests {
                 root,
                 false,
                 modern,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -1130,6 +1214,7 @@ mod find_tests {
                 root,
                 false,
                 modern,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -1145,15 +1230,21 @@ mod find_tests {
                 root,
                 false,
                 modern,
+                false,
             )
             .unwrap()
             .unwrap();
             assert_eq!(envelope["partial"], false);
             assert_eq!(envelope["warnings"].as_array().unwrap().len(), 1);
             assert_eq!(envelope["warnings"][0]["code"], "syntaxOnly");
+            // #715: with no hits, only the searched languages with selected tuples.
             assert_eq!(
                 envelope["data"]["scopeCoverage"].as_array().unwrap().len(),
-                4
+                1
+            );
+            assert_eq!(
+                envelope["data"]["scopeCoverage"][0]["language"],
+                "javascript"
             );
         }
     }
@@ -1176,6 +1267,7 @@ mod find_tests {
                 root,
                 false,
                 modern,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -1206,6 +1298,7 @@ mod find_tests {
                 root,
                 false,
                 modern,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -1278,6 +1371,7 @@ mod find_tests {
                 std::path::Path::new("/workspace"),
                 false,
                 true,
+                false,
             )
             .unwrap_err();
             assert!(failure.starts_with("store_unavailable"));
@@ -1303,6 +1397,7 @@ mod find_tests {
                 root,
                 true,
                 modern,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -1332,7 +1427,8 @@ mod find_tests {
                         .any(|symbol| symbol["doc"] == index)
                 );
             }
-            assert_eq!(data["scopeCoverage"].as_array().unwrap().len(), 4);
+            // #715: only the emitted (JavaScript) row.
+            assert_eq!(data["scopeCoverage"].as_array().unwrap().len(), 1);
             assert_eq!(envelope["catchingUp"], true);
             assert_eq!(envelope["truncated"], true);
             assert_eq!(envelope["truncationReason"], "response_bytes");
@@ -1345,6 +1441,7 @@ mod find_tests {
                 root,
                 true,
                 modern,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -1367,6 +1464,7 @@ mod find_tests {
                 root,
                 false,
                 modern,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -1393,6 +1491,7 @@ mod find_tests {
                 std::path::Path::new("/workspace"),
                 false,
                 modern,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -1448,6 +1547,7 @@ mod search_tests {
             std::path::Path::new("/workspace"),
             true,
             modern,
+            false,
         )
     }
 
@@ -1471,7 +1571,8 @@ mod search_tests {
             .unwrap()
             .unwrap();
             let data = &envelope["data"];
-            assert_eq!(data.as_object().unwrap().len(), 7);
+            assert_eq!(data.as_object().unwrap().len(), 8);
+            assert_eq!(data["coverageDiagnostics"], json!([]));
             assert_eq!(data["role"], "any");
             assert_eq!(data["searchIndex"]["state"], "partial");
             assert_eq!(data["searchIndex"]["embedded"], 1);
@@ -1499,7 +1600,13 @@ mod search_tests {
             let empty = project(unavailable, modern).unwrap().unwrap();
             assert_eq!(empty["partial"], false);
             assert_eq!(empty["data"]["searchIndex"]["backend"], Value::Null);
-            for field in ["hits", "documents", "coverage", "provenance"] {
+            for field in [
+                "hits",
+                "documents",
+                "coverage",
+                "coverageDiagnostics",
+                "provenance",
+            ] {
                 assert_eq!(empty["data"][field], json!([]));
             }
             let incomplete = [[0; 5], [2, 1, 1, 0, 0], [0; 5], [3, 3, 0, 0, 0]];
@@ -1509,7 +1616,8 @@ mod search_tests {
             assert_eq!(empty["partial"], true);
             assert_eq!(empty["warnings"][0]["code"], "coverageIncomplete");
             assert_eq!(empty["warnings"][1]["code"], "syntaxOnly");
-            assert_eq!(empty["data"]["scopeCoverage"][1]["coverage"]["partial"], 1);
+            assert_eq!(empty["data"]["scopeCoverage"][0]["language"], "rust");
+            assert_eq!(empty["data"]["scopeCoverage"][0]["coverage"]["partial"], 1);
             assert_wire(&empty, modern);
         }
     }
@@ -1547,7 +1655,13 @@ mod search_tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(empty["truncationReason"], "response_bytes");
-            for field in ["hits", "documents", "coverage", "provenance"] {
+            for field in [
+                "hits",
+                "documents",
+                "coverage",
+                "coverageDiagnostics",
+                "provenance",
+            ] {
                 assert_eq!(empty["data"][field], json!([]));
             }
             assert_wire(&empty, modern);
@@ -1644,6 +1758,451 @@ mod search_tests {
                 serde_json::to_vec(&frame).unwrap().len() + 1,
                 crate::mcp::wire::RESPONSE_BYTES
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod compact_symbol_tests {
+    //! #715: compact find and search, result-language `scopeCoverage` and the coverage
+    //! diagnostic table.
+    use super::*;
+    use crate::mcp::search::SearchResult;
+    use crate::search_model::{LexicalState, SearchIndexState, SearchIndexStatus};
+    use crate::store::mcp_read::McpFindWithLines;
+
+    const MACRO_GAP: &str = "opaque Rust macro/attribute token trees skipped; calls and definitions inside were not measured";
+    /// Java, Rust (mostly partial) and JavaScript tuples are selected; Python has none.
+    const SCOPE: [[u64; 5]; 4] = [
+        [4, 4, 0, 0, 0],
+        [117, 6, 111, 0, 0],
+        [0; 5],
+        [140, 140, 0, 0, 0],
+    ];
+
+    /// Hits `(name, language, path, partial)`, each keyed `path::name`.
+    fn fixture(hits: &[(&str, &str, &str, bool)], has_more: bool) -> McpFindWithLines {
+        let rows: Vec<_> = hits
+            .iter()
+            .map(|(name, _, path, _)| {
+                ((*name).to_owned(), "source-set:v1:test", (*path).to_owned())
+            })
+            .collect();
+        let mut result = super::find_tests::fixture(&rows, SCOPE, has_more);
+        for (i, (symbol, (name, language, path, partial))) in
+            result.symbols.iter_mut().zip(hits).enumerate()
+        {
+            symbol.symbol.declaration.syntax_id = format!("sid:v1:{i:032x}");
+            symbol.symbol.declaration.document.language = (*language).into();
+            symbol.source.document.document.language = (*language).into();
+            symbol.symbol.coverage.language = (*language).into();
+            if *partial {
+                symbol.symbol.coverage.state = "partial".into();
+                symbol.symbol.coverage.diagnostic = Some(MACRO_GAP.into());
+            }
+            symbol.source.stable_lookup_key = Some(format!("{path}::{name}"));
+            let proof = &symbol.symbol.declaration.provenance_id;
+            for row in result.provenance.iter_mut().filter(|row| &row.id == proof) {
+                row.document.language = (*language).into();
+            }
+        }
+        result
+    }
+
+    fn mixed() -> McpFindWithLines {
+        fixture(
+            &[
+                ("navigation_at", "rust", "src/store.rs", true),
+                ("navigation_in", "rust", "src/navigation.rs", true),
+                ("navigationAt", "javascript", "web/app.js", false),
+            ],
+            false,
+        )
+    }
+
+    fn search_result(symbols: McpFindWithLines) -> SearchResult {
+        SearchResult {
+            role: crate::search_rank::SearchRole::default(),
+            matched_by: symbols
+                .symbols
+                .iter()
+                .map(|_| vec!["lexical".into()])
+                .collect(),
+            symbols,
+            search_index: SearchIndexStatus {
+                state: SearchIndexState::Unavailable,
+                model_id: None,
+                model_name: None,
+                backend: None,
+                declarations: 261,
+                embedded: 0,
+                lexical: LexicalState::Complete,
+                unavailable_reason: None,
+            },
+        }
+    }
+
+    fn root() -> &'static std::path::Path {
+        std::path::Path::new("/workspace")
+    }
+
+    fn find_page(result: McpFindWithLines, compact: bool) -> Value {
+        find(
+            &json!(1),
+            result,
+            &Default::default(),
+            root(),
+            false,
+            true,
+            compact,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn search_page(result: McpFindWithLines, compact: bool) -> Value {
+        search(
+            &json!(1),
+            search_result(result),
+            &Default::default(),
+            root(),
+            false,
+            true,
+            compact,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn frame_bytes(tool: &str, envelope: &Value) -> usize {
+        let frame = json!({"jsonrpc":"2.0","id":1,
+            "result":crate::mcp::tools::result(tool, envelope.clone(), true)});
+        serde_json::to_vec(&frame).unwrap().len() + 1
+    }
+
+    fn languages(envelope: &Value) -> Vec<&str> {
+        envelope["data"]["scopeCoverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["language"].as_str().unwrap())
+            .collect()
+    }
+
+    /// Compact keeps every follow-up handle (IDs, names, paths, lines, kind, role, evidence
+    /// tier, `stableLookupKey`) and the completeness of the full answer, and drops the
+    /// document table, coverage and provenance.
+    #[test]
+    fn compact_find_and_search_keep_handles_and_drop_proof_detail() {
+        for (tool, items, project) in [
+            (
+                "trellis_find_symbols",
+                "symbols",
+                find_page as fn(McpFindWithLines, bool) -> Value,
+            ),
+            ("trellis_search_symbols", "hits", search_page),
+        ] {
+            let full = project(mixed(), false);
+            let page = project(mixed(), true);
+            let data = page["data"].as_object().unwrap();
+            let mut fields: Vec<_> = data.keys().map(String::as_str).collect();
+            fields.sort_unstable();
+            if tool == "trellis_search_symbols" {
+                assert_eq!(fields, ["hits", "role", "scopeCoverage", "searchIndex"]);
+                assert_eq!(data["searchIndex"], full["data"]["searchIndex"]);
+                assert_eq!(data["role"], full["data"]["role"]);
+            } else {
+                assert_eq!(fields, ["scopeCoverage", "symbols"]);
+            }
+            let shown = page["data"][items].as_array().unwrap();
+            let whole = full["data"][items].as_array().unwrap();
+            assert_eq!(shown.len(), 3, "{tool}");
+            for (item, full_item) in shown.iter().zip(whole) {
+                let mut kept: Vec<_> = item
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                kept.sort_unstable();
+                let mut expected = vec![
+                    "evidenceTier",
+                    "kind",
+                    "lines",
+                    "name",
+                    "path",
+                    "role",
+                    "stableLookupKey",
+                    "symbolId",
+                ];
+                if tool == "trellis_search_symbols" {
+                    expected.extend(["matchedBy", "rank"]);
+                    expected.sort_unstable();
+                }
+                assert_eq!(kept, expected, "{tool}");
+                for field in kept.iter().filter(|field| **field != "path") {
+                    assert_eq!(item[*field], full_item[*field], "{tool} {field}");
+                }
+                let doc = full_item["doc"].as_u64().unwrap() as usize;
+                assert_eq!(
+                    item["path"],
+                    full["data"]["documents"][doc]["document"]["path"]
+                );
+                assert!(item["stableLookupKey"].as_str().unwrap().contains("::"));
+            }
+            for field in ["warnings", "partial", "truncated", "truncationReason"] {
+                assert_eq!(page[field], full[field], "{tool} {field}");
+            }
+            assert_eq!(page["data"]["scopeCoverage"], full["data"]["scopeCoverage"]);
+            assert_eq!(page["partial"], true, "compact never hides incompleteness");
+            assert!(frame_bytes(tool, &page) * 2 < frame_bytes(tool, &full));
+            super::size_tests::assert_catalog_valid(tool, &[&full, &page]);
+        }
+        // An exact lookup-key find takes compact as well.
+        let lookup = find_lookup(
+            &json!(1),
+            fixture(&[("navigation_at", "rust", "src/store.rs", true)], false),
+            &Default::default(),
+            root(),
+            false,
+            true,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            lookup["data"]["symbols"][0]["stableLookupKey"],
+            "src/store.rs::navigation_at"
+        );
+        assert!(lookup["data"].get("documents").is_none());
+        super::size_tests::assert_catalog_valid("trellis_find_symbols", &[&lookup]);
+    }
+
+    /// Full and compact `scopeCoverage` list only the languages of the emitted items, in
+    /// #22 order; with no items, the searched languages with selected tuples. Completeness
+    /// still covers the whole searched scope.
+    #[test]
+    fn scope_coverage_lists_only_the_result_languages() {
+        for compact in [false, true] {
+            let javascript = find_page(
+                fixture(
+                    &[("navigationAt", "javascript", "web/app.js", false)],
+                    false,
+                ),
+                compact,
+            );
+            assert_eq!(languages(&javascript), ["javascript"]);
+            assert_eq!(
+                javascript["data"]["scopeCoverage"][0],
+                language_status(&SCOPE, &Default::default())[3]
+            );
+            // The Rust scope is partial although no Rust row is shown.
+            assert_eq!(javascript["partial"], true);
+            assert_eq!(javascript["warnings"][0]["code"], "coverageIncomplete");
+            assert_eq!(
+                languages(&find_page(mixed(), compact)),
+                ["rust", "javascript"]
+            );
+            assert_eq!(
+                languages(&search_page(mixed(), compact)),
+                ["rust", "javascript"]
+            );
+            let empty = find_page(fixture(&[], false), compact);
+            assert_eq!(languages(&empty), ["java", "rust", "javascript"]);
+            assert_eq!(empty["partial"], true);
+            let empty = search_page(fixture(&[], false), compact);
+            assert_eq!(languages(&empty), ["java", "rust", "javascript"]);
+            super::size_tests::assert_catalog_valid("trellis_find_symbols", &[&javascript]);
+        }
+        // Lookup alternatives for the other tools keep all four rows.
+        let candidates = lookup_candidates(
+            &json!(1),
+            "trellis_declaration",
+            "src/a.rs::a",
+            mixed(),
+            &Default::default(),
+            root(),
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            languages(&candidates),
+            ["java", "rust", "python", "javascript"]
+        );
+    }
+
+    /// PR #767 review: the empty prefix lists every searched language, a hit only its own.
+    /// A large unrelated Rust row that overflows the empty frame must not reject a
+    /// JavaScript hit that fits; a genuinely zero-hit answer still keeps the Rust row and,
+    /// too large, is `range_too_large`.
+    #[test]
+    fn a_large_unrelated_scope_row_does_not_reject_a_fitting_hit() {
+        let mut tiers: Tiers = Default::default();
+        tiers[1].documents = (0..700)
+            .map(|i| {
+                serde_json::from_value(json!({"producerId":"rust-analyzer","language":"rust",
+                "path":format!("src/projected/module_{i:04}.rs"),
+                "projection":{"currentPin":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":2},
+                    "semanticBasisPin":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1},
+                    "basisNativeRevisionId":"revision:v2:historical","semanticStatus":"olderBasis"}}))
+                .unwrap()
+            })
+            .collect();
+        let rust_row = serde_json::to_vec(&language_status(&SCOPE, &tiers)[1])
+            .unwrap()
+            .len();
+        assert!(rust_row > crate::mcp::wire::RESPONSE_BYTES, "{rust_row}");
+        let hit = || {
+            fixture(
+                &[("navigationAt", "javascript", "web/app.js", false)],
+                false,
+            )
+        };
+        for compact in [false, true] {
+            let found = find(&json!(1), hit(), &tiers, root(), false, true, compact)
+                .unwrap()
+                .expect("the JavaScript hit fits");
+            assert_eq!(found["data"]["symbols"].as_array().unwrap().len(), 1);
+            assert_eq!(languages(&found), ["javascript"]);
+            assert_eq!(found["truncated"], false);
+            assert_eq!(found["partial"], true, "the Rust scope is still partial");
+            let searched = search(
+                &json!(1),
+                search_result(hit()),
+                &tiers,
+                root(),
+                false,
+                true,
+                compact,
+            )
+            .unwrap()
+            .expect("the JavaScript hit fits");
+            assert_eq!(searched["data"]["hits"].as_array().unwrap().len(), 1);
+            assert_eq!(languages(&searched), ["javascript"]);
+            let empty = find(
+                &json!(1),
+                fixture(&[], false),
+                &tiers,
+                root(),
+                false,
+                true,
+                compact,
+            );
+            assert!(
+                empty.unwrap().is_none(),
+                "zero hits keep the oversized Rust row"
+            );
+        }
+    }
+
+    /// Full find and search list each distinct coverage diagnostic once in
+    /// `coverageDiagnostics`; each coverage row refers to it by `diagnosticRef`, and
+    /// re-inlining gives back the native coverage rows.
+    #[test]
+    fn coverage_diagnostics_are_listed_once() {
+        for (tool, project) in [
+            (
+                "trellis_find_symbols",
+                find_page as fn(McpFindWithLines, bool) -> Value,
+            ),
+            ("trellis_search_symbols", search_page),
+        ] {
+            let page = project(mixed(), false);
+            let data = &page["data"];
+            assert_eq!(data["coverageDiagnostics"], json!([MACRO_GAP]));
+            let rows = data["coverage"].as_array().unwrap();
+            assert_eq!(rows.len(), 3);
+            let mut expected: Vec<_> = mixed()
+                .symbols
+                .iter()
+                .map(|symbol| serde_json::to_value(&symbol.symbol.coverage).unwrap())
+                .collect();
+            expected.sort_by_key(|row| {
+                (
+                    row["language"] != "rust",
+                    row["documentPath"].as_str().unwrap().to_owned(),
+                )
+            });
+            for (row, native) in rows.iter().zip(&expected) {
+                assert!(row.get("diagnostic").is_none());
+                let mut inlined = row.clone();
+                let reference = inlined
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("diagnosticRef")
+                    .unwrap();
+                inlined["diagnostic"] = match reference.as_u64() {
+                    Some(index) => data["coverageDiagnostics"][index as usize].clone(),
+                    None => Value::Null,
+                };
+                assert_eq!(&inlined, native, "{tool}");
+            }
+            assert_eq!(rows[0]["diagnosticRef"], 0);
+            assert_eq!(rows[1]["diagnosticRef"], 0);
+            assert_eq!(rows[2]["diagnosticRef"], Value::Null);
+            super::size_tests::assert_catalog_valid(tool, &[&page]);
+        }
+    }
+
+    /// Twenty Rust hits in twenty partial documents, the dogfood's shape: compact is under
+    /// a third of the full page, and the full page is smaller than before #715 (four
+    /// scope rows and the diagnostic inline on every coverage row).
+    #[test]
+    fn compact_symbol_pages_are_a_fraction_of_the_full_page() {
+        let names: Vec<_> = (0..20)
+            .map(|i| {
+                (
+                    format!("catching_up_{i}"),
+                    format!("src/daemon/module_{i}.rs"),
+                )
+            })
+            .collect();
+        let hits: Vec<_> = names
+            .iter()
+            .map(|(name, path)| (name.as_str(), "rust", path.as_str(), true))
+            .collect();
+        for (tool, project) in [
+            (
+                "trellis_find_symbols",
+                find_page as fn(McpFindWithLines, bool) -> Value,
+            ),
+            ("trellis_search_symbols", search_page),
+        ] {
+            let full = project(fixture(&hits, true), false);
+            let page = project(fixture(&hits, true), true);
+            let mut old = full.clone();
+            let data = old["data"].as_object_mut().unwrap();
+            let diagnostics = data.remove("coverageDiagnostics").unwrap();
+            for row in data["coverage"].as_array_mut().unwrap() {
+                let row = row.as_object_mut().unwrap();
+                let reference = row.remove("diagnosticRef").unwrap();
+                row.insert(
+                    "diagnostic".into(),
+                    diagnostics[reference.as_u64().unwrap() as usize].clone(),
+                );
+            }
+            data.insert(
+                "scopeCoverage".into(),
+                json!(language_status(&SCOPE, &Default::default())),
+            );
+            let (old, full_bytes, compact) = (
+                frame_bytes(tool, &old),
+                frame_bytes(tool, &full),
+                frame_bytes(tool, &page),
+            );
+            eprintln!("#715 {tool}: before {old} B, full {full_bytes} B, compact {compact} B");
+            assert!(
+                full_bytes + 20 * 80 < old,
+                "{tool}: full {full_bytes}, old {old}"
+            );
+            assert!(
+                compact * 3 < full_bytes,
+                "{tool}: compact {compact}, full {full_bytes}"
+            );
+            assert!(compact < 8 * 1024, "{tool}: compact {compact}");
+            assert_eq!(page["truncationReason"], "limit");
         }
     }
 }
@@ -2170,10 +2729,12 @@ pub fn outgoing(
 /// #665: each distinct semantic basis is emitted once in `data.semanticBases` and proofs
 /// carry `basisRef`, as outgoing and incoming calls do. `compact` drops the proof detail
 /// (see [`compact_graph`]) and is fitted on its own, smaller frame.
+#[allow(clippy::too_many_arguments)]
 pub fn call_graph(
     id: &Value,
     answer: &mut crate::graph_query::GraphAnswer,
     stable_lookup_key: Option<&str>,
+    node_keys: &std::collections::BTreeMap<String, String>,
     compact: bool,
     root: &std::path::Path,
     catching_up: bool,
@@ -2228,7 +2789,7 @@ pub fn call_graph(
             let mut data = json!({"stableLookupKey":stable_lookup_key,"requested":requested,
                 "result":projected,"semanticBases":bases,"responseOmitted":omitted});
             if compact {
-                compact_graph(&mut data);
+                compact_graph(&mut data, node_keys);
             }
             Ok(
                 json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
@@ -2287,7 +2848,9 @@ const CALLEE_TEXT_BYTES: usize = 1024;
 /// result's `coverage`, `provenance` and `projectedProvenance`, each edge's `binding`
 /// (replaced by its `resolution`, null without one), each node declaration's header, ancestors, key, name
 /// range, revision and proof, and each call's document, revision, regions and proof.
-fn compact_graph(data: &mut Value) {
+/// #715: each node declaration adds its `stableLookupKey` from `node_keys` (null without
+/// one), the durable handle for follow-up calls.
+fn compact_graph(data: &mut Value, node_keys: &std::collections::BTreeMap<String, String>) {
     if let Some(fields) = data.as_object_mut() {
         fields.remove("semanticBases");
     }
@@ -2309,6 +2872,11 @@ fn compact_graph(data: &mut Value) {
             ] {
                 declaration.remove(field);
             }
+            let key = declaration
+                .get("syntaxId")
+                .and_then(Value::as_str)
+                .and_then(|sid| node_keys.get(sid));
+            declaration.insert("stableLookupKey".into(), json!(key));
         }
     }
     for edge in result["edges"].as_array_mut().into_iter().flatten() {
@@ -3403,6 +3971,7 @@ mod call_graph_tests {
             &json!("graph"),
             answer,
             None,
+            &Default::default(),
             false,
             std::path::Path::new("/w"),
             false,
@@ -4200,10 +4769,37 @@ mod size_tests {
     }
 
     fn project_graph(answer: &mut crate::graph_query::GraphAnswer, compact: bool) -> Value {
+        project_graph_keys(answer, compact, &graph_node_keys(answer))
+    }
+
+    /// Every node's stable lookup key, as the server reads them for a compact graph.
+    fn graph_node_keys(
+        answer: &crate::graph_query::GraphAnswer,
+    ) -> std::collections::BTreeMap<String, String> {
+        let Ok(result) = &answer.outcome else {
+            return Default::default();
+        };
+        result
+            .nodes
+            .iter()
+            .map(|node| {
+                let d = &node.declaration;
+                let name = d.name.clone().unwrap_or_default();
+                (d.syntax_id.clone(), format!("{}::{name}", d.document.path))
+            })
+            .collect()
+    }
+
+    fn project_graph_keys(
+        answer: &mut crate::graph_query::GraphAnswer,
+        compact: bool,
+        node_keys: &std::collections::BTreeMap<String, String>,
+    ) -> Value {
         super::call_graph(
             &json!(1),
             answer,
             Some("src/daemon/state.rs::DaemonState::enqueue_index"),
+            node_keys,
             compact,
             std::path::Path::new("/Users/someone/projects/trellis"),
             false,
@@ -4413,6 +5009,7 @@ for (const output of JSON.parse(readFileSync(0,'utf8'))) {
         assert!(!result.contains_key("coverage"));
         assert!(!result.contains_key("provenance"));
         let (graph, proofs) = (&page["data"]["result"], &full["data"]["result"]);
+        let keys = graph_node_keys(&answer);
         for (node, whole) in graph["nodes"]
             .as_array()
             .unwrap()
@@ -4431,14 +5028,25 @@ for (const output of JSON.parse(readFileSync(0,'utf8'))) {
                     "name",
                     "range",
                     "role",
+                    "stableLookupKey",
                     "syntaxId"
                 ]
             );
-            for field in kept {
+            // #715: every compact node keeps its durable follow-up handle.
+            let sid = declaration["syntaxId"].as_str().unwrap();
+            assert_eq!(declaration["stableLookupKey"], json!(keys[sid]));
+            for field in kept.into_iter().filter(|field| *field != "stableLookupKey") {
                 assert_eq!(declaration[field], whole["declaration"][field]);
             }
+            assert!(whole["declaration"].get("stableLookupKey").is_none());
             assert_eq!(node["depth"], whole["depth"]);
         }
+        // A node without a stable key (a partial Rust impl parse) says so with null.
+        let unkeyed = project_graph_keys(&mut answer, true, &Default::default());
+        for node in unkeyed["data"]["result"]["nodes"].as_array().unwrap() {
+            assert_eq!(node["declaration"]["stableLookupKey"], Value::Null);
+        }
+        assert_catalog_valid("trellis_call_graph", &[&full, &page, &unkeyed]);
         let edges = graph["edges"].as_array().unwrap();
         assert_eq!(edges.len(), proofs["edges"].as_array().unwrap().len());
         for (edge, whole) in edges.iter().zip(proofs["edges"].as_array().unwrap()) {
@@ -4500,7 +5108,8 @@ for (const output of JSON.parse(readFileSync(0,'utf8'))) {
                 json!({"nodes":0,"edges":0})
             );
             let bytes = graph_frame_bytes(&page);
-            assert!(bytes < 56 * 1024, "compact={compact}: {bytes} bytes");
+            // #715: compact node keys add about 3 KB at fifty nodes; the cap is 64 KiB.
+            assert!(bytes < 60 * 1024, "compact={compact}: {bytes} bytes");
         }
     }
 
@@ -4541,7 +5150,7 @@ for (const output of JSON.parse(readFileSync(0,'utf8'))) {
     }
 
     /// Validate tool outputs against the reviewed catalog fixture's closed output schema.
-    fn assert_catalog_valid(tool: &str, outputs: &[&Value]) {
+    pub(super) fn assert_catalog_valid(tool: &str, outputs: &[&Value]) {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let script = r#"
