@@ -1039,6 +1039,16 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
         let cancel = |id: Value| json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}});
         writeln!(peer.stdin.as_mut().unwrap(), "{}", call(json!("cancel-A"))).unwrap();
         let hold = |listener: &UnixListener| {
+            // A call decided without its pause (such as one past its deadline)
+            // never connects: fail at the backstop instead of blocking (#742).
+            let mut ready = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let backstop = trellis::testing::HANG_BACKSTOP.as_millis() as libc::c_int;
+            let polled = unsafe { libc::poll(&mut ready, 1, backstop) };
+            assert_eq!(polled, 1, "no call reached launch_final ({variant})");
             let (phase, _) = listener.accept().unwrap();
             phase
                 .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
@@ -1159,11 +1169,17 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
                 }
             }
             "calls" => {
-                let mut answered = Vec::new();
+                // Calls that finish together are decided as one batch: the
+                // daemon pauses at each one's launch_final before writing any
+                // of their replies, so all three are released first (#742).
                 for _ in 0..3 {
                     hold(&listener).write_all(b"x").unwrap();
+                }
+                let mut answered = Vec::new();
+                for _ in 0..3 {
                     let reply = next();
-                    assert!(reply["result"].is_object(), "{reply}");
+                    // The relay's deadline answer is a result object too.
+                    assert_eq!(reply["result"]["isError"], false, "{reply}");
                     answered.push(reply["id"].as_u64().unwrap());
                 }
                 answered.sort_unstable();
