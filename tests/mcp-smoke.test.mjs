@@ -242,6 +242,23 @@ test('a configured producer missing from scope still fails even when another lan
   }
 });
 
+test('a configured language absent from find scope uses the described status', async () => {
+  // #715: find lists only the returned languages in `scopeCoverage`.
+  for (const [semantic, ok] of [
+    [{producerId: 'scip-typescript', available: true, freshness: 'fresh'}, true],
+    [{producerId: 'scip-typescript', available: false, freshness: 'stale'}, false],
+  ]) {
+    const client = clientFor((name, result) => {
+      if (name === 'trellis_workspace_describe') result.structuredContent.data.languages.push({language: 'javascript', semantic});
+      return result;
+    });
+    const report = await exercise(client, liveTools, '/fixture', 'main');
+    assert.equal(report.ok, ok, JSON.stringify(report));
+    assert.equal(report.semanticCapabilities.find(row => row.language === 'javascript').status,
+      ok ? 'ready' : 'unavailable');
+  }
+});
+
 test('CLI requires explicit absolute installed binary and checkout', () => {
   assert.deepEqual(parseArgs(['--binary', '/installed/trellis', '--workspace', '/fixture']), {binary: '/installed/trellis', workspace: '/fixture', query: 'main'});
   assert.throws(() => parseArgs(['--binary', 'trellis', '--workspace', '/fixture']));

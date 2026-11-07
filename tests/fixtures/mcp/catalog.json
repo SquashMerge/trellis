@@ -982,7 +982,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 10
+                  "const": 11
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1147,6 +1147,10 @@
         "lookupKey": {
           "type": "string",
           "minLength": 1
+        },
+        "compact": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -1199,16 +1203,6 @@
         "Coverage": {
           "additionalProperties": false,
           "properties": {
-            "diagnostic": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Text"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
             "documentPath": {
               "$ref": "#/$defs/Path"
             },
@@ -1251,6 +1245,16 @@
                 "$ref": "#/$defs/Role"
               },
               "type": "array"
+            },
+            "diagnosticRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -1264,7 +1268,7 @@
             "state",
             "supportedRoles",
             "observedRoles",
-            "diagnostic"
+            "diagnosticRef"
           ],
           "type": "object"
         },
@@ -2312,6 +2316,72 @@
             "path",
             "projection"
           ]
+        },
+        "CompactSymbol": {
+          "additionalProperties": false,
+          "type": "object",
+          "properties": {
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            }
+          },
+          "required": [
+            "symbolId",
+            "name",
+            "stableLookupKey",
+            "kind",
+            "role",
+            "path",
+            "lines",
+            "evidenceTier"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2339,12 +2409,19 @@
                     "$ref": "#/$defs/LanguageStatus"
                   },
                   "maxItems": 4,
-                  "minItems": 4,
+                  "minItems": 0,
                   "type": "array"
                 },
                 "symbols": {
                   "items": {
-                    "$ref": "#/$defs/Symbol"
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/Symbol"
+                      },
+                      {
+                        "$ref": "#/$defs/CompactSymbol"
+                      }
+                    ]
                   },
                   "type": "array"
                 },
@@ -2353,16 +2430,26 @@
                   "items": {
                     "$ref": "#/$defs/DocumentRef"
                   }
+                },
+                "coverageDiagnostics": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/Text"
+                  }
                 }
               },
               "required": [
                 "symbols",
-                "coverage",
-                "scopeCoverage",
-                "provenance",
-                "documents"
+                "scopeCoverage"
               ],
-              "type": "object"
+              "type": "object",
+              "dependentRequired": {
+                "documents": [
+                  "coverage",
+                  "coverageDiagnostics",
+                  "provenance"
+                ]
+              }
             },
             "evidenceBasis": {
               "anyOf": [
@@ -2445,7 +2532,7 @@
       ],
       "type": "object"
     },
-    "description": "Find declarations by literal name or ID substring (no regex). Returns symbol IDs for the other tools, with line ranges. Results are native declarations; `scopeCoverage` also reports each language's selected semantic evidence, and `syntaxOnly` appears only for returned languages without it. Callables and types rank before fields, parameters and variables."
+    "description": "Find declarations by literal name or ID substring (no regex), callables and types first. Returns symbol IDs and stable lookup keys for the other tools, with line ranges. `scopeCoverage` reports the returned languages' semantic evidence; `syntaxOnly` names those without it. `compact:true` drops documents, coverage and provenance."
   },
   {
     "annotations": {
@@ -2512,6 +2599,10 @@
             "test"
           ],
           "default": "any"
+        },
+        "compact": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -2543,16 +2634,6 @@
         "Coverage": {
           "additionalProperties": false,
           "properties": {
-            "diagnostic": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Text"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
             "documentPath": {
               "$ref": "#/$defs/Path"
             },
@@ -2595,6 +2676,16 @@
                 "$ref": "#/$defs/Role"
               },
               "type": "array"
+            },
+            "diagnosticRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -2608,7 +2699,7 @@
             "state",
             "supportedRoles",
             "observedRoles",
-            "diagnostic"
+            "diagnosticRef"
           ],
           "type": "object"
         },
@@ -2950,104 +3041,6 @@
             "configHash",
             "dependencyHash",
             "lookupDependencies"
-          ],
-          "type": "object"
-        },
-        "Symbol": {
-          "additionalProperties": false,
-          "properties": {
-            "displayKey": {
-              "$ref": "#/$defs/Text"
-            },
-            "evidenceTier": {
-              "const": "syntax"
-            },
-            "freshness": {
-              "const": "fresh"
-            },
-            "kind": {
-              "$ref": "#/$defs/Kind"
-            },
-            "name": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Text"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "nameRange": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Range"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "range": {
-              "$ref": "#/$defs/Range"
-            },
-            "semanticBasis": {
-              "const": null
-            },
-            "staleBecause": {
-              "maxItems": 0,
-              "type": "array"
-            },
-            "symbolId": {
-              "$ref": "#/$defs/SyntaxId"
-            },
-            "doc": {
-              "$ref": "#/$defs/UInt"
-            },
-            "lines": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/LineSpan"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "role": {
-              "type": "string",
-              "enum": [
-                "test",
-                "production"
-              ]
-            },
-            "stableLookupKey": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "minLength": 1
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "symbolId",
-            "name",
-            "displayKey",
-            "kind",
-            "range",
-            "nameRange",
-            "evidenceTier",
-            "semanticBasis",
-            "freshness",
-            "staleBecause",
-            "doc",
-            "lines",
-            "role",
-            "stableLookupKey"
           ],
           "type": "object"
         },
@@ -3862,6 +3855,109 @@
             "path",
             "projection"
           ]
+        },
+        "CompactSearchHit": {
+          "additionalProperties": false,
+          "type": "object",
+          "properties": {
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "rank": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "matchedBy": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "lexical",
+                  "vector"
+                ]
+              },
+              "minItems": 1,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "oneOf": [
+                {
+                  "const": [
+                    "lexical"
+                  ]
+                },
+                {
+                  "const": [
+                    "vector"
+                  ]
+                },
+                {
+                  "const": [
+                    "lexical",
+                    "vector"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "symbolId",
+            "name",
+            "stableLookupKey",
+            "kind",
+            "role",
+            "path",
+            "lines",
+            "evidenceTier",
+            "rank",
+            "matchedBy"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3889,7 +3985,7 @@
                     "$ref": "#/$defs/LanguageStatus"
                   },
                   "maxItems": 4,
-                  "minItems": 4,
+                  "minItems": 0,
                   "type": "array"
                 },
                 "documents": {
@@ -3901,7 +3997,14 @@
                 "hits": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/$defs/SearchHit"
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/SearchHit"
+                      },
+                      {
+                        "$ref": "#/$defs/CompactSearchHit"
+                      }
+                    ]
                   }
                 },
                 "searchIndex": {
@@ -3914,18 +4017,28 @@
                     "production",
                     "test"
                   ]
+                },
+                "coverageDiagnostics": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/Text"
+                  }
                 }
               },
               "required": [
                 "hits",
-                "documents",
-                "coverage",
                 "scopeCoverage",
-                "provenance",
                 "searchIndex",
                 "role"
               ],
-              "type": "object"
+              "type": "object",
+              "dependentRequired": {
+                "documents": [
+                  "coverage",
+                  "coverageDiagnostics",
+                  "provenance"
+                ]
+              }
             },
             "evidenceBasis": {
               "anyOf": [
@@ -4008,7 +4121,7 @@
       ],
       "type": "object"
     },
-    "description": "Rank declarations for a natural-language or code query (lexical plus local vector search when available). Returns symbol IDs for the other tools. Relevance is not proof; `scopeCoverage` reports each language's selected semantic evidence."
+    "description": "Rank declarations for a natural-language or code query (lexical plus local vector search when available). Returns symbol IDs and stable lookup keys for the other tools. Relevance is not proof; `scopeCoverage` reports the returned languages' semantic evidence. `compact:true` drops documents, coverage and provenance."
   },
   {
     "annotations": {
@@ -13243,6 +13356,17 @@
             },
             "range": {
               "$ref": "#/$defs/Range"
+            },
+            "stableLookupKey": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -13252,7 +13376,8 @@
             "kind",
             "name",
             "lookupKey",
-            "range"
+            "range",
+            "stableLookupKey"
           ],
           "type": "object"
         },
@@ -13547,7 +13672,7 @@
       ],
       "type": "object"
     },
-    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Defaults: depth 2, maxNodes 8, maxCalls 10 with full proofs; `compact:true` keeps node keys, names, paths, edge kinds and resolutions, drops bindings, coverage and provenance, and defaults to maxNodes 50, maxCalls 60. Each distinct semantic basis appears once in `semanticBases`; `responseOmitted` counts nodes and edges cut to fit the response. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead."
+    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Defaults: depth 2, maxNodes 8, maxCalls 10 with full proofs; `compact:true` keeps node and stable lookup keys, names, paths, edge kinds and resolutions, drops bindings, coverage and provenance, and defaults to maxNodes 50, maxCalls 60. Each distinct semantic basis appears once in `semanticBases`; `responseOmitted` counts nodes and edges cut to fit the response. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead."
   },
   {
     "annotations": {

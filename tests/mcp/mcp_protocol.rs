@@ -902,22 +902,10 @@ fn golden_settled_failure(id: &Value, root: &Value, code: &str, basis: Value) ->
 }
 
 /// Find's four scope rows for a checkout with no native documents (#156).
-fn empty_scope_coverage() -> Value {
-    let row = |language: &str| {
-        json!({"language":language,"nativeCoverageTier":"syntax","coverage":{
-            "selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
-            "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
-                "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
-                "documents":[],
-                "note":"no semantic producer published; showing syntax","reimport":null}})
-    };
-    json!([row("java"), row("rust"), row("python"), row("javascript")])
-}
-
 fn golden_settled_empty_find(id: &Value, root: &Value, pin: &Value) -> Value {
     json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":false,
         "evidenceBasis":pin,"data":{"symbols":[],"documents":[],"coverage":[],
-            "scopeCoverage":empty_scope_coverage(),"provenance":[]},
+            "coverageDiagnostics":[],"scopeCoverage":[],"provenance":[]},
         "warnings":[{"code":"syntaxOnly","message":"This answer is syntax-derived",
             "provenanceId":null}],"partial":false,"truncated":false,
         "truncationReason":null})
@@ -2900,8 +2888,8 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
                 let data = &answer["result"]["structuredContent"]["data"];
                 assert_eq!(
                     *data,
-                    json!({"symbols":[],"documents":[],"coverage":[],"scopeCoverage":empty_scope_coverage(),
-                        "provenance":[]})
+                    json!({"symbols":[],"documents":[],"coverage":[],"coverageDiagnostics":[],
+                        "scopeCoverage":[],"provenance":[]})
                 );
             } else {
                 tool(&answer, Some("not_found"), !legacy);
@@ -6900,6 +6888,7 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     assert_eq!(data["data"]["symbols"], json!([]));
     // #156: a zero-hit find carries no per-document rows; the searched
     // scope is reported as per-language tuple counts from the same snapshot.
+    // #715: only the searched languages with selected tuples (Java's are unselected).
     assert_eq!(data["data"]["coverage"], json!([]));
     let row = |language: &str, counts: [u64; 5]| {
         json!({"language":language,"nativeCoverageTier":"syntax","coverage":{
@@ -6913,7 +6902,6 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     assert_eq!(
         data["data"]["scopeCoverage"],
         json!([
-            row("java", [0, 0, 0, 0, 2]),
             row("rust", [1, 1, 0, 0, 0]),
             row("python", [2, 0, 1, 1, 0]),
             row("javascript", [1, 1, 0, 0, 0]),
@@ -7141,7 +7129,10 @@ async fn mcp_find_zero_hit_over_a_large_scope_fits_with_scope_counts() {
         })
         .sum();
     assert_eq!(total, 270, "{envelope}");
-    assert_eq!(scope[3]["coverage"]["complete"], 270, "{envelope}");
+    // #715: only the searched language with selected tuples.
+    assert_eq!(scope.len(), 1, "{envelope}");
+    assert_eq!(scope[0]["language"], "javascript");
+    assert_eq!(scope[0]["coverage"]["complete"], 270, "{envelope}");
     assert_eq!(envelope["partial"], false);
 }
 
@@ -13091,14 +13082,23 @@ async fn mcp_search_zero_hits_keep_incomplete_native_scope_separate_from_vectors
         assert_eq!(envelope["warnings"][0]["code"], "coverageIncomplete");
         assert_eq!(envelope["warnings"][1]["code"], "syntaxOnly");
         assert_eq!(envelope["warnings"].as_array().unwrap().len(), 2);
+        // #715: the hit's language only; with no hit, the searched languages. The
+        // incomplete Python scope keeps the answer partial either way.
         let scope = envelope["data"]["scopeCoverage"].as_array().unwrap();
-        assert_eq!(scope.len(), 4);
-        assert_eq!(scope[2]["language"], "python");
-        assert_eq!(scope[2]["coverage"]["partial"], 1);
+        let languages: Vec<_> = scope
+            .iter()
+            .map(|row| row["language"].as_str().unwrap())
+            .collect();
+        if count == 0 {
+            assert_eq!(languages, ["python", "javascript"]);
+            assert_eq!(scope[0]["coverage"]["partial"], 1);
+        } else {
+            assert_eq!(languages, ["javascript"]);
+        }
         assert_eq!(envelope["data"]["searchIndex"]["state"], "unavailable");
         assert_eq!(envelope["data"]["searchIndex"]["embedded"], 0);
         if count == 0 {
-            for field in ["documents", "coverage", "provenance"] {
+            for field in ["documents", "coverage", "coverageDiagnostics", "provenance"] {
                 assert_eq!(envelope["data"][field], json!([]));
             }
         } else {
@@ -15159,6 +15159,22 @@ async fn call_graph_compact_and_basis_table_through_mcp() {
     assert_eq!(mcp.shape(whole), mcp.shape(small));
     assert!(small.get("provenance").is_none() && small.get("coverage").is_none());
     assert!(compact["data"].get("semanticBases").is_none());
+    // #715: every compact node keeps its stable lookup key; the full declaration is the
+    // contract record and has none.
+    let nodes = small["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 4, "{compact}");
+    for node in nodes {
+        let declaration = &node["declaration"];
+        let name = declaration["name"].as_str().unwrap();
+        assert_eq!(declaration["stableLookupKey"], format!("a.rs::{name}"));
+    }
+    assert!(
+        whole["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["declaration"].get("stableLookupKey").is_none())
+    );
     for edge in small["edges"].as_array().unwrap() {
         assert!(edge.get("binding").is_none());
         assert_eq!(edge["resolution"], "resolved");
@@ -15168,6 +15184,85 @@ async fn call_graph_compact_and_basis_table_through_mcp() {
             envelope["data"]["responseOmitted"],
             json!({"nodes":0,"edges":0})
         );
+    }
+    mcp.finish();
+}
+
+/// #715: `compact` reaches find (query and lookup key) and search through MCP. Each item
+/// keeps its stable lookup key and path, the answer drops documents, coverage and
+/// provenance, and full and compact `scopeCoverage` list only the result languages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_find_and_search_through_mcp() {
+    let spec = graph_fixtures::Spec::new(&[
+        (
+            "src/lib.rs",
+            "fn navigation_at() {}\nfn navigation_in() {}\n",
+        ),
+        ("web/app.js", "function navigationAt() {}\n"),
+    ]);
+    let mut mcp = GraphMcp::start(715, &[spec], Default::default()).await;
+    let languages = |envelope: &Value| -> Vec<String> {
+        envelope["data"]["scopeCoverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["language"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    for (name, items, arguments) in [
+        (
+            "trellis_find_symbols",
+            "symbols",
+            json!({"schemaVersion":1,"query":"navigation_"}),
+        ),
+        (
+            "trellis_find_symbols",
+            "symbols",
+            json!({"schemaVersion":1,"lookupKey":"src/lib.rs::navigation_at"}),
+        ),
+        (
+            "trellis_search_symbols",
+            "hits",
+            json!({"schemaVersion":1,"query":"navigation"}),
+        ),
+    ] {
+        let full = mcp.call_tool(name, arguments.clone());
+        let mut compact_args = arguments;
+        compact_args["compact"] = json!(true);
+        let compact = mcp.call_tool(name, compact_args);
+        let shown = compact["data"][items].as_array().unwrap();
+        assert!(!shown.is_empty(), "{full}");
+        assert_eq!(shown.len(), full["data"][items].as_array().unwrap().len());
+        for item in shown {
+            let key = item["stableLookupKey"].as_str().unwrap();
+            let path = item["path"].as_str().unwrap();
+            assert_eq!(key, format!("{path}::{}", item["name"].as_str().unwrap()));
+            assert!(item.get("doc").is_none() && item.get("range").is_none());
+        }
+        for field in ["documents", "coverage", "provenance", "coverageDiagnostics"] {
+            assert!(compact["data"].get(field).is_none(), "{field}");
+            assert!(full["data"].get(field).is_some(), "{field}");
+        }
+        assert_eq!(
+            compact["data"]["scopeCoverage"],
+            full["data"]["scopeCoverage"]
+        );
+        let mut expected: Vec<String> = shown
+            .iter()
+            .map(|item| {
+                if item["path"].as_str().unwrap().ends_with(".rs") {
+                    "rust".to_owned()
+                } else {
+                    "javascript".to_owned()
+                }
+            })
+            .collect();
+        expected.sort_by_key(|language| language != "rust");
+        expected.dedup();
+        assert_eq!(languages(&full), expected, "{full}");
+        for field in ["warnings", "partial", "truncated", "truncationReason"] {
+            assert_eq!(compact[field], full[field], "{name} {field}");
+        }
     }
     mcp.finish();
 }

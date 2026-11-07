@@ -149,6 +149,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "query",
                 "lookupKey",
                 "limit",
+                "compact",
                 "expectedBasis",
                 "workspace",
             ],
@@ -160,6 +161,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "query",
                 "limit",
                 "role",
+                "compact",
                 "expectedBasis",
                 "workspace",
             ],
@@ -232,9 +234,11 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             &["schemaVersion", "path", "startLine", "endLine"],
         ),
     };
+    // `compact` (#528, #665, #715) is a closed boolean wherever a tool accepts it.
     if !closed(o, fields, required)
         || o.get("schemaVersion").and_then(wire::uint) != Some(1)
         || !expected_basis(o)
+        || o.get("compact").is_some_and(|value| !value.is_boolean())
     {
         return Err("invalid_request");
     }
@@ -396,7 +400,8 @@ fn call_graph_arguments(o: &serde_json::Map<String, Value>) -> Result<(), &'stat
 /// #665: the MCP graph's default `maxNodes` and `maxCalls`, sized so a default answer fits
 /// the 65,536-byte response. A full answer carries every proof: eight nodes and ten
 /// semantic edges in this repository's shape (`DaemonState::enqueue_index`) measured about
-/// 50 KB. A compact answer drops them: fifty nodes and sixty edges measured about 51 KB.
+/// 50 KB. A compact answer drops them: fifty nodes and sixty edges measured about 51 KB,
+/// plus about 3 KB for the #715 node `stableLookupKey`s.
 pub const GRAPH_DEFAULT_LIMITS: (u64, u64) = (8, 10);
 pub const GRAPH_COMPACT_DEFAULT_LIMITS: (u64, u64) = (50, 60);
 
@@ -1099,7 +1104,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":10,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":11,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
@@ -1424,15 +1429,20 @@ mod tests {
             }
         }
     }
-    /// #528: `compact` is an optional boolean on the two call tools only.
+    /// #528, #715: `compact` is an optional boolean on the call tools and on find and
+    /// search (query and lookup-key find alike); other tools reject it.
     #[test]
-    fn compact_is_a_closed_boolean_on_the_call_tools() {
-        for name in [
-            "trellis_outgoing_calls",
-            "trellis_incoming_calls",
-            "trellis_call_graph",
+    fn compact_is_a_closed_boolean_on_the_call_and_symbol_tools() {
+        let lookup = json!({"schemaVersion":1,"lookupKey":"src/a.rs::a"});
+        for (name, base) in [
+            ("trellis_outgoing_calls", good("trellis_outgoing_calls")),
+            ("trellis_incoming_calls", good("trellis_incoming_calls")),
+            ("trellis_call_graph", good("trellis_call_graph")),
+            ("trellis_find_symbols", good("trellis_find_symbols")),
+            ("trellis_find_symbols", lookup),
+            ("trellis_search_symbols", good("trellis_search_symbols")),
         ] {
-            let mut valid = good(name);
+            let mut valid = base;
             for compact in [json!(true), json!(false)] {
                 valid["compact"] = compact;
                 assert_eq!(validate(name, Some(&valid)), Ok(()), "{name}");
@@ -1442,7 +1452,7 @@ mod tests {
                 check(name, &valid, "invalid_request");
             }
         }
-        for name in ["trellis_find_symbols", "trellis_declaration"] {
+        for name in ["trellis_declaration", "trellis_read_source"] {
             let mut other = good(name);
             other["compact"] = json!(true);
             check(name, &other, "invalid_request");

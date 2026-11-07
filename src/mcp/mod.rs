@@ -1231,6 +1231,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 serde_json::from_value(value.clone())
                                     .expect("validated search role")
                             });
+                    let compact = args.get("compact").and_then(|v| v.as_bool()) == Some(true);
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |runtime, response, sampled, prepared| {
                         let prepared = prepared.expect("search query prepared before admission");
@@ -1442,6 +1443,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             root,
                             sampled,
                             modern,
+                            compact,
                         )
                         .map_err(|error| anyhow::anyhow!(error))
                         .map(|envelope| {
@@ -1455,6 +1457,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let limit = args
                         .get("limit")
                         .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
+                    let compact = args.get("compact").and_then(|v| v.as_bool()) == Some(true);
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |_, response, sampled, _query| {
                         let found = if let Some(key) = lookup_key {
@@ -1468,9 +1471,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         };
                         let tiers = response.mcp_language_tiers()?;
                         let projected = if lookup_key.is_some() {
-                            projection::find_lookup(id, found, &tiers, root, sampled, modern)
+                            projection::find_lookup(
+                                id, found, &tiers, root, sampled, modern, compact,
+                            )
                         } else {
-                            projection::find(id, found, &tiers, root, sampled, modern)
+                            projection::find(id, found, &tiers, root, sampled, modern, compact)
                         };
                         Ok(projected
                             .map_err(|error| anyhow::anyhow!(error))?
@@ -1694,10 +1699,19 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         }
                         let stable_lookup_key =
                             response.mcp_stable_lookup_key(&query.root_syntax_id, expected)?;
+                        // #715: compact nodes keep their stable lookup keys.
+                        let node_keys = match &answer.outcome {
+                            Ok(result) if compact => response.mcp_stable_lookup_keys(
+                                result.nodes.iter().map(|node| &node.declaration),
+                                answer.basis,
+                            )?,
+                            _ => Default::default(),
+                        };
                         Ok(projection::call_graph(
                             id,
                             &mut answer,
                             stable_lookup_key.as_deref(),
+                            &node_keys,
                             compact,
                             root,
                             sampled,

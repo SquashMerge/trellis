@@ -306,6 +306,65 @@ counts and the CLI and browser shapes are unchanged.
   deviations fill the first 8 pages (189 KB), each with one basis entry and none
   inline.
 
+## Amendment (#715): compact find and search, result-language scope rows
+
+From the 2026-11-05 dogfood: `trellis_search_symbols` returned about 7 KB for six hits,
+most of it context repeated on every call: four `scopeCoverage` rows whatever the result
+languages, the same Rust macro-gap diagnostic on every coverage row, and proof detail an
+agent rarely reads. `toolVersion` is **11** (previously 10). This section wins over the W2
+`scopeCoverage`, `coverage` and data text, the #211 search data text, and the #528
+language-status sentence, for find and search only. Matching, ranking, limits, the
+response-byte fit rule, completeness and warnings are unchanged. Describe `languages`,
+incoming `scopeCoverage` and the lookup alternatives other tools return keep their shape.
+
+- **Result-language scope rows.** In full and compact find (query and lookup key) and
+  search, `scopeCoverage` holds the `LanguageStatus` rows of the emitted items' languages
+  only, in #22 order. With no emitted item it holds the searched languages with selected
+  native tuples (the #528 `syntaxOnly` rule), and with neither it is empty. Row contents are
+  unchanged. `partial` and the aggregate `coverageIncomplete` warning still cover every
+  searched language, so an answer can be partial because of a language it does not list.
+  Because the empty prefix lists more rows than a hit prefix may, the W2 byte fit no longer
+  treats it as a lower bound: the longest fitting hit prefix is returned even when the
+  empty prefix alone would not fit, and `range_too_large` means neither the empty prefix
+  nor the first hit fits.
+- **Coverage diagnostic table.** Full find and search data add the required
+  `coverageDiagnostics:Text[]`: each distinct coverage `diagnostic` of the page's rows once,
+  in first-row order. Each `coverage` row carries `diagnosticRef:UInt|null` instead of
+  `diagnostic`, null for a row without one. Re-inlining the table gives back the native
+  `Coverage` row. The table is per page and empty when no row has a diagnostic.
+- **Compact find and search.** Both accept `compact?:boolean` (default false; a
+  non-boolean is `invalid_request`), find with either `query` or `lookupKey`. When true, data
+  omits `documents`, `coverage`, `coverageDiagnostics` and `provenance`. Each item keeps only
+  `symbolId`, `name`, `stableLookupKey`, `kind`, `role`, `path` (the declaration's document
+  path, in place of `doc`), `lines` and `evidenceTier`, and search hits also keep `rank` and
+  `matchedBy`. For the same emitted prefix, the items, `scopeCoverage`, search's
+  `searchIndex` and `role`, warnings, `partial` and `truncated` are those of the full answer.
+  The byte fit uses the smaller compact frame, so more items may fit, and `truncationReason`
+  can be `limit` where the full answer is `response_bytes`. Byte ranges, display keys,
+  revisions and proofs need the full answer.
+- **Compact graph node keys.** Each compact `trellis_call_graph` node declaration adds the
+  required `stableLookupKey:Text|null`, the node's #593 stable lookup key, or null when it
+  has none (a partial Rust impl parse). This is the cheap, durable handle for follow-up
+  calls; the short `lookupKey` stays. Full graph declarations are the contract records and
+  do not carry it. Default limits are unchanged. On the #665 fixture shape the keys add
+  about 3 KB to a fifty-node compact answer, which still fits by `limit`.
+- **Catalog.** Search's output schema drops its unreferenced copy of `Symbol` (`SearchHit`
+  already repeats its fields), which keeps `tools/list` inside its named headroom. No
+  response shape depends on it.
+- **Measured.** A private clone of this repository at `cd2f0a9a` with a rust-analyzer
+  import, as complete JSON-RPC lines (bytes, items):
+
+  | Call | Before | After, full | After, compact |
+  |---|---|---|---|
+  | search, production role, "decide whether a checkout is still catching up after an edit" | 15,785 (10) | 14,675 (10) | 4,813 (10) |
+  | search "stable lookup key" | 16,882 (10) | 15,191 (10) | 4,155 (10) |
+  | search "frame bytes response cap", limit 20 | 21,824 (20) | 21,103 (20) | 8,150 (20) |
+  | find "navigation_at" | 6,490 (3) | 5,360 (3) | 1,896 (3) |
+  | find "catching_up" | 23,074 (20) | 21,292 (20) | 6,821 (20) |
+  | find "symbols", limit 50 | 64,481 (46, `response_bytes`) | 64,731 (49, `response_bytes`) | 15,965 (50, `limit`) |
+  | find by lookup key `src/mcp/projection.rs::compact_graph` | 4,080 (1) | 2,949 (1) | 1,298 (1) |
+  | compact call graph `src/http/worker.rs::DaemonState::enqueue_index` | 6,924 (5 nodes) | n/a | 7,260 (5 nodes, all keyed) |
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)
