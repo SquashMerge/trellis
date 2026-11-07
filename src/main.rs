@@ -52,7 +52,7 @@ enum Command {
     Daemon(DaemonArgs),
     /// Serve one read-only MCP connection on line-framed stdin/stdout.
     Mcp(WorkspaceArgs),
-    /// Serve the authenticated loopback API and browser inspector. Refresh is explicit.
+    /// Serve the authenticated loopback API and browser inspector. The watcher keeps the index current.
     Serve(Box<ServeArgs>),
     /// Print the current published index status.
     Status(WorkspaceArgs),
@@ -1376,7 +1376,7 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         .try_clone()
         .context("daemon_unavailable: clone serve control connection")?;
     eprintln!(
-        "Trellis: http://{}/\nState: {}\nToken file: {}\nRefresh is explicit. No repository commands run.",
+        "Trellis: http://{}/\nState: {}\nToken file: {}\nIndexing runs in the background; the watcher refreshes the index after file changes.\nNo repository commands run.",
         address.as_str().unwrap_or("unknown"),
         roots.cache.display(),
         token_file.display()
