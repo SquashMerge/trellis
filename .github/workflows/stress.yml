@@ -11,8 +11,12 @@ on:
   workflow_dispatch:
     inputs:
       repeat:
-        description: Repetitions of the suite per runner
+        description: Repetitions of the suite per runner (0 = only the deep property pass)
         default: '3'
+        type: string
+      proptest_cases:
+        description: Cases per property in the deep property pass (0 = no deep pass)
+        default: '1024'
         type: string
       load:
         description: Busy loops per core, running for the whole suite (0 = none)
@@ -70,7 +74,8 @@ jobs:
       - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cargo-nextest@0.9.150
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: tests
           workspaces: . -> target-test-support
@@ -78,6 +83,8 @@ jobs:
       # Builds first, then runs the suite under load REPEAT times and writes a
       # per-test, per-repetition failure summary to the job summary.
       - name: Run the tests under load
+        id: stress
+        if: ${{ (inputs.repeat || '3') != '0' }}
         env:
           REPEAT: ${{ inputs.repeat || '3' }}
           LOAD: ${{ inputs.load || '2' }}
@@ -95,5 +102,27 @@ jobs:
         with:
           name: stress-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: target-test-support/stress/
+          retention-days: 14
+          if-no-files-found: warn
+      # The curated property tests once more, without load, at PROPTEST_CASES
+      # cases each (#757), even when a repetition above failed. The seed is the
+      # run ID, so a failure can be replayed with PROPTEST_RNG_SEED.
+      - name: Deep property pass
+        id: deep
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' && (inputs.proptest_cases || '1024') != '0' }}
+        env:
+          PROPTEST_CASES: ${{ inputs.proptest_cases || '1024' }}
+          TEST_THREADS: ${{ inputs.test_threads }}
+          SEED: ${{ github.run_id }}
+        run: |
+          set -- --repeat 0 --proptest-cases "$PROPTEST_CASES" --proptest-seed "$SEED" --out target-test-support/stress-deep
+          if [ -n "$TEST_THREADS" ]; then set -- "$@" --test-threads "$TEST_THREADS"; fi
+          ./tools/stress "$@"
+      # The deep pass's log, JUnit report, seed and the proptest regression files.
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.deep.outcome == 'failure' }}
+        with:
+          name: proptest-deep-${{ matrix.os }}-attempt-${{ github.run_attempt }}
+          path: target-test-support/stress-deep/
           retention-days: 14
           if-no-files-found: warn

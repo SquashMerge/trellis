@@ -4,18 +4,28 @@
 # they reach a release PR. The stress workflow (.github/workflows/stress.yml)
 # runs this; it never gates a PR. See docs/releases.md#stress-lane.
 #
-# Usage: ./tools/stress [--repeat N] [--load K] [--test-threads N] [--out DIR] [-- NEXTEST_ARGS...]
-#   --repeat N        run the suite N times (default 3)
+# Usage: ./tools/stress [--repeat N] [--load K] [--test-threads N] [--out DIR]
+#                      [--proptest-cases N] [--proptest-seed S] [-- NEXTEST_ARGS...]
+#   --repeat N        run the suite N times (default 3; 0 runs only the deep pass)
 #   --load K          start K busy loops per core for the whole run (default 2; 0 = none)
 #   --test-threads N  nextest test threads (default: nextest's, one per core)
 #   --out DIR         where per-repetition logs, JUnit reports and the summary go
 #                     (default <target>-test-support/stress, emptied first)
-#   NEXTEST_ARGS      extra `cargo nextest run` arguments, e.g. -E 'test(watcher)'
+#   --proptest-cases N  after the repetitions, rerun the property tests once,
+#                     without load, at N cases each (default 0 = no deep pass)
+#   --proptest-seed S PROPTEST_RNG_SEED for the deep pass (default: the time)
+#   NEXTEST_ARGS      extra `cargo nextest run` arguments for the repetitions,
+#                     e.g. -E 'test(watcher)'; the deep pass has its own filter
 #
 # It builds what the verify tests lane builds (same target directory, features
 # and flags), before the load starts. Each repetition runs with --no-fail-fast.
 # The exit status is non-zero if any repetition failed; the summary names each
 # failed test and the repetitions it failed in.
+#
+# The deep pass (#757) runs the property tests (PROPERTY_FILTER below) under the
+# `deep` nextest profile with TRELLIS_PROPTEST_CASES and PROPTEST_CASES set to
+# N. Its log, JUnit report, seed and any proptest regression files go to
+# <out>/deep/, and its failures are added to the summary.
 set -eu
 workspace=$(cd "$(dirname "$0")/.." && pwd)
 cd "$workspace"
@@ -24,22 +34,29 @@ repeat=3
 load=2
 threads=""
 out=""
+proptest_cases=0
+proptest_seed=""
 while [ "$#" -gt 0 ]; do
   case $1 in
     --repeat) repeat=${2:?--repeat needs a count}; shift 2 ;;
     --load) load=${2:?--load needs a count}; shift 2 ;;
     --test-threads) threads=${2:?--test-threads needs a count}; shift 2 ;;
     --out) out=${2:?--out needs a directory}; shift 2 ;;
+    --proptest-cases) proptest_cases=${2:?--proptest-cases needs a count}; shift 2 ;;
+    --proptest-seed) proptest_seed=${2:?--proptest-seed needs a seed}; shift 2 ;;
     --) shift; break ;;
     *) echo "stress: unknown argument: $1 (see the usage at the top of tools/stress)" >&2; exit 2 ;;
   esac
 done
-for value in "$repeat" "$load" ${threads:+"$threads"}; do
+for value in "$repeat" "$load" "$proptest_cases" ${threads:+"$threads"} ${proptest_seed:+"$proptest_seed"}; do
   case $value in
     '' | *[!0-9]*) echo "stress: counts must be non-negative integers, got '$value'" >&2; exit 2 ;;
   esac
 done
-[ "$repeat" -ge 1 ] || { echo "stress: --repeat must be at least 1" >&2; exit 2; }
+[ "$repeat" -ge 1 ] || [ "$proptest_cases" -ge 1 ] || {
+  echo "stress: --repeat must be at least 1 unless --proptest-cases runs a deep pass" >&2
+  exit 2
+}
 
 # The same target directory as `./tools/verify --lane tests`.
 target_dir=${CARGO_TARGET_DIR:-target}
@@ -54,7 +71,8 @@ mkdir -p "$out"
 
 cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
 busy=$((cores * load))
-echo "stress: $cores cores, $busy busy loops, $repeat repetitions, test threads ${threads:-default}, output in $out"
+[ "$repeat" -ge 1 ] || busy=0
+echo "stress: $cores cores, $busy busy loops, $repeat repetitions, test threads ${threads:-default}, deep pass ${proptest_cases} cases, output in $out"
 
 # Build first, without load, so the load presses on the tests and not rustc.
 CARGO_TARGET_DIR="$test_target" cargo nextest run --profile stress --locked --all-targets --features test-support --no-run "$@"
@@ -95,37 +113,96 @@ while [ "$rep" -le "$repeat" ]; do
 done
 stop_load
 
+# The deep pass: the curated property tests (tests/property-testing.md), once,
+# at a high case count. Keep the selection in step with proptest-nightly.yml.
+PROPERTY_FILTER='binary(index) & test(/^proptest_/) | binary(semantic) & (test(proptest_witness_rejoin::) | test(proptest_retention::) | test(proptest_native_first::)) | binary(http) & test(architecture_cache_properties::) | binary(scip_decoding_properties)'
+deep_code=0
+if [ "$proptest_cases" -ge 1 ]; then
+  deep=$out/deep
+  mkdir -p "$deep"
+  proptest_seed=${proptest_seed:-$(date +%s)}
+  echo "$proptest_seed" >"$deep/seed.txt"
+  deep_junit=$workspace/target/nextest/deep/junit.xml
+  rm -f "$deep_junit"
+  start=$(date +%s)
+  TRELLIS_PROPTEST_CASES=$proptest_cases PROPTEST_CASES=$proptest_cases PROPTEST_RNG_SEED=$proptest_seed TRELLIS_RETENTION_TRACE=1 \
+    CARGO_TARGET_DIR="$test_target" cargo nextest run --profile deep --locked --no-fail-fast --features test-support --color never \
+    ${threads:+--test-threads "$threads"} --test index --test semantic --test http --test scip_decoding_properties \
+    -E "$PROPERTY_FILTER" >"$deep/deep.log" 2>&1 || deep_code=$?
+  if [ -f "$deep_junit" ]; then
+    cp "$deep_junit" "$deep/junit.xml"
+  fi
+  echo "==> deep property pass ($proptest_cases cases, PROPTEST_RNG_SEED=$proptest_seed): exit $deep_code in $(($(date +%s) - start)) s"
+  sed -n '/^ *Summary \[/,$p' "$deep/deep.log" | tail -n 60
+  if [ "$deep_code" -ne 0 ]; then
+    # Proptest persists each failure's seed next to the test source (checked-in
+    # files included); keep them all, at their workspace paths.
+    find "$workspace" \( -path "$workspace/target*" -o -path "$workspace/.git" -o -name node_modules \) -prune -o \
+      -type f \( -name '*.proptest-regressions' -o -path '*/proptest-regressions/*' \) -print |
+      while IFS= read -r file; do
+        dest=$deep/regressions/${file#"$workspace"/}
+        mkdir -p "$(dirname "$dest")"
+        cp "$file" "$dest"
+      done
+  fi
+fi
+
 # Name each failed test and the repetitions it failed in, from the JUnit reports.
-python3 -I - "$out" "$repeat" "$failed_reps" <<'PY'
+python3 -I - "$out" "$repeat" "$failed_reps" "$proptest_cases" "${proptest_seed:-}" "$deep_code" <<'PY'
 import os, sys, xml.etree.ElementTree as ET
 
 out, repeat, failed_reps = sys.argv[1], int(sys.argv[2]), sys.argv[3].split()
-failures = {}
-missing = []
-for rep in range(1, repeat + 1):
-    path = os.path.join(out, f"rep-{rep}-junit.xml")
-    if not os.path.exists(path):
-        missing.append(rep)
-        continue
+deep_cases, deep_seed, deep_code = int(sys.argv[4]), sys.argv[5], int(sys.argv[6])
+
+
+def failed_cases(path):
     for case in ET.parse(path).getroot().iter("testcase"):
         for child in case:
             if child.tag in ("failure", "error"):
-                name = f"{case.get('classname')} {case.get('name')}"
-                kind = child.get("type") or child.tag
-                failures.setdefault(name, []).append((rep, kind))
+                yield f"{case.get('classname')} {case.get('name')}", child.get("type") or child.tag
                 break
 
-lines = [f"## Stress lane: {len(failed_reps)} of {repeat} repetitions failed", ""]
-if failures:
-    lines += ["| Test | Failed in repetition |", "| --- | --- |"]
-    for name in sorted(failures):
-        reps = ", ".join(f"{rep} ({kind})" for rep, kind in failures[name])
-        lines.append(f"| `{name}` | {reps} |")
-for rep in missing:
-    lines.append(f"\nRepetition {rep} wrote no JUnit report (a build or setup failure?); see rep-{rep}.log.")
-if not failures and not missing:
-    lines.append("No test failed.")
-text = "\n".join(lines) + "\n"
+
+lines = []
+if repeat:
+    failures = {}
+    missing = []
+    for rep in range(1, repeat + 1):
+        path = os.path.join(out, f"rep-{rep}-junit.xml")
+        if not os.path.exists(path):
+            missing.append(rep)
+            continue
+        for name, kind in failed_cases(path):
+            failures.setdefault(name, []).append((rep, kind))
+
+    lines += [f"## Stress lane: {len(failed_reps)} of {repeat} repetitions failed", ""]
+    if failures:
+        lines += ["| Test | Failed in repetition |", "| --- | --- |"]
+        for name in sorted(failures):
+            reps = ", ".join(f"{rep} ({kind})" for rep, kind in failures[name])
+            lines.append(f"| `{name}` | {reps} |")
+    for rep in missing:
+        lines.append(f"\nRepetition {rep} wrote no JUnit report (a build or setup failure?); see rep-{rep}.log.")
+    if not failures and not missing:
+        lines.append("No test failed.")
+
+if deep_cases:
+    verdict = "passed" if deep_code == 0 else f"failed (exit {deep_code})"
+    lines += ["", f"## Deep property pass: {verdict}", "",
+              f"{deep_cases} cases per property, `PROPTEST_RNG_SEED={deep_seed}`.", ""]
+    path = os.path.join(out, "deep", "junit.xml")
+    if os.path.exists(path):
+        failures = sorted(failed_cases(path))
+        if failures:
+            lines += ["| Test | Failure |", "| --- | --- |"]
+            lines += [f"| `{name}` | {kind} |" for name, kind in failures]
+        elif deep_code == 0:
+            lines.append("No property failed.")
+    else:
+        lines.append("The deep pass wrote no JUnit report (a build or setup failure?); see deep/deep.log.")
+    if deep_code:
+        lines.append("\nThe proptest regression files are under deep/regressions/.")
+text = "\n".join(lines).lstrip("\n") + "\n"
 print(text)
 with open(os.path.join(out, "summary.md"), "w") as f:
     f.write(text)
@@ -135,4 +212,6 @@ if summary:
         f.write(text)
 PY
 
-[ -z "$failed_reps" ] || { echo "stress: failed repetition(s):$failed_reps" >&2; exit 1; }
+[ -z "$failed_reps" ] || echo "stress: failed repetition(s):$failed_reps" >&2
+[ "$deep_code" -eq 0 ] || echo "stress: the deep property pass failed (exit $deep_code)" >&2
+[ -z "$failed_reps" ] && [ "$deep_code" -eq 0 ]

@@ -33,7 +33,7 @@ jobs:
       - name: Run curated properties
         run: >-
           cargo nextest run --profile nightly --locked --features test-support --no-fail-fast --test index --test semantic --test http --test scip_decoding_properties
-          -E 'binary(index) & (test(proptest_absence::) | test(proptest_java_absence::) | test(proptest_python_absence::) | test(proptest_rust_absence::)) | binary(semantic) & (test(proptest_witness_rejoin::) | test(proptest_retention::)) | binary(http) & (test(architecture_cache_properties::) | test(architecture_precompute::concurrent_readers_wait_for_one_build) | test(architecture_precompute::a_rules_edit_during_a_build_is_built_next)) | binary(scip_decoding_properties)'
+          -E 'binary(index) & (test(proptest_absence::) | test(proptest_java_absence::) | test(proptest_python_absence::) | test(proptest_rust_absence::)) | binary(semantic) & (test(proptest_witness_rejoin::) | test(proptest_retention::) | test(proptest_native_first::)) | binary(http) & (test(architecture_cache_properties::) | test(architecture_precompute::concurrent_readers_wait_for_one_build) | test(architecture_precompute::a_rules_edit_during_a_build_is_built_next)) | binary(scip_decoding_properties)'
 
   report:
     if: ${{ always() && needs.deep.result == 'failure' }}
