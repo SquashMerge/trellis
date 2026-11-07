@@ -285,7 +285,12 @@ placeholder that no config format parses, so the facts it would supply are unkno
 manifest with a syntax error: no external package and no absent dependency is inferred from it.
 A skipped `Cargo.toml` also leaves every workspace document without a Cargo target: its
 unread explicit target paths could cross package directories. These facts recover when the
-input shrinks back under the cap. Syntax past 128
+input shrinks back under the cap. `.gitignore` and `.ignore` files are read for admission rules,
+not as source, so they share the 16 MiB config input cap (#586). One over it isn't read; its
+directory and everything under it aren't indexed, since its unread rules could exclude any of
+it, and status shows an `ignore-file-oversized` diagnostic for it. The rest of the checkout
+indexes; a root ignore file over the cap leaves no source indexed. This recovers when the file
+shrinks back under the cap. Syntax past 128
 levels or 1,000,000 visits is a per-file coverage gap (#554). So is a file whose evidence exceeds a selected read's budgets: 16
 rows per source byte in a table, at most 1,000,000, and 64 bytes per source byte plus 256 KiB of
 native rows, the same of graph rows and the same of class rows (#564). It publishes its file module, `partial` coverage and a whole-file capability gap,

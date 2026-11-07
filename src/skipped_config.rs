@@ -1,5 +1,9 @@
 //! Config inputs a capture admits without reading their bytes (#581).
 //!
+//! `.gitignore` and `.ignore` files share the cap (#586). One over it is admitted the same
+//! way, and the walk doesn't descend its directory, so nothing its unread rules could
+//! exclude is indexed. Status shows an [`IGNORE_DIAGNOSTIC_CODE`] diagnostic for it.
+//!
 //! Root config inputs (`package.json`, `package-lock.json`, `Cargo.lock` and the rest of
 //! [`crate::capture::ROOT_INPUTS`]) and nested package and Cargo manifests are read for
 //! dependency and module-root facts, not as source. So they have their own cap,
@@ -39,6 +43,18 @@ pub const DIAGNOSTIC_CODE: &str = "config-input-oversized";
 pub(crate) fn diagnostic_message() -> String {
     format!(
         "config input is larger than the {} MiB config input cap and was not read; the dependency and package-root facts it would supply are unknown",
+        CONFIG_INPUT_MAX_BYTES / (1024 * 1024)
+    )
+}
+
+/// The status diagnostic code of an ignore file over the config input cap (#586).
+pub const IGNORE_DIAGNOSTIC_CODE: &str = "ignore-file-oversized";
+
+/// The status diagnostic message of an ignore file over the config input cap. The walk
+/// doesn't descend its directory, so its unread rules never decide what is indexed.
+pub(crate) fn ignore_diagnostic_message() -> String {
+    format!(
+        "ignore file is larger than the {} MiB config input cap and was not read; its directory and everything under it were not indexed",
         CONFIG_INPUT_MAX_BYTES / (1024 * 1024)
     )
 }

@@ -1458,6 +1458,52 @@ fn cold_cli_commands_start_and_reuse_daemon() {
     assert!(!symbols["data"]["items"].as_array().unwrap().is_empty());
 }
 
+/// #586: an ignore file over the 16 MiB config input cap no longer fails the index. Its
+/// directory isn't indexed, status names it with a typed diagnostic, and the rest indexes.
+#[test]
+fn an_oversized_ignore_file_is_a_diagnostic_not_a_failed_index() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "ignored");
+    let sub = root.join("generated");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("hidden.js"), "function hiddenSymbol() {}\n").unwrap();
+    let cap = trellis::skipped_config::CONFIG_INPUT_MAX_BYTES as usize;
+    fs::write(sub.join(".gitignore"), vec![b'#'; cap + 1]).unwrap();
+    let output = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .output()
+        .unwrap();
+    let reply = crate::child::cli_json(&output, "index with an oversized ignore file failed");
+    let diagnostics = reply["status"]["diagnostics"].as_array().unwrap();
+    let skipped: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d["code"] == "ignore-file-oversized")
+        .collect();
+    assert_eq!(skipped.len(), 1, "{reply}");
+    assert_eq!(skipped[0]["path"], "generated/.gitignore", "{reply}");
+    let symbols = |name: &str| {
+        let output = cli(&home)
+            .arg("symbols")
+            .arg("--workspace")
+            .arg(&root)
+            .arg("--search")
+            .arg(name)
+            .output()
+            .unwrap();
+        crate::child::cli_json(&output, "symbols failed")["data"]["items"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert!(symbols("ignoredSymbol") > 0);
+    assert_eq!(symbols("hiddenSymbol"), 0);
+}
+
 #[tokio::test]
 async fn long_home_socket_names_are_private_distinct_connectable_and_recover_after_crash() {
     use std::os::unix::{

@@ -296,7 +296,9 @@ used as display inputs refuse admission before the optional read; nonregular eli
 sources such as FIFOs refuse admission rather than disappear from the inventory.
 Identity-equivalent non-source inputs reuse one captured buffer after metadata checks.
 Drift, unreadable or unsafe inputs, excess size, and cancellation
-fail the indexing call rather than publishing its result. Ambient ancestor, global,
+fail the indexing call rather than publishing its result, except for the inputs later rulings
+admit unread: a source over `--max-file-bytes` (#576), a config input over its cap (#581), and
+an ignore file over the config input cap, whose directory is then not descended (#586). Ambient ancestor, global,
 and Git-info ignore files do not participate in admission.
 
 This is a non-adversarial writer check, not a filesystem security sandbox. A writer

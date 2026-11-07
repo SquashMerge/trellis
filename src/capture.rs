@@ -421,7 +421,37 @@ pub(crate) fn nested_cargo_manifest(root: &Path, path: &Path) -> bool {
         && path.starts_with(root)
         && path.parent() != Some(root)
 }
-fn walk(root: &Path, cancel: &CancelFlag) -> Result<(BTreeMap<PathBuf, Stamp>, Vec<PathBuf>)> {
+/// The workspace inventory and its sources, and the directories the walk did not descend
+/// because one of their ignore files is over its cap.
+type Walked = (BTreeMap<PathBuf, Stamp>, Vec<PathBuf>, BTreeSet<PathBuf>);
+
+/// Whether `dir` has a `.gitignore` or `.ignore` regular file over `cap` (#586). Only its
+/// no-follow stat is read. A stat error is left to the walker and the input's admission.
+fn ignore_file_over_cap(dir: &Path, cap: u64) -> bool {
+    [".gitignore", ".ignore"].iter().any(|name| {
+        metadata(&dir.join(name))
+            .ok()
+            .flatten()
+            .is_some_and(|item| item.kind == 2 && item.len > cap)
+    })
+}
+
+/// Walk the workspace. The `ignore` walker reads every ignore file it meets whole, so a
+/// directory with an ignore file over `ignore_cap` is never descended (#586): it stays in
+/// the inventory, nothing under it is a source, and its unread rules can't be misapplied.
+/// When it is the root, nothing is walked.
+fn walk(root: &Path, ignore_cap: u64, cancel: &CancelFlag) -> Result<Walked> {
+    let mut inventory = BTreeMap::new();
+    let mut excluded = BTreeSet::new();
+    if ignore_file_over_cap(root, ignore_cap) {
+        let item = metadata(root)?.context("walk entry disappeared")?;
+        ensure!(item.kind == 1, "directory changed: {}", root.display());
+        inventory.insert(root.to_owned(), item);
+        excluded.insert(root.to_owned());
+        return Ok((inventory, Vec::new(), excluded));
+    }
+    let skipped_dirs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let filter_skipped = skipped_dirs.clone();
     let mut builder = ignore::WalkBuilder::new(root);
     let filter_root = root.to_owned();
     builder
@@ -435,7 +465,7 @@ fn walk(root: &Path, cancel: &CancelFlag) -> Result<(BTreeMap<PathBuf, Stamp>, V
             if e.depth() == 0 {
                 return true;
             }
-            match e.file_name().to_str() {
+            let admitted = match e.file_name().to_str() {
                 Some(".git" | "node_modules" | ".venv" | ".trellis") => false,
                 Some("target" | "dist" | "build") => e
                     .path()
@@ -453,9 +483,16 @@ fn walk(root: &Path, cancel: &CancelFlag) -> Result<(BTreeMap<PathBuf, Stamp>, V
                         })
                     }),
                 _ => true,
+            };
+            // Runs after the walker's own ignore rules, so `e` is an admitted entry.
+            let over = admitted
+                && e.file_type().is_some_and(|kind| kind.is_dir())
+                && ignore_file_over_cap(e.path(), ignore_cap);
+            if over {
+                filter_skipped.lock().unwrap().push(e.path().to_owned());
             }
+            admitted && !over
         });
-    let mut inventory = BTreeMap::new();
     let mut sources = Vec::new();
     for entry in builder.build() {
         check(cancel)?;
@@ -478,7 +515,13 @@ fn walk(root: &Path, cancel: &CancelFlag) -> Result<(BTreeMap<PathBuf, Stamp>, V
         );
     }
     sources.sort();
-    Ok((inventory, sources))
+    for dir in std::mem::take(&mut *skipped_dirs.lock().unwrap()) {
+        let item = metadata(&dir)?.context("walk entry disappeared")?;
+        ensure!(item.kind == 1, "directory changed: {}", dir.display());
+        inventory.insert(dir.clone(), item);
+        excluded.insert(dir);
+    }
+    Ok((inventory, sources, excluded))
 }
 
 /// The running image must be pinned before the executable pathname is replaced.
@@ -644,6 +687,8 @@ pub struct Capture {
     input_bytes: BTreeMap<PathBuf, Option<Arc<[u8]>>>,
     /// Config inputs over their cap, admitted unread with the placeholder as their bytes.
     skipped_inputs: BTreeSet<PathBuf>,
+    /// The ignore-file cap the walk used; verification re-walks with it (#586).
+    ignore_cap: u64,
     reconcile_options: crate::indexer::ReconcileOptions,
 }
 impl Capture {
@@ -684,7 +729,12 @@ impl Capture {
             "workspace root is not a real directory"
         );
         let root = fs::canonicalize(&options.workspace_root)?;
-        let (inventory, sources) = walk(&root, cancel)?;
+        // Config and ignore inputs are read for facts and admission rules, not as source, so
+        // they have their own cap, not --max-file-bytes (owner ruling 2026-11-01, #581; #586).
+        let config_cap = options
+            .max_config_bytes
+            .min(crate::skipped_config::CONFIG_INPUT_MAX_BYTES);
+        let (inventory, sources, unwalked) = walk(&root, config_cap, cancel)?;
         ensure!(
             !running_executable.is_some() || !sources.contains(&exe),
             "running executable pathname conflicts with source"
@@ -703,11 +753,6 @@ impl Capture {
                 );
             }
         }
-        // Config inputs are read for dependency and module-root facts, not as source, so
-        // they have their own cap, not --max-file-bytes (owner ruling 2026-11-01, #581).
-        let config_cap = options
-            .max_config_bytes
-            .min(crate::skipped_config::CONFIG_INPUT_MAX_BYTES);
         let mut skipped_inputs = BTreeSet::new();
         for name in ROOT_INPUTS {
             admit_input(
@@ -729,8 +774,8 @@ impl Capture {
             for name in [".gitignore", ".ignore"] {
                 admit_input(
                     dir.join(name),
-                    options.max_file_bytes.min(16 * 1024 * 1024),
-                    None,
+                    config_cap,
+                    Some(&mut skipped_inputs),
                     cancel,
                     &source_identities,
                     &mut input_identities,
@@ -738,6 +783,21 @@ impl Capture {
                     &mut input_bytes,
                 )?;
             }
+        }
+        // An ignore file is admitted unread exactly where the walk left its directory
+        // undescended; otherwise it changed between the two stats.
+        let unread_ignore_dirs: BTreeSet<_> = skipped_inputs
+            .iter()
+            .filter(|path| {
+                matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(".gitignore" | ".ignore")
+                )
+            })
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect();
+        if unread_ignore_dirs != unwalked {
+            return Err(SourceInputDrift("ignore input drift").into());
         }
         // scip-typescript names a module relative to the nearest package.json directory, so
         // nested package roots of JavaScript sources are admitted beside the root inputs
@@ -878,6 +938,7 @@ impl Capture {
             running_executable,
             input_bytes,
             skipped_inputs,
+            ignore_cap: config_cap,
             reconcile_options: crate::indexer::ReconcileOptions::from(options),
         };
         capture.verify(cancel)?;
@@ -922,7 +983,7 @@ impl Capture {
             metadata(&self.admission_root)?.as_ref() == Some(&self.root_stamp),
             "workspace root drift"
         );
-        let (inventory, _) = walk(&self.root, cancel)?;
+        let (inventory, _, _) = walk(&self.root, self.ignore_cap, cancel)?;
         if inventory != self.inventory {
             return Err(WorkspaceInventoryDrift.into());
         }
@@ -1289,6 +1350,78 @@ mod tests {
             error.downcast_ref::<SourceInputDrift>().unwrap().0,
             "input alias drift"
         );
+    }
+
+    /// #586: an ignore file over the config input cap is admitted unread and its directory is
+    /// not descended. The rest of the checkout is captured, the capture verifies, and the
+    /// ignore file shrinking back is drift.
+    #[test]
+    fn an_ignore_file_over_its_cap_leaves_its_directory_undescended() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let binary = exe.path().join("extractor");
+        fs::write(&binary, b"binary").unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let sub = workspace.path().join("sub");
+        fs::create_dir_all(sub.join("deep")).unwrap();
+        fs::write(sub.join("b.js"), "function b() {}\n").unwrap();
+        fs::write(sub.join("deep/c.js"), "function c() {}\n").unwrap();
+        let ignore = sub.join(".gitignore");
+        fs::write(&ignore, "# x\n".repeat(100)).unwrap();
+        let mut options = IndexOptions::new(workspace.path().to_owned());
+        // A source cap smaller than the ignore file does not apply to it.
+        options.max_file_bytes = 16;
+        options.max_config_bytes = 256;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture =
+            Capture::admit_with_executable(&options, &cancel, &|_| {}, binary.clone()).unwrap();
+        let paths: Vec<_> = capture.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a.js"]);
+        let ignore = fs::canonicalize(&ignore).unwrap();
+        assert_eq!(
+            capture.bytes(&ignore),
+            Some(crate::skipped_config::PLACEHOLDER)
+        );
+        let inputs = capture.persisted_inputs().unwrap();
+        assert!(inputs.contains_key("directory:sub"));
+        assert!(!inputs.contains_key("directory:sub/deep"));
+        let CaptureInputObservation::Present { stat, hash } = &inputs["ignore:sub/.gitignore"]
+        else {
+            panic!("skipped ignore file must stay present");
+        };
+        assert_eq!(stat.size, 400);
+        assert_eq!(hash, &crate::skipped_config::placeholder_hash());
+        capture.native_input_fingerprints().unwrap();
+        capture.verify(&cancel).unwrap();
+        fs::write(&ignore, "deep/\n").unwrap();
+        assert!(capture.verify(&cancel).is_err());
+        // Under the cap it is read and applied again.
+        let capture = Capture::admit_with_executable(&options, &cancel, &|_| {}, binary).unwrap();
+        let paths: Vec<_> = capture.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a.js", "sub/b.js"]);
+    }
+
+    /// #586: a root ignore file over the cap leaves the whole checkout undescended.
+    #[test]
+    fn a_root_ignore_file_over_its_cap_captures_no_sources() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let binary = exe.path().join("extractor");
+        fs::write(&binary, b"binary").unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        fs::write(workspace.path().join(".ignore"), "# x\n".repeat(100)).unwrap();
+        let mut options = IndexOptions::new(workspace.path().to_owned());
+        options.max_config_bytes = 256;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit_with_executable(&options, &cancel, &|_| {}, binary).unwrap();
+        assert!(capture.files.is_empty());
+        let inputs = capture.persisted_inputs().unwrap();
+        assert!(matches!(
+            &inputs["ignore:.ignore"],
+            CaptureInputObservation::Present { hash, .. }
+                if hash == &crate::skipped_config::placeholder_hash()
+        ));
+        capture.verify(&cancel).unwrap();
     }
 
     /// #581: a config input over its cap is admitted unread. It is never opened, its stat is
