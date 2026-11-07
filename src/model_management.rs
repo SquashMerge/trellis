@@ -559,7 +559,11 @@ mod tests {
             let url = format!("http://{}/fixture", listener.local_addr().unwrap());
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (mut stream, _) =
+                    tokio::time::timeout(crate::testing::HANG_BACKSTOP, listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
                 let mut request = [0; 1024];
                 assert!(stream.read(&mut request).await.unwrap() > 0);
                 if send_headers {
@@ -602,7 +606,11 @@ mod tests {
         let url = format!("https://{}/fixture", listener.local_addr().unwrap());
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut stream, _) =
+                tokio::time::timeout(crate::testing::HANG_BACKSTOP, listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
             let mut hello = [0; 1024];
             assert!(stream.read(&mut hello).await.unwrap() > 0);
             ready_tx.send(()).unwrap();

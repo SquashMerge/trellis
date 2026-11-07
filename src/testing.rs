@@ -45,6 +45,59 @@ pub fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
+/// Run `open` (such as `|| Store::open(roots.clone(), identity.clone())`) until it
+/// succeeds. Only typed admission contention, `storage_busy` from an owner the
+/// test does not order (its own daemon, watcher, FIFO or S), is retried, as real
+/// CLI clients retry it (#712); any other error panics at once. A test that
+/// unwraps the open instead fails whenever that owner holds admission.
+pub fn retry_admission<T>(mut open: impl FnMut() -> anyhow::Result<T>) -> T {
+    let mut result = None;
+    wait_until("index admission", || match open() {
+        Ok(value) => {
+            result = Some(value);
+            true
+        }
+        Err(error) if crate::store::cli_read_retryable_contention(&error) => false,
+        Err(error) => panic!("index admission failed: {error:#}"),
+    });
+    result.unwrap()
+}
+
+/// Accept one connection on a blocking test listener, such as a hook socket,
+/// panicking at [`HANG_BACKSTOP`] if none arrives instead of blocking until the
+/// test runner kills the test (#742). Reads on the accepted stream are bounded
+/// by the same backstop.
+pub fn accept_within_backstop(
+    listener: &std::os::unix::net::UnixListener,
+) -> std::os::unix::net::UnixStream {
+    use std::os::fd::AsRawFd;
+    let mut ready = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let deadline = Instant::now() + HANG_BACKSTOP;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !left.is_zero(),
+            "no connection reached the test listener (hang)"
+        );
+        let polled = unsafe { libc::poll(&mut ready, 1, left.as_millis() as libc::c_int) };
+        if polled == 1 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        assert!(
+            polled == 0 || error.kind() == std::io::ErrorKind::Interrupted,
+            "poll on the test listener failed: {error}"
+        );
+    }
+    let (stream, _) = listener.accept().unwrap();
+    stream.set_read_timeout(Some(HANG_BACKSTOP)).unwrap();
+    stream
+}
+
 /// Names the test process that owns a daemon a test-support CLI starts (#130).
 pub const OWNER_PID_ENV: &str = "TRELLIS_TEST_OWNER_PID";
 
@@ -322,5 +375,20 @@ mod tests {
                     .any(|(name, configured)| name == key && configured == Some(OsStr::new(value)))
             );
         }
+    }
+
+    #[test]
+    fn accept_within_backstop_takes_a_pending_connection_with_bounded_reads() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut peer = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        peer.write_all(b"x").unwrap();
+        let mut accepted = super::accept_within_backstop(&listener);
+        assert_eq!(accepted.read_timeout().unwrap(), Some(super::HANG_BACKSTOP));
+        let mut byte = [0];
+        accepted.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
     }
 }

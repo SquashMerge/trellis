@@ -8678,9 +8678,7 @@ fn mcp_outgoing_wire_fixture_delayed(
         }
         Some(std::thread::spawn(move || {
             for (index, (stage, millis)) in stages.iter().enumerate() {
-                let (mut gate, _) = listener.accept().unwrap();
-                gate.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-                    .unwrap();
+                let mut gate = trellis::testing::accept_within_backstop(&listener);
                 let mut received = String::new();
                 BufReader::new(gate.try_clone().unwrap())
                     .read_line(&mut received)
@@ -15937,9 +15935,7 @@ fn bind_phase_socket() -> std::os::unix::net::UnixListener {
 fn hold_at_node_hook(
     listener: &std::os::unix::net::UnixListener,
 ) -> std::os::unix::net::UnixStream {
-    let (gate, _) = listener.accept().unwrap();
-    gate.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-        .unwrap();
+    let gate = trellis::testing::accept_within_backstop(listener);
     let mut received = String::new();
     BufReader::new(gate.try_clone().unwrap())
         .read_line(&mut received)

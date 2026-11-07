@@ -735,7 +735,7 @@ fn serve_request_preserves_explicit_default_file_cap_presence() {
     let (tx, rx) = mpsc::sync_channel(2);
     let responder = std::thread::spawn(move || {
         for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = trellis::testing::accept_within_backstop(&listener);
             let request: protocol::Request = protocol::read_frame(&mut stream).unwrap();
             assert_eq!(request.operation, "serve");
             tx.send(request.payload["options"].clone()).unwrap();
