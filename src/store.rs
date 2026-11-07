@@ -10398,11 +10398,12 @@ impl ScanComparison {
 }
 
 /// One status diagnostic per config input the published head admitted unread because it
-/// is over the config input cap (#581). Its recorded hash is the placeholder's.
+/// is over the config input cap (#581), and per ignore file likewise (#586). Its recorded
+/// hash is the placeholder's.
 fn skipped_config_diagnostics(db: &Connection, status: &mut IndexStatus) -> Result<()> {
     let placeholder = crate::skipped_config::placeholder_hash();
     let mut statement = db.prepare_cached(
-        "SELECT i.input_key,i.payload FROM revision_capture_inputs i JOIN native_revisions r ON r.id=i.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE i.input_key LIKE 'config:%' OR i.input_key LIKE 'toolchain:%' ORDER BY i.input_key",
+        "SELECT i.input_key,i.payload FROM revision_capture_inputs i JOIN native_revisions r ON r.id=i.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE i.input_key LIKE 'config:%' OR i.input_key LIKE 'toolchain:%' OR i.input_key LIKE 'ignore:%' ORDER BY i.input_key",
     )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
@@ -10415,10 +10416,21 @@ fn skipped_config_diagnostics(db: &Connection, status: &mut IndexStatus) -> Resu
         if let crate::capture::CaptureInputObservation::Present { hash, .. } = observation
             && hash == placeholder
         {
+            let (code, message) = if key.starts_with("ignore:") {
+                (
+                    crate::skipped_config::IGNORE_DIAGNOSTIC_CODE,
+                    crate::skipped_config::ignore_diagnostic_message(),
+                )
+            } else {
+                (
+                    crate::skipped_config::DIAGNOSTIC_CODE,
+                    crate::skipped_config::diagnostic_message(),
+                )
+            };
             status.diagnostics.push(Diagnostic {
                 path: key.split_once(':').map(|(_, path)| path.to_owned()),
-                code: crate::skipped_config::DIAGNOSTIC_CODE.into(),
-                message: crate::skipped_config::diagnostic_message(),
+                code: code.into(),
+                message,
             });
         }
     }
