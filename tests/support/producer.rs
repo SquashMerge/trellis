@@ -146,6 +146,15 @@ pub fn cli(home: &Path) -> Command {
     command
 }
 
+/// The daemon environment entry that gives a checkout's watcher real OS delivery, for a test
+/// of watcher delivery. Fixture daemons otherwise take synthetic ingress only (#720).
+pub fn native_watcher() -> (String, String) {
+    (
+        trellis::testing::NATIVE_WATCHER_ENV.to_owned(),
+        "on".to_owned(),
+    )
+}
+
 /// Populate a fresh workspace with `setup`, then index it.
 pub fn start_checkout(setup: impl FnOnce(&Path), daemon_env: &[(String, String)]) -> Checkout {
     let temp = Builder::new()

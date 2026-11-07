@@ -567,7 +567,8 @@ fn daemon_watcher_keeps_cli_file_cap_and_selected_source_after_edit() {
     fs::create_dir(&home).unwrap();
     let source = root.join("source.js");
     fs::write(&source, "function before() { return 1; }\n").unwrap();
-    let indexed = cli(&root, &home, "index")
+    // The edit below reaches the daemon only through real OS watcher delivery.
+    let indexed = trellis::testing::with_native_watcher(cli(&root, &home, "index"))
         .arg("--max-file-bytes")
         .arg("128")
         .output()

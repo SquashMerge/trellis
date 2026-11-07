@@ -492,7 +492,11 @@ fn reply_of(output: &Output) -> Value {
 
 #[test]
 fn basis_change_during_run_rejects_result() {
-    let world = World::with(&[("TRELLIS_TEST_PRODUCER_EXITED_SOCKET", "exited.sock")]);
+    // The edit under the run reaches the daemon through real OS watcher delivery.
+    let world = World::with_env(
+        &[("TRELLIS_TEST_PRODUCER_EXITED_SOCKET", "exited.sock")],
+        &[(trellis::testing::NATIVE_WATCHER_ENV, "on")],
+    );
     world.emitting();
     let before = world.status()["head"]["sourceRevision"].clone();
     let child = world.spawn_run(&[]);
@@ -595,7 +599,11 @@ fn workspace_unmodified_by_run() {
 
 #[test]
 fn retirement_cancels_active_run() {
-    let world = World::with(&[("TRELLIS_TEST_PRODUCER_SPAWNED_SOCKET", "spawned.sock")]);
+    // The root replacement reaches the daemon through real OS watcher delivery.
+    let world = World::with_env(
+        &[("TRELLIS_TEST_PRODUCER_SPAWNED_SOCKET", "spawned.sock")],
+        &[(trellis::testing::NATIVE_WATCHER_ENV, "on")],
+    );
     let pids = world.hook("tree.pids");
     world.mode(json!({"tree": pids, "sleep": true}));
     let child = world.spawn_run(&[]);

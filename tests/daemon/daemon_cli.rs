@@ -1422,7 +1422,8 @@ fn cold_cli_commands_start_and_reuse_daemon() {
     fs::create_dir(&home).unwrap();
     let _daemon = AutoDaemonGuard::for_home(&home);
     let root = checkout(temp.path(), "fallback");
-    let output = cli(&home)
+    // The status witness below is the native watcher's: this daemon gets OS delivery.
+    let output = trellis::testing::with_native_watcher(cli(&home))
         .arg("index")
         .arg("--workspace")
         .arg(&root)

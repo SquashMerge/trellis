@@ -16,8 +16,12 @@ use semantic_batch_support::{
 
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 
+/// Every daemon this file starts, restarts included, has real OS watcher delivery: `World`
+/// waits for the watcher to publish each batch directory it writes (#720).
 fn cli(home: &Path) -> Command {
-    let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
+    let mut cmd = trellis::testing::with_native_watcher(trellis::testing::owned(Command::new(
+        env!("CARGO_BIN_EXE_trellis"),
+    )));
     cmd.env("HOME", home)
         .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"))
         .env_remove("XDG_CACHE_HOME")

@@ -234,9 +234,12 @@ pub struct DaemonState {
     /// (`"before_revision"`), and after it published its outcome (`"published"`).
     #[cfg(feature = "test-support")]
     dependency_hook: Mutex<Option<DependencyHook>>,
-    /// Install each watcher without asynchronous OS delivery (#703).
+    /// Install each watcher with asynchronous OS delivery. Off by default in a
+    /// test-support build, so a late OS event for a fixture's own setup write
+    /// cannot be honest catch-up at an unchanged head (#703, #720); a watcher
+    /// test opts in.
     #[cfg(feature = "test-support")]
-    native_watcher_disabled: AtomicBool,
+    native_watcher: AtomicBool,
     dependencies: Mutex<DependencyIndex>,
     #[cfg(test)]
     dependency_idle: tokio::sync::Notify,
@@ -443,7 +446,7 @@ pub fn new_with_config(
         #[cfg(feature = "test-support")]
         dependency_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
-        native_watcher_disabled: AtomicBool::new(false),
+        native_watcher: AtomicBool::new(crate::testing::native_watcher_requested()),
         runtime: Mutex::new(RuntimeState::Activating),
         startup_error: Mutex::new(None),
         startup_failures: AtomicU64::new(0),
@@ -683,13 +686,13 @@ impl DaemonState {
         true
     }
 
-    /// Install every later watcher without asynchronous OS delivery, before startup
-    /// begins: a late OS event for a fixture's own earlier write is otherwise
-    /// accepted, honest catch-up at an unchanged head (#703). Synthetic ingress,
-    /// generations and acknowledgment are unchanged.
+    /// Install every later watcher with asynchronous OS delivery, for a test of
+    /// real watcher delivery. Call it before startup begins. Without it a
+    /// test-support build's watchers take synthetic ingress only (#703, #720).
     #[cfg(feature = "test-support")]
-    pub(crate) fn disable_native_watcher_for_tests(&self) {
-        self.native_watcher_disabled.store(true, Ordering::Release);
+    #[doc(hidden)]
+    pub fn enable_native_watcher_for_tests(&self) {
+        self.native_watcher.store(true, Ordering::Release);
     }
 
     /// Watcher health as the current watcher published it. A sticky flag, not
@@ -1110,15 +1113,16 @@ impl DaemonState {
                     .unwrap_or_else(|| self.config().options.clone());
                 let mut work = self.watcher_work.lock().unwrap();
                 if work.is_none() {
-                    let mut scheduler = crate::index_coordinator::WatcherWork::publishing(
-                        &self.store,
-                        &session,
-                        &options,
-                        self.watcher_health.clone(),
-                    )?;
                     // A late OS event from before this forced fixture tick must
                     // not defer pin expiration as accepted watcher work (#131).
-                    scheduler.disable_native_watcher_for_tests();
+                    let mut scheduler =
+                        crate::index_coordinator::WatcherWork::publishing_with_native(
+                            &self.store,
+                            &session,
+                            &options,
+                            self.watcher_health.clone(),
+                            false,
+                        )?;
                     scheduler.set_waker(self.watch_waker.clone());
                     let reconciled = scheduler.reconcile_due(
                         &self.store,
@@ -1594,16 +1598,18 @@ impl DaemonState {
                             .upgrade()
                             .is_some_and(|owner| Arc::ptr_eq(&owner, session))
                     }) {
-                        let mut scheduler = crate::index_coordinator::WatcherWork::publishing(
-                            &self.store,
-                            session,
-                            &selected_options,
-                            self.watcher_health.clone(),
-                        )?;
                         #[cfg(feature = "test-support")]
-                        if self.native_watcher_disabled.load(Ordering::Acquire) {
-                            scheduler.disable_native_watcher_for_tests();
-                        }
+                        let native = self.native_watcher.load(Ordering::Acquire);
+                        #[cfg(not(feature = "test-support"))]
+                        let native = true;
+                        let mut scheduler =
+                            crate::index_coordinator::WatcherWork::publishing_with_native(
+                                &self.store,
+                                session,
+                                &selected_options,
+                                self.watcher_health.clone(),
+                                native,
+                            )?;
                         #[cfg(feature = "test-support")]
                         if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
                             scheduler.attach_causal_witness(

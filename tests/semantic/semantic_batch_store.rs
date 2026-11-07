@@ -6551,11 +6551,7 @@ for (const {name, structuredContent} of JSON.parse(readFileSync(0, 'utf8'))) {
             "schema validator input: {written:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(
-            output.status.success(),
-            "structuredContent schema validation: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::child::assert_cli_success(&output, "structuredContent schema validation");
         let _ = self.release.send(());
         let session = self.session.take().unwrap();
         drop(self.reader);
