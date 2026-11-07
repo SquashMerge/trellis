@@ -144,7 +144,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":10,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":11,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
@@ -291,8 +291,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        // #715: a zero-hit find shows the searched languages only, here Rust.
+        assert_eq!(found["data"]["scopeCoverage"][0]["language"], "rust");
         assert_eq!(
-            found["data"]["scopeCoverage"][1]["semantic"]["reimport"],
+            found["data"]["scopeCoverage"][0]["semantic"]["reimport"],
             described["data"]["languages"][1]["semantic"]["reimport"]
         );
         let script = r#"
@@ -683,6 +685,38 @@ pub fn search(
     )
 }
 
+/// #715: each distinct coverage diagnostic once, in first-row order, with each row's
+/// `diagnostic` replaced by `diagnosticRef` (null without one). Re-inlining the table gives
+/// back the native coverage rows.
+fn coverage_diagnostics(
+    rows: &[&crate::native_evidence::Coverage],
+) -> Result<(Vec<Value>, Vec<String>), &'static str> {
+    let mut diagnostics: Vec<String> = Vec::new();
+    let rows = rows
+        .iter()
+        .map(|row| {
+            let mut value =
+                serde_json::to_value(row).map_err(|_| "store_unavailable: coverage projection")?;
+            let fields = value
+                .as_object_mut()
+                .ok_or("store_unavailable: coverage projection")?;
+            fields.remove("diagnostic");
+            let reference = row.diagnostic.as_ref().map(|diagnostic| {
+                diagnostics
+                    .iter()
+                    .position(|seen| seen == diagnostic)
+                    .unwrap_or_else(|| {
+                        diagnostics.push(diagnostic.clone());
+                        diagnostics.len() - 1
+                    })
+            });
+            fields.insert("diagnosticRef".into(), json!(reference));
+            Ok(value)
+        })
+        .collect::<Result<_, &'static str>>()?;
+    Ok((rows, diagnostics))
+}
+
 /// Budget the actual structured-plus-summary JSON-RPC frame, not the structured envelope alone.
 #[allow(clippy::too_many_arguments)]
 fn symbols(
@@ -695,7 +729,6 @@ fn symbols(
     mode: SymbolMode<'_>,
     compact: bool,
 ) -> Result<Option<Value>, &'static str> {
-    let _ = compact;
     let search = match mode {
         SymbolMode::Search(matched_by, status, role) => Some((matched_by, status, role)),
         _ => None,
@@ -715,22 +748,28 @@ fn symbols(
         .filter(|(_, row)| row[0] != 0)
         .map(|(language, _)| language)
         .collect();
-    let warnings_for = |n: usize| -> Vec<Value> {
-        let mut warnings = Vec::new();
-        if incomplete {
-            warnings.push(json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}));
-        }
-        let languages: Vec<&str> = if n == 0 {
+    let languages_for = |n: usize| -> Vec<&str> {
+        if n == 0 {
             scope_languages.clone()
         } else {
             result.symbols[..n]
                 .iter()
                 .map(|symbol| symbol.symbol.declaration.document.language.as_str())
                 .collect()
-        };
-        warnings.extend(syntax_only(tiers, languages));
+        }
+    };
+    let warnings_for = |n: usize| -> Vec<Value> {
+        let mut warnings = Vec::new();
+        if incomplete {
+            warnings.push(json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}));
+        }
+        warnings.extend(syntax_only(tiers, languages_for(n)));
         warnings
     };
+    // #715: lookup alternatives for the other tools keep the contract shape; find and
+    // search trim the scope rows, share coverage diagnostics and take `compact`.
+    let alternatives = matches!(mode, SymbolMode::Candidates(..));
+    let compact = compact && !alternatives;
     let scope = language_status(&result.scope, tiers);
     let basis = json!({"indexGeneration":result.pin.index_generation.to_string(),
         "indexRevision":result.pin.index_revision});
@@ -752,11 +791,17 @@ fn symbols(
         )?;
         let mut symbols: Vec<Value> = result.symbols[..n].iter().map(|symbol| {
             let d = &symbol.symbol.declaration;
-            Ok(json!({"symbolId":d.syntax_id,"name":d.name,"displayKey":display_key(d),"stableLookupKey":symbol.source.stable_lookup_key,
-                "kind":d.kind,"role":d.role,"doc":document_ref(&refs, &symbol.source.document).ok_or("store_unavailable: missing document ref")?,
-                "range":d.range,"nameRange":d.name_range,
-                "lines":symbol.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),
-                "evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]}))
+            let lines = symbol.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end}));
+            let doc = document_ref(&refs, &symbol.source.document).ok_or("store_unavailable: missing document ref")?;
+            // #715 compact: the follow-up handles only; the path replaces the document ref.
+            Ok(if compact {
+                json!({"symbolId":d.syntax_id,"name":d.name,"stableLookupKey":symbol.source.stable_lookup_key,
+                    "kind":d.kind,"role":d.role,"path":d.document.path,"lines":lines,"evidenceTier":"syntax"})
+            } else {
+                json!({"symbolId":d.syntax_id,"name":d.name,"displayKey":display_key(d),"stableLookupKey":symbol.source.stable_lookup_key,
+                    "kind":d.kind,"role":d.role,"doc":doc,"range":d.range,"nameRange":d.name_range,"lines":lines,
+                    "evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]})
+            })
         }).collect::<Result<Vec<_>, &'static str>>()?;
         if let Some((matched_by, _, _)) = search {
             for (index, symbol) in symbols.iter_mut().enumerate() {
@@ -817,9 +862,28 @@ fn symbols(
                 ))
         });
         let truncated = n < result.symbols.len() || result.has_more;
+        let data = if alternatives {
+            json!({"symbols":symbols,"documents":documents,"coverage":coverage,"scopeCoverage":scope,"provenance":closure})
+        } else {
+            // #715: only the scope rows of the emitted items' languages (with none, the
+            // searched languages), in #22 order. Completeness still covers every row.
+            let languages = languages_for(n);
+            let scope: Vec<&Value> = LANGUAGES
+                .iter()
+                .zip(&scope)
+                .filter(|(language, _)| languages.contains(language))
+                .map(|(_, row)| row)
+                .collect();
+            if compact {
+                json!({"symbols":symbols,"scopeCoverage":scope})
+            } else {
+                let (coverage, diagnostics) = coverage_diagnostics(&coverage)?;
+                json!({"symbols":symbols,"documents":documents,"coverage":coverage,
+                    "coverageDiagnostics":diagnostics,"scopeCoverage":scope,"provenance":closure})
+            }
+        };
         let mut envelope = json!({"schemaVersion":1,"requestId":id,"workspace":root,
-            "catchingUp":catching_up,"evidenceBasis":basis,
-            "data":{"symbols":symbols,"documents":documents,"coverage":coverage,"scopeCoverage":scope,"provenance":closure},
+            "catchingUp":catching_up,"evidenceBasis":basis,"data":data,
             "warnings":warnings_for(n),"partial":incomplete || truncated,"truncated":truncated,
             "truncationReason": if n < result.symbols.len() {Some("response_bytes")}
                 else if result.has_more {Some("limit")} else {None}});
@@ -1169,9 +1233,14 @@ mod find_tests {
             assert_eq!(envelope["partial"], false);
             assert_eq!(envelope["warnings"].as_array().unwrap().len(), 1);
             assert_eq!(envelope["warnings"][0]["code"], "syntaxOnly");
+            // #715: with no hits, only the searched languages with selected tuples.
             assert_eq!(
                 envelope["data"]["scopeCoverage"].as_array().unwrap().len(),
-                4
+                1
+            );
+            assert_eq!(
+                envelope["data"]["scopeCoverage"][0]["language"],
+                "javascript"
             );
         }
     }
@@ -1354,7 +1423,8 @@ mod find_tests {
                         .any(|symbol| symbol["doc"] == index)
                 );
             }
-            assert_eq!(data["scopeCoverage"].as_array().unwrap().len(), 4);
+            // #715: only the emitted (JavaScript) row.
+            assert_eq!(data["scopeCoverage"].as_array().unwrap().len(), 1);
             assert_eq!(envelope["catchingUp"], true);
             assert_eq!(envelope["truncated"], true);
             assert_eq!(envelope["truncationReason"], "response_bytes");
@@ -1497,7 +1567,8 @@ mod search_tests {
             .unwrap()
             .unwrap();
             let data = &envelope["data"];
-            assert_eq!(data.as_object().unwrap().len(), 7);
+            assert_eq!(data.as_object().unwrap().len(), 8);
+            assert_eq!(data["coverageDiagnostics"], json!([]));
             assert_eq!(data["role"], "any");
             assert_eq!(data["searchIndex"]["state"], "partial");
             assert_eq!(data["searchIndex"]["embedded"], 1);
@@ -1525,7 +1596,13 @@ mod search_tests {
             let empty = project(unavailable, modern).unwrap().unwrap();
             assert_eq!(empty["partial"], false);
             assert_eq!(empty["data"]["searchIndex"]["backend"], Value::Null);
-            for field in ["hits", "documents", "coverage", "provenance"] {
+            for field in [
+                "hits",
+                "documents",
+                "coverage",
+                "coverageDiagnostics",
+                "provenance",
+            ] {
                 assert_eq!(empty["data"][field], json!([]));
             }
             let incomplete = [[0; 5], [2, 1, 1, 0, 0], [0; 5], [3, 3, 0, 0, 0]];
@@ -1535,7 +1612,8 @@ mod search_tests {
             assert_eq!(empty["partial"], true);
             assert_eq!(empty["warnings"][0]["code"], "coverageIncomplete");
             assert_eq!(empty["warnings"][1]["code"], "syntaxOnly");
-            assert_eq!(empty["data"]["scopeCoverage"][1]["coverage"]["partial"], 1);
+            assert_eq!(empty["data"]["scopeCoverage"][0]["language"], "rust");
+            assert_eq!(empty["data"]["scopeCoverage"][0]["coverage"]["partial"], 1);
             assert_wire(&empty, modern);
         }
     }
@@ -1573,7 +1651,13 @@ mod search_tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(empty["truncationReason"], "response_bytes");
-            for field in ["hits", "documents", "coverage", "provenance"] {
+            for field in [
+                "hits",
+                "documents",
+                "coverage",
+                "coverageDiagnostics",
+                "provenance",
+            ] {
                 assert_eq!(empty["data"][field], json!([]));
             }
             assert_wire(&empty, modern);
@@ -1701,7 +1785,10 @@ mod compact_symbol_tests {
             })
             .collect();
         let mut result = super::find_tests::fixture(&rows, SCOPE, has_more);
-        for (symbol, (name, language, path, partial)) in result.symbols.iter_mut().zip(hits) {
+        for (i, (symbol, (name, language, path, partial))) in
+            result.symbols.iter_mut().zip(hits).enumerate()
+        {
+            symbol.symbol.declaration.syntax_id = format!("sid:v1:{i:032x}");
             symbol.symbol.declaration.document.language = (*language).into();
             symbol.source.document.document.language = (*language).into();
             symbol.symbol.coverage.language = (*language).into();
@@ -1835,7 +1922,6 @@ mod compact_symbol_tests {
                     .collect();
                 kept.sort_unstable();
                 let mut expected = vec![
-                    "displayKey",
                     "evidenceTier",
                     "kind",
                     "lines",
@@ -1993,7 +2079,7 @@ mod compact_symbol_tests {
     }
 
     /// Twenty Rust hits in twenty partial documents, the dogfood's shape: compact is under
-    /// a quarter of the full page, and the full page is smaller than before #715 (four
+    /// a third of the full page, and the full page is smaller than before #715 (four
     /// scope rows and the diagnostic inline on every coverage row).
     #[test]
     fn compact_symbol_pages_are_a_fraction_of_the_full_page() {
@@ -2044,7 +2130,7 @@ mod compact_symbol_tests {
                 "{tool}: full {full_bytes}, old {old}"
             );
             assert!(
-                compact * 4 < full_bytes,
+                compact * 3 < full_bytes,
                 "{tool}: compact {compact}, full {full_bytes}"
             );
             assert!(compact < 8 * 1024, "{tool}: compact {compact}");
@@ -2585,7 +2671,6 @@ pub fn call_graph(
     catching_up: bool,
     modern: bool,
 ) -> Result<Option<Value>, &'static str> {
-    let _ = node_keys;
     let Ok(full) = &answer.outcome else {
         return Err("store_unavailable: call graph answer is a contract failure");
     };
@@ -2635,7 +2720,7 @@ pub fn call_graph(
             let mut data = json!({"stableLookupKey":stable_lookup_key,"requested":requested,
                 "result":projected,"semanticBases":bases,"responseOmitted":omitted});
             if compact {
-                compact_graph(&mut data);
+                compact_graph(&mut data, node_keys);
             }
             Ok(
                 json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
@@ -2694,7 +2779,9 @@ const CALLEE_TEXT_BYTES: usize = 1024;
 /// result's `coverage`, `provenance` and `projectedProvenance`, each edge's `binding`
 /// (replaced by its `resolution`, null without one), each node declaration's header, ancestors, key, name
 /// range, revision and proof, and each call's document, revision, regions and proof.
-fn compact_graph(data: &mut Value) {
+/// #715: each node declaration adds its `stableLookupKey` from `node_keys` (null without
+/// one), the durable handle for follow-up calls.
+fn compact_graph(data: &mut Value, node_keys: &std::collections::BTreeMap<String, String>) {
     if let Some(fields) = data.as_object_mut() {
         fields.remove("semanticBases");
     }
@@ -2716,6 +2803,11 @@ fn compact_graph(data: &mut Value) {
             ] {
                 declaration.remove(field);
             }
+            let key = declaration
+                .get("syntaxId")
+                .and_then(Value::as_str)
+                .and_then(|sid| node_keys.get(sid));
+            declaration.insert("stableLookupKey".into(), json!(key));
         }
     }
     for edge in result["edges"].as_array_mut().into_iter().flatten() {
@@ -4947,7 +5039,8 @@ for (const output of JSON.parse(readFileSync(0,'utf8'))) {
                 json!({"nodes":0,"edges":0})
             );
             let bytes = graph_frame_bytes(&page);
-            assert!(bytes < 56 * 1024, "compact={compact}: {bytes} bytes");
+            // #715: compact node keys add about 3 KB at fifty nodes; the cap is 64 KiB.
+            assert!(bytes < 60 * 1024, "compact={compact}: {bytes} bytes");
         }
     }
 

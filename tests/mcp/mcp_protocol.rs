@@ -902,22 +902,10 @@ fn golden_settled_failure(id: &Value, root: &Value, code: &str, basis: Value) ->
 }
 
 /// Find's four scope rows for a checkout with no native documents (#156).
-fn empty_scope_coverage() -> Value {
-    let row = |language: &str| {
-        json!({"language":language,"nativeCoverageTier":"syntax","coverage":{
-            "selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
-            "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
-                "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
-                "documents":[],
-                "note":"no semantic producer published; showing syntax","reimport":null}})
-    };
-    json!([row("java"), row("rust"), row("python"), row("javascript")])
-}
-
 fn golden_settled_empty_find(id: &Value, root: &Value, pin: &Value) -> Value {
     json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":false,
         "evidenceBasis":pin,"data":{"symbols":[],"documents":[],"coverage":[],
-            "scopeCoverage":empty_scope_coverage(),"provenance":[]},
+            "coverageDiagnostics":[],"scopeCoverage":[],"provenance":[]},
         "warnings":[{"code":"syntaxOnly","message":"This answer is syntax-derived",
             "provenanceId":null}],"partial":false,"truncated":false,
         "truncationReason":null})
@@ -2900,8 +2888,8 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
                 let data = &answer["result"]["structuredContent"]["data"];
                 assert_eq!(
                     *data,
-                    json!({"symbols":[],"documents":[],"coverage":[],"scopeCoverage":empty_scope_coverage(),
-                        "provenance":[]})
+                    json!({"symbols":[],"documents":[],"coverage":[],"coverageDiagnostics":[],
+                        "scopeCoverage":[],"provenance":[]})
                 );
             } else {
                 tool(&answer, Some("not_found"), !legacy);
@@ -6900,6 +6888,7 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     assert_eq!(data["data"]["symbols"], json!([]));
     // #156: a zero-hit find carries no per-document rows; the searched
     // scope is reported as per-language tuple counts from the same snapshot.
+    // #715: only the searched languages with selected tuples (Java's are unselected).
     assert_eq!(data["data"]["coverage"], json!([]));
     let row = |language: &str, counts: [u64; 5]| {
         json!({"language":language,"nativeCoverageTier":"syntax","coverage":{
@@ -6913,7 +6902,6 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     assert_eq!(
         data["data"]["scopeCoverage"],
         json!([
-            row("java", [0, 0, 0, 0, 2]),
             row("rust", [1, 1, 0, 0, 0]),
             row("python", [2, 0, 1, 1, 0]),
             row("javascript", [1, 1, 0, 0, 0]),
@@ -7141,7 +7129,10 @@ async fn mcp_find_zero_hit_over_a_large_scope_fits_with_scope_counts() {
         })
         .sum();
     assert_eq!(total, 270, "{envelope}");
-    assert_eq!(scope[3]["coverage"]["complete"], 270, "{envelope}");
+    // #715: only the searched language with selected tuples.
+    assert_eq!(scope.len(), 1, "{envelope}");
+    assert_eq!(scope[0]["language"], "javascript");
+    assert_eq!(scope[0]["coverage"]["complete"], 270, "{envelope}");
     assert_eq!(envelope["partial"], false);
 }
 
@@ -13091,14 +13082,23 @@ async fn mcp_search_zero_hits_keep_incomplete_native_scope_separate_from_vectors
         assert_eq!(envelope["warnings"][0]["code"], "coverageIncomplete");
         assert_eq!(envelope["warnings"][1]["code"], "syntaxOnly");
         assert_eq!(envelope["warnings"].as_array().unwrap().len(), 2);
+        // #715: the hit's language only; with no hit, the searched languages. The
+        // incomplete Python scope keeps the answer partial either way.
         let scope = envelope["data"]["scopeCoverage"].as_array().unwrap();
-        assert_eq!(scope.len(), 4);
-        assert_eq!(scope[2]["language"], "python");
-        assert_eq!(scope[2]["coverage"]["partial"], 1);
+        let languages: Vec<_> = scope
+            .iter()
+            .map(|row| row["language"].as_str().unwrap())
+            .collect();
+        if count == 0 {
+            assert_eq!(languages, ["python", "javascript"]);
+            assert_eq!(scope[0]["coverage"]["partial"], 1);
+        } else {
+            assert_eq!(languages, ["javascript"]);
+        }
         assert_eq!(envelope["data"]["searchIndex"]["state"], "unavailable");
         assert_eq!(envelope["data"]["searchIndex"]["embedded"], 0);
         if count == 0 {
-            for field in ["documents", "coverage", "provenance"] {
+            for field in ["documents", "coverage", "coverageDiagnostics", "provenance"] {
                 assert_eq!(envelope["data"][field], json!([]));
             }
         } else {

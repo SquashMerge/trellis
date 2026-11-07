@@ -1699,11 +1699,19 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         }
                         let stable_lookup_key =
                             response.mcp_stable_lookup_key(&query.root_syntax_id, expected)?;
+                        // #715: compact nodes keep their stable lookup keys.
+                        let node_keys = match &answer.outcome {
+                            Ok(result) if compact => response.mcp_stable_lookup_keys(
+                                result.nodes.iter().map(|node| &node.declaration),
+                                answer.basis,
+                            )?,
+                            _ => Default::default(),
+                        };
                         Ok(projection::call_graph(
                             id,
                             &mut answer,
                             stable_lookup_key.as_deref(),
-                            &Default::default(),
+                            &node_keys,
                             compact,
                             root,
                             sampled,

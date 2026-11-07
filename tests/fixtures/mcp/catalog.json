@@ -1203,16 +1203,6 @@
         "Coverage": {
           "additionalProperties": false,
           "properties": {
-            "diagnostic": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Text"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
             "documentPath": {
               "$ref": "#/$defs/Path"
             },
@@ -1255,6 +1245,16 @@
                 "$ref": "#/$defs/Role"
               },
               "type": "array"
+            },
+            "diagnosticRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -1268,7 +1268,7 @@
             "state",
             "supportedRoles",
             "observedRoles",
-            "diagnostic"
+            "diagnosticRef"
           ],
           "type": "object"
         },
@@ -2317,78 +2317,6 @@
             "projection"
           ]
         },
-        "SymbolCoverage": {
-          "additionalProperties": false,
-          "properties": {
-            "documentPath": {
-              "$ref": "#/$defs/Path"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "observedRoles": {
-              "items": {
-                "$ref": "#/$defs/Role"
-              },
-              "type": "array"
-            },
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "requested": {
-              "type": "boolean"
-            },
-            "revisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "selected": {
-              "type": "boolean"
-            },
-            "sourceSetId": {
-              "$ref": "#/$defs/Text"
-            },
-            "state": {
-              "enum": [
-                "notRequested",
-                "omitted",
-                "unsupported",
-                "failed",
-                "partial",
-                "complete"
-              ]
-            },
-            "supportedRoles": {
-              "items": {
-                "$ref": "#/$defs/Role"
-              },
-              "type": "array"
-            },
-            "diagnosticRef": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/UInt"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "producerId",
-            "language",
-            "sourceSetId",
-            "documentPath",
-            "revisionId",
-            "requested",
-            "selected",
-            "state",
-            "supportedRoles",
-            "observedRoles",
-            "diagnosticRef"
-          ],
-          "type": "object"
-        },
         "CompactSymbol": {
           "additionalProperties": false,
           "type": "object",
@@ -2405,9 +2333,6 @@
                   "type": "null"
                 }
               ]
-            },
-            "displayKey": {
-              "$ref": "#/$defs/Text"
             },
             "stableLookupKey": {
               "anyOf": [
@@ -2450,7 +2375,6 @@
           "required": [
             "symbolId",
             "name",
-            "displayKey",
             "stableLookupKey",
             "kind",
             "role",
@@ -2466,84 +2390,66 @@
           "additionalProperties": false,
           "properties": {
             "data": {
-              "oneOf": [
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "coverage": {
-                      "items": {
-                        "$ref": "#/$defs/SymbolCoverage"
-                      },
-                      "type": "array"
-                    },
-                    "provenance": {
-                      "items": {
-                        "$ref": "#/$defs/Provenance"
-                      },
-                      "type": "array"
-                    },
-                    "scopeCoverage": {
-                      "items": {
-                        "$ref": "#/$defs/LanguageStatus"
-                      },
-                      "maxItems": 4,
-                      "minItems": 0,
-                      "type": "array"
-                    },
-                    "symbols": {
-                      "items": {
+              "additionalProperties": false,
+              "properties": {
+                "coverage": {
+                  "items": {
+                    "$ref": "#/$defs/Coverage"
+                  },
+                  "type": "array"
+                },
+                "provenance": {
+                  "items": {
+                    "$ref": "#/$defs/Provenance"
+                  },
+                  "type": "array"
+                },
+                "scopeCoverage": {
+                  "items": {
+                    "$ref": "#/$defs/LanguageStatus"
+                  },
+                  "maxItems": 4,
+                  "minItems": 0,
+                  "type": "array"
+                },
+                "symbols": {
+                  "items": {
+                    "anyOf": [
+                      {
                         "$ref": "#/$defs/Symbol"
                       },
-                      "type": "array"
-                    },
-                    "documents": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/$defs/DocumentRef"
-                      }
-                    },
-                    "coverageDiagnostics": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/$defs/Text"
-                      }
-                    }
-                  },
-                  "required": [
-                    "symbols",
-                    "coverage",
-                    "scopeCoverage",
-                    "provenance",
-                    "documents",
-                    "coverageDiagnostics"
-                  ],
-                  "type": "object"
-                },
-                {
-                  "additionalProperties": false,
-                  "type": "object",
-                  "properties": {
-                    "symbols": {
-                      "type": "array",
-                      "items": {
+                      {
                         "$ref": "#/$defs/CompactSymbol"
                       }
-                    },
-                    "scopeCoverage": {
-                      "items": {
-                        "$ref": "#/$defs/LanguageStatus"
-                      },
-                      "maxItems": 4,
-                      "minItems": 0,
-                      "type": "array"
-                    }
+                    ]
                   },
-                  "required": [
-                    "symbols",
-                    "scopeCoverage"
-                  ]
+                  "type": "array"
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentRef"
+                  }
+                },
+                "coverageDiagnostics": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/Text"
+                  }
                 }
-              ]
+              },
+              "required": [
+                "symbols",
+                "scopeCoverage"
+              ],
+              "type": "object",
+              "dependentRequired": {
+                "documents": [
+                  "coverage",
+                  "coverageDiagnostics",
+                  "provenance"
+                ]
+              }
             },
             "evidenceBasis": {
               "anyOf": [
@@ -2626,7 +2532,7 @@
       ],
       "type": "object"
     },
-    "description": "Find declarations by literal name or ID substring (no regex). Returns symbol IDs for the other tools, with line ranges. Results are native declarations; `scopeCoverage` also reports each language's selected semantic evidence, and `syntaxOnly` appears only for returned languages without it. Callables and types rank before fields, parameters and variables. `scopeCoverage` lists only the languages of the returned items. `compact:true` returns only each symbol's ID, name, display and stable lookup keys, kind, role, path, lines and evidence tier, plus `scopeCoverage`; it drops documents, coverage and provenance."
+    "description": "Find declarations by literal name or ID substring (no regex), callables and types first. Returns symbol IDs and stable lookup keys for the other tools, with line ranges. `scopeCoverage` reports the returned languages' semantic evidence; `syntaxOnly` names those without it. `compact:true` drops documents, coverage and provenance."
   },
   {
     "annotations": {
@@ -2728,16 +2634,6 @@
         "Coverage": {
           "additionalProperties": false,
           "properties": {
-            "diagnostic": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Text"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
             "documentPath": {
               "$ref": "#/$defs/Path"
             },
@@ -2780,6 +2676,16 @@
                 "$ref": "#/$defs/Role"
               },
               "type": "array"
+            },
+            "diagnosticRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -2793,7 +2699,7 @@
             "state",
             "supportedRoles",
             "observedRoles",
-            "diagnostic"
+            "diagnosticRef"
           ],
           "type": "object"
         },
@@ -3135,104 +3041,6 @@
             "configHash",
             "dependencyHash",
             "lookupDependencies"
-          ],
-          "type": "object"
-        },
-        "Symbol": {
-          "additionalProperties": false,
-          "properties": {
-            "displayKey": {
-              "$ref": "#/$defs/Text"
-            },
-            "evidenceTier": {
-              "const": "syntax"
-            },
-            "freshness": {
-              "const": "fresh"
-            },
-            "kind": {
-              "$ref": "#/$defs/Kind"
-            },
-            "name": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Text"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "nameRange": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Range"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "range": {
-              "$ref": "#/$defs/Range"
-            },
-            "semanticBasis": {
-              "const": null
-            },
-            "staleBecause": {
-              "maxItems": 0,
-              "type": "array"
-            },
-            "symbolId": {
-              "$ref": "#/$defs/SyntaxId"
-            },
-            "doc": {
-              "$ref": "#/$defs/UInt"
-            },
-            "lines": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/LineSpan"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "role": {
-              "type": "string",
-              "enum": [
-                "test",
-                "production"
-              ]
-            },
-            "stableLookupKey": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "minLength": 1
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "symbolId",
-            "name",
-            "displayKey",
-            "kind",
-            "range",
-            "nameRange",
-            "evidenceTier",
-            "semanticBasis",
-            "freshness",
-            "staleBecause",
-            "doc",
-            "lines",
-            "role",
-            "stableLookupKey"
           ],
           "type": "object"
         },
@@ -4048,78 +3856,6 @@
             "projection"
           ]
         },
-        "SymbolCoverage": {
-          "additionalProperties": false,
-          "properties": {
-            "documentPath": {
-              "$ref": "#/$defs/Path"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "observedRoles": {
-              "items": {
-                "$ref": "#/$defs/Role"
-              },
-              "type": "array"
-            },
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "requested": {
-              "type": "boolean"
-            },
-            "revisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "selected": {
-              "type": "boolean"
-            },
-            "sourceSetId": {
-              "$ref": "#/$defs/Text"
-            },
-            "state": {
-              "enum": [
-                "notRequested",
-                "omitted",
-                "unsupported",
-                "failed",
-                "partial",
-                "complete"
-              ]
-            },
-            "supportedRoles": {
-              "items": {
-                "$ref": "#/$defs/Role"
-              },
-              "type": "array"
-            },
-            "diagnosticRef": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/UInt"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "producerId",
-            "language",
-            "sourceSetId",
-            "documentPath",
-            "revisionId",
-            "requested",
-            "selected",
-            "state",
-            "supportedRoles",
-            "observedRoles",
-            "diagnosticRef"
-          ],
-          "type": "object"
-        },
         "CompactSearchHit": {
           "additionalProperties": false,
           "type": "object",
@@ -4136,9 +3872,6 @@
                   "type": "null"
                 }
               ]
-            },
-            "displayKey": {
-              "$ref": "#/$defs/Text"
             },
             "stableLookupKey": {
               "anyOf": [
@@ -4216,7 +3949,6 @@
           "required": [
             "symbolId",
             "name",
-            "displayKey",
             "stableLookupKey",
             "kind",
             "role",
@@ -4234,110 +3966,79 @@
           "additionalProperties": false,
           "properties": {
             "data": {
-              "oneOf": [
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "coverage": {
-                      "items": {
-                        "$ref": "#/$defs/SymbolCoverage"
-                      },
-                      "type": "array"
-                    },
-                    "provenance": {
-                      "items": {
-                        "$ref": "#/$defs/Provenance"
-                      },
-                      "type": "array"
-                    },
-                    "scopeCoverage": {
-                      "items": {
-                        "$ref": "#/$defs/LanguageStatus"
-                      },
-                      "maxItems": 4,
-                      "minItems": 0,
-                      "type": "array"
-                    },
-                    "documents": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/$defs/DocumentRef"
-                      }
-                    },
-                    "hits": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/$defs/SearchHit"
-                      }
-                    },
-                    "searchIndex": {
-                      "$ref": "#/$defs/SearchIndexStatus"
-                    },
-                    "role": {
-                      "type": "string",
-                      "enum": [
-                        "any",
-                        "production",
-                        "test"
-                      ]
-                    },
-                    "coverageDiagnostics": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/$defs/Text"
-                      }
-                    }
+              "additionalProperties": false,
+              "properties": {
+                "coverage": {
+                  "items": {
+                    "$ref": "#/$defs/Coverage"
                   },
-                  "required": [
-                    "hits",
-                    "documents",
-                    "coverage",
-                    "scopeCoverage",
-                    "provenance",
-                    "searchIndex",
-                    "role",
-                    "coverageDiagnostics"
-                  ],
-                  "type": "object"
+                  "type": "array"
                 },
-                {
-                  "additionalProperties": false,
-                  "type": "object",
-                  "properties": {
-                    "hits": {
-                      "type": "array",
-                      "items": {
+                "provenance": {
+                  "items": {
+                    "$ref": "#/$defs/Provenance"
+                  },
+                  "type": "array"
+                },
+                "scopeCoverage": {
+                  "items": {
+                    "$ref": "#/$defs/LanguageStatus"
+                  },
+                  "maxItems": 4,
+                  "minItems": 0,
+                  "type": "array"
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentRef"
+                  }
+                },
+                "hits": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/SearchHit"
+                      },
+                      {
                         "$ref": "#/$defs/CompactSearchHit"
                       }
-                    },
-                    "scopeCoverage": {
-                      "items": {
-                        "$ref": "#/$defs/LanguageStatus"
-                      },
-                      "maxItems": 4,
-                      "minItems": 0,
-                      "type": "array"
-                    },
-                    "searchIndex": {
-                      "$ref": "#/$defs/SearchIndexStatus"
-                    },
-                    "role": {
-                      "type": "string",
-                      "enum": [
-                        "any",
-                        "production",
-                        "test"
-                      ]
-                    }
-                  },
-                  "required": [
-                    "hits",
-                    "scopeCoverage",
-                    "searchIndex",
-                    "role"
+                    ]
+                  }
+                },
+                "searchIndex": {
+                  "$ref": "#/$defs/SearchIndexStatus"
+                },
+                "role": {
+                  "type": "string",
+                  "enum": [
+                    "any",
+                    "production",
+                    "test"
                   ]
+                },
+                "coverageDiagnostics": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/Text"
+                  }
                 }
-              ]
+              },
+              "required": [
+                "hits",
+                "scopeCoverage",
+                "searchIndex",
+                "role"
+              ],
+              "type": "object",
+              "dependentRequired": {
+                "documents": [
+                  "coverage",
+                  "coverageDiagnostics",
+                  "provenance"
+                ]
+              }
             },
             "evidenceBasis": {
               "anyOf": [
@@ -4420,7 +4121,7 @@
       ],
       "type": "object"
     },
-    "description": "Rank declarations for a natural-language or code query (lexical plus local vector search when available). Returns symbol IDs for the other tools. Relevance is not proof; `scopeCoverage` reports each language's selected semantic evidence. `scopeCoverage` lists only the languages of the returned items. `compact:true` returns only each hit's ID, name, display and stable lookup keys, kind, role, path, lines, evidence tier, rank and arms, plus `scopeCoverage`, `searchIndex` and `role`; it drops documents, coverage and provenance."
+    "description": "Rank declarations for a natural-language or code query (lexical plus local vector search when available). Returns symbol IDs and stable lookup keys for the other tools. Relevance is not proof; `scopeCoverage` reports the returned languages' semantic evidence. `compact:true` drops documents, coverage and provenance."
   },
   {
     "annotations": {
@@ -13971,7 +13672,7 @@
       ],
       "type": "object"
     },
-    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Defaults: depth 2, maxNodes 8, maxCalls 10 with full proofs; `compact:true` keeps node keys (with each node's `stableLookupKey`), names, paths, edge kinds and resolutions, drops bindings, coverage and provenance, and defaults to maxNodes 50, maxCalls 60. Each distinct semantic basis appears once in `semanticBases`; `responseOmitted` counts nodes and edges cut to fit the response. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead."
+    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Defaults: depth 2, maxNodes 8, maxCalls 10 with full proofs; `compact:true` keeps node and stable lookup keys, names, paths, edge kinds and resolutions, drops bindings, coverage and provenance, and defaults to maxNodes 50, maxCalls 60. Each distinct semantic basis appears once in `semanticBases`; `responseOmitted` counts nodes and edges cut to fit the response. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead."
   },
   {
     "annotations": {
