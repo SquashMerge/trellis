@@ -15243,6 +15243,49 @@ async fn call_graph_ranks_project_named_calls_first_through_mcp() {
     mcp.finish();
 }
 
+/// #778 (owner ruling 2026-11-07): semantic bindings take precedence. The name relation
+/// orders only calls with no selected binding; a bound boundary keeps the third rank even
+/// when its name matches no declaration, so it is never ranked below an unbound call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_graph_name_order_applies_only_to_unbound_calls_through_mcp() {
+    use graph_fixtures::{Bind, bind};
+    use trellis::semantic_evidence::Resolution;
+    let spec = with_bindings(
+        &[(
+            "a.rs",
+            "fn run(x: R) {\n    Some(1);\n    x.mystery();\n    helper();\n}\nfn helper() {}\n",
+        )],
+        vec![Bind {
+            resolution: Resolution::Unresolved,
+            target: None,
+            ..bind("run", 1, "-")
+        }],
+    );
+    let mut mcp = GraphMcp::start(7781, &[spec], Default::default()).await;
+    let producer = json!({"semanticProducerId":graph_fixtures::PRODUCER,"compact":true});
+    let reply = mcp.graph(mcp.args("run", producer));
+    let edges = reply["data"]["result"]["edges"].as_array().unwrap();
+    let order: Vec<(&str, &str)> = edges
+        .iter()
+        .map(|edge| {
+            (
+                edge["call"]["spelling"].as_str().unwrap(),
+                edge["boundaryReason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("mystery", "unresolved"),
+            ("helper", "missingEvidence"),
+            ("Some", "missingEvidence")
+        ],
+        "{reply}"
+    );
+    mcp.finish();
+}
+
 /// #715: `compact` reaches find (query and lookup key) and search through MCP. Each item
 /// keeps its stable lookup key and path, the answer drops documents, coverage and
 /// provenance, and full and compact `scopeCoverage` list only the result languages.

@@ -452,7 +452,7 @@ pub trait GraphSource {
     fn history(&mut self, key: &DocumentKey, syntax_id: &str) -> Result<Option<Arc<HistoryFacts>>>;
     /// Whether `call`'s measured callee lookup key names a declaration of the call's language
     /// in the admitted snapshot: the Decision 0012 name relation, read in the other
-    /// direction (#778). It only orders boundaries; it never targets, expands or filters.
+    /// direction (#778). It only orders unbound boundaries; it never targets, expands or filters.
     fn names_declaration(&mut self, _call: &native::Call) -> Result<bool> {
         Ok(false)
     }
@@ -1075,14 +1075,16 @@ pub fn evaluate(
                     existing.edge.call_site_count += 1;
                     continue;
                 }
-                // #778: among the other boundaries, a call whose callee name names a
-                // declaration in the snapshot (likely the project's own) ranks before
-                // name-only calls that name none (constructors, standard-library methods).
+                // #778 (owner-ratified 2026-11-07): semantic bindings take precedence, so a
+                // bound boundary keeps the third rank. Only an unbound call is ordered by
+                // name: one whose callee names a declaration in the snapshot (likely the
+                // project's own) ranks before those that name none (constructors,
+                // standard-library methods).
                 let rank = if reason == BoundaryReason::None {
                     0
                 } else if external {
                     1
-                } else if source.names_declaration(call)? {
+                } else if selected.is_some() || source.names_declaration(call)? {
                     2
                 } else {
                     3
