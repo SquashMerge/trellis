@@ -15188,6 +15188,61 @@ async fn call_graph_compact_and_basis_table_through_mcp() {
     mcp.finish();
 }
 
+/// #778: without semantic evidence every call is a boundary. Calls whose callee name
+/// names a declaration in the admitted snapshot (the Decision 0012 name relation) rank
+/// before the other name-only calls, so constructors and standard-library methods no
+/// longer crowd the project's calls out of `maxCalls`; the cut stays exactly counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_graph_ranks_project_named_calls_first_through_mcp() {
+    let spec = graph_fixtures::Spec::new(&[(
+        "a.rs",
+        "fn run(x: R) -> R {\n    Some(1);\n    x.clone();\n    x.map_err(e);\n    Ok(2);\n    helper();\n    x.into_response();\n    other();\n    Err(3)\n}\nfn helper() {}\nfn other() {}\n",
+    )]);
+    let mut mcp = GraphMcp::start(778, &[spec], Default::default()).await;
+    let spellings = |envelope: &Value| -> Vec<String> {
+        envelope["data"]["result"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| edge["call"]["spelling"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let all = mcp.graph(mcp.args("run", json!({"compact":true})));
+    assert_eq!(
+        spellings(&all),
+        [
+            "helper",
+            "other",
+            "Some",
+            "clone",
+            "map_err",
+            "Ok",
+            "into_response",
+            "Err"
+        ],
+        "{all}"
+    );
+    assert_eq!(all["truncated"], false);
+    for compact in [true, false] {
+        let arguments = mcp.args("run", json!({"compact":compact,"maxCalls":3}));
+        let cut = mcp.graph(arguments.clone());
+        assert_eq!(spellings(&cut), ["helper", "other", "Some"], "{cut}");
+        let result = &cut["data"]["result"];
+        assert_eq!(result["omitted"]["callLimit"], 5, "{cut}");
+        assert_eq!(
+            result["frontier"],
+            json!([{"reason":"callLimit","nodeId":mcp.id_of("run"),"callId":null,
+                "targetId":null,"nextOrdinal":null,"omittedCalls":5}]),
+            "{cut}"
+        );
+        assert_eq!(cut["truncationReason"], "limit");
+        if !compact {
+            assert_eq!(*result, mcp.store_answer(&arguments, None));
+        }
+    }
+    mcp.finish();
+}
+
 /// #715: `compact` reaches find (query and lookup key) and search through MCP. Each item
 /// keeps its stable lookup key and path, the answer drops documents, coverage and
 /// provenance, and full and compact `scopeCoverage` list only the result languages.
