@@ -3383,7 +3383,7 @@ mod selection_tests {
                 }
                 store.request_by_id(&accepted.id)
             },
-            Instant::now() + Duration::from_secs(30),
+            Instant::now() + crate::testing::HANG_BACKSTOP,
         )
         .unwrap()
         .unwrap();

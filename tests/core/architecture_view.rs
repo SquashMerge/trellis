@@ -79,7 +79,7 @@ fn architecture_full_view_shares_one_deadline_across_parallel_preparation() {
             "{RULES}\n[roles.inherited]\nselect={{extends='Base'}}\n[roles.any]\nselect={{paths=['**']}}\n[[rules]]\nid='inheritance'\nfor_each='inherited'\nrequire=[{{calls='any'}}]"
         ),
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut check = || {
         anyhow::ensure!(std::time::Instant::now() < deadline, "deadline_exceeded");
         Ok(())

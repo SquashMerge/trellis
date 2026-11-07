@@ -9954,7 +9954,7 @@ async fn mcp_outgoing_prior_revision_target_is_not_a_selected_candidate() {
             20,
             None,
             &|| std::time::Instant::now(),
-            std::time::Instant::now() + Duration::from_secs(5),
+            std::time::Instant::now() + trellis::testing::HANG_BACKSTOP,
         )
         .unwrap()
         .unwrap();

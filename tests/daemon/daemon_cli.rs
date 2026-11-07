@@ -2459,7 +2459,11 @@ fn metrics_preface_rejects_other_operation_and_preserves_ordinary_frames() {
     prefaced
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    protocol::write_preface_until(&mut prefaced, Instant::now() + Duration::from_secs(1)).unwrap();
+    protocol::write_preface_until(
+        &mut prefaced,
+        Instant::now() + trellis::testing::HANG_BACKSTOP,
+    )
+    .unwrap();
     protocol::write_frame(&mut prefaced, &request).unwrap();
     assert!(protocol::read_frame::<Reply>(&mut prefaced).is_err());
     let mut again = UnixStream::connect(&socket).unwrap();
@@ -3219,7 +3223,7 @@ fn metrics_held_daemon_work_returns_complete_multiframe_revision() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let admitted = Instant::now() + Duration::from_secs(30);
+    let admitted = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if fs::metadata(gate.join("started")).is_ok() {
             break;
@@ -3390,7 +3394,7 @@ fn metrics_peer_closes_at_parser_hook_without_poisoning_daemon() {
         .unwrap();
     crate::child::assert_cli_success(&indexed, "indexed");
     let mut stream = UnixStream::connect(fixture_socket_paths(&home).socket).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     protocol::write_preface_until(&mut stream, deadline).unwrap();
     protocol::write_frame_until(&mut stream, &Request {
         id: 39, operation: "metrics".into(),
@@ -3398,7 +3402,7 @@ fn metrics_peer_closes_at_parser_hook_without_poisoning_daemon() {
     }, deadline).unwrap();
     let admission: Reply = protocol::read_frame_until(&mut stream, deadline).unwrap();
     assert_eq!(admission.payload, serde_json::json!({"admitted": true}));
-    let progress_deadline = Instant::now() + Duration::from_secs(5);
+    let progress_deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while !hit.exists() {
         assert!(
             Instant::now() < progress_deadline,
@@ -3666,7 +3670,7 @@ fn metrics_file_and_declaration_work_deadlines_are_typed() {
     // excluding CLI process startup and requiring the error inside the grace.
     fs::write(&error_delay_file, "50").unwrap();
     let mut stream = UnixStream::connect(fixture_socket_paths(&home).socket).unwrap();
-    let ingress = Instant::now() + Duration::from_secs(5);
+    let ingress = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let request = Request {
         id: 79,
         operation: "metrics".into(),
@@ -3698,7 +3702,7 @@ fn metrics_file_and_declaration_work_deadlines_are_typed() {
     // than publish a typed error or a partial success after expiry.
     fs::write(&error_delay_file, "600").unwrap();
     let mut late = UnixStream::connect(fixture_socket_paths(&home).socket).unwrap();
-    let ingress = Instant::now() + Duration::from_secs(5);
+    let ingress = Instant::now() + trellis::testing::HANG_BACKSTOP;
     protocol::write_preface_until(&mut late, ingress).unwrap();
     protocol::write_frame_until(&mut late, &request, ingress).unwrap();
     let admission: Reply = protocol::read_frame_until(&mut late, ingress).unwrap();
