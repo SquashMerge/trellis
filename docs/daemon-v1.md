@@ -22,9 +22,11 @@ daemon. `--token-file` is required and must be outside the selected checkout. Th
 disposable path-keyed index uses fixed per-user cache locations. A Git workspace UUID marker is written inside the selected Git directory;
 there are no other checkout topology writes.
 
-`serve` indexes the checkout in the background at startup, and the daemon's watcher then keeps
-it current: it re-publishes a few seconds after a file change or branch switch, with no user
-action (see [local topology](local-topology.md)). **Index workspace** queues an explicit index
+`serve` starts the listener and registers the checkout; registration alone does not index.
+The first browser data request, CLI operation or MCP request for the checkout activates it,
+which starts background indexing, and the daemon's watcher then keeps the active checkout
+current: it re-publishes a few seconds after a file change or branch switch, with no user
+action (see [local topology](local-topology.md) and Decision 0009 §6). **Index workspace** queues an explicit index
 request; **Refresh status & view** only reloads the already published data. Ctrl-C or SIGTERM
 ends `serve`, but the per-user daemon keeps running and keeps answering on the port until
 `trellis daemon stop` or its idle exit (see the [quickstart](quickstart.md)). A cancellation
