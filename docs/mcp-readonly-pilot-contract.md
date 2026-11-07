@@ -375,30 +375,47 @@ over the [proposal prompt](#one-no-argument-proposal-prompt) and
 references" means inside the prompt. The tools, their pages, the pin, the rules bytes and
 descriptor, the atomic failures and the frame are unchanged.
 
-- `payload.references` is a summary of the pinned references result. It keeps
-  `referencesVersion`, `evidenceTier`, `semanticComplete`, `semanticProducers`,
-  `partial`, `counts` and `limitations` as they are, and adds
-  `totals:{productionEdges,productionSites,testEdges,testSites,externalPackages,partialFiles}`.
-- Four groups, each `{rows,total,omitted}`:
-  - `directories.production` and `directories.tests` hold
-    `{source,target,sites,filePairs}`, with native edges summed by
-    source and target directory. A file's directory is its path up to the last slash,
-    or `.` at the root.
-  - `packages.production` holds `{language,package,standardLibrary,sites,filePairs}`,
-    with production package edges summed by package identity.
-  - `filePairs.production` holds native production edges as
-    `{source:{language,path},target:{language,path},sites}`. These are the endpoints of
-    a `$layers` exception.
-- Each group is ordered by `sites` descending, then by key. They are filled in the order
-  listed above. Each keeps the longest prefix whose rows fit the complete frame after the
-  instructions, rules bytes, pin and envelope; `rows.length + omitted = total`. The
-  result is deterministic for one pin and rules text.
-- Site samples, module and package descriptors, unresolved sites and partial files are
-  counted, not listed. The server instructions name `trellis_references` (with
-  `expectedBasis`, `paths` and `offset`) and `trellis_rules_check` /
-  `trellis_rules_explain` for detail.
-- Rules bytes are never clipped. If the fixed part alone does not fit, the prompt still
-  fails atomically with `response_too_large`.
+The prompt is a hybrid: a small fixed context plus an explicit workflow that pages the
+existing tools for detail.
+
+- **Unchanged:** the server instructions and the full rules grammar (skeleton, external
+  policy, exceptions); the current exact `rules.toml` bytes and descriptor, or explicit
+  absence; the pin (`evidenceBasis`), `workspace` and `catchingUp`.
+- **`payload.references` is a summary** of the pinned references result, not the result.
+  - It keeps `referencesVersion`, `evidenceTier`, `semanticComplete`,
+    `semanticProducers`, `partial`, `counts` (scanned documents, mapped, unresolved and
+    semantic sites) and `limitations` as they are.
+  - It adds
+    `totals:{productionEdges,productionSites,testEdges,testSites,externalPackages,partialFiles}`.
+- **One overview table,** `overview:{rows,total,omitted}`.
+  - Each row is `{source,target,sites}`: production native edges summed by source and
+    target directory. A file's directory is its path up to the last slash, or `.` at the
+    root. Package destinations have no directory and are only counted.
+  - Rows are ordered by `sites` descending, then by source and target.
+  - The overview keeps the longest prefix whose rows, as escaped in the prompt text, fit
+    a fixed budget of 12,288 bytes (`PROMPT_OVERVIEW_BYTES`). If large rules bytes leave
+    less room in the frame, it keeps the smaller remaining room instead.
+    `rows.length + omitted = total`, and the result is deterministic for one pin and
+    rules text.
+  - Why 12 KiB: a directory row costs about 45 to 70 bytes, so the budget holds roughly
+    200 rows. That covers every production directory pair of mimir (74) and Trellis (67).
+    It also keeps the prompt near the #528 24 KiB agent page target.
+- **Not listed:** test, package and file-module edges, site samples, module and package
+  descriptors, unresolved sites and partial files. They are counted, not listed.
+- **Workflow.** The instructions tell the agent to:
+  1. start from the overview;
+  2. page `trellis_references` (`expectedBasis`, `paths`, `offset`) to refine particular
+     areas;
+  3. draft `rules.toml` and test it with `trellis_rules_check` /
+     `trellis_rules_explain`;
+  4. pull exact file-level edges from `trellis_references` only when writing baseline
+     exceptions.
+
+  A future `groupBy` aggregation
+  ([#775](https://github.com/SquashMerge/trellis/issues/775)) will make step 2 cheaper.
+- **Atomic failure stays.** Rules bytes are never clipped. If the fixed part
+  (instructions, rules bytes, pin and envelope) does not fit, the prompt still fails
+  atomically with `response_too_large`.
 
 ## Tool catalog
 

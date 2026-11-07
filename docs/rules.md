@@ -884,8 +884,11 @@ Its static list is workspace-independent; get uses the same evidence admission,
 deadline, cancellation and final-root lifecycle as tools. It supplies server task
 instructions separately from untrusted repository data: the pinned structural
 reference view, limitations and production/test split, plus current exact rules
-bytes/digest or explicit absence. The reference view is a bounded summary: directory
-and file-pair edges with counts, the largest that fit, and exact omitted counts
+bytes/digest or explicit absence. The reference view is a bounded summary: counts,
+limitations and edge and site totals, plus one production directory-to-directory
+overview within a fixed byte budget, with an exact omitted count. The instructions'
+workflow pages `trellis_references` and runs `trellis_rules_check` /
+`trellis_rules_explain` for detail
 ([MCP amendment #770](mcp-readonly-pilot-contract.md#amendment-770-a-bounded-prompt-reference-view)).
 
 Ask the agent for integer layer orders, explicit peer/shared policy choices,

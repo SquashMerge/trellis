@@ -12012,7 +12012,8 @@ async fn propose_layers_prompt_fits_the_frame_when_references_exceed_it() {
     let refs_env = &refs["result"]["structuredContent"];
     assert!(refs_env.get("error").is_none(), "{refs}");
     let first = raw(2, "prompts/get", json!({"name":"trellis_propose_layers"}));
-    assert!(first.len() <= 65_536, "{} bytes", first.len());
+    // A small prompt: instructions, rules, pin, totals and a bounded overview.
+    assert!(first.len() < 32 * 1024, "{} bytes", first.len());
     let prompt: Value = serde_json::from_str(&first).unwrap();
     assert!(prompt.get("error").is_none(), "{prompt}");
     let second = raw(3, "prompts/get", json!({"name":"trellis_propose_layers"}));
@@ -12025,7 +12026,8 @@ async fn propose_layers_prompt_fits_the_frame_when_references_exceed_it() {
         .as_str()
         .unwrap();
     assert!(text.contains("for human review"));
-    assert!(text.contains("trellis_references"));
+    assert!(text.contains("WORKFLOW\n1. Start from the overview"));
+    assert!(text.contains("trellis_references with expectedBasis"));
     let context: Value =
         serde_json::from_str(text.split("UNTRUSTED REPOSITORY DATA\n").nth(1).unwrap()).unwrap();
     let payload = &context["payload"];
@@ -12036,33 +12038,21 @@ async fn propose_layers_prompt_fits_the_frame_when_references_exceed_it() {
     );
     let summary = &payload["references"];
     assert_eq!(summary["referencesVersion"], "references:v2");
-    // 200 modules, each importing six modules of other packages: 1,200 file pairs in 60
-    // directory pairs. The pairs cannot all fit; the directory view can.
+    // 200 modules, each importing six modules of other packages: 1,200 file pairs (whose
+    // inlined references exceed the frame) in 60 directory pairs, all in the overview.
     assert_eq!(summary["totals"]["productionEdges"], 1200, "{summary}");
-    let directories = &summary["directories"]["production"];
-    assert_eq!(directories["total"], 60, "{directories}");
-    assert_eq!(directories["omitted"], 0);
-    let rows = directories["rows"].as_array().unwrap();
+    assert_eq!(summary["totals"]["productionSites"], 1200, "{summary}");
+    assert_eq!(summary["counts"], refs_env["data"]["counts"]);
+    let overview = &summary["overview"];
+    assert_eq!(overview["total"], 60, "{overview}");
+    assert_eq!(overview["omitted"], 0);
+    let rows = overview["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 60);
-    assert!(
-        rows.iter()
-            .all(|row| row["sites"] == 20 && row["filePairs"] == 20),
-        "{directories}"
-    );
-    assert_eq!(rows[0]["source"], "pkg0");
-    assert_eq!(rows[0]["target"], "pkg1");
-    let pairs = &summary["filePairs"]["production"];
-    assert_eq!(pairs["total"], 1200);
-    let shown = pairs["rows"].as_array().unwrap();
-    assert!(!shown.is_empty());
-    let omitted = pairs["omitted"].as_u64().unwrap();
-    assert_eq!(shown.len() as u64 + omitted, 1200);
-    assert!(omitted > 0, "the fixture must exceed the frame");
-    assert_eq!(
-        shown[0],
-        json!({"source":{"language":"python","path":"pkg0/m0.py"},
-            "target":{"language":"python","path":"pkg1/m1.py"},"sites":1})
-    );
+    assert!(rows.iter().all(|row| row["sites"] == 20), "{overview}");
+    assert_eq!(rows[0], json!({"source":"pkg0","target":"pkg1","sites":20}));
+    for field in ["production", "tests", "unresolved", "filePairs", "packages"] {
+        assert!(summary.get(field).is_none(), "{field}");
+    }
     drop(raw);
     drop(reader);
     drop(client);
