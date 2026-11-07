@@ -29,6 +29,16 @@
 //!
 //! Settled describes the moment it was sampled: work a test starts after it
 //! returns, or a late watcher event, can make the checkout busy again.
+//!
+//! # Flaky-pattern check
+//!
+//! `tools/flaky-patterns.py`, in the verify checks lane, flags these in test
+//! code and names the helper to use: an unwrapped `Store::open` (use
+//! [`retry_admission`]), a process-global static counter (scope it to the
+//! thread, store or call), a functional deadline shorter than
+//! [`HANG_BACKSTOP`] (use [`wait_until`], settled, or the backstop), and a
+//! blocking `accept()` (use [`accept_within_backstop`]). Justified exceptions
+//! go in `tools/flaky-patterns.allow`, each with a one-line reason.
 
 use std::time::{Duration, Instant};
 
