@@ -44,7 +44,8 @@ fn fixture(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, Sto
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
     }
-    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), root.path()));
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let baseline = store.index_baseline().unwrap();
     let leader = store.publication_for_tests().unwrap();
