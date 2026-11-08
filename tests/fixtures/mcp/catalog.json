@@ -992,7 +992,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 14
+                  "const": 15
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -14485,6 +14485,79 @@
                   "type": "null"
                 }
               ]
+            },
+            "owner": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "syntaxId": {
+                      "$ref": "#/$defs/SyntaxId"
+                    },
+                    "name": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "stableLookupKey": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "syntaxId",
+                    "name",
+                    "stableLookupKey"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "target": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "syntaxId": {
+                      "$ref": "#/$defs/SyntaxId"
+                    },
+                    "displayKey": {
+                      "type": "string"
+                    },
+                    "document": {
+                      "$ref": "#/$defs/DocumentKey"
+                    },
+                    "lines": {
+                      "$ref": "#/$defs/LineSpan"
+                    }
+                  },
+                  "required": [
+                    "syntaxId",
+                    "displayKey",
+                    "document",
+                    "lines"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "targetReason": {
+              "enum": [
+                "structural_only",
+                "unresolved",
+                "external",
+                "ambiguous",
+                null
+              ]
             }
           },
           "required": [
@@ -14496,7 +14569,10 @@
             "spelling",
             "callId",
             "mapping",
-            "provenanceId"
+            "provenanceId",
+            "owner",
+            "target",
+            "targetReason"
           ]
         },
         "Module": {
@@ -14564,6 +14640,30 @@
                   "type": "null"
                 }
               ]
+            },
+            "kindCounts": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "call": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "type": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "import": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "reference": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "call",
+                "type",
+                "import",
+                "reference"
+              ]
             }
           },
           "required": [
@@ -14573,7 +14673,8 @@
             "sites",
             "omittedSites",
             "evidenceTier",
-            "semanticSites"
+            "semanticSites",
+            "kindCounts"
           ]
         },
         "UnresolvedReference": {
@@ -14594,568 +14695,6 @@
             "source",
             "site",
             "reason"
-          ]
-        },
-        "ConfigDescriptor": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "path": {
-              "const": ".trellis/rules.toml"
-            },
-            "source": {
-              "const": "checkout-config"
-            },
-            "contentHash": {
-              "$ref": "#/$defs/Hash"
-            }
-          },
-          "required": [
-            "path",
-            "source",
-            "contentHash"
-          ]
-        },
-        "RuleEvidence": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "document": {
-              "$ref": "#/$defs/DocumentKey"
-            },
-            "revisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "range": {
-              "$ref": "#/$defs/Range"
-            },
-            "kind": {
-              "enum": [
-                "declaration",
-                "call",
-                "structuralReference",
-                "semanticBinding",
-                "typeRelationship"
-              ]
-            },
-            "syntaxId": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SyntaxId"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "callId": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "pattern": "^occ:v2:[0-9a-f]{32}$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "provenanceId": {
-              "$ref": "#/$defs/Text"
-            },
-            "projection": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticProjection"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "historicalFreshness": {
-              "enum": [
-                "fresh",
-                "possiblyStale",
-                "stale",
-                null
-              ]
-            },
-            "historicalContentHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "evidenceKind": {
-              "enum": [
-                "measuredSyntax",
-                "declarationBinding",
-                "semanticReference",
-                "typeRelationship"
-              ]
-            },
-            "derivedFrom": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/DerivedFrom"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "basis": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticBasis"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "historicalTargets": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "kind": {
-                    "enum": [
-                      "internal",
-                      "external"
-                    ]
-                  },
-                  "language": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "path": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "syntaxId": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "revisionId": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "role": {
-                    "enum": [
-                      "declared",
-                      "candidate",
-                      "dispatch"
-                    ]
-                  }
-                },
-                "required": [
-                  "kind",
-                  "language",
-                  "path",
-                  "syntaxId",
-                  "revisionId"
-                ]
-              }
-            },
-            "semanticBoundary": {
-              "type": "boolean"
-            },
-            "freshness": {
-              "enum": [
-                "fresh",
-                "possiblyStale",
-                "stale"
-              ]
-            },
-            "historicalResolution": {
-              "enum": [
-                "resolved",
-                "external",
-                "ambiguous",
-                "unresolved"
-              ]
-            },
-            "historicalExternalTargets": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "scheme": {
-                    "type": "string"
-                  },
-                  "symbol": {
-                    "type": "string"
-                  },
-                  "scope": {
-                    "enum": [
-                      "global",
-                      "document"
-                    ]
-                  },
-                  "language": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "path": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "role": {
-                    "enum": [
-                      "declared",
-                      "candidate",
-                      "dispatch"
-                    ]
-                  }
-                },
-                "required": [
-                  "scheme",
-                  "symbol",
-                  "scope",
-                  "language",
-                  "path"
-                ]
-              }
-            },
-            "historicalDispatch": {
-              "enum": [
-                "direct",
-                "constructor",
-                "virtual",
-                "interface",
-                "dynamic",
-                "unknown"
-              ]
-            },
-            "historicalJoin": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "status": {
-                  "type": "string"
-                },
-                "kind": {
-                  "type": "string"
-                },
-                "language": {
-                  "type": "string"
-                },
-                "path": {
-                  "type": "string"
-                },
-                "revisionId": {
-                  "type": "string"
-                },
-                "range": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "start": {
-                      "$ref": "#/$defs/UInt"
-                    },
-                    "end": {
-                      "$ref": "#/$defs/UInt"
-                    }
-                  },
-                  "required": [
-                    "start",
-                    "end"
-                  ]
-                }
-              },
-              "required": [
-                "status",
-                "kind",
-                "language",
-                "path",
-                "revisionId",
-                "range"
-              ]
-            },
-            "caller": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Caller"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "callerReason": {
-              "anyOf": [
-                {
-                  "enum": [
-                    "syntax_only",
-                    "enclosing_callable_unknown",
-                    "stable_lookup_unavailable",
-                    "semantic_boundary"
-                  ]
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "document",
-            "revisionId",
-            "range",
-            "kind",
-            "syntaxId",
-            "callId",
-            "provenanceId"
-          ]
-        },
-        "ConstraintResult": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "mode": {
-              "enum": [
-                "require",
-                "forbid"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "calls",
-                "extends",
-                "implements"
-              ]
-            },
-            "targetRole": {
-              "$ref": "#/$defs/Text"
-            },
-            "status": {
-              "enum": [
-                "conforms",
-                "deviates",
-                "unknown"
-              ]
-            },
-            "evidence": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/RuleEvidence"
-              }
-            },
-            "unresolved": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/Text"
-              }
-            },
-            "projection": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticProjection"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "mode",
-            "kind",
-            "targetRole",
-            "status",
-            "evidence",
-            "unresolved"
-          ]
-        },
-        "RuleInstance": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "rule": {
-              "$ref": "#/$defs/Text"
-            },
-            "target": {
-              "$ref": "#/$defs/Identity"
-            },
-            "destination": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Destination"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "sourceLayer": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Text"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "destinationLayer": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Text"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "status": {
-              "enum": [
-                "conforms",
-                "deviates",
-                "unknown"
-              ]
-            },
-            "excepted": {
-              "type": "boolean"
-            },
-            "exceptionReason": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Text"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "constraints": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/ConstraintResult"
-              }
-            },
-            "evidence": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/RuleEvidence"
-              }
-            },
-            "unresolved": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/Text"
-              }
-            },
-            "referenceCount": {
-              "$ref": "#/$defs/UInt"
-            },
-            "projection": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticProjection"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "rule",
-            "target",
-            "destination",
-            "sourceLayer",
-            "destinationLayer",
-            "status",
-            "excepted",
-            "exceptionReason",
-            "constraints",
-            "evidence",
-            "unresolved",
-            "referenceCount"
-          ]
-        },
-        "RuleCounts": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "comparable": {
-              "$ref": "#/$defs/UInt"
-            },
-            "conforms": {
-              "$ref": "#/$defs/UInt"
-            },
-            "deviates": {
-              "$ref": "#/$defs/UInt"
-            },
-            "unknown": {
-              "$ref": "#/$defs/UInt"
-            },
-            "excepted": {
-              "$ref": "#/$defs/UInt"
-            }
-          },
-          "required": [
-            "comparable",
-            "conforms",
-            "deviates",
-            "unknown",
-            "excepted"
-          ]
-        },
-        "RuleDiagnostic": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "code": {
-              "const": "invalid_rules"
-            },
-            "kind": {
-              "$ref": "#/$defs/Text"
-            },
-            "path": {
-              "const": ".trellis/rules.toml"
-            },
-            "range": {
-              "$ref": "#/$defs/Range"
-            },
-            "line": {
-              "$ref": "#/$defs/UInt"
-            },
-            "column": {
-              "$ref": "#/$defs/UInt"
-            },
-            "attribution": {
-              "enum": [
-                "token",
-                "file",
-                "boundary"
-              ]
-            },
-            "message": {
-              "$ref": "#/$defs/Text"
-            }
-          },
-          "required": [
-            "code",
-            "kind",
-            "path",
-            "range",
-            "line",
-            "column",
-            "attribution",
-            "message"
           ]
         },
         "ExternalIdentity": {
@@ -16953,441 +16492,6 @@
             "sid"
           ]
         },
-        "Site": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "ownerSyntaxId": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SyntaxId"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "role": {
-              "anyOf": [
-                {
-                  "enum": [
-                    "production",
-                    "test"
-                  ]
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "range": {
-              "$ref": "#/$defs/Range"
-            },
-            "lines": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/LineSpan"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "relationKind": {
-              "enum": [
-                "reference",
-                "import",
-                "call",
-                "type"
-              ]
-            },
-            "spelling": {
-              "type": "string"
-            },
-            "callId": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "pattern": "^occ:v2:[0-9a-f]{32}$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "mapping": {
-              "enum": [
-                "structural",
-                "semantic"
-              ]
-            },
-            "provenanceId": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Text"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "projection": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticProjection"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "historicalFreshness": {
-              "enum": [
-                "fresh",
-                "possiblyStale",
-                "stale",
-                null
-              ]
-            },
-            "historicalContentHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "evidenceKind": {
-              "enum": [
-                "measuredSyntax",
-                "declarationBinding",
-                "semanticReference",
-                "typeRelationship"
-              ]
-            },
-            "derivedFrom": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/DerivedFrom"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "basis": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticBasis"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "historicalTargets": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "kind": {
-                    "enum": [
-                      "internal",
-                      "external"
-                    ]
-                  },
-                  "language": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "path": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "syntaxId": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "revisionId": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "role": {
-                    "enum": [
-                      "declared",
-                      "candidate",
-                      "dispatch"
-                    ]
-                  }
-                },
-                "required": [
-                  "kind",
-                  "language",
-                  "path",
-                  "syntaxId",
-                  "revisionId"
-                ]
-              }
-            },
-            "semanticBoundary": {
-              "type": "boolean"
-            },
-            "freshness": {
-              "enum": [
-                "fresh",
-                "possiblyStale",
-                "stale"
-              ]
-            },
-            "historicalResolution": {
-              "enum": [
-                "resolved",
-                "external",
-                "ambiguous",
-                "unresolved"
-              ]
-            },
-            "historicalExternalTargets": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "scheme": {
-                    "type": "string"
-                  },
-                  "symbol": {
-                    "type": "string"
-                  },
-                  "scope": {
-                    "enum": [
-                      "global",
-                      "document"
-                    ]
-                  },
-                  "language": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "path": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "role": {
-                    "enum": [
-                      "declared",
-                      "candidate",
-                      "dispatch"
-                    ]
-                  }
-                },
-                "required": [
-                  "scheme",
-                  "symbol",
-                  "scope",
-                  "language",
-                  "path"
-                ]
-              }
-            },
-            "historicalDispatch": {
-              "enum": [
-                "direct",
-                "constructor",
-                "virtual",
-                "interface",
-                "dynamic",
-                "unknown"
-              ]
-            },
-            "historicalJoin": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "status": {
-                  "type": "string"
-                },
-                "kind": {
-                  "type": "string"
-                },
-                "language": {
-                  "type": "string"
-                },
-                "path": {
-                  "type": "string"
-                },
-                "revisionId": {
-                  "type": "string"
-                },
-                "range": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "start": {
-                      "$ref": "#/$defs/UInt"
-                    },
-                    "end": {
-                      "$ref": "#/$defs/UInt"
-                    }
-                  },
-                  "required": [
-                    "start",
-                    "end"
-                  ]
-                }
-              },
-              "required": [
-                "status",
-                "kind",
-                "language",
-                "path",
-                "revisionId",
-                "range"
-              ]
-            },
-            "caller": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Caller"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "callerReason": {
-              "anyOf": [
-                {
-                  "enum": [
-                    "syntax_only",
-                    "enclosing_callable_unknown",
-                    "stable_lookup_unavailable",
-                    "semantic_boundary"
-                  ]
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "ownerSyntaxId",
-            "role",
-            "range",
-            "lines",
-            "relationKind",
-            "spelling",
-            "callId",
-            "mapping",
-            "provenanceId"
-          ]
-        },
-        "Module": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "identity": {
-              "$ref": "#/$defs/Identity"
-            },
-            "revisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "contentHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "provenanceId": {
-              "$ref": "#/$defs/Text"
-            }
-          },
-          "required": [
-            "identity",
-            "revisionId",
-            "contentHash",
-            "provenanceId"
-          ]
-        },
-        "Edge": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "source": {
-              "$ref": "#/$defs/Identity"
-            },
-            "target": {
-              "$ref": "#/$defs/Destination"
-            },
-            "count": {
-              "$ref": "#/$defs/UInt"
-            },
-            "sites": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/Site"
-              }
-            },
-            "omittedSites": {
-              "$ref": "#/$defs/UInt"
-            },
-            "evidenceTier": {
-              "enum": [
-                "syntax",
-                "semantic",
-                "mixed"
-              ]
-            },
-            "semanticSites": {
-              "$ref": "#/$defs/UInt"
-            },
-            "projection": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticProjection"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "source",
-            "target",
-            "count",
-            "sites",
-            "omittedSites",
-            "evidenceTier",
-            "semanticSites"
-          ]
-        },
-        "UnresolvedReference": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "source": {
-              "$ref": "#/$defs/Identity"
-            },
-            "site": {
-              "$ref": "#/$defs/Site"
-            },
-            "reason": {
-              "$ref": "#/$defs/Text"
-            }
-          },
-          "required": [
-            "source",
-            "site",
-            "reason"
-          ]
-        },
         "ConfigDescriptor": {
           "type": "object",
           "additionalProperties": false,
@@ -17700,6 +16804,100 @@
                   "type": "null"
                 }
               ]
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "relationKind": {
+              "enum": [
+                "reference",
+                "import",
+                "call",
+                "type"
+              ]
+            },
+            "spelling": {
+              "type": "string"
+            },
+            "owner": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "syntaxId": {
+                      "$ref": "#/$defs/SyntaxId"
+                    },
+                    "name": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "stableLookupKey": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "syntaxId",
+                    "name",
+                    "stableLookupKey"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "target": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "syntaxId": {
+                      "$ref": "#/$defs/SyntaxId"
+                    },
+                    "displayKey": {
+                      "type": "string"
+                    },
+                    "document": {
+                      "$ref": "#/$defs/DocumentKey"
+                    },
+                    "lines": {
+                      "$ref": "#/$defs/LineSpan"
+                    }
+                  },
+                  "required": [
+                    "syntaxId",
+                    "displayKey",
+                    "document",
+                    "lines"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "targetReason": {
+              "enum": [
+                "structural_only",
+                "unresolved",
+                "external",
+                "ambiguous",
+                null
+              ]
             }
           },
           "required": [
@@ -17905,6 +17103,30 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "kindCounts": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "call": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "type": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "import": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "reference": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "call",
+                "type",
+                "import",
+                "reference"
               ]
             }
           },
@@ -18832,65 +18054,6 @@
             "coverageState",
             "boundary"
           ]
-        },
-        "SemanticBasis": {
-          "additionalProperties": false,
-          "properties": {
-            "artifactHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "configHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "dependencyHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "lookupDependencies": {
-              "items": {
-                "$ref": "#/$defs/Text"
-              },
-              "type": "array"
-            },
-            "producerHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "producerVersion": {
-              "$ref": "#/$defs/Text"
-            },
-            "revisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "sourceManifestHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "sourceSetId": {
-              "$ref": "#/$defs/Text"
-            },
-            "toolchainHash": {
-              "$ref": "#/$defs/Hash"
-            }
-          },
-          "required": [
-            "producerId",
-            "producerVersion",
-            "producerHash",
-            "artifactHash",
-            "language",
-            "sourceSetId",
-            "revisionId",
-            "sourceManifestHash",
-            "toolchainHash",
-            "configHash",
-            "dependencyHash",
-            "lookupDependencies"
-          ],
-          "type": "object"
         },
         "DerivedFrom": {
           "additionalProperties": false,
@@ -20172,441 +19335,6 @@
             "sid"
           ]
         },
-        "Site": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "ownerSyntaxId": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SyntaxId"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "role": {
-              "anyOf": [
-                {
-                  "enum": [
-                    "production",
-                    "test"
-                  ]
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "range": {
-              "$ref": "#/$defs/Range"
-            },
-            "lines": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/LineSpan"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "relationKind": {
-              "enum": [
-                "reference",
-                "import",
-                "call",
-                "type"
-              ]
-            },
-            "spelling": {
-              "type": "string"
-            },
-            "callId": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "pattern": "^occ:v2:[0-9a-f]{32}$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "mapping": {
-              "enum": [
-                "structural",
-                "semantic"
-              ]
-            },
-            "provenanceId": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Text"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "projection": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticProjection"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "historicalFreshness": {
-              "enum": [
-                "fresh",
-                "possiblyStale",
-                "stale",
-                null
-              ]
-            },
-            "historicalContentHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "evidenceKind": {
-              "enum": [
-                "measuredSyntax",
-                "declarationBinding",
-                "semanticReference",
-                "typeRelationship"
-              ]
-            },
-            "derivedFrom": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/DerivedFrom"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "basis": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticBasis"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "historicalTargets": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "kind": {
-                    "enum": [
-                      "internal",
-                      "external"
-                    ]
-                  },
-                  "language": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "path": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "syntaxId": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "revisionId": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "role": {
-                    "enum": [
-                      "declared",
-                      "candidate",
-                      "dispatch"
-                    ]
-                  }
-                },
-                "required": [
-                  "kind",
-                  "language",
-                  "path",
-                  "syntaxId",
-                  "revisionId"
-                ]
-              }
-            },
-            "semanticBoundary": {
-              "type": "boolean"
-            },
-            "freshness": {
-              "enum": [
-                "fresh",
-                "possiblyStale",
-                "stale"
-              ]
-            },
-            "historicalResolution": {
-              "enum": [
-                "resolved",
-                "external",
-                "ambiguous",
-                "unresolved"
-              ]
-            },
-            "historicalExternalTargets": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "scheme": {
-                    "type": "string"
-                  },
-                  "symbol": {
-                    "type": "string"
-                  },
-                  "scope": {
-                    "enum": [
-                      "global",
-                      "document"
-                    ]
-                  },
-                  "language": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "path": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "role": {
-                    "enum": [
-                      "declared",
-                      "candidate",
-                      "dispatch"
-                    ]
-                  }
-                },
-                "required": [
-                  "scheme",
-                  "symbol",
-                  "scope",
-                  "language",
-                  "path"
-                ]
-              }
-            },
-            "historicalDispatch": {
-              "enum": [
-                "direct",
-                "constructor",
-                "virtual",
-                "interface",
-                "dynamic",
-                "unknown"
-              ]
-            },
-            "historicalJoin": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "status": {
-                  "type": "string"
-                },
-                "kind": {
-                  "type": "string"
-                },
-                "language": {
-                  "type": "string"
-                },
-                "path": {
-                  "type": "string"
-                },
-                "revisionId": {
-                  "type": "string"
-                },
-                "range": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "start": {
-                      "$ref": "#/$defs/UInt"
-                    },
-                    "end": {
-                      "$ref": "#/$defs/UInt"
-                    }
-                  },
-                  "required": [
-                    "start",
-                    "end"
-                  ]
-                }
-              },
-              "required": [
-                "status",
-                "kind",
-                "language",
-                "path",
-                "revisionId",
-                "range"
-              ]
-            },
-            "caller": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Caller"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "callerReason": {
-              "anyOf": [
-                {
-                  "enum": [
-                    "syntax_only",
-                    "enclosing_callable_unknown",
-                    "stable_lookup_unavailable",
-                    "semantic_boundary"
-                  ]
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "ownerSyntaxId",
-            "role",
-            "range",
-            "lines",
-            "relationKind",
-            "spelling",
-            "callId",
-            "mapping",
-            "provenanceId"
-          ]
-        },
-        "Module": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "identity": {
-              "$ref": "#/$defs/Identity"
-            },
-            "revisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "contentHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "provenanceId": {
-              "$ref": "#/$defs/Text"
-            }
-          },
-          "required": [
-            "identity",
-            "revisionId",
-            "contentHash",
-            "provenanceId"
-          ]
-        },
-        "Edge": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "source": {
-              "$ref": "#/$defs/Identity"
-            },
-            "target": {
-              "$ref": "#/$defs/Destination"
-            },
-            "count": {
-              "$ref": "#/$defs/UInt"
-            },
-            "sites": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/Site"
-              }
-            },
-            "omittedSites": {
-              "$ref": "#/$defs/UInt"
-            },
-            "evidenceTier": {
-              "enum": [
-                "syntax",
-                "semantic",
-                "mixed"
-              ]
-            },
-            "semanticSites": {
-              "$ref": "#/$defs/UInt"
-            },
-            "projection": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SemanticProjection"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "source",
-            "target",
-            "count",
-            "sites",
-            "omittedSites",
-            "evidenceTier",
-            "semanticSites"
-          ]
-        },
-        "UnresolvedReference": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "source": {
-              "$ref": "#/$defs/Identity"
-            },
-            "site": {
-              "$ref": "#/$defs/Site"
-            },
-            "reason": {
-              "$ref": "#/$defs/Text"
-            }
-          },
-          "required": [
-            "source",
-            "site",
-            "reason"
-          ]
-        },
         "ConfigDescriptor": {
           "type": "object",
           "additionalProperties": false,
@@ -20919,6 +19647,100 @@
                   "type": "null"
                 }
               ]
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "relationKind": {
+              "enum": [
+                "reference",
+                "import",
+                "call",
+                "type"
+              ]
+            },
+            "spelling": {
+              "type": "string"
+            },
+            "owner": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "syntaxId": {
+                      "$ref": "#/$defs/SyntaxId"
+                    },
+                    "name": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "stableLookupKey": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "syntaxId",
+                    "name",
+                    "stableLookupKey"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "target": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "syntaxId": {
+                      "$ref": "#/$defs/SyntaxId"
+                    },
+                    "displayKey": {
+                      "type": "string"
+                    },
+                    "document": {
+                      "$ref": "#/$defs/DocumentKey"
+                    },
+                    "lines": {
+                      "$ref": "#/$defs/LineSpan"
+                    }
+                  },
+                  "required": [
+                    "syntaxId",
+                    "displayKey",
+                    "document",
+                    "lines"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "targetReason": {
+              "enum": [
+                "structural_only",
+                "unresolved",
+                "external",
+                "ambiguous",
+                null
+              ]
             }
           },
           "required": [
@@ -21082,6 +19904,30 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "kindCounts": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "call": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "type": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "import": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "reference": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "call",
+                "type",
+                "import",
+                "reference"
               ]
             }
           },
@@ -22009,65 +20855,6 @@
             "coverageState",
             "boundary"
           ]
-        },
-        "SemanticBasis": {
-          "additionalProperties": false,
-          "properties": {
-            "artifactHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "configHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "dependencyHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "lookupDependencies": {
-              "items": {
-                "$ref": "#/$defs/Text"
-              },
-              "type": "array"
-            },
-            "producerHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "producerVersion": {
-              "$ref": "#/$defs/Text"
-            },
-            "revisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "sourceManifestHash": {
-              "$ref": "#/$defs/Hash"
-            },
-            "sourceSetId": {
-              "$ref": "#/$defs/Text"
-            },
-            "toolchainHash": {
-              "$ref": "#/$defs/Hash"
-            }
-          },
-          "required": [
-            "producerId",
-            "producerVersion",
-            "producerHash",
-            "artifactHash",
-            "language",
-            "sourceSetId",
-            "revisionId",
-            "sourceManifestHash",
-            "toolchainHash",
-            "configHash",
-            "dependencyHash",
-            "lookupDependencies"
-          ],
-          "type": "object"
         },
         "DerivedFrom": {
           "additionalProperties": false,

@@ -164,6 +164,8 @@ fn assert_syntax_only(store: &Store, pin: IndexPin) {
     for site in structural["sites"].as_array().unwrap() {
         assert_eq!(site["mapping"], "structural");
         assert_eq!(site["provenanceId"], Value::Null);
+        assert_eq!(site["target"], Value::Null);
+        assert_eq!(site["targetReason"], "structural_only");
     }
     let check = read(store, "check", json!({"expectedBasis":pin}));
     let layers = instance(&check, "$layers", "src/orphan.rs", None);
@@ -208,9 +210,14 @@ fn bindings_map_unresolved_and_unspelled_sites_and_settle_rules() {
     assert_eq!(orphan["semanticSites"], 1);
     let site = &orphan["sites"][0];
     assert_eq!(site["mapping"], "semantic");
-    assert_eq!(site["relationKind"], "reference");
+    assert_eq!(site["relationKind"], "call");
     assert_eq!(site["spelling"], "crate::high::upper");
     assert_eq!(site["provenanceId"], "call-orphan-0");
+    assert!(site["target"]["syntaxId"].is_string());
+    assert!(site["target"]["displayKey"].is_string());
+    assert_eq!(site["target"]["document"]["path"], "src/high.rs");
+    assert!(site["target"]["lines"]["start"].as_u64().unwrap() >= 1);
+    assert_eq!(site["targetReason"], Value::Null);
     assert!(
         !references["unresolved"]
             .as_array()
@@ -348,18 +355,28 @@ fn stale_unusable_and_unbound_evidence_reverts_to_structural() {
         let low = edge(&references, "src/low.rs", "src/high.rs").unwrap();
         assert_eq!(low["count"], 1);
         assert_eq!(low["evidenceTier"], "syntax");
-        // A call without a known target is not a site, like a call without a binding; the
-        // orphan's structural site stays unresolved.
+        // A call without a known target is not a site of its own, like a call without a
+        // binding; the orphan's structural site stays unresolved, is still a call by its
+        // callee path, and says why it has no target.
         let unresolved = references["unresolved"].as_array().unwrap();
-        assert!(
-            !unresolved
-                .iter()
-                .any(|row| row["site"]["relationKind"] == "call")
-        );
         assert!(
             unresolved
                 .iter()
-                .any(|row| row["source"]["path"] == "src/orphan.rs")
+                .all(|row| row["site"]["mapping"] == "structural")
+        );
+        let orphan = unresolved
+            .iter()
+            .find(|row| row["source"]["path"] == "src/orphan.rs")
+            .unwrap();
+        assert_eq!(orphan["site"]["relationKind"], "call");
+        assert_eq!(orphan["site"]["target"], Value::Null);
+        assert_eq!(
+            orphan["site"]["targetReason"],
+            if matches!(resolution, Resolution::Unresolved) {
+                "unresolved"
+            } else {
+                "ambiguous"
+            }
         );
         let check = read(&store, "check", json!({"expectedBasis":pin}));
         let row = instance(&check, "orphan-calls-upper", "src/orphan.rs", None);
