@@ -2723,7 +2723,7 @@ impl EvidenceResponse {
                     .into());
                 }
             };
-            if !nested && path == "jsconfig.json" && root_tsconfig.is_some() {
+            if path == "jsconfig.json" && root_tsconfig.is_some() {
                 continue;
             }
             source_bytes = source_bytes.saturating_add(byte_length);

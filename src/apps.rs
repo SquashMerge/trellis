@@ -634,12 +634,11 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(checks >= 2);
-        assert!(
-            candidates(&manifests, &documents, &mut Work::new(100), &mut || {
-                anyhow::bail!("expired")
-            })
-            .is_err()
-        );
+        assert_eq!(checks, 2);
+        let error = candidates(&manifests, &documents, &mut Work::new(100), &mut || {
+            anyhow::bail!("expired")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "expired");
     }
 }

@@ -29,7 +29,7 @@ fn published(root_package_json: bool) -> (tempfile::TempDir, tempfile::TempDir, 
         write(dir, "package.json", "{\"name\":\"root\"}\n");
     }
     write(dir, "a.js", "function a() {}\n");
-    let store = Store::open_for_tests(state.path(), dir).unwrap();
+    let store = crate::testing::retry_admission(|| Store::open_for_tests(state.path(), dir));
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = index_workspace_bundle(
         &IndexOptions::new(dir.into()),
@@ -135,6 +135,43 @@ fn a_corrupt_retained_nested_entry_is_a_typed_selected_integrity_failure() {
         error
             .to_string()
             .contains("corrupt retained web/package.json length"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn a_duplicated_retained_nested_manifest_is_a_typed_selected_integrity_failure() {
+    let (_state, _root, store) = published(true);
+    let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+    let retained: String = db
+        .query_row("SELECT retained_config FROM native_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut entries: Vec<serde_json::Value> = serde_json::from_str(&retained).unwrap();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["path"] == "web/package.json")
+        .expect("nested manifest is retained")
+        .clone();
+    entries.push(entry);
+    db.execute(
+        "UPDATE native_revisions SET retained_config=?1",
+        [serde_json::to_string(&entries).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let error = core(&store).err().expect("duplicate entry fails the read");
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<SelectedIntegrity>().is_some()),
+        "{error:#}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("incompatible_index: duplicate retained nested manifest"),
         "{error:#}"
     );
 }
