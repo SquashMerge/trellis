@@ -521,7 +521,7 @@ pub fn valid_package(language: &str, package: &str, standard_library: bool) -> b
             "rust" => matches!(package, "std" | "core" | "alloc"),
             "java" => matches!(package, "java" | "javax"),
             "python" => identifier(package),
-            "javascript" => npm_part(package) && !package.starts_with('@'),
+            "javascript" | "typescript" => npm_part(package) && !package.starts_with('@'),
             _ => false,
         };
     }
@@ -556,7 +556,7 @@ pub fn valid_package(language: &str, package: &str, standard_library: bool) -> b
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
                 && !package.contains("--")
         }
-        "javascript" => match package.strip_prefix('@') {
+        "javascript" | "typescript" => match package.strip_prefix('@') {
             Some(scoped) => scoped
                 .split_once('/')
                 .is_some_and(|(scope, name)| npm_part(scope) && npm_part(name)),
@@ -650,13 +650,17 @@ const NODE_BARE_ROOTS: &[&str] = &[
 ];
 
 /// Exact reviewed labels only. The caller charges lookup and descriptor allocation.
-pub fn node_standard_library(source_set_id: &str, specifier: &str) -> Option<ExternalPackage> {
+pub fn node_standard_library(
+    source_set_id: &str,
+    specifier: &str,
+    language: &str,
+) -> Option<ExternalPackage> {
     let root = node_root(specifier)?;
     Some(ExternalPackage {
         identity: ExternalIdentity {
             kind: ExternalKind::ExternalPackage,
             source_set_id: source_set_id.into(),
-            language: "javascript".into(),
+            language: language.into(),
             package: root.into(),
             standard_library: true,
         },
@@ -884,20 +888,29 @@ impl JavascriptPackages {
 
     /// A captured root declaration relation, not node_modules/member/export-map resolution.
     /// Call only for supported static syntax after local/context checks and work charging.
-    pub fn resolve(&self, source_set_id: &str, specifier: &str) -> Option<ExternalPackage> {
-        if let Some(package) = node_standard_library(source_set_id, specifier) {
+    /// The identity carries the importing document's `language`: JavaScript and
+    /// TypeScript share the npm patterns, not the identity.
+    pub fn resolve(
+        &self,
+        source_set_id: &str,
+        specifier: &str,
+        language: &str,
+    ) -> Option<ExternalPackage> {
+        if let Some(package) = node_standard_library(source_set_id, specifier, language) {
             return Some(package);
         }
-        self.binding(source_set_id, specifier).cloned()
+        let mut package = self.binding(source_set_id, specifier).cloned()?;
+        package.identity.language = language.into();
+        Some(package)
     }
 
     /// Borrow-only size of owned evidence copied by resolve, including misses.
     /// The caller charges this to the shared budget and checks cancellation first.
-    pub fn resolution_work(&self, source_set_id: &str, specifier: &str) -> usize {
+    pub fn resolution_work(&self, source_set_id: &str, specifier: &str, language: &str) -> usize {
         if let Some(root) = node_root(specifier) {
             return 1usize
                 .saturating_add(source_set_id.len())
-                .saturating_add("javascript".len())
+                .saturating_add(language.len())
                 .saturating_add(root.len().saturating_mul(2));
         }
         let Some(package) = self.binding(source_set_id, specifier) else {
@@ -905,7 +918,7 @@ impl JavascriptPackages {
         };
         let mut size = 1usize
             .saturating_add(package.identity.source_set_id.len())
-            .saturating_add(package.identity.language.len())
+            .saturating_add(language.len())
             .saturating_add(package.identity.package.len());
         for evidence in &package.evidence {
             if let ExternalEvidence::Manifest {
@@ -1290,7 +1303,7 @@ mod javascript_package_tests {
             ("path", "path"),
             ("node:path", "path"),
         ] {
-            let package = node_standard_library("fixture", specifier).unwrap();
+            let package = node_standard_library("fixture", specifier, "javascript").unwrap();
             assert_eq!(package.identity.package, root);
             assert!(package.identity.standard_library);
             assert_eq!(package.ecosystem, "node");
@@ -1309,11 +1322,11 @@ mod javascript_package_tests {
         let packages = packages(&serde_json::json!({"dependencies":dependencies}).to_string());
         for root in NODE_BARE_ROOTS {
             if !matches!(*root, "fs" | "path") {
-                assert!(packages.resolve("fixture", root).is_none());
+                assert!(packages.resolve("fixture", root, "javascript").is_none());
             }
             assert!(
                 packages
-                    .resolve("fixture", &format!("{root}/fake"))
+                    .resolve("fixture", &format!("{root}/fake"), "javascript")
                     .is_none()
             );
         }
@@ -1327,7 +1340,11 @@ mod javascript_package_tests {
             "./fs.js",
             "../path.js",
         ] {
-            assert!(packages.resolve("fixture", specifier).is_none());
+            assert!(
+                packages
+                    .resolve("fixture", specifier, "javascript")
+                    .is_none()
+            );
         }
     }
     #[test]
@@ -1335,10 +1352,15 @@ mod javascript_package_tests {
         let packages = packages(
             r#"{"dependencies":{"widget":"^1.2.3","@scope/tool":"2.3.4","test":"1.0.0","sea":"1.0.0"},"devDependencies":{"widget":"~2.3.4"},"optionalDependencies":{"widget":"3.4.5"},"peerDependencies":{"widget":"4.5.6"}}"#,
         );
-        assert!(packages.resolution_work("fixture", "widget/sub/path") > 4);
-        assert_eq!(packages.resolution_work("fixture", "absent"), 1);
-        assert!(packages.resolution_work("fixture", "node:fs") > 1);
-        let widget = packages.resolve("fixture", "widget/sub/path").unwrap();
+        assert!(packages.resolution_work("fixture", "widget/sub/path", "javascript") > 4);
+        assert_eq!(
+            packages.resolution_work("fixture", "absent", "javascript"),
+            1
+        );
+        assert!(packages.resolution_work("fixture", "node:fs", "javascript") > 1);
+        let widget = packages
+            .resolve("fixture", "widget/sub/path", "javascript")
+            .unwrap();
         assert_eq!(widget.identity.package, "widget");
         assert!(!widget.identity.standard_library);
         assert_eq!(widget.ecosystem, "npm");
@@ -1358,7 +1380,11 @@ mod javascript_package_tests {
             assert!(version_constraint.is_some());
         }
         for specifier in ["@scope/tool", "@scope/tool/sub", "test/reporters", "sea"] {
-            assert!(packages.resolve("fixture", specifier).is_some());
+            assert!(
+                packages
+                    .resolve("fixture", specifier, "javascript")
+                    .is_some()
+            );
         }
         for specifier in [
             "absent",
@@ -1373,9 +1399,35 @@ mod javascript_package_tests {
             "https://widget",
             "#widget",
         ] {
-            assert!(packages.resolve("fixture", specifier).is_none());
+            assert!(
+                packages
+                    .resolve("fixture", specifier, "javascript")
+                    .is_none()
+            );
         }
-        assert!(packages.resolve("other-source-set", "widget").is_none());
+        assert!(
+            packages
+                .resolve("other-source-set", "widget", "javascript")
+                .is_none()
+        );
+    }
+    #[test]
+    fn identities_carry_the_importing_language() {
+        let packages = packages(r#"{"dependencies":{"lodash":"^4.17.21"}}"#);
+        for language in ["javascript", "typescript"] {
+            for specifier in ["lodash/fp", "fs"] {
+                let package = packages.resolve("fixture", specifier, language).unwrap();
+                assert_eq!(package.identity.language, language);
+            }
+        }
+        assert!(
+            packages.resolution_work("fixture", "lodash", "typescript")
+                > packages.resolution_work("fixture", "lodash", "ts")
+        );
+        assert!(valid_package("typescript", "fs", true));
+        assert!(!valid_package("typescript", "@scope/fs", true));
+        assert!(valid_package("typescript", "@scope/tool", false));
+        assert!(valid_package("typescript", "lodash", false));
     }
     #[test]
     fn unsupported_competitors_duplicates_and_contexts_never_last_win() {
@@ -1394,7 +1446,9 @@ mod javascript_package_tests {
         ] {
             let text = serde_json::json!({"dependencies":{"widget":"1.2.3"}, "peerDependencies":{"widget":constraint}}).to_string();
             assert!(
-                packages(&text).resolve("fixture", "widget").is_none(),
+                packages(&text)
+                    .resolve("fixture", "widget", "javascript")
+                    .is_none(),
                 "{constraint}"
             );
         }
@@ -1408,7 +1462,9 @@ mod javascript_package_tests {
             "invalid json",
         ] {
             assert!(
-                packages(text).resolve("fixture", "widget").is_none(),
+                packages(text)
+                    .resolve("fixture", "widget", "javascript")
+                    .is_none(),
                 "{text}"
             );
         }

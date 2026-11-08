@@ -63,6 +63,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
         },
         documents,
         manifests: vec![],
+        root_tsconfig: None,
         evidence_gaps: Default::default(),
     }
 }

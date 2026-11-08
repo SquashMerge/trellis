@@ -100,6 +100,7 @@ fn project(files: &Files, filter: &[String]) -> Value {
         },
         documents,
         manifests: Vec::new(),
+        root_tsconfig: None,
         evidence_gaps,
     };
     references::project(&snapshot, filter, 20, &mut || Ok(()))

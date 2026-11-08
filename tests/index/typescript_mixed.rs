@@ -463,3 +463,85 @@ fn typescript_mixed_class_catalog() {
         "classes inside namespaces and `declare global` are not catalogued"
     );
 }
+
+#[test]
+fn typescript_mixed_import_resolution() {
+    use serde_json::json;
+    let state = tempfile::tempdir().unwrap();
+    let workspace = fixture_root();
+    let root = fs::canonicalize(workspace.path()).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
+    let cancel: trellis::model::CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    let response = store.evidence_response().unwrap();
+    let references = response
+        .architecture_response("references", &json!({"expectedBasis": pin}), &mut || Ok(()))
+        .unwrap();
+    response.finish(()).unwrap();
+    let edges = |kind: &str| -> Vec<(String, String, u64)> {
+        references[kind]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| {
+                let target = &edge["target"];
+                (
+                    edge["source"]["path"].as_str().unwrap().to_owned(),
+                    target["path"]
+                        .as_str()
+                        .or(target["package"].as_str())
+                        .unwrap()
+                        .to_owned(),
+                    edge["count"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let edge = |from: &str, to: &str, count: u64| (from.to_owned(), to.to_owned(), count);
+    let mut production = edges("production");
+    production.sort();
+    let mut expected = vec![
+        // R11: JavaScript imports TypeScript.
+        edge("src/app/legacy.js", "src/app/model.ts", 1),
+        // R9 baseUrl, R13 `import m = require`, R8 paths.
+        edge("src/app/alias.ts", "src/app/model.ts", 2),
+        edge("src/app/alias.ts", "src/app/repo.ts", 1),
+        // R11 and R6 implementation over declaration, R3, R6 declaration-only, R5.
+        edge("src/app/bridge.ts", "src/app/legacy.js", 1),
+        edge("src/app/bridge.ts", "pkg/index.ts", 1),
+        edge("src/app/bridge.ts", "src/app/cjs.cts", 1),
+        edge("src/app/bridge.ts", "src/app/esm.mts", 1),
+        edge("src/app/bridge.ts", "src/app/types.d.ts", 1),
+        // R7 type-only and R2 `.js` to `.ts`, then R12.
+        edge("src/app/repo.ts", "src/app/model.ts", 2),
+        edge("src/app/repo.ts", "lodash", 1),
+        // R10 rootDirs.
+        edge("src/app/uses-generated.ts", "generated/app/api.ts", 1),
+        // R1 extensionless.
+        edge("src/app/view.tsx", "src/app/model.ts", 1),
+    ];
+    expected.sort();
+    assert_eq!(production, expected);
+    assert_eq!(references["unresolved"], json!([]));
+    let lodash = references["externalPackages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["identity"]["package"] == "lodash")
+        .unwrap();
+    assert_eq!(lodash["identity"]["language"], "typescript");
+    assert_eq!(lodash["identity"]["standardLibrary"], false);
+    assert_eq!(lodash["ecosystem"], "npm");
+}
