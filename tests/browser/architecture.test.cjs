@@ -1855,6 +1855,19 @@ test("Deviations Open in Sequence keeps its highlight through Back, Forward and 
     await showHighlight(page);
     assert.equal(await highlights(page).count(), 1);
     assert.deepEqual(await hashCallIds(page), ids);
+
+    const stale = await page.evaluate(() => {
+      const at = location.hash.indexOf("?"), query = new URLSearchParams(location.hash.slice(at + 1));
+      query.set("indexRevision", String(Number(query.get("indexRevision")) + 1));
+      return location.hash.slice(0, at + 1) + query;
+    });
+    await page.evaluate(hash => { location.hash = hash; }, stale);
+    await page.reload({waitUntil:"domcontentloaded"});
+    await page.locator("#token").fill(paths.token);
+    await page.locator("#connect-form button[type=submit]").click();
+    const message = "Cannot open sequence: Sequence link is stale for the selected index snapshot. Reload or select a current link.";
+    await page.waitForFunction(text => document.querySelector("#sequence-state")?.textContent === text && document.querySelector("#error")?.textContent === text, message);
+    assert.equal(await highlights(page).count(), 0, "a stale link shows no highlight");
   }, new Map(), base);
 });
 

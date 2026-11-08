@@ -391,6 +391,24 @@ test("multi-pair one-reason edit uses one preview and exact same operations/hash
   assert.equal(JSON.stringify(writes[1].options.body),JSON.stringify({...sent.options.body,proposedHash:"rules-proposed"}));assert.match(h.get("architecture-state").textContent,/Rules committed.*same code/);
 });
 
+test("a refresh that fails after an apply drops the reopen request, so a later refresh keeps the tree closed", async () => {
+  const h=harness();let hash="rules-one",failRead=false;
+  h.setResponse(async url => {
+    if(url.endsWith("/preview")) return editorResponse();
+    if(url.endsWith("/apply")) {hash="rules-proposed";failRead=true;return {payload:{...pin,rulesFile:{contentHash:hash},mutationOutcome:"committed"}};}
+    if(failRead) throw Object.assign(new Error("Architecture is still building"),{status:503});
+    return {payload:authoringFixture(hash)};
+  });
+  await h.controller.refresh();await selectTwo(h);
+  h.get("architecture-reason").value="Reviewed";await h.get("architecture-reason").fire("input");await h.get("architecture-preview").fire("click");
+  await h.get("architecture-review").fire("click");await flush();
+  assert.equal(h.get("architecture-deviations").hidden,false,"the tree is open when the rules are applied");
+  await h.get("architecture-confirm").fire("click");await flush();
+  assert.equal(h.get("architecture-deviations").hidden,true);
+  failRead=false;await h.controller.refresh();await flush();
+  assert.equal(h.get("architecture-deviations").hidden,true,"a later successful refresh does not reopen the tree");
+});
+
 test("conflict preserves draft and reload requires a new preview on the new rules base", async () => {
   const h=harness();let hash="rules-one";
   h.setResponse(async (url,options) => {
