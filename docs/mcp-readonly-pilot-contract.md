@@ -365,6 +365,125 @@ incoming `scopeCoverage` and the lookup alternatives other tools return keep the
   | find by lookup key `src/mcp/projection.rs::compact_graph` | 4,080 (1) | 2,949 (1) | 1,298 (1) |
   | compact call graph `src/http/worker.rs::DaemonState::enqueue_index` | 6,924 (5 nodes) | n/a | 7,260 (5 nodes, all keyed) |
 
+## Amendment (#770): a bounded prompt reference view
+
+**Status: owner-ratified 2026-11-07 (#770).** `trellis_propose_layers`
+inlined the whole `references:v2` result, so on any non-trivial checkout the prompt
+exceeded the 65,536-byte frame and failed with `response_too_large`. This section wins
+over the [proposal prompt](#one-no-argument-proposal-prompt) and
+[rules proposal workflow](rules.md#proposal-workflow) text only for what "structural
+references" means inside the prompt. The tools, their pages, the pin, the rules bytes and
+descriptor, the atomic failures and the frame are unchanged.
+
+The prompt is a hybrid: a small fixed context plus an explicit workflow that pages the
+existing tools for detail.
+
+- **Unchanged:** the server instructions and the full rules grammar (skeleton, external
+  policy, exceptions); the current exact `rules.toml` bytes and descriptor, or explicit
+  absence; the pin (`evidenceBasis`), `workspace` and `catchingUp`.
+- **`payload.references` is a summary** of the pinned references result, not the result.
+  - It keeps `referencesVersion`, `evidenceTier`, `semanticComplete`,
+    `semanticProducers`, `partial`, `counts` (scanned documents, mapped, unresolved and
+    semantic sites) and `limitations` as they are.
+  - It adds
+    `totals:{productionEdges,productionSites,testEdges,testSites,externalPackages,partialFiles}`.
+- **One overview table,** `overview:{rows,total,omitted}`.
+  - Each row is `{source,target,sites}`: production native edges summed by source and
+    target directory. A file's directory is its path up to the last slash, or `.` at the
+    root. Package destinations have no directory and are only counted.
+  - Rows are ordered by `sites` descending, then by source and target.
+  - The overview keeps the longest prefix whose rows fit a fixed budget of 12,288 bytes
+    (`PROMPT_OVERVIEW_BYTES`). The rows' bytes are their JSON array as escaped in the
+    prompt text, with separators and without brackets. If large rules bytes leave less
+    room, it keeps the longest prefix whose complete response line still fits the frame.
+    Both limits are measured on the serialized bytes. `rows.length + omitted = total`,
+    and the result is deterministic for one pin and rules text.
+  - Why 12 KiB: a directory row costs about 45 to 70 bytes, so the budget holds roughly
+    200 rows. That covers every production directory pair of mimir (74) and Trellis (67).
+    It also keeps the prompt near the #528 24 KiB agent page target.
+- **Not listed:** test, package and file-module edges, site samples, module and package
+  descriptors, unresolved sites and partial files. They are counted, not listed.
+- **Workflow.** The instructions tell the agent to:
+  1. start from the overview;
+  2. page `trellis_references` (`expectedBasis`, `paths`, `offset`) to refine particular
+     areas;
+  3. draft `rules.toml` and test it with `trellis_rules_check` /
+     `trellis_rules_explain`;
+  4. pull exact file-level edges from `trellis_references` only when writing baseline
+     exceptions.
+
+  A future `groupBy` aggregation
+  ([#775](https://github.com/SquashMerge/trellis/issues/775)) will make step 2 cheaper.
+- **Atomic failure stays.** Rules bytes are never clipped. If the fixed part
+  (instructions, rules bytes, pin and envelope) does not fit, the prompt still fails
+  atomically with `response_too_large`.
+
+## Amendment (#769): rules tools point to the next call
+
+**Status: owner-ratified 2026-11-07.** From the 2026-11-07 setup of a new repository and a
+Claude Desktop session. With no rules file, nothing named the prompt that drafts one.
+A check instance's single kept evidence row gave no route to the rest, so the agent
+read source files instead. Desktop also could not call `trellis_rules_explain` at all,
+because it sent a `{language,path}` module pair as `target` and got only `Invalid tool
+arguments`. `toolVersion` is **13** (previously 12). This section wins over the #129
+failure text, the #725 instance text and the failure table below. Evaluation,
+verdicts, counts, `omittedEvidence`, instance order, paging rules and bounds are
+unchanged, as are the CLI and the browser.
+
+- **Rules file hint.** The `rules_not_found` message from check and explain is the
+  static text ``No .trellis/rules.toml. Ask the user to run the
+  `trellis_propose_layers` MCP prompt (in Claude Code:
+  /mcp__trellis__trellis_propose_layers) to draft one for review.`` Its code and
+  retryability are unchanged.
+- **Ready-made explain call.** A `trellis_rules_check` instance (in `instances` or
+  `testOnly`) with `omittedEvidence > 0` adds the optional
+  `nextCall:{tool:"trellis_rules_explain",arguments}`. `arguments` is
+  `{schemaVersion:1,rule,target,destination?,limit}`. `rule` and `target` are copied
+  verbatim from the instance, and so is `destination` when the instance's rule is
+  `$layers` or `$external` and its destination is non-null. `limit` is the
+  instance's evidence count, `1 + omittedEvidence`, at most 50.
+  - Sent back as given, these arguments validate. The explain answer lists that
+    instance with up to `limit` evidence entries, all of them when the count is 50
+    or less. A caller that chose a `workspace` for check adds the same one. It may
+    also add the check's `evidenceBasis` as `expectedBasis`, to read the same pin.
+  - An instance whose arguments would not validate as an explain request carries no
+    `nextCall`. Neither does an instance with `omittedEvidence:0`. Explain instances
+    never carry one.
+  - The hint is server-authored from the instance's own identities and adds no
+    repository text. It is part of the instance it rides on, so the page fit and the
+    instance `limit` measure each instance with its hint. A page can therefore hold
+    fewer instances than before, but no instance is split, dropped or clipped.
+- **Field-naming argument errors.** An `invalid_request` from application argument
+  validation now says which field failed and what it expects, as static server text.
+  It never echoes the caller's arguments or repository content. Validation order,
+  codes and retryability are unchanged, and so is every other code, including
+  `range_too_large`, which keeps its generic message.
+  - The message names the first failing check: first an argument the tool does not
+    accept (`Invalid tool arguments: a field is not in this tool's inputSchema`),
+    then a missing required field, then each field in the existing validation order.
+    Non-object arguments say `Tool arguments must be a JSON object`.
+  - For example, an explain `target` that is not a check identity gives `` `target`
+    must be the identity object from a trellis_rules_check instance: {sourceSetId,
+    language, path, sid} ``.
+  - An object-valued field (`target`, `destination`, `expectedBasis`) that arrives as
+    a JSON string, as a client that stringifies object arguments sends it, says so:
+    `` `target` must be a JSON object (got a string): … ``. The server still rejects
+    it; it never parses a string as an object.
+  - The exact text of each message is server-authored, not part of this contract.
+    Each one names its field in backticks and fits the 512-byte summary.
+- **Object input properties.** In every tool's `inputSchema`, a property that is a
+  bare `$ref` to an object-valued definition also carries `"type":"object"` (allowed
+  beside `$ref` in JSON Schema 2020-12). This covers `expectedBasis` on the ten tools
+  that accept it, and explain's `target` and `destination`, because some clients
+  choose how to serialize an argument from its `type`. The same holds at any depth of
+  an input schema: explain's `Destination` union and each of its `oneOf` branches say
+  `"type":"object"` too. Accepted values are unchanged.
+- **Catalog.** Check's output `RuleInstance` adds the optional, closed `nextCall`.
+  `trellis_read_source`'s output schema drops its unreferenced `SemanticProjection`,
+  `DocumentSemanticStatus` and `Language` definitions, which no response shape uses.
+  The complete catalog is 31 bytes smaller than at `toolVersion` 12, so it keeps its
+  named headroom.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)
@@ -405,22 +524,38 @@ it never enters card hashes, lookup, ranking, ordering or joins.
 `SearchIndexStatus` is exactly:
 `{state:"complete"|"building"|"partial"|"unavailable",modelId:Hash|null,
 modelName:Text|null,backend:"cpu"|"metal"|null,declarations:UInt,embedded:UInt,
-lexical:"complete"|"unavailable",unavailableReason:null|"model_not_configured"|"model_load_failed"|"vector_budget_exceeded"}`.
+lexical:"complete"|"unavailable",unavailableReason:null|"model_not_configured"|"model_load_failed"|"vector_budget_exceeded"|"model_not_ready"|"matrix_not_resident"}`.
 `declarations` counts eligible candidate declarations at the admitted head; `embedded` counts
 those with a current decoded vector for the active model and satisfies
 `embedded<=declarations`. These are admitted-head counts, independent of the role filter;
 `scopeCoverage` also remains unfiltered. No configured/verified/ready model, or no matching admitted
 resident matrix (including first search, eviction, head-change races or an oversized head),
-gives `unavailable`, null `modelId`, null `modelName`, and `embedded:0`. The zero is an
-unavailable sentinel, not a measured vector count. `unavailableReason` is
-`model_not_configured` when no model path is configured, or `model_load_failed` after a
-verification/loading failure, cleared by a successful load. Loading, idle residency or a
-missing matrix alone leave the reason null. Backend selection is independent: report the
+gives a lexical-only answer with null `modelId` and null `modelName`. Its state is `building`
+while the background owner works on this head (below), otherwise `unavailable` with
+`embedded:0`, an unavailable sentinel rather than a measured vector count.
+**Amendment (#777, owner-ratified 2026-11-07):** `toolVersion` is **14** (previously 13, #769).
+`unavailable` always has a non-null `unavailableReason`; there is no
+reasonless `unavailable`. The reason is `model_not_configured` when no model path is configured
+(including a standalone registry with no search service), or `model_load_failed` after a
+verification/loading failure, cleared by a successful load. Otherwise it is `model_not_ready`
+when this query got no query vector (the model was loading for another job, or query inference
+failed), or `matrix_not_resident` when there is no matching resident matrix and the owner has
+no work for this head (memory policy, an eviction no request has rearmed, or a head race). Model
+diagnostics and `vector_budget_exceeded` take precedence over `building`. Backend selection is independent: report the
 backend actually selected whenever known, including while loading/building or when the model
 is unavailable; `backend:null` means only that no backend has been selected. With a ready
 model and an admitted matching resident matrix, `complete` means
 all candidates have vectors, `building` means vectors are missing and a background job is
-running, and `partial` means vectors are missing and no job is running. Missing or evicted
+running, and `partial` means vectors are missing and no job is running. Without a used matrix,
+the state is `building` while the owner has queued, running or deferred work for this checkout's
+head. That covers right after a publication, before the new head's matrix exists, and work
+deferred until reconciliation ends. A no-op hint for an evicted head, or for the same head the
+memory policy declined (same declaration count at the current cache epoch), does not count; a
+different, e.g. smaller, successor head is pending again. Retry exhaustion settles the head until
+the next hint. The hits are then lexical-only, model identity is null, and `embedded` counts the
+admitted candidates with a current decoded vector in one vector-cache snapshot. Both the hash
+enumeration and that count are optional work under the vector cutoff: past it, search returns
+the complete lexical answer with `vector_budget_exceeded`. The count may equal `declarations`. Missing or evicted
 vectors do not change native coverage or evidence completeness. A candidate without a vector
 can still be returned by the lexical arm. If this call exhausts its optional vector budget,
 that query-specific reason takes precedence over model diagnostics. Then the complete vector arm is discarded, state is
@@ -487,8 +622,9 @@ and stops at cap admission failure without evicting matrices for more startup wo
 Other checkouts return complete lexical results on first search while the independent
 background owner builds their matrices. A single head that cannot fit remains lexical-only.
 When no matching matrix is retained or acquisition races with a head change, search also
-returns lexical-only with unavailable status, null model identity, embedded:0, selected
-backend and unavailableReason:null. It never waits for the owner or embeds a query without
+returns lexical-only with null model identity and the selected backend: `building` with the
+cached count while the owner works on this head, else `unavailable`, embedded:0 and
+`matrix_not_resident` (#777). It never waits for the owner or embeds a query without
 an admitted resident matrix; the streaming scorer cannot bypass the cap. This supersedes
 the earlier missing-matrix streaming fallback. Exact admitted declaration counts and lexical
 retrieval remain mandatory, and observed store faults remain typed failures rather than
@@ -528,6 +664,26 @@ Database-level vector-cache failures, including corruption, schema mismatch and 
 unsafe storage, fail store_unavailable. A vector-cache row that fails typed decoding is a
 specified miss under T00/T02, excluded from the selected cache snapshot's embedded count and
 re-embedded outside the read. This does not invalidate a valid retained published matrix.
+A cache file the owner is still creating (no version and no schema yet) reads as an absent
+cache, not a schema mismatch (#777).
+
+**Amendment (#777, owner-ratified 2026-11-07): head coverage in describe and CLI status.** Workspace describe and CLI
+status `searchIndex` (`SearchAvailability`) add optional `state:"complete"|"building"|"partial"|"unavailable"`,
+`declarations:UInt`, `embedded:UInt|null` and `cacheDiagnostic?:"vector_cache_unavailable"|"vector_cache_busy"`:
+this checkout's coverage at the admitted head. Describe and status never fail on the optional
+vector cache: if the cached count cannot be read while the owner is pending (a corrupt,
+unreadable or unsafe cache, or cache contention), they report `building` with `embedded:null`
+and that typed `cacheDiagnostic`, present only then. Search keeps its typed `store_unavailable`
+for database-level cache failures. Its
+precedence follows search without the per-query causes. A model diagnostic gives `unavailable`
+with that reason. Otherwise the matrix the owner published for that pin gives `complete`, or
+`building` while the owner runs for that pin, else `partial`. Otherwise owner work for the head
+gives `building` with the cached count, and no owner work gives `unavailable` with
+`matrix_not_resident`. With these fields, `unavailableReason` is the state's reason, so it can
+also be `matrix_not_resident`, and it is non-null exactly when the state is `unavailable`. The
+fields are omitted without a search service or matrix owner (a standalone registry keeps
+`{backend:null,unavailableReason:null}`) and without an admitted head. The other describe
+`SearchAvailability` text stands.
 
 The tool description states: “Find candidate declarations by lexical and local vector
 retrieval. Relevance is not evidence. Inspect hits with trellis_declaration at the returned
@@ -588,6 +744,17 @@ A separate tool for the rooted graph capability ([Decision 0012](semantic-eviden
 **Response bytes (D1, amended #379).** Build the bounded grouped answer once. Serialize and check the complete JSON-RPC frame first; return it unchanged if it fits. Only on overflow, make one forward pass over proper ancestor-closed priority prefixes. Add the next group only while the complete serialized JSON-RPC frame fits 65,536 bytes; stop at the first non-fitting prefix. No maximal-fit promise or descending exhaustive scan. Rebuild retained nodes/evidence/frontiers/warnings from frozen facts with no SQL or resolver re-evaluation. Both `data.result.request` and `data.requested` keep the original effective request and limits. Omitted immediate measured sites of retained owners receive `responseBytes` frontiers after depth/filtered/callLimit precedence, and `result.omitted.responseBytes` is their exact sum. Drop evidence/frontiers of pruned nodes. `truncated=true` and `truncationReason:"response_bytes"` disclose clipping. If the root plus mandatory closure/disclosure cannot fit, fail `range_too_large`. Existing 16 KiB request bounds remain unchanged. No graph config, new GraphError code, index/schema/publication change or warnings-v1 change is introduced.
 
 **Imported-data reach.** The current SCIP importer sets `dispatch: unknown` on every call binding, so until dispatch evidence lands (#12, #14), `trellis_call_graph` on imported data stops at the root's direct callees.
+
+**Project-named boundaries first (#778, owner-ratified 2026-11-07).** From a 2026-11-07 Claude Desktop session: without semantic evidence, compact `trellis_call_graph` from `src/http.rs::provisioned_core_answer` kept the first 60 of its calls in source order, almost all `Some`, `Ok`, `Err`, `clone`, `map_err` and `into_response`. `toolVersion` is **12** (previously 11). For this tool, the only reader of the engine, this amends step 5 of the contract-v1 [pinned bounded priority algorithm](semantic-evidence/contract-v1.md#pinned-bounded-priority-algorithm) by splitting its third rank, "other boundaries", in two:
+
+- *Third:* a boundary call with a selected binding, or an unbound boundary call whose stored callee lookup key equals the lookup key of a declaration of the call's language in the admitted snapshot. This is the [Decision 0012](semantic-evidence/decisions/0012-incoming-calls-syntax-tier.md) name relation that incoming calls use, read from the call's side.
+- *Fourth:* every other unbound boundary, including one with no provable callee key.
+
+The ranking applies only to unbound boundary calls; semantic bindings always take precedence. A call with a selected binding keeps the placement that binding gives it. It expands in rank one, is an external leaf in rank two or, under the default `includeExternal:false`, is dropped as filtered. A dispatch, ambiguous, unresolved or stale binding stays in rank three whatever its name, so it never ranks below an unbound call. The name match is only the fallback order for calls with no selected binding: no producer for the call's language, a document whose evidence is pending (catching up or needing re-import), or no binding row for the call.
+
+Ranks one (fresh admissible internal direct/constructor) and two (external leaves) are unchanged. The tie-breaks within a rank (owner depth, owner document and syntax identity, source order) are also unchanged. The name relation only orders candidates. It never targets, expands, filters or groups a call, and it changes no boundary reason, warning, `partial`, input or output schema. The `maxCalls` cut, its `callLimit` frontiers and `omitted.callLimit`, and the response-byte prefix stay exact, so a de-prioritized call that is cut is still counted. No standard-library name list is added. Sequence's external rule, a selected binding that resolves external, is already the call graph's `includeExternal` filter and is unchanged. A name match is not proof of a project target: a project `fn len` also lifts every `.len()` call.
+
+Measured on a private clone of this repository at `913b645e`, syntax only, with compact defaults: the root has 339 calls, 60 are kept and `omitted.callLimit` is 279 both before and after. Among the 60 kept edges, `Some`, `Ok`, `Err`, `clone`, `map_err` and `into_response` went from 23 to 6. The remaining 6 are `into_response`, which this repository declares. The frame went from 25,445 to 25,597 bytes.
 
 ### `trellis_read_source` (W5)
 
@@ -784,7 +951,8 @@ complete-frame cap applies, not the catalog cap.
 
 Prompt content separates server-authored task instructions from untrusted
 repository data. It supplies the verified checkout, one code pin, sampled
-`catchingUp`, structural references/limitations and production/test split; it also
+`catchingUp`, structural references/limitations and production/test split (as the
+bounded summary of [Amendment (#770)](#amendment-770-a-bounded-prompt-reference-view)); it also
 supplies current exact rules bytes and the separate checkout-config descriptor,
 or explicit absence. Missing rules permits a new proposal; malformed rules fails
 atomically, just as check/explain do. The index pin does not identify current

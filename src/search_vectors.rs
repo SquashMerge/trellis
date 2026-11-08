@@ -328,6 +328,20 @@ fn evict(tx: &Transaction<'_>, budget: u64, retained: &[(&str, &str)]) -> Result
     Ok(())
 }
 
+/// The owner creates the cache file before its schema transaction commits. A
+/// reader that sees that state (no version, no schema, including an empty
+/// file) reads an absent cache, not a corrupt one, so it never reports a
+/// failure or drops the owner's writer for a cache still being created.
+fn being_created(db: &rusqlite::Connection) -> Result<bool> {
+    let version: i64 = storage(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+    if version != 0 {
+        return Ok(false);
+    }
+    let count: i64 =
+        storage(db.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0)))?;
+    Ok(count == 0)
+}
+
 pub struct VectorCacheReader {
     db: ProtectedSqliteConnection,
 }
@@ -340,6 +354,9 @@ impl VectorCacheReader {
         let mut db = open(path, false)?;
         {
             let tx = storage(db.transaction())?;
+            if being_created(&tx)? {
+                return Ok(None);
+            }
             validate(&tx)?;
         }
         Ok(Some(Self { db }))
@@ -360,6 +377,10 @@ impl VectorCacheReader {
         storage(db.busy_timeout(BUSY_WAIT.min(budget.remaining())))?;
         {
             let tx = storage(db.transaction())?;
+            if being_created(&tx)? {
+                budget.check()?;
+                return Ok(None);
+            }
             validate(&tx)?;
         }
         budget.check()?;
@@ -504,6 +525,36 @@ mod tests {
             VectorCacheWriter::open_with_budget(&directory.path().join("vectors.db"), budget)
                 .unwrap();
         (directory, writer)
+    }
+
+    #[test]
+    fn cache_still_being_created_reads_as_absent_and_the_writer_initializes_it() {
+        use crate::search_embed::QueryBudget;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vectors.db");
+        let now = Instant::now();
+        let budget = QueryBudget::new(now + Duration::from_secs(60), Arc::new(move || now));
+        // The file exists before the owner's schema commit: first empty, then
+        // an empty SQLite database with no version.
+        fs::write(&path, b"").unwrap();
+        for _ in 0..2 {
+            assert!(VectorCacheReader::open_existing(&path).unwrap().is_none());
+            assert!(
+                VectorCacheReader::open_existing_with_budget(&path, &budget)
+                    .unwrap()
+                    .is_none()
+            );
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.pragma_update(None, "auto_vacuum", "FULL").unwrap();
+            drop(db);
+        }
+        let mut writer = VectorCacheWriter::open(&path).unwrap();
+        writer.put(&key(1), &key(2), &[1, 2]).unwrap();
+        let mut reader = VectorCacheReader::open_existing(&path).unwrap().unwrap();
+        assert_eq!(reader.snapshot().unwrap().entry_count(), 1);
     }
 
     #[test]

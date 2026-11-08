@@ -793,6 +793,11 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str, home: &P
         envelope["catchingUp"] = actual["catchingUp"].clone();
         assert!(actual["catchingUp"].is_boolean());
         if state == "ready" {
+            // #777: a ready describe projects the admitted head's search
+            // coverage; the missing model decides it, with its reason.
+            envelope["data"]["searchIndex"]["state"] = json!("unavailable");
+            envelope["data"]["searchIndex"]["declarations"] = json!(0);
+            envelope["data"]["searchIndex"]["embedded"] = json!(0);
             let languages = actual["data"]["languages"].as_array().unwrap();
             assert_eq!(languages.len(), 4);
             for (row, language) in languages
@@ -2063,7 +2068,10 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             tool(&failed, Some("invalid_request"), !legacy);
             assert_eq!(
                 failed["result"]["content"][0]["text"],
-                format!("{name} failed: invalid_request: Invalid tool arguments"),
+                format!(
+                    "{name} failed: invalid_request: Invalid tool arguments: a field is not \
+                     in this tool's inputSchema"
+                ),
                 "failure summary must identify the called tool"
             );
             schema_pairs.push(json!({"name":name,
@@ -2156,8 +2164,22 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
         for name in &names {
             let name = name.as_str().unwrap();
             for args in [json!([]), json!(42), Value::Null] {
+                // #769: non-object arguments say so; the rest is the golden envelope.
+                let mut reply = peer.ask(call(legacy, json!(heavy_id), name, args));
+                let message = "Tool arguments must be a JSON object";
+                let error = &mut reply["result"]["structuredContent"]["error"]["message"];
+                assert_eq!(*error, message);
+                *error = fixture()["expected"]["failures"]["invalid_request"][0].clone();
+                let text = &mut reply["result"]["content"][0]["text"];
+                assert_eq!(*text, format!("{name} failed: invalid_request: {message}"));
+                *text = json!(format!(
+                    "{name} failed: invalid_request: {}",
+                    fixture()["expected"]["failures"]["invalid_request"][0]
+                        .as_str()
+                        .unwrap()
+                ));
                 exact_tool_for_id(
-                    &peer.ask(call(legacy, json!(heavy_id), name, args)),
+                    &reply,
                     &json!(heavy_id),
                     Some("invalid_request"),
                     !legacy,
@@ -11670,6 +11692,299 @@ async fn rules_check_paths_scope_the_unassigned_list_through_every_page() {
     session.join().unwrap().unwrap();
 }
 
+/// #769: a check instance that omits evidence carries a ready-made `nextCall`. Its
+/// `trellis_rules_explain` arguments, sent back verbatim, succeed and return that
+/// instance with all of its evidence. An instance that omits nothing has no hint.
+#[tokio::test(flavor = "current_thread")]
+async fn rules_check_next_call_explains_an_instance_with_its_omitted_evidence() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            (
+                "app_main.js",
+                "import('external');\nimport('external');\nimport('external');\n",
+            ),
+            (
+                "lib_000.js",
+                "import './app_main.js';\nimport { y } from './app_main.js';\n",
+            ),
+            ("lib_001.js", "import './app_main.js';\n"),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 1\npaths = [\"app_main.js\"]\n[layers.lib]\norder = 2\npaths = [\"lib_*.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(769, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 769, None);
+    let mut ask = |id: i64, name: &str, arguments: Value| {
+        let frame = modern(
+            json!(id),
+            "tools/call",
+            json!({"name":name,"arguments":arguments}),
+        );
+        writeln!(client, "{frame}").unwrap();
+        next_reply(&mut reader)
+    };
+    let check = ask(1, "trellis_rules_check", json!({"schemaVersion":1}));
+    tool(&check, None, true);
+    let mut structured = vec![
+        json!({"name":"trellis_rules_check","structuredContent":check["result"]["structuredContent"]}),
+    ];
+    let data = &check["result"]["structuredContent"]["data"];
+    let rows: Vec<Value> = ["instances", "testOnly"]
+        .iter()
+        .flat_map(|field| data[*field].as_array().unwrap().clone())
+        .collect();
+    let mut hinted = 0;
+    for (index, row) in rows.iter().enumerate() {
+        if row["omittedEvidence"] == 0 {
+            assert!(row.get("nextCall").is_none(), "{row}");
+            continue;
+        }
+        hinted += 1;
+        let next = &row["nextCall"];
+        assert_eq!(next["tool"], "trellis_rules_explain", "{row}");
+        let arguments = &next["arguments"];
+        assert_eq!(arguments["rule"], row["rule"]);
+        assert_eq!(arguments["target"], row["target"]);
+        assert_eq!(
+            arguments.get("destination").unwrap_or(&Value::Null),
+            &row["destination"]
+        );
+        let explained = ask(
+            10 + index as i64,
+            "trellis_rules_explain",
+            arguments.clone(),
+        );
+        tool(&explained, None, true);
+        let instances = explained["result"]["structuredContent"]["data"]["instances"]
+            .as_array()
+            .unwrap();
+        let same = instances
+            .iter()
+            .find(|candidate| {
+                candidate["rule"] == row["rule"]
+                    && candidate["target"] == row["target"]
+                    && candidate["destination"] == row["destination"]
+                    && candidate["status"] == row["status"]
+            })
+            .unwrap_or_else(|| panic!("explain lists the hinted instance: {explained}"));
+        let total = row["omittedEvidence"].as_u64().unwrap() + 1;
+        assert_eq!(
+            same["evidence"].as_array().unwrap().len() as u64,
+            total,
+            "{same}"
+        );
+        assert_eq!(same["omittedEvidence"], 0, "{same}");
+        assert_eq!(same["evidence"][0], row["evidence"][0]);
+        structured.push(json!({"name":"trellis_rules_explain",
+            "structuredContent":explained["result"]["structuredContent"]}));
+    }
+    // The unknown app_main.js instance (three unresolved imports) and the lib_000.js
+    // deviation (two imports of app_main.js) omit evidence; lib_001.js does not.
+    assert_eq!(hinted, 2, "{data}");
+    validate_structured_content(&structured);
+    drop(ask);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #769: without `.trellis/rules.toml`, check and explain fail `rules_not_found` with a
+/// static hint naming the `trellis_propose_layers` prompt that drafts one.
+#[tokio::test(flavor = "current_thread")]
+async fn rules_not_found_names_the_propose_layers_prompt() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) =
+        published_inactive_checkout(temp.path(), &[("app.js", "export const a = 1;\n")]);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(7691, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 7691, None);
+    let target = json!({"sourceSetId":"app","language":"javascript","path":"app.js",
+        "sid":"sid:v1:00000000000000000000000000000000"});
+    for (id, name, arguments) in [
+        (1, "trellis_rules_check", json!({"schemaVersion":1})),
+        (
+            2,
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers","target":target}),
+        ),
+    ] {
+        let frame = modern(
+            json!(id),
+            "tools/call",
+            json!({"name":name,"arguments":arguments}),
+        );
+        writeln!(client, "{frame}").unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, Some("rules_not_found"), true);
+        let envelope = &reply["result"]["structuredContent"];
+        let message = envelope["error"]["message"].as_str().unwrap();
+        assert!(message.contains(".trellis/rules.toml"), "{message}");
+        assert!(message.contains("`trellis_propose_layers`"), "{message}");
+        assert!(
+            message.contains("/mcp__trellis__trellis_propose_layers"),
+            "{message}"
+        );
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            format!("{name} failed: rules_not_found: {message}")
+        );
+        validate_structured_content(&[json!({"name":name,"structuredContent":envelope})]);
+    }
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #769: an `invalid_request` for tool arguments names the failing field and the
+/// shape it expects, in static server text. A `{language,path}` module pair (the
+/// rules.toml exception shape) or a stringified identity is not an explain `target`.
+#[test]
+fn invalid_tool_arguments_name_the_failing_field_and_its_shape() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let mut peer = Peer::start(Some(&root));
+    let identity = json!({"sourceSetId":"app","language":"rust","path":"src/a.rs",
+        "sid":"sid:v1:00000000000000000000000000000000"});
+    let target_message = "`target` must be the identity object from a trellis_rules_check \
+        instance: {sourceSetId, language, path, sid}";
+    let cases = [
+        (
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers",
+                "target":{"language":"rust","path":"src/a.rs"}}),
+            target_message,
+        ),
+        // The Claude Desktop shape: the right object, sent as a JSON string. The closed
+        // schema still rejects it, and the message says what arrived.
+        (
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers","target":identity.to_string()}),
+            "`target` must be a JSON object (got a string): the identity object from a \
+                trellis_rules_check instance, {sourceSetId, language, path, sid}",
+        ),
+        (
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers","target":identity.clone(),
+                "destination":identity.to_string()}),
+            "`destination` must be a JSON object (got a string): the destination object \
+                from a trellis_rules_check instance",
+        ),
+        (
+            "trellis_rules_check",
+            json!({"schemaVersion":1,"expectedBasis":
+                json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000",
+                    "indexRevision":1}).to_string()}),
+            "`expectedBasis` must be a JSON object (got a string): the evidenceBasis \
+                object of an earlier result, {indexGeneration, indexRevision}",
+        ),
+        (
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers"}),
+            target_message,
+        ),
+        (
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers","target":identity,
+                "destination":{"language":"rust","path":"src/b.rs"}}),
+            "`destination` must be the destination object from a trellis_rules_check \
+                instance: {sourceSetId, language, path, sid} or {kind:\"externalPackage\", \
+                sourceSetId, language, package, standardLibrary}, and only for $layers or \
+                $external",
+        ),
+        (
+            "trellis_rules_check",
+            json!({"schemaVersion":1,"status":["violates"]}),
+            "`status` must be 1 to 3 distinct values from \"conforms\", \"deviates\", \"unknown\"",
+        ),
+        (
+            "trellis_declaration",
+            json!({"schemaVersion":1,"symbolId":"sid:v1:x"}),
+            "`symbolId` must be a syntax ID: sid:v1: followed by 32 lowercase hex digits",
+        ),
+    ];
+    for (id, (name, arguments, message)) in cases.into_iter().enumerate() {
+        let reply = peer.ask(modern(
+            json!(id),
+            "tools/call",
+            json!({"name":name,"arguments":arguments}),
+        ));
+        tool(&reply, Some("invalid_request"), true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["message"], message,
+            "{name} {arguments}"
+        );
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            format!("{name} failed: invalid_request: {message}")
+        );
+    }
+    peer.assert_success("trellis mcp");
+}
+
+/// #769: every input property whose `$ref` names an object-valued definition also says
+/// `"type":"object"`, so a client serializes it as an object rather than a string.
+#[test]
+fn object_valued_input_refs_declare_type_object() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let mut peer = Peer::start(Some(&root));
+    let list = peer.ask(modern(json!(1), "tools/list", json!({})));
+    let mut checked = Vec::new();
+    for tool in list["result"]["tools"].as_array().unwrap() {
+        let schema = &tool["inputSchema"];
+        for (field, property) in schema["properties"].as_object().unwrap() {
+            let Some(reference) = property.get("$ref").and_then(Value::as_str) else {
+                continue;
+            };
+            let definition = &schema["$defs"][reference.strip_prefix("#/$defs/").unwrap()];
+            let object = definition["type"] == "object"
+                || definition["oneOf"].as_array().is_some_and(|branches| {
+                    branches.iter().all(|branch| {
+                        let name = branch["$ref"].as_str().unwrap_or_default();
+                        schema["$defs"][name.strip_prefix("#/$defs/").unwrap_or_default()]["type"]
+                            == "object"
+                    })
+                });
+            if object {
+                assert_eq!(property["type"], "object", "{} {field}", tool["name"]);
+                checked.push(format!("{}.{field}", tool["name"].as_str().unwrap()));
+            } else {
+                assert!(property.get("type").is_none(), "{} {field}", tool["name"]);
+            }
+        }
+    }
+    assert!(checked.contains(&"trellis_rules_explain.target".to_owned()));
+    assert!(checked.contains(&"trellis_rules_explain.destination".to_owned()));
+    assert!(checked.contains(&"trellis_find_symbols.expectedBasis".to_owned()));
+    assert_eq!(checked.len(), 12, "{checked:?}");
+    // Nested: the explain destination union and each of its branches say so too.
+    let explain = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "trellis_rules_explain")
+        .unwrap();
+    let destination = &explain["inputSchema"]["$defs"]["Destination"];
+    assert_eq!(destination["type"], "object");
+    for branch in destination["oneOf"].as_array().unwrap() {
+        assert_eq!(branch["type"], "object", "{branch}");
+    }
+    peer.assert_success("trellis mcp");
+}
+
 #[test]
 fn architecture_catalog_prompt_and_closed_inputs_use_both_protocol_modes() {
     for legacy in [false, true] {
@@ -11959,6 +12274,104 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
         drop(client);
         session.join().unwrap().unwrap();
     }
+}
+
+/// #770: on a checkout whose structural references alone exceed the 65,536-byte frame,
+/// `prompts/get` still returns a fitting, deterministic proposal context: directory
+/// edges and file-module pairs with exact totals and omitted counts, and the exact
+/// current rules bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn propose_layers_prompt_fits_the_frame_when_references_exceed_it() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let mut files = Vec::new();
+    for package in 0..10 {
+        fs::create_dir_all(temp.path().join(format!("checkout/pkg{package}"))).unwrap();
+        files.push((format!("pkg{package}/__init__.py"), String::new()));
+        for module in 0..20 {
+            let mut text = String::new();
+            for other in 1..=6 {
+                let target = (package + other) % 10;
+                let name = (module + other) % 20;
+                text.push_str(&format!("from pkg{target}.m{name} import f as f{other}\n"));
+            }
+            text.push_str("def f():\n    pass\n");
+            files.push((format!("pkg{package}/m{module}.py"), text));
+        }
+    }
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let (identity, topology) = published_inactive_checkout(temp.path(), &borrowed);
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    let rules = "version = 1\n[layers.top]\norder = 1\npaths = [\"pkg0/**\"]\n";
+    fs::write(identity.root.join(".trellis/rules.toml"), rules).unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(770, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 770, None);
+    let mut raw = |id: i64, method: &str, params: Value| {
+        writeln!(client, "{}", modern(json!(id), method, params)).unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        line
+    };
+    let refs: Value = serde_json::from_str(&raw(
+        1,
+        "tools/call",
+        json!({"name":"trellis_references","arguments":{"schemaVersion":1}}),
+    ))
+    .unwrap();
+    let refs_env = &refs["result"]["structuredContent"];
+    assert!(refs_env.get("error").is_none(), "{refs}");
+    let first = raw(2, "prompts/get", json!({"name":"trellis_propose_layers"}));
+    // A small prompt: instructions, rules, pin, totals and a bounded overview.
+    assert!(first.len() < 32 * 1024, "{} bytes", first.len());
+    let prompt: Value = serde_json::from_str(&first).unwrap();
+    assert!(prompt.get("error").is_none(), "{prompt}");
+    let second = raw(3, "prompts/get", json!({"name":"trellis_propose_layers"}));
+    assert_eq!(
+        first.replacen("\"id\":2", "", 1),
+        second.replacen("\"id\":3", "", 1),
+        "deterministic"
+    );
+    let text = prompt["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("for human review"));
+    assert!(text.contains("WORKFLOW\n1. Start from the overview"));
+    assert!(text.contains("trellis_references with expectedBasis"));
+    let context: Value =
+        serde_json::from_str(text.split("UNTRUSTED REPOSITORY DATA\n").nth(1).unwrap()).unwrap();
+    let payload = &context["payload"];
+    assert_eq!(payload["rulesText"], rules);
+    assert_eq!(
+        context["evidenceBasis"], refs_env["evidenceBasis"],
+        "one pin"
+    );
+    let summary = &payload["references"];
+    assert_eq!(summary["referencesVersion"], "references:v2");
+    // 200 modules, each importing six modules of other packages: 1,200 file pairs (whose
+    // inlined references exceed the frame) in 60 directory pairs, all in the overview.
+    assert_eq!(summary["totals"]["productionEdges"], 1200, "{summary}");
+    assert_eq!(summary["totals"]["productionSites"], 1200, "{summary}");
+    assert_eq!(summary["counts"], refs_env["data"]["counts"]);
+    let overview = &summary["overview"];
+    assert_eq!(overview["total"], 60, "{overview}");
+    assert_eq!(overview["omitted"], 0);
+    let rows = overview["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 60);
+    assert!(rows.iter().all(|row| row["sites"] == 20), "{overview}");
+    assert_eq!(rows[0], json!({"source":"pkg0","target":"pkg1","sites":20}));
+    for field in ["production", "tests", "unresolved", "filePairs", "packages"] {
+        assert!(summary.get(field).is_none(), "{field}");
+    }
+    drop(raw);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12572,7 +12985,8 @@ async fn mcp_search_both_modes_use_real_lexical_cards_without_optional_cache() {
                 envelope["data"]["searchIndex"],
                 json!({
                     "state":"unavailable","modelId":null,"modelName":null,"backend":null,
-                    "declarations":51,"embedded":0,"lexical":"complete","unavailableReason":null
+                    "declarations":51,"embedded":0,"lexical":"complete",
+                    "unavailableReason":"model_not_configured"
                 })
             );
             assert_eq!(envelope["warnings"].as_array().unwrap().len(), 1);
@@ -12624,7 +13038,8 @@ async fn mcp_search_model_configuration_reasons_reach_describe_and_status() {
         let models_dir = home.path().join("custom-models");
         let mut expected_status = json!({
             "backend":"cpu",
-            "unavailableReason":if configured { "model_load_failed" } else { "model_not_configured" }
+            "unavailableReason":if configured { "model_load_failed" } else { "model_not_configured" },
+            "state":"unavailable","declarations":1,"embedded":0
         });
         if scenario == "managed_missing" {
             fs::create_dir_all(config_file.parent().unwrap()).unwrap();
@@ -13297,7 +13712,7 @@ async fn mcp_search_without_model_ignores_stale_and_corrupt_optional_cache() {
                 json!({
                     "state":"unavailable", "modelId":null, "modelName":null,
                     "backend":backend, "declarations":1, "embedded":0, "lexical":"complete",
-                    "unavailableReason":if configured_service { json!("model_not_configured") } else { Value::Null }
+                    "unavailableReason":"model_not_configured"
                 })
             );
             assert_eq!(envelope["partial"], false);
@@ -13874,10 +14289,12 @@ async fn mcp_search_fill_serves_queued_query_between_real_batches_and_reports_bu
         cold_envelope["evidenceBasis"],
         SearchMcpFixture::basis(fixture.current)
     );
+    // The owner is building this head (held before its model load), so the
+    // lexical-only answer reports building with the measured empty cache.
     assert_eq!(
         cold_envelope["data"]["searchIndex"],
         json!({
-            "state":"unavailable","modelId":null,"modelName":null,"backend":"cpu",
+            "state":"building","modelId":null,"modelName":null,"backend":"cpu",
             "declarations":17,"embedded":0,"lexical":"complete","unavailableReason":null
         })
     );
@@ -14062,6 +14479,579 @@ async fn mcp_search_fill_serves_queued_query_between_real_batches_and_reports_bu
     drop(client);
     session.join().unwrap().unwrap();
     validate_structured_content(&schema_pairs);
+}
+
+/// #777: right after a publication the owner has not yet built the new head's
+/// matrix. Search, describe and CLI status report `building` with the measured
+/// cache count, never `unavailable` without a reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_reports_building_with_counts_before_owner_builds_new_head() {
+    let first_batch = ReadGate::default();
+    let second_batch = ReadGate::default();
+    first_batch.open();
+    second_batch.open();
+    let factory = std::sync::Arc::new(McpFillEmbedderFactory {
+        before_load: None,
+        first_batch,
+        second_batch,
+        loads: Default::default(),
+        batches: Default::default(),
+        queries: Default::default(),
+    });
+    let (fixture, service, fill) = SearchMcpFixture::with_search(
+        &[("a.js", "function orchard() {}\nfunction unrelated() {}\n")],
+        |roots| {
+            std::sync::Arc::new(
+                trellis::daemon::search::SearchService::with_embedder_for_tests(
+                    roots.clone(),
+                    factory.clone(),
+                )
+                .unwrap(),
+            )
+        },
+        true,
+    )
+    .await;
+    // The prior head's two cards already have cached vectors.
+    fixture.seed_vectors(&service);
+    let fill = fill.unwrap();
+    let build = ReadGate::default();
+    let _release_on_failure = McpFillRelease([build.clone(), ReadGate::default()]);
+    fixture
+        .head()
+        .await
+        .set_before_build_hook_for_tests(build.hook());
+    let runtime = fixture
+        .registry
+        .lock()
+        .await
+        .runtime(&fixture.identity.root_key)
+        .unwrap();
+    // Change the checkout while startup reconciliation is held, so releasing
+    // it publishes a newer revision. Appending keeps the two existing cards
+    // (and their cached vectors) intact.
+    fs::write(
+        fixture.identity.root.join("a.js"),
+        "function orchard() {}\nfunction unrelated() {}\nfunction orchardnew() {}\n",
+    )
+    .unwrap();
+    fixture.startup.open();
+    // The owner holds here only after the worker published the new revision
+    // and hinted it: it has read the new head but not built its matrix. A
+    // hint during reconciliation defers before reading a head, so it cannot
+    // reach this hook.
+    let waiter = build.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    let mut pairs = Vec::new();
+    let held = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        1,
+        json!({"schemaVersion":1,"query":"orchard","limit":50}),
+    );
+    tool(&held, None, true);
+    let envelope = &held["result"]["structuredContent"];
+    let basis = envelope["evidenceBasis"].clone();
+    assert_ne!(basis, SearchMcpFixture::basis(fixture.current), "{held}");
+    assert_eq!(
+        envelope["data"]["searchIndex"],
+        json!({
+            "state":"building","modelId":null,"modelName":null,"backend":"cpu",
+            "declarations":3,"embedded":2,"lexical":"complete","unavailableReason":null
+        }),
+        "{held}"
+    );
+    let hits = envelope["data"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["name"], "orchard");
+    assert_eq!(hits[0]["matchedBy"], json!(["lexical"]));
+    pairs.push(search_schema_pair(&held));
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(2),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1})
+        )
+    )
+    .unwrap();
+    let describe = next_reply(&mut reader);
+    let expected = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"building","declarations":3,"embedded":2
+    });
+    assert_eq!(
+        describe["result"]["structuredContent"]["data"]["searchIndex"], expected,
+        "{describe}"
+    );
+    pairs.push(json!({"name":"trellis_workspace_describe",
+        "structuredContent":describe["result"]["structuredContent"]}));
+    let status_runtime = runtime.clone();
+    let status = tokio::task::spawn_blocking(move || status_runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status["searchIndex"], expected, "{status}");
+    build.open();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    assert_eq!(*factory.batches.lock().unwrap(), [1]);
+    let complete = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        3,
+        json!({"schemaVersion":1,"query":"orchard","limit":50}),
+    );
+    tool(&complete, None, true);
+    let envelope = &complete["result"]["structuredContent"];
+    assert_eq!(envelope["evidenceBasis"], basis);
+    let index = &envelope["data"]["searchIndex"];
+    assert_eq!(index["state"], "complete", "{complete}");
+    assert!(index["modelId"].is_string());
+    assert_eq!(index["declarations"], 3);
+    assert_eq!(index["embedded"], 3);
+    assert_eq!(index["unavailableReason"], Value::Null);
+    pairs.push(search_schema_pair(&complete));
+    // All three surfaces agree once complete: describe and CLI status project
+    // the same state and counts that search reports.
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(4),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1})
+        )
+    )
+    .unwrap();
+    let describe = next_reply(&mut reader);
+    let expected = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"complete","declarations":3,"embedded":3
+    });
+    let described = &describe["result"]["structuredContent"]["data"]["searchIndex"];
+    assert_eq!(described, &expected, "{describe}");
+    for field in ["state", "declarations", "embedded", "unavailableReason"] {
+        assert_eq!(described[field], index[field], "{field}");
+    }
+    pairs.push(json!({"name":"trellis_workspace_describe",
+        "structuredContent":describe["result"]["structuredContent"]}));
+    let status = tokio::task::spawn_blocking(move || runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status["searchIndex"], expected);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&pairs);
+}
+
+/// #777 owner ruling (2026-11-07): describe and CLI status never fail on the
+/// optional vector cache. With the owner pending and the cache unreadable,
+/// both report building with a null count and a typed diagnostic, while
+/// search keeps its typed store_unavailable failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_describe_and_status_report_building_without_count_when_cache_unreadable() {
+    let first_batch = ReadGate::default();
+    let second_batch = ReadGate::default();
+    first_batch.open();
+    second_batch.open();
+    let factory = std::sync::Arc::new(McpFillEmbedderFactory {
+        before_load: None,
+        first_batch,
+        second_batch,
+        loads: Default::default(),
+        batches: Default::default(),
+        queries: Default::default(),
+    });
+    let (fixture, service, fill) = SearchMcpFixture::with_search(
+        &[("a.js", "function orchard() {}\nfunction unrelated() {}\n")],
+        |roots| {
+            std::sync::Arc::new(
+                trellis::daemon::search::SearchService::with_embedder_for_tests(
+                    roots.clone(),
+                    factory.clone(),
+                )
+                .unwrap(),
+            )
+        },
+        true,
+    )
+    .await;
+    fixture.seed_vectors(&service);
+    let fill = fill.unwrap();
+    let build = ReadGate::default();
+    let _release_on_failure = McpFillRelease([build.clone(), ReadGate::default()]);
+    fixture
+        .head()
+        .await
+        .set_before_build_hook_for_tests(build.hook());
+    let runtime = fixture
+        .registry
+        .lock()
+        .await
+        .runtime(&fixture.identity.root_key)
+        .unwrap();
+    fs::write(
+        fixture.identity.root.join("a.js"),
+        "function orchard() {}\nfunction unrelated() {}\nfunction orchardnew() {}\n",
+    )
+    .unwrap();
+    fixture.startup.open();
+    let waiter = build.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    // Make the cache path unreadable while the owner is paused. Rename the
+    // live file instead of reopening it, so no separate descriptor is closed
+    // beneath the owner's SQLite connection.
+    let moved = fixture.vectors.with_extension("db.moved");
+    fs::rename(&fixture.vectors, &moved).unwrap();
+    fs::create_dir(&fixture.vectors).unwrap();
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    let mut pairs = Vec::new();
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(1),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1})
+        )
+    )
+    .unwrap();
+    let describe = next_reply(&mut reader);
+    let expected = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"building","declarations":3,"embedded":null,
+        "cacheDiagnostic":"vector_cache_unavailable"
+    });
+    assert_eq!(
+        describe["result"]["structuredContent"]["data"]["searchIndex"], expected,
+        "{describe}"
+    );
+    pairs.push(json!({"name":"trellis_workspace_describe",
+        "structuredContent":describe["result"]["structuredContent"]}));
+    let status_runtime = runtime.clone();
+    let status = tokio::task::spawn_blocking(move || status_runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status["searchIndex"], expected, "{status}");
+    let failed = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        2,
+        json!({"schemaVersion":1,"query":"orchard","limit":50}),
+    );
+    tool(&failed, Some("store_unavailable"), true);
+    // Restore the cache and let the owner finish: nothing was invalidated.
+    fs::remove_dir(&fixture.vectors).unwrap();
+    fs::rename(&moved, &fixture.vectors).unwrap();
+    build.open();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    let status = tokio::task::spawn_blocking(move || runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        status["searchIndex"],
+        json!({
+            "backend":"cpu","unavailableReason":null,
+            "state":"complete","declarations":3,"embedded":3
+        })
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&pairs);
+}
+
+/// #781 review finding 1: a memory decline of the old head must not hide a
+/// smaller successor the owner admits. Decline a two-card head, publish a
+/// one-card successor, pause the owner before its build, and require
+/// `building` on search, describe and CLI status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_smaller_successor_after_memory_decline_reports_building() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(
+        root.join("a.js"),
+        "function orchard() {}\nfunction unrelated() {}\n",
+    )
+    .unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let service = std::sync::Arc::new(
+        trellis::daemon::search::SearchService::with_embedder_for_tests(
+            topology.clone(),
+            std::sync::Arc::new(McpSearchEmbedderFactory::default()),
+        )
+        .unwrap(),
+    );
+    // A cap that admits a one-card head alone but declines a two-card head.
+    let one = trellis::daemon::search_head::full_admission_bytes_for_tests(1);
+    let two = trellis::daemon::search_head::full_admission_bytes_for_tests(2);
+    assert!(one < two);
+    let fill = trellis::daemon::search_fill::SearchFill::start_with_limit_for_tests(
+        service.clone(),
+        one + (two - one) / 2,
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.set_search_service(service.clone());
+    registry.set_search_fill(fill.clone());
+    registry.attach_launch(211, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("startup reconciliation did not finish");
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let head = scheduler.search_head_slot_for_tests().unwrap();
+    // Settle the owner's attempt on the two-card head: it is declined.
+    let waiter = head.clone();
+    tokio::task::spawn_blocking(move || {
+        let budget = trellis::search_embed::QueryBudget::new(
+            std::time::Instant::now() + trellis::testing::HANG_BACKSTOP,
+            std::sync::Arc::new(std::time::Instant::now),
+        );
+        waiter.request();
+        waiter
+            .wait_latest(&std::sync::atomic::AtomicBool::new(false), &budget)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    assert_eq!(fill.matrix_storage_bytes(), 0);
+    let status_runtime = runtime.clone();
+    let declined = tokio::task::spawn_blocking(move || status_runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        declined["searchIndex"],
+        json!({
+            "backend":"cpu","unavailableReason":"matrix_not_resident",
+            "state":"unavailable","declarations":2,"embedded":0
+        }),
+        "{declined}"
+    );
+    let build = ReadGate::default();
+    let _release_on_failure = McpFillRelease([build.clone(), ReadGate::default()]);
+    head.set_before_build_hook_for_tests(build.hook());
+    fs::write(root.join("a.js"), "function orchard() {}\n").unwrap();
+    let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Content,
+    )))
+    .add_path(root.join("a.js"));
+    assert!(scheduler.submit_watch_event_for_tests(Ok(event)));
+    // The owner admitted the smaller successor and holds before its build.
+    let waiter = build.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    let expected = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"building","declarations":1,"embedded":0
+    });
+    let status_runtime = runtime.clone();
+    let status = tokio::task::spawn_blocking(move || status_runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status["searchIndex"], expected, "{status}");
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 211, None);
+    let mut pairs = Vec::new();
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(1),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1})
+        )
+    )
+    .unwrap();
+    let describe = next_reply(&mut reader);
+    assert_eq!(
+        describe["result"]["structuredContent"]["data"]["searchIndex"], expected,
+        "{describe}"
+    );
+    pairs.push(json!({"name":"trellis_workspace_describe",
+        "structuredContent":describe["result"]["structuredContent"]}));
+    let reply = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        2,
+        json!({"schemaVersion":1,"query":"orchard"}),
+    );
+    tool(&reply, None, true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["data"]["searchIndex"],
+        json!({
+            "state":"building","modelId":null,"modelName":null,"backend":"cpu",
+            "declarations":1,"embedded":0,"lexical":"complete","unavailableReason":null
+        }),
+        "{reply}"
+    );
+    pairs.push(search_schema_pair(&reply));
+    build.open();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    let status = tokio::task::spawn_blocking(move || runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        status["searchIndex"],
+        json!({
+            "backend":"cpu","unavailableReason":null,
+            "state":"complete","declarations":1,"embedded":1
+        })
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&pairs);
+}
+
+/// #781 review finding 3: the optional pending-head hash scan honors the
+/// 3,000ms vector cutoff. With the owner pending and the frozen MCP clock
+/// past the cutoff (before the request deadline), search returns the
+/// complete lexical answer with `vector_budget_exceeded` without starting
+/// the scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_pending_head_count_stops_at_the_vector_cutoff() {
+    let factory = std::sync::Arc::new(McpSearchEmbedderFactory::default());
+    let (fixture, service, fill) = SearchMcpFixture::with_search(
+        &[("a.js", "function orchard() {}\nfunction unrelated() {}\n")],
+        |roots| {
+            std::sync::Arc::new(
+                trellis::daemon::search::SearchService::with_embedder_for_tests(
+                    roots.clone(),
+                    factory.clone(),
+                )
+                .unwrap(),
+            )
+        },
+        true,
+    )
+    .await;
+    fixture.seed_vectors(&service);
+    let fill = fill.unwrap();
+    let build = ReadGate::default();
+    let admitted = ReadGate::default();
+    let _release_on_failure = McpFillRelease([build.clone(), admitted.clone()]);
+    fixture
+        .head()
+        .await
+        .set_before_build_hook_for_tests(build.hook());
+    let runtime = fixture
+        .registry
+        .lock()
+        .await
+        .runtime(&fixture.identity.root_key)
+        .unwrap();
+    fs::write(
+        fixture.identity.root.join("a.js"),
+        "function orchard() {}\nfunction unrelated() {}\nfunction orchardnew() {}\n",
+    )
+    .unwrap();
+    fixture.startup.open();
+    let waiter = build.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    runtime.set_mcp_admitted_gate_for_tests(admitted.hook());
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(1),
+            "trellis_search_symbols",
+            json!({"schemaVersion":1,"query":"orchard","limit":50})
+        )
+    )
+    .unwrap();
+    let waiter = admitted.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    // Past the 3,000ms vector cutoff, inside the 5,000ms request deadline.
+    runtime.advance_mcp_clock_for_tests(Duration::from_millis(3500));
+    let scans = runtime.search_hash_scans_for_tests();
+    admitted.open();
+    let reply = next_reply(&mut reader);
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(
+        envelope["data"]["searchIndex"],
+        json!({
+            "state":"unavailable","modelId":null,"modelName":null,"backend":"cpu",
+            "declarations":3,"embedded":0,"lexical":"complete",
+            "unavailableReason":"vector_budget_exceeded"
+        }),
+        "{reply}"
+    );
+    assert_eq!(envelope["data"]["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["data"]["hits"][0]["matchedBy"], json!(["lexical"]));
+    assert_eq!(
+        runtime.search_hash_scans_for_tests(),
+        scans,
+        "optional hash scan ran past the vector cutoff"
+    );
+    build.open();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&[search_schema_pair(&reply)]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14250,11 +15240,13 @@ async fn mcp_search_residency_lost_before_rank_stays_lexical_at_admitted_pin() {
         envelope["evidenceBasis"],
         SearchMcpFixture::basis(fixture.current)
     );
+    // Nothing is resident and the owner has no work for this head.
     assert_eq!(
         envelope["data"]["searchIndex"],
         json!({
             "state":"unavailable","modelId":null,"modelName":null,"backend":"cpu",
-            "declarations":2,"embedded":0,"lexical":"complete","unavailableReason":null
+            "declarations":2,"embedded":0,"lexical":"complete",
+            "unavailableReason":"matrix_not_resident"
         })
     );
     let hits = envelope["data"]["hits"].as_array().unwrap();
@@ -14333,7 +15325,8 @@ async fn mcp_search_oversized_head_stays_lexical_without_query_embedding() {
             envelope["data"]["searchIndex"],
             json!({
                 "state":"unavailable","modelId":null,"modelName":null,"backend":"cpu",
-                "declarations":2,"embedded":0,"lexical":"complete","unavailableReason":null
+                "declarations":2,"embedded":0,"lexical":"complete",
+                "unavailableReason":"matrix_not_resident"
             })
         );
         let hits = envelope["data"]["hits"].as_array().unwrap();
@@ -14603,10 +15596,12 @@ async fn mcp_search_during_startup_defers_background_head_and_serves_valid_prior
     assert_eq!(envelope["partial"], false);
     assert_eq!(envelope["truncated"], false);
     assert_eq!(envelope["data"]["searchIndex"]["declarations"], 1);
+    // The owner deferred this head until reconciliation finishes; that work
+    // is still pending, so lexical-only search reports building (#777).
     assert_eq!(
         envelope["data"]["searchIndex"],
         json!({
-            "state":"unavailable","modelId":null,"modelName":null,"backend":"cpu",
+            "state":"building","modelId":null,"modelName":null,"backend":"cpu",
             "declarations":1,"embedded":0,"lexical":"complete","unavailableReason":null
         })
     );
@@ -15185,6 +16180,104 @@ async fn call_graph_compact_and_basis_table_through_mcp() {
             json!({"nodes":0,"edges":0})
         );
     }
+    mcp.finish();
+}
+
+/// #778: without semantic evidence every call is a boundary. Calls whose callee name
+/// names a declaration in the admitted snapshot (the Decision 0012 name relation) rank
+/// before the other name-only calls, so constructors and standard-library methods no
+/// longer crowd the project's calls out of `maxCalls`; the cut stays exactly counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_graph_ranks_project_named_calls_first_through_mcp() {
+    let spec = graph_fixtures::Spec::new(&[(
+        "a.rs",
+        "fn run(x: R) -> R {\n    Some(1);\n    x.clone();\n    x.map_err(e);\n    Ok(2);\n    helper();\n    x.into_response();\n    other();\n    Err(3)\n}\nfn helper() {}\nfn other() {}\n",
+    )]);
+    let mut mcp = GraphMcp::start(778, &[spec], Default::default()).await;
+    let spellings = |envelope: &Value| -> Vec<String> {
+        envelope["data"]["result"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| edge["call"]["spelling"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let all = mcp.graph(mcp.args("run", json!({"compact":true})));
+    assert_eq!(
+        spellings(&all),
+        [
+            "helper",
+            "other",
+            "Some",
+            "clone",
+            "map_err",
+            "Ok",
+            "into_response",
+            "Err"
+        ],
+        "{all}"
+    );
+    assert_eq!(all["truncated"], false);
+    for compact in [true, false] {
+        let arguments = mcp.args("run", json!({"compact":compact,"maxCalls":3}));
+        let cut = mcp.graph(arguments.clone());
+        assert_eq!(spellings(&cut), ["helper", "other", "Some"], "{cut}");
+        let result = &cut["data"]["result"];
+        assert_eq!(result["omitted"]["callLimit"], 5, "{cut}");
+        assert_eq!(
+            result["frontier"],
+            json!([{"reason":"callLimit","nodeId":mcp.id_of("run"),"callId":null,
+                "targetId":null,"nextOrdinal":null,"omittedCalls":5}]),
+            "{cut}"
+        );
+        assert_eq!(cut["truncationReason"], "limit");
+        if !compact {
+            assert_eq!(*result, mcp.store_answer(&arguments, None));
+        }
+    }
+    mcp.finish();
+}
+
+/// #778 (owner ruling 2026-11-07): semantic bindings take precedence. The name relation
+/// orders only calls with no selected binding; a bound boundary keeps the third rank even
+/// when its name matches no declaration, so it is never ranked below an unbound call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_graph_name_order_applies_only_to_unbound_calls_through_mcp() {
+    use graph_fixtures::{Bind, bind};
+    use trellis::semantic_evidence::Resolution;
+    let spec = with_bindings(
+        &[(
+            "a.rs",
+            "fn run(x: R) {\n    Some(1);\n    x.mystery();\n    helper();\n}\nfn helper() {}\n",
+        )],
+        vec![Bind {
+            resolution: Resolution::Unresolved,
+            target: None,
+            ..bind("run", 1, "-")
+        }],
+    );
+    let mut mcp = GraphMcp::start(7781, &[spec], Default::default()).await;
+    let producer = json!({"semanticProducerId":graph_fixtures::PRODUCER,"compact":true});
+    let reply = mcp.graph(mcp.args("run", producer));
+    let edges = reply["data"]["result"]["edges"].as_array().unwrap();
+    let order: Vec<(&str, &str)> = edges
+        .iter()
+        .map(|edge| {
+            (
+                edge["call"]["spelling"].as_str().unwrap(),
+                edge["boundaryReason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("mystery", "unresolved"),
+            ("helper", "missingEvidence"),
+            ("Some", "missingEvidence")
+        ],
+        "{reply}"
+    );
     mcp.finish();
 }
 

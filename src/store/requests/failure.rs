@@ -182,6 +182,12 @@ pub(crate) fn classify(
     ("index_failed", INTERNAL_REASON)
 }
 
+/// The reason a `recovery_blocked` row and reply record for the recovery failure that blocked
+/// them (#768): the reason [`classify`] gives it, so paths and error chains stay out.
+pub(crate) fn recovery_blocked_reason(error: &anyhow::Error) -> &'static str {
+    classify(super::RequestKind::Index, error).1
+}
+
 /// The codes a semantic import request may settle with besides `index_failed`.
 const PREFIXED_CODES: [&str; 7] = [
     "invalid_request",

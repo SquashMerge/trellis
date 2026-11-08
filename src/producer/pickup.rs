@@ -606,7 +606,14 @@ impl PickupOwner {
             };
             let options =
                 import::options_for(&written, GenerationOrigin::OwnerPickup, &generation_id)?;
-            let request_id = import::submit(scheduler, &options)?;
+            // The ID is chosen first, so an enqueue error is settled against it (#629).
+            let id = import::new_request_id();
+            let (request_id, unobservable) = match import::submit(store, scheduler, &options, id) {
+                Ok(request_id) => (request_id, None),
+                Err(import::SubmitError::Rejected(error)) => return Err(error),
+                // Possibly accepted: recorded as an accepted request whose wait was lost.
+                Err(import::SubmitError::Unknown(error)) => (id.to_string(), Some(error)),
+            };
             accepted = Some(LastImported {
                 sha256: sha256.clone(),
                 source_revision: revision.clone(),
@@ -615,6 +622,9 @@ impl PickupOwner {
                 error_code: None,
                 attempted_at,
             });
+            if let Some(error) = unobservable {
+                return Err(error);
+            }
             import::test_wait_fault()?;
             let outcome = import::wait(store, scheduler, &options, request_id)?;
             let last = LastImported {

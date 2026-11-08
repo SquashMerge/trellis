@@ -319,9 +319,37 @@ impl GraphSource for SnapshotGraphSource<'_> {
         Ok(history)
     }
 
+    fn names_declaration(&mut self, call: &crate::native_evidence::Call) -> Result<bool> {
+        if let Some(named) = self.facts.named_calls.get(&call.id) {
+            return Ok(*named);
+        }
+        let scope = self.scope(&call.document)?;
+        let owner = id_codec::encode_sid(&call.owner_syntax_id).ok_or_else(|| {
+            SelectedIntegrity("store_unavailable: invalid graph call owner identity".into())
+        })?;
+        // The call's stored callee key, then a declaration with that key in a document of
+        // the call's language in the admitted revision: the incoming-calls name relation.
+        let named: bool = self
+            .db
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM native_version_calls c CROSS JOIN native_version_declarations n CROSS JOIN revision_documents m WHERE c.vid=?2 AND c.owner_syntax_id=?3 AND c.ordinal=?4 AND n.lookup_key=c.callee_lookup_key AND m.vid=n.vid AND m.revision_id=?1 AND m.language=c.language)",
+            )?
+            .query_row(
+                params![
+                    self.selected.key,
+                    scope.vid,
+                    owner,
+                    i64::try_from(call.ordinal)?
+                ],
+                |row| row.get(0),
+            )?;
+        self.facts.named_calls.insert(call.id.clone(), named);
+        Ok(named)
+    }
+
     fn check(&mut self) -> Result<()> {
         #[cfg(feature = "test-support")]
-        crate::mcp::phase_hook("call_graph_node")?;
+        crate::testing::phase_hook("call_graph_node")?;
         (self.check)()
     }
 

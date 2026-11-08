@@ -646,17 +646,25 @@ impl Run<'_> {
         let options = import::options_for(&written, GenerationOrigin::TrellisRun, &run_id)?;
 
         // Enqueue under the control lock: a cancel either lands before it and
-        // wins, or finds the request ID and is refused.
-        let id = {
+        // wins, or finds the request ID and is refused. The ID is chosen first, so an
+        // enqueue error is settled against it before the lock is released (#629).
+        let (id, unobservable) = {
             let mut control = self.active.control();
             if self.active.cancel.load(Ordering::SeqCst) {
                 drop(control);
                 return Ok(self.cancel_finish(Some(&diagnostics)));
             }
-            let id = import::submit(self.ctx.scheduler, &options)?;
+            let id = import::new_request_id();
+            let (id, unobservable) = match import::submit(store, self.ctx.scheduler, &options, id) {
+                Ok(id) => (id, None),
+                Err(import::SubmitError::Rejected(error)) => return Err(error),
+                // Possibly accepted: the run keeps the ID as an accepted request it can no
+                // longer observe, so its inputs stay until the queue no longer names them.
+                Err(import::SubmitError::Unknown(error)) => (id.to_string(), Some(error)),
+            };
             control.phase = RunState::Importing;
             control.request_id = Some(id.clone());
-            id
+            (id, unobservable)
         };
         // The request is accepted: from here the run only observes it. A record that
         // cannot be written leaves `writingBatch` behind, and the final record corrects it.
@@ -666,6 +674,9 @@ impl Run<'_> {
                 record.request_id = Some(id.clone());
             })
         });
+        if let Some(error) = unobservable {
+            return Err(error);
+        }
         test_hook("TRELLIS_TEST_PRODUCER_ENQUEUED_SOCKET");
         test_fault("TRELLIS_TEST_PRODUCER_FAIL_WAIT")?;
         let imported = import::wait(store, self.ctx.scheduler, &options, id)?;

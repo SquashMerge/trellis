@@ -787,11 +787,39 @@
               "enum": [
                 null,
                 "model_not_configured",
-                "model_load_failed"
+                "model_load_failed",
+                "matrix_not_resident"
               ]
             },
             "configuration": {
               "$ref": "#/$defs/SearchConfiguration"
+            },
+            "state": {
+              "enum": [
+                "complete",
+                "building",
+                "partial",
+                "unavailable"
+              ]
+            },
+            "declarations": {
+              "$ref": "#/$defs/UInt"
+            },
+            "embedded": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cacheDiagnostic": {
+              "enum": [
+                "vector_cache_unavailable",
+                "vector_cache_busy"
+              ]
             }
           },
           "required": [
@@ -982,7 +1010,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 11
+                  "const": 14
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1126,6 +1154,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "limit": {
@@ -2570,6 +2599,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "limit": {
@@ -3788,7 +3818,9 @@
                 null,
                 "vector_budget_exceeded",
                 "model_not_configured",
-                "model_load_failed"
+                "model_load_failed",
+                "model_not_ready",
+                "matrix_not_resident"
               ]
             }
           },
@@ -4164,6 +4196,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "schemaVersion": {
@@ -5905,6 +5938,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "limit": {
@@ -8063,6 +8097,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "limit": {
@@ -10204,6 +10239,7 @@
           "type": "integer"
         },
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "expectedContentHash": {
@@ -10744,67 +10780,6 @@
               "type": "integer"
             }
           ]
-        },
-        "SemanticProjection": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "currentPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "semanticBasisPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "basisNativeRevisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "semanticStatus": {
-              "enum": [
-                "olderBasis",
-                "catchingUp",
-                "needsReimport"
-              ]
-            }
-          },
-          "required": [
-            "currentPin",
-            "semanticBasisPin",
-            "basisNativeRevisionId",
-            "semanticStatus"
-          ]
-        },
-        "DocumentSemanticStatus": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "type": "string",
-              "minLength": 1
-            },
-            "projection": {
-              "$ref": "#/$defs/SemanticProjection"
-            }
-          },
-          "required": [
-            "producerId",
-            "language",
-            "path",
-            "projection"
-          ]
-        },
-        "Language": {
-          "enum": [
-            "java",
-            "rust",
-            "python",
-            "javascript"
-          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -10972,6 +10947,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "schemaVersion": {
@@ -13672,7 +13648,7 @@
       ],
       "type": "object"
     },
-    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Defaults: depth 2, maxNodes 8, maxCalls 10 with full proofs; `compact:true` keeps node and stable lookup keys, names, paths, edge kinds and resolutions, drops bindings, coverage and provenance, and defaults to maxNodes 50, maxCalls 60. Each distinct semantic basis appears once in `semanticBases`; `responseOmitted` counts nodes and edges cut to fit the response. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead."
+    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Defaults: depth 2, maxNodes 8, maxCalls 10 with full proofs; `compact:true` keeps node and stable lookup keys, names, paths, edge kinds and resolutions, drops bindings, coverage and provenance, and defaults to maxNodes 50, maxCalls 60. Each distinct semantic basis appears once in `semanticBases`; `responseOmitted` counts nodes and edges cut to fit the response. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead. Unexpanded calls whose callee is named like a project declaration rank before other names (`Some`, `clone`); `omitted.callLimit` counts the cut."
   },
   {
     "annotations": {
@@ -13693,6 +13669,7 @@
           "maxLength": 4096
         },
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "paths": {
@@ -16485,6 +16462,7 @@
           "maxLength": 4096
         },
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "paths": {
@@ -18060,6 +18038,48 @@
             "omittedEvidence": {
               "$ref": "#/$defs/UInt"
             },
+            "nextCall": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "tool": {
+                  "const": "trellis_rules_explain"
+                },
+                "arguments": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "schemaVersion": {
+                      "const": 1
+                    },
+                    "rule": {
+                      "$ref": "#/$defs/Text"
+                    },
+                    "target": {
+                      "$ref": "#/$defs/Identity"
+                    },
+                    "destination": {
+                      "$ref": "#/$defs/Destination"
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 50
+                    }
+                  },
+                  "required": [
+                    "schemaVersion",
+                    "rule",
+                    "target",
+                    "limit"
+                  ]
+                }
+              },
+              "required": [
+                "tool",
+                "arguments"
+              ]
+            },
             "projection": {
               "anyOf": [
                 {
@@ -19411,6 +19431,7 @@
           "maxLength": 4096
         },
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "rule": {
@@ -19419,9 +19440,11 @@
           "maxLength": 256
         },
         "target": {
+          "type": "object",
           "$ref": "#/$defs/Identity"
         },
         "destination": {
+          "type": "object",
           "$ref": "#/$defs/Destination"
         },
         "limit": {
@@ -19701,11 +19724,14 @@
           ]
         },
         "Destination": {
+          "type": "object",
           "oneOf": [
             {
+              "type": "object",
               "$ref": "#/$defs/Identity"
             },
             {
+              "type": "object",
               "$ref": "#/$defs/ExternalIdentity"
             }
           ]

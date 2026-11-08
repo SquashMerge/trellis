@@ -450,6 +450,12 @@ pub trait GraphSource {
             .ok_or_else(|| integrity("target declaration missing from document"))
     }
     fn history(&mut self, key: &DocumentKey, syntax_id: &str) -> Result<Option<Arc<HistoryFacts>>>;
+    /// Whether `call`'s measured callee lookup key names a declaration of the call's language
+    /// in the admitted snapshot: the Decision 0012 name relation, read in the other
+    /// direction (#778). It only orders unbound boundaries; it never targets, expands or filters.
+    fn names_declaration(&mut self, _call: &native::Call) -> Result<bool> {
+        Ok(false)
+    }
     /// Called once per expanded node; an error aborts without a result.
     fn check(&mut self) -> Result<()>;
     /// Deadline and cancellation check during local scanning, without a node-phase hook.
@@ -475,6 +481,9 @@ pub struct GraphFacts {
     pub history: BTreeMap<(DocumentKey, String), Option<Arc<HistoryFacts>>>,
     /// `None` is an eligible older-basis endpoint; otherwise the boundary it imposes.
     pub projection_endpoints: BTreeMap<(String, DocumentKey, String), Option<BoundaryReason>>,
+    /// Each ranked boundary call's [`GraphSource::names_declaration`], by call ID (#778).
+    /// In complete mode an absent call names nothing.
+    pub named_calls: BTreeMap<String, bool>,
 }
 
 impl GraphFacts {
@@ -488,6 +497,7 @@ impl GraphFacts {
             documents: BTreeMap::new(),
             history: BTreeMap::new(),
             projection_endpoints: BTreeMap::new(),
+            named_calls: BTreeMap::new(),
         }
     }
 
@@ -568,6 +578,14 @@ impl GraphSource for &GraphFacts {
         }
     }
 
+    fn names_declaration(&mut self, call: &native::Call) -> Result<bool> {
+        match self.named_calls.get(&call.id) {
+            Some(named) => Ok(*named),
+            None if self.memo => Err(anyhow!(FACTS_MISS)),
+            None => Ok(false),
+        }
+    }
+
     fn check(&mut self) -> Result<()> {
         Ok(())
     }
@@ -599,6 +617,9 @@ impl GraphSource for GraphFacts {
     }
     fn history(&mut self, key: &DocumentKey, id: &str) -> Result<Option<Arc<HistoryFacts>>> {
         (&*self).history(key, id)
+    }
+    fn names_declaration(&mut self, call: &native::Call) -> Result<bool> {
+        (&*self).names_declaration(call)
     }
     fn check(&mut self) -> Result<()> {
         Ok(())
@@ -1055,12 +1076,19 @@ pub fn evaluate(
                     existing.edge.call_site_count += 1;
                     continue;
                 }
+                // #778 (owner-ratified 2026-11-07): semantic bindings take precedence, so a
+                // bound boundary keeps the third rank. Only an unbound call is ordered by
+                // name: one whose callee names a declaration in the snapshot (likely the
+                // project's own) ranks before those that name none (constructors,
+                // standard-library methods).
                 let rank = if reason == BoundaryReason::None {
                     0
                 } else if external {
                     1
-                } else {
+                } else if selected.is_some() || source.names_declaration(call)? {
                     2
+                } else {
+                    3
                 };
                 pending.push(Candidate {
                     rank,
