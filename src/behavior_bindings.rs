@@ -205,6 +205,13 @@ impl Bindings {
                         out.add(name, scope(n.parent().unwrap_or(tree), false), None, source);
                     }
                 }
+                // `declare function f(): T;` and overload signatures bind `f` like a
+                // function declaration in its lexical scope.
+                "function_signature" => {
+                    if let Some(name) = n.child_by_field_name("name") {
+                        out.add(name, scope(n.parent().unwrap_or(tree), false), None, source);
+                    }
+                }
                 // `import x = require("m")` and `import x = N.B`.
                 "import_require_clause" | "import_alias" => {
                     if let Some(name) = n.named_child(0).filter(|x| x.kind() == "identifier") {

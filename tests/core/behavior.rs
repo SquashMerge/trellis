@@ -605,6 +605,8 @@ fn typescript_value_declarations_shadow_standard_globals_and_types_do_not() {
         "namespace Math.Inner { export const x = 1; }\nfunction run() { return Math.abs(-1); }",
         "import Math = require(\"m\");\nfunction run() { return Math.abs(-1); }",
         "import Math = Other.Math;\nfunction run() { return Math.abs(-1); }",
+        "declare const Math: { abs(n: number): number };\nfunction run() { return Math.abs(-1); }",
+        "declare namespace Math { function abs(n: number): number; }\nfunction run() { return Math.abs(-1); }",
     ] {
         let (_, view) = fixture_at("fixture.ts", source, "run");
         assert_ne!(
@@ -612,6 +614,14 @@ fn typescript_value_declarations_shadow_standard_globals_and_types_do_not() {
             "builtin",
             "{source}"
         );
+    }
+    // Ambient and overload function signatures bind their name like a declaration.
+    for source in [
+        "declare function Math(): number;\nexport function run() { return Math(); }",
+        "export function run() { return Math(); }\nfunction Math(): number;\nfunction Math(): number { return 1; }",
+    ] {
+        let (_, view) = fixture_at("fixture.ts", source, "run");
+        assert_ne!(participant_for(&view, "Math").kind, "builtin", "{source}");
     }
     for source in [
         "interface Math { x: number }\nfunction run() { return Math.abs(-1); }",
