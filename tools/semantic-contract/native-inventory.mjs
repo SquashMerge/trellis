@@ -16,7 +16,10 @@ const INVENTORIES = new Map([
   // Conformance producer used by the example fixture and the toolkit tests. Like the Rust
   // native producer (`EXTRACTION_INPUTS` in src/native_evidence.rs), it measures a document
   // from only its own bytes, path and language, so every language declares `[]`.
-  ["native\u00001", { java: [], rust: [], python: [], javascript: [] }],
+  [
+    "native\u00001",
+    { java: [], rust: [], python: [], javascript: [], typescript: [] },
+  ],
   // Conformance-only producer version that reads its config capture, used to exercise a
   // legitimate inventory change (a new version) and the omitted-input rejection.
   [

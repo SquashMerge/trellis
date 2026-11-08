@@ -13,6 +13,18 @@ const cmp = (a, b) => Buffer.compare(bytes(a), bytes(b));
 const contains = (outer, inner) =>
   outer.start <= inner.start && inner.end <= outer.end;
 const strict = (outer, inner) => contains(outer, inner) && !equal(outer, inner);
+// Contract-v1 `Call.ownerSyntaxId`: only these declaration kinds own calls and
+// control regions (owner ruling 2026-11-08, #801; production native_evidence.rs).
+const EXECUTABLE_CONTAINERS = new Set([
+  "module",
+  "namespace",
+  "type",
+  "implementation",
+  "function",
+  "method",
+  "constructor",
+  "anonymousFunction",
+]);
 const snapshot = (row) =>
   hex([row.document.sourceSetId, row.revisionId, row.document.path]);
 function reject(assertion, field, reason, code = "invalidRecord") {
@@ -560,16 +572,13 @@ export function checkMeasurement(
       if (!contains(ownerRange, range))
         reject("MEASUREMENT.OWNER", "range", "occurrence outside owner");
       if (kind === "call" || kind === "control") {
-        if (
-          owner.kind !== "module" &&
-          !["function", "method", "constructor", "anonymousFunction"].includes(
-            owner.kind,
-          )
-        )
+        // Owner ruling 2026-11-08 (#801): the innermost executable container owns
+        // a call or control region, as in production.
+        if (!EXECUTABLE_CONTAINERS.has(owner.kind))
           reject(
             "MEASUREMENT.OWNER",
             "ownerRef",
-            "call/control requires callable or module owner",
+            "call/control requires executable container owner",
           );
         for (const inner of decls)
           if (
@@ -577,14 +586,12 @@ export function checkMeasurement(
             snapshot(inner) === snapshot(row) &&
             strict(ownerRange, position.get(inner.ref).range) &&
             contains(position.get(inner.ref).range, range) &&
-            ["function", "method", "constructor", "anonymousFunction"].includes(
-              inner.kind,
-            )
+            EXECUTABLE_CONTAINERS.has(inner.kind)
           )
             reject(
               "MEASUREMENT.OWNER",
               "ownerRef",
-              "nested callable owns occurrence",
+              "nested executable container owns occurrence",
             );
       }
       const dup = hex([row.revisionId, ids.get(owner.ref).id, kind, range]);
