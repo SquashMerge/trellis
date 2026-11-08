@@ -472,7 +472,7 @@ test("four measured language DTOs project to one lane, ordered source notes and 
   for (const language of ["javascript", "rust", "java", "python"]) {
     const view = peleFixture(language);
     const result = adapter.project(view);
-    assert.match(result.source, /^sequenceDiagram\nparticipant S as /);
+    assert.match(result.source, /^%%\{init: [^\n]*\}%%\nsequenceDiagram\nparticipant S as /);
     assert.equal((result.source.match(/^participant /gm) || []).length, 1);
     assert.equal((result.source.match(/^Note right of S:/gm) || []).length, result.rows.length);
     assert.doesNotMatch(result.source, /S\s*[-=]+>/);
@@ -817,7 +817,7 @@ test("resolved projection maps original occurrences and participants, not call s
   const result = adapter.project(view);
   assert.equal(result.lanes.length,2);
   assert.equal(result.lanes[1].targets.get(target.id).participant.declaration,target);
-  assert.match(result.source,/participant P1 as actual_target/);
+  assert.match(result.source,/participant P1 as actual_<br\/>target\n/);
   assert.equal(result.rows[1].step,call);
   assert.equal(result.rows[2].step,repeat);
   assert.equal(result.rows[1].statementId,"i3");
@@ -1063,4 +1063,48 @@ test("Interactions cap arrows after filtering internal steps and count the omitt
   assert.equal(capped.visible.has(dense.steps[203]), false);
   assert.equal(capped.omittedInteractions, 5);
   assert.equal(capped.hiddenSteps, 3, "omitted arrows are not internal steps");
+});
+
+// #716: a type `Session` and a module `session` never look alike, and a long lane name wraps
+// between words instead of being clipped.
+function namedColumns() {
+  const {view, call, target} = resolvedSequence();
+  const lane = (id, name, column) => {
+    view.participants.push({id, label:name, kind:"internal", declaration:{...target, id, name}, column});
+    return {...call, id:`call-${id}`, callId:`occurrence-${id}`, target:id};
+  };
+  view.steps = [
+    lane("type", "open", {id:"type:Session", label:"Session"}),
+    lane("module", "open", {id:"module:src/mcp/session.rs:session", label:"session"}),
+    lane("class", "run", {id:"python:source:class:0123", label:"SemanticEvidenceProjection"}),
+  ];
+  return view;
+}
+test("#716: each Pele lane says whether it is a type, a module or a class, and wraps a long name", () => {
+  const result = peleProjector().project(namedColumns());
+  assert.deepEqual(Array.from(result.lanes, lane => Array.from(lane.lines)), [["run"], ["«type»", "Session"], ["«module»", "session"], ["«class»", "Semantic", "Evidence", "Projection"]],
+    "a lane without a column has no kind; a name breaks only between words");
+  assert.match(result.source, /^participant P1 as #171;type#187;<br\/>Session$/m);
+  assert.match(result.source, /^participant P2 as #171;module#187;<br\/>session$/m);
+  assert.match(result.source, /^participant P3 as #171;class#187;<br\/>Semantic<br\/>Evidence<br\/>Projection$/m);
+});
+test("#716: a lane name breaks after a separator or before a capital, never inside a word", () => {
+  const window = {};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{}});
+  const lines = name => Array.from(window.TrellisSequence.laneHeader(undefined, name));
+  assert.deepEqual(lines("behavior_columns"), ["behavior_", "columns"]);
+  assert.deepEqual(lines("graph_read::tests"), ["graph_", "read::", "tests"]);
+  assert.deepEqual(lines("fmt::Error"), ["fmt::Error"], "a short name stays on one line");
+  assert.deepEqual(lines("sequence-pele.js"), ["sequence-", "pele.js"]);
+  assert.deepEqual(lines("averyveryverylongunbrokenname"), ["averyveryverylongunbrokenname"], "a word is never cut");
+});
+test("#716: the legacy renderer shows the same kinds and never clips a lane name", () => {
+  const window = {};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{createElementNS:(_, tag) => new Element(tag)}});
+  const container = new Element("div");
+  window.TrellisSequence.render(container, namedColumns(), () => {});
+  const all = node => [node, ...node.children.flatMap(all)];
+  const headers = all(container).filter(node => node.attrs.class === "sequence-participant-label")
+    .map(node => node.children.filter(child => child.tag === "tspan").map(child => child.textContent).join(" ") || node.textContent);
+  assert.deepEqual(headers, ["run", "«type» Session", "«module» session", "«class» SemanticEvidence Projection"]);
 });

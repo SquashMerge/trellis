@@ -71,6 +71,11 @@ async function render(view, options = {}, id = "sequence-diagram") {
     return {status:result.status, reason:result.reason};
   }, {view, options, id});
 }
+// Each lane's header, its lines joined by a space (#716): the kind, then the wrapped name.
+const headers = selector => page.locator(selector).evaluateAll(nodes => nodes.map(node => {
+  const lines = [...node.querySelectorAll("tspan")].map(line => line.textContent);
+  return lines.length ? lines.join(" ") : node.matches(".pele-actor") ? node.textContent : node.firstChild.textContent;
+}));
 const geometry = id => page.evaluate(id => {
   const box = document.getElementById(id), svg = box.querySelector("svg"), view = svg.viewBox.baseVal;
   const scale = svg.getScreenCTM().a;
@@ -82,8 +87,8 @@ test("a coordinate-shaped diagram draws one lane per type with the method on eac
   const view = coordinateView();
   const result = await render(view);
   assert.equal(result.status, "rendered", result.reason);
-  const actors = await page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").allTextContents();
-  assert.deepEqual([...actors].sort(), ["Coordinator", "Type0", "Type1", "Type2", "Type3", "Type4", "Type5", "Type6"]);
+  const actors = await headers("#sequence-diagram .pele-actor:not(.pele-actor-footer)");
+  assert.deepEqual([...actors].sort(), ["«type» Coordinator", "«type» Type0", "«type» Type1", "«type» Type2", "«type» Type3", "«type» Type4", "«type» Type5", "«type» Type6"]);
   const call = view.steps.find(step => step.kind === "call"), target = view.participants.find(p => p.id === call.target);
   const label = page.locator(`#sequence-diagram .pele-edge-label[data-trellis-step-id="${call.id}"]`);
   assert.equal(await label.textContent(), `[001] ${target.declaration.name}`);
@@ -148,9 +153,9 @@ test("the legacy renderer draws the same columns", async () => {
     const box = document.getElementById("sequence-diagram");
     TrellisSequence.render(box, view, null, new Set(), {});
     const ends = [...box.querySelectorAll(".sequence-arrow[data-trellis-target-id]")].map(arrow => [arrow.getAttribute("data-trellis-target-id"), arrow.getAttribute("d")]);
-    return {labels:[...box.querySelectorAll(".sequence-participant-label")].map(node => node.firstChild.textContent), ends};
+    return {ends};
   }, view);
-  assert.deepEqual(positions.labels, ["Coordinator", "Type0", "Type1"]);
+  assert.deepEqual(await headers("#sequence-diagram .sequence-participant-label"), ["«type» Coordinator", "«type» Type0", "«type» Type1"]);
   const end = id => positions.ends.find(([target]) => target === id)[1];
   const x = id => end(id).match(/H (\d+)/)[1];
   assert.equal(x("exact:0:0"), x("exact:0:2"), "two methods of one type end on one lifeline");
@@ -196,6 +201,26 @@ test("both renderers cap a long name, and a collapsed chain's arrow names its en
   for (const text of texts) assert.ok(text.length <= 72, `${text.length}: ${text}`);
   assert.match(texts[0], /^\[001\] a_declaration_name_.*… · may return early$/);
   assert.match(texts[1], /^\[002\] a_declaration_name_.*… \+1 calls collapsed \(entry preview\)$/);
+});
+
+// #716: the dogfood diagram had 17 columns, among them type `Session` and module `session`,
+// and was 2,892 px wide.
+test("a wide diagram's lanes say what they are, wrap long names and sit closer, at full size", async () => {
+  const names = ["Session", "session", "RequestQueue", "SequenceView", "FrameWindow", "Watcher", "fs_util", "SemanticEvidenceProjection",
+    "IndexPin", "behavior_columns", "Inbox", "DaemonClient", "Store", "OpenedWorkspace", "tools", "graph_read"];
+  const view = coordinateView({types:names.length, methods:2, steps:60});
+  for (const participant of view.participants.slice(1)) {
+    const name = names[Number(participant.id.split(":")[1])];
+    participant.column = {id:/^[a-z]/.test(name) ? `module:src/${name}.rs:${name}` : `type:${name}`, label:name};
+  }
+  assert.equal((await render(view)).status, "rendered");
+  const shown = await headers("#sequence-diagram .pele-actor:not(.pele-actor-footer)");
+  assert.ok(shown.includes("«type» Session") && shown.includes("«module» session"), "a type and a module of one name are told apart by a word");
+  assert.ok(shown.includes("«type» Semantic Evidence Projection") && shown.includes("«module» behavior_ columns"), "long names wrap between words, whole");
+  const open = await geometry("sequence-diagram");
+  // Before #716 this diagram drew 3,080 units wide; wrapped headers and closer lanes take it to 2,341.
+  assert.ok(open.viewWidth < 2500, `width ${open.viewWidth}`);
+  assert.ok(Math.abs(open.scale - 1) < 0.001 && open.smallest >= 12, `still drawn at its own size: ${JSON.stringify(open)}`);
 });
 
 test("a large diagram opens at readable size and the panel scrolls", async () => {

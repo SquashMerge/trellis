@@ -3,6 +3,7 @@
 (() => {
   const ROOT_STYLE = "max-width:100%;height:auto;--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg);--_r:var(--pele-radius,4px);--_hw:var(--pele-heading-weight,bold);--_fm:var(--pele-font-mono,monospace);font:16px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)";
   const SVG_NS = "http://www.w3.org/2000/svg";
+  const LAYOUT = '%%{init: {"sequence": {"actorMargin": 12}}}%%';
   const kinds = new Set(["call", "group", "branch", "loop", "try", "effect", "return", "throw", "exit", "await", "note", "boundary", "definition"]);
   const tags = new Set(["svg", "g", "path", "rect", "text", "tspan"]);
   const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "fill-opacity", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "stroke-dasharray", "stroke-linecap", "xml:space"]);
@@ -28,7 +29,9 @@
     // One lane per type or module (#558); its targets are the exact methods drawn in it.
     const columnOf = participant => window.TrellisSequence.column(participant);
     const seed = view.participants.find(p => p.id === view.seed.id);
-    const lanes = [{alias:"S", id:columnOf(seed).id ?? view.seed.id, label:seed?.column ? columnOf(seed).label : view.seed.name || view.seed.id, targets:new Map([[view.seed.id, {participant:seed, proof:null}]])}];
+    // A lane's header says what kind of column it is and wraps a long name (#716).
+    const laneHeader = (participant, label) => ({label, lines:window.TrellisSequence.laneHeader(participant, label)});
+    const lanes = [{alias:"S", id:columnOf(seed).id ?? view.seed.id, ...laneHeader(seed, seed?.column ? columnOf(seed).label : view.seed.name || view.seed.id), targets:new Map([[view.seed.id, {participant:seed, proof:null}]])}];
     // Each statement's meta, if any, receives its Pele statement ID: a row or a return.
     const lines = ["sequenceDiagram", `Note over S: ${intro}`], metas = [null, null];
     const emit = (line, meta = null) => { lines.push(line); metas.push(meta); };
@@ -40,7 +43,7 @@
       let lane = lanes.find(item => item.id === column.id);
       if (!lane) {
         if (lanes.length >= 20) unsupported("Too many sequence participants");
-        lane = {alias:`P${lanes.length}`, id:column.id, label:target.column ? column.label : target.declaration.name || target.label, targets:new Map()}; lanes.push(lane);
+        lane = {alias:`P${lanes.length}`, id:column.id, ...laneHeader(target, target.column ? column.label : target.declaration.name || target.label), targets:new Map()}; lanes.push(lane);
       }
       const member = lane.targets.get(target.id);
       if (member) member.proof ||= proof; else lane.targets.set(target.id, {participant:target, proof});
@@ -169,8 +172,11 @@
       if (Array.isArray(step?.alternate)) pending.push(...step.alternate);
     }
     visit(view.steps, 0);
-    const participants = lanes.map(lane => `participant ${lane.alias} as ${encode(lane.label)}`);
-    const source = [lines[0], ...participants, ...lines.slice(1)].join("\n") + "\n";
+    // Each header line is encoded on its own; only the app's line break stays literal.
+    const participants = lanes.map(lane => `participant ${lane.alias} as ${lane.lines.map(encode).join("<br/>")}`);
+    // Lanes sit closer than Pele's default 40 units apart (#716): with wrapped headers a wide
+    // diagram needs less sideways scrolling, and arrow labels still widen a gap they need.
+    const source = [LAYOUT, lines[0], ...participants, ...lines.slice(1)].join("\n") + "\n";
     if (new TextEncoder().encode(source).length > 512 * 1024) unsupported("Mermaid source too large");
     // Participants do not consume Pele statement IDs. Every note, message, activation,
     // operator, separator and end does, including statements without a row.
@@ -231,9 +237,11 @@
     if (activations.length !== projection.activations) unsupported("Changed Pele activations");
     const actors = [...root.querySelectorAll(".pele-actor")], lifelines = [...root.querySelectorAll(".pele-lifeline")];
     if (actors.length !== projection.lanes.length * 2 || lifelines.length !== projection.lanes.length) unsupported("Changed Pele participants");
+    // A one-line header is a bare text; a wrapped one has a tspan per line.
+    const headerLines = actor => { const spans = [...actor.querySelectorAll("tspan")].map(n => n.textContent); return spans.length ? spans : [actor.textContent]; };
     for (const lane of projection.lanes) {
       const members = actors.filter(actor => actor.getAttribute("data-id") === lane.alias);
-      if (members.length !== 2 || members.some(actor => actor.textContent !== lane.label) ||
+      if (members.length !== 2 || members.some(actor => headerLines(actor).join("\n") !== lane.lines.join("\n")) ||
           lifelines.filter(line => line.getAttribute("data-id") === lane.alias).length !== 1) unsupported("Changed Pele participant identity or text");
     }
     const observed = [...root.querySelectorAll(".pele-frame")].map(n => n.classList.contains("pele-frame-alt") ? "alt" : n.classList.contains("pele-frame-opt") ? "opt" : n.classList.contains("pele-frame-loop") ? "loop" : "unknown");
