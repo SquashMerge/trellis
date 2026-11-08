@@ -329,7 +329,7 @@ pub const SCIP_TYPESCRIPT_TSCONFIG: &[u8] =
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Omission {
     pub path: &'static str,
-    pub reason: &'static str,
+    pub reason: String,
 }
 
 /// The row's worktree omissions and additions.
@@ -345,7 +345,7 @@ pub fn rules(row: &Row) -> Rules {
             omit: JAVA_BUILD_FILES
                 .map(|path| Omission {
                     path,
-                    reason: "java build logic is denied in the restricted profile",
+                    reason: "java build logic is denied in the restricted profile".into(),
                 })
                 .to_vec(),
             generated: vec![Generated {
@@ -357,7 +357,8 @@ pub fn rules(row: &Row) -> Rules {
         (Target::Real(ProducerName::ScipPython), TrustProfile::Restricted) => Rules {
             omit: vec![Omission {
                 path: "pyproject.toml",
-                reason: "the only captured file that can configure the interpreter pyright uses",
+                reason: "the only captured file that can configure the interpreter pyright uses"
+                    .into(),
             }],
             generated: vec![Generated {
                 path: "producer-config/environment.json".into(),

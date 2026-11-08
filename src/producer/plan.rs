@@ -4,7 +4,7 @@
 
 use super::detect::{self, Declared, Environment, Resolution};
 use super::exec::Limits;
-use super::profiles::{self, GenerationTable, Row, Stub, Target};
+use super::profiles::{self, GenerationTable, Row, Rules, Stub, Target};
 use super::state::{RunRecord, StateDir};
 use super::worktree::{self, RetainedInputs};
 use super::{PRODUCER_UNAVAILABLE, TrustProfile};
@@ -174,6 +174,8 @@ pub struct Parts<'a> {
     pub declared: &'a Declared,
     pub stub: Option<&'a Stub>,
     pub basis: &'a Basis,
+    /// The row's worktree omissions and additions for this basis.
+    pub rules: &'a Rules,
     pub limits: LimitsRequest,
     /// `<state dir>/runs/{runId}`: the literal placeholder stands for the
     /// run's ID.
@@ -204,8 +206,7 @@ pub fn build(parts: &Parts<'_>) -> Value {
         parts.pin,
         run,
     );
-    let rules = profiles::rules(row);
-    let layout = worktree::layout(&parts.basis.inputs, &rules);
+    let layout = worktree::layout(&parts.basis.inputs, parts.rules);
     let generation: GenerationTable = profiles::run_generation(row, parts.resolution);
     let limits = effective_limits(parts.limits);
     let caches: Vec<Value> = profiles::declared_caches(row, parts.declared)
@@ -328,6 +329,8 @@ pub struct Prepared {
     pub resolution: Resolution,
     pub declared: Declared,
     pub basis: Basis,
+    /// The row's rules, with a root `tsconfig.json` package `extends` resolved (#799).
+    pub rules: Rules,
     pub limits: LimitsRequest,
 }
 
@@ -342,14 +345,17 @@ impl Prepared {
             declared: &self.declared,
             stub,
             basis: &self.basis,
+            rules: &self.rules,
             limits: self.limits,
             run_dir,
         })
     }
 }
 
-/// Resolve and verify the producer and read the retained revision a plan binds to.
-/// Refusals and unavailable producers are typed errors; nothing is created or executed.
+/// Resolve and verify the producer and read the retained revision a plan binds to, and for
+/// scip-typescript the configs a root `tsconfig.json` package `extends` reaches in the
+/// checkout's `node_modules` (#799). Refusals and unavailable producers are typed errors;
+/// nothing is created or executed.
 pub fn prepare(store: &Store, request: &PlanRequest, stub: Option<&Stub>) -> Result<Prepared> {
     let target = Target::parse(&request.producer, stub.is_some())
         .ok_or_else(|| anyhow::anyhow!("invalid_request: unknown producer"))?;
@@ -360,12 +366,17 @@ pub fn prepare(store: &Store, request: &PlanRequest, stub: Option<&Stub>) -> Res
     let baseline = store.index_baseline()?;
     let basis =
         store.with_native_reader(baseline, |reader| read_basis(reader, target.languages()))?;
+    let mut rules = profiles::rules(&row);
+    if target == Target::Real(super::ProducerName::ScipTypescript) {
+        super::tsconfig::apply(&mut rules, &basis.inputs, Path::new(store.workspace_root()))?;
+    }
     Ok(Prepared {
         row,
         pin,
         resolution,
         declared,
         basis,
+        rules,
         limits: request.limits,
     })
 }
