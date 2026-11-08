@@ -38,6 +38,45 @@ Reviewed exceptions retain their underlying verdict and reason. Upward counts ca
 the word **deviation** as well as error color; peer/shared deviations are not called
 upward references. Same-layer sites remain in evidence totals rather than module arrows.
 Unassigned endpoints and unresolved sites remain explicit unknown evidence.
+(#783: a checkout with two or more apps draws one layer stack per app; see
+[Amendment (#783)](#amendment-783-apps-in-the-architecture-view).)
+
+## Amendment (#783): apps in the Architecture view
+
+**Status: owner-ratified 2026-11-07 (#783).** The rules side is
+[rules.md Amendment (#783)](rules.md#amendment-783-apps-and-per-app-layers): app detection,
+the `app` and shared `apps` layer keys, order compared only within an app, and the
+`cross_app` verdict. This section says what the view and its reads must keep true. The
+switcher and the drawing are [#789](https://github.com/SquashMerge/trellis/issues/789) and
+[#790](https://github.com/SquashMerge/trellis/issues/790). The data is
+[#784](https://github.com/SquashMerge/trellis/issues/784).
+
+- **Apps are detected, never guessed or proposed.** The summary lists the detected apps,
+  each with its name, its kind (`cargo` or `npm`), its manifest path, its roots and its
+  entries. It also gives each layer its app: `layers[].app` for an ordered layer, the served
+  apps for a shared layer. #784 fixes the exact fields. The view never draws a layer or an
+  app that `rules.toml` and the manifests don't define. It has no function-level layers:
+  layers stay whole files.
+- **One stack per app.** An app's view draws that app's ordered layers, including its hidden
+  ones, by their own `order`. It also draws the shared layers that serve the app. With zero
+  or one app, the view is the single stack above, unchanged.
+- **An app with no layers yet** lists its files as unassigned, under that app, and shows
+  the `trellis_propose_layers` setup help.
+- **Tooling, test harnesses and fixtures are hidden layers of their app, not apps** (#524).
+  They wait in that app's hidden-layer note and its toggle. There is no app chip for them.
+- **Unassigned files are listed per app,** by the most specific containing app root, plus
+  a "no app" group. They are never dropped. The checkout-wide unassigned count is unchanged.
+- **No cross-app arrows inside a stack.** A reference between layers that share no app is
+  not drawn as a layer arrow or counted as a deviation. It is an `unknown` `$layers`
+  instance with reason `cross_app`, counted with the other unknowns and listed in the review
+  list. Interface edges between apps wait for
+  [#686](https://github.com/SquashMerge/trellis/issues/686).
+- **Counts equal the CLI per app.** A band's counts are sums over that app's `$layers`
+  instances on the same pin and rules hash. A cross-app pair is never a deviation, so the
+  apps' deviation totals cover every deviation in `rules.counts.deviates`. A deviation
+  involving a shared layer counts under each app that the pair's layers have in common.
+- **Exceptions are unchanged:** one file pair, previewed and applied through the existing
+  routes.
 
 ## Module chips and counts (#424)
 

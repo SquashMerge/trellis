@@ -484,6 +484,39 @@ unchanged, as are the CLI and the browser.
   The complete catalog is 31 bytes smaller than at `toolVersion` 12, so it keeps its
   named headroom.
 
+## Amendment (#783): per-app layers in the proposal prompt
+
+**Status: owner-ratified 2026-11-07 (#783).** Following the
+[owner's 2026-11-07 ruling](https://github.com/SquashMerge/trellis/issues/783),
+`trellis_propose_layers` gives per-app context and asks for per-app layers, under
+[rules.md Amendment (#783)](rules.md#amendment-783-apps-and-per-app-layers). Everything in
+[Amendment (#770)](#amendment-770-a-bounded-prompt-reference-view) is unchanged except
+what this section adds.
+
+- **`payload.apps`** lists the detected apps: `{name, kind:"cargo"|"npm", manifest, roots,
+  entries}`, ordered by manifest path. It is untrusted repository data, like the rest of
+  the payload.
+  - The prompt detects apps against the current rules bytes, so a manifest that a hidden
+    layer selects is left out.
+  - Without a rules file, every manifest is listed. Placing tooling and fixture manifests
+    in hidden layers is part of the agent's proposal.
+  - `apps` belongs to the fixed part of the prompt. Like the rules bytes, it is never
+    clipped, and if the fixed part does not fit the prompt fails atomically with
+    `response_too_large`.
+- **Instructions.** The instructions ask the agent to:
+  - propose layers per app. When two or more apps are detected, every ordered layer names
+    its `app`, and a shared layer lists the apps it serves in `apps` (or omits it to serve
+    every app);
+  - number each app's `order` on its own;
+  - put tooling, test harnesses and fixtures in `display = "hidden"` layers of the app they
+    belong to, with fixtures in the app whose tests consume them;
+  - leave references between apps alone. They report `unknown`/`cross_app`, so they are
+    not deviations and need no exception.
+
+  With zero or one app, the instructions are as before.
+- **Unchanged:** the overview table, its budget and order, the tools, the pin and the
+  descriptor. Overview rows stay directory pairs and are not split by app.
+
 ## Amendment (#683): TypeScript language rows
 
 **Status: owner-ratified 2026-11-07 ([Decision 0020](semantic-evidence/decisions/0020-typescript-language.md) item 7).** `Language` gains `typescript` after `javascript`; #22 order is java, rust, python, javascript, typescript. Fixed `LanguageStatus` rows (describe `languages`, incoming `scopeCoverage` and the lookup alternatives other tools return) are five. Find and search keep the #715 result-language rows, so a `typescript` row appears exactly when TypeScript items are emitted, or, with none emitted, when TypeScript has selected native tuples in the searched scope. `Destination.language` accepts `typescript`. npm and Node descriptors serve TypeScript importers, and their identity language is the importer's. `toolVersion` is unchanged.
@@ -962,7 +995,9 @@ bounded summary of [Amendment (#770)](#amendment-770-a-bounded-prompt-reference-
 supplies current exact rules bytes and the separate checkout-config descriptor,
 or explicit absence. Missing rules permits a new proposal; malformed rules fails
 atomically, just as check/explain do. The index pin does not identify current
-configuration bytes. Output asks for explicit integer orders, reviewed peer/shared
+configuration bytes. (#783: the prompt also lists detected apps and asks for
+layers per app; see [Amendment (#783)](#amendment-783-per-app-layers-in-the-proposal-prompt).)
+Output asks for explicit integer orders, reviewed peer/shared
 choices, justified placements, exact positively witnessed baseline exceptions and
 a `rules.toml` diff **for human review**. Ambiguities go to normal chat. Trellis
 never writes the proposal, invokes a provider, runs repository code or requests
