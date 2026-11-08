@@ -325,7 +325,9 @@ pub(crate) fn build_sequence_work(
     show_all: bool,
 ) -> Result<SequenceView> {
     let mut view = match file.language.as_str() {
-        "javascript" => crate::behavior_js::build(revision, seed, file, calls, show_all),
+        "javascript" | "typescript" => {
+            crate::behavior_js::build(revision, seed, file, calls, show_all)
+        }
         "rust" => crate::behavior_rust::build(revision, seed, file, calls, show_all),
         "java" => crate::behavior_java::build(revision, seed, file, calls, show_all),
         "python" => crate::behavior_python::build(revision, seed, file, calls, show_all),

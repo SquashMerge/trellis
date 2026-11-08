@@ -4688,10 +4688,12 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
                     .bytes()
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         })
-        || options
-            .language
-            .as_ref()
-            .is_some_and(|v| !matches!(v.as_str(), "java" | "python" | "javascript" | "rust"))
+        || options.language.as_ref().is_some_and(|v| {
+            !matches!(
+                v.as_str(),
+                "java" | "python" | "javascript" | "typescript" | "rust"
+            )
+        })
     {
         return Err(invalid());
     }

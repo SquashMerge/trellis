@@ -206,7 +206,7 @@ Owner rulings 2026-10-31 (#543). They amend the #522, #536 and #542 sections abo
   - **Assigns a field:** `this.f = v`/`self.f = v`; in Java also `f = v` under the same
     field rule.
 
-  The rule is the same for Java, Rust, Python and JavaScript. The steps evaluating its
+  The rule is the same for Java, Rust, Python, JavaScript and TypeScript. The steps evaluating its
   receiver and arguments are hidden with it, except a call that can expand (by the same
   structural test as the reserve, in the seed and in every expanded body). An unresolved
   `getX()` is never an accessor: the name alone never qualifies.
@@ -214,7 +214,7 @@ Owner rulings 2026-10-31 (#543). They amend the #522, #536 and #542 sections abo
   holds one is not hidden with the call it feeds. Operand subtrees are hidden whole: every
   step they nest is marked and counted.
 - Rust `::log::`/`::tracing::` macro paths and JavaScript optional calls (`console?.log`)
-  match the same rule. Constructors (Java constructors, a JavaScript `constructor`, Python
+  match the same rule. Constructors (Java constructors, a JavaScript or TypeScript `constructor`, Python
   `__init__`) are never accessors, and a setter assigns with plain `=` only.
 
 ### Readable large sequences (#558)
@@ -231,7 +231,7 @@ and #542's "any other guard is unchanged".
     (`impl<A> Tr for A`) is its module's. A self type by a path that does not start at
     `crate`, `self` or `super` may be foreign, so it keeps that path (`fmt::Error`) and
     never joins a local type's column.
-  - JavaScript, Java and Python: the class, else the file (Python: the module).
+  - JavaScript, TypeScript, Java and Python: the class, else the file (Python: the module).
   - A closure or nested function is in the column of whatever encloses it; an anonymous
     class defers outward.
   - A Rust type's `impl` blocks join across files when the snapshot declares at most one
@@ -279,7 +279,7 @@ and #542's "any other guard is unchanged".
   "Show all steps", the same request as Options → Show all steps. A view with no admitted
   measured calls instead says that non-call behavior may be hidden, never that the method has
   no behavior. Any retained unknown/control markers and truncation warning stay visible.
-- **JavaScript source hints.** As in the other adapters, the last syntax lane is reserved:
+- **JavaScript and TypeScript source hints.** As in the other adapters, the last syntax lane is reserved:
   excess hints share the unknown-operations lane and stay measured calls, so a view with
   many hints is neither truncated nor loses its arrows once enrichment resolves them.
 

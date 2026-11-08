@@ -49,7 +49,7 @@ pub struct OutlineItem {
 /// Outline facts read from the parsed cached file, keyed by a declaration's native byte range.
 #[derive(Debug, Default)]
 pub(crate) struct OutlineSyntax {
-    /// Bindings whose initializer is a function: a JavaScript `variable_declarator` whose value
+    /// Bindings whose initializer is a function: a JavaScript or TypeScript `variable_declarator` whose value
     /// is a function or arrow expression, or a Python assignment whose right side is a `lambda`.
     pub callable_initializers: std::collections::BTreeSet<(usize, usize)>,
     /// Rust `impl` blocks and the last path segment of the type each implements.
@@ -67,6 +67,7 @@ pub(crate) fn outline_syntax(
 ) -> Option<OutlineSyntax> {
     let language: tree_sitter::Language = match file.language.as_str() {
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(&file.path),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         _ => return None,
@@ -385,6 +386,7 @@ pub(crate) fn scan_file(
 ) -> Result<bool> {
     let language = match file.language.as_str() {
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(&file.path),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         "java" => tree_sitter_java::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
@@ -565,6 +567,15 @@ mod outline_syntax_tests {
             ["f"]
         );
         assert!(syntax("java", "class A {}").is_none());
+    }
+
+    #[test]
+    fn typescript_bindings_follow_the_javascript_rule() {
+        let typescript = "const anon = function (): number { return 1; };\n\
+             const arrow = <T,>(value: T): T => value;\n\
+             const result = ((): number => 2)();\n\
+             const callback: Fn = wrap(() => 4);\n";
+        assert_eq!(bindings("typescript", typescript), ["anon", "arrow"]);
     }
 
     #[test]

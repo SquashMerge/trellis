@@ -141,6 +141,7 @@ pub(crate) fn trivial_accessors(file: &SourceFile, nodes: &[Symbol]) -> BTreeSet
         "java" => tree_sitter_java::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(&file.path),
         _ => return out,
     };
     let mut parser = tree_sitter::Parser::new();
@@ -218,7 +219,8 @@ fn accessor_body(
     // Object creation is not an accessor, however small its body.
     let name = node.child_by_field_name("name").map(text);
     if node.kind() == "constructor_declaration"
-        || (file.language == "javascript" && name == Some("constructor"))
+        || (matches!(file.language.as_str(), "javascript" | "typescript")
+            && name == Some("constructor"))
         || (file.language == "python" && name == Some("__init__"))
     {
         return false;

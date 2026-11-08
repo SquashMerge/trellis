@@ -4231,3 +4231,47 @@ async fn read_under_index_use_contention(
     drop(replacement);
     Some((indexed, output))
 }
+
+#[test]
+fn metrics_language_filter_accepts_typescript_and_rejects_other_spellings() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("flow.ts"),
+        "function start(x: number) { return x; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("flow.js"), "function start() {}\n").unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    crate::child::assert_cli_success(&indexed, "indexed");
+    let revision = command(&root, &home, "metrics")
+        .arg("--json")
+        .output()
+        .unwrap();
+    crate::child::assert_cli_success(&revision, "revision metrics");
+    let revision: Value = serde_json::from_slice(&revision.stdout).unwrap();
+    let file = revision["payload"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["language"] == "typescript")
+        .unwrap_or_else(|| panic!("no typescript file: {revision}"));
+    let selected = |language: &str| {
+        let mut c = command(&root, &home, "metrics");
+        c.args(["--json", "--scope", "file", "--source-set-id"])
+            .arg(file["sourceSetId"].as_str().unwrap())
+            .args(["--path", file["path"].as_str().unwrap()])
+            .args(["--language", language]);
+        c.output().unwrap()
+    };
+    let accepted = selected("typescript");
+    crate::child::assert_cli_success(&accepted, "typescript metrics");
+    let accepted: Value = serde_json::from_slice(&accepted.stdout).unwrap();
+    assert_eq!(accepted["payload"]["files"][0]["language"], "typescript");
+    let rejected = selected("TypeScript");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("invalid_argument: language"));
+}

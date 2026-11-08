@@ -22,7 +22,7 @@ mod native_navigation_fixture;
 #[command(
     name = "trellis",
     version = trellis::build_info::version(),
-    about = "Local, read-only JavaScript, Rust, Java and Python code index and inspection daemon"
+    about = "Local, read-only Java, Python, JavaScript, TypeScript and Rust code index and inspection daemon"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -1025,7 +1025,7 @@ fn dispatch_cli(command: &Command) -> Result<()> {
             ensure!(
                 options.language.as_deref().is_none_or(|language| matches!(
                     language,
-                    "java" | "python" | "javascript" | "rust"
+                    "java" | "python" | "javascript" | "typescript" | "rust"
                 )),
                 "invalid_argument: language"
             );
@@ -2992,10 +2992,10 @@ fn metrics_options_from_request(
         "invalid_argument: path"
     );
     ensure!(
-        options
-            .language
-            .as_deref()
-            .is_none_or(|language| matches!(language, "java" | "python" | "javascript" | "rust")),
+        options.language.as_deref().is_none_or(|language| matches!(
+            language,
+            "java" | "python" | "javascript" | "typescript" | "rust"
+        )),
         "invalid_argument: language"
     );
     Ok(options)

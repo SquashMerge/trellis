@@ -19,7 +19,7 @@ impl Endpoint {
     fn valid(&self) -> bool {
         matches!(
             self.language.as_str(),
-            "java" | "rust" | "python" | "javascript"
+            "java" | "rust" | "python" | "javascript" | "typescript"
         ) && !self.path.is_empty()
             && crate::file_tree::valid_path(&self.path)
             && !self.path.contains(['*', '?'])
@@ -490,6 +490,19 @@ mod tests {
     const CONFIG: &str = "# keep top\nversion = 1\n[layers.a]\norder = 1\npaths = ['src/a.rs'] # keep paths\n[layers.b]\norder = 2\npaths = ['src/b.rs']\n\n# exception attached\n[[exceptions]]\nrule = '$layers'\ntarget = {language='rust',path='src/a.rs'}\ndestination = {language='rust',path='src/b.rs'}\nreason = 'old' # keep reason\n";
     fn request(operations: Value) -> Request {
         serde_json::from_value(json!({"indexGeneration":"f64aac54-3da7-4a00-8c9b-4ec2efdeff32","indexRevision":1,"baseHash":hash(CONFIG),"operations":operations})).unwrap()
+    }
+    #[test]
+    fn typescript_endpoints_are_valid_and_other_spellings_are_not() {
+        let endpoint = |language: &str| Endpoint {
+            language: language.into(),
+            path: "src/a.ts".into(),
+        };
+        for language in ["java", "rust", "python", "javascript", "typescript"] {
+            assert!(endpoint(language).valid(), "{language}");
+        }
+        for language in ["TypeScript", "ts", "tsx", ""] {
+            assert!(!endpoint(language).valid(), "{language}");
+        }
     }
     #[test]
     fn selected_reason_preserves_unrelated_bytes_and_attached_comments() {
