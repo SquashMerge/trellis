@@ -458,6 +458,23 @@ impl SemanticImportJob {
     }
 }
 
+/// Test-support fault: report an error after a generated import's COMMIT and before its
+/// wake, as a lost COMMIT acknowledgement does (#629).
+#[cfg(all(feature = "test-support", unix))]
+fn generated_after_commit_fault() -> Result<()> {
+    const VARIABLE: &str = "TRELLIS_TEST_PRODUCER_FAIL_AFTER_ENQUEUE_COMMIT";
+    ensure!(
+        std::env::var_os(VARIABLE).is_none(),
+        "storage_busy: injected {VARIABLE}"
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "test-support", unix)))]
+fn generated_after_commit_fault() -> Result<()> {
+    Ok(())
+}
+
 fn lowercase_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1309,8 +1326,8 @@ impl Store {
             &ReconcileOptions::from(options),
             RequestKind::Index,
             expected,
-            after_write_lock,
-            after_insert,
+            Uuid::new_v4(),
+            (after_write_lock, after_insert, || Ok(())),
         )
     }
 
@@ -1337,8 +1354,8 @@ impl Store {
             options,
             RequestKind::SemanticImport,
             None,
-            || {},
-            || {},
+            Uuid::new_v4(),
+            (|| {}, || {}, || Ok(())),
         )
     }
 
@@ -1348,6 +1365,17 @@ impl Store {
         &self,
         root: &Path,
         options: &GeneratedImportOptions,
+    ) -> Result<Request> {
+        self.enqueue_generated_semantic_import_as(root, options, Uuid::new_v4())
+    }
+
+    /// Accept a Trellis-written import as request `id`, chosen by the caller before the
+    /// transaction: an error reported after COMMIT leaves the caller an ID to re-read (#629).
+    pub fn enqueue_generated_semantic_import_as(
+        &self,
+        root: &Path,
+        options: &GeneratedImportOptions,
+        id: Uuid,
     ) -> Result<Request> {
         ensure!(
             options.version == 2
@@ -1363,8 +1391,8 @@ impl Store {
             options,
             RequestKind::SemanticImport,
             None,
-            || {},
-            || {},
+            id,
+            (|| {}, || {}, generated_after_commit_fault),
         )
     }
 
@@ -1406,8 +1434,8 @@ impl Store {
             options,
             RequestKind::SemanticImport,
             None,
-            || {},
-            || {},
+            Uuid::new_v4(),
+            (|| {}, || {}, || Ok(())),
         )
     }
 
@@ -1417,8 +1445,12 @@ impl Store {
         options: &T,
         request_kind: RequestKind,
         expected: Option<IndexPin>,
-        after_write_lock: impl FnOnce(),
-        after_insert: impl FnOnce(),
+        id: Uuid,
+        (after_write_lock, after_insert, after_commit): (
+            impl FnOnce(),
+            impl FnOnce(),
+            impl FnOnce() -> Result<()>,
+        ),
     ) -> Result<Request> {
         // In flight from before the transaction until after the wake.
         let _in_flight = self.enqueue_in_flight();
@@ -1443,7 +1475,7 @@ impl Store {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         after_write_lock();
         self.identity.verify()?;
-        let id = Uuid::new_v4().to_string();
+        let id = id.to_string();
         let submitted_at = now();
         let root_device = self.identity.device.to_string();
         let root_inode = self.identity.inode.to_string();
@@ -1457,6 +1489,7 @@ impl Store {
         tx.commit()?;
         #[cfg(feature = "test-support")]
         self.run_after_enqueue_commit_hook();
+        after_commit()?;
         crate::index_coordinator::diagnostic_marker("-", "request_enqueued", &format!("id={id}"));
         // The row is durable: wake the checkout's worker, which re-reads the queue.
         self.wake_queue_workers();

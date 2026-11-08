@@ -424,6 +424,37 @@ fn lost_wait_reconciles_with_the_accepted_request_instead_of_importing_again() {
     assert_eq!(last(&checkout)["requestId"], accepted);
 }
 
+/// #629: the enqueue's COMMIT lands but its acknowledgement is lost. The pickup settles the
+/// error against the request ID it chose and imports through that one accepted request,
+/// rather than failing, discarding the directory the request reads and importing again.
+#[test]
+fn enqueue_error_after_commit_imports_through_the_accepted_request() {
+    let mut env = fast();
+    env.push((
+        "TRELLIS_TEST_PRODUCER_FAIL_AFTER_ENQUEUE_COMMIT".into(),
+        "unused".into(),
+    ));
+    let checkout = start_checkout(workspace, &env);
+    let (tripwire, _marker) = tripwire_dir(checkout.temp.path());
+    let artifact = checkout.temp.path().join("index.scip");
+    fs::write(&artifact, java_bytes(&checkout, None)).unwrap();
+    let before = request_rows(&checkout).len();
+    let output = set(&checkout, &tripwire, &artifact);
+    crate::child::assert_cli_success_with(
+        &output,
+        "producer pickup set",
+        Some(&checkout.daemon_stderr()),
+    );
+    let done = last(&checkout);
+    assert_eq!(done["state"], "done", "{done}");
+    // Several retry intervals later still one request: the accepted one, never a second.
+    std::thread::sleep(SETTLE);
+    let rows = request_rows(&checkout);
+    assert_eq!(rows.len(), before + 1, "{rows:?}");
+    assert_eq!(rows[before].1, "done", "{rows:?}");
+    assert_eq!(done["requestId"], rows[before].0.as_str());
+}
+
 #[test]
 fn pending_request_past_the_retry_interval_starts_no_second_import() {
     let sockets = Builder::new()
