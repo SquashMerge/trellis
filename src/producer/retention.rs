@@ -62,12 +62,38 @@ pub(crate) fn inputs_present(options: &GeneratedImportOptions) -> Result<bool> {
     }
 }
 
+/// Whether a present retained descriptor still passes check 1 (size, digest, closed grammar,
+/// format and decoder version). Its bytes never change, so a failure is permanent: a
+/// descriptor written before a grammar change (#800 renamed `language`) can never be
+/// admitted again and counts as a missing input (#811). I/O errors stay errors.
+pub(crate) fn descriptor_admissible(
+    options: &GeneratedImportOptions,
+    limits: &crate::semantic_batch::BatchLimits,
+) -> Result<bool> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(&options.descriptor)?
+        .take(limits.descriptor_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok(
+        crate::semantic_batch::descriptor::Descriptor::parse_admitted(
+            &bytes,
+            &options.descriptor_sha256,
+            limits,
+        )
+        .is_ok(),
+    )
+}
+
 pub const FILE: &str = "retention.sqlite";
 const SCHEMA: &str = "CREATE TABLE identity(root_key TEXT NOT NULL); CREATE TABLE retained_runs(producer TEXT PRIMARY KEY,languages TEXT NOT NULL,options TEXT NOT NULL,descriptor_sha256 TEXT NOT NULL,source_revision TEXT NOT NULL,attempted_generation TEXT); CREATE TABLE legacy_languages(language TEXT PRIMARY KEY); PRAGMA user_version=1;";
 
 pub(crate) fn attach(db: &Connection, state: &StateDir, root_key: &str) -> Result<()> {
     attach_inner(db, state, root_key).map_err(|error| {
-        if unavailable_catalog(&error) {
+        // A typed catalog fault already names its area; only SQLite corruption is wrapped.
+        if unavailable_catalog(&error)
+            && !error.to_string().starts_with(super::PRODUCER_STATE_CORRUPT)
+        {
             anyhow::anyhow!(
                 "{}: retention catalog: {error}",
                 super::PRODUCER_STATE_CORRUPT
@@ -150,10 +176,16 @@ fn attach_inner(db: &Connection, state: &StateDir, root_key: &str) -> Result<()>
         );
         let identity: String =
             catalog_query(tx.query_row("SELECT root_key FROM identity", [], |row| row.get(0)))?;
-        ensure!(
-            identity == root_key,
-            "producer_state_corrupt: retention root"
-        );
+        if identity != root_key {
+            // A catalog written before #811 also bound the root's `st_dev`, which APFS does
+            // not keep across reboots: the same record and inode is the same root. Any other
+            // identity is a different root. The catalog is disposable, so its slots are
+            // dropped rather than refused forever; nothing of the other root is admitted.
+            if !same_root_other_device(&identity, root_key) {
+                tx.execute_batch("DELETE FROM retained_runs; DELETE FROM legacy_languages;")?;
+            }
+            tx.execute("UPDATE identity SET root_key=?1", [root_key])?;
+        }
         tx.commit()?;
     }
     db.execute(
@@ -173,6 +205,23 @@ fn attach_inner(db: &Connection, state: &StateDir, root_key: &str) -> Result<()>
     let rows = catalog_query(legacy.query_map([], |row| row.get::<_, String>(0)))?;
     catalog_query(rows.collect::<rusqlite::Result<Vec<_>>>())?;
     Ok(())
+}
+
+/// Whether `stored` is the pre-#811 spelling `{record}:{device}:{inode}` of `key`, which is
+/// `{record}:{inode}`: the same root seen with a different `st_dev`.
+fn same_root_other_device(stored: &str, key: &str) -> bool {
+    let Some((record, inode)) = key.rsplit_once(':') else {
+        return false;
+    };
+    stored
+        .strip_prefix(record)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(device, stored_inode)| {
+            !device.is_empty()
+                && device.bytes().all(|b| b.is_ascii_digit())
+                && stored_inode == inode
+        })
 }
 
 /// Missing state has no hold; unreadable state is an error and cleanup must defer.
@@ -527,6 +576,83 @@ mod tests {
         state.strip_to_record(&id1).unwrap();
         assert!(!state.run_dir(&id1).unwrap().join("batch").exists());
     }
+    fn catalog_identity(state: &StateDir) -> String {
+        Connection::open(state.path().join(FILE))
+            .unwrap()
+            .query_row("SELECT root_key FROM identity", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn set_catalog_identity(state: &StateDir, identity: &str) {
+        Connection::open(state.path().join(FILE))
+            .unwrap()
+            .execute("UPDATE identity SET root_key=?1", [identity])
+            .unwrap();
+    }
+
+    /// #811: APFS renumbers `st_dev` across reboots. A pre-#811 catalog bound to the same
+    /// record and inode under another device is the same root: adopted, slots kept.
+    #[test]
+    fn catalog_bound_to_another_device_is_adopted_with_its_slots() {
+        let (temp, state, record) = world();
+        let key = format!("{record}:1110064");
+        let id = "1".repeat(32);
+        state.create_run_dir(&id).unwrap();
+        let db = Connection::open(temp.path().join("index.db")).unwrap();
+        attach(&db, &state, &key).unwrap();
+        insert(&db, &state, &id);
+        drop(db);
+        set_catalog_identity(&state, &format!("{record}:16777234:1110064"));
+        let db = Connection::open(temp.path().join("index.db")).unwrap();
+        attach(&db, &state, &key).unwrap();
+        assert_eq!(slots(&db).unwrap().len(), 1, "same root keeps its slot");
+        drop(db);
+        assert_eq!(catalog_identity(&state), key, "identity rewritten");
+        assert_eq!(
+            held_dirs(&state).unwrap(),
+            BTreeSet::from([state.run_dir(&id).unwrap()])
+        );
+    }
+
+    /// Any other identity is a different root at this path. The disposable catalog is reset,
+    /// not refused forever, and none of the other root's slots survive.
+    #[test]
+    fn catalog_bound_to_a_different_root_is_reset() {
+        for other in [
+            "other-record:1110064".to_owned(),
+            "other-record:16777234:1110064".to_owned(),
+            "{record}:16777234:999".to_owned(),
+            "{record}:999".to_owned(),
+            "{record}:x:1110064".to_owned(),
+        ] {
+            let (temp, state, record) = world();
+            let other = other.replace("{record}", &record);
+            let key = format!("{record}:1110064");
+            let id = "1".repeat(32);
+            state.create_run_dir(&id).unwrap();
+            let db = Connection::open(temp.path().join("index.db")).unwrap();
+            attach(&db, &state, &key).unwrap();
+            insert(&db, &state, &id);
+            db.execute("INSERT INTO retained.legacy_languages VALUES('rust')", [])
+                .unwrap();
+            drop(db);
+            set_catalog_identity(&state, &other);
+            let db = Connection::open(temp.path().join("index.db")).unwrap();
+            attach(&db, &state, &key).unwrap();
+            assert!(slots(&db).unwrap().is_empty(), "{other}: slots dropped");
+            let legacy: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM retained.legacy_languages",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(legacy, 0, "{other}: legacy rows dropped");
+            drop(db);
+            assert_eq!(catalog_identity(&state), key, "{other}");
+        }
+    }
+
     #[test]
     fn structural_catalog_faults_are_typed_and_never_recreated() {
         for damage in [

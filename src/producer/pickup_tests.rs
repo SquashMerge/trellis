@@ -1,5 +1,6 @@
 use super::pickup::{
-    Decision, PickupOwner, PickupRequest, TRANSIENT_RETRY_MILLIS, decide, decide_with_retry,
+    Decision, MAX_RETRY_DOUBLINGS, PickupOwner, PickupRequest, TRANSIENT_RETRY_MILLIS, counted,
+    decide, decide_with_retry,
 };
 use super::state::{LastImported, PickupEntry};
 use serde_json::json;
@@ -19,6 +20,7 @@ fn entry(last: Option<(&str, &str, Option<&str>)>) -> PickupEntry {
             state: state.into(),
             error_code: code.map(Into::into),
             attempted_at: THEN,
+            failures: 1,
         }),
     }
 }
@@ -116,6 +118,70 @@ fn decide_honours_a_shorter_retry_interval() {
         decide_with_retry(&failed, SHA, HEAD, THEN + 200, 200),
         Decision::Import
     );
+}
+
+/// #811: a transient failure that keeps repeating for the same bytes and revision backs off,
+/// doubling up to a bound, instead of retrying every interval forever.
+#[test]
+fn repeated_transient_failure_backs_off_to_a_bound() {
+    let attempt = |sha: &str, revision: &str, state: &str| LastImported {
+        sha256: sha.into(),
+        source_revision: revision.into(),
+        request_id: None,
+        state: state.into(),
+        error_code: (state == "failed").then(|| "producer_state_corrupt: retention catalog".into()),
+        attempted_at: THEN,
+        failures: 0,
+    };
+    // Consecutive failures for the same bytes and revision count up; anything else restarts.
+    let mut last = counted(attempt(SHA, HEAD, "failed"), None);
+    assert_eq!(last.failures, 1);
+    for expected in 2..=9 {
+        last = counted(attempt(SHA, HEAD, "failed"), Some(&last));
+        assert_eq!(last.failures, expected);
+    }
+    assert_eq!(
+        counted(attempt("bb", HEAD, "failed"), Some(&last)).failures,
+        1
+    );
+    assert_eq!(
+        counted(attempt(SHA, "rev-2", "failed"), Some(&last)).failures,
+        1
+    );
+    let done = counted(attempt(SHA, HEAD, "done"), Some(&last));
+    assert_eq!(done.failures, 0);
+    assert_eq!(
+        counted(attempt(SHA, HEAD, "failed"), Some(&done)).failures,
+        1
+    );
+
+    let retry = TRANSIENT_RETRY_MILLIS;
+    for (failures, wait) in [
+        (0, retry),
+        (1, retry),
+        (2, 2 * retry),
+        (3, 4 * retry),
+        (MAX_RETRY_DOUBLINGS + 1, retry << MAX_RETRY_DOUBLINGS),
+        (u32::MAX, retry << MAX_RETRY_DOUBLINGS),
+    ] {
+        let mut failed = entry(Some((SHA, "failed", Some("index_failed"))));
+        failed.last_imported.as_mut().unwrap().failures = failures;
+        assert_eq!(
+            decide(&failed, SHA, HEAD, THEN + wait - 1),
+            Decision::Skip,
+            "{failures}"
+        );
+        assert_eq!(
+            decide(&failed, SHA, HEAD, THEN + wait),
+            Decision::Import,
+            "{failures}"
+        );
+        assert_eq!(
+            decide(&failed, SHA, "rev-2", THEN + retry),
+            Decision::Import,
+            "{failures}: a new head waits only the base interval"
+        );
+    }
 }
 
 #[test]

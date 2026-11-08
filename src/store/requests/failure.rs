@@ -30,9 +30,11 @@ pub(crate) const NO_REASON: &str = "";
 const STORAGE_FULL_REASON: &str = "database or disk is full";
 
 /// Every detail Trellis's SCIP capture, admission and import spell for `invalid_request`,
-/// `invalid_artifact` and `limit_exceeded` (limit names included). It also maps the detail of
-/// any text-spelled code in [`PREFIXED_CODES`]. Byte-sorted for lookup.
+/// `invalid_artifact` and `limit_exceeded` (limit names included), and the areas a
+/// `producer_state_corrupt` failure names. It also maps the detail of any text-spelled code
+/// in [`PREFIXED_CODES`]. Byte-sorted for lookup.
 const REASONS: &[&str] = &[
+    "ambiguous document path",
     "artifact bytes",
     "artifact count",
     "artifact digest",
@@ -100,6 +102,7 @@ const REASONS: &[&str] = &[
     "page rows",
     "page totals",
     "pages",
+    "pickup configuration",
     "position encoding",
     "producer not pinned",
     "producer profile pin",
@@ -110,9 +113,17 @@ const REASONS: &[&str] = &[
     "relationships",
     "reordered page",
     "repeated field",
+    "retained descriptor is not a regular file",
+    "retained origin",
+    "retained run",
     "retained source pages no longer match",
+    "retention catalog",
+    "retention requires rollback journals",
+    "retention schema",
     "reversed range",
     "role outside root",
+    "run record",
+    "run record identity",
     "selected role absent",
     "selected role is not absolute",
     "semantic import options",
@@ -189,7 +200,7 @@ pub(crate) fn recovery_blocked_reason(error: &anyhow::Error) -> &'static str {
 }
 
 /// The codes a semantic import request may settle with besides `index_failed`.
-const PREFIXED_CODES: [&str; 7] = [
+const PREFIXED_CODES: [&str; 8] = [
     "invalid_request",
     "invalid_artifact",
     "limit_exceeded",
@@ -197,7 +208,10 @@ const PREFIXED_CODES: [&str; 7] = [
     "stale_basis",
     "revision_conflict",
     "root_changed",
+    PRODUCER_STATE_CORRUPT,
 ];
+/// Spelled here: the request classifier never reaches producer state.
+const PRODUCER_STATE_CORRUPT: &str = "producer_state_corrupt";
 
 /// Parses a plain `<code>` or `<code>: <detail>` message from the producer and request
 /// paths, which spell their typed causes as text. The reason is a [`REASONS`] entry or
@@ -208,7 +222,12 @@ fn prefixed(message: &str) -> Option<(&'static str, &'static str)> {
         if rest.is_empty() {
             return Some((*code, NO_REASON));
         }
-        let detail = rest.strip_prefix(": ")?;
+        let mut detail = rest.strip_prefix(": ")?;
+        // Producer state names the corrupt area first; what follows (a SQLite or serde
+        // message) varies between runs and never reaches the row.
+        if *code == PRODUCER_STATE_CORRUPT {
+            detail = detail.split(": ").next().unwrap_or(detail);
+        }
         let reason = REASONS
             .binary_search(&detail)
             .map_or(UNLISTED_REASON, |index| REASONS[index]);
@@ -291,6 +310,53 @@ mod tests {
                 &anyhow::anyhow!("{artifact_text}").context("index publication")
             ),
             ("index_failed", INTERNAL_REASON)
+        );
+    }
+
+    /// #811: corrupt producer state is its own typed code, never `internal error`, and only
+    /// the area it names reaches the row.
+    #[test]
+    fn producer_state_corrupt_is_typed_with_its_area() {
+        for (message, reason) in [
+            (
+                "producer_state_corrupt: retention schema",
+                "retention schema",
+            ),
+            (
+                "producer_state_corrupt: retention catalog: no such table: legacy_languages",
+                "retention catalog",
+            ),
+            (
+                "producer_state_corrupt: retained run: expected value at line 1",
+                "retained run",
+            ),
+            ("producer_state_corrupt: /home/user/secret", UNLISTED_REASON),
+        ] {
+            assert_eq!(
+                classify(RequestKind::SemanticImport, &anyhow::anyhow!("{message}")),
+                ("producer_state_corrupt", reason),
+                "{message}"
+            );
+        }
+        // Other codes keep the whole-detail lookup.
+        assert_eq!(
+            classify(
+                RequestKind::SemanticImport,
+                &anyhow::anyhow!("invalid_artifact: protobuf parse: truncated")
+            ),
+            ("invalid_artifact", UNLISTED_REASON)
+        );
+    }
+
+    /// #800's admission detail is listed (#811).
+    #[test]
+    fn ambiguous_document_path_is_a_listed_reason() {
+        assert_eq!(
+            classify(
+                RequestKind::SemanticImport,
+                &typed("invalid_artifact", "ambiguous document path")
+            ),
+            ("invalid_artifact", "ambiguous document path")
         );
     }
 

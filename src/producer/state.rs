@@ -119,6 +119,10 @@ pub struct LastImported {
     pub state: String,
     pub error_code: Option<String>,
     pub attempted_at: u64,
+    /// Consecutive failed attempts for these bytes against this source revision (#811). A
+    /// transient retry waits longer after each one.
+    #[serde(default)]
+    pub failures: u32,
 }
 
 /// What a sweep did, for the caller's log and for tests.
