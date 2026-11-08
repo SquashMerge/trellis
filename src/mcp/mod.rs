@@ -11,6 +11,7 @@ pub mod wire;
 
 use crate::daemon::registry::SelectionError;
 use crate::store::topology::WorkspaceIdentity;
+use crate::testing::phase_hook;
 use std::os::unix::fs::MetadataExt;
 
 /// An already selected and marker-attached workspace. Never opens an index or repairs a marker.
@@ -752,38 +753,6 @@ fn catching_up(
 /// How soon a final selected check that could not finish is started again
 /// (#131), while the coordinator keeps deciding the connection's other calls.
 const FINAL_RECHECK_TICK: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// An opt-in, bounded fixture barrier at an actual coordinator boundary.
-/// Normal MCP calls do not connect to or wait for a test socket.
-#[cfg(feature = "test-support")]
-pub(crate) fn phase_hook(stage: &str) -> std::io::Result<()> {
-    use std::io::{Read, Write};
-    // One stage, or several separated by commas.
-    if !std::env::var("TRELLIS_TEST_MCP_PHASE")
-        .is_ok_and(|stages| stages.split(',').any(|named| named == stage))
-    {
-        return Ok(());
-    }
-    let path = std::env::var_os("TRELLIS_TEST_MCP_PHASE_SOCKET").ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "missing MCP fixture socket",
-        )
-    })?;
-    let mut stream = std::os::unix::net::UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
-    stream.write_all(stage.as_bytes())?;
-    stream.write_all(b"\n")?;
-    let mut release = [0u8; 1];
-    stream.read_exact(&mut release)?;
-    Ok(())
-}
-
-#[cfg(not(feature = "test-support"))]
-pub(crate) fn phase_hook(_: &str) -> std::io::Result<()> {
-    Ok(())
-}
 
 /// Call workers alive across all connections, each holding a permit until
 /// its thread exits, even after its call was decided (Decision 0009 §7).

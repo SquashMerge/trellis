@@ -349,7 +349,7 @@ impl GraphSource for SnapshotGraphSource<'_> {
 
     fn check(&mut self) -> Result<()> {
         #[cfg(feature = "test-support")]
-        crate::mcp::phase_hook("call_graph_node")?;
+        crate::testing::phase_hook("call_graph_node")?;
         (self.check)()
     }
 
