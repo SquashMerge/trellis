@@ -46,6 +46,8 @@ allow that direction. An exact reviewed exception can approve an individual pair
 without changing its underlying deviation status.
 
 An integer `order` is explicit: lower means higher, equal integers are peers.
+(Proposed, #783: with two or more detected apps, `order` is compared only within an app.
+See [Amendment (#783)](#amendment-783-apps-and-per-app-layers).)
 Table order has no meaning. A layer has either `order` or `shared = true`, never
 both. Path assignment uses the most specific matching patterns:
 
@@ -79,6 +81,9 @@ For an observed production structural reference pair:
 | Any source into shared, including shared into shared | conforms |
 | Shared into ordered | deviates unless `shared_outbound = "allow"` |
 | Unassigned endpoint or unresolved mapping/ownership | unknown |
+
+(Proposed, #783: a pair between layers of two different apps is `unknown` with reason
+`cross_app`. See [Amendment (#783)](#amendment-783-apps-and-per-app-layers).)
 
 Conformance describes **that observed structural pair**, not the absence of hidden
 semantic dependencies in a module. A stricter no-skipping rule is not implicit.
@@ -138,6 +143,198 @@ Include tests and fixtures restores those contributions. This scoped heat rule d
 not change stored roles or policy. Client-side expansion and collapsing do not change
 metric population.
 Rules edits preserve the field like any other authored text.
+
+## Amendment (#783): apps and per-app layers
+
+**Status: proposed (#783), awaiting owner ratification.** This section encodes the
+[owner's 2026-11-07 ruling](https://github.com/SquashMerge/trellis/issues/783). Once
+ratified, it wins over the single global `order` space above, the direction table and the
+[proposal workflow](#proposal-workflow) wherever a checkout has two or more apps. A checkout
+with zero or one app behaves exactly as above, so its rules file stays valid unchanged.
+
+**Apps come from build manifests (ruling 1).** No authored `[[apps]]` table exists in this
+round, so the closed top-level keys are unchanged. Detection reads manifest bytes from the
+same admitted snapshot as the code. It never reads live files or runs `cargo` or `npm`. An
+app is one of:
+
+- **A Cargo package with a binary target.** That is the root `Cargo.toml` package or a
+  member of the root manifest's `[workspace]` (`members` globs expanded against the
+  snapshot, `exclude` honoured). The package needs an explicit `[[bin]]` or one of Cargo's
+  default `src/main.rs` / `src/bin/*.rs` targets, unless `autobins = false`. Its name is
+  `package.name`. Its root is the manifest's directory. Its entries are its binary target
+  names. A package with several binaries is one app, and a library-only member is not an
+  app.
+- **A `package.json`,** anywhere in the snapshot outside `node_modules/`. Its name is
+  `name`, or the manifest's checkout-relative directory (`.` at the checkout root) when
+  `name` is absent or not a nonblank string. Its root is the manifest's directory.
+
+The following detect no app:
+
+- **A manifest whose path a hidden layer selects.** The path is assigned by the usual
+  [path rules](#start-with-reviewed-layers), as if it were a file, and the assigned layer
+  has `display = "hidden"`. This is how tooling and fixture manifests (`tools/x/package.json`,
+  `tests/fixtures/**/Cargo.toml`) stay tooling and fixtures rather than apps (ruling, #524).
+- **A malformed or over-bound manifest.** It adds a `limitations` entry and is never an
+  error, like other unproved manifests.
+
+Detection shares the existing manifest byte and work bounds.
+
+**App names.** A layer names an app by this exact, case-sensitive name. When two detected
+apps share a name, neither can be named: a layer naming it is a located `invalid_rules`
+`ambiguity`. Both still appear in the app inventory. Because detection reads the code
+snapshot, adding or removing a manifest can change which rules are valid, just as a second
+source set can invalidate a portable exception.
+
+**Each layer names its app (ruling 2).** The layer key is `app`, a nonblank string:
+
+```toml
+[layers.entry]
+app = "trellis"
+order = 1
+paths = ["src/main.rs", "src/http.rs", "src/http/**"]
+```
+
+| Detected apps | `app` on a layer |
+| --- | --- |
+| None | Not allowed. Any `app` is a located `invalid_rules` `reference` (unknown app). All layers share one order space, as today. |
+| Exactly one | Optional. When present, it must be that app's name (otherwise `reference`). An omitted `app` means that app. |
+| Two or more | Required on every ordered layer that is not hidden. A missing `app` is a located `invalid_rules` `schema` error at the layer's table header. Shared layers and `display = "hidden"` layers may omit it. An unknown name is a `reference` error. |
+
+An omitted `app` is allowed only by an authored `display = "hidden"`, not by the
+role-derived hiding of an unhinted test or fixture layer. Validation then depends only on
+the rules bytes and the detected apps.
+
+A layer's `app` is authoritative for its files in verdicts and views. Trellis does not check
+that the layer's paths lie under the app's roots. Detection supplies the valid names, the
+inventory and the grouping of unassigned files. An unassigned file belongs, for listing
+only, to the app whose root contains it most specifically, or to no app. Unassigned files
+are listed and never dropped. `unassignedFileCount` stays checkout-wide.
+
+**`order` is compared only within an app (ruling 3).** Each app is its own order space.
+Equal orders in two apps are not peers, and an app's numbering may restart at 1. In a
+checkout with two or more apps, the ordered layers that omit `app` (hidden tooling and
+fixture layers) form one more space of their own. `[layer_policy]` stays checkout-wide and
+applies inside each space. A shared layer with an `app` is shared within that app. A shared
+layer without one is shared by every app and space: references into it conform, and
+references out of it into an ordered layer follow `shared_outbound`, as today.
+
+**References between apps are interface evidence (ruling 4), not `$layers` deviations.**
+This adds a row to the direction table:
+
+| Direction | Result |
+| --- | --- |
+| Source and destination layers in different order spaces (two apps, or an app and the app-less space), unless the destination is a shared layer without `app` | unknown, with reason `cross_app` |
+
+`cross_app` joins `layer_unassigned` in the instance's `unresolved` reasons. Such a pair is
+never counted as a deviation and never fails `trellis rules check`. It stays `unknown` until
+[#686](https://github.com/SquashMerge/trellis/issues/686) measures interfaces between apps.
+A later amendment then decides how a matched interface reports. A shared layer that has an
+`app`, when referenced from another app, is also `cross_app`.
+
+The `rules:v2` instance shape is unchanged. Production and test rows, exact counts,
+evidence and sampling are unchanged.
+
+**Unchanged:**
+
+- Tooling and fixtures stay hidden layers (#524), not apps. They may span apps by omitting
+  `app`, or name one.
+- Exceptions stay per file pair, with the [portable form](#reviewed-exceptions-not-count-baselines)
+  and matching unchanged. A cross-app pair is not a deviation, so it needs no exception; an
+  exception that matches one keeps its `unknown` status and `excepted=true`, as for any
+  instance.
+- `$external` is unchanged.
+
+**Worked example: Trellis itself.** This assumes [#784](https://github.com/SquashMerge/trellis/issues/784)
+adds a one-file `web/package.json` (`{"name":"trellis-web","private":true}`). Today `web/`
+has no manifest, so detection alone would find one app.
+
+With the rules below, the detected apps are:
+
+- **`trellis`**: Cargo, root `.`, entries `trellis` (`src/main.rs`) and
+  `trellis-producer-stub`;
+- **`trellis-web`**: npm, root `web`.
+
+The other manifests (`tools/**/package.json`, `tools/metrics-oracle/Cargo.toml`,
+`tests/browser/package.json`, `tests/mcp/package.json` and every `tests/fixtures/**`
+manifest) fall in hidden layers, so they detect no app. Path lists are shortened here; the
+real file keeps today's lists.
+
+```toml
+version = 1
+
+[layer_policy]
+peers = "forbid"
+shared_outbound = "forbid"
+
+# --- app "trellis-web" (web/package.json). Its numbering restarts at 1.
+[layers.web-shell]
+app = "trellis-web"
+order = 1
+paths = ["web/app.js", "web/shell.js"]
+
+[layers.web-views]
+app = "trellis-web"
+order = 2
+paths = ["web/architecture.js", "web/classes.js", "web/files.js", "web/sequence.js",
+         "web/treemap.js", "web/*-pele.js", "web/navigation.js", "web/metric-heat.js",
+         "web/viewer-metrics.js"]
+
+[layers.web-vendor]
+app = "trellis-web"
+shared = true
+paths = ["web/vendor/**"]
+
+# --- app "trellis" (root Cargo.toml). Orders compare only with other "trellis" layers.
+[layers.entry]
+app = "trellis"
+order = 1
+paths = ["src/main.rs", "src/auth.rs", "src/http.rs", "src/http/**", "src/daemon/**", "src/mcp/**"]
+
+[layers.query]
+app = "trellis"
+order = 2
+paths = ["src/navigation.rs", "src/references.rs", "src/references/**", "src/rules.rs", "src/rules/**"]
+
+[layers.indexing]
+app = "trellis"
+order = 3
+paths = ["src/indexer.rs", "src/index_coordinator.rs", "src/index_coordinator/**", "src/producer/**"]
+
+[layers.storage]
+app = "trellis"
+order = 4
+paths = ["src/store.rs", "src/store/**", "src/search_vectors.rs"]
+
+[layers.shared]
+app = "trellis"
+shared = true
+paths = ["src/model.rs", "src/testing.rs", "src/lib.rs"]
+
+# --- No app: hidden layers that span apps. They form one order space of their own.
+[layers.tooling]
+display = "hidden"
+order = 1
+paths = ["tools/**", "src/bin/**", "build.rs", "examples/**"]
+
+[layers.test-harnesses]
+display = "hidden"
+order = 2
+paths = ["tests/browser/**", "tests/mcp/**"]
+
+[layers.fixture-inputs]
+display = "hidden"
+order = 3
+paths = ["tests/fixtures/**", "tools/synthetic-cohorts/templates/**"]
+```
+
+What the example shows:
+
+- `web/app.js` → `web/architecture.js` is checked against the `trellis-web` order only.
+- `entry` and `web-shell` both have order 1, but they are not peers.
+- A reference from `src/bin/**` (tooling, no app) into `src/store.rs` is `unknown`/`cross_app`.
+  It was a downward conformance under the single order space.
+- Without `display = "hidden"` on `test-harnesses`, `tests/browser/package.json` would be a
+  third app named `trellis-browser-tests`. The layer would then also need an `app`.
 
 ## External package policy
 
@@ -203,7 +400,8 @@ forbid = [{ calls = "repository" }]
 
 The closed top-level keys are `version`, `layer_policy`, `external_policy`, `layers`,
 `roles`, `rules` and `exceptions`. `version` is required and exactly `1`; optional collections
-start empty. A selector has at least one of `paths`, `name`, `language`, `extends`
+start empty. (Proposed, #783: no `apps` key is added. A layer gains the optional `app` key; see
+[Amendment (#783)](#amendment-783-apps-and-per-app-layers).) A selector has at least one of `paths`, `name`, `language`, `extends`
 and `implements`. Keys combine with AND; entries within `paths` or `language`
 combine with OR. Languages are `java`, `rust`, `python`, `javascript`. Name patterns
 match the measured nullable name; null never receives an invented name.
@@ -896,6 +1094,8 @@ placement justifications, exact reviewed baseline exceptions and a `rules.toml`
 **diff for human review**. Ambiguous placement belongs in normal chat. Trellis
 never applies that diff, samples a model, invokes a provider, elicits input or
 requests indexing. Any later file edit uses the agent's ordinary authorized tools.
+(Proposed, #783: the prompt lists the detected apps and asks for layers per app. See
+[MCP Amendment (#783)](mcp-readonly-pilot-contract.md#amendment-783-per-app-layers-in-the-proposal-prompt).)
 
 MCP request and complete response bounds still apply, including prompt messages,
 errors, summary text and LF. The larger static tool-catalog allowance does not
