@@ -412,17 +412,23 @@ unchanged, as are the CLI and the browser.
   - For example, an explain `target` that is not a check identity gives `` `target`
     must be the identity object from a trellis_rules_check instance: {sourceSetId,
     language, path, sid} ``.
+  - An object-valued field (`target`, `destination`, `expectedBasis`) that arrives as
+    a JSON string, as a client that stringifies object arguments sends it, says so:
+    `` `target` must be a JSON object (got a string): … ``. The server still rejects
+    it; it never parses a string as an object.
   - The exact text of each message is server-authored, not part of this contract.
     Each one names its field in backticks and fits the 512-byte summary.
 - **Object input properties.** In every tool's `inputSchema`, a property that is a
   bare `$ref` to an object-valued definition also carries `"type":"object"` (allowed
   beside `$ref` in JSON Schema 2020-12). This covers `expectedBasis` on the ten tools
   that accept it, and explain's `target` and `destination`, because some clients
-  choose how to serialize an argument from its `type`. Accepted values are unchanged.
+  choose how to serialize an argument from its `type`. The same holds at any depth of
+  an input schema: explain's `Destination` union and each of its `oneOf` branches say
+  `"type":"object"` too. Accepted values are unchanged.
 - **Catalog.** Check's output `RuleInstance` adds the optional, closed `nextCall`.
   `trellis_read_source`'s output schema drops its unreferenced `SemanticProjection`,
   `DocumentSemanticStatus` and `Language` definitions, which no response shape uses.
-  The complete catalog is 79 bytes smaller than at `toolVersion` 12, so it keeps its
+  The complete catalog is 31 bytes smaller than at `toolVersion` 12, so it keeps its
   named headroom.
 
 ## Tool catalog

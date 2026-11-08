@@ -19694,11 +19694,14 @@
           ]
         },
         "Destination": {
+          "type": "object",
           "oneOf": [
             {
+              "type": "object",
               "$ref": "#/$defs/Identity"
             },
             {
+              "type": "object",
               "$ref": "#/$defs/ExternalIdentity"
             }
           ]

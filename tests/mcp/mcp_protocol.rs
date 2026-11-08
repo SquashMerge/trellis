@@ -11862,10 +11862,28 @@ fn invalid_tool_arguments_name_the_failing_field_and_its_shape() {
                 "target":{"language":"rust","path":"src/a.rs"}}),
             target_message,
         ),
+        // The Claude Desktop shape: the right object, sent as a JSON string. The closed
+        // schema still rejects it, and the message says what arrived.
         (
             "trellis_rules_explain",
             json!({"schemaVersion":1,"rule":"$layers","target":identity.to_string()}),
-            target_message,
+            "`target` must be a JSON object (got a string): the identity object from a \
+                trellis_rules_check instance, {sourceSetId, language, path, sid}",
+        ),
+        (
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers","target":identity.clone(),
+                "destination":identity.to_string()}),
+            "`destination` must be a JSON object (got a string): the destination object \
+                from a trellis_rules_check instance",
+        ),
+        (
+            "trellis_rules_check",
+            json!({"schemaVersion":1,"expectedBasis":
+                json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000",
+                    "indexRevision":1}).to_string()}),
+            "`expectedBasis` must be a JSON object (got a string): the evidenceBasis \
+                object of an earlier result, {indexGeneration, indexRevision}",
         ),
         (
             "trellis_rules_explain",
@@ -11947,6 +11965,18 @@ fn object_valued_input_refs_declare_type_object() {
     assert!(checked.contains(&"trellis_rules_explain.destination".to_owned()));
     assert!(checked.contains(&"trellis_find_symbols.expectedBasis".to_owned()));
     assert_eq!(checked.len(), 12, "{checked:?}");
+    // Nested: the explain destination union and each of its branches say so too.
+    let explain = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "trellis_rules_explain")
+        .unwrap();
+    let destination = &explain["inputSchema"]["$defs"]["Destination"];
+    assert_eq!(destination["type"], "object");
+    for branch in destination["oneOf"].as_array().unwrap() {
+        assert_eq!(branch["type"], "object", "{branch}");
+    }
     peer.assert_success("trellis mcp");
 }
 

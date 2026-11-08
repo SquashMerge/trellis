@@ -259,6 +259,19 @@ fn field_message(name: &str, field: &str) -> &'static str {
             "`status` must be 1 to 3 distinct values from \"conforms\", \"deviates\", \"unknown\""
         }
         (_, "rule") => "`rule` must be a rule name of 1 to 256 bytes, such as \"$layers\"",
+        // A client that stringifies an object argument is told so (#769).
+        (_, "expectedBasis:string") => {
+            "`expectedBasis` must be a JSON object (got a string): the evidenceBasis object \
+             of an earlier result, {indexGeneration, indexRevision}"
+        }
+        (_, "target:string") => {
+            "`target` must be a JSON object (got a string): the identity object from a \
+             trellis_rules_check instance, {sourceSetId, language, path, sid}"
+        }
+        (_, "destination:string") => {
+            "`destination` must be a JSON object (got a string): the destination object \
+             from a trellis_rules_check instance"
+        }
         (_, "target") => {
             "`target` must be the identity object from a trellis_rules_check instance: \
              {sourceSetId, language, path, sid}"
@@ -323,6 +336,14 @@ pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
         code: "invalid_request",
         message: Some(field_message(name, field)),
     };
+    // An object field that arrived as a string says so (#769).
+    let object = |field: &'static str, stringified: &'static str| {
+        if string_field(args, field) {
+            bad(stringified)
+        } else {
+            bad(field)
+        }
+    };
     let coded = |field: &'static str| {
         move |code: &'static str| {
             if code == "invalid_request" {
@@ -350,7 +371,7 @@ pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
         return Err(bad("schemaVersion"));
     }
     if !expected_basis(o) {
-        return Err(bad("expectedBasis"));
+        return Err(object("expectedBasis", "expectedBasis:string"));
     }
     // `compact` (#528, #665, #715) is a closed boolean wherever a tool accepts it.
     if o.get("compact").is_some_and(|value| !value.is_boolean()) {
@@ -385,14 +406,14 @@ pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
                 .get("target")
                 .is_some_and(super::architecture::valid_identity)
             {
-                return Err(bad("target"));
+                return Err(object("target", "target:string"));
             }
             if !o
                 .get("destination")
                 .is_none_or(super::architecture::valid_destination)
                 || (!matches!(rule, "$layers" | "$external") && o.contains_key("destination"))
             {
-                return Err(bad("destination"));
+                return Err(object("destination", "destination:string"));
             }
             limit(o).map_err(coded("limit"))?;
             offset(o).map_err(coded("offset"))?;
@@ -492,6 +513,11 @@ pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
         return Err(bad("workspace"));
     }
     Ok(())
+}
+/// Whether `field` of the arguments is a JSON string.
+fn string_field(args: Option<&Value>, field: &str) -> bool {
+    args.and_then(|args| args.get(field))
+        .is_some_and(Value::is_string)
 }
 fn workspace_field(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
     if o.get("workspace")
@@ -975,6 +1001,25 @@ mod tests {
             ("maxCalls", format!("from 0 to {MAX_CALLS}")),
         ] {
             assert!(field_message("trellis_call_graph", field).ends_with(&range));
+        }
+        // An object field sent as a string (a stringifying client) says so.
+        for (name, field) in [
+            ("trellis_rules_explain", "target"),
+            ("trellis_rules_explain", "destination"),
+            ("trellis_rules_explain", "expectedBasis"),
+            ("trellis_find_symbols", "expectedBasis"),
+        ] {
+            let mut stringified = good(name);
+            let object = json!({"indexGeneration":"x"}).to_string();
+            stringified[field] = json!(object);
+            if field == "destination" {
+                stringified["rule"] = json!("$layers");
+            }
+            let named = message(name, &stringified).unwrap();
+            assert!(
+                named.starts_with(&format!("`{field}` must be a JSON object (got a string)")),
+                "{named}"
+            );
         }
         // A numeric cap keeps its own code and generic message.
         let over = super::check(
