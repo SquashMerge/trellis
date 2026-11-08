@@ -303,7 +303,9 @@ Supported mapping is deliberately narrow:
   to a TypeScript target and the reverse. The root `tsconfig.json` (else
   `jsconfig.json`; JSONC, `extends` is not followed) adds `paths` (exact key,
   else the longest `prefix*suffix` pattern, targets in order, targets leaving
-  the checkout skipped), `baseUrl` and `rootDirs` for relative misses. A
+  the checkout skipped), `baseUrl` and `rootDirs` for relative misses. A bare
+  specifier falls back to a package only when no local module matched; an
+  ambiguous local match stays `module_path_ambiguous`. A
   config that cannot be read leaves relative resolution unchanged and reports
   bare specifiers that match no package as `tsconfig_unreadable`. `export = x`
   sets an unknown name set; `.cts` ends export following. `export * from`

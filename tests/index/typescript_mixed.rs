@@ -652,3 +652,86 @@ fn typescript_root_config_falls_back_to_jsconfig_and_prefers_tsconfig() {
     });
     assert_ne!(empty, tsconfig_edges);
 }
+
+/// The architecture `references` response of a fresh workspace holding `files`.
+fn references_of(files: &[(&str, &str)]) -> serde_json::Value {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(workspace.path()).unwrap();
+    for (path, text) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
+    let cancel: trellis::model::CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    let response = store.evidence_response().unwrap();
+    let references = response
+        .architecture_response(
+            "references",
+            &serde_json::json!({"expectedBasis": pin}),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    response.finish(()).unwrap();
+    references
+}
+
+/// A `paths` alias that names two local modules stays ambiguous: a declared package of
+/// the same name is no fallback for it.
+#[test]
+fn an_ambiguous_paths_alias_is_not_a_package_import() {
+    let use_ts = "import { x } from \"lodash\";\nexport const result = x;\n";
+    let local = "export const x = 1;\n";
+    let manifest = r#"{"dependencies":{"lodash":"^4.17.21"}}"#;
+    let ambiguous = references_of(&[
+        ("package.json", manifest),
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"lodash":["src/local"]}}}"#,
+        ),
+        ("use.ts", use_ts),
+        ("src/local.ts", local),
+        ("src/local/index.ts", local),
+    ]);
+    assert_eq!(
+        ambiguous["production"],
+        serde_json::json!([]),
+        "{ambiguous:#}"
+    );
+    assert_eq!(
+        ambiguous["unresolved"][0]["reason"], "module_path_ambiguous",
+        "{ambiguous:#}"
+    );
+    // A mapping that names nothing local still falls back to the declared package.
+    let unmapped = references_of(&[
+        ("package.json", manifest),
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"lodash":["src/missing"]}}}"#,
+        ),
+        ("use.ts", use_ts),
+    ]);
+    assert_eq!(
+        unmapped["production"][0]["target"]["package"], "lodash",
+        "{unmapped:#}"
+    );
+    assert_eq!(
+        unmapped["unresolved"],
+        serde_json::json!([]),
+        "{unmapped:#}"
+    );
+}

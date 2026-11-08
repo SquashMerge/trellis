@@ -254,12 +254,14 @@ impl Catalog {
                         Err(reason) => resolution.residual = Some(reason),
                     }
                 }
+                // A package is the fallback only when no local module matched. An
+                // ambiguous local mapping stays ambiguous.
                 if source.supported
                     && let Some(specifier) = source.specifier.as_deref()
                     && !relative(specifier)
                     && resolver
                         .target(document, Some(specifier), work, check)?
-                        .is_err()
+                        .is_err_and(|reason| reason != "module_path_ambiguous")
                 {
                     let key = &docs[document].key;
                     charge(
