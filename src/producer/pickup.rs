@@ -504,7 +504,7 @@ impl PickupOwner {
             .find(|e| e.producer == producer)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("{}: no pickup configured", super::NOT_FOUND))?;
-        let (pin, language) = batch::pickup_target(producer)
+        let (pin, languages) = batch::pickup_target(producer)
             .ok_or_else(|| anyhow::anyhow!("{INVALID_REQUEST}: pickup producer"))?;
         Self::wait_ready(scheduler)?;
         let generation_id = Uuid::new_v4().simple().to_string();
@@ -555,7 +555,7 @@ impl PickupOwner {
                     reader,
                     &BatchSpec {
                         pin: &pin,
-                        language,
+                        languages,
                         workspace: Path::new(store.workspace_root()),
                         dir: &dir,
                         generation: batch::pickup_generation(&generation_id),

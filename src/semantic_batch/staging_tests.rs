@@ -15,7 +15,7 @@ fn seeded(parent: &std::path::Path, incarnation: &str) -> Stage {
     conn.execute_batch(
         "INSERT INTO sources VALUES(0,'java','a.java','h',1),(1,'java','b.java','h',1);
          INSERT INTO coverage VALUES(0,0,NULL),(1,NULL,'failed');
-         INSERT INTO artifacts(ordinal,path,language,sha256,byte_length) VALUES(0,'p','java','s',1);",
+         INSERT INTO artifacts(ordinal,path,languages,sha256,byte_length) VALUES(0,'p','[\"java\"]','s',1);",
     )
     .unwrap();
     stage
@@ -133,6 +133,7 @@ fn staged_cursor_queries_use_indexes_without_temp_sort() {
         "SELECT ord FROM sources ORDER BY ord",
         "SELECT source_ord FROM coverage WHERE artifact=0 ORDER BY source_ord",
         "SELECT s.ord FROM sources s JOIN coverage c ON c.source_ord=s.ord WHERE s.language='java' AND s.path='a' AND c.artifact=0",
+        "SELECT s.ord FROM sources s JOIN coverage c ON c.source_ord=s.ord WHERE s.path='a' AND c.artifact=0 LIMIT 2",
     ] {
         let plan: Vec<String> = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -145,6 +146,12 @@ fn staged_cursor_queries_use_indexes_without_temp_sort() {
             plan.iter().all(|step| !step.contains("TEMP B-TREE")),
             "{sql}: {plan:?}"
         );
+        if sql.contains("s.path='a' AND c.artifact=0 LIMIT 2") {
+            assert!(
+                plan.iter().all(|step| !step.starts_with("SCAN s")),
+                "the per-document lookup must not scan every source: {plan:?}"
+            );
+        }
     }
 }
 
@@ -154,7 +161,7 @@ fn claim_sink_dedups_and_types_collisions_and_duplicate_documents() {
     let mut stage = seeded(parent.path(), "sink");
     let budget = stage.budget(&BatchLimits::PRODUCTION);
     let conn = stage.conn().unwrap();
-    let mut sink = StageClaimSink::new(conn, &budget, 0, "java");
+    let mut sink = StageClaimSink::new(conn, &budget, 0);
     sink.begin_document(&unit("a.java")).unwrap();
     sink.claim(claim(b"one", "d1", "p1")).unwrap();
     sink.claim(claim(b"one", "d1", "p1")).unwrap();
@@ -183,7 +190,7 @@ fn claim_sink_types_a_proof_id_clash_as_non_unique_proof() {
     let mut stage = seeded(parent.path(), "proof-clash");
     let budget = stage.budget(&BatchLimits::PRODUCTION);
     let conn = stage.conn().unwrap();
-    let mut sink = StageClaimSink::new(conn, &budget, 0, "java");
+    let mut sink = StageClaimSink::new(conn, &budget, 0);
     sink.begin_document(&unit("a.java")).unwrap();
     sink.claim(claim(b"one", "d1", "p1")).unwrap();
     assert_eq!(
@@ -204,7 +211,7 @@ fn claim_sink_types_a_full_disk_insert_as_storage_full() {
         .unwrap();
     conn.query_row(&format!("PRAGMA max_page_count={pages}"), [], |_| Ok(()))
         .unwrap();
-    let mut sink = StageClaimSink::new(conn, &budget, 0, "java");
+    let mut sink = StageClaimSink::new(conn, &budget, 0);
     sink.begin_document(&unit("a.java")).unwrap();
     let big = vec![7u8; 1 << 20];
     let error = sink.claim(claim(&big, "d1", "p1")).unwrap_err();
@@ -227,28 +234,37 @@ fn only_documents_assigned_to_the_artifact_resolve() {
     let parent = tempfile::tempdir().unwrap();
     let mut stage = seeded(parent.path(), "assign");
     let conn = stage.conn().unwrap();
+    assert!(lookup_assigned(conn, 0, "a.java").unwrap().is_some());
+    assert!(lookup_assigned(conn, 1, "a.java").unwrap().is_none());
     assert!(
-        lookup_assigned(conn, 0, "java", "a.java")
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        lookup_assigned(conn, 1, "java", "a.java")
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        lookup_assigned(conn, 0, "java", "b.java")
-            .unwrap()
-            .is_none(),
+        lookup_assigned(conn, 0, "b.java").unwrap().is_none(),
         "excluded"
     );
-    assert!(
-        lookup_assigned(conn, 0, "java", "missing.java")
-            .unwrap()
-            .is_none()
-    );
+    assert!(lookup_assigned(conn, 0, "missing.java").unwrap().is_none());
     let _ = params![0];
+}
+
+#[test]
+fn an_assigned_path_resolves_to_its_source_language_and_a_shared_path_is_ambiguous() {
+    use super::staging::StageLookupError;
+    let parent = tempfile::tempdir().unwrap();
+    let mut stage = seeded(parent.path(), "language");
+    let conn = stage.conn().unwrap();
+    conn.execute_batch(
+        "INSERT INTO sources VALUES(2,'javascript','src/a.js','hj',1),(3,'typescript','src/b.ts','ht',1),(4,'typescript','src/a.js','hx',1);
+         INSERT INTO coverage VALUES(2,0,NULL),(3,0,NULL);",
+    )
+    .unwrap();
+    let ts = lookup_assigned(conn, 0, "src/b.ts").unwrap().unwrap();
+    assert_eq!((ts.ord, ts.language.as_str()), (3, "typescript"));
+    let js = lookup_assigned(conn, 0, "src/a.js").unwrap().unwrap();
+    assert_eq!((js.ord, js.language.as_str()), (2, "javascript"));
+    conn.execute("INSERT INTO coverage VALUES(4,0,NULL)", [])
+        .unwrap();
+    assert!(matches!(
+        lookup_assigned(conn, 0, "src/a.js"),
+        Err(StageLookupError::Ambiguous)
+    ));
 }
 
 /// Duplicate coverage rows are rejected by the row-order check, so a failing coverage insert is
@@ -353,7 +369,7 @@ fn admitted_claims_record_the_symbol_presence_discovery_reads() {
     let mut stage = seeded(parent.path(), "presence");
     let budget = stage.budget(&BatchLimits::PRODUCTION);
     let conn = stage.conn().unwrap();
-    let mut sink = StageClaimSink::new(conn, &budget, 0, "java");
+    let mut sink = StageClaimSink::new(conn, &budget, 0);
     sink.begin_document(&unit("a.java")).unwrap();
     let mut first = cases[2].0.clone();
     first.fact_digest = "d1".into();

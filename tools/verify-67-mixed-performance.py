@@ -977,7 +977,7 @@ def write_import_batch(root, header, artifact_bytes, covered):
     profile = json.loads((REPO / "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json").read_text())
     producer = next(p for p in profile["semanticProducers"] if p["name"] == "scip-typescript")
     batch = load_batch_module()
-    producer_languages = ["javascript"]
+    producer_languages = ["javascript", "typescript"]
     descriptor_header = {
         "trustOrigin": "referenceProfile", "profileId": profile["profileId"],
         "decoderVersion": DECODER_VERSION,

@@ -199,7 +199,7 @@ fn lookup_bytes(language: &str, spelling: &str, live: &Rc<LiveBudget>) -> Result
             ])
         }
         "java" => sum(&[size_of::<String>() as u64, spelling.len() as u64]),
-        "javascript" => sum(&[
+        "javascript" | "typescript" => sum(&[
             size_of::<String>() as u64,
             if spelling.contains('\\') {
                 // Identifier escape decoding only shrinks UTF-8 input; four hex digits
@@ -959,6 +959,7 @@ mod tests {
             ("python", "é"),
             ("java", "name"),
             ("javascript", r"na\u006de"),
+            ("typescript", r"na\u006de"),
         ] {
             let live = LiveBudget::new(BatchLimits::PRODUCTION.unit_expansion_bytes);
             let bytes = lookup_bytes(language, input, &live).unwrap();

@@ -180,18 +180,18 @@ pub fn pickup_generation(generation_id: &str) -> Generation {
     )
 }
 
-/// The pin and artifact language of a producer name, or `None` for a name that is neither
+/// The pin and artifact languages of a producer name, or `None` for a name that is neither
 /// pinned nor the registered test stub.
-pub fn pickup_target(producer: &str) -> Option<(PinnedProducer, &'static str)> {
+pub fn pickup_target(producer: &str) -> Option<(PinnedProducer, &'static [&'static str])> {
     let target = Target::parse(producer, profiles::Stub::from_env().is_some())?;
-    Some((target.pin()?, target.language()))
+    Some((target.pin()?, target.languages()))
 }
 
 /// Everything `write_batch` needs besides the retained revision.
 pub struct BatchSpec<'a> {
     pub pin: &'a PinnedProducer,
-    /// The language the artifact covers.
-    pub language: &'a str,
+    /// The languages the artifact covers; each is one of the pin's.
+    pub languages: &'a [&'a str],
     pub workspace: &'a Path,
     /// The canonical generation directory; the artifact is at `ARTIFACT_PATH` under it.
     pub dir: &'a Path,
@@ -318,7 +318,8 @@ fn read_artifact(dir: &Path) -> Result<(Vec<u8>, String)> {
 ///
 /// Every inventory document gets a source row. Documents of the pin's languages get a
 /// coverage row: covered by the artifact when it names the document, `failed` when it is the
-/// artifact's language and the artifact omits it, and `notRequested` for any other language.
+/// one of the artifact's languages and the artifact omits it, and `notRequested` for any other
+/// language.
 pub fn write_batch(reader: &NativeReader<'_>, spec: &BatchSpec<'_>) -> Result<WrittenBatch> {
     let (artifact, artifact_sha256) = read_artifact(spec.dir)?;
     let artifact_path = if spec.snapshot {
@@ -348,9 +349,18 @@ pub fn write_batch(reader: &NativeReader<'_>, spec: &BatchSpec<'_>) -> Result<Wr
         return Err(invalid("project root"));
     };
     ensure!(
-        spec.pin.languages.iter().any(|l| l == spec.language),
+        !spec.languages.is_empty()
+            && spec.languages.iter().all(|language| spec
+                .pin
+                .languages
+                .iter()
+                .any(|l| l == language)),
         invalid("artifact language")
     );
+    let mut artifact_languages: Vec<String> =
+        spec.languages.iter().map(|l| (*l).to_owned()).collect();
+    artifact_languages.sort_by_key(|language| crate::scip_admission::order(language));
+    artifact_languages.dedup();
 
     let header = reader.header()?;
     let batch_dir = spec.dir.join(BATCH_DIR);
@@ -380,7 +390,7 @@ pub fn write_batch(reader: &NativeReader<'_>, spec: &BatchSpec<'_>) -> Result<Wr
         if !spec.pin.languages.contains(language) {
             continue;
         }
-        let (artifact_ordinal, exclusion) = if language != spec.language {
+        let (artifact_ordinal, exclusion) = if !spec.languages.contains(&language.as_str()) {
             (None, Some("notRequested"))
         } else if scan.documents.contains(path) {
             (Some(0), None)
@@ -460,7 +470,7 @@ pub fn write_batch(reader: &NativeReader<'_>, spec: &BatchSpec<'_>) -> Result<Wr
             relative_path: artifact_path.to_owned(),
             byte_length: artifact.len() as u64,
             sha256: artifact_sha256,
-            language: spec.language.to_owned(),
+            languages: artifact_languages,
         }],
         generation: Some(generation.clone()),
     };

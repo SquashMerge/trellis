@@ -38,7 +38,9 @@ use crate::support;
 use support::{Checkout, cache_dir, data_dir, native_watcher, start_checkout, state_dir};
 
 use crate::semantic_batch_support;
-use semantic_batch_support::{BatchFixture, edit_descriptor, edit_scip, uniform_workspace};
+use semantic_batch_support::{
+    BatchFixture, DocSpec, edit_descriptor, edit_scip, uniform_workspace,
+};
 
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 const RUN_ID: &str = "0123456789abcdef0123456789abcdef";
@@ -199,7 +201,7 @@ impl Inproc {
                 reader,
                 &BatchSpec {
                     pin: &pin,
-                    language: "javascript",
+                    languages: &["javascript"],
                     workspace: &self.root,
                     dir: &dir,
                     generation: batch::run_generation(&table, GenerationOrigin::TrellisRun, id),
@@ -446,7 +448,11 @@ struct World {
 }
 
 fn world(env: &[(String, String)]) -> World {
-    let checkout = start_checkout(workspace, env);
+    world_in(workspace, env)
+}
+
+fn world_in(setup: fn(&Path), env: &[(String, String)]) -> World {
+    let checkout = start_checkout(setup, env);
     let roots =
         TopologyRoots::isolated_for_tests(cache_dir(&checkout.home), data_dir(&checkout.home));
     let identity = WorkspaceIdentity::discover(Some(&checkout.root), &checkout.root).unwrap();
@@ -969,4 +975,135 @@ fn rust_pickup_batch_survives_store_reuse() {
         retained[0].descriptor.generation.as_ref().unwrap().origin,
         GenerationOrigin::OwnerPickup
     );
+}
+
+/// One scip-typescript run covers JavaScript and TypeScript (Decision 0020): the sources are
+/// `src/a.ts`, `src/b.tsx` and `src/c.js`.
+fn typescript_workspace(root: &Path) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/a.ts"),
+        "export function a(): number { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.tsx"),
+        "export function b(): number { return 2; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/c.js"), "export function c() { return 3; }\n").unwrap();
+    fs::write(root.join(".gitignore"), ".trellis-semantic-batch*/\n").unwrap();
+}
+
+/// A synthetic scip-typescript `Index` over the three sources whose documents carry an empty
+/// `language`, as the real producer's do. `edit` may change it before it is written.
+fn typescript_artifact(world: &World, edit: impl FnOnce(&mut scip::types::Index)) -> PathBuf {
+    let fixture = BatchFixture::from_published(&world.index_db, &world.checkout.root)
+        .reference("scip-typescript");
+    let docs = ["src/a.ts", "src/b.tsx", "src/c.js"]
+        .into_iter()
+        .map(DocSpec::new)
+        .collect::<Vec<_>>();
+    let bytes = edit_scip(&fixture.scip_bytes("", &docs), edit);
+    let path = world.checkout.temp.path().join("typescript.scip");
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn typescript_pickup_binds_empty_document_language_per_source() {
+    let world = world_in(typescript_workspace, &[]);
+    let artifact = typescript_artifact(&world, |_| {});
+    let output = world
+        .pickup_command_for("scip-typescript", &artifact)
+        .output()
+        .unwrap();
+    crate::child::assert_cli_success_with(
+        &output,
+        "scip-typescript pickup",
+        Some(&world.checkout.daemon_stderr()),
+    );
+    let head = world.head();
+    let snapshot = world.store.semantic_at(head).unwrap();
+    let mut covered: Vec<_> = snapshot
+        .coverage
+        .iter()
+        .filter(|row| row.producer_id == "scip-typescript")
+        .map(|row| {
+            assert!(
+                row.selected && row.state == trellis::semantic_evidence::CoverageState::Complete,
+                "{row:?}"
+            );
+            (row.language, row.document_path.clone())
+        })
+        .collect();
+    covered.sort();
+    use trellis::semantic_evidence::Language::{Javascript, Typescript};
+    assert_eq!(
+        covered,
+        [
+            (Javascript, "src/c.js".to_owned()),
+            (Typescript, "src/a.ts".to_owned()),
+            (Typescript, "src/b.tsx".to_owned()),
+        ]
+    );
+    let typescript: Vec<_> = snapshot
+        .provenance
+        .iter()
+        .filter(|row| row.document.language == "typescript")
+        .collect();
+    assert!(!typescript.is_empty(), "no typescript provenance");
+    for row in typescript {
+        assert_eq!(row.producer_id, "scip-typescript");
+        assert_eq!(row.freshness, trellis::semantic_evidence::Freshness::Fresh);
+        if let Some(basis) = &row.basis {
+            assert_eq!(basis.language, Typescript);
+        }
+    }
+    let (languages, claim_languages): (String, Vec<String>) = world
+        .store
+        .with_index_read_for_tests(|db| {
+            let languages =
+                db.query_row("SELECT languages FROM semantic_raw_captures", [], |r| {
+                    r.get(0)
+                })?;
+            let claims = db
+                .prepare("SELECT DISTINCT language FROM semantic_raw_proofs ORDER BY language")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Ok((languages, claims))
+        })
+        .unwrap();
+    assert_eq!(languages, r#"["javascript","typescript"]"#);
+    assert_eq!(claim_languages, ["javascript", "typescript"]);
+}
+
+#[test]
+fn typescript_document_language_must_be_empty_or_exactly_typescript() {
+    let world = world_in(typescript_workspace, &[]);
+    let before = world.head();
+    for language in ["TypeScript", "javascript"] {
+        let artifact = typescript_artifact(&world, |index| {
+            let document = index
+                .documents
+                .iter_mut()
+                .find(|d| d.relative_path == "src/a.ts")
+                .unwrap();
+            document.language = language.into();
+        });
+        let output = world
+            .pickup_command_for("scip-typescript", &artifact)
+            .output()
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        assert!(!output.status.success(), "{language} was accepted");
+        assert_eq!(reply["state"], "failed", "{reply}");
+        let code = reply["errorCode"].as_str().unwrap();
+        assert!(
+            code.starts_with("invalid_artifact") && code.contains("document source binding"),
+            "{language}: {reply}"
+        );
+    }
+    assert_eq!(world.head(), before, "the head did not move");
+    assert_eq!(world.batches(), 0);
 }

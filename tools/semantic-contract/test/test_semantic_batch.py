@@ -99,7 +99,7 @@ class WriteBatchTests(unittest.TestCase):
             self.assertEqual((page["formatVersion"], page["kind"], page["ordinal"]), (1, entry["kind"], entry["ordinal"]))
             self.assertEqual(len(page["rows"]), entry["rowCount"])
         artifact = descriptor["artifacts"][0]
-        self.assertEqual((artifact["ordinal"], artifact["language"], artifact["relativePath"]), (0, "java", "artifact-0.scip"))
+        self.assertEqual((artifact["ordinal"], artifact["languages"], artifact["relativePath"]), (0, ["java"], "artifact-0.scip"))
         self.assertEqual(artifact["sha256"], hashlib.sha256(b"scip").hexdigest())
 
     def test_page_closes_before_row_count_would_exceed_bound(self):

@@ -533,9 +533,10 @@ def validate_run(db, home, index_out, import_out, descriptor_sha, probe, invento
     if not states or set(states) - {"complete", "partial"} or sum(states.values()) != documents \
             or distinct != documents:
         raise GateFault(f"coverage is not one complete/partial row per document: {states}")
-    captures = db.execute("""SELECT language,artifact_hash FROM semantic_raw_captures
-                             WHERE batch_id=? ORDER BY ordinal""", (batch_id,)).fetchall()
-    if captures != [(a["language"], a["sha256"]) for a in inventory["artifacts"]]:
+    captures = [(json.loads(languages), artifact_hash) for languages, artifact_hash in db.execute(
+        """SELECT languages,artifact_hash FROM semantic_raw_captures
+           WHERE batch_id=? ORDER BY ordinal""", (batch_id,))]
+    if captures != [([a["language"]], a["sha256"]) for a in inventory["artifacts"]]:
         raise GateFault(f"selected batch captures differ from the four preparation artifacts: {captures}")
     proofs = db.execute("""SELECT count(*) FROM semantic_raw_proofs WHERE capture_id IN
                            (SELECT capture_id FROM semantic_raw_captures WHERE batch_id=?)""", (batch_id,)).fetchone()[0]

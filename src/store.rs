@@ -905,7 +905,7 @@ CREATE TABLE semantic_coverage_reasons(tuple_id INTEGER PRIMARY KEY REFERENCES s
 CREATE TABLE semantic_basis(basis_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL REFERENCES semantic_coverage(tuple_id),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,producer_hash TEXT NOT NULL,artifact_hash TEXT NOT NULL,language TEXT NOT NULL,source_set_id TEXT NOT NULL,captured_native_revision_id TEXT NOT NULL,source_manifest_hash TEXT NOT NULL,toolchain_hash TEXT NOT NULL,config_hash TEXT NOT NULL,dependency_hash TEXT NOT NULL,UNIQUE(tuple_id,basis_id));
 CREATE TABLE semantic_basis_lookup_dependencies(basis_id INTEGER NOT NULL REFERENCES semantic_basis(basis_id),ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),lookup_key TEXT NOT NULL,PRIMARY KEY(basis_id,ordinal),UNIQUE(basis_id,lookup_key));
 CREATE TABLE semantic_raw_batches(batch_id INTEGER PRIMARY KEY,producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,profile_id TEXT NOT NULL,source_set_id TEXT NOT NULL,captured_revision TEXT NOT NULL,source_manifest_hash TEXT NOT NULL CHECK(length(source_manifest_hash)=64),descriptor_sha256 TEXT NOT NULL CHECK(length(descriptor_sha256)=64),descriptor_bytes BLOB NOT NULL,decoder_version TEXT NOT NULL,UNIQUE(producer_id,descriptor_sha256,captured_revision));
-CREATE TABLE semantic_raw_captures(capture_id INTEGER PRIMARY KEY,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),ordinal INTEGER NOT NULL,language TEXT NOT NULL,producer_id TEXT NOT NULL,artifact_hash TEXT NOT NULL CHECK(length(artifact_hash)=64),source_set_id TEXT NOT NULL,captured_revision TEXT NOT NULL,binary_bytes BLOB NOT NULL,decoder_version TEXT NOT NULL,UNIQUE(batch_id,ordinal),UNIQUE(producer_id,artifact_hash,source_set_id,captured_revision));
+CREATE TABLE semantic_raw_captures(capture_id INTEGER PRIMARY KEY,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),ordinal INTEGER NOT NULL,languages TEXT NOT NULL CHECK(json_valid(languages)),producer_id TEXT NOT NULL,artifact_hash TEXT NOT NULL CHECK(length(artifact_hash)=64),source_set_id TEXT NOT NULL,captured_revision TEXT NOT NULL,binary_bytes BLOB NOT NULL,decoder_version TEXT NOT NULL,UNIQUE(batch_id,ordinal),UNIQUE(producer_id,artifact_hash,source_set_id,captured_revision));
 CREATE INDEX semantic_raw_captures_batch ON semantic_raw_captures(batch_id);
 CREATE TABLE semantic_batch_witnesses(batch_id INTEGER PRIMARY KEY REFERENCES semantic_raw_batches(batch_id));
 CREATE TABLE semantic_batch_witness_documents(batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),language TEXT NOT NULL,path TEXT NOT NULL,snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),PRIMARY KEY(batch_id,language,path));
@@ -6669,7 +6669,7 @@ fn authenticate_stored_batch(
         let mut docs = Vec::new();
         for doc in &r1.revision.documents {
             let (language, path) = (&doc.key.language, &doc.key.path);
-            if *language != capture.language
+            if !capture.languages.contains(language)
                 || excluded.contains(&(language.as_str(), path.as_str()))
                 || raw
                     .documents
@@ -6800,7 +6800,7 @@ pub struct StoredRawProof {
 pub struct SelectedRawCapture {
     pub capture_id: i64,
     pub ordinal: u32,
-    pub language: String,
+    pub languages: Vec<String>,
     pub artifact_hash: String,
     pub binary_bytes: Vec<u8>,
 }
@@ -8459,7 +8459,7 @@ fn write_staged_raw_rows(
     let batch_id: i64 = db.query_row("SELECT batch_id FROM semantic_raw_batches WHERE producer_id=?1 AND descriptor_sha256=?2 AND captured_revision=?3", params![producer_id,descriptor_sha256,captured_revision], |r| r.get(0))?;
     let artifacts: Vec<(i64, String, String, i64)> = db
         .prepare(
-            "SELECT ordinal,language,sha256,byte_length FROM stage.artifacts ORDER BY ordinal",
+            "SELECT ordinal,languages,sha256,byte_length FROM stage.artifacts ORDER BY ordinal",
         )?
         .query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -8467,7 +8467,7 @@ fn write_staged_raw_rows(
         .collect::<rusqlite::Result<_>>()?;
     ensure!(!artifacts.is_empty(), "staged batch has no artifacts");
     let mut capture_ids = Vec::with_capacity(artifacts.len());
-    for (ordinal, language, sha256, length) in &artifacts {
+    for (ordinal, languages, sha256, length) in &artifacts {
         let other: Option<i64> = db.query_row("SELECT batch_id FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4", params![producer_id,sha256,source_set_id,captured_revision], |r| r.get(0)).optional()?;
         ensure!(
             other.is_none_or(|other| other == batch_id),
@@ -8483,7 +8483,7 @@ fn write_staged_raw_rows(
         let capture_id = if let Some(existing) = existing {
             existing
         } else {
-            db.execute("INSERT INTO semantic_raw_captures(batch_id,ordinal,language,producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,decoder_version) VALUES(?1,?2,?3,?4,?5,?6,?7,zeroblob(?8),?9)", params![batch_id,ordinal,language,producer_id,sha256,source_set_id,captured_revision,length,descriptor.decoder_version])?;
+            db.execute("INSERT INTO semantic_raw_captures(batch_id,ordinal,languages,producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,decoder_version) VALUES(?1,?2,?3,?4,?5,?6,?7,zeroblob(?8),?9)", params![batch_id,ordinal,languages,producer_id,sha256,source_set_id,captured_revision,length,descriptor.decoder_version])?;
             let capture_id = db.last_insert_rowid();
             fill_capture_blob(
                 db,
@@ -18681,12 +18681,20 @@ impl Store {
                         })?;
                 let captures = db.prepare(
                     if omit_binary {
-                        "SELECT capture_id,ordinal,language,artifact_hash,X'' FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
+                        "SELECT capture_id,ordinal,languages,artifact_hash,X'' FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
                     } else {
-                        "SELECT capture_id,ordinal,language,artifact_hash,binary_bytes FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
+                        "SELECT capture_id,ordinal,languages,artifact_hash,binary_bytes FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
                     }
-                )?.query_map([batch_id], |r| Ok(SelectedRawCapture {capture_id:r.get(0)?,ordinal:r.get(1)?,language:r.get(2)?,artifact_hash:r.get(3)?,binary_bytes:r.get(4)?}))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                )?.query_map([batch_id], |r| Ok((r.get::<_, i64>(0)?,r.get::<_, u32>(1)?,r.get::<_, String>(2)?,r.get::<_, String>(3)?,r.get::<_, Vec<u8>>(4)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|(capture_id,ordinal,languages,artifact_hash,binary_bytes)| {
+                        let languages = serde_json::from_str::<Vec<String>>(&languages).map_err(|_| {
+                            SelectedIntegrity("incompatible_index: selected raw capture".into())
+                        })?;
+                        Ok(SelectedRawCapture {capture_id,ordinal,languages,artifact_hash,binary_bytes})
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 selected_ensure!(
                     !captures.is_empty(),
                     "incompatible_index: selected capture missing"

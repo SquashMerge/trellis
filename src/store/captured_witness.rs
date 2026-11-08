@@ -246,7 +246,7 @@ mod tests {
             complete(&db, batch).unwrap();
         }
         db.execute(
-            "INSERT INTO semantic_raw_captures VALUES(1,1,0,'rust','producer',?1,
+            "INSERT INTO semantic_raw_captures VALUES(1,1,0,'[\"rust\"]','producer',?1,
              'sources','captured',X'','decoder')",
             [&hash],
         )

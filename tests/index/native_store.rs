@@ -3613,7 +3613,7 @@ fn selected_capture_keeps_r1_and_all_raw_proofs_until_last_selector_expires() {
         let hash = "0".repeat(64);
         db.execute("INSERT INTO semantic_raw_batches(producer_id,producer_version,profile_id,source_set_id,captured_revision,source_manifest_hash,descriptor_sha256,descriptor_bytes,decoder_version) SELECT 'fixture','fixture','fixture',source_set_id,native_revision_id,?2,?2,x'02','fixture' FROM native_revisions WHERE published_index_revision=?1", rusqlite::params![r1.index_revision as i64, hash])?;
         let batch_id = db.last_insert_rowid();
-        db.execute("INSERT INTO semantic_raw_captures(batch_id,ordinal,language,producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,decoder_version) SELECT ?1,0,'javascript','fixture',?3,source_set_id,native_revision_id,x'01','fixture' FROM native_revisions WHERE published_index_revision=?2", rusqlite::params![batch_id, r1.index_revision as i64, hash])?;
+        db.execute("INSERT INTO semantic_raw_captures(batch_id,ordinal,languages,producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,decoder_version) SELECT ?1,0,'[\"javascript\"]','fixture',?3,source_set_id,native_revision_id,x'01','fixture' FROM native_revisions WHERE published_index_revision=?2", rusqlite::params![batch_id, r1.index_revision as i64, hash])?;
         let capture_id = db.last_insert_rowid();
         db.execute("INSERT INTO semantic_raw_exclusions(batch_id,language,path,reason) VALUES(?1,'javascript','flow.js','failed')", [batch_id])?;
         for i in 0..70_u32 {

@@ -982,7 +982,7 @@ impl World {
                 let artifact = parsed
                     .artifacts
                     .iter()
-                    .find(|a| a.language == document.key.language)
+                    .find(|a| a.languages.contains(&document.key.language))
                     .unwrap_or(&parsed.artifacts[0]);
                 (
                     document.key.clone(),
@@ -4475,7 +4475,7 @@ fn native_rejoin_after_batch_import_rejoins_every_artifact() {
         parsed
             .artifacts
             .iter()
-            .find(|artifact| artifact.language == language)
+            .find(|artifact| artifact.languages.iter().any(|l| l == language))
             .unwrap()
             .sha256
             .clone()
@@ -5900,7 +5900,7 @@ fn whole_publication_validator_runs_over_every_original_of_a_batch() {
         .store
         .with_index_sql_for_tests(|db| {
             let changed = db.execute(
-                "UPDATE semantic_raw_captures SET binary_bytes=zeroblob(length(binary_bytes)) WHERE language='java'",
+                "UPDATE semantic_raw_captures SET binary_bytes=zeroblob(length(binary_bytes)) WHERE languages='[\"java\"]'",
                 [],
             )?;
             assert_eq!(changed, 1);

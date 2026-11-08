@@ -139,7 +139,7 @@ def write_batch(out_dir, header, sources, coverage, artifacts, rows_per_page=MAX
                      "sha256": sha256(artifact["data"])}
         else:
             entry = {key: artifact[key] for key in ("relativePath", "byteLength", "sha256")}
-        artifact_entries.append({"ordinal": ordinal, **entry, "language": artifact["language"]})
+        artifact_entries.append({"ordinal": ordinal, **entry, "languages": [artifact["language"]]})
     excluded = sum(row["exclusion"] is not None for row in coverage)
     descriptor = {
         "formatVersion": FORMAT_VERSION, **header,
