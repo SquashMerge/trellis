@@ -414,7 +414,7 @@ resident matrix (including first search, eviction, head-change races or an overs
 gives a lexical-only answer with null `modelId` and null `modelName`. Its state is `building`
 while the background owner works on this head (below), otherwise `unavailable` with
 `embedded:0`, an unavailable sentinel rather than a measured vector count.
-**Amendment (#777, owner-ratified 2026-11-07):** `toolVersion` is **12** (previously 11).
+**Amendment (#777, owner-ratified 2026-11-07):** `toolVersion` is **13** (previously 12, #778).
 `unavailable` always has a non-null `unavailableReason`; there is no
 reasonless `unavailable`. The reason is `model_not_configured` when no model path is configured
 (including a standalone registry with no search service), or `model_load_failed` after a
@@ -625,6 +625,17 @@ A separate tool for the rooted graph capability ([Decision 0012](semantic-eviden
 **Response bytes (D1, amended #379).** Build the bounded grouped answer once. Serialize and check the complete JSON-RPC frame first; return it unchanged if it fits. Only on overflow, make one forward pass over proper ancestor-closed priority prefixes. Add the next group only while the complete serialized JSON-RPC frame fits 65,536 bytes; stop at the first non-fitting prefix. No maximal-fit promise or descending exhaustive scan. Rebuild retained nodes/evidence/frontiers/warnings from frozen facts with no SQL or resolver re-evaluation. Both `data.result.request` and `data.requested` keep the original effective request and limits. Omitted immediate measured sites of retained owners receive `responseBytes` frontiers after depth/filtered/callLimit precedence, and `result.omitted.responseBytes` is their exact sum. Drop evidence/frontiers of pruned nodes. `truncated=true` and `truncationReason:"response_bytes"` disclose clipping. If the root plus mandatory closure/disclosure cannot fit, fail `range_too_large`. Existing 16 KiB request bounds remain unchanged. No graph config, new GraphError code, index/schema/publication change or warnings-v1 change is introduced.
 
 **Imported-data reach.** The current SCIP importer sets `dispatch: unknown` on every call binding, so until dispatch evidence lands (#12, #14), `trellis_call_graph` on imported data stops at the root's direct callees.
+
+**Project-named boundaries first (#778, owner-ratified 2026-11-07).** From a 2026-11-07 Claude Desktop session: without semantic evidence, compact `trellis_call_graph` from `src/http.rs::provisioned_core_answer` kept the first 60 of its calls in source order, almost all `Some`, `Ok`, `Err`, `clone`, `map_err` and `into_response`. `toolVersion` is **12** (previously 11). For this tool, the only reader of the engine, this amends step 5 of the contract-v1 [pinned bounded priority algorithm](semantic-evidence/contract-v1.md#pinned-bounded-priority-algorithm) by splitting its third rank, "other boundaries", in two:
+
+- *Third:* a boundary call with a selected binding, or an unbound boundary call whose stored callee lookup key equals the lookup key of a declaration of the call's language in the admitted snapshot. This is the [Decision 0012](semantic-evidence/decisions/0012-incoming-calls-syntax-tier.md) name relation that incoming calls use, read from the call's side.
+- *Fourth:* every other unbound boundary, including one with no provable callee key.
+
+The ranking applies only to unbound boundary calls; semantic bindings always take precedence. A call with a selected binding keeps the placement that binding gives it. It expands in rank one, is an external leaf in rank two or, under the default `includeExternal:false`, is dropped as filtered. A dispatch, ambiguous, unresolved or stale binding stays in rank three whatever its name, so it never ranks below an unbound call. The name match is only the fallback order for calls with no selected binding: no producer for the call's language, a document whose evidence is pending (catching up or needing re-import), or no binding row for the call.
+
+Ranks one (fresh admissible internal direct/constructor) and two (external leaves) are unchanged. The tie-breaks within a rank (owner depth, owner document and syntax identity, source order) are also unchanged. The name relation only orders candidates. It never targets, expands, filters or groups a call, and it changes no boundary reason, warning, `partial`, input or output schema. The `maxCalls` cut, its `callLimit` frontiers and `omitted.callLimit`, and the response-byte prefix stay exact, so a de-prioritized call that is cut is still counted. No standard-library name list is added. Sequence's external rule, a selected binding that resolves external, is already the call graph's `includeExternal` filter and is unchanged. A name match is not proof of a project target: a project `fn len` also lifts every `.len()` call.
+
+Measured on a private clone of this repository at `913b645e`, syntax only, with compact defaults: the root has 339 calls, 60 are kept and `omitted.callLimit` is 279 both before and after. Among the 60 kept edges, `Some`, `Ok`, `Err`, `clone`, `map_err` and `into_response` went from 23 to 6. The remaining 6 are `into_response`, which this repository declares. The frame went from 25,445 to 25,597 bytes.
 
 ### `trellis_read_source` (W5)
 
