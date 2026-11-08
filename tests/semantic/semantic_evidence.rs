@@ -42,7 +42,7 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
     };
     let producer = n::Producer {
         id: "trellis.native.syntax".into(),
-        version: "native-v15".into(),
+        version: "native-v16".into(),
         executable_hash: h(b"native"),
         kind: "native".into(),
         languages: vec!["rust".into()],
@@ -421,6 +421,72 @@ fn language_names_round_trip_including_typescript() {
         );
     }
     assert!(s::Language::Javascript < s::Language::Typescript);
+}
+
+#[test]
+fn captured_manifest_orders_javascript_before_typescript() {
+    let h = |b: &[u8]| native_ids::digest(b"", b);
+    let (semantic, native, mut captured) = fixture();
+    let revision_id = |captured: &s::CapturedComponents| {
+        let documents: Vec<_> = captured.captured_revision.documents.iter().map(|d| json!({"byteLength":d.byte_length,"contentHash":d.content_hash,"language":d.key.language,"path":d.key.path})).collect();
+        format!(
+            "revision:v2:{}",
+            native_ids::digest(
+                b"trellis.native-revision.v2\0",
+                &native_ids::canonical(&json!({
+                    "sourceSetId":captured.captured_revision.source_set_id,
+                    "documents":documents,
+                    "toolchain":captured.native_toolchain,
+                    "config":captured.native_config,
+                    "dependencies":captured.native_dependencies,
+                }))
+            )
+        )
+    };
+    let source_set_id = captured.captured_revision.source_set_id.clone();
+    let document = |language: &str, path: &str, text: &[u8]| n::Document {
+        key: n::DocumentKey {
+            source_set_id: source_set_id.clone(),
+            language: language.into(),
+            path: path.into(),
+        },
+        revision_id: String::new(),
+        content_hash: h(text),
+        byte_length: text.len(),
+    };
+    let reorder = |captured: &mut s::CapturedComponents, documents: Vec<n::Document>| {
+        captured.captured_revision.documents = documents;
+        let id = revision_id(captured);
+        captured.captured_revision.id = id.clone();
+        for document in &mut captured.captured_revision.documents {
+            document.revision_id = id.clone();
+        }
+    };
+    let rejected = |captured: &s::CapturedComponents| {
+        s::validate_evidence(&semantic, &native, captured)
+            .unwrap_err()
+            .to_string()
+    };
+    let javascript = document("javascript", "z.js", b"let z;");
+    let typescript = document("typescript", "a.ts", b"let a: number;");
+    captured.sources.clear();
+    captured
+        .sources
+        .insert(javascript.key.clone(), b"let z;".to_vec());
+    captured
+        .sources
+        .insert(typescript.key.clone(), b"let a: number;".to_vec());
+    reorder(&mut captured, vec![typescript.clone(), javascript.clone()]);
+    let first = rejected(&captured);
+    assert!(
+        first.contains("unsorted native document manifest"),
+        "{first}"
+    );
+    reorder(&mut captured, vec![javascript, typescript]);
+    assert!(
+        !rejected(&captured).contains("unsorted native document manifest"),
+        "javascript sorts before typescript whatever the paths"
+    );
 }
 
 #[test]

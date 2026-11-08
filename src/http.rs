@@ -3042,15 +3042,9 @@ async fn tree(
             let reason = if !absolute.starts_with(&indexed_workspace) {
                 "Outside indexed workspace"
             } else {
-                match absolute
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                {
-                    Some("ts" | "tsx") => "TypeScript indexing not supported yet",
-                    Some("js" | "mjs" | "cjs" | "rs" | "java" | "py") => {
-                        "Not indexed yet (may be excluded or size-limited)"
-                    }
-                    _ => "Unsupported source type",
+                match crate::capture::language_of_path(&absolute) {
+                    Some(_) => "Not indexed yet (may be excluded or size-limited)",
+                    None => "Unsupported source type",
                 }
             };
             item.unindexed_reason = Some(reason.into());
@@ -5449,12 +5443,9 @@ async fn provisioned_core_answer(
                     let reason = if !absolute.starts_with(&indexed_workspace) {
                         "Outside indexed workspace"
                     } else {
-                        match absolute.extension().and_then(|e| e.to_str()) {
-                            Some("ts" | "tsx") => "TypeScript indexing not supported yet",
-                            Some("js" | "mjs" | "cjs" | "rs" | "java" | "py") => {
-                                "Not indexed yet (may be excluded or size-limited)"
-                            }
-                            _ => "Unsupported source type",
+                        match crate::capture::language_of_path(&absolute) {
+                            Some(_) => "Not indexed yet (may be excluded or size-limited)",
+                            None => "Unsupported source type",
                         }
                     };
                     item.unindexed_reason = Some(reason.into());

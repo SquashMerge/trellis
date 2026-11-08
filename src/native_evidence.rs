@@ -27,11 +27,11 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
-const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
+pub(crate) const LANGUAGES: [&str; 5] = ["java", "rust", "python", "javascript", "typescript"];
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v15";
+pub(crate) const NATIVE_VERSION: &str = "native-v16";
 /// The build-time producer hash of this executable's extraction inputs: the
 /// listed extraction modules and crates (`build/extractor_inputs.rs`). Each
 /// revision records it; an executable rebuild with an equal hash keeps the
@@ -60,6 +60,7 @@ const EXTRACTION_INPUTS: &[(&str, &str, &[LanguageInventory])] = &[(
         ("rust", &[]),
         ("python", &[]),
         ("javascript", &[]),
+        ("typescript", &[]),
     ],
 )];
 
@@ -610,7 +611,7 @@ pub fn lookup(language: &str, name: &str) -> Result<String> {
             .normalize(name)
             .into_owned(),
         "java" => name.to_owned(),
-        "javascript" => javascript_identifier(name)?,
+        "javascript" | "typescript" => javascript_identifier(name)?,
         _ => anyhow::bail!("unsupported native language"),
     })
 }
@@ -690,7 +691,9 @@ fn javascript_identifier(name: &str) -> Result<String> {
 fn declaration_lookup(language: &str, name: &str) -> Result<String> {
     match lookup(language, name) {
         Ok(key) => Ok(key),
-        Err(_) if language == "javascript" && name.contains('\\') => Ok(name.to_owned()),
+        Err(_) if matches!(language, "javascript" | "typescript") && name.contains('\\') => {
+            Ok(name.to_owned())
+        }
         Err(error) => Err(error),
     }
 }
@@ -1965,6 +1968,7 @@ fn kind(lang: &str, n: Node<'_>) -> Option<&'static str> {
         "rust" => crate::indexer_rust::native_kind(n),
         "python" => crate::indexer_python::native_kind(n),
         "javascript" => crate::indexer::native_js_kind(n),
+        "typescript" => crate::indexer_ts::native_ts_kind(n),
         _ => None,
     }
 }
@@ -1976,7 +1980,10 @@ fn is_call(lang: &str, n: Node<'_>) -> bool {
             "method_invocation" | "object_creation_expression" | "explicit_constructor_invocation"
         ) | ("rust", "call_expression" | "method_call_expression")
             | ("python", "call")
-            | ("javascript", "call_expression" | "new_expression")
+            | (
+                "javascript" | "typescript",
+                "call_expression" | "new_expression"
+            )
     )
 }
 fn is_region(n: Node<'_>) -> bool {
@@ -2476,8 +2483,8 @@ fn callee(n: Node<'_>, f: &SourceFile) -> (Option<String>, Option<Range>) {
         .child_by_field_name(match f.language.as_str() {
             "java" => "name",
             "python" => "function",
-            "javascript" if n.kind() == "new_expression" => "constructor",
-            "javascript" => "function",
+            "javascript" | "typescript" if n.kind() == "new_expression" => "constructor",
+            "javascript" | "typescript" => "function",
             _ => "function",
         })
         .or_else(|| n.child_by_field_name("constructor"));
@@ -2492,7 +2499,9 @@ fn callee(n: Node<'_>, f: &SourceFile) -> (Option<String>, Option<Range>) {
     let member = match f.language.as_str() {
         "java" => Some(expr),
         "python" if expr.kind() == "attribute" => expr.child_by_field_name("attribute"),
-        "javascript" if expr.kind() == "member_expression" => expr.child_by_field_name("property"),
+        "javascript" | "typescript" if expr.kind() == "member_expression" => {
+            expr.child_by_field_name("property")
+        }
         "rust" if token_expr.kind() == "field_expression" => {
             token_expr.child_by_field_name("field")
         }
@@ -2593,7 +2602,9 @@ fn extract_document(
         "java" => tree_sitter_java::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
-        _ => tree_sitter_javascript::LANGUAGE.into(),
+        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(&f.path),
+        _ => anyhow::bail!("unsupported native language"),
     })?;
     let tree = parser
         .parse(&f.text, None)
@@ -3237,6 +3248,14 @@ impl ParserState<'_> {
                     | "property_identifier"
                     | "shorthand_property_identifier"
                     | "shorthand_property_identifier_pattern"
+            ),
+            "typescript" => matches!(
+                n.kind(),
+                "identifier"
+                    | "property_identifier"
+                    | "shorthand_property_identifier"
+                    | "shorthand_property_identifier_pattern"
+                    | "type_identifier"
             ),
             _ => false,
         };
@@ -4324,7 +4343,7 @@ mod borrowed_witness_tests {
         let expected = digest(b"trellis.native-version-witness.v1\0", &bytes);
         assert_eq!(
             expected,
-            "61e957f84731efed9d63e341c682815c86798406ea1524703260ab90a81ebb87"
+            "862fed7c9c4da4d0188771aaac49de5be193a3bccf7b55be58d416c98c49cc31"
         );
         assert_eq!(witness(&f).unwrap(), expected);
         let declarations: Vec<_> = f.declarations.iter().collect();
@@ -5338,7 +5357,7 @@ mod parallel_extraction_tests {
         );
     }
 
-    /// Several files in each of the four languages, with calls, control
+    /// Several files in each of the five languages, with calls, control
     /// regions and nested declarations, spread over several chunks.
     #[test]
     fn parallel_and_sequential_builds_are_identical() {
@@ -5360,6 +5379,10 @@ mod parallel_extraction_tests {
                 format!("js/j{i}.js"),
                 format!("function go{i}(x) {{ if (x > {i}) {{ return helper(x); }} return 0; }}\nfunction helper(y) {{ return y; }}\nclass K {{ run() {{ go{i}(1); }} }}\n"),
             ));
+            files.push((
+                format!("ts/t{i}.ts"),
+                format!("function go{i}(x: number): number {{ if (x > {i}) {{ return helper(x); }} return 0; }}\nfunction helper(y: number): number {{ return y; }}\n"),
+            ));
         }
         let files: Vec<(&str, String)> =
             files.iter().map(|(p, t)| (p.as_str(), t.clone())).collect();
@@ -5377,7 +5400,7 @@ mod parallel_extraction_tests {
         };
         let (sequential, sequential_keys) = observed(SEQUENTIAL);
         let (parallel, parallel_keys) = observed(PARALLEL);
-        assert_eq!(sequential.revision.documents.len(), 16);
+        assert_eq!(sequential.revision.documents.len(), 20);
         for language in LANGUAGES {
             assert!(
                 sequential

@@ -31,3 +31,4 @@ mod schema12_recreate;
 mod schema13_recreate;
 mod schema14_recreate;
 mod sqlite_witness;
+mod typescript_mixed;
