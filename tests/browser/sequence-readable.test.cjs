@@ -147,6 +147,24 @@ test("a lane of several methods opens none; a lane of one method keeps its actio
   assert.deepEqual(await page.evaluate(() => window.opens), ["exact:1:0"]);
 });
 
+// #716 review: a word longer than a header line stays whole in both renderers, inside its box.
+test("both renderers keep a lane word longer than a line whole, and the legacy box holds it", async () => {
+  const view = coordinateView({types:2, methods:1, steps:6});
+  view.participants.find(p => p.column.label === "Type1").column.label = "authenticationconfiguration";
+  assert.equal((await render(view)).status, "rendered");
+  assert.ok((await headers("#sequence-diagram .pele-actor:not(.pele-actor-footer)")).includes("«type» authenticationconfiguration"));
+  const legacy = await page.evaluate(view => {
+    const box = document.getElementById("sequence-diagram");
+    TrellisSequence.render(box, view, null, new Set(), {});
+    const rects = [...box.querySelectorAll("rect.participant")].map(rect => rect.getBoundingClientRect());
+    const texts = [...box.querySelectorAll(".sequence-participant-label")].map(text => text.getBoundingClientRect());
+    return {rects:rects.map(r => [r.left, r.right]), texts:texts.map(r => [r.left, r.right])};
+  }, view);
+  assert.ok((await headers("#sequence-diagram .sequence-participant-label")).includes("«type» authenticationconfiguration"), "never cut inside a word");
+  for (const [i, [left, right]] of legacy.texts.entries()) assert.ok(legacy.rects[i][0] <= left && right <= legacy.rects[i][1], `header ${i} inside its box: ${JSON.stringify(legacy)}`);
+  for (let i = 1; i < legacy.rects.length; i++) assert.ok(legacy.rects[i - 1][1] < legacy.rects[i][0], "boxes never overlap");
+});
+
 test("the legacy renderer draws the same columns", async () => {
   const view = coordinateView({types:2, methods:3, steps:20});
   const positions = await page.evaluate(view => {

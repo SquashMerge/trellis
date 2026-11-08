@@ -411,13 +411,20 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     else columns.set(column.id, {...participant, id:column.id, label:column.label, members:[participant]});
   }
   const participants = [...columns.values()];
+  // A header names its kind and wraps its name between words, as Pele's does, never cutting a
+  // word (#716). A word longer than a line widens every box and the canvas scrolls; the
+  // tallest header sets how far down the lifelines and rows start.
+  const headers = new Map(participants.map(p => [p.id, sequenceLaneHeader(p, p.label, 22)]));
+  const box = Math.max(190, Math.ceil(Math.max(0, ...[...headers.values()].flat().map(line => [...line].length)) * 7.8) + 16);
+  const spacing = box + 20, first = box / 2 + 35;
+  const head = Math.max(0, ...[...headers.values()].map(lines => lines.length - 1)) * 16;
   // Keep a readable guard column even for deeply nested input. The canvas scrolls.
-  const width = Math.max(720, participants.length * 210 + 80, visibleDepth * 10 + 400);
+  const width = Math.max(720, participants.length * spacing + 80, visibleDepth * 10 + 400);
   const svg = make("svg", {viewBox:`0 0 ${width} 200`, width, role:"group", "aria-label":"Static possible paths; resolved declarations where evidenced, not a runtime trace"});
   svg.append(make("title", {}, `${view.seed.name}: measured source steps, not a runtime trace${view.revision?.indexGeneration ? ` · revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}` : ""}`));
-  const positions = new Map(participants.map((p, i) => [p.id, 130 + i * 210]));
+  const positions = new Map(participants.map((p, i) => [p.id, first + i * spacing]));
   const columnX = id => positions.get(sequenceColumn(participantById.get(id)).id);
-  const origin = columnX(view.seed.id) || 130;
+  const origin = columnX(view.seed.id) || first;
   // Steps of an expanded callee body run on that callee's lane (#522); the seed's own
   // steps carry no lane.
   const laneX = step => (step?.lane != null && columnX(step.lane)) || origin;
@@ -428,13 +435,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   const kindLabels = {externalCandidate:"External type · candidate", unresolvedReceiver:"Receiver · type unresolved", unresolvedCallee:"Callee · unresolved", boundary:"Unknown target", builtin:"Built-in name", import:"Imported binding", receiver:"Receiver hint", internal:"Indexed target", method:"Selected method"};
   const compactKinds = {externalCandidate:"candidate", unresolvedReceiver:"unresolved", unresolvedCallee:"unresolved", boundary:"unknown", builtin:"source hint", import:"source hint", receiver:"source hint", internal:"indexed", method:"selected"};
   const shorten = (text, limit) => text.length > limit ? `${text.slice(0, limit-1)}…` : text;
-  // A header names its kind and wraps its name inside its box, never clipping it (#716). The
-  // tallest header sets how far down the lifelines and rows start.
-  const headers = new Map(participants.map(p => [p.id, sequenceLaneHeader(p, p.label, 22).flatMap(line => line.match(/[\s\S]{1,22}/gu) || [""])]));
-  const head = Math.max(0, ...[...headers.values()].map(lines => lines.length - 1)) * 16;
   for (const p of participants) {
     const x = positions.get(p.id), header = headers.get(p.id);
-    svg.append(make("rect", {x:x-95, y:10, width:190, height:44+head, class:"participant"}));
+    svg.append(make("rect", {x:x-box/2, y:10, width:box, height:44+head, class:"participant"}));
     const text = make("text", {x, y:28, "text-anchor":"middle", class:"sequence-participant-label"}, header.length === 1 ? header[0] : undefined);
     if (header.length > 1) for (const [i, line] of header.entries()) text.append(make("tspan", {x, dy:i ? 16 : 0}, line));
     text.append(make("title", {}, p.label)); svg.append(text);

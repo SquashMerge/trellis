@@ -1108,3 +1108,18 @@ test("#716: the legacy renderer shows the same kinds and never clips a lane name
     .map(node => node.children.filter(child => child.tag === "tspan").map(child => child.textContent).join(" ") || node.textContent);
   assert.deepEqual(headers, ["run", "«type» Session", "«module» session", "«class» SemanticEvidence Projection"]);
 });
+test("#716 review: the legacy renderer keeps a word longer than a line whole and widens its boxes", () => {
+  const window = {};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{createElementNS:(_, tag) => new Element(tag)}});
+  const view = namedColumns();
+  view.participants.find(p => p.id === "class").column.label = "authenticationconfiguration";
+  const container = new Element("div");
+  window.TrellisSequence.render(container, view, () => {});
+  const all = node => [node, ...node.children.flatMap(all)];
+  const nodes = all(container);
+  const header = nodes.filter(node => node.attrs.class === "sequence-participant-label").at(-1);
+  assert.deepEqual(header.children.filter(child => child.tag === "tspan").map(child => child.textContent), ["«class»", "authenticationconfiguration"], "Pele's lines, never cut inside a word");
+  const boxes = nodes.filter(node => node.attrs.class === "participant").map(node => ({x:Number(node.attrs.x), width:Number(node.attrs.width)}));
+  for (const box of boxes) assert.ok(box.width >= "authenticationconfiguration".length * 7.8, `box ${box.width} holds the word`);
+  for (const [i, box] of boxes.slice(1).entries()) assert.ok(boxes[i].x + boxes[i].width < box.x, "boxes never overlap");
+});
