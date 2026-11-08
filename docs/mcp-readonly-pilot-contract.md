@@ -420,7 +420,7 @@ existing tools for detail.
 
 ## Amendment (#769): rules tools point to the next call
 
-**Pending owner ratification.** From the 2026-11-07 setup of a new repository and a
+**Status: owner-ratified 2026-11-07.** From the 2026-11-07 setup of a new repository and a
 Claude Desktop session. With no rules file, nothing named the prompt that drafts one.
 A check instance's single kept evidence row gave no route to the rest, so the agent
 read source files instead. Desktop also could not call `trellis_rules_explain` at all,
