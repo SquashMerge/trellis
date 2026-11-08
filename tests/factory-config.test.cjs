@@ -248,6 +248,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "--test", "tests/factory-config.test.cjs"],
         ["node", "docs/semantic-evidence/check-policy.mjs", "--self-test"],
         ["node", "--check", "web/app.js"],
+        ["node", "--import", "./herdr-mod/test/register.mjs", "--test", "herdr-mod/test/mod.test.mjs"],
         ["node", "--test", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs", "tests/metric-heat.test.cjs", "tests/viewer-metrics-ui.test.cjs", "tests/files-ui.test.cjs", "tests/architecture-ui.test.cjs", "tests/architecture-pele-ui.test.cjs", "tests/treemap-ui.test.cjs", "tests/treemap-pele.test.cjs"],
       ],
     };
