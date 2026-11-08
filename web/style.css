@@ -596,6 +596,7 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 #architecture-deviations .deviation-path, #architecture-deviations .deviation-label, #architecture-deviations .deviation-symbol, #architecture-deviations .deviation-target,
 #architecture-deviations .deviation-line { font: 13px/1.5 var(--mono); }
 #architecture-deviations .deviation-path { overflow-wrap: anywhere; }
+#architecture-deviations .deviation-row[data-level="1"] .deviation-path { font-weight: 600; }
 #architecture-deviations .deviation-reach { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-1); min-width: 0; }
 #architecture-deviations .deviation-reason { font-size: 12px; }
 #architecture-deviations .deviation-muted { color: var(--secondary); }
@@ -607,7 +608,7 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 .deviation-primary { min-height: var(--control-min-height); border-radius: var(--radius-control); background: var(--primary); border-color: var(--primary); color: var(--sm-ink); font-weight: 600; }
 .deviation-primary:hover { background: var(--primary); border-color: var(--ink); }
 #architecture-inspector-content .deviation-primary, #architecture-inspector-content .deviation-secondary { display: block; margin-top: var(--sp-2); }
-#architecture-inspector-content .deviation-secondary { min-height: 32px; }
+#architecture-inspector-content .deviation-secondary { min-height: var(--control-min-height); }
 @media (max-width: 900px) {
   #architecture-deviations .deviations-head { display: none; }
   #architecture-deviations .deviation-row { grid-template-columns: minmax(0, 1fr) 56px 72px 32px; }

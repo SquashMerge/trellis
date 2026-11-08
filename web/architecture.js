@@ -84,12 +84,12 @@
       selectionSerial++; pressed = null; inspection = null;
       window.TrellisShell?.clearArchitectureInspector();
     }
-    function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false) {
+    function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false, keepReopen = false) {
       editSerial++; preview = null; selected.clear();
       if (!keepDraft) setBusy(false);
       if (!keepDraft) { draft = null; get("architecture-review-panel").hidden = true; get("architecture-editor").hidden = true; }
       get("architecture-preview-result").hidden = true;
-      serial++; renderSerial++; clearInspection(); deviations.reset(); view = null; basis = null;
+      serial++; renderSerial++; clearInspection(); deviations.reset(keepReopen); view = null; basis = null;
       clearTimeout(buildingTimer); buildingWake?.(); buildingTimer = buildingWake = null;
       get("architecture-diagram").replaceChildren(); get("architecture-diagram").setAttribute("aria-busy", "false");
       get("architecture-legend").replaceChildren(); get("architecture-notice-content").replaceChildren();
@@ -513,7 +513,7 @@
       return `Building Architecture for this revision: ${phase}${count}…`;
     }
     async function refresh(options = {}) {
-      reset(undefined, options.keepDraft === true);
+      reset(undefined, options.keepDraft === true, true);
       const c = capture();
       if (!c.rootKey || !c.pin) { state("Choose an indexed checkout, then open Architecture.", "empty"); return; }
       loadDisplay(c.rootKey);
@@ -524,6 +524,7 @@
       return new Promise(resolve => { buildingWake = resolve; buildingTimer = setTimeout(resolve, delay); });
     }
     async function read(c, options) {
+      let settled = false;
       try {
         const query = new URLSearchParams({aggregate:c.aggregate, role:c.role, workbench:"true", indexGeneration:c.pin.indexGeneration, indexRevision:String(c.pin.indexRevision)});
         let data, payload;
@@ -543,14 +544,16 @@
         if (payload.state === "no_layers") { state("No authored layers are configured. Existing authored exceptions can still be edited or removed. Review .trellis/rules.toml to configure layers.", "empty"); overview(); }
         else await render();
         if (options.keepDraft === true) { get("architecture-review-panel").hidden = false; renderReview(); }
-        void deviations.afterRefresh();
+        settled = true; void deviations.afterRefresh();
       } catch (error) {
         if (!current(c) || error.name === "AbortError") return;
         const diagnostic = error.diagnostic;
         state(diagnostic ? `${diagnostic.code || "invalid_rules"} · ${diagnostic.path}:${diagnostic.line}:${diagnostic.column} · ${diagnostic.kind} · ${diagnostic.message}` : error.message || "Architecture unavailable. Select the Architecture tab again to retry.", "error");
         if (diagnostic) disclosure(get("architecture-notice-content"), "Located rules diagnostic", diagnostic);
         if (error.status === 409 && ["revision_conflict", "pin_expired", "root_changed"].includes(error.code)) onConflict();
-      } finally { if (current(c)) get("architecture-diagram").setAttribute("aria-busy", "false"); }
+      } finally {
+        if (current(c)) { get("architecture-diagram").setAttribute("aria-busy", "false"); if (!settled) deviations.reset(); }
+      }
     }
     function same(a, b) { return moduleKey(a) === moduleKey(b); }
     function inspectorSource(target, identity, site, active) {
