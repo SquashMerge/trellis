@@ -306,7 +306,7 @@ Supported mapping is deliberately narrow:
   catalog below. Relative misses never fall back to builtin or npm labels.
 - **Python:** captured `m.py` or `m/__init__.py` layouts at the checkout root or
   a declared source root require unique module ownership and proved `__init__.py`
-  package prefixes. Declared source roots (#771) are the literal relative
+  package prefixes. Declared source roots (#771, owner-ratified 2026-11-07) are the literal relative
   directories the captured root `pyproject.toml` names in `tool.uv.workspace.members`,
   `tool.setuptools.package-dir` key `""` and `tool.setuptools.packages.find.where`,
   plus the parent directory of each `tool.hatch.build.targets.wheel.packages` entry.

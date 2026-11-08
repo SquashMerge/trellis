@@ -163,6 +163,42 @@ fn nested_file_without_a_proved_package_under_its_root_does_not_compete() {
 }
 
 #[test]
+fn filtered_wildcard_through_an_overlapping_root_keeps_its_intermediate_proof() {
+    // `src/pkg/mod.py` is proved both as `src.pkg.mod` and, under the `src` root, as
+    // `pkg.mod`: it has no unique membership, but the import route still proves it.
+    let (_state, _root, store, pin) = fixture(&[
+        (
+            "pyproject.toml",
+            "[project]\nname = 'core'\n[tool.setuptools]\npackage-dir = { \"\" = \"src\" }\n",
+        ),
+        ("src/__init__.py", ""),
+        ("src/pkg/__init__.py", ""),
+        ("src/pkg/mod.py", "from shared import run\n"),
+        ("shared.py", "def run():\n    pass\n"),
+        ("use.py", "from pkg.mod import *\n"),
+    ]);
+    let response = store.evidence_response().unwrap();
+    let value = response
+        .architecture_response(
+            "references",
+            &json!({"expectedBasis":pin,"paths":["use.py"]}),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    let data = response.finish(value).unwrap();
+    assert!(has_edge(&data, "use.py", "shared.py"), "{data}");
+    let modules: Vec<_> = data["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|module| module["identity"]["path"].as_str().unwrap())
+        .collect();
+    for path in ["src/pkg/__init__.py", "src/pkg/mod.py"] {
+        assert!(modules.contains(&path), "{path} missing from {modules:?}");
+    }
+}
+
+#[test]
 fn nested_pyproject_without_a_declaring_root_stays_unknown() {
     let (_state, _root, store, pin) = fixture(&[("pyproject.toml", "[project]\nname = 'core'\n")]);
     let data = read(&store, "references", pin);

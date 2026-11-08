@@ -80,7 +80,8 @@ pub(super) struct Catalog {
     module_proofs: BTreeMap<usize, BTreeSet<usize>>,
     child_names: BTreeMap<usize, BTreeSet<String>>,
     roots: BTreeSet<(String, String)>,
-    source_roots: BTreeMap<String, BTreeSet<String>>,
+    /// Declared source roots of each source set, by directory, with their root ids.
+    source_roots: BTreeMap<String, BTreeMap<String, usize>>,
     file_declarations: BTreeMap<usize, DeclarationId>,
     test_modules: BTreeSet<usize>,
     results: BTreeMap<(usize, usize, usize), SiteResolution>,
@@ -104,7 +105,10 @@ impl Catalog {
             module_proofs: BTreeMap::new(),
             child_names: BTreeMap::new(),
             roots: BTreeSet::new(),
-            source_roots: source_roots(manifests, work, check)?,
+            source_roots: source_roots(manifests, work, check)?
+                .into_iter()
+                .map(|(set, roots)| (set, roots.into_iter().zip(1..).collect()))
+                .collect(),
             file_declarations: BTreeMap::new(),
             test_modules: BTreeSet::new(),
             results: BTreeMap::new(),
@@ -138,7 +142,9 @@ impl Catalog {
             for (path, package, root) in module_paths(
                 &doc.key.path,
                 result.source_roots.get(&doc.key.source_set_id),
-            ) {
+                work,
+                check,
+            )? {
                 if let Some(first) = path.first() {
                     owner_step(work, check)?;
                     result
@@ -175,9 +181,12 @@ impl Catalog {
             let source_set = &input.key.source_set_id;
             // A file proved under two roots has no unique package for relative imports.
             let mut proved = Vec::new();
-            for (path, package, _) in
-                module_paths(&input.key.path, result.source_roots.get(source_set))
-            {
+            for (path, package, _) in module_paths(
+                &input.key.path,
+                result.source_roots.get(source_set),
+                work,
+                check,
+            )? {
                 if let Ok(layout) = result.layout(source_set, &path, work, check)?
                     && layout.document == doc.document
                 {
@@ -872,7 +881,18 @@ impl Catalog {
                 ..Names::default()
             }));
         }
-        self.exports(layout.document, depth, route, work, check)
+        // The route's own layout proof, not only unique membership, proves the target (#771).
+        let mut names = std::sync::Arc::unwrap_or_clone(self.exports(
+            layout.document,
+            depth,
+            route,
+            work,
+            check,
+        )?);
+        for bucket in names.names.values_mut() {
+            extend_proof(bucket, &layout.proof, work, check)?;
+        }
+        Ok(std::sync::Arc::new(names))
     }
     fn exports(
         &self,
@@ -1240,19 +1260,29 @@ fn source_roots(
     Ok(result)
 }
 /// A file's module path under the checkout root (root 0), then under each declared source
-/// root that contains it (root 1 onward, in sorted order).
-fn module_paths(path: &str, roots: Option<&BTreeSet<String>>) -> Vec<(Vec<String>, bool, usize)> {
-    let nested = roots
+/// root (by id) that is one of its ancestor directories. Each ancestor costs one charged
+/// lookup, so the work follows path depth, not the number of declared roots.
+fn module_paths(
+    path: &str,
+    roots: Option<&BTreeMap<String, usize>>,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Vec<(Vec<String>, bool, usize)>> {
+    let mut result: Vec<_> = module_path(path)
+        .map(|(path, package)| (path, package, 0))
         .into_iter()
-        .flatten()
-        .enumerate()
-        .filter_map(|(i, root)| {
-            Some((path.strip_prefix(root.as_str())?.strip_prefix('/')?, i + 1))
-        });
-    std::iter::once((path, 0))
-        .chain(nested)
-        .filter_map(|(path, root)| module_path(path).map(|(path, package)| (path, package, root)))
-        .collect()
+        .collect();
+    if let Some(roots) = roots {
+        for (end, _) in path.match_indices('/') {
+            owner_step(work, check)?;
+            if let Some(&root) = roots.get(&path[..end])
+                && let Some((path, package)) = module_path(&path[end + 1..])
+            {
+                result.push((path, package, root));
+            }
+        }
+    }
+    Ok(result)
 }
 fn module_path(path: &str) -> Option<(Vec<String>, bool)> {
     let package = path.ends_with("/__init__.py");
@@ -1847,12 +1877,17 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     fn documents() -> Vec<DocumentInput> {
-        let root = tempfile::tempdir().unwrap();
-        for (path, text) in [
+        documents_with(&[
             ("use.py", "from provider import *\n"),
             ("provider.py", "def public_name():\n    pass\n"),
-        ] {
-            std::fs::write(root.path().join(path), text).unwrap();
+        ])
+    }
+    fn documents_with(files: &[(&str, &str)]) -> Vec<DocumentInput> {
+        let root = tempfile::tempdir().unwrap();
+        for (path, text) in files {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
         }
         let identity =
             crate::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
@@ -2019,5 +2054,45 @@ packages = ["core", "pkgs/one/one", "pkgs/two/two"]
         assert!(roots("Cargo.toml", declared).is_empty());
         assert!(roots("pyproject.toml", "[tool.uv.workspace\nmembers = ['a']").is_empty());
         assert!(roots("pyproject.toml", "[project]\nname = 'x'\n").is_empty());
+    }
+
+    /// Candidate-root tests are charged work: one lookup per ancestor directory of each
+    /// Python file, in each of the two module-path passes, however many roots are declared.
+    #[test]
+    fn declared_roots_charge_ancestor_lookups_not_roots_times_documents() {
+        let paths: Vec<_> = (0..20).map(|i| format!("a/b/c/d/e/m{i}.py")).collect();
+        let files: Vec<_> = paths.iter().map(|path| (path.as_str(), "")).collect();
+        let documents = documents_with(&files);
+        let docs: Vec<_> = documents.iter().collect();
+        let trees: Vec<_> = docs
+            .iter()
+            .map(|doc| parse(doc, &mut || Ok(())).unwrap())
+            .collect();
+        // Work used by the catalog, less the manifest's own parsing charge.
+        let used = |members: Option<&[String]>| {
+            let mut manifests = Vec::new();
+            let mut parsing = 0;
+            if let Some(members) = members {
+                let quoted: Vec<_> = members.iter().map(|m| format!("'{m}'")).collect();
+                let text = format!("[tool.uv.workspace]\nmembers = [{}]\n", quoted.join(","));
+                parsing = 1 + text.len() + members.iter().map(String::len).sum::<usize>();
+                manifests.push(external::ManifestInput {
+                    source_set_id: docs[0].key.source_set_id.clone(),
+                    native_revision_id: "revision".into(),
+                    dependency_hash: "dependencies".into(),
+                    path: "pyproject.toml".into(),
+                    content_hash: Some("hash".into()),
+                    bytes: Some(text.into_bytes()),
+                });
+            }
+            let mut work = Work::new(work::reference_limit(docs.len(), 1 << 20));
+            Catalog::new(&docs, &trees, &manifests, &[], &mut work, &mut || Ok(())).unwrap();
+            work.used - parsing
+        };
+        let base = used(None);
+        let lookups = 2 * paths.len() * 5;
+        assert_eq!(used(Some(&["plugins/x".into()])) - base, lookups);
+        let many: Vec<_> = (0..2000).map(|i| format!("plugins/p{i}")).collect();
+        assert_eq!(used(Some(&many)) - base, lookups);
     }
 }
