@@ -143,6 +143,20 @@ fn javascript_methods_share_their_class_and_functions_their_file() {
 }
 
 #[test]
+fn typescript_methods_share_their_class_and_functions_their_file() {
+    let source = "class A {\n  run(): void { this.one(); free(); }\n  one(): void {}\n}\nfunction free(): void {}\n";
+    let view = publish(
+        &[("web/a.ts", source)],
+        s::Language::Typescript,
+        vec![bind("run", 0, "one"), bind("run", 1, "free")],
+    );
+    assert_eq!(
+        columns(&view),
+        [("run", "A"), ("one", "A"), ("free", "a.ts")]
+    );
+}
+
+#[test]
 fn java_methods_share_their_class_and_a_nested_class_is_its_own() {
     let source = "class A {\n  void run() { one(); new B().two(); }\n  void one() {}\n  static class B { void two() {} }\n}\n";
     let view = publish(

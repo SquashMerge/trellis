@@ -1716,6 +1716,7 @@ impl Store {
         let physical_lines = file.text.lines().count();
         let source = crate::metrics::SourceInput {
             language: &key.language,
+            path: &key.path,
             content_hash: &file.hash,
             text: &file.text,
         };

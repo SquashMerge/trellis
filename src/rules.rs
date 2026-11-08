@@ -376,8 +376,8 @@ fn target_valid(t: &ConfigTarget) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn languages(s: &str) -> bool {
-    matches!(s, "java" | "rust" | "python" | "javascript")
+pub(crate) fn languages(s: &str) -> bool {
+    matches!(s, "java" | "rust" | "python" | "javascript" | "typescript")
 }
 pub fn parse(text: &str) -> Result<Config> {
     if text.len() > CONFIG_BYTES {
@@ -1095,12 +1095,32 @@ fn base_texts(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
         .filter_map(|n| source.get(n.byte_range()).map(str::to_owned))
         .collect()
 }
+/// Each `extends` value from its start to the end of the `type_arguments` that follows it.
+fn ts_extends_texts(clause: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
+    let nodes = children(clause);
+    let mut texts = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if clause.field_name_for_named_child(index as u32) != Some("value") {
+            continue;
+        }
+        let end = nodes
+            .get(index + 1)
+            .filter(|next| next.kind() == "type_arguments")
+            .map_or(node.end_byte(), |next| next.end_byte());
+        if let Some(text) = source.get(node.start_byte()..end) {
+            texts.push(text.to_owned());
+        }
+    }
+    texts
+}
 fn has_bases(node: tree_sitter::Node<'_>) -> bool {
     matches!(
         node.kind(),
         "class_declaration"
+            | "abstract_class_declaration"
             | "class_definition"
             | "interface_declaration"
+            | "type_alias_declaration"
             | "impl_item"
             | "trait_item"
             | "enum_declaration"
@@ -1121,6 +1141,7 @@ fn parse_bases(
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(&doc.key.path),
         _ => anyhow::bail!("store_unavailable: unknown selector language"),
     };
     let mut parser = tree_sitter::Parser::new();
@@ -1222,6 +1243,36 @@ fn parse_bases(
                             .map(|b| base_texts(b, source))
                             .unwrap_or_default(),
                     );
+                }
+                "typescript" => {
+                    let mut extends = Vec::new();
+                    let mut implements = Vec::new();
+                    for heritage in children(n)
+                        .into_iter()
+                        .filter(|c| c.kind() == "class_heritage")
+                    {
+                        for clause in children(heritage) {
+                            match clause.kind() {
+                                "extends_clause" => {
+                                    extends.extend(ts_extends_texts(clause, source))
+                                }
+                                "implements_clause" => {
+                                    implements.extend(base_texts(clause, source))
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    for clause in children(n)
+                        .into_iter()
+                        .filter(|c| c.kind() == "extends_type_clause")
+                    {
+                        extends.extend(base_texts(clause, source));
+                    }
+                    bases = Bases {
+                        extends: Some(extends),
+                        implements: Some(implements),
+                    };
                 }
                 "rust" if n.kind() == "impl_item" => {
                     bases.implements = Some(

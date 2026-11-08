@@ -117,6 +117,7 @@ fn cancelled_parse_never_enters_memo() {
     let mut first = true;
     let input = || SourceInput {
         language: "rust",
+        path: "example",
         content_hash: "hash",
         text: src,
     };
@@ -170,6 +171,7 @@ fn completed_memo_rebinds_native_identity_and_call_sites() {
         &mut memo,
         SourceInput {
             language: "java",
+            path: "example",
             content_hash: "same",
             text: src,
         },
@@ -198,6 +200,7 @@ fn completed_memo_rebinds_native_identity_and_call_sites() {
         &mut memo,
         SourceInput {
             language: "java",
+            path: "example",
             content_hash: "same",
             text: src,
         },
@@ -318,6 +321,7 @@ fn memo_does_not_publish_after_bind_cancellation() {
         &mut memo,
         SourceInput {
             language: "python",
+            path: "example",
             content_hash: "h",
             text: src,
         },
@@ -846,6 +850,7 @@ fn resident_memo_limit_evicts_fifo_and_never_caches_oversized_score() {
             &mut tiny,
             SourceInput {
                 language: "rust",
+                path: "example",
                 content_hash: "a",
                 text: src,
             },
@@ -869,6 +874,7 @@ fn resident_memo_limit_evicts_fifo_and_never_caches_oversized_score() {
             &mut memo,
             SourceInput {
                 language: "rust",
+                path: "example",
                 content_hash: hash,
                 text: src,
             },
@@ -968,6 +974,7 @@ fn deadline_from_parser_and_cancellation_during_score_walk_keep_memo_empty() {
         &mut memo,
         SourceInput {
             language: "rust",
+            path: "example",
             content_hash: "parse",
             text: src,
         },
@@ -997,6 +1004,7 @@ fn deadline_from_parser_and_cancellation_during_score_walk_keep_memo_empty() {
         &mut memo,
         SourceInput {
             language: "rust",
+            path: "example",
             content_hash: "walk",
             text: src,
         },
@@ -1186,6 +1194,10 @@ fn labeled_break_adds_flat_cognitive_without_branch() {
         (
             "javascript",
             "function calc() { outer: while (true) { break outer; } }",
+        ),
+        (
+            "typescript",
+            "function calc(): void { outer: while (true) { break outer; } }",
         ),
         ("rust", "fn calc() { 'outer: loop { break 'outer; } }"),
     ] {
@@ -1437,6 +1449,7 @@ fn every_grammar_binds_the_current_declaration_role() {
                 &mut memo,
                 SourceInput {
                     language,
+                    path: "example",
                     content_hash: "same",
                     text: source,
                 },
@@ -1477,6 +1490,7 @@ fn warm_memo_rebinds_reordered_callables_by_source_range_and_current_role() {
     let mut memo = MetricsMemo::new(1024 * 1024);
     let input = || SourceInput {
         language: "rust",
+        path: "example",
         content_hash: "same-two-callables",
         text: &source,
     };
@@ -1557,4 +1571,55 @@ fn syntax_past_the_score_bounds_is_unmeasured_not_refused() {
     )
     .unwrap();
     assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn typescript_scores_follow_the_grammar_its_path_selects() {
+    let src = "function calc(x: number, y: number) {\n  if (x && y) { return new Box<number>(<number>x); }\n  return y;\n}\n";
+    let mut memo = MetricsMemo::new(1024 * 1024);
+    let mut scored = |path: &'static str| {
+        let mut native = declaration("typescript", src.trim_end().len());
+        native.document.path = path.into();
+        metrics::compute_memoized(
+            &mut memo,
+            SourceInput {
+                language: "typescript",
+                path,
+                content_hash: "identical-bytes",
+                text: src,
+            },
+            &[native],
+            &[],
+            &[],
+            &mut || Ok(()),
+        )
+        .unwrap()
+    };
+    let ts = scored("src/a.ts");
+    let tsx = scored("src/a.tsx");
+    assert_eq!(ts[0].metrics.cyclomatic, 3);
+    assert_ne!(
+        ts[0].metrics, tsx[0].metrics,
+        "a `<T>x` cast parses only in .ts, so the two documents must not share scores"
+    );
+    assert_eq!(scored("src/b.ts")[0].metrics, ts[0].metrics);
+}
+
+#[test]
+fn a_typescript_new_self_call_is_syntactic_recursion() {
+    let recursive = native_rows(
+        "typescript",
+        "case.ts",
+        "function Calc(): void { new Calc(); }\n",
+    );
+    let other = native_rows(
+        "typescript",
+        "case.ts",
+        "function Calc(): void { new Other(); }\n",
+    );
+    assert_eq!(recursive[0].metrics.fan_out, 1);
+    assert_eq!(
+        recursive[0].metrics.cognitive,
+        other[0].metrics.cognitive + 1
+    );
 }

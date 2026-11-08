@@ -183,3 +183,9 @@ test("measured viewport sets a non-square native layout; tiny or crowded panels 
   assert.deepEqual({...adapter.layoutSize(10,{width:1000.6,height:500.4})},{width:1000,height:500},"an uncrowded panel is filled exactly");
   assert.deepEqual({...adapter.layoutSize(4,undefined)},{width:640,height:640});
 });
+test("the treemap language select offers TypeScript after JavaScript",()=>{
+  const html=fs.readFileSync("web/index.html","utf8");
+  const select=html.match(/<select id="treemap-language">(.*?)<\/select>/s)[1];
+  const values=[...select.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g)].map(m=>[m[1],m[2]]);
+  assert.deepEqual(values,[["","All languages"],["rust","Rust"],["java","Java"],["python","Python"],["javascript","JavaScript"],["typescript","TypeScript"]]);
+});

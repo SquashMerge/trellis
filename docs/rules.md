@@ -157,7 +157,7 @@ shared = true
 external = [{ language = "rust", package = "std", stdlib = true }]
 ```
 
-`language` is `rust`, `java`, `python` or `javascript`. `package` is a literal
+`language` is `rust`, `java`, `python`, `javascript` or `typescript`. `package` is a literal
 canonical identity, not a glob, import alias or version; `stdlib` is required and
 distinguishes standard-library targets from declared dependencies of the same
 spelling. Canonical dependency names are Cargo's upstream declared package name
@@ -205,7 +205,7 @@ The closed top-level keys are `version`, `layer_policy`, `external_policy`, `lay
 `roles`, `rules` and `exceptions`. `version` is required and exactly `1`; optional collections
 start empty. A selector has at least one of `paths`, `name`, `language`, `extends`
 and `implements`. Keys combine with AND; entries within `paths` or `language`
-combine with OR. Languages are `java`, `rust`, `python`, `javascript`. Name patterns
+combine with OR. Languages are `java`, `rust`, `python`, `javascript`, `typescript`. Name patterns
 match the measured nullable name; null never receives an invented name.
 
 `extends` and `implements` **selectors** match direct header syntax spelling where
@@ -356,7 +356,7 @@ are syntax. Unsupported coverage and unresolved counts stay visible. Paths hidde
 behind unproved aliases are not claimed covered. Rust/Java external-name
 uncertainty does not veto an independently proved in-repo wildcard name; two
 native candidates, macro/cfg uncertainty or unproved explicit bindings still do.
-Python/JavaScript retain wildcard-only names as unknown under external-name
+Python/JavaScript/TypeScript retain wildcard-only names as unknown under external-name
 uncertainty unless an explicit/local binding settles them. This is **syntactic,
 structurally mapped reference evidence**, not a compiler dependency graph,
 resolved library membership or call binding. A positive mapped upward reference can deviate under this syntax contract;
@@ -406,8 +406,8 @@ destination = { language = "rust", path = "src/navigation.rs" }
 reason = "Concrete reviewed justification for this observed pair"
 ```
 
-Both fields are required at each endpoint. Language is `rust`, `java`, `python`
-or `javascript`. Paths are nonempty, literal, case-sensitive repository-relative
+Both fields are required at each endpoint. Language is `rust`, `java`, `python`,
+`javascript` or `typescript`. Paths are nonempty, literal, case-sensitive repository-relative
 paths, not globs, basenames or suffix matches. Wildcard markers `*` and `?` are
 invalid, as are absolute paths, backslashes, NUL, colons, empty components, `.` and
 `..` components. Existing path-length bounds apply. There is no case normalization
@@ -539,7 +539,7 @@ an over-deep one:
 - In Rust, every scope of the file is opaque, and an explicit name there is unknown too. A
   file below it that its text names, but its tree doesn't declare, could have it as a second
   owner, so that file and everything below it have no proved crate.
-- In JavaScript and Python, the file counts as dynamic: its exports are unknown.
+- In JavaScript, TypeScript and Python, the file counts as dynamic: its exports are unknown.
 - In Java, no type root or explicit import of the file is proved, and neither is any type of
   its package, nor any name another file's type root could lose to a type hidden there. A
   broken package declaration, or a broken file with none that still spells `package`, leaves
@@ -549,7 +549,7 @@ an over-deep one:
 - A selector's `extends` or `implements` on a type in the file is unknown, not false.
 
 Sites that survive in the recovered tree keep the resolution their language gives them: an
-intact `import` of a broken JavaScript or Python file still maps its literal path.
+intact `import` of a broken JavaScript, TypeScript or Python file still maps its literal path.
 
 `evidence_budget` names a document published with no evidence but its file module, because
 its facts exceed a [per-file budget](daemon-v1.md#current-limits) (#564). `range` is the whole file and
@@ -759,7 +759,7 @@ No Python third-party mapping table, installed-distribution lookup or additional
 mapping-metadata capture is part of this slice.
 
 
-JavaScript uses `ecosystem:"npm"` only for supported declarations in the captured
+JavaScript and TypeScript use `ecosystem:"npm"` only for supported declarations in the captured
 root `package.json`: `dependencies`, `devDependencies`, `optionalDependencies`
 and `peerDependencies`. Constraints are literal decimal `M.m.p`, `^M.m.p` or
 `~M.m.p`, without leading-zero components, whitespace, suffixes or compound ranges.

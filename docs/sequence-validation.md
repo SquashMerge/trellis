@@ -37,7 +37,14 @@ effects remain explicit boundaries rather than fabricated steps. Bounds preserve
 and source-backed call evidence where possible. Implicit getter/coercion effects are not
 expanded.
 
-The language-neutral DTO and renderer are separated from the JavaScript adapter. For now,
+TypeScript documents (`.ts`, `.tsx`, `.mts`, `.cts`) use the JavaScript adapter with the
+TypeScript grammar (`tsx` for `.tsx`). Type-only syntax (annotations, type arguments and
+parameters, interfaces, aliases) adds no behavior; `as`, `satisfies`, `!` and `<T>x` expressions
+walk only their value; a plain typed parameter needs no boundary. An overload, ambient or abstract
+signature has no body, so its view is one boundary, "TypeScript declaration has no body;
+behavior unknown." Every other TypeScript form the adapter does not model stays a boundary.
+
+The language-neutral DTO and renderer are separated from the JavaScript and TypeScript adapter. For now,
 behavior is derived on demand from cached indexed source and measured calls; this does not
 read the live workspace or change the persistent graph schema.
 

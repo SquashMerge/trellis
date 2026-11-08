@@ -1138,3 +1138,48 @@ async fn workbench_metrics_option_is_explicit_and_strict() {
             .unwrap();
     assert_eq!(data["error"]["code"], "invalid_rules");
 }
+
+#[tokio::test]
+async fn typescript_is_a_metrics_language_and_other_spellings_are_refused() {
+    let (_base, _runtime, browser, key) = fixture_with_identity(
+        None,
+        true,
+        false,
+        false,
+        false,
+        &[(
+            "typed.ts",
+            "function typed(x: number) { return <number>x; }\n",
+        )],
+    )
+    .await;
+    let app = browser.router();
+    let (status, response) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let generation = response["payload"]["indexGeneration"].as_str().unwrap();
+    let revision = response["payload"]["indexRevision"].as_u64().unwrap();
+    let file = response["payload"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"] == "typed.ts")
+        .unwrap_or_else(|| panic!("typed.ts missing: {response}"));
+    assert_eq!(file["language"], "typescript");
+    let source = file["sourceSetId"].as_str().unwrap();
+    let selector = |language: &str| {
+        format!(
+            "?scope=file&sourceSetId={source}&language={language}&path=typed.ts&indexGeneration={generation}&indexRevision={revision}"
+        )
+    };
+    let (status, typed) = request(app.clone(), &key, &selector("typescript")).await;
+    assert_eq!(status, StatusCode::OK, "{typed}");
+    assert_eq!(
+        typed["payload"]["declarations"][0]["language"],
+        "typescript"
+    );
+    for language in ["TypeScript", "ts"] {
+        let (status, error) = request(app.clone(), &key, &selector(language)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{language}: {error}");
+        assert_eq!(error["error"]["code"], "invalid_request");
+    }
+}

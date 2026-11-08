@@ -1,4 +1,4 @@
-//! JavaScript-only adapter. No execution, filesystem reads, or model calls.
+//! JavaScript and TypeScript adapter. No execution, filesystem reads, or model calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
 use crate::behavior::{CONTINUES_LABEL, Participant, SequenceStep, SequenceView, fold_guard};
 use crate::model::{CallSite, IndexPin, SourceFile, SourceRange, Symbol, SymbolKind};
@@ -41,6 +41,25 @@ fn callable(n: Node<'_>) -> bool {
             | "arrow_function"
             | "method_definition"
     )
+}
+/// A TypeScript declaration with no body: an overload, ambient or abstract signature.
+fn signature(n: Node<'_>) -> bool {
+    matches!(
+        n.kind(),
+        "function_signature" | "method_signature" | "abstract_method_signature"
+    )
+}
+/// A TypeScript parameter that is only a name: no pattern, default or implicit read.
+fn plain_parameter(p: Node<'_>) -> bool {
+    match p.kind() {
+        "identifier" => true,
+        "required_parameter" | "optional_parameter" => {
+            p.child_by_field_name("value").is_none()
+                && p.child_by_field_name("pattern")
+                    .is_some_and(|pattern| pattern.kind() == "identifier")
+        }
+        _ => false,
+    }
 }
 fn optional_chain(n: Node<'_>) -> bool {
     // Follow only the callee/receiver chain, never argument strings or subexpressions.
@@ -87,6 +106,7 @@ impl Flow {
     }
 }
 struct Builder<'a> {
+    language: &'static str,
     file: &'a SourceFile,
     seed: &'a Symbol,
     calls: &'a [CallSite],
@@ -193,7 +213,11 @@ impl Builder<'_> {
             return self.boundary(n, "Depth limit: behavior omitted.");
         }
         if n.has_error() || n.is_missing() {
-            return self.boundary(n, "Malformed JavaScript: behavior cannot be established.");
+            let message = format!(
+                "Malformed {}: behavior cannot be established.",
+                self.language
+            );
+            return self.boundary(n, &message);
         }
         if callable(n) || matches!(n.kind(), "class" | "class_declaration") {
             return self.boundary(n, "Nested function/callback/class boundary: bodies are not executed here; class definition effects (base, computed keys, static initialization) are not expanded.");
@@ -248,6 +272,20 @@ impl Builder<'_> {
                 }
             }
             "call_expression" | "new_expression" => self.call(n, depth),
+            "as_expression" | "satisfies_expression" | "non_null_expression" => n
+                .named_child(0)
+                .map_or_else(Flow::empty, |c| self.walk(c, depth + 1)),
+            "type_assertion" => named(n)
+                .last()
+                .map_or_else(Flow::empty, |c| self.walk(*c, depth + 1)),
+            "type_annotation"
+            | "type_arguments"
+            | "type_parameters"
+            | "predefined_type"
+            | "type_identifier"
+            | "generic_type"
+            | "interface_declaration"
+            | "type_alias_declaration" => Flow::empty(),
             "member_expression" | "subscript_expression" if optional_chain(n) => self.boundary(
                 n,
                 "Optional-chain access: guarded property evaluation not expanded.",
@@ -343,7 +381,8 @@ impl Builder<'_> {
             | "array_pattern"
             | "object_pattern"
             | "pair_pattern"
-            | "rest_pattern" => self.children(n, depth),
+            | "rest_pattern"
+            | "instantiation_expression" => self.children(n, depth),
             "identifier"
             | "property_identifier"
             | "private_property_identifier"
@@ -604,17 +643,22 @@ pub fn build(
         seed.range.start_byte < seed.range.end_byte && seed.range.end_byte <= file.text.len(),
         "invalid symbol source range"
     );
+    let (language, grammar) = if file.language == "typescript" {
+        ("TypeScript", crate::indexer_ts::grammar(&file.path))
+    } else {
+        ("JavaScript", tree_sitter_javascript::LANGUAGE.into())
+    };
     let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_javascript::LANGUAGE.into())?;
+    parser.set_language(&grammar)?;
     let tree = parser
         .parse(&file.text, None)
-        .context("JavaScript parse unavailable")?;
+        .with_context(|| format!("{language} parse unavailable"))?;
     let mut node = tree.root_node();
     // Locate the exact indexed function, not a nested body or an approximate span.
     loop {
         if node.start_byte() == seed.range.start_byte
             && node.end_byte() == seed.range.end_byte
-            && callable(node)
+            && (callable(node) || signature(node))
         {
             break;
         }
@@ -626,12 +670,20 @@ pub fn build(
             None => break,
         }
     }
-    let mut b = Builder { file, seed, calls, bindings: crate::behavior_bindings::Bindings::new(tree.root_node(), &file.text), count: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
+    let mut b = Builder { language, file, seed, calls, bindings: crate::behavior_bindings::Bindings::new(tree.root_node(), &file.text), count: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
         revision, seed: seed.clone(), participants: vec![Participant { declaration: None, column: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not observed runtime order. Selectivity is an uncalibrated conservative heuristic. Implicit getters, coercions, iteration protocols, and other runtime effects are not expanded.".into()],
         hidden_steps: 0, truncated: false, truncated_by: vec![],
     }};
-    let f = if !callable(node)
+    let f = if signature(node)
+        && node.start_byte() == seed.range.start_byte
+        && node.end_byte() == seed.range.end_byte
+    {
+        b.boundary(
+            node,
+            "TypeScript declaration has no body; behavior unknown.",
+        )
+    } else if !callable(node)
         || node.start_byte() != seed.range.start_byte
         || node.end_byte() != seed.range.end_byte
     {
@@ -640,14 +692,12 @@ pub fn build(
             "Indexed function does not match cached syntax; behavior unknown.",
         )
     } else if node.has_error() {
-        b.boundary(
-            node,
-            "Malformed JavaScript: behavior cannot be established.",
-        )
+        let message = format!("Malformed {language}: behavior cannot be established.");
+        b.boundary(node, &message)
     } else {
         let mut f = b.field(node, "body", 0);
         if let Some(params) = node.child_by_field_name("parameters")
-            && named(params).iter().any(|p| p.kind() != "identifier")
+            && !named(params).into_iter().all(plain_parameter)
         {
             let mut boundary = b.boundary(params, "Parameter defaults/destructuring may execute before the body; behavior not expanded.").steps;
             boundary.extend(f.steps);
@@ -657,4 +707,136 @@ pub fn build(
     };
     b.view.steps = f.steps;
     Ok(b.view)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build;
+    use crate::behavior::{SequenceStep, SequenceView};
+    use crate::model::{
+        IndexPin, Provenance, SemanticState, SourceFile, SourceRange, Symbol, SymbolKind,
+    };
+
+    /// The Sequence view of the declaration that starts at `start` and ends at the first
+    /// `end` after it (inclusive), in a file of `language` at `path`.
+    fn sequence(language: &str, path: &str, text: &str, start: &str, end: &str) -> SequenceView {
+        let from = text.find(start).unwrap();
+        let to = from + text[from..].find(end).unwrap() + end.len();
+        let file = SourceFile {
+            path: path.into(),
+            hash: String::new(),
+            language: language.into(),
+            text: text.into(),
+        };
+        let seed = Symbol {
+            id: "seed".into(),
+            name: "f".into(),
+            display_label: None,
+            kind: SymbolKind::Function,
+            path: path.into(),
+            range: SourceRange {
+                start_byte: from,
+                end_byte: to,
+                ..SourceRange::default()
+            },
+            parent: None,
+            accessor: false,
+            provenance: Provenance {
+                projection: None,
+                source: "test".into(),
+                semantic: SemanticState::Unavailable,
+            },
+        };
+        let pin = IndexPin {
+            index_generation: uuid::Uuid::nil(),
+            index_revision: 1,
+        };
+        build(pin, &seed, &file, &[], false).unwrap()
+    }
+
+    fn boundaries(steps: &[SequenceStep]) -> Vec<&str> {
+        steps
+            .iter()
+            .filter(|step| step.kind == "boundary")
+            .map(|step| step.label.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn type_only_syntax_adds_no_behavior() {
+        let text = "function f(a: number, b?: string): void {\n  const c: Foo<T> = (a as Foo<T>);\n  const d = c satisfies Foo<T>;\n  const e = d!;\n  const g = <Foo>e;\n  const h = id<number>;\n  interface Local { x: number }\n  type Alias = Local;\n}\n";
+        let view = sequence("typescript", "a.ts", text, "function f", "\n}");
+        assert_eq!(boundaries(&view.steps), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn calls_inside_typescript_casts_are_still_walked() {
+        let text = "function f() {\n  g() as T;\n  h() satisfies T;\n  k()!;\n  <T>m();\n}\n";
+        let view = sequence("typescript", "a.ts", text, "function f", "\n}");
+        assert_eq!(
+            boundaries(&view.steps),
+            ["Call has no matching measured call site; target unknown."; 4]
+        );
+    }
+
+    #[test]
+    fn a_typescript_signature_has_no_body() {
+        let text = "declare function f(a: number): void;\n";
+        let view = sequence("typescript", "a.d.ts", text, "function f", ";");
+        assert_eq!(
+            boundaries(&view.steps),
+            ["TypeScript declaration has no body; behavior unknown."]
+        );
+    }
+
+    #[test]
+    fn a_default_parameter_is_a_boundary_and_a_typed_one_is_not() {
+        let plain = "function f(a: number, b?: string) {}\n";
+        assert!(
+            boundaries(&sequence("typescript", "a.ts", plain, "function f", "{}").steps).is_empty()
+        );
+        let default = "function f(a: number = 1) {}\n";
+        assert_eq!(
+            boundaries(&sequence("typescript", "a.ts", default, "function f", "{}").steps),
+            [
+                "Parameter defaults/destructuring may execute before the body; behavior not expanded."
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_source_names_its_language() {
+        let ts = "function f() { const = ; }\n";
+        let view = sequence("typescript", "a.ts", ts, "function f", "}");
+        assert_eq!(
+            boundaries(&view.steps),
+            ["Malformed TypeScript: behavior cannot be established."]
+        );
+        let js = sequence("javascript", "a.js", ts, "function f", "}");
+        assert_eq!(
+            boundaries(&js.steps),
+            ["Malformed JavaScript: behavior cannot be established."]
+        );
+    }
+
+    #[test]
+    fn other_typescript_forms_stay_fail_closed() {
+        let text = "function f() {\n  enum E { A }\n}\n";
+        let view = sequence("typescript", "a.ts", text, "function f", "\n}");
+        assert_eq!(
+            boundaries(&view.steps),
+            ["Unsupported JavaScript form 'enum_declaration': behavior unknown."]
+        );
+    }
+
+    #[test]
+    fn a_tsx_file_parses_with_the_tsx_grammar() {
+        let text = "function f() {\n  return <div>{1}</div>;\n}\n";
+        let view = sequence("typescript", "a.tsx", text, "function f", "\n}");
+        assert!(
+            !boundaries(&view.steps)
+                .iter()
+                .any(|label| label.starts_with("Malformed"))
+        );
+    }
 }
