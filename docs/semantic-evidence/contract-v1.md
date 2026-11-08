@@ -403,16 +403,16 @@ Other binding sites without a measured declaration remain candidates, but cannot
 
 ### The evidence kind
 
-An `interfaces[]` entry with `kind: "http"` records one HTTP interface between a client app and a server app. Its fields are:
+An `interfaces[]` item with `kind: "http"` is an interface: it records the HTTP evidence between one client app and one server app. Its fields are:
 
 - the client and server apps;
 - `method`;
 - `pathTemplate`;
-- the handler: its `syntaxId`, its location, and `handler.kind`, which is `declaration` or `dispatchArm`;
-- the call sites, each with a `callId` and a `caller`;
+- the handler: its `syntaxId`, its location, and `handler.kind`, which is `declaration`, `closure` or `dispatchArm`;
+- the call sites, each with a `callId` and a `caller`; each pairing of a client path with a server route is a match;
 - `serverOnly` and `clientOnly`, which mark a route with no matched call site and a call site with no matched route.
 
-Extraction details (route recognition, handler identity, exclusions and the wrapper list) are specified in architecture-view.md, not here.
+Extraction details (route recognition, handler identity, segment matching rules, exclusions and the wrapper list) are specified in architecture-view.md, not here.
 
 ### Matching
 
@@ -420,14 +420,14 @@ A client path is matched against server route templates. Server templates come f
 
 ### Confidence
 
-Each entry carries one of four confidence values, each with exactly one meaning:
+Each match carries a `confidence`, and so does each `clientOnly` item, which is always `unresolved`. Every match gets exactly one of four values, each with exactly one meaning. The values are decided in the order below, and that order is the precedence:
 
-| Value | Meaning |
-|---|---|
-| `exact` | a literal client path equals a literal server route |
-| `template` | a client path with substitutions matches a parameterized or dispatch segment pattern |
-| `wrapperInferred` | the path was assembled by a known wrapper plus prefix |
-| `unresolved` | there is no match |
+| Order | Value | Meaning |
+|---|---|---|
+| 1 | `wrapperInferred` | the match needed a known client wrapper's prefix to build the path |
+| 2 | `template` | otherwise, the match used a client path substitution, a server path parameter or tail, or a dispatch-table route |
+| 3 | `exact` | otherwise, a literal client path equals a literal server route |
+| 4 | `unresolved` | a client call whose path matched no server route |
 
 ### Evidence, never proof
 
