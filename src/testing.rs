@@ -149,6 +149,40 @@ pub(crate) fn native_watcher_requested() -> bool {
     std::env::var_os(NATIVE_WATCHER_ENV).is_some_and(|value| value == "on")
 }
 
+/// An opt-in, bounded fixture barrier at an actual coordinator boundary: the
+/// MCP coordinator, the daemon relay and the storage reads they drive. Normal
+/// calls do not connect to or wait for a test socket. It lives here, not in
+/// `mcp`, so storage has no upward reference (#791).
+#[cfg(feature = "test-support")]
+pub(crate) fn phase_hook(stage: &str) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    // One stage, or several separated by commas.
+    if !std::env::var("TRELLIS_TEST_MCP_PHASE")
+        .is_ok_and(|stages| stages.split(',').any(|named| named == stage))
+    {
+        return Ok(());
+    }
+    let path = std::env::var_os("TRELLIS_TEST_MCP_PHASE_SOCKET").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing MCP fixture socket",
+        )
+    })?;
+    let mut stream = std::os::unix::net::UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.write_all(stage.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let mut release = [0u8; 1];
+    stream.read_exact(&mut release)?;
+    Ok(())
+}
+
+#[cfg(not(feature = "test-support"))]
+pub(crate) fn phase_hook(_: &str) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// A fixture process recorded before its PID can become stale. The start time
 /// distinguishes an exited fixture from a later process assigned the same PID.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
