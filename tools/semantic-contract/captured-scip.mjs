@@ -7,8 +7,10 @@ import { confinedFileCapped } from "./load.mjs";
 import { contentHash, sourceManifestHash } from "./identity.mjs";
 
 const profilePath = fileURLToPath(new URL("../../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json", import.meta.url));
-const languageOrder = ["java", "rust", "python", "javascript"];
-const producers = { "scip-java": ["java", 2], "scip-typescript": ["javascript", 2], "scip-python": ["python", 2], "rust-analyzer": ["rust", 1] };
+const languageOrder = ["java", "rust", "python", "javascript", "typescript"];
+// A captured manifest's source set is the four-language cohort: no TypeScript semantic captures exist (Decision 0017 Amendment 7).
+const sourceSetLanguages = languageOrder.slice(0, 4);
+const producers = { "scip-java": [["java"], 2], "scip-typescript": [["javascript", "typescript"], 2], "scip-python": [["python"], 2], "rust-analyzer": [["rust"], 1] };
 // Exact named SymbolInformation.Kind values in locked scip 0.10.0 (83 is absent).
 const symbolKinds = new Set([...Array(83).keys(), 84, 85, 86]);
 const limits = { manifest: 1024 * 1024, artifact: 64 * 1024 * 1024, source: 256 * 1024 * 1024, documents: 1000, candidates: 100000, relationships: 20000 };
@@ -77,14 +79,14 @@ export async function checkCapturedScip(root, expectedManifestHash) {
   try { actualProfile = JSON.parse(await readFile(profilePath, "utf8")); }
   catch (error) { fail("InvalidAdmission", `profile unavailable: ${error.message}`); }
   const pinned = actualProfile?.semanticProducers?.find((p) => p.name === manifest.producer.name);
-  const [language, productionEncoding] = producers[manifest.producer.name] ?? [];
+  const [languages = [], productionEncoding] = producers[manifest.producer.name] ?? [];
   const encoding = productionEncoding;
   requireThat(actualProfile.profileId === manifest.profileId && pinned?.version === manifest.producer.version && pinned.executableHash === manifest.producer.executableHash && encoding === manifest.producer.positionEncoding, "producer profile mismatch");
   requireThat(manifest.sourceSet.id === `source-set:v1:${manifest.sourceSet.rootId}` && manifest.sourceSet.rootId.length > 0 && /^revision:v2:[a-f0-9]{64}$/.test(manifest.sourceRevision), "source identity mismatch");
-  requireThat(JSON.stringify(manifest.sourceSet.languages) === JSON.stringify(languageOrder) && manifest.sourceSet.dependencies.length === 0, "source set mismatch");
+  requireThat(JSON.stringify(manifest.sourceSet.languages) === JSON.stringify(sourceSetLanguages) && manifest.sourceSet.dependencies.length === 0, "source set mismatch");
   requireThat(Object.values(manifest.components).every((hash) => /^[a-f0-9]{64}$/.test(hash)), "component hashes invalid");
   requireThat(manifest.metadata.projectRoot === pathToFileURL(physical).href, "project root mismatch");
-  requireThat(manifest.artifacts.length === 1 && manifest.artifacts[0].language === language && manifest.artifacts[0].path.startsWith("captured-scip/") && manifest.artifacts[0].path !== "captured-scip/manifest.json", "artifact selection mismatch");
+  requireThat(manifest.artifacts.length === 1 && languages.includes(manifest.artifacts[0].language) && manifest.artifacts[0].path.startsWith("captured-scip/") && manifest.artifacts[0].path !== "captured-scip/manifest.json", "artifact selection mismatch");
   const artifactRow = manifest.artifacts[0];
   requireThat(manifest.sourceDocuments.length > 0 && manifest.documents.length > 0, "document count");
   requireThat(manifest.exclusions.length <= manifest.sourceDocuments.length, "exclusion count");
@@ -106,15 +108,15 @@ export async function checkCapturedScip(root, expectedManifestHash) {
   requireThat(sourceManifestHash(rows) === manifest.sourceManifestHash, "source manifest mismatch");
   const covered = new Set();
   for (const row of manifest.documents) {
-    requireThat(row.language === language && sourceMap.get(row.relativePath)?.row.language === row.language && sourceMap.get(row.relativePath)?.row.contentHash === row.contentHash && !covered.has(row.relativePath), "document coverage mismatch");
+    requireThat(languages.includes(row.language) && sourceMap.get(row.relativePath)?.row.language === row.language && sourceMap.get(row.relativePath)?.row.contentHash === row.contentHash && !covered.has(row.relativePath), "document coverage mismatch");
     covered.add(row.relativePath);
   }
   for (const row of manifest.exclusions) {
-    requireThat(row.language === language && sourceMap.get(row.relativePath)?.row.language === language && !covered.has(row.relativePath), "exclusion mismatch");
+    requireThat(languages.includes(row.language) && sourceMap.get(row.relativePath)?.row.language === row.language && !covered.has(row.relativePath), "exclusion mismatch");
     covered.add(row.relativePath);
   }
   requireThat((manifest.completion === "complete") === (manifest.exclusions.length === 0), "completion mismatch");
-  requireThat(manifest.sourceDocuments.filter((row) => row.language === language).every((row) => covered.has(row.relativePath)) && covered.size === manifest.sourceDocuments.filter((row) => row.language === language).length, "incomplete coverage");
+  requireThat(manifest.sourceDocuments.filter((row) => languages.includes(row.language)).every((row) => covered.has(row.relativePath)) && covered.size === manifest.sourceDocuments.filter((row) => languages.includes(row.language)).length, "incomplete coverage");
   requireThat(JSON.stringify(artifactRow.documents) === JSON.stringify(manifest.documents.map((row) => row.relativePath)), "artifact documents mismatch");
   const artifactBytes = await readInput(physical, artifactRow.path, limits.artifact);
   const artifactHash = contentHash(artifactBytes);

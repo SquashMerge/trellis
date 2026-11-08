@@ -144,11 +144,11 @@ impl Passes<'_> {
         )?;
         for artifact in &self.descriptor.artifacts {
             conn.execute(
-                "INSERT INTO artifacts(ordinal, path, language, sha256, byte_length) VALUES(?1,?2,?3,?4,?5)",
+                "INSERT INTO artifacts(ordinal, path, languages, sha256, byte_length) VALUES(?1,?2,?3,?4,?5)",
                 params![
                     artifact.ordinal,
                     artifact.relative_path,
-                    artifact.language,
+                    artifact.languages_json(),
                     artifact.sha256,
                     artifact.byte_length as i64
                 ],
@@ -299,7 +299,7 @@ impl Passes<'_> {
                         let bound = descriptor
                             .artifacts
                             .get(artifact as usize)
-                            .is_some_and(|entry| entry.language == row.language);
+                            .is_some_and(|entry| entry.languages.contains(&row.language));
                         if !bound {
                             return Err(admission("coverage artifact").into());
                         }
@@ -450,15 +450,20 @@ impl Passes<'_> {
             cargo_targets,
             assigned_documents,
         };
-        let mut sink = StageClaimSink::new(conn, &self.budget, entry.ordinal, &entry.language);
+        let mut sink = StageClaimSink::new(conn, &self.budget, entry.ordinal);
         let mut fault: Option<anyhow::Error> = None;
         let mut resolve = |path: &str, language: &str| {
-            let found = lookup_assigned(conn, entry.ordinal, &entry.language, path);
+            let found = lookup_assigned(conn, entry.ordinal, path);
             let assigned = match found {
                 Ok(Some(assigned)) => assigned,
                 Ok(None) => {
                     return Err(ScipCaptureError::InvalidArtifact(
                         "unlisted document".into(),
+                    ));
+                }
+                Err(super::staging::StageLookupError::Ambiguous) => {
+                    return Err(ScipCaptureError::InvalidArtifact(
+                        "ambiguous document path".into(),
                     ));
                 }
                 Err(error) => {
@@ -468,13 +473,13 @@ impl Passes<'_> {
             };
             let language = crate::scip_raw::bind_document_language(
                 language,
-                &entry.language,
+                &assigned.language,
                 &self.producer.languages,
             )?;
             let document = native::Document {
                 key: native::DocumentKey {
                     source_set_id: descriptor.source_set.id.clone(),
-                    language: entry.language.clone(),
+                    language: assigned.language.clone(),
                     path: path.to_owned(),
                 },
                 revision_id: descriptor.source_revision.clone(),

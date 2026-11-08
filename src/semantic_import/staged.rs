@@ -1405,6 +1405,7 @@ impl<'a> JoinStore for StagedSide<'a> {
         let group = self.require_group(document)?;
         let (sites, tree) = super::source_role_sites_parsed(
             document.language.as_str(),
+            document.path.as_str(),
             group.text.as_bytes(),
             group.native.capability_reports.first(),
             &mut |bytes| operation.grow(bytes()?),
@@ -2581,12 +2582,20 @@ impl StagedJoin<'_> {
         let conn = self.conn();
         let artifacts = {
             let mut statement = conn.prepare(
-                "SELECT ordinal, language, sha256, documents, claims FROM artifacts ORDER BY ordinal",
+                "SELECT ordinal, languages, sha256, documents, claims FROM artifacts ORDER BY ordinal",
             )?;
             statement
                 .query_map([], |row| {
+                    let languages: Vec<String> = serde_json::from_str(&row.get::<_, String>(1)?)
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
                     Ok(serde_json::json!({
-                        "ordinal": row.get::<_, i64>(0)?, "language": row.get::<_, String>(1)?,
+                        "ordinal": row.get::<_, i64>(0)?, "languages": languages,
                         "artifactHash": row.get::<_, String>(2)?, "documents": row.get::<_, i64>(3)?,
                         "claims": row.get::<_, i64>(4)?,
                     }))

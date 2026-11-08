@@ -1296,12 +1296,14 @@ impl TargetCallable {
             declaration.document.language.as_str(),
             declaration.kind.as_str(),
         ) {
-            ("javascript" | "rust", "function") => Self::FreeFunction,
-            ("javascript", "type") => Self::Constructor,
-            ("javascript", "method") if declaration.name.as_deref() == Some("constructor") => {
+            ("javascript" | "typescript" | "rust", "function") => Self::FreeFunction,
+            ("javascript" | "typescript", "type") => Self::Constructor,
+            ("javascript" | "typescript", "method")
+                if declaration.name.as_deref() == Some("constructor") =>
+            {
                 Self::Constructor
             }
-            ("javascript", "method") => Self::DynamicMethod,
+            ("javascript" | "typescript", "method") => Self::DynamicMethod,
             // The only native `type` that holds a method is a trait.
             ("rust", "method")
                 if declaration
@@ -1400,7 +1402,7 @@ fn call_shape(language: &str, call: &native::Call, source: &[u8]) -> CallShape {
         // `new`, whitespace, then only a dotted name: the native callee of a `new_expression`
         // is its constructor identifier or the last property of its dotted constructor, and
         // no call or member expression on another value fits in that prefix.
-        "javascript" => match prefix.strip_prefix(b"new") {
+        "javascript" | "typescript" => match prefix.strip_prefix(b"new") {
             Some(rest)
                 if rest.first().is_some_and(u8::is_ascii_whitespace)
                     && rest.iter().all(|b| {
@@ -1449,12 +1451,12 @@ fn call_dispatch(language: &str, shape: CallShape, callable: TargetCallable) -> 
     use CallShape::{Member, New, Path, Plain};
     use TargetCallable::{Constructor, DynamicMethod, FixedMethod, FreeFunction};
     match (language, shape, callable) {
-        ("javascript", Plain, FreeFunction)
+        ("javascript" | "typescript", Plain, FreeFunction)
         | ("rust", Plain | Path, FreeFunction)
         | ("rust", Member | Path, FixedMethod)
         | ("java", Plain | Member, FixedMethod) => semantic::Dispatch::Direct,
-        ("javascript", New, Constructor) => semantic::Dispatch::Constructor,
-        ("javascript", Member, DynamicMethod)
+        ("javascript" | "typescript", New, Constructor) => semantic::Dispatch::Constructor,
+        ("javascript" | "typescript", Member, DynamicMethod)
         | ("rust", Member | Path, DynamicMethod)
         | ("java", Plain | Member, DynamicMethod) => semantic::Dispatch::Dynamic,
         _ => semantic::Dispatch::Unknown,
@@ -1575,8 +1577,10 @@ fn measure_occurrence<S: JoinStore>(
                 // Native JavaScript represents a class constructor as a method. SCIP can
                 // state either its constructor semantics or its method declaration shape.
                 "method"
-                    if candidate.document.language == "javascript"
-                        && candidate.name.as_deref() == Some("constructor") =>
+                    if matches!(
+                        candidate.document.language.as_str(),
+                        "javascript" | "typescript"
+                    ) && candidate.name.as_deref() == Some("constructor") =>
                 {
                     matches!(kind, 9 | 26)
                 }
@@ -2000,13 +2004,14 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         if !declaration_site
             && roles & 4 == 0
             && roles & 2 == 0
-            && (!assigned.contains(&semantic::Role::Type) || doc.language == "javascript")
+            && (!assigned.contains(&semantic::Role::Type)
+                || matches!(doc.language.as_str(), "javascript" | "typescript"))
         {
             assigned.insert(semantic::Role::Read);
         }
         if declaration_site
             && roles & 2 != 0
-            && matches!(doc.language.as_str(), "javascript" | "rust")
+            && matches!(doc.language.as_str(), "javascript" | "typescript" | "rust")
             && binding.status == semantic::JoinStatus::Exact
             && store
                 .declarations_with_id(&doc, &binding.candidate_ids[0], operation)?
@@ -2420,7 +2425,10 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             .context("missing admitted document source")?;
         let bytes: &[u8] = &bytes;
         #[cfg(feature = "test-support")]
-        if matches!(doc.language.as_str(), "java" | "javascript" | "python") {
+        if matches!(
+            doc.language.as_str(),
+            "java" | "javascript" | "typescript" | "python"
+        ) {
             note_parsed_type_document(doc);
         }
         let mut relationship_operation = store.operation()?;
@@ -2434,6 +2442,12 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 tree_sitter_javascript::LANGUAGE.into(),
                 "class_declaration",
                 "class_heritage",
+                parsed,
+                &mut reserve_bases,
+            )?,
+            "typescript" => direct_ts_types(
+                bytes,
+                crate::indexer_ts::grammar(&doc.path),
                 parsed,
                 &mut reserve_bases,
             )?,
@@ -2975,15 +2989,18 @@ fn source_role_sites_reserved(
     report: Option<&native::CapabilityReport>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<RoleSites> {
-    Ok(source_role_sites_parsed(language, source, report, reserve)?.0)
+    // The capability report names the document, so its path picks the TypeScript grammar.
+    let path = report.map_or("", |report| report.document.path.as_str());
+    Ok(source_role_sites_parsed(language, path, source, report, reserve)?.0)
 }
 
 /// The role sites of `source`, and the syntax tree they were read from (`None` for a language
 /// without role sites). Each supported language's tree is the one its direct type bases are
 /// read from too. `report` is the document's capability report, whose measured macros hold sites
-/// of their own.
+/// of their own. `path` is the document's, which picks the TypeScript or TSX grammar.
 fn source_role_sites_parsed(
     language: &str,
+    path: &str,
     source: &[u8],
     report: Option<&native::CapabilityReport>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
@@ -2992,6 +3009,7 @@ fn source_role_sites_parsed(
     let grammar: tree_sitter::Language = match language {
         "java" => tree_sitter_java::LANGUAGE.into(),
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(path),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         _ => return Ok((RoleSites::default(), None)),
@@ -3088,6 +3106,59 @@ fn source_role_sites_parsed(
                 js_direct_class_span(child, &mut sites.types, reserve)?;
             }
         }
+        if language == "typescript" {
+            match kind {
+                "type_annotation"
+                | "type_predicate_annotation"
+                | "asserts_annotation"
+                | "type_arguments"
+                | "type_parameters" => {
+                    collect_role_leaf_spans_reserved(node, language, &mut sites.types, reserve)?;
+                }
+                "type_alias_declaration" => {
+                    if let Some(value) = node.child_by_field_name("value") {
+                        collect_role_leaf_spans_reserved(
+                            value,
+                            language,
+                            &mut sites.types,
+                            reserve,
+                        )?;
+                    }
+                }
+                "as_expression" | "satisfies_expression" => {
+                    let count = node.named_child_count();
+                    if let Some(target) = count
+                        .checked_sub(1)
+                        .and_then(|last| node.named_child(u32::try_from(last).ok()?))
+                    {
+                        collect_role_leaf_spans_reserved(
+                            target,
+                            language,
+                            &mut sites.types,
+                            reserve,
+                        )?;
+                    }
+                }
+                "extends_clause" => {
+                    if let Some(value) = node.child_by_field_name("value") {
+                        js_direct_class_span(value, &mut sites.types, reserve)?;
+                    }
+                }
+                "implements_clause" | "extends_type_clause" => {
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        if let Some(name) = ts_base_name(child) {
+                            reserve_role_span(
+                                &mut sites.types,
+                                (name.start_byte(), name.end_byte()),
+                                reserve,
+                            )?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         if language == "python" && kind == "class_definition" {
             let mut cursor = node.walk();
             for child in node
@@ -3097,7 +3168,7 @@ fn source_role_sites_parsed(
                 collect_role_leaf_spans_reserved(child, language, &mut sites.types, reserve)?;
             }
         }
-        if language == "javascript"
+        if matches!(language, "javascript" | "typescript")
             && kind == "binary_expression"
             && let (Some(operator), Some(right)) = (
                 node.child_by_field_name("operator"),
@@ -3109,7 +3180,7 @@ fn source_role_sites_parsed(
         }
         let import_root = match language {
             "java" => kind == "import_declaration",
-            "javascript" => kind == "import_statement",
+            "javascript" | "typescript" => kind == "import_statement",
             "python" => matches!(kind, "import_statement" | "import_from_statement"),
             "rust" => kind == "use_declaration",
             _ => false,
@@ -3174,6 +3245,13 @@ fn collect_role_leaf_spans_reserved(
                 node.kind(),
                 "identifier" | "property_identifier" | "shorthand_property_identifier"
             ),
+            "typescript" => matches!(
+                node.kind(),
+                "identifier"
+                    | "property_identifier"
+                    | "shorthand_property_identifier"
+                    | "type_identifier"
+            ),
             "python" => node.kind() == "identifier",
             _ => false,
         };
@@ -3181,6 +3259,112 @@ fn collect_role_leaf_spans_reserved(
             reserve_role_span(spans, (node.start_byte(), node.end_byte()), reserve)?;
         }
         Ok(!leaf)
+    })
+}
+
+/// The name token of a TypeScript base type or class value: an identifier, the last segment of
+/// a `nested_type_identifier` or `member_expression`, or the name of a `generic_type`.
+fn ts_base_name(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    match node.kind() {
+        "identifier" | "type_identifier" => Some(node),
+        "nested_type_identifier" => node.child_by_field_name("name"),
+        "member_expression" => node.child_by_field_name("property"),
+        "generic_type" => node.child_by_field_name("name").and_then(ts_base_name),
+        _ => None,
+    }
+}
+
+/// The direct bases of TypeScript classes and interfaces: a class's `extends` value is an
+/// `Extends` base and each `implements` type an `Implements` base, and an interface's
+/// `extends` types are `Extends` bases.
+fn direct_ts_types(
+    source: &[u8],
+    language: tree_sitter::Language,
+    parsed: Option<tree_sitter::Tree>,
+    reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
+) -> Result<Vec<DirectBase>> {
+    let tree = match parsed {
+        Some(tree) => tree,
+        None => {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&language)?;
+            parser
+                .parse(source, None)
+                .context("semantic source parser failed")?
+        }
+    };
+    collect_direct_bases(reserve, |emit| {
+        walk_named_reverse(tree.root_node(), &mut |node| {
+            let owner_kind = node.kind();
+            if matches!(
+                owner_kind,
+                "class_declaration" | "abstract_class_declaration" | "interface_declaration"
+            ) && let Some(name) = node.child_by_field_name("name")
+            {
+                let owner = native::Range {
+                    start: name.start_byte(),
+                    end: name.end_byte(),
+                };
+                let mut bases: Vec<(tree_sitter::Node<'_>, semantic::RelationshipKind)> = vec![];
+                let mut cursor = node.walk();
+                for clause in node.named_children(&mut cursor) {
+                    match clause.kind() {
+                        "extends_type_clause" => {
+                            let mut inner = clause.walk();
+                            bases.extend(clause.named_children(&mut inner).filter_map(|base| {
+                                ts_base_name(base)
+                                    .map(|name| (name, semantic::RelationshipKind::Extends))
+                            }));
+                        }
+                        "class_heritage" => {
+                            let mut inner = clause.walk();
+                            for heritage in clause.named_children(&mut inner) {
+                                match heritage.kind() {
+                                    "extends_clause" => {
+                                        bases.extend(
+                                            heritage
+                                                .child_by_field_name("value")
+                                                .and_then(ts_base_name)
+                                                .map(|name| {
+                                                    (name, semantic::RelationshipKind::Extends)
+                                                }),
+                                        );
+                                    }
+                                    "implements_clause" => {
+                                        let mut types = heritage.walk();
+                                        bases.extend(
+                                            heritage.named_children(&mut types).filter_map(
+                                                |base| {
+                                                    ts_base_name(base).map(|name| {
+                                                        (
+                                                            name,
+                                                            semantic::RelationshipKind::Implements,
+                                                        )
+                                                    })
+                                                },
+                                            ),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for (name, kind) in bases {
+                    emit((
+                        owner.clone(),
+                        native::Range {
+                            start: name.start_byte(),
+                            end: name.end_byte(),
+                        },
+                        kind,
+                    ))?;
+                }
+            }
+            Ok(true)
+        })
     })
 }
 
@@ -4656,6 +4840,8 @@ mod walk_tests {
             let language: tree_sitter::Language = match path.extension().and_then(|e| e.to_str()) {
                 Some("java") => tree_sitter_java::LANGUAGE.into(),
                 Some("js") => tree_sitter_javascript::LANGUAGE.into(),
+                Some("ts") => crate::indexer_ts::grammar("a.ts"),
+                Some("tsx") => crate::indexer_ts::grammar("a.tsx"),
                 Some("py") => tree_sitter_python::LANGUAGE.into(),
                 Some("rs") => tree_sitter_rust::LANGUAGE.into(),
                 _ => continue,
@@ -4783,5 +4969,128 @@ mod language_reason_tests {
         assert!(json["listed"].to_string().len() <= REPORT_PARTIAL_DOCUMENT_BYTES);
         assert_eq!(json["listed"].as_array().unwrap().len(), 315);
         assert_eq!(json["unlisted"], 1);
+    }
+}
+
+#[cfg(test)]
+mod typescript_tests {
+    use super::*;
+
+    fn spelled(source: &str, spans: &BTreeSet<(usize, usize)>) -> Vec<String> {
+        spans
+            .iter()
+            .map(|&(start, end)| source[start..end].to_owned())
+            .collect()
+    }
+
+    fn type_sites(path: &str, source: &str) -> Vec<String> {
+        let sites =
+            source_role_sites_parsed("typescript", path, source.as_bytes(), None, &mut |_| Ok(()))
+                .unwrap()
+                .0;
+        spelled(source, &sites.types)
+    }
+
+    fn direct_bases(source: &str) -> Vec<(String, String, semantic::RelationshipKind)> {
+        direct_ts_types(
+            source.as_bytes(),
+            crate::indexer_ts::grammar("a.ts"),
+            None,
+            &mut |_| Ok(()),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(owner, base, kind)| {
+            (
+                source[owner.start..owner.end].to_owned(),
+                source[base.start..base.end].to_owned(),
+                kind,
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn annotation_and_cast_types_are_type_sites_and_the_cast_operand_is_not() {
+        let source = "let x: Foo = y as Bar;";
+        let sites = type_sites("a.ts", source);
+        assert_eq!(sites, ["Foo", "Bar"]);
+        assert!(!sites.contains(&"y".to_owned()));
+    }
+
+    #[test]
+    fn type_roles_cover_alias_arguments_parameters_and_satisfies() {
+        let source =
+            "type T = Alias; function f<P>(a: Arg<Inner>): Ret { return a satisfies Sat; }";
+        let sites = type_sites("a.ts", source);
+        for expected in ["Alias", "P", "Arg", "Inner", "Ret", "Sat"] {
+            assert!(
+                sites.contains(&expected.to_owned()),
+                "{expected}: {sites:?}"
+            );
+        }
+        assert!(!sites.contains(&"a".to_owned()), "{sites:?}");
+    }
+
+    #[test]
+    fn tsx_documents_parse_with_the_tsx_grammar() {
+        let source = "const v = <Box/>; let x: Foo = y;";
+        assert_eq!(type_sites("a.tsx", source), ["Foo"]);
+    }
+
+    #[test]
+    fn heritage_names_are_type_sites() {
+        let source = "class A extends ns.B implements C, D<E> {} interface I extends J, a.K {}";
+        let sites = type_sites("a.ts", source);
+        for expected in ["B", "C", "D", "E", "J", "K"] {
+            assert!(
+                sites.contains(&expected.to_owned()),
+                "{expected}: {sites:?}"
+            );
+        }
+        assert!(!sites.contains(&"ns".to_owned()), "{sites:?}");
+    }
+
+    #[test]
+    fn direct_bases_name_extends_implements_and_interface_extends() {
+        use semantic::RelationshipKind::{Extends, Implements};
+        let source = "class A extends ns.B implements C, D<E> {} abstract class F extends G<H> {} interface I extends J, a.K {}";
+        let mut got = direct_bases(source);
+        got.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let expected = [
+            ("A", "B", Extends),
+            ("A", "C", Implements),
+            ("A", "D", Implements),
+            ("F", "G", Extends),
+            ("I", "J", Extends),
+            ("I", "K", Extends),
+        ];
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(o, b, k)| (o.to_owned(), b.to_owned(), k))
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn calls_classify_like_javascript() {
+        use CallShape::{Member, New, Plain};
+        use TargetCallable::{Constructor, DynamicMethod, FreeFunction};
+        assert_eq!(
+            call_dispatch("typescript", Plain, FreeFunction),
+            semantic::Dispatch::Direct
+        );
+        assert_eq!(
+            call_dispatch("typescript", New, Constructor),
+            semantic::Dispatch::Constructor
+        );
+        assert_eq!(
+            call_dispatch("typescript", Member, DynamicMethod),
+            semantic::Dispatch::Dynamic
+        );
+        assert_eq!(
+            call_dispatch("typescript", Plain, Constructor),
+            semantic::Dispatch::Unknown
+        );
     }
 }

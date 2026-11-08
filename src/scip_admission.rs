@@ -127,41 +127,41 @@ fn encoding_code(name: &str) -> Option<u8> {
     }
 }
 
-/// The language of each real reference producer.
-pub fn producer_language(producer_id: &str) -> Option<&'static str> {
+/// The languages each real reference producer covers, in contract order (#22).
+pub fn producer_languages(producer_id: &str) -> Option<&'static [&'static str]> {
     match producer_id {
-        "scip-java" => Some("java"),
-        "scip-typescript" => Some("javascript"),
-        "scip-python" => Some("python"),
-        "rust-analyzer" => Some("rust"),
+        "scip-java" => Some(&["java"]),
+        "scip-typescript" => Some(&["javascript", "typescript"]),
+        "scip-python" => Some(&["python"]),
+        "rust-analyzer" => Some(&["rust"]),
         _ => None,
     }
 }
 
-/// The language a `producer run` of `producer_id` covers: a real reference producer's, or
+/// The languages a `producer run` of `producer_id` covers: a real reference producer's, or
 /// the test stub's (#664). `None` for an unknown producer.
-pub fn run_language(producer_id: &str) -> Option<&'static str> {
-    producer_language(producer_id).or_else(|| (producer_id == STUB_PRODUCER).then(stub_language))
+pub fn run_languages(producer_id: &str) -> Option<&'static [&'static str]> {
+    producer_languages(producer_id).or_else(|| (producer_id == STUB_PRODUCER).then(stub_languages))
 }
 
 /// The id of the test-support stand-in producer.
 pub const STUB_PRODUCER: &str = "trellis-synthetic-scip";
 
-/// The one language the test-support stub producer's runs cover.
-pub fn stub_language() -> &'static str {
+/// The languages the test-support stub producer's runs cover: one language.
+pub fn stub_languages() -> &'static [&'static str] {
     #[cfg(feature = "test-support")]
     if std::env::var("TRELLIS_TEST_PRODUCER_STUB_LANGUAGE").as_deref() == Ok("rust") {
-        return "rust";
+        return &["rust"];
     }
-    "javascript"
+    &["javascript"]
 }
 
-/// The language of each producer the witness fast path accepts. `scip-java` is omitted on
+/// The languages of each producer the witness fast path accepts. `scip-java` is omitted on
 /// purpose: its rejoin has always taken the FULL path, and that behavior is preserved.
-pub fn witness_language(producer_id: &str) -> Option<&'static str> {
+pub fn witness_languages(producer_id: &str) -> Option<&'static [&'static str]> {
     match producer_id {
         "scip-java" => None,
-        other => producer_language(other),
+        other => producer_languages(other),
     }
 }
 
@@ -181,7 +181,7 @@ fn reference_pin(
     profile_id: &str,
     target: &str,
 ) -> Option<PinnedProducer> {
-    let language = producer_language(&producer.name)?;
+    let languages = producer_languages(&producer.name)?;
     let target_pins: Vec<_> = producer
         .target_pins
         .iter()
@@ -194,7 +194,7 @@ fn reference_pin(
         executable_hash: producer.executable_hash.clone(),
         target_pins,
         position_encoding: encoding_code(producer.position_encoding.as_deref()?)?,
-        languages: vec![language.into()],
+        languages: languages.iter().map(|l| (*l).to_owned()).collect(),
         trust_origin: REFERENCE_TRUST_ORIGIN,
         profile_id: profile_id.to_owned(),
     };
@@ -417,11 +417,15 @@ mod tests {
             "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
         ))
         .unwrap();
-        for (id, language, semantic_language) in [
-            ("scip-java", "java", Language::Java),
-            ("scip-typescript", "javascript", Language::Javascript),
-            ("scip-python", "python", Language::Python),
-            ("rust-analyzer", "rust", Language::Rust),
+        for (id, languages, semantic_languages) in [
+            ("scip-java", &["java"][..], vec![Language::Java]),
+            (
+                "scip-typescript",
+                &["javascript", "typescript"][..],
+                vec![Language::Javascript, Language::Typescript],
+            ),
+            ("scip-python", &["python"][..], vec![Language::Python]),
+            ("rust-analyzer", &["rust"][..], vec![Language::Rust]),
         ] {
             let row = profile
                 .semantic_producers
@@ -434,12 +438,12 @@ mod tests {
                 "utf16" => (2, PositionEncoding::Utf16),
                 _ => (3, PositionEncoding::UnicodeScalar),
             };
-            assert_eq!(producer_language(id), Some(language));
+            assert_eq!(producer_languages(id), Some(languages));
             assert_eq!(pinned.identity_kind, IdentityKind::Executable);
             assert_eq!(pinned.trust_origin, "referenceProfile");
             assert_eq!(pinned.profile_id, profile.profile_id);
             assert_eq!(pinned.position_encoding, encoding.0);
-            assert_eq!(pinned.languages, [language]);
+            assert_eq!(pinned.languages, languages);
             let expected_hash = row
                 .target_pins
                 .iter()
@@ -452,7 +456,7 @@ mod tests {
                     version: row.version.clone(),
                     executable_hash: expected_hash.clone(),
                     kind: SemanticKind::Semantic,
-                    languages: vec![semantic_language],
+                    languages: semantic_languages,
                     position_encoding: encoding.1,
                 }
             );
@@ -463,7 +467,7 @@ mod tests {
             );
         }
         assert_eq!(pinned_producer_by_id("scip-unknown"), None);
-        assert_eq!(producer_language("scip-unknown"), None);
+        assert_eq!(producer_languages("scip-unknown"), None);
     }
     #[test]
     fn rust_analyzer_pin_selects_the_hash_of_each_target() {
@@ -565,11 +569,14 @@ mod tests {
         );
     }
     #[test]
-    fn witness_language_keeps_the_fast_path_closure() {
-        assert_eq!(witness_language("scip-typescript"), Some("javascript"));
-        assert_eq!(witness_language("scip-python"), Some("python"));
-        assert_eq!(witness_language("rust-analyzer"), Some("rust"));
-        assert_eq!(witness_language("scip-java"), None);
-        assert_eq!(witness_language("trellis-synthetic-scip"), None);
+    fn witness_languages_keep_the_fast_path_closure() {
+        assert_eq!(
+            witness_languages("scip-typescript"),
+            Some(&["javascript", "typescript"][..])
+        );
+        assert_eq!(witness_languages("scip-python"), Some(&["python"][..]));
+        assert_eq!(witness_languages("rust-analyzer"), Some(&["rust"][..]));
+        assert_eq!(witness_languages("scip-java"), None);
+        assert_eq!(witness_languages("trellis-synthetic-scip"), None);
     }
 }

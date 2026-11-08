@@ -355,6 +355,26 @@ test("authenticated UTF-16 endpoints retain scalar, CRLF and trailing-line bound
     });
   }
 });
+test("scip-typescript covers javascript and typescript documents, no other language", async () => {
+  for (const [language, valid] of [["javascript", true], ["typescript", true], ["rust", false]]) {
+    await withFixture(async (f) => {
+      f.manifest.producer = { name: "scip-typescript", version: "0.4.0", executableHash: "fa4c8398393d2743e1306fdc7eaccfaafe488690bbfed481354abbf5a33559b9", positionEncoding: 2 };
+      f.manifest.sourceDocuments[0].language = language;
+      f.manifest.documents[0].language = language;
+      f.manifest.artifacts[0].language = language;
+      const doc = f.artifact.documents[0];
+      doc.language = language;
+      doc.positionEncoding = 2;
+      await attestSource(f, source);
+      const expected = await attestArtifact(f);
+      if (valid) {
+        assert.ok((await checkCapturedScip(f.root, expected)).claims.length > 0, language);
+      } else {
+        await assert.rejects(checkCapturedScip(f.root, expected), { code: "InvalidAdmission" }, language);
+      }
+    });
+  }
+});
 test("position validation fits a bounded child heap without per-scalar storage", async () => {
   await withFixture(async (f) => {
     // A 4 MiB line is below the existing source cap. The 64 MiB heap isolates

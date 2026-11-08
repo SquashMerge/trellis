@@ -20,7 +20,7 @@ pub fn sha256(bytes: &[u8]) -> String {
 }
 
 fn language_order(language: &str) -> usize {
-    LANGUAGES.iter().position(|l| *l == language).unwrap()
+    trellis::semantic_evidence::language_order(language).unwrap()
 }
 
 fn extension(language: &str) -> &'static str {
@@ -28,6 +28,7 @@ fn extension(language: &str) -> &'static str {
         "java" => "java",
         "rust" => "rs",
         "python" => "py",
+        "typescript" => "ts",
         _ => "js",
     }
 }
@@ -131,7 +132,7 @@ pub struct BatchFixture {
     components: Value,
     sources: Vec<SourceDoc>,
     producer: Producer,
-    artifacts: Vec<(String, Vec<DocSpec>)>,
+    artifacts: Vec<(Vec<String>, Vec<DocSpec>)>,
     byte_docs: BTreeMap<u32, Vec<DocSpec>>,
     raw_bytes: BTreeMap<u32, Vec<u8>>,
     exclusions: BTreeMap<(String, String), &'static str>,
@@ -247,7 +248,7 @@ impl BatchFixture {
         self
     }
 
-    /// A pinned real producer from the hardware profile; it covers one language.
+    /// A pinned real producer from the hardware profile; it covers the languages of its pin.
     pub fn reference(mut self, producer: &str) -> Self {
         let profile: Value = serde_json::from_str(include_str!(
             "../../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
@@ -259,12 +260,6 @@ impl BatchFixture {
             .iter()
             .find(|p| p["name"] == producer)
             .unwrap();
-        let language = match producer {
-            "scip-java" => "java",
-            "scip-typescript" => "javascript",
-            "scip-python" => "python",
-            _ => "rust",
-        };
         self.producer = Producer {
             trust_origin: "referenceProfile",
             profile_id: profile["profileId"].as_str().unwrap().into(),
@@ -280,7 +275,9 @@ impl BatchFixture {
                 "utf16" => 2,
                 _ => 3,
             },
-            languages: vec![language.into()],
+            languages: trellis::scip_admission::pinned_producer_by_id(producer)
+                .unwrap()
+                .languages,
         };
         self
     }
@@ -301,7 +298,14 @@ impl BatchFixture {
 
     /// Adds an artifact covering `docs`; returns its ordinal.
     pub fn artifact(&mut self, language: &str, docs: Vec<DocSpec>) -> u32 {
-        self.artifacts.push((language.into(), docs));
+        self.artifact_languages(&[language], docs)
+    }
+
+    /// Adds one artifact covering `docs` of every language in `languages` (contract order);
+    /// returns its ordinal.
+    pub fn artifact_languages(&mut self, languages: &[&str], docs: Vec<DocSpec>) -> u32 {
+        self.artifacts
+            .push((languages.iter().map(|l| (*l).to_owned()).collect(), docs));
         (self.artifacts.len() - 1) as u32
     }
 
@@ -423,9 +427,16 @@ impl BatchFixture {
                 .cmp(&(language_order(&b.language), b.path.as_bytes()))
         });
         let mut assigned: BTreeMap<(String, String), u32> = BTreeMap::new();
-        for (ordinal, (language, docs)) in self.artifacts.iter().enumerate() {
+        for (ordinal, (languages, docs)) in self.artifacts.iter().enumerate() {
             for doc in docs {
-                assigned.insert((language.clone(), doc.path.clone()), ordinal as u32);
+                for language in languages {
+                    if sources
+                        .iter()
+                        .any(|s| s.language == *language && s.path == doc.path)
+                    {
+                        assigned.insert((language.clone(), doc.path.clone()), ordinal as u32);
+                    }
+                }
             }
         }
         let source_rows: Vec<Value> = sources
@@ -456,17 +467,20 @@ impl BatchFixture {
             }
         }
         let mut artifacts = vec![];
-        for (ordinal, (language, docs)) in self.artifacts.iter().enumerate() {
+        for (ordinal, (languages, docs)) in self.artifacts.iter().enumerate() {
             let bytes = match self.raw_bytes.get(&(ordinal as u32)) {
                 Some(bytes) => bytes.clone(),
                 None => self.scip_bytes(
-                    language,
+                    match languages.as_slice() {
+                        [language] => language,
+                        _ => "",
+                    },
                     self.byte_docs.get(&(ordinal as u32)).unwrap_or(docs),
                 ),
             };
             let name = format!("artifact-{ordinal}.scip");
             fs::write(dir.join(&name), &bytes).unwrap();
-            artifacts.push(json!({"ordinal":ordinal,"relativePath":relative(&name),"byteLength":bytes.len(),"sha256":sha256(&bytes),"language":language}));
+            artifacts.push(json!({"ordinal":ordinal,"relativePath":relative(&name),"byteLength":bytes.len(),"sha256":sha256(&bytes),"languages":languages}));
         }
         let set_id = self.source_set["id"].as_str().unwrap();
         let mut hasher = SourceManifestHasher::new(set_id);

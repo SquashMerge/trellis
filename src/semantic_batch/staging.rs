@@ -53,9 +53,10 @@ const STAGE_DB: &str = "stage.db";
 const STAGE_SCHEMA: &str = "
 CREATE TABLE header(singleton INTEGER PRIMARY KEY CHECK(singleton=1), descriptor_sha256 TEXT NOT NULL, descriptor_bytes BLOB NOT NULL);
 CREATE TABLE sources(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, UNIQUE(language,path));
+CREATE INDEX sources_path ON sources(path);
 CREATE TABLE coverage(source_ord INTEGER PRIMARY KEY REFERENCES sources(ord), artifact INTEGER, exclusion TEXT, CHECK((artifact IS NULL)<>(exclusion IS NULL)));
 CREATE INDEX coverage_artifact ON coverage(artifact, source_ord);
-CREATE TABLE artifacts(ordinal INTEGER PRIMARY KEY, path TEXT NOT NULL, language TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE, byte_length INTEGER NOT NULL, documents INTEGER NOT NULL DEFAULT 0, claims INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE artifacts(ordinal INTEGER PRIMARY KEY, path TEXT NOT NULL, languages TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE, byte_length INTEGER NOT NULL, documents INTEGER NOT NULL DEFAULT 0, claims INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, path TEXT NOT NULL, wire_digest TEXT NOT NULL, capped INTEGER NOT NULL CHECK(capped IN (0,1,2,3)), UNIQUE(artifact,path));
 CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL, symbol TEXT, presence INTEGER NOT NULL, target_root INTEGER, target_lib INTEGER NOT NULL DEFAULT 0, target_package TEXT, target_version TEXT, UNIQUE(artifact,fact_digest));
 CREATE INDEX claims_order ON claims(source_ord, canonical_bytes);
@@ -759,27 +760,58 @@ pub struct Assigned {
     pub ord: i64,
     pub content_hash: String,
     pub byte_length: usize,
+    pub language: String,
 }
 
-/// The source `(language, path)` if coverage assigned it to `artifact`.
+/// The source at `path` if coverage assigned it to `artifact`. Two assigned sources at one
+/// path (one per language) are an ambiguous artifact document path.
 pub fn lookup_assigned(
     conn: &Connection,
     artifact: u32,
-    language: &str,
     path: &str,
-) -> rusqlite::Result<Option<Assigned>> {
-    conn.prepare_cached(
-        "SELECT s.ord, s.content_hash, s.byte_length FROM sources s JOIN coverage c ON c.source_ord=s.ord \
-         WHERE s.language=?1 AND s.path=?2 AND c.artifact=?3",
-    )?
-    .query_row(params![language, path, artifact], |row| {
-        Ok(Assigned {
-            ord: row.get(0)?,
-            content_hash: row.get(1)?,
-            byte_length: row.get::<_, i64>(2)? as usize,
-        })
-    })
-    .optional()
+) -> std::result::Result<Option<Assigned>, StageLookupError> {
+    let mut statement = conn.prepare_cached(
+        "SELECT s.ord, s.content_hash, s.byte_length, s.language FROM sources s JOIN coverage c ON c.source_ord=s.ord \
+         WHERE s.path=?1 AND c.artifact=?2 LIMIT 2",
+    )?;
+    let mut rows = statement.query(params![path, artifact])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let assigned = Assigned {
+        ord: row.get(0)?,
+        content_hash: row.get(1)?,
+        byte_length: row.get::<_, i64>(2)? as usize,
+        language: row.get(3)?,
+    };
+    if rows.next()?.is_some() {
+        return Err(StageLookupError::Ambiguous);
+    }
+    Ok(Some(assigned))
+}
+
+/// Why `lookup_assigned` found no single source.
+#[derive(Debug)]
+pub enum StageLookupError {
+    Storage(rusqlite::Error),
+    Ambiguous,
+}
+
+impl std::fmt::Display for StageLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(error) => error.fmt(f),
+            Self::Ambiguous => f.write_str("ambiguous document path"),
+        }
+    }
+}
+
+impl std::error::Error for StageLookupError {}
+
+impl From<rusqlite::Error> for StageLookupError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Storage(error)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -795,7 +827,6 @@ pub struct StageClaimSink<'c> {
     conn: &'c Connection,
     budget: &'c StageBudget,
     artifact: u32,
-    language: String,
     current: Option<i64>,
     totals: SinkTotals,
     rows_since_check: u64,
@@ -807,17 +838,11 @@ fn stage_storage() -> ScipCaptureError {
 }
 
 impl<'c> StageClaimSink<'c> {
-    pub fn new(
-        conn: &'c Connection,
-        budget: &'c StageBudget,
-        artifact: u32,
-        language: &str,
-    ) -> Self {
+    pub fn new(conn: &'c Connection, budget: &'c StageBudget, artifact: u32) -> Self {
         Self {
             conn,
             budget,
             artifact,
-            language: language.to_owned(),
             current: None,
             totals: SinkTotals {
                 documents: 0,
@@ -866,8 +891,16 @@ impl ClaimSink for StageClaimSink<'_> {
     ) -> std::result::Result<(), ScipCaptureError> {
         let begun = self.conn.execute_batch(UNIT_BEGIN);
         self.record(begun)?;
-        let found = lookup_assigned(self.conn, self.artifact, &self.language, doc.path);
-        self.current = self.record(found)?.map(|assigned| assigned.ord);
+        let found = match lookup_assigned(self.conn, self.artifact, doc.path) {
+            Ok(found) => found,
+            Err(StageLookupError::Ambiguous) => {
+                return Err(ScipCaptureError::InvalidArtifact(
+                    "ambiguous document path".into(),
+                ));
+            }
+            Err(StageLookupError::Storage(error)) => self.record(Err(error))?,
+        };
+        self.current = found.map(|assigned| assigned.ord);
         let Some(ord) = self.current else {
             return Ok(());
         };

@@ -78,7 +78,10 @@ fn plan_lists_every_inspectable_field() {
 
     let plan_ts = json_out(&plan(&checkout, &[&ts], "scip-typescript", "restricted"));
     assert_eq!(plan_ts["producer"]["name"], "scip-typescript");
-    assert_eq!(plan_ts["producer"]["language"], "javascript");
+    assert_eq!(
+        plan_ts["producer"]["languages"],
+        json!(["javascript", "typescript"])
+    );
     assert_eq!(
         plan_ts["producer"]["version"],
         pinned_version("scip-typescript")
@@ -127,7 +130,10 @@ fn plan_lists_every_inspectable_field() {
             .starts_with("revision:v2:")
     );
     assert_eq!(inputs["sourceManifestHash"].as_str().unwrap().len(), 64);
-    assert_eq!(inputs["documents"]["requestedLanguage"], "javascript");
+    assert_eq!(
+        inputs["documents"]["requestedLanguages"],
+        json!(["javascript", "typescript"])
+    );
     assert_eq!(inputs["documents"]["requested"], 1);
     assert!(
         inputs["config"]

@@ -1217,7 +1217,7 @@ fn unresolved_module_marker(
     path: &str,
     o: &types::Occurrence,
 ) -> bool {
-    if language != "javascript" || o.symbol_roles & 1 == 0 {
+    if !matches!(language, "javascript" | "typescript") || o.symbol_roles & 1 == 0 {
         return false;
     }
     let Ok(symbol) = scip::symbol::parse_symbol(&o.symbol) else {
@@ -1239,7 +1239,7 @@ pub(crate) fn module_marker_shape(language: &str, path: &str, symbol: &str) -> b
     let package =
         |descriptor: &types::Descriptor| descriptor.suffix.enum_value() == Ok(Suffix::Package);
     match (language, symbol.scheme.as_str()) {
-        ("javascript", "scip-typescript") => {
+        ("javascript" | "typescript", "scip-typescript") => {
             module_roots::typescript_module_path(&symbol).is_some()
         }
         ("python", "scip-python") => {
@@ -2126,6 +2126,35 @@ mod tests {
             decode_authenticated(&input, &Arc::new(AtomicBool::new(false))).unwrap_err(),
             invalid("document source binding")
         );
+    }
+    #[test]
+    fn typescript_profile_binds_empty_and_exact_typescript_languages_only() {
+        let languages = vec!["javascript".to_owned(), "typescript".to_owned()];
+        assert_eq!(
+            bind_document_language("", "typescript", &languages),
+            Ok("typescript")
+        );
+        assert_eq!(
+            bind_document_language("typescript", "typescript", &languages),
+            Ok("typescript")
+        );
+        for (raw, detected) in [
+            ("javascript", "typescript"),
+            ("TypeScript", "typescript"),
+            ("", "python"),
+        ] {
+            assert_eq!(
+                bind_document_language(raw, detected, &languages),
+                Err(invalid("document source binding"))
+            );
+        }
+    }
+    #[test]
+    fn typescript_documents_carry_scip_typescript_module_markers() {
+        let marker = "scip-typescript npm root 2.0.0 src/`a.ts`/";
+        assert!(module_marker_shape("typescript", "src/a.ts", marker));
+        assert!(module_marker_shape("javascript", "src/a.js", marker));
+        assert!(!module_marker_shape("python", "src/a.ts", marker));
     }
     #[test]
     fn empty_document_language_binds_source_without_rewriting_artifact() {

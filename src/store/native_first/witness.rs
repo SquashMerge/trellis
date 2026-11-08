@@ -1619,8 +1619,8 @@ pub(crate) fn source_authority(
             params![selection.batch_id,producer.id,producer.version,descriptor.profile_id,descriptor.source_set.id,descriptor.source_revision,descriptor.source_manifest_hash,descriptor.decoder_version],|r|r.get(0))?;
         selected_ensure!(metadata, "witness batch metadata mismatch");
         let entry = &descriptor.artifacts[0];
-        let (capture_id,valid):(i64,bool)=db.prepare_cached("SELECT capture_id,ordinal=?2 AND language=?3 AND artifact_hash=?4 AND producer_id=?5 AND source_set_id=?6 AND captured_revision=?7 AND decoder_version=?8 AND length(binary_bytes)=?9 FROM semantic_raw_captures WHERE batch_id=?1 AND ordinal=?2")?.query_row(
-            params![selection.batch_id,entry.ordinal,entry.language,entry.sha256,producer.id,descriptor.source_set.id,descriptor.source_revision,descriptor.decoder_version,i64::try_from(entry.byte_length)?],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (capture_id,valid):(i64,bool)=db.prepare_cached("SELECT capture_id,ordinal=?2 AND languages=?3 AND artifact_hash=?4 AND producer_id=?5 AND source_set_id=?6 AND captured_revision=?7 AND decoder_version=?8 AND length(binary_bytes)=?9 FROM semantic_raw_captures WHERE batch_id=?1 AND ordinal=?2")?.query_row(
+            params![selection.batch_id,entry.ordinal,entry.languages_json(),entry.sha256,producer.id,descriptor.source_set.id,descriptor.source_revision,descriptor.decoder_version,i64::try_from(entry.byte_length)?],|r|Ok((r.get(0)?,r.get(1)?)))?;
         if !valid {
             // A retained artifact that no longer matches its descriptor is the producer's
             // failure, as FULL authenticates and reports it, never index corruption.

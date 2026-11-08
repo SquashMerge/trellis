@@ -3,12 +3,20 @@ use crate::{native_evidence::DocumentKey, semantic_batch::descriptor::Descriptor
 use serde_json::json;
 
 fn batch() -> SelectedRawBatch {
+    batch_of(&[&["java"], &["javascript"], &["javascript"]], "b.js")
+}
+
+fn batch_of(artifact_languages: &[&[&str]], assigned_path: &str) -> SelectedRawBatch {
     let pinned = crate::scip_admission::pinned_producer_by_id("trellis-synthetic-scip").unwrap();
     let hex = |c: char| c.to_string().repeat(64);
-    let artifact = |ordinal: u32, language: &str| {
-        json!({"ordinal": ordinal, "relativePath": format!("a{ordinal}.scip"), "byteLength": 1,
-               "sha256": hex(char::from(b'0' + ordinal as u8)), "language": language})
-    };
+    let artifacts: Vec<_> = artifact_languages
+        .iter()
+        .enumerate()
+        .map(|(ordinal, languages)| {
+            json!({"ordinal": ordinal, "relativePath": format!("a{ordinal}.scip"), "byteLength": 1,
+                   "sha256": hex(char::from(b'0' + ordinal as u8)), "languages": languages})
+        })
+        .collect();
     let descriptor = json!({
         "formatVersion": 1, "trustOrigin": "syntheticProfile", "profileId": pinned.profile_id,
         "decoderVersion": crate::scip_raw::DECODER_VERSION,
@@ -22,7 +30,7 @@ fn batch() -> SelectedRawBatch {
         "completion": "complete",
         "totals": {"sourceDocuments": 3, "coveredDocuments": 1, "excludedDocuments": 0, "pageBytes": 0, "artifactBytes": 3},
         "pages": [],
-        "artifacts": [artifact(0, "java"), artifact(1, "javascript"), artifact(2, "javascript")],
+        "artifacts": artifacts,
         "generation": null,
     });
     let descriptor: Descriptor = serde_json::from_value(descriptor).unwrap();
@@ -32,7 +40,7 @@ fn batch() -> SelectedRawBatch {
         .map(|entry| SelectedRawCapture {
             capture_id: 10 + i64::from(entry.ordinal),
             ordinal: entry.ordinal,
-            language: entry.language.clone(),
+            languages: entry.languages.clone(),
             artifact_hash: entry.sha256.clone(),
             binary_bytes: vec![1],
         })
@@ -52,7 +60,7 @@ fn batch() -> SelectedRawBatch {
         capped_documents: Default::default(),
         proofs: vec![],
         documents: BTreeMap::from([(
-            ("javascript".into(), "b.js".into()),
+            ("javascript".into(), assigned_path.into()),
             (hex('e'), hex('f'), 12),
         )]),
         captured_pin: IndexPin {
@@ -81,4 +89,20 @@ fn basis_artifact_is_the_assigned_capture_else_the_lowest_ordinal_of_the_languag
     );
     assert_eq!(batch.artifact_hash_for(&key("java", "A.java")), hash(0));
     assert_eq!(batch.artifact_hash_for(&key("python", "a.py")), hash(0));
+}
+
+#[test]
+fn a_multi_language_artifact_carries_the_basis_of_each_of_its_languages() {
+    let batch = batch_of(&[&["java"], &["javascript", "typescript"]], "b.js");
+    let hash = |ordinal: usize| batch.captures[ordinal].artifact_hash.as_str();
+    assert_eq!(batch.captures[1].languages, ["javascript", "typescript"]);
+    assert_eq!(
+        batch.artifact_hash_for(&key("typescript", "excluded.ts")),
+        hash(1)
+    );
+    assert_eq!(
+        batch.artifact_hash_for(&key("javascript", "excluded.js")),
+        hash(1)
+    );
+    assert_eq!(batch.artifact_hash_for(&key("java", "A.java")), hash(0));
 }

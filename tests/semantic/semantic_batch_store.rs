@@ -982,7 +982,7 @@ impl World {
                 let artifact = parsed
                     .artifacts
                     .iter()
-                    .find(|a| a.language == document.key.language)
+                    .find(|a| a.languages.contains(&document.key.language))
                     .unwrap_or(&parsed.artifacts[0]);
                 (
                     document.key.clone(),
@@ -3733,6 +3733,385 @@ fn real_typescript_explicit_symbol_kind_is_checked_identically_in_batch_and_memo
     }
 }
 
+const ISSUE444_PACKAGE: &str = r#"{"name":"issue444-fixture","version":"1.0.0"}"#;
+
+/// The real #444 bytes with `src/lib.js` and `src/main.js` renamed to `lib` and `main` (paths
+/// and module markers), and optionally an explicit SCIP kind on the constructor and `run`.
+fn issue444_retargeted(lib: &str, main: &str, kind: Option<i32>) -> Vec<u8> {
+    use protobuf::{EnumOrUnknown, Message};
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import/issue444-javascript-calls");
+    let mut index =
+        scip::types::Index::parse_from_bytes(&fs::read(fixture_dir.join("index.scip")).unwrap())
+            .unwrap();
+    let rename = |text: &str| {
+        text.replace(
+            "`lib.js`",
+            &format!("`{}`", lib.rsplit('/').next().unwrap()),
+        )
+        .replace(
+            "`main.js`",
+            &format!("`{}`", main.rsplit('/').next().unwrap()),
+        )
+    };
+    for document in &mut index.documents {
+        document.relative_path = match document.relative_path.as_str() {
+            "src/lib.js" => lib.to_owned(),
+            "src/main.js" => main.to_owned(),
+            other => panic!("unexpected document {other}"),
+        };
+        for occurrence in &mut document.occurrences {
+            occurrence.symbol = rename(&occurrence.symbol);
+        }
+        for info in &mut document.symbols {
+            info.symbol = rename(&info.symbol);
+            for relationship in &mut info.relationships {
+                relationship.symbol = rename(&relationship.symbol);
+            }
+            let explicit = info.symbol.ends_with("Widget#`<constructor>`().")
+                || info.symbol.ends_with("Widget#run().");
+            if let (Some(kind), true) = (kind, explicit) {
+                info.kind = EnumOrUnknown::from_i32(kind);
+            }
+        }
+    }
+    index.write_to_bytes().unwrap()
+}
+
+/// Joins the retargeted #444 bytes (artifact covering `languages`), checks the staged join
+/// equals the memory join, and returns the `(callee, resolution, dispatch)` of every call in
+/// `main`, sorted by callee text.
+fn issue444_calls(
+    lib: &str,
+    main: &str,
+    languages: &[&str],
+    kind: Option<i32>,
+) -> Vec<(String, Resolution, trellis::semantic_evidence::Dispatch)> {
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import/issue444-javascript-calls");
+    let read = |path: &str| fs::read_to_string(fixture_dir.join(path)).unwrap();
+    let (lib_text, main_text) = (read("src/lib.js"), read("src/main.js"));
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                (lib, &lib_text),
+                (main, &main_text),
+                ("package.json", ISSUE444_PACKAGE),
+            ],
+        )
+    });
+    let mut fixture = world.fixture().reference("scip-typescript");
+    let ordinal =
+        fixture.artifact_languages(languages, vec![DocSpec::new(lib), DocSpec::new(main)]);
+    fixture.override_artifact_raw(ordinal, issue444_retargeted(lib, main, kind));
+    let descriptor = world.write(&fixture);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    assert_same_publication(&staged, &memory, &format!("{lib} {main} kind {kind:?}"));
+    let mut calls: Vec<_> = staged
+        .call_bindings
+        .iter()
+        .map(|binding| {
+            let range = &binding.join.anchor.range;
+            (
+                main_text[range.start..range.end].to_owned(),
+                binding.resolution,
+                binding.dispatch,
+            )
+        })
+        .collect();
+    calls.sort_by(|a, b| a.0.cmp(&b.0));
+    calls
+}
+
+/// Calls in a TypeScript document dispatch as JavaScript's do: a plain call of a function is
+/// direct, `new` of a class (its constructor method is the target) is constructor, and a member
+/// call of a method is dynamic.
+#[test]
+fn typescript_calls_dispatch_direct_constructor_and_dynamic() {
+    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Dynamic};
+    let resolved = Resolution::Resolved;
+    let calls = issue444_calls("src/lib.ts", "src/main.ts", &["typescript"], None);
+    let expected = [
+        ("Widget", resolved, Constructor),
+        ("helper", resolved, Direct),
+        ("plain", resolved, Direct),
+        ("plain", resolved, Direct),
+        ("register", resolved, Direct),
+        ("run", resolved, Dynamic),
+    ]
+    .map(|(c, r, d)| (c.to_owned(), r, d));
+    assert_eq!(calls, expected);
+}
+
+/// The own-language guard is unchanged: a JavaScript document's call of a declaration in a
+/// TypeScript document of the same artifact stays unknown.
+#[test]
+fn javascript_call_of_a_typescript_declaration_stays_unknown() {
+    use trellis::semantic_evidence::Dispatch::{Direct, Unknown};
+    let resolved = Resolution::Resolved;
+    let calls = issue444_calls(
+        "src/lib.ts",
+        "src/main.js",
+        &["javascript", "typescript"],
+        None,
+    );
+    let by_callee = |name: &str| -> Vec<_> {
+        calls
+            .iter()
+            .filter(|(callee, _, _)| callee == name)
+            .map(|(_, resolution, dispatch)| (*resolution, *dispatch))
+            .collect()
+    };
+    for imported in ["helper", "Widget", "run"] {
+        assert_eq!(by_callee(imported), [(resolved, Unknown)], "{imported}");
+    }
+    assert_eq!(by_callee("plain"), [(resolved, Direct), (resolved, Direct)]);
+    assert_eq!(by_callee("register"), [(resolved, Direct)]);
+}
+
+/// #473 for TypeScript: the constructor's explicit kind `Constructor` (9) binds, `Method` (26)
+/// binds both, and `Function` (17) conflicts with both.
+#[test]
+fn typescript_explicit_symbol_kinds_are_checked() {
+    use trellis::semantic_evidence::Dispatch::{Constructor, Dynamic, Unknown};
+    for (kind, widget, run) in [
+        (
+            9,
+            (Resolution::Resolved, Constructor),
+            (Resolution::Unresolved, Unknown),
+        ),
+        (
+            26,
+            (Resolution::Resolved, Constructor),
+            (Resolution::Resolved, Dynamic),
+        ),
+        (
+            17,
+            (Resolution::Unresolved, Unknown),
+            (Resolution::Unresolved, Unknown),
+        ),
+    ] {
+        let calls = issue444_calls("src/lib.ts", "src/main.ts", &["typescript"], Some(kind));
+        let pick = |name: &str| {
+            calls
+                .iter()
+                .find(|(callee, _, _)| callee == name)
+                .map(|(_, resolution, dispatch)| (*resolution, *dispatch))
+                .unwrap()
+        };
+        assert_eq!(pick("Widget"), widget, "kind {kind}");
+        assert_eq!(pick("run"), run, "kind {kind}");
+    }
+}
+
+/// `new C()` of a TypeScript class without an explicit constructor binds the class symbol, whose
+/// native declaration kind is `type`: it is constructor, and the same shapes as JavaScript's
+/// stay unknown (`C()`, member calls of a free function).
+#[test]
+fn typescript_new_of_a_class_without_a_constructor_is_constructor() {
+    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+    let source =
+        "class W {}\nfunction m(o){ new W(); new o.W(); W(); h(); o.h(); }\nfunction h(){}\n";
+    let world = world(|root| write_files(root, &[("D.ts", source)]));
+    let mut doc = DocSpec::new("D.ts")
+        .symbol("pkg W#", 7, &[])
+        .symbol("pkg h().", 17, &[]);
+    for (needle, nth, symbol, roles) in [
+        ("W", 0, "pkg W#", 1),
+        ("h", 2, "pkg h().", 1),
+        ("W", 1, "pkg W#", 0),
+        ("W", 2, "pkg W#", 0),
+        ("W", 3, "pkg W#", 0),
+        ("h", 0, "pkg h().", 0),
+        ("h", 1, "pkg h().", 0),
+    ] {
+        doc = occ_at(doc, source, (needle, nth), None, symbol, roles);
+    }
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact_languages(&["typescript"], vec![doc]);
+    let descriptor = world.write(&fixture);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    assert_same_publication(&staged, &memory, "typescript dispatch shapes");
+    let mut dispatches: Vec<_> = staged
+        .call_bindings
+        .iter()
+        .map(|b| {
+            assert_eq!(b.resolution, Resolution::Resolved);
+            let range = &b.join.anchor.range;
+            (range.start, &source[range.start - 2..range.end], b.dispatch)
+        })
+        .collect();
+    dispatches.sort_by_key(|(start, _, _)| *start);
+    assert_eq!(
+        dispatches
+            .into_iter()
+            .map(|(_, text, dispatch)| (text, dispatch))
+            .collect::<Vec<_>>(),
+        [
+            ("w W", Constructor),
+            ("o.W", Constructor),
+            ("; W", Unknown),
+            ("; h", Direct),
+            ("o.h", Unknown),
+        ]
+    );
+}
+
+/// Anchors `doc` with an occurrence of `len` bytes at `delta` into the first `anchor` in `source`.
+fn occ_in(
+    doc: DocSpec,
+    source: &str,
+    (anchor, delta, len): (&str, usize, usize),
+    symbol: &str,
+    roles: i32,
+) -> DocSpec {
+    let start = source.find(anchor).unwrap() + delta;
+    let prefix = &source[..start];
+    let line = prefix.bytes().filter(|b| *b == b'\n').count() as i32;
+    let column = prefix.rsplit('\n').next().unwrap().len() as i32;
+    doc.occurrence(&[line, column, column + len as i32], &[], symbol, roles)
+}
+
+const TYPESCRIPT_ROLES: &str = "import { a as b } from \"./m\";\nclass C {}\nlet x: C = y as C;\nfunction f(z) { return z instanceof C; }\n";
+const TYPESCRIPT_TYPES: &str =
+    "class B {}\ninterface I {}\nclass A extends B implements I {}\ninterface J extends I {}\n";
+
+fn typescript_join() -> trellis::semantic_evidence::SemanticPublication {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/roles.ts", TYPESCRIPT_ROLES),
+                ("src/types.ts", TYPESCRIPT_TYPES),
+            ],
+        )
+    });
+    let roles = TYPESCRIPT_ROLES;
+    let mut roles_doc = DocSpec::new("src/roles.ts")
+        .symbol("pkg a.", 12, &[])
+        .symbol("pkg b.", 12, &[])
+        .symbol("pkg C#", 7, &[]);
+    for (spec, symbol, flags) in [
+        (("{ a", 2, 1), "pkg a.", 2),
+        (("as b", 3, 1), "pkg b.", 3),
+        (("class C", 6, 1), "pkg C#", 1),
+        (("x: C", 3, 1), "pkg C#", 0),
+        (("as C", 3, 1), "pkg C#", 0),
+        (("instanceof C", 11, 1), "pkg C#", 0),
+    ] {
+        roles_doc = occ_in(roles_doc, roles, spec, symbol, flags);
+    }
+    let types = TYPESCRIPT_TYPES;
+    let mut types_doc = DocSpec::new("src/types.ts")
+        .symbol("pkg B#", 7, &[])
+        .symbol("pkg I#", 21, &[])
+        .symbol("pkg A#", 7, &["pkg B#", "pkg I#"])
+        .symbol("pkg J#", 21, &["pkg I#"]);
+    for (spec, symbol, flags) in [
+        (("class B", 6, 1), "pkg B#", 1),
+        (("interface I", 10, 1), "pkg I#", 1),
+        (("class A", 6, 1), "pkg A#", 1),
+        (("extends B", 8, 1), "pkg B#", 0),
+        (("implements I", 11, 1), "pkg I#", 0),
+        (("interface J", 10, 1), "pkg J#", 1),
+        (("extends I", 8, 1), "pkg I#", 0),
+    ] {
+        types_doc = occ_in(types_doc, types, spec, symbol, flags);
+    }
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact_languages(&["typescript"], vec![roles_doc, types_doc]);
+    let descriptor = world.write(&fixture);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    assert_same_publication(&staged, &memory, "typescript roles and types");
+    staged
+}
+
+/// TypeScript type annotations, casts, `instanceof` and imports give their occurrences the same
+/// roles JavaScript's do: a type site is also read, an import occurrence is an import, and a
+/// declaring alias import is an alias.
+#[test]
+fn typescript_occurrence_roles_and_type_relationships_join() {
+    use trellis::semantic_evidence::{RelationshipKind, Role};
+    let staged = typescript_join();
+    let source = TYPESCRIPT_ROLES;
+    let roles_at = |anchor: &str, delta: usize| -> Vec<Role> {
+        let start = source.find(anchor).unwrap() + delta;
+        let mut roles: Vec<Role> = staged
+            .references
+            .iter()
+            .find(|r| r.document.path == "src/roles.ts" && r.range.start == start)
+            .unwrap_or_else(|| panic!("no reference at {anchor:?}"))
+            .roles
+            .clone();
+        roles.sort();
+        roles
+    };
+    // `x: C`, `y as C` and `z instanceof C` are type sites that are also read.
+    for (anchor, delta) in [("x: C", 3), ("as C", 3), ("instanceof C", 11)] {
+        assert_eq!(
+            roles_at(anchor, delta),
+            [Role::Read, Role::Type],
+            "{anchor}"
+        );
+    }
+    assert_eq!(roles_at("{ a", 2), [Role::Import]);
+    assert_eq!(
+        roles_at("as b", 3),
+        [Role::Definition, Role::Import, Role::Alias]
+    );
+    let mut relationships: Vec<_> = staged
+        .type_relationships
+        .iter()
+        .map(|row| (row.kind, row.source.clone(), row.target.clone()))
+        .collect();
+    relationships.sort_by_key(|(kind, _, _)| *kind as u8);
+    let kinds: Vec<_> = relationships.iter().map(|(kind, _, _)| *kind).collect();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == RelationshipKind::Extends)
+            .count(),
+        2,
+        "A extends B and J extends I: {relationships:?}"
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == RelationshipKind::Implements)
+            .count(),
+        1,
+        "A implements I: {relationships:?}"
+    );
+}
+
 /// Real scip-typescript 0.4.0 bytes for issue #466 (`index` with the fixture's `tsconfig.json`,
 /// producer metadata dropped). `new Set(..)` names four merged lib declarations and `Error(..)`
 /// two, so each call publishes one ambiguous row per occurrence, all sharing its `call_id`.
@@ -4475,7 +4854,7 @@ fn native_rejoin_after_batch_import_rejoins_every_artifact() {
         parsed
             .artifacts
             .iter()
-            .find(|artifact| artifact.language == language)
+            .find(|artifact| artifact.languages.iter().any(|l| l == language))
             .unwrap()
             .sha256
             .clone()
@@ -5900,7 +6279,7 @@ fn whole_publication_validator_runs_over_every_original_of_a_batch() {
         .store
         .with_index_sql_for_tests(|db| {
             let changed = db.execute(
-                "UPDATE semantic_raw_captures SET binary_bytes=zeroblob(length(binary_bytes)) WHERE language='java'",
+                "UPDATE semantic_raw_captures SET binary_bytes=zeroblob(length(binary_bytes)) WHERE languages='[\"java\"]'",
                 [],
             )?;
             assert_eq!(changed, 1);

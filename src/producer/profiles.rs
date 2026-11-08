@@ -41,13 +41,13 @@ impl Target {
         }
     }
 
-    /// The language its artifact covers.
-    pub fn language(self) -> &'static str {
+    /// The languages its artifact covers.
+    pub fn languages(self) -> &'static [&'static str] {
         match self {
             Self::Real(producer) => {
-                crate::scip_admission::producer_language(producer.as_str()).unwrap_or("javascript")
+                crate::scip_admission::producer_languages(producer.as_str()).unwrap_or(&[])
             }
-            Self::Stub => crate::scip_admission::stub_language(),
+            Self::Stub => crate::scip_admission::stub_languages(),
         }
     }
 
@@ -320,9 +320,10 @@ pub struct Generated {
 /// whose ES5 default target cannot parse ES2015+ identifiers (an escaped astral name gave a
 /// zero-width definition); this keeps its defaults but targets ES2022. With the ES2015+
 /// target, `module` defaults to ES2015 and classic resolution, so `commonjs` keeps the
-/// node10 resolution `--infer-tsconfig` had.
+/// node10 resolution `--infer-tsconfig` had. `jsx: preserve` lets `.tsx` parse, and
+/// `allowJs` keeps `.js` in the same program as `.ts` (#683).
 pub const SCIP_TYPESCRIPT_TSCONFIG: &[u8] =
-    br#"{"compilerOptions":{"allowJs":true,"target":"es2022","module":"commonjs"}}"#;
+    br#"{"compilerOptions":{"allowJs":true,"jsx":"preserve","target":"es2022","module":"commonjs"}}"#;
 
 /// A captured root input the row leaves out of the worktree.
 #[derive(Clone, Debug, Eq, PartialEq)]

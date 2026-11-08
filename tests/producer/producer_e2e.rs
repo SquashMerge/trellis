@@ -32,6 +32,114 @@ fn scip_typescript_javascript_restricted_end_to_end_strict() {
     assert!(real::run_case(&TYPESCRIPT, Availability::Required).is_some());
 }
 
+/// The mixed TypeScript and JavaScript fixture through one real scip-typescript run
+/// (Decision 0020): the artifact covers both languages. With `own_tsconfig` false the
+/// checkout's root `tsconfig.json` is deleted, so the plan generates its own.
+fn typescript_mixed(own_tsconfig: bool, availability: Availability) -> Option<String> {
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typescript-mixed");
+    let checkout = support::start_checkout(
+        |root| {
+            real::copy_tree(&fixture, root);
+            if !own_tsconfig {
+                std::fs::remove_file(root.join("tsconfig.json")).unwrap();
+            }
+        },
+        &[],
+    );
+    let plan = availability.resolve(
+        "scip-typescript",
+        real::plan(&checkout, "scip-typescript", "restricted", &[]),
+    )?;
+    assert_eq!(
+        plan["producer"]["languages"],
+        serde_json::json!(["javascript", "typescript"])
+    );
+    let generated = plan["inputs"]["generatedConfig"].as_array().unwrap();
+    assert_eq!(generated.len(), usize::from(!own_tsconfig), "{generated:?}");
+    // `ignored.jsx` is not indexed, so it is in neither count.
+    let documents: usize = ["js", "mjs", "cjs", "ts", "tsx", "mts", "cts"]
+        .iter()
+        .map(|extension| real_documents(&fixture, extension))
+        .sum();
+    assert_eq!(plan["inputs"]["documents"]["requested"], documents);
+    let hash = plan["planSha256"].as_str().unwrap().to_owned();
+    let before = support::workspace_tree_digest(&checkout.root);
+    let output = real::producer_command(
+        &checkout,
+        "run",
+        "scip-typescript",
+        &["--trust", "restricted", "--plan-sha256", &hash],
+    )
+    .output()
+    .unwrap();
+    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "no JSON on stdout; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(reply["outcome"], "imported", "{reply}");
+    let report = &reply["import"]["report"];
+    let artifacts = report["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 1, "{report}");
+    assert_eq!(
+        artifacts[0]["languages"],
+        serde_json::json!(["javascript", "typescript"])
+    );
+    assert!(artifacts[0]["claims"].as_u64().unwrap() > 0, "{report}");
+    for language in ["javascript", "typescript"] {
+        let row = report["languages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["language"] == language)
+            .unwrap_or_else(|| panic!("no {language} report: {report}"));
+        assert_eq!(row["failed"], 0, "{language}: {row}");
+        assert!(row["complete"].as_u64().unwrap() > 0, "{language}: {row}");
+    }
+    assert_eq!(
+        support::workspace_tree_digest(&checkout.root),
+        before,
+        "the run changed the workspace"
+    );
+    let line = format!(
+        "E2E-EVIDENCE producer=scip-typescript language=typescript rootTsconfig={own_tsconfig} documents={documents} claims={}",
+        artifacts[0]["claims"]
+    );
+    println!("{line}");
+    Some(line)
+}
+
+fn real_documents(fixture: &std::path::Path, extension: &str) -> usize {
+    fn walk(dir: &std::path::Path, extension: &str, count: &mut usize) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, extension, count);
+            } else if path.extension().is_some_and(|e| e == extension) {
+                *count += 1;
+            }
+        }
+    }
+    let mut count = 0;
+    walk(fixture, extension, &mut count);
+    count
+}
+
+#[test]
+fn scip_typescript_typescript_restricted_end_to_end() {
+    typescript_mixed(true, Availability::SkipIfUnavailable);
+    typescript_mixed(false, Availability::SkipIfUnavailable);
+}
+
+#[test]
+#[ignore = "strict real-producer evidence: fails when the producer is unavailable"]
+fn scip_typescript_typescript_restricted_end_to_end_strict() {
+    assert!(typescript_mixed(true, Availability::Required).is_some());
+    assert!(typescript_mixed(false, Availability::Required).is_some());
+}
+
 #[test]
 fn scip_python_restricted_end_to_end() {
     real::run_case(&PYTHON, Availability::SkipIfUnavailable);
@@ -348,7 +456,7 @@ mod omitted_python_context {
                     reader,
                     &batch::BatchSpec {
                         pin: &prepared.pin,
-                        language: "python",
+                        languages: &["python"],
                         workspace: &root,
                         dir: &dir,
                         generation: batch::run_generation(
