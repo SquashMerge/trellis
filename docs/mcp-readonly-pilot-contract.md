@@ -367,7 +367,7 @@ incoming `scopeCoverage` and the lookup alternatives other tools return keep the
 
 ## Amendment (#770): a bounded prompt reference view
 
-**Status: proposed in #770, awaiting owner ratification.** `trellis_propose_layers`
+**Status: owner-ratified 2026-11-07 (#770).** `trellis_propose_layers`
 inlined the whole `references:v2` result, so on any non-trivial checkout the prompt
 exceeded the 65,536-byte frame and failed with `response_too_large`. This section wins
 over the [proposal prompt](#one-no-argument-proposal-prompt) and
