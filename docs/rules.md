@@ -166,7 +166,7 @@ app is one of:
 - **A `package.json`,** anywhere in the snapshot outside `node_modules/`. Its name is
   `name`, or the manifest's checkout-relative directory (`.` at the checkout root) when
   `name` is absent or not a nonblank string. Its root is the manifest's directory.
-- **A Python project** (status: proposed (owner-directed, #807)). That is a `pyproject.toml`,
+- **A Python project** (status: owner-ratified 2026-11-08 (#807)). That is a `pyproject.toml`,
   anywhere in the snapshot outside `node_modules/`, with a `[project]` table whose `name`
   is a nonblank string, or, without `[project]`, a Poetry `[tool.poetry]` table with one.
   Its name is that `name`. Its root is the manifest's directory. Its entries are the
@@ -174,10 +174,11 @@ app is one of:
   `[tool.poetry.scripts]` targets, and may be empty. A `pyproject.toml` with neither table,
   such as a tool-only file, is not an app. Each file is judged alone: a uv
   `[tool.uv.workspace]` changes nothing, so a virtual workspace root is not an app, and a
-  member, an excluded project and a project outside the workspace are each an app. A nested
-  `pyproject.toml` is detected only once the snapshot retains it.
+  member, an excluded project and a project outside the workspace are each an app. Capture
+  retains a nested `pyproject.toml` that sits above Python sources, as it does a nested
+  `Cargo.toml` above Rust sources.
 
-The app kinds are `cargo`, `npm` and `python` (`python` proposed (owner-directed, #807)).
+The app kinds are `cargo`, `npm` and `python` (`python` owner-ratified 2026-11-08 (#807)).
 
 There is no authored `[[apps]]` table, so the closed top-level keys are unchanged. An
 authored override is a planned follow-up in a separate issue, for checkouts that manifests
