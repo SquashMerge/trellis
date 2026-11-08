@@ -28,6 +28,24 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
+/// Every file below `dir`, as a `/`-separated path relative to `root`.
+fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            walk(root, &path, out);
+        } else {
+            out.push(
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+    }
+}
+
 fn fixture_root() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     copy_tree(
@@ -84,7 +102,7 @@ fn typescript_mixed_detection_and_capture() {
     let root = fs::canonicalize(workspace.path()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let state = tempfile::tempdir().unwrap();
-    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
     let options = IndexOptions::new(root.clone());
     let (graph, artifact, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
@@ -98,23 +116,17 @@ fn typescript_mixed_detection_and_capture() {
             .find(|file| file.path == path)
             .map(|file| file.language.as_str())
     };
-    for path in [
-        "src/app/model.ts",
-        "src/app/view.tsx",
-        "src/app/esm.mts",
-        "src/app/cjs.cts",
-        "src/app/types.d.ts",
-        "src/app/legacy.d.ts",
-        "tests/types.d.ts",
-        "__tests__/view.test.tsx",
-        "src/app/model.test.ts",
-        "generated/app/api.ts",
-        "pkg/index.ts",
-        "src/space.ts",
-    ] {
-        assert_eq!(language_of(path), Some("typescript"), "{path}");
+    let mut fixture_files = Vec::new();
+    walk(&root, &root, &mut fixture_files);
+    assert!(fixture_files.iter().any(|path| path.ends_with(".d.ts")));
+    for path in &fixture_files {
+        let expected = match path.rsplit('.').next().unwrap() {
+            "ts" | "tsx" | "mts" | "cts" => Some("typescript"),
+            "js" => Some("javascript"),
+            _ => None,
+        };
+        assert_eq!(language_of(path), expected, "{path}");
     }
-    assert_eq!(language_of("src/app/legacy.js"), Some("javascript"));
     assert_eq!(language_of("src/app/ignored.jsx"), None);
     assert!(
         artifact
@@ -188,7 +200,7 @@ fn typescript_mixed_detection_and_capture() {
         .unwrap();
     drop(leader);
     drop(store);
-    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
     for document in &artifact.revision.documents {
         let (stored, _) = store
             .native_source_at(pin, &document.key)
