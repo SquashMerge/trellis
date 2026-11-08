@@ -134,6 +134,10 @@ pub(crate) struct ArchitectureCore {
     /// Every build manifest's app-detection outcome, before any rules file hides some.
     #[cfg_attr(not(test), allow(dead_code))]
     app_candidates: Result<crate::apps::Candidates, CoreFailure>,
+    /// Server routes and client calls, computed only for a checkout with two or more apps.
+    /// `None` when this core was computed without a rules file.
+    #[cfg_attr(not(test), allow(dead_code))]
+    interfaces: Option<Result<crate::interfaces::Extraction, CoreFailure>>,
     /// Finished summaries; one per valid role, aggregate and workbench choice.
     summaries: Mutex<BTreeMap<SummaryKey, Arc<serde_json::Value>>>,
 }
@@ -165,6 +169,13 @@ impl ArchitectureCore {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn app_candidates(&self) -> Result<&crate::apps::Candidates> {
         self.app_candidates.as_ref().map_err(CoreFailure::error)
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn interfaces(&self) -> Result<&crate::interfaces::Extraction> {
+        match &self.interfaces {
+            Some(interfaces) => interfaces.as_ref().map_err(CoreFailure::error),
+            None => anyhow::bail!("store_unavailable: architecture interfaces part"),
+        }
     }
     /// Metrics rows for a read that can compute its own if this core failed them.
     pub(crate) fn metrics_if_computed(&self) -> Option<&ArchitectureMetrics> {
@@ -302,6 +313,24 @@ impl ArchitectureCore {
                 Err(error) => return Err(error),
             }
         };
+        let interfaces = match (config, &app_candidates) {
+            (None, _) => None,
+            (Some(_), Ok(candidates)) if detected_apps(candidates) >= 2 => {
+                let mut work =
+                    crate::references::work::Work::new(crate::references::work::rules_limit(
+                        snapshot.documents.len(),
+                        crate::references::work::snapshot_bytes(&snapshot, check)?,
+                    ));
+                Some(
+                    match crate::interfaces::extract(&snapshot, &mut work, check) {
+                        Ok(extraction) => Ok(extraction),
+                        Err(error) if CoreFailure::repeats(&error) => Err(CoreFailure::of(&error)),
+                        Err(error) => return Err(error),
+                    },
+                )
+            }
+            (Some(_), _) => Some(Ok(crate::interfaces::Extraction::default())),
+        };
         check()?;
         Ok(Self {
             pin: snapshot.pin,
@@ -309,9 +338,19 @@ impl ArchitectureCore {
             rules,
             metrics,
             app_candidates,
+            interfaces,
             summaries: Mutex::default(),
         })
     }
+}
+
+/// How many manifests detect an app.
+fn detected_apps(candidates: &crate::apps::Candidates) -> usize {
+    candidates
+        .manifests
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, crate::apps::Outcome::App(_)))
+        .count()
 }
 
 /// Metrics of the documents already read, in parallel.

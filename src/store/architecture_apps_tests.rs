@@ -20,15 +20,20 @@ fn published(root_package_json: bool) -> (tempfile::TempDir, tempfile::TempDir, 
         "crates/alpha/Cargo.toml",
         "[package]\nname = \"alpha\"\n",
     );
-    write(dir, "crates/alpha/src/main.rs", "fn main() {}\n");
+    write(dir, "crates/alpha/src/main.rs", SERVER);
     write(dir, "tools/loose/Cargo.toml", "this is not toml [\n");
     write(dir, "tools/loose/src/lib.rs", "pub fn f() {}\n");
     write(dir, "web/package.json", "{\"name\":\"web-app\"}\n");
-    write(dir, "web/app.js", "function app() {}\n");
+    write(dir, "web/app.js", CLIENT);
     if root_package_json {
         write(dir, "package.json", "{\"name\":\"root\"}\n");
     }
     write(dir, "a.js", "function a() {}\n");
+    let store = publish(&state, dir);
+    (state, root, store)
+}
+
+fn publish(state: &tempfile::TempDir, dir: &std::path::Path) -> Store {
     let store = crate::testing::retry_admission(|| Store::open_for_tests(state.path(), dir));
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = index_workspace_bundle(
@@ -48,7 +53,35 @@ fn published(root_package_json: bool) -> (tempfile::TempDir, tempfile::TempDir, 
             &cancel,
         )
         .unwrap();
+    store
+}
+
+const SERVER: &str = "async fn h() {}\nfn router() -> Router {\n    Router::new().route(\"/health\", get(h))\n}\nfn main() {}\n";
+const CLIENT: &str =
+    "async function app(api) {\n  await api(\"/health\");\n  await api(\"/missing\");\n}\n";
+
+/// A checkout with one app only, so that interfaces have nothing to relate.
+fn published_single_app() -> (tempfile::TempDir, tempfile::TempDir, Store) {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "web/package.json", "{\"name\":\"web-app\"}\n");
+    write(root.path(), "web/app.js", CLIENT);
+    write(root.path(), "src/lib.rs", SERVER);
+    let store = publish(&state, root.path());
     (state, root, store)
+}
+
+fn core_with_rules(store: &Store) -> Result<ArchitectureCore> {
+    let config = crate::rules::parse("version = 1\n").unwrap();
+    let response = store.evidence_response()?;
+    let pin = response.selected_pin(None)?;
+    response.architecture_core_at(
+        pin,
+        Some(&config),
+        false,
+        &mut || Ok(()),
+        &|_: ArchitectureProgress| {},
+    )
 }
 
 fn core(store: &Store) -> Result<ArchitectureCore> {
@@ -172,6 +205,50 @@ fn a_duplicated_retained_nested_manifest_is_a_typed_selected_integrity_failure()
         error
             .to_string()
             .contains("incompatible_index: duplicate retained nested manifest"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn two_apps_extract_routes_and_match_their_client_calls() {
+    let (_state, _root, store) = published(false);
+    let core = core_with_rules(&store).unwrap();
+    let found = core.interfaces().unwrap();
+    let routes: Vec<&str> = found
+        .routes
+        .iter()
+        .map(|route| route.path_template.as_str())
+        .collect();
+    assert_eq!(routes, ["/health"]);
+    let paths: Vec<_> = found
+        .calls
+        .iter()
+        .map(|call| call.path_template.as_deref())
+        .collect();
+    assert_eq!(paths, [Some("/health"), Some("/missing")]);
+    assert_eq!(
+        found.matched[0].map(|m| m.confidence),
+        Some(crate::interfaces::Confidence::Exact)
+    );
+    assert!(found.matched[1].is_none());
+}
+
+#[test]
+fn one_app_has_empty_interfaces_without_extracting() {
+    let (_state, _root, store) = published_single_app();
+    let core = core_with_rules(&store).unwrap();
+    let found = core.interfaces().unwrap();
+    assert!(found.routes.is_empty() && found.calls.is_empty() && found.matched.is_empty());
+}
+
+#[test]
+fn a_core_without_rules_has_no_interfaces_part() {
+    let (_state, _root, store) = published(false);
+    let error = core(&store).unwrap().interfaces().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("store_unavailable: architecture interfaces part"),
         "{error:#}"
     );
 }

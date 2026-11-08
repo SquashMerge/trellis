@@ -3,16 +3,16 @@
 //! about apps, and runs at read time; nothing here is stored.
 #![cfg_attr(not(test), allow(dead_code))]
 
+mod calls;
 mod routes;
 
 use crate::native_evidence::{Declaration, DeclarationRole, DocumentKey, Range};
-use crate::references::{DocumentInput, work::Work};
+use crate::references::{DocumentInput, Snapshot, callers::Caller, work::Work};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use tree_sitter::Node;
 
-/// How firmly a client call is tied to a server route. Client calls (a3) are its only users.
-#[allow(dead_code)]
+/// How firmly a client call is tied to a server route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Confidence {
@@ -71,6 +71,54 @@ pub(crate) struct Route {
     /// Expanded from a dispatch table, not registered literally.
     pub(crate) from_table: bool,
     pub(crate) handler: Handler,
+}
+
+/// One call a client makes to a server route through a request wrapper.
+#[derive(Clone)]
+pub(crate) struct ClientCall {
+    /// `None` when the method cannot be read.
+    pub(crate) method: Option<String>,
+    /// `None` when the path cannot be read. A client substitution is written `{}`.
+    pub(crate) path_template: Option<String>,
+    pub(crate) segments: Option<Vec<Seg>>,
+    pub(crate) document: DocumentKey,
+    pub(crate) range: Range,
+    pub(crate) lines: Lines,
+    pub(crate) call_id: Option<String>,
+    pub(crate) caller: Option<Caller>,
+}
+
+/// The route a client call reached, and how firmly. Never `Unresolved`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Match {
+    /// Index into [`Extraction::routes`].
+    pub(crate) route: usize,
+    pub(crate) confidence: Confidence,
+}
+
+/// Every route and client call of a revision, and the route each call reached.
+#[derive(Clone, Default)]
+pub(crate) struct Extraction {
+    pub(crate) routes: Vec<Route>,
+    pub(crate) calls: Vec<ClientCall>,
+    /// One entry per call, in call order. `None` is an unresolved call.
+    pub(crate) matched: Vec<Option<Match>>,
+}
+
+/// The routes and client calls of a snapshot, with each call matched to at most one route.
+pub(crate) fn extract(
+    snapshot: &Snapshot,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Extraction> {
+    let routes = routes::extract(snapshot, work, check)?;
+    let calls = calls::extract(snapshot, work, check)?;
+    let matched = calls::resolve(&routes, &calls, work, check)?;
+    Ok(Extraction {
+        routes,
+        calls,
+        matched,
+    })
 }
 
 /// Splits a `/`-rooted template into segments. A trailing empty segment is dropped.
