@@ -1070,3 +1070,65 @@ fn daemon_restart_sweep_abandons_another_daemons_unfinished_run() {
 fn run_id_text(n: u32) -> String {
     format!("{n:032x}")
 }
+
+/// #629: the enqueue's COMMIT lands but its acknowledgement is lost. The run settles the
+/// error against the request ID it chose, so it imports through that one accepted request
+/// instead of failing while the request still reads its inputs.
+#[test]
+fn enqueue_error_after_commit_imports_through_the_accepted_request() {
+    let world = World::with(&[("TRELLIS_TEST_PRODUCER_FAIL_AFTER_ENQUEUE_COMMIT", "unused")]);
+    world.emitting();
+    let before = support::request_rows(&world.checkout).len();
+    let output = world.run(&[]);
+    let reply = reply(&output);
+    assert!(output.status.success(), "{reply} {}", stderr(&output));
+    assert_eq!(reply["outcome"], "imported");
+    let rows = support::request_rows(&world.checkout);
+    assert_eq!(
+        rows.len(),
+        before + 1,
+        "one request, never a second: {rows:?}"
+    );
+    let (id, state, _) = &rows[before];
+    assert_eq!(state, "done", "{rows:?}");
+    assert_eq!(reply["import"]["requestId"], id.as_str());
+    let record = world.record(reply["runId"].as_str().unwrap());
+    assert_eq!(record["state"], "done");
+    assert_eq!(record["requestId"], id.as_str());
+}
+
+/// #629: when the queue cannot be re-read after the enqueue error, acceptance is unknown.
+/// The run treats its chosen ID as an accepted request it can no longer observe: it fails
+/// with `storage_busy`, its record stays `importing` naming that ID with its inputs kept,
+/// and the request it names still settles.
+#[test]
+fn unknown_acceptance_keeps_an_importing_record_naming_the_request() {
+    let world = World::with(&[
+        ("TRELLIS_TEST_PRODUCER_FAIL_AFTER_ENQUEUE_COMMIT", "unused"),
+        ("TRELLIS_TEST_PRODUCER_FAIL_ACCEPTANCE_READ", "unused"),
+    ]);
+    world.emitting();
+    let before = support::request_rows(&world.checkout).len();
+    let output = world.run(&[]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("storage_busy"),
+        "{}",
+        stderr(&output)
+    );
+    let run_id = world.run_ids().pop().unwrap();
+    let record = world.record(&run_id);
+    assert_eq!(record["state"], "importing");
+    assert_eq!(record["outcome"], Value::Null);
+    let rows = support::request_rows(&world.checkout);
+    assert_eq!(rows.len(), before + 1, "{rows:?}");
+    assert_eq!(record["requestId"], rows[before].0.as_str());
+    assert_eq!(
+        entries(&world.runs_dir().join(&run_id)),
+        import_inputs(&record)
+    );
+    assert!(world.status()["activeRun"].is_null());
+    trellis::testing::wait_until("the accepted request to settle", || {
+        support::request_rows(&world.checkout)[before].1 == "done"
+    });
+}

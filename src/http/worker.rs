@@ -728,17 +728,29 @@ impl DaemonState {
         Ok(row)
     }
 
-    /// A Trellis-written import joins the same lease, FIFO and inbox wake. Only the producer
-    /// import module calls this.
+    /// A Trellis-written import joins the same lease, FIFO and inbox wake, as request `id`
+    /// chosen by the caller. Only the producer import module calls this.
     pub(crate) fn enqueue_generated_semantic_import(
         &self,
         options: &crate::store::requests::GeneratedImportOptions,
+        id: uuid::Uuid,
     ) -> anyhow::Result<crate::store::requests::Request> {
         let lease = self.admission_lease()?;
-        let row = self.store.enqueue_generated_semantic_import(
+        let row = match self.store.enqueue_generated_semantic_import_as(
             std::path::Path::new(self.store.workspace_root()),
             options,
-        )?;
+            id,
+        ) {
+            Ok(row) => row,
+            Err(error) => {
+                // An error after COMMIT may still have accepted the row, unwoken: the worker
+                // re-reads the queue and publishes whether FIFO work really remains (#629).
+                self.fifo_pending.store(true, Ordering::Release);
+                drop(lease);
+                self.inbox.wake();
+                return Err(error);
+            }
+        };
         self.fifo_pending.store(true, Ordering::Release);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
