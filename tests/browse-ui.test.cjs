@@ -1478,6 +1478,61 @@ for (const hash of ["#sequence", "#sequence?sid=", "#sequence?sid=a&sid=b", `#se
   });
 }
 
+const callId = n => `occ:v2:${n.toString(16).padStart(32, "0")}`;
+const PIN_QUERY = "rootKey=" + ROOT + "&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=1";
+
+test("sequence links append callId in order only for the boundary seed and up to 50 IDs", () => {
+  const h = harness(historyWindow());
+  const hash = ids => h.run(`sequenceHash("seed", status.revision, ${JSON.stringify({symbolId:"seed", callIds:ids})})`);
+  const ids = [callId(3), callId(1), callId(2)];
+  assert.deepEqual(new URLSearchParams(hash(ids).split("?")[1]).getAll("callId"), ids);
+  const fifty = Array.from({length:50}, (_, i) => callId(i));
+  assert.equal(new URLSearchParams(hash(fifty).split("?")[1]).getAll("callId").length, 50);
+  const many = Array.from({length:51}, (_, i) => callId(i));
+  assert.equal(new URLSearchParams(hash(many).split("?")[1]).has("callId"), false);
+  assert.equal(new URLSearchParams(hash([]).split("?")[1]).has("callId"), false);
+  assert.equal(h.run(`sequenceHash("other", status.revision, {symbolId:"seed", callIds:[${JSON.stringify(callId(1))}]})`), h.run('sequenceHash("other", status.revision)'));
+});
+
+for (const [name, query] of [
+  ["a malformed ID", `callId=occ:v2:xyz`], ["an empty ID", `callId=`],
+  ["a duplicate", `callId=${callId(1)}&callId=${callId(1)}`],
+  ["51 IDs", Array.from({length:51}, (_, i) => `callId=${callId(i)}`).join("&")],
+  ["no pin", `callId=${callId(1)}`]]) {
+  test(`sequence link with ${name} is refused before any request`, async () => {
+    const pinned = name === "no pin" ? "" : PIN_QUERY + "&";
+    const h = harness(historyWindow(`#sequence?sid=a&${pinned}${query}`));
+    await h.run("readNavigationLocation()");
+    assert.equal(h.networkUrls.length, 0);
+    assert.equal(h.get("error").textContent, "Cannot open sequence: Sequence link has invalid call IDs.");
+    assert.equal(h.run("selectedMethod"), null);
+  });
+}
+
+test("the stale-pin check comes before the call-ID check", async () => {
+  const h = harness(historyWindow(`#sequence?sid=a&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2&callId=bad`));
+  await h.run("readNavigationLocation()");
+  assert.match(h.get("error").textContent, /stale for the selected index snapshot/);
+});
+
+test("a valid call-ID link passes its boundary to selectMethod", async () => {
+  const ids = [callId(1), callId(2)];
+  const h = harness(historyWindow(`#sequence?sid=a&${PIN_QUERY}&${ids.map(id => `callId=${id}`).join("&")}`));
+  h.context.fetch = async () => response(view("a"));
+  await h.run("readNavigationLocation()");
+  assert.equal(h.run("selectedMethod.id"), "a");
+  assert.deepEqual(JSON.parse(h.run("JSON.stringify(sequenceBoundary)")), {symbolId:"a", callIds:ids});
+});
+
+test("a boundary over 50 calls keeps its highlight and explains the link limit", () => {
+  const h = harness(historyWindow());
+  const ids = Array.from({length:51}, (_, i) => callId(i));
+  h.get("sequence-diagram").querySelectorAll = () => [];
+  h.run(`sequenceBoundary = {symbolId:"a", callIds:${JSON.stringify(ids)}}`);
+  h.run(`highlightSequenceBoundary(${JSON.stringify(view("a"))}, {isCurrent:() => true, showDetails:true})`);
+  assert.match(text(h.get("sequence-boundary-status")), /Links keep at most 50 highlighted calls, so reloading this link shows the sequence without highlights\./);
+});
+
 for (const invalidate of ["clearNavigationHistory()", "epoch++", "selectedRootKey=null", "status.revision={indexGeneration:'87654321-1234-4123-8123-123456789abc',indexRevision:1}"]) {
   test(`late sid response cannot publish after ${invalidate}`, async () => {
     const browser = historyWindow("#sequence?sid=old"), h = harness(browser), old = deferred();

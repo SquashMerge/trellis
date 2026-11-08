@@ -101,6 +101,11 @@ visible refusal. No new source read or source-text persistence is needed for a r
 returned seed must match the requested ID and full pin; no workspace scan or lexical lookup resolves
 a URL. Back, new routes, checkout/session changes and pin adoption fence all pending route results.
 
+Status: proposed (owner-delegated, run 802). Generated Sequence links may add repeated `callId`
+parameters: at most 50, unique, in `occ:v2:` format. Such links require `rootKey` and the full pin;
+any other form is refused with "Sequence link has invalid call IDs." An in-app group with more than
+50 calls keeps its in-memory highlight, but its link omits `callId`.
+
 Library candidate identities are not workspace declaration IDs. External source therefore has an
 explicit unavailable hint and no workspace navigation attachment. Working-tree-only source has no
 indexed actions. Positive external navigation needs a separate indexed identity contract, not a
