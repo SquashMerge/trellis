@@ -271,6 +271,23 @@ test('a configured language absent from find scope uses the described status', a
   }
 });
 
+test('TypeScript is a fifth semantic capability row, ready or unavailable from the described status', async () => {
+  for (const [semantic, ok] of [
+    [{producerId: 'scip-typescript', available: true, freshness: 'fresh'}, true],
+    [{producerId: 'scip-typescript', available: false, freshness: 'stale'}, false],
+  ]) {
+    const client = clientFor((name, result) => {
+      if (name === 'trellis_workspace_describe') result.structuredContent.data.languages.push({language: 'typescript', semantic});
+      return result;
+    });
+    const report = await exercise(client, liveTools, '/fixture', 'main');
+    assert.equal(report.ok, ok, JSON.stringify(report));
+    assert.deepEqual(report.semanticCapabilities.map(row => row.language),
+      ['java', 'rust', 'python', 'javascript', 'typescript']);
+    assert.equal(report.semanticCapabilities.at(-1).status, ok ? 'ready' : 'unavailable');
+  }
+});
+
 test('CLI requires explicit absolute installed binary and checkout', () => {
   assert.deepEqual(parseArgs(['--binary', '/installed/trellis', '--workspace', '/fixture']), {binary: '/installed/trellis', workspace: '/fixture', query: 'main'});
   assert.throws(() => parseArgs(['--binary', 'trellis', '--workspace', '/fixture']));

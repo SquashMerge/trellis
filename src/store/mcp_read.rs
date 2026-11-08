@@ -3759,7 +3759,8 @@ mod find_scope_tests {
         let (counts, coverage) = reference(&read, &selected);
         let scope = read.mcp_find_scope(&selected, &mut || Ok(())).unwrap();
         assert_eq!(scope.counts, counts);
-        assert!(counts.iter().all(|language| language[0] > 0));
+        assert!(counts[..4].iter().all(|language| language[0] > 0));
+        assert_eq!(counts[4], [0; 5]);
         assert_eq!(
             scope.scopes.keys().collect::<Vec<_>>(),
             coverage.keys().collect::<Vec<_>>()

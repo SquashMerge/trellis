@@ -799,10 +799,11 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str, home: &P
             envelope["data"]["searchIndex"]["declarations"] = json!(0);
             envelope["data"]["searchIndex"]["embedded"] = json!(0);
             let languages = actual["data"]["languages"].as_array().unwrap();
-            assert_eq!(languages.len(), 4);
-            for (row, language) in languages
-                .iter()
-                .zip(["java", "rust", "python", "javascript"])
+            assert_eq!(languages.len(), 5);
+            for (row, language) in
+                languages
+                    .iter()
+                    .zip(["java", "rust", "python", "javascript", "typescript"])
             {
                 assert_eq!(row["language"], language);
                 let coverage = &row["coverage"];
@@ -1915,7 +1916,7 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
         assert_eq!(incoming_data["callers"][0]["callerRole"], "production");
         assert!(incoming_data["callers"][0]["binding"].is_null());
         assert!(incoming_data["callers"][0]["targetId"].is_null());
-        assert_eq!(incoming_data["scopeCoverage"].as_array().unwrap().len(), 4);
+        assert_eq!(incoming_data["scopeCoverage"].as_array().unwrap().len(), 5);
         assert_eq!(incoming_data["documents"].as_array().unwrap().len(), 1);
         assert_eq!(
             incoming["result"]["structuredContent"]["evidenceBasis"],
@@ -4275,7 +4276,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     let described = &second["result"]["structuredContent"];
     assert_eq!(described["data"]["indexState"], "ready");
     assert_eq!(described["evidenceBasis"], *published);
-    assert_eq!(described["data"]["languages"].as_array().unwrap().len(), 4);
+    assert_eq!(described["data"]["languages"].as_array().unwrap().len(), 5);
     assert_eq!(described["data"]["languages"][0]["language"], "java");
     assert_eq!(described["data"]["languages"][3]["language"], "javascript");
     assert_eq!(described["partial"], false);
@@ -4739,7 +4740,7 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     assert_eq!(envelope["data"]["watcherDegraded"], true);
     assert_eq!(envelope["data"]["indexState"], "ready");
     assert!(envelope["evidenceBasis"]["indexRevision"].as_u64().unwrap() > 0);
-    assert_eq!(envelope["data"]["languages"].as_array().unwrap().len(), 4);
+    assert_eq!(envelope["data"]["languages"].as_array().unwrap().len(), 5);
     drop(client);
     session.join().unwrap().unwrap();
 }
@@ -5043,7 +5044,7 @@ async fn describe_serves_valid_prior_head_while_startup_reconciliation_is_paused
         "indexGeneration":prior.index_generation.to_string(),
         "indexRevision":prior.index_revision})
     );
-    assert_eq!(envelope["data"]["languages"].as_array().unwrap().len(), 4);
+    assert_eq!(envelope["data"]["languages"].as_array().unwrap().len(), 5);
     resume_tx.send(()).unwrap();
     drop(client);
     session.join().unwrap().unwrap();
@@ -5506,7 +5507,7 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
             .as_array()
             .unwrap()
             .len(),
-        4
+        5
     );
     assert!(
         recovered["result"]["structuredContent"]["evidenceBasis"]["indexRevision"]
@@ -17545,6 +17546,200 @@ async fn stable_lookup_selector_validation_missing_and_revision_conflict() {
         }
     }
     mcp.finish();
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// AC11 end to end (#683): TypeScript documents are first-class MCP citizens on a real index
+/// of the mixed TypeScript/JavaScript fixture.
+#[test]
+fn typescript_documents_are_first_class() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typescript-mixed"),
+        &root,
+    );
+    let mut peer = Peer::start(Some(&root));
+    ready_legacy(&mut peer);
+    let home = peer._home.path().to_path_buf();
+    let mut command = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
+    command
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"));
+    let indexed = bounded_output(command);
+    crate::child::assert_cli_success(&indexed, "index");
+    let mut pairs = Vec::new();
+    let mut next_id = 0;
+    let mut ask = |peer: &mut Peer, name: &str, arguments: Value| {
+        next_id += 1;
+        let reply = peer.ask(call(true, json!(next_id), name, arguments));
+        tool(&reply, None, false);
+        let envelope = reply["result"]["structuredContent"].clone();
+        pairs.push(json!({"name":name,"structuredContent":envelope}));
+        envelope
+    };
+    let languages = |envelope: &Value| -> Vec<String> {
+        envelope["data"]["scopeCoverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["language"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let described = ask(
+        &mut peer,
+        "trellis_workspace_describe",
+        json!({"schemaVersion":1}),
+    );
+    let rows = described["data"]["languages"].as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[3]["language"], "javascript");
+    assert_eq!(rows[4]["language"], "typescript");
+    assert!(rows[4]["coverage"]["selected"].as_u64().unwrap() > 0);
+
+    let document_languages = |envelope: &Value| -> Vec<String> {
+        let mut found: Vec<String> = envelope["data"]["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["document"]["language"].as_str().unwrap().to_owned())
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    };
+    let model = ask(
+        &mut peer,
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"Model"}),
+    );
+    assert_eq!(document_languages(&model), ["typescript"]);
+    assert_eq!(languages(&model), ["typescript"]);
+    let symbol = model["data"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == "Model")
+        .expect("the Model class");
+    let helper = ask(
+        &mut peer,
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"helper"}),
+    );
+    assert_eq!(languages(&helper), ["javascript", "typescript"]);
+
+    let declaration = ask(
+        &mut peer,
+        "trellis_declaration",
+        json!({"schemaVersion":1,"symbolId":symbol["symbolId"]}),
+    );
+    assert_eq!(
+        declaration["data"]["documents"][0]["document"]["language"],
+        "typescript"
+    );
+    assert_eq!(declaration["data"]["displayKey"], "src/app/model.ts#Model");
+    let source = ask(
+        &mut peer,
+        "trellis_read_source",
+        json!({"schemaVersion":1,"path":"src/app/model.ts","startLine":1,"endLine":4}),
+    );
+    assert!(
+        source["data"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("export interface Entity"))
+    );
+    let references = ask(
+        &mut peer,
+        "trellis_references",
+        json!({"schemaVersion":1,"paths":["src/app/**"]}),
+    );
+    let modules = references["data"]["modules"].as_array().unwrap();
+    assert!(modules.iter().any(|module| {
+        module["identity"]["language"] == "typescript"
+            && module["identity"]["path"] == "src/app/bridge.ts"
+    }));
+    let bridge = ask(
+        &mut peer,
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"bridge"}),
+    );
+    let root = bridge["data"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == "bridge")
+        .expect("the bridge function");
+    let graph = ask(
+        &mut peer,
+        "trellis_call_graph",
+        json!({"schemaVersion":1,"symbolId":root["symbolId"]}),
+    );
+    assert_eq!(
+        graph["data"]["result"]["coverage"][0]["language"],
+        "typescript"
+    );
+    assert_eq!(
+        graph["data"]["result"]["edges"][0]["call"]["document"]["path"],
+        "src/app/bridge.ts"
+    );
+    validate_structured_content(&pairs);
+    peer.assert_success("trellis mcp");
+}
+
+/// #683: the rules tools accept `typescript` as a module language and npm package language,
+/// and still reject the miscased name as an invalid request.
+#[test]
+fn rules_explain_accepts_typescript_targets_and_npm_destinations() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let mut peer = Peer::start(Some(&root));
+    ready_legacy(&mut peer);
+    let target = |language: &str| {
+        json!({"sourceSetId":"app","language":language,"path":"src/app/model.ts",
+            "sid":"sid:v1:00000000000000000000000000000000"})
+    };
+    let npm = json!({"kind":"externalPackage","sourceSetId":"app","language":"typescript",
+        "package":"@scope/library","standardLibrary":false});
+    let mut explain = |id: i64, language: &str, destination: Value| -> Value {
+        peer.ask(call(
+            true,
+            json!(id),
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$external","target":target(language),
+                "destination":destination}),
+        ))
+    };
+    let accepted = explain(1, "typescript", npm.clone());
+    assert_ne!(
+        accepted["result"]["structuredContent"]["error"]["code"], "invalid_request",
+        "{accepted}"
+    );
+    let rejected = explain(2, "TypeScript", npm);
+    tool(&rejected, Some("invalid_request"), false);
+    let rejected = explain(
+        3,
+        "typescript",
+        json!({"kind":"externalPackage","sourceSetId":"app","language":"typescript",
+            "package":"@scope/library*","standardLibrary":false}),
+    );
+    tool(&rejected, Some("invalid_request"), false);
+    peer.assert_success("trellis mcp");
 }
 
 /// A child test's libtest name in the grouped test binary, which names this

@@ -143,7 +143,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":15,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":14,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
@@ -179,6 +179,37 @@ mod tests {
     }
 
     #[test]
+    fn describe_has_five_rows_typescript_last() {
+        let basis =
+            json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1});
+        let mut rows = [[0; 5]; 5];
+        rows[4] = [3, 3, 0, 0, 1];
+        let ready = describe(
+            &json!(2),
+            "project",
+            "ready",
+            None,
+            Some((rows, Tiers::default())),
+            Some(basis),
+            false,
+        );
+        let languages: Vec<&str> = ready["data"]["languages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["language"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            languages,
+            ["java", "rust", "python", "javascript", "typescript"]
+        );
+        assert_eq!(
+            ready["data"]["languages"][4]["coverage"],
+            json!({"selected":3,"complete":3,"partial":0,"failed":0,"unselected":1})
+        );
+    }
+
+    #[test]
     fn describe_closed_ready_and_missing_head() {
         let empty = describe(&json!(1), "project", "reconciling", None, None, None, false);
         assert!(empty["evidenceBasis"].is_null());
@@ -198,14 +229,14 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 15);
+        assert_eq!(ready["data"]["toolVersion"], 14);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
             "selected":2,"complete":1,"partial":1,"failed":0,"unselected":3})
         );
         assert_eq!(ready["partial"], true);
-        assert_eq!(ready["data"]["languages"].as_array().unwrap().len(), 4);
+        assert_eq!(ready["data"]["languages"].as_array().unwrap().len(), 5);
         // Without imported evidence every language is syntax, with no producer.
         for language in ready["data"]["languages"].as_array().unwrap() {
             assert_eq!(language["nativeCoverageTier"], "syntax");
@@ -2018,7 +2049,7 @@ mod compact_symbol_tests {
             assert_eq!(languages(&empty), ["java", "rust", "javascript"]);
             super::size_tests::assert_catalog_valid("trellis_find_symbols", &[&javascript]);
         }
-        // Lookup alternatives for the other tools keep all four rows.
+        // Lookup alternatives for the other tools keep all five rows.
         let candidates = lookup_candidates(
             &json!(1),
             "trellis_declaration",
@@ -2033,8 +2064,76 @@ mod compact_symbol_tests {
         .unwrap();
         assert_eq!(
             languages(&candidates),
-            ["java", "rust", "python", "javascript"]
+            ["java", "rust", "python", "javascript", "typescript"]
         );
+    }
+
+    /// TypeScript follows the #715 rule: a result lists only its own languages, in #22 order,
+    /// and with no items the searched languages that have selected tuples.
+    #[test]
+    fn typescript_scope_rows_follow_the_715_rule() {
+        let typescript = |hits: &[(&str, &str, &str, bool)]| {
+            let mut result = fixture(hits, false);
+            result.scope[4] = [5, 5, 0, 0, 0];
+            result
+        };
+        for compact in [false, true] {
+            let only = find_page(
+                typescript(&[("Model", "typescript", "src/model.ts", false)]),
+                compact,
+            );
+            assert_eq!(languages(&only), ["typescript"]);
+            assert_eq!(
+                only["data"]["scopeCoverage"][0],
+                language_status(&typescript(&[]).scope, &Default::default())[4]
+            );
+            let both = find_page(
+                typescript(&[
+                    ("helper", "typescript", "src/util.ts", false),
+                    ("helper", "javascript", "web/util.js", false),
+                ]),
+                compact,
+            );
+            assert_eq!(languages(&both), ["javascript", "typescript"]);
+            let searched = search_page(
+                typescript(&[("Model", "typescript", "src/model.ts", false)]),
+                compact,
+            );
+            assert_eq!(languages(&searched), ["typescript"]);
+            let empty = find_page(typescript(&[]), compact);
+            assert_eq!(
+                languages(&empty),
+                ["java", "rust", "javascript", "typescript"]
+            );
+            super::size_tests::assert_catalog_valid(
+                "trellis_find_symbols",
+                &[&only, &both, &empty],
+            );
+            super::size_tests::assert_catalog_valid("trellis_search_symbols", &[&searched]);
+        }
+    }
+
+    #[test]
+    fn javascript_sorts_before_typescript() {
+        let result = fixture(
+            &[
+                ("a", "typescript", "src/a.ts", false),
+                ("b", "javascript", "src/a.js", false),
+            ],
+            false,
+        );
+        let typescript = document_key(&result.symbols[0].source.document);
+        let javascript = document_key(&result.symbols[1].source.document);
+        assert!(javascript < typescript);
+        assert_eq!(language_rank("typescript"), 4);
+        assert!(language_rank("javascript") < language_rank("typescript"));
+        let (documents, _) =
+            document_table(result.symbols.iter().map(|s| &s.source.document)).unwrap();
+        let order: Vec<&str> = documents
+            .iter()
+            .map(|document| document["document"]["language"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, ["javascript", "typescript"]);
     }
 
     /// PR #767 review: the empty prefix lists every searched language, a hit only its own.
@@ -3691,6 +3790,24 @@ mod incoming_tests {
             let frame = json!({"jsonrpc":"2.0","id":1,
                 "result":crate::mcp::tools::result("trellis_incoming_calls",full,modern)});
             assert!(serde_json::to_vec(&frame).unwrap().len() <= crate::mcp::wire::RESPONSE_BYTES);
+        }
+    }
+    #[test]
+    fn incoming_scope_has_five_rows() {
+        for modern in [false, true] {
+            let mut result = fixture(1, false, 0);
+            result.scope[4] = [1, 1, 0, 0, 0];
+            let envelope = project(result, modern).unwrap();
+            let rows = envelope["data"]["scopeCoverage"].as_array().unwrap();
+            let languages: Vec<&str> = rows
+                .iter()
+                .map(|row| row["language"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                languages,
+                ["java", "rust", "python", "javascript", "typescript"]
+            );
+            assert_eq!(rows[4]["coverage"]["selected"], 1);
         }
     }
     #[test]
