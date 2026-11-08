@@ -163,8 +163,8 @@ impl DaemonState {
         if self.startup_failures.load(Ordering::Acquire) < STARTUP_FAILURE_LIMIT {
             return None;
         }
-        self.startup_error()
-            .map(|reason| format!("recovery_blocked: {reason}"))
+        let reason = *self.recovery_blocked.lock().unwrap();
+        reason.map(|reason| format!("recovery_blocked: {reason}"))
     }
 
     /// Deterministically pause startup reconciliation after old-root settlement
@@ -380,6 +380,7 @@ impl DaemonState {
                     lifecycle();
                 }
                 *self.startup_error.lock().unwrap() = None;
+                *self.recovery_blocked.lock().unwrap() = None;
                 self.startup_failures.store(0, Ordering::Release);
                 *self.startup_backoff.lock().unwrap() = STARTUP_BACKOFF_FIRST;
                 *self.recovery_retry_after.lock().unwrap() = None;
@@ -424,10 +425,13 @@ impl DaemonState {
                     |failures| Some(failures.saturating_add(1)),
                 );
                 if self.startup_failures.load(Ordering::Acquire) >= STARTUP_FAILURE_LIMIT {
-                    let reason = format!("{error:#}");
-                    *self.startup_error.lock().unwrap() = Some(reason.clone());
+                    // The full chain stays an in-process diagnostic; the row and
+                    // the reply record only the typed reason (#445, #768).
+                    *self.startup_error.lock().unwrap() = Some(format!("{error:#}"));
+                    let reason = crate::store::requests::recovery_blocked_reason(&error);
+                    *self.recovery_blocked.lock().unwrap() = Some(reason);
                     self.note_state_change();
-                    *self.recovery_disposition.lock().unwrap() = Some(reason);
+                    *self.recovery_disposition.lock().unwrap() = Some(reason.to_owned());
                     self.confirm_recovery_disposition()?;
                 } else {
                     self.note_state_change();

@@ -3327,7 +3327,7 @@ mod selection_tests {
             .unwrap();
         for _ in 0..5 {
             runtime.set_startup_hook_for_tests(Arc::new(|| {
-                panic!("persistent startup capture fault")
+                panic!("persistent startup capture fault at /private/secret/a.js")
             }));
             // A new durable request wakes an attempt; no timing/polling is needed.
             resources
@@ -3342,19 +3342,13 @@ mod selection_tests {
             );
         }
         let blocker = runtime.cli_status().unwrap_err().to_string();
-        assert!(blocker.starts_with("recovery_blocked: "), "{blocker}");
-        assert!(
-            blocker.contains("persistent startup capture fault"),
-            "{blocker}"
-        );
+        // The reply and the row carry the typed cause, never the fault's path (#768).
+        assert_eq!(blocker, "recovery_blocked: internal error");
+        let row = resources.store.request_by_id(&queued.id).unwrap().unwrap();
+        assert_eq!(row.state, "failed");
         assert_eq!(
-            resources
-                .store
-                .request_by_id(&queued.id)
-                .unwrap()
-                .unwrap()
-                .state,
-            "failed"
+            row.error_code.as_deref(),
+            Some("recovery_blocked: internal error")
         );
         let next = resources
             .scheduler
