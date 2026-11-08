@@ -27,7 +27,7 @@ const roles = [
 const applicable = (language) =>
   language === "java" ? roles.filter((x) => x !== "alias") : roles;
 const order = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b));
-const languages = ["java", "rust", "python", "javascript"];
+const languages = ["java", "rust", "python", "javascript", "typescript"];
 const documentOrder = (a, b) =>
   languages.indexOf(a.key.language) - languages.indexOf(b.key.language) ||
   order(a.key.path, b.key.path);
@@ -724,7 +724,10 @@ export async function discoverFixtures(root) {
       !children.some((x) => x.name === "fixture.json" && x.isFile()) ||
       children.some(
         (x) =>
-          x.isDirectory() && (x.name === "corpus" || x.name === "javascript"),
+          x.isDirectory() &&
+          (x.name === "corpus" ||
+            x.name === "javascript" ||
+            x.name === "typescript"),
       )
     )
       reject(

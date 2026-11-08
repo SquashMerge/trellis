@@ -1115,3 +1115,38 @@ test("absent declared input fails a concrete inventory assertion", async (t) => 
     return true;
   });
 });
+
+test("the committed TypeScript draft corpus is discovered and its publication passes no-write checks", async () => {
+  if (fixturesRoot !== defaultRoot) return; // Temporary roots may intentionally omit it.
+  const path = join(fixturesRoot, "typescript");
+  assert.ok((await discoverFixtures(fixturesRoot)).includes(path));
+  const descriptorValue = JSON.parse(
+    await readFile(join(path, "fixture.json"), "utf8"),
+  );
+  assert.equal(descriptorValue.language, "typescript");
+  assert.equal(descriptorValue.profile, "draft");
+  assert.deepEqual(descriptorValue.semanticArtifacts, []);
+  await checkPublication(path);
+});
+
+test("a typescript directory must hold a typescript descriptor and nest no language fixture", async (t) => {
+  const { root, cleanup } = await copyExample();
+  t.after(cleanup);
+  await rename(join(root, "example"), join(root, "typescript"));
+  await descriptor(root, "typescript", (value) => {
+    value.profile = "draft";
+  });
+  await assert.rejects(
+    discoverFixtures(root),
+    error("DISCOVERY.PROFILE", join(root, "typescript")),
+  );
+  await descriptor(root, "typescript", (value) => {
+    value.language = "typescript";
+  });
+  assert.deepEqual(await discoverFixtures(root), [join(root, "typescript")]);
+  await mkdir(join(root, "typescript", "typescript"));
+  await assert.rejects(
+    discoverFixtures(root),
+    error("DISCOVERY.PROFILE", "typescript"),
+  );
+});

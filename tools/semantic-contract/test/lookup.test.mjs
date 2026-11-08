@@ -7,7 +7,9 @@ test("LOOKUP.LEXICAL decoding and language normalization preserve raw spelling i
   assert.equal(lookupKey("python", "Ａ"), "A");
   assert.equal(lookupKey("java", "\\u0061"), "a");
   assert.equal(lookupKey("javascript", "\\u{61}"), "a");
-  for (const language of ["java", "javascript"])
+  assert.equal(lookupKey("typescript", "\\u{61}"), "a");
+  assert.equal(lookupKey("typescript", "\\u0061"), "a");
+  for (const language of ["java", "javascript", "typescript"])
     assert.notEqual(lookupKey(language, "é"), lookupKey(language, "é"));
   assert.equal(lookupKey("rust", "é"), lookupKey("rust", "é"));
   const make = (name) =>
@@ -20,6 +22,7 @@ test("LOOKUP.LEXICAL decoding and language normalization preserve raw spelling i
     });
   assert.notEqual(make("é"), make("é"));
   assert.throws(() => lookupKey("javascript", "\\u{110000}"), /LOOKUP.ESCAPE/);
+  assert.throws(() => lookupKey("typescript", "\\u{110000}"), /LOOKUP.ESCAPE/);
   assert.throws(() => lookupKey("java", "\\u00Q0"), /LOOKUP.ESCAPE/);
 });
 test("ROLE.APPLICABILITY alias is absent in Java and requires definition on declaration", () => {
@@ -39,10 +42,15 @@ test("ROLE.APPLICABILITY alias is absent in Java and requires definition on decl
     /ROLE.CALL/,
   );
   validateRoles("javascript", ["read", "call"], { callee: true });
+  assert.throws(
+    () => validateRoles("typescript", ["call"], { callee: false }),
+    /ROLE.CALL/,
+  );
+  validateRoles("typescript", ["definition", "alias"], { site: "declaration" });
 });
 
 test("LOOKUP and ROLE raw spelling, declaration sites and all language roles", () => {
-  for (const language of ["java", "rust", "python", "javascript"]) {
+  for (const language of ["java", "rust", "python", "javascript", "typescript"]) {
     assert.deepEqual(
       applicableRoles(language),
       language === "java"

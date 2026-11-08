@@ -1,4 +1,4 @@
-const languages = ["java", "rust", "python", "javascript"];
+const languages = ["java", "rust", "python", "javascript", "typescript"];
 const roles = [
   "definition",
   "read",

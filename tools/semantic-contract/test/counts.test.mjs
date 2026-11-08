@@ -1744,6 +1744,12 @@ const amendedFloors = {
     typeRelationships: 20,
     exempt: [],
   },
+  typescript: {
+    ambiguous: 20,
+    unsupported: 0,
+    typeRelationships: 20,
+    exempt: [],
+  },
   java: {
     ambiguous: 0,
     unsupported: 0,
@@ -1847,7 +1853,7 @@ test("each independent corpus minimum and each nonzero category and outcome floo
   }
 });
 
-test("ambiguous floor is 0 for Python, Java and Rust and stays 20 for JavaScript", async () => {
+test("ambiguous floor is 0 for Python, Java and Rust and stays 20 for JavaScript and TypeScript", async () => {
   for (const language of ["python", "java", "rust"]) {
     const count = countAtFloors(language);
     assert.equal(
@@ -1856,10 +1862,10 @@ test("ambiguous floor is 0 for Python, Java and Rust and stays 20 for JavaScript
     );
     assert.equal(assertCorpusFloors(count), count);
   }
-  const controls = registerControls([
-    {
-      id: "COUNT.floor.javascript-ambiguous-19",
-      baseline: () => countAtFloors("javascript"),
+  const controls = registerControls(
+    ["javascript", "typescript"].map((language) => ({
+      id: `COUNT.floor.${language}-ambiguous-19`,
+      baseline: () => countAtFloors(language),
       mutate: (row) => {
         row.outcomes.find((x) => x.disposition === "ambiguous").count = 19;
         return row;
@@ -1868,13 +1874,13 @@ test("ambiguous floor is 0 for Python, Java and Rust and stays 20 for JavaScript
       expectedAssertion: "COUNT.FLOOR",
       expectedCode: "invalidRecord",
       expectedField: "counts",
-    },
-  ]);
+    })),
+  );
   for (const row of controls) await runControl(row);
 });
 
-test("unsupported floor is 0 for JavaScript, Java and Python and stays 1 for Rust", async () => {
-  for (const language of ["javascript", "java", "python"]) {
+test("unsupported floor is 0 for JavaScript, TypeScript, Java and Python and stays 1 for Rust", async () => {
+  for (const language of ["javascript", "typescript", "java", "python"]) {
     const count = countAtFloors(language);
     assert.equal(
       count.outcomes.find((x) => x.disposition === "unsupported").count,
@@ -1910,12 +1916,12 @@ test("JavaScript unsupported floor deferral preserves its other outcome floors",
   );
 });
 
-test("Rust needs no type relationships; Java, JavaScript and Python still need 20", async () => {
+test("Rust needs no type relationships; Java, JavaScript, TypeScript and Python still need 20", async () => {
   const rust = countAtFloors("rust");
   assert.equal(rust.typeRelationships, 0);
   assert.equal(assertCorpusFloors(rust), rust);
   const controls = registerControls(
-    ["java", "javascript", "python"].map((language) => ({
+    ["java", "javascript", "typescript", "python"].map((language) => ({
       id: `COUNT.floor.${language}-relationships-19`,
       baseline: () => countAtFloors(language),
       mutate: (row) => {
@@ -1931,14 +1937,14 @@ test("Rust needs no type relationships; Java, JavaScript and Python still need 2
   for (const row of controls) await runControl(row);
 });
 
-test("alias role is exempt for Java and Python and required for JavaScript and Rust", async () => {
+test("alias role is exempt for Java and Python and required for JavaScript, TypeScript and Rust", async () => {
   for (const language of ["java", "python"]) {
     const count = countAtFloors(language);
     assert.equal(count.observedRoles.includes("alias"), false);
     assert.equal(assertCorpusFloors(count), count);
   }
   const controls = registerControls(
-    ["javascript", "rust"].map((language) => ({
+    ["javascript", "typescript", "rust"].map((language) => ({
       id: `COUNT.floor.${language}-alias-required`,
       baseline: () => countAtFloors(language),
       mutate: (row) => {

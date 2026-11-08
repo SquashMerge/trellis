@@ -33,19 +33,23 @@ answers are empty. `generated/manifest.json` selects the content-addressed bundl
 
 ## Current native-v16 recapture
 
-The #683 TypeScript slice (TypeScript becomes its own native language, so the native
-descriptor's `languages` gain `typescript`) re-ran the production `native-capture`
+The #683 TypeScript work (TypeScript becomes its own native language, with its own
+native constructs and class diagrams) re-ran the production `native-capture`
 command twice on these unchanged snapshots using pinned Rust 1.99.1 and
-`test-support`. Both outputs were byte-identical (SHA-256
-`0f90e1e4cd6484fbbaddda296304b57347387b4af6d76b6d7fe742d974880965`). The compiled native extractor hash is
-`ef89a2f1d8b91a9e9275e5ad1a45c503f670641a9b3680746fa33569bd6a4337`, pinned as
+`test-support`, at the final native-v16 extractor. Both outputs were byte-identical
+(SHA-256 `0f90e1e4cd6484fbbaddda296304b57347387b4af6d76b6d7fe742d974880965`) and equal
+to the previously stored `captures/native.json`. The compiled native extractor hash
+is `2ca488b0dcc0c80025ce0bcdf4eab91f44a1fa89baf90809f3c7f03419035027`, pinned as
 `trellis-native-v16-javascript-test-support` in the hardware profile.
 
-JavaScript measurement is unchanged: only the producer version, extractor hash and
-occurrence IDs (which include the producer version) differ from the native-v15
-capture, and the producer's declared language list gains `typescript`. The extractor
-hash now also covers `tree-sitter-typescript` 0.23.2 and `src/indexer_ts.rs`. This
-corpus does not exercise TypeScript; the TypeScript corpus is a later slice.
+JavaScript measurement is unchanged from the native-v15 capture: only the producer
+version, extractor hash and occurrence IDs (which include the producer version)
+differ, and the producer's declared language list gains `typescript`. The final
+extraction changes (TypeScript native constructs and class diagrams) do not alter
+any JavaScript record, so only the hash pins in `fixture.json` and the generated
+manifest changed. The extractor hash also covers `tree-sitter-typescript` 0.23.2,
+`src/indexer_ts.rs` and `src/classes.rs`. This corpus does not exercise TypeScript;
+the TypeScript draft corpus lives in `../typescript/`.
 
 ## Historical native-v15 recapture
 
