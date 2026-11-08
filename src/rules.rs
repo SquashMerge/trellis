@@ -2148,6 +2148,7 @@ mod portable_exception_tests {
                 content_hash: None,
                 bytes: None,
             }],
+            root_tsconfig: None,
             evidence_gaps: Default::default(),
         };
         let error = portable_source_set(
@@ -2248,6 +2249,7 @@ mod document_parallel_tests {
             },
             documents,
             manifests: vec![],
+            root_tsconfig: None,
             evidence_gaps: Default::default(),
         }
     }

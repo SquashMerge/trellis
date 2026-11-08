@@ -2656,6 +2656,83 @@ impl EvidenceResponse {
                 label
             );
         }
+        // The root TypeScript config rides the retained native config: a present
+        // `tsconfig.json`, else a present `jsconfig.json`.
+        let config_bytes: i64 = self.db.query_row(
+            "SELECT length(CAST(retained_config AS BLOB)) FROM native_revisions WHERE id=?1",
+            [&selected.key],
+            |row| row.get(0),
+        )?;
+        let config_bytes = u64::try_from(config_bytes).context(SelectedIntegrity(
+            "incompatible_index: invalid retained config length".into(),
+        ))?;
+        stored_bytes = stored_bytes.saturating_add(config_bytes);
+        ensure!(
+            stored_bytes <= 512 * 1024 * 1024,
+            "bounded_work: architecture source"
+        );
+        check()?;
+        let retained_config: String = self.db.query_row(
+            "SELECT retained_config FROM native_revisions WHERE id=?1",
+            [&selected.key],
+            |row| row.get(0),
+        )?;
+        // Entries of other inputs have shapes this read does not need.
+        #[derive(serde::Deserialize)]
+        struct ConfigEntry<'a> {
+            #[serde(borrow, default)]
+            path: Option<std::borrow::Cow<'a, str>>,
+            #[serde(borrow, default, rename = "type")]
+            kind: Option<std::borrow::Cow<'a, str>>,
+            #[serde(borrow, default)]
+            bytes: Option<std::borrow::Cow<'a, str>>,
+            #[serde(default, rename = "byteLength")]
+            byte_length: Option<u64>,
+        }
+        let configs: Vec<ConfigEntry<'_>> = serde_json::from_str(&retained_config).context(
+            SelectedIntegrity("incompatible_index: corrupt retained config".into()),
+        )?;
+        check()?;
+        let mut root_tsconfig: Option<crate::references::tsconfig::RootTsconfigInput> = None;
+        for entry in configs {
+            check()?;
+            let ConfigEntry {
+                path: Some(path),
+                kind: Some(kind),
+                bytes: Some(bytes),
+                byte_length: Some(byte_length),
+            } = entry
+            else {
+                continue;
+            };
+            let path = path.as_ref();
+            if kind != "present"
+                || !matches!(path, "tsconfig.json" | "jsconfig.json")
+                || (path == "jsconfig.json" && root_tsconfig.is_some())
+            {
+                continue;
+            }
+            source_bytes = source_bytes.saturating_add(byte_length);
+            ensure!(
+                byte_length <= crate::skipped_config::CONFIG_INPUT_MAX_BYTES
+                    && source_bytes <= 256 * 1024 * 1024,
+                "bounded_work: architecture source"
+            );
+            selected_ensure!(
+                byte_length.checked_mul(2) == Some(bytes.len() as u64),
+                "incompatible_index: corrupt retained {} length",
+                path
+            );
+            check()?;
+            let bytes = hex::decode(bytes.as_ref()).context(SelectedIntegrity(format!(
+                "incompatible_index: corrupt retained {path} bytes"
+            )))?;
+            root_tsconfig = Some(crate::references::tsconfig::RootTsconfigInput {
+                source_set_id: source_set_id.clone(),
+                path: path.to_owned(),
+                bytes,
+            });
+        }
         semantic_display::architecture_semantic(&self.db, &selected.key, &mut documents, check)?;
         check()?;
         Ok((
@@ -2663,6 +2740,7 @@ impl EvidenceResponse {
                 pin: selected.pin,
                 documents,
                 manifests: manifests.into_values().collect(),
+                root_tsconfig,
                 evidence_gaps,
             },
             regions,

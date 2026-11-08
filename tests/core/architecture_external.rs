@@ -1124,3 +1124,86 @@ fn malformed_captured_package_json_is_unknown_not_empty_dependency_proof() {
     );
     assert_eq!(package(&refs, "fs")["ecosystem"], "node");
 }
+
+#[test]
+fn typescript_npm_identity() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for (path, text) in [
+        ("package.json", JS_MANIFEST),
+        (
+            "app.ts",
+            "import { send } from 'widget/sub/path';\nimport 'node:fs';\nimport 'path';\nimport 'absent';\n",
+        ),
+        ("legacy.js", "import 'widget';\nimport 'fs';\n"),
+    ] {
+        fs::write(root.path().join(path), text).unwrap();
+    }
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    let references = read(&store, "references", pin);
+    let identities = |source: &str| -> Vec<(String, String, bool)> {
+        let mut found: Vec<_> = references["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|edge| edge["source"]["path"] == source)
+            .map(|edge| {
+                let identity = &edge["target"];
+                (
+                    identity["language"].as_str().unwrap().to_owned(),
+                    identity["package"].as_str().unwrap().to_owned(),
+                    identity["standardLibrary"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    let triple = |language: &str, package: &str, standard_library: bool| {
+        (language.to_owned(), package.to_owned(), standard_library)
+    };
+    assert_eq!(
+        identities("app.ts"),
+        [
+            triple("typescript", "fs", true),
+            triple("typescript", "path", true),
+            triple("typescript", "widget", false),
+        ]
+    );
+    assert_eq!(
+        identities("legacy.js"),
+        [
+            triple("javascript", "fs", true),
+            triple("javascript", "widget", false)
+        ]
+    );
+    let widgets: Vec<_> = references["externalPackages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|package| package["identity"]["package"] == "widget")
+        .map(|package| package["identity"]["language"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(widgets, ["javascript", "typescript"]);
+    assert!(
+        references["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["site"]["spelling"].as_str().unwrap().contains("absent"))
+    );
+}

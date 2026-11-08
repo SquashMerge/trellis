@@ -288,10 +288,25 @@ Supported mapping is deliberately narrow:
   Captured Cargo declarations and reviewed `std/core/alloc` roots prove package
   targets, never semantic calls. Custom roots/`#[path]`, macro/cfg uncertainty,
   ambiguous ownership and depth beyond four remain unknown.
-- **JavaScript:** static relative imports/reexports/side-effect imports use a
-  unique explicit indexed extension or `.js`/`.mjs`/`.cjs` and `index.js`
-  convention. A trailing `/` selects only a directory's `index.js`, never a
-  sibling file. `export * from` forwards proved named exports, never `default`.
+- **JavaScript and TypeScript:** the two languages share one resolver. Static
+  relative imports/reexports/side-effect imports (also `import type`,
+  `export type` and `import x = require("m")`) try the extensionless candidates
+  `.ts`, `.tsx`, `.d.ts`, `.js`, `.mjs`, `.cjs` and `index.*` of a directory,
+  including for dotted names such as `./x.config`. `./x.js` also names `x.ts`,
+  `x.tsx` and `x.d.ts`; `./x.mjs` and `./x.cjs` name `.mts`/`.d.mts` and
+  `.cts`/`.d.cts`; `./x.jsx` names `x.tsx`; an explicit TypeScript extension is
+  literal. A trailing `/` selects only a directory's `index` file, never a
+  sibling file. Several hits are partitioned by precedence: implementations in
+  the importer's language, then implementations in the other language, then
+  declaration-only `.d.ts` files; one hit resolves and several in the winning
+  class are `module_path_ambiguous`. A JavaScript importer may therefore resolve
+  to a TypeScript target and the reverse. The root `tsconfig.json` (else
+  `jsconfig.json`; JSONC, `extends` is not followed) adds `paths` (exact key,
+  else the longest `prefix*suffix` pattern, targets in order, targets leaving
+  the checkout skipped), `baseUrl` and `rootDirs` for relative misses. A
+  config that cannot be read leaves relative resolution unchanged and reports
+  bare specifiers that match no package as `tsconfig_unreadable`. `export = x`
+  and `.cts` ends export following with an unknown name set. `export * from` forwards proved named exports, never `default`.
   Explicit exported names shadow star names; distinct surviving declarations
   collide, while routes to the same native declaration deduplicate. Import-binding
   reexports retain the original identity; a proved local variable alias keeps its
@@ -303,7 +318,9 @@ Supported mapping is deliberately narrow:
   an explicit proved export settles only its matching name. Supported static
   literals use the resolver's documented decoding subset, not runtime execution.
   Bare imports can label captured npm dependencies or the exact reviewed Node
-  catalog below. Relative misses never fall back to builtin or npm labels.
+  catalog below, after `paths`/`baseUrl` fall through; the identity carries the
+  importing file's language (`javascript` or `typescript`). Relative misses never
+  fall back to builtin or npm labels.
 - **Python:** captured checkout-root `m.py` or `m/__init__.py` layouts require
   unique module ownership and proved `__init__.py` package prefixes. Relative
   imports follow captured package membership; absolute imports use only that
