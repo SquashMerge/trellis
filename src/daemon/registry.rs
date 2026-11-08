@@ -681,6 +681,8 @@ impl CheckoutRegistry {
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "test-support")]
+            search_hash_scans: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "test-support")]
             mcp_hint_clock_origin: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
             mcp_call_clock_origin: std::sync::Mutex::new(None),
@@ -1823,6 +1825,9 @@ pub struct CheckoutRuntime {
     /// a test can pass a call deadline without waiting real seconds.
     #[cfg(feature = "test-support")]
     mcp_clock_skew_ms: std::sync::atomic::AtomicU64,
+    /// Optional pending-head hash scans that MCP search started (#777).
+    #[cfg(feature = "test-support")]
+    search_hash_scans: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-support")]
     mcp_call_clock_origin: std::sync::Mutex<Option<Instant>>,
     /// Optional hint clock can be frozen separately from the real mandatory deadline.
@@ -1960,7 +1965,9 @@ impl CheckoutRuntime {
         pin: crate::model::IndexPin,
         mut check: &mut dyn FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<Option<crate::search_model::SearchHeadCoverage>> {
-        use crate::search_model::{SearchHeadCoverage, SearchIndexState, SearchUnavailableReason};
+        use crate::search_model::{
+            SearchCacheDiagnostic, SearchHeadCoverage, SearchIndexState, SearchUnavailableReason,
+        };
         let Some(search) = self.search.as_ref() else {
             return Ok(None);
         };
@@ -1968,7 +1975,8 @@ impl CheckoutRuntime {
             return Ok(Some(SearchHeadCoverage {
                 state: SearchIndexState::Unavailable(reason),
                 declarations: response.mcp_search_head_count(pin, &mut check)? as u64,
-                embedded: 0,
+                embedded: Some(0),
+                cache_diagnostic: None,
             }));
         }
         let scheduler = self.browser_scheduler()?;
@@ -1991,21 +1999,40 @@ impl CheckoutRuntime {
                     SearchIndexState::Partial
                 },
                 declarations,
-                embedded,
+                embedded: Some(embedded),
+                cache_diagnostic: None,
             }));
         }
-        if running || head.pending_for(pin) {
+        let declarations = response.mcp_search_head_count(pin, &mut check)? as u64;
+        if running || head.pending_for(pin, declarations) {
             let hashes = response.mcp_search_head_card_hashes(pin, &mut check)?;
+            // Owner ruling 2026-11-07 (#777): the optional cache never fails
+            // describe/status. A cache fault or cache contention leaves the
+            // count unknown with a typed diagnostic, so describe never spends
+            // its deadline retrying a cache-only read. The request deadline
+            // and index reads stay typed errors.
+            let (embedded, cache_diagnostic) = match search.cached_embedded(&hashes, None, check) {
+                Ok(embedded) => (Some(embedded), None),
+                Err(error) if error.is::<crate::search_vectors::StoreUnavailable>() => {
+                    (None, Some(SearchCacheDiagnostic::VectorCacheUnavailable))
+                }
+                Err(error) if crate::store::cli_read_retryable_contention(&error) => {
+                    (None, Some(SearchCacheDiagnostic::VectorCacheBusy))
+                }
+                Err(error) => return Err(error),
+            };
             return Ok(Some(SearchHeadCoverage {
                 state: SearchIndexState::Building,
-                declarations: hashes.len() as u64,
-                embedded: search.cached_embedded(&hashes, None, check)?,
+                declarations,
+                embedded,
+                cache_diagnostic,
             }));
         }
         Ok(Some(SearchHeadCoverage {
             state: SearchIndexState::Unavailable(SearchUnavailableReason::MatrixNotResident),
-            declarations: response.mcp_search_head_count(pin, &mut check)? as u64,
-            embedded: 0,
+            declarations,
+            embedded: Some(0),
+            cache_diagnostic: None,
         }))
     }
 
@@ -2572,6 +2599,20 @@ impl CheckoutRuntime {
         if let Some(hook) = hook {
             hook();
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn count_search_hash_scan_for_tests(&self) {
+        self.search_hash_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Optional pending-head hash scans MCP search started on this checkout.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn search_hash_scans_for_tests(&self) -> usize {
+        self.search_hash_scans
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Advance this checkout's MCP call clock without waiting real time.
@@ -3376,6 +3417,7 @@ mod selection_tests {
             pickup: crate::producer::pickup::PickupOwner::default(),
             producer: crate::producer::run::ProducerOwner::default(),
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
+            search_hash_scans: std::sync::atomic::AtomicUsize::new(0),
             mcp_call_clock_origin: std::sync::Mutex::new(None),
             mcp_hint_clock_origin: std::sync::Mutex::new(None),
             mcp_read_hook: std::sync::Mutex::new(None),

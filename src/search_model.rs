@@ -228,11 +228,26 @@ impl Serialize for SearchIndexStatus {
 
 /// This checkout's retrieval coverage at its admitted head, derived from
 /// owner-published matrix/job state (#777). Describe and CLI status show it.
+/// `embedded` is null only with a `cacheDiagnostic`: the optional cache could
+/// not be read for the count (owner ruling 2026-11-07, #777). Describe and
+/// status never fail on the optional cache; search keeps `store_unavailable`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchHeadCoverage {
     pub state: SearchIndexState,
     pub declarations: u64,
-    pub embedded: u64,
+    pub embedded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_diagnostic: Option<SearchCacheDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchCacheDiagnostic {
+    /// The vector cache could not be read (corrupt, unreadable or unsafe).
+    VectorCacheUnavailable,
+    /// The vector cache stayed busy; the count was not retried.
+    VectorCacheBusy,
 }
 
 /// Daemon-wide diagnostics plus, when known, this checkout's head coverage.

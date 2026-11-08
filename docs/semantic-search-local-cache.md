@@ -158,7 +158,9 @@ any stale socket left by the stopped process.
 CLI status, `trellis_workspace_describe` and browser diagnostics expose
 `searchIndex: {backend, unavailableReason, configuration}`. CLI status and describe also add
 `state`, `declarations` and `embedded`, the checkout's search coverage at its admitted head
-(#777); a standalone registry without a search service omits them. The daemon's immutable
+(#777, owner-ratified 2026-11-07); a standalone registry without a search service omits them.
+They never fail on the optional vector cache: an unreadable or busy cache while the owner is
+building gives `state:"building"`, `embedded:null` and `cacheDiagnostic`. The daemon's immutable
 `configuration` snapshot records `configFile`, `modelsDir`, `modelName`, `modelRevision`,
 `modelPath`, the requested `backend`, and `sources` for `modelsDir`, `model` and `backend`.
 Each source is `default`, `config_file` or `environment`. The top-level diagnostic `backend`

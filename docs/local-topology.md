@@ -112,7 +112,7 @@ acquisition races with a head change, search also returns lexical-only without q
 embedding or waiting for the owner, never streaming around the cap. These lexical-only
 results have null model identity and the selected backend; they report `building` with the
 cached vector count while the owner works on that head, else `unavailable` with embedded:0 and
-a non-null reason such as `matrix_not_resident` (#777);
+a non-null reason such as `matrix_not_resident` (#777, owner-ratified 2026-11-07);
 mandatory declaration counts/lexical reads and typed observed storage faults are unchanged.
 This supersedes the earlier missing-matrix streaming fallback. A valid retained matrix
 survives backing-cache eviction; owner updates and residency changes may change retrieval between calls at one

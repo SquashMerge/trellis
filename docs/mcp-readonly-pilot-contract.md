@@ -414,7 +414,8 @@ resident matrix (including first search, eviction, head-change races or an overs
 gives a lexical-only answer with null `modelId` and null `modelName`. Its state is `building`
 while the background owner works on this head (below), otherwise `unavailable` with
 `embedded:0`, an unavailable sentinel rather than a measured vector count.
-**Amendment (#777):** `unavailable` always has a non-null `unavailableReason`; there is no
+**Amendment (#777, owner-ratified 2026-11-07):** `toolVersion` is **12** (previously 11).
+`unavailable` always has a non-null `unavailableReason`; there is no
 reasonless `unavailable`. The reason is `model_not_configured` when no model path is configured
 (including a standalone registry with no search service), or `model_load_failed` after a
 verification/loading failure, cleared by a successful load. Otherwise it is `model_not_ready`
@@ -429,10 +430,13 @@ all candidates have vectors, `building` means vectors are missing and a backgrou
 running, and `partial` means vectors are missing and no job is running. Without a used matrix,
 the state is `building` while the owner has queued, running or deferred work for this checkout's
 head. That covers right after a publication, before the new head's matrix exists, and work
-deferred until reconciliation ends. A no-op hint for an evicted or memory-declined head does not
-count. The hits are then lexical-only, model identity is null, and `embedded` counts the admitted
-candidates with a current decoded vector in one vector-cache snapshot. That count is read under
-the optional vector budget and may equal `declarations`. Missing or evicted
+deferred until reconciliation ends. A no-op hint for an evicted head, or for the same head the
+memory policy declined (same declaration count at the current cache epoch), does not count; a
+different, e.g. smaller, successor head is pending again. Retry exhaustion settles the head until
+the next hint. The hits are then lexical-only, model identity is null, and `embedded` counts the
+admitted candidates with a current decoded vector in one vector-cache snapshot. Both the hash
+enumeration and that count are optional work under the vector cutoff: past it, search returns
+the complete lexical answer with `vector_budget_exceeded`. The count may equal `declarations`. Missing or evicted
 vectors do not change native coverage or evidence completeness. A candidate without a vector
 can still be returned by the lexical arm. If this call exhausts its optional vector budget,
 that query-specific reason takes precedence over model diagnostics. Then the complete vector arm is discarded, state is
@@ -544,9 +548,14 @@ re-embedded outside the read. This does not invalidate a valid retained publishe
 A cache file the owner is still creating (no version and no schema yet) reads as an absent
 cache, not a schema mismatch (#777).
 
-**Amendment (#777): head coverage in describe and CLI status.** Workspace describe and CLI
+**Amendment (#777, owner-ratified 2026-11-07): head coverage in describe and CLI status.** Workspace describe and CLI
 status `searchIndex` (`SearchAvailability`) add optional `state:"complete"|"building"|"partial"|"unavailable"`,
-`declarations:UInt` and `embedded:UInt`: this checkout's coverage at the admitted head. Its
+`declarations:UInt`, `embedded:UInt|null` and `cacheDiagnostic?:"vector_cache_unavailable"|"vector_cache_busy"`:
+this checkout's coverage at the admitted head. Describe and status never fail on the optional
+vector cache: if the cached count cannot be read while the owner is pending (a corrupt,
+unreadable or unsafe cache, or cache contention), they report `building` with `embedded:null`
+and that typed `cacheDiagnostic`, present only then. Search keeps its typed `store_unavailable`
+for database-level cache failures. Its
 precedence follows search without the per-query causes. A model diagnostic gives `unavailable`
 with that reason. Otherwise the matrix the owner published for that pin gives `complete`, or
 `building` while the owner runs for that pin, else `partial`. Otherwise owner work for the head

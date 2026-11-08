@@ -64,6 +64,33 @@ impl HeadFailure {
     }
 }
 
+/// Candidate identity bytes the owner charges while reading a head update.
+/// Stored syntax IDs decode to 39 ASCII bytes; card hashes have 64.
+/// Vec -> Arc temporarily keeps both identity arrays, not string clones.
+fn candidate_bytes(added: usize, removed: usize) -> usize {
+    added
+        .saturating_mul(2 * std::mem::size_of::<SearchCandidate>() + 39 + 64)
+        .saturating_add(removed.saturating_mul(std::mem::size_of::<i64>()))
+        .saturating_add(2 * std::mem::size_of::<usize>())
+}
+
+/// Bytes a full build of `added` candidates must fit alone under the cap.
+fn full_admission_bytes(added: usize) -> usize {
+    SearchMatrix::estimated_new_build_bytes_for_counts(
+        added,
+        added.saturating_mul(39),
+        added.saturating_mul(64),
+    )
+    .saturating_add(candidate_bytes(added, 0))
+    .saturating_add(super::search_fill::MATRIX_FILL_SCRATCH)
+}
+
+/// The cap that admits a full build of exactly `count` candidates alone.
+#[cfg(any(test, feature = "test-support"))]
+pub fn full_admission_bytes_for_tests(count: usize) -> usize {
+    full_admission_bytes(count)
+}
+
 pub struct HeadSlot {
     state: Mutex<State>,
     changed: Condvar,
@@ -228,15 +255,17 @@ impl HeadSlot {
     ///
     /// The worker hints after every step, published or not, so `building`
     /// briefly rises on heads whose next attempt is a known no-op. An evicted
-    /// (dormant) head or one the memory policy declined at this cache epoch is
-    /// not pending: only a request (rearm) or a changed head makes it build.
-    pub fn pending_for(&self, pin: IndexPin) -> bool {
+    /// (dormant) head is not pending until a request rearms it. A memory
+    /// decline suppresses only the same head it declined: the owner's own
+    /// admission compares the head's `declarations` count at this cache
+    /// epoch, so a smaller (or otherwise different) successor is still real
+    /// queued work and stays pending.
+    pub fn pending_for(&self, pin: IndexPin, declarations: u64) -> bool {
         let state = self.state.lock().unwrap();
         let epoch = self.search.upgrade().map(|search| search.cache_epoch());
-        let declined = state
-            .declined
-            .as_ref()
-            .is_some_and(|(_, _, declined)| epoch.is_none_or(|epoch| *declined == epoch));
+        let declined = state.declined.as_ref().is_some_and(|(count, _, declined)| {
+            *count as u64 == declarations && epoch.is_none_or(|epoch| *declined == epoch)
+        });
         !state.stopped
             && !state.evicted
             && !declined
@@ -428,23 +457,8 @@ impl HeadSlot {
         {
             return Err(super::search_fill::MemoryDeclined.into());
         }
-        // Stored syntax IDs decode to 39 ASCII bytes; card hashes have 64.
-        // Vec -> Arc temporarily keeps both identity arrays, not string clones.
-        let bytes = added
-            .saturating_mul(2 * std::mem::size_of::<SearchCandidate>() + 39 + 64)
-            .saturating_add(removed.saturating_mul(std::mem::size_of::<i64>()))
-            .saturating_add(2 * std::mem::size_of::<usize>());
-        if full
-            && !owner.can_fit_alone(
-                SearchMatrix::estimated_new_build_bytes_for_counts(
-                    added,
-                    added.saturating_mul(39),
-                    added.saturating_mul(64),
-                )
-                .saturating_add(bytes)
-                .saturating_add(super::search_fill::MATRIX_FILL_SCRATCH),
-            )
-        {
+        let bytes = candidate_bytes(added, removed);
+        if full && !owner.can_fit_alone(full_admission_bytes(added)) {
             let mut state = self.state.lock().unwrap();
             state.declined = Some((added, model_id.to_owned(), epoch));
             state.published = None;
@@ -758,45 +772,49 @@ mod tests {
     #[test]
     fn pending_is_the_owner_flag_or_a_matrix_older_than_the_admitted_pin() {
         let head = slot();
-        assert!(!head.pending_for(pin(1)));
+        assert!(!head.pending_for(pin(1), 1));
         // A hint marks the head before the owner reads or builds anything.
         head.begin();
-        assert!(head.pending_for(pin(1)));
+        assert!(head.pending_for(pin(1), 1));
         head.build(update(1), "model", 2, None, &mut || Ok(()))
             .unwrap();
         assert_eq!(head.coverage(pin(1), "model", 2), Some((1, 0)));
         assert_eq!(head.coverage(pin(2), "model", 2), None);
         // Publication cleared the flag: current for its own pin, but a newer
         // admitted pin is pending until its hint and build arrive.
-        assert!(!head.pending_for(pin(1)));
-        assert!(head.pending_for(pin(2)));
+        assert!(!head.pending_for(pin(1), 1));
+        assert!(head.pending_for(pin(2), 1));
         let other = IndexPin {
             index_generation: uuid::Uuid::from_u128(1),
             index_revision: 1,
         };
-        assert!(head.pending_for(other));
+        assert!(head.pending_for(other, 1));
         // A matrix newer than the admitted pin is a head race, not pending.
         head.build(update(3), "model", 2, None, &mut || Ok(()))
             .unwrap();
-        assert!(!head.pending_for(pin(2)));
+        assert!(!head.pending_for(pin(2), 1));
         // A deferral keeps the owner's work pending; an ordinary end clears it.
         head.begin();
         head.finish(&Err(super::super::search_fill::SearchDeferred.into()));
-        assert!(head.pending_for(pin(3)));
+        assert!(head.pending_for(pin(3), 1));
         head.finish(&Ok(()));
-        assert!(!head.pending_for(pin(3)));
+        assert!(!head.pending_for(pin(3), 1));
         // A hint on an evicted head is a known no-op until a request rearms it.
         head.clear();
         head.begin();
-        assert!(!head.pending_for(pin(3)));
+        assert!(!head.pending_for(pin(3), 1));
         head.rearm();
-        assert!(head.pending_for(pin(3)));
+        assert!(head.pending_for(pin(3), 1));
         // Likewise for a head the memory policy declined at this epoch.
         head.state.lock().unwrap().declined = Some((1, "model".into(), 2));
-        assert!(!head.pending_for(pin(3)));
+        assert!(!head.pending_for(pin(3), 1));
+        // A different (e.g. smaller) successor head is admissible again: the
+        // decline of the old head must not hide its queued build.
+        head.state.lock().unwrap().declined = Some((2, "model".into(), 2));
+        assert!(head.pending_for(pin(4), 1));
         head.state.lock().unwrap().declined = None;
         head.stop();
-        assert!(!head.pending_for(pin(4)));
+        assert!(!head.pending_for(pin(4), 1));
     }
     #[test]
     fn observed_store_fault_wins_over_budget_and_old_matrix() {

@@ -806,7 +806,20 @@
               "$ref": "#/$defs/UInt"
             },
             "embedded": {
-              "$ref": "#/$defs/UInt"
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cacheDiagnostic": {
+              "enum": [
+                "vector_cache_unavailable",
+                "vector_cache_busy"
+              ]
             }
           },
           "required": [
@@ -997,7 +1010,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 11
+                  "const": 12
                 },
                 "watcherDegraded": {
                   "type": "boolean"

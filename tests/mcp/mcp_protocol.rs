@@ -14248,6 +14248,404 @@ async fn mcp_search_reports_building_with_counts_before_owner_builds_new_head() 
     validate_structured_content(&pairs);
 }
 
+/// #777 owner ruling (2026-11-07): describe and CLI status never fail on the
+/// optional vector cache. With the owner pending and the cache unreadable,
+/// both report building with a null count and a typed diagnostic, while
+/// search keeps its typed store_unavailable failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_describe_and_status_report_building_without_count_when_cache_unreadable() {
+    let first_batch = ReadGate::default();
+    let second_batch = ReadGate::default();
+    first_batch.open();
+    second_batch.open();
+    let factory = std::sync::Arc::new(McpFillEmbedderFactory {
+        before_load: None,
+        first_batch,
+        second_batch,
+        loads: Default::default(),
+        batches: Default::default(),
+        queries: Default::default(),
+    });
+    let (fixture, service, fill) = SearchMcpFixture::with_search(
+        &[("a.js", "function orchard() {}\nfunction unrelated() {}\n")],
+        |roots| {
+            std::sync::Arc::new(
+                trellis::daemon::search::SearchService::with_embedder_for_tests(
+                    roots.clone(),
+                    factory.clone(),
+                )
+                .unwrap(),
+            )
+        },
+        true,
+    )
+    .await;
+    fixture.seed_vectors(&service);
+    let fill = fill.unwrap();
+    let build = ReadGate::default();
+    let _release_on_failure = McpFillRelease([build.clone(), ReadGate::default()]);
+    fixture
+        .head()
+        .await
+        .set_before_build_hook_for_tests(build.hook());
+    let runtime = fixture
+        .registry
+        .lock()
+        .await
+        .runtime(&fixture.identity.root_key)
+        .unwrap();
+    fs::write(
+        fixture.identity.root.join("a.js"),
+        "function orchard() {}\nfunction unrelated() {}\nfunction orchardnew() {}\n",
+    )
+    .unwrap();
+    fixture.startup.open();
+    let waiter = build.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    // Make the cache path unreadable while the owner is paused. Rename the
+    // live file instead of reopening it, so no separate descriptor is closed
+    // beneath the owner's SQLite connection.
+    let moved = fixture.vectors.with_extension("db.moved");
+    fs::rename(&fixture.vectors, &moved).unwrap();
+    fs::create_dir(&fixture.vectors).unwrap();
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    let mut pairs = Vec::new();
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(1),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1})
+        )
+    )
+    .unwrap();
+    let describe = next_reply(&mut reader);
+    let expected = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"building","declarations":3,"embedded":null,
+        "cacheDiagnostic":"vector_cache_unavailable"
+    });
+    assert_eq!(
+        describe["result"]["structuredContent"]["data"]["searchIndex"], expected,
+        "{describe}"
+    );
+    pairs.push(json!({"name":"trellis_workspace_describe",
+        "structuredContent":describe["result"]["structuredContent"]}));
+    let status_runtime = runtime.clone();
+    let status = tokio::task::spawn_blocking(move || status_runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status["searchIndex"], expected, "{status}");
+    let failed = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        2,
+        json!({"schemaVersion":1,"query":"orchard","limit":50}),
+    );
+    tool(&failed, Some("store_unavailable"), true);
+    // Restore the cache and let the owner finish: nothing was invalidated.
+    fs::remove_dir(&fixture.vectors).unwrap();
+    fs::rename(&moved, &fixture.vectors).unwrap();
+    build.open();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    let status = tokio::task::spawn_blocking(move || runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        status["searchIndex"],
+        json!({
+            "backend":"cpu","unavailableReason":null,
+            "state":"complete","declarations":3,"embedded":3
+        })
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&pairs);
+}
+
+/// #781 review finding 1: a memory decline of the old head must not hide a
+/// smaller successor the owner admits. Decline a two-card head, publish a
+/// one-card successor, pause the owner before its build, and require
+/// `building` on search, describe and CLI status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_smaller_successor_after_memory_decline_reports_building() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(
+        root.join("a.js"),
+        "function orchard() {}\nfunction unrelated() {}\n",
+    )
+    .unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let service = std::sync::Arc::new(
+        trellis::daemon::search::SearchService::with_embedder_for_tests(
+            topology.clone(),
+            std::sync::Arc::new(McpSearchEmbedderFactory::default()),
+        )
+        .unwrap(),
+    );
+    // A cap that admits a one-card head alone but declines a two-card head.
+    let one = trellis::daemon::search_head::full_admission_bytes_for_tests(1);
+    let two = trellis::daemon::search_head::full_admission_bytes_for_tests(2);
+    assert!(one < two);
+    let fill = trellis::daemon::search_fill::SearchFill::start_with_limit_for_tests(
+        service.clone(),
+        one + (two - one) / 2,
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.set_search_service(service.clone());
+    registry.set_search_fill(fill.clone());
+    registry.attach_launch(211, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("startup reconciliation did not finish");
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let head = scheduler.search_head_slot_for_tests().unwrap();
+    // Settle the owner's attempt on the two-card head: it is declined.
+    let waiter = head.clone();
+    tokio::task::spawn_blocking(move || {
+        let budget = trellis::search_embed::QueryBudget::new(
+            std::time::Instant::now() + trellis::testing::HANG_BACKSTOP,
+            std::sync::Arc::new(std::time::Instant::now),
+        );
+        waiter.request();
+        waiter
+            .wait_latest(&std::sync::atomic::AtomicBool::new(false), &budget)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    assert_eq!(fill.matrix_storage_bytes(), 0);
+    let status_runtime = runtime.clone();
+    let declined = tokio::task::spawn_blocking(move || status_runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        declined["searchIndex"],
+        json!({
+            "backend":"cpu","unavailableReason":"matrix_not_resident",
+            "state":"unavailable","declarations":2,"embedded":0
+        }),
+        "{declined}"
+    );
+    let build = ReadGate::default();
+    let _release_on_failure = McpFillRelease([build.clone(), ReadGate::default()]);
+    head.set_before_build_hook_for_tests(build.hook());
+    fs::write(root.join("a.js"), "function orchard() {}\n").unwrap();
+    let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Content,
+    )))
+    .add_path(root.join("a.js"));
+    assert!(scheduler.submit_watch_event_for_tests(Ok(event)));
+    // The owner admitted the smaller successor and holds before its build.
+    let waiter = build.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    let expected = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"building","declarations":1,"embedded":0
+    });
+    let status_runtime = runtime.clone();
+    let status = tokio::task::spawn_blocking(move || status_runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status["searchIndex"], expected, "{status}");
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 211, None);
+    let mut pairs = Vec::new();
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(1),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1})
+        )
+    )
+    .unwrap();
+    let describe = next_reply(&mut reader);
+    assert_eq!(
+        describe["result"]["structuredContent"]["data"]["searchIndex"], expected,
+        "{describe}"
+    );
+    pairs.push(json!({"name":"trellis_workspace_describe",
+        "structuredContent":describe["result"]["structuredContent"]}));
+    let reply = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        2,
+        json!({"schemaVersion":1,"query":"orchard"}),
+    );
+    tool(&reply, None, true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["data"]["searchIndex"],
+        json!({
+            "state":"building","modelId":null,"modelName":null,"backend":"cpu",
+            "declarations":1,"embedded":0,"lexical":"complete","unavailableReason":null
+        }),
+        "{reply}"
+    );
+    pairs.push(search_schema_pair(&reply));
+    build.open();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    let status = tokio::task::spawn_blocking(move || runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        status["searchIndex"],
+        json!({
+            "backend":"cpu","unavailableReason":null,
+            "state":"complete","declarations":1,"embedded":1
+        })
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&pairs);
+}
+
+/// #781 review finding 3: the optional pending-head hash scan honors the
+/// 3,000ms vector cutoff. With the owner pending and the frozen MCP clock
+/// past the cutoff (before the request deadline), search returns the
+/// complete lexical answer with `vector_budget_exceeded` without starting
+/// the scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_pending_head_count_stops_at_the_vector_cutoff() {
+    let factory = std::sync::Arc::new(McpSearchEmbedderFactory::default());
+    let (fixture, service, fill) = SearchMcpFixture::with_search(
+        &[("a.js", "function orchard() {}\nfunction unrelated() {}\n")],
+        |roots| {
+            std::sync::Arc::new(
+                trellis::daemon::search::SearchService::with_embedder_for_tests(
+                    roots.clone(),
+                    factory.clone(),
+                )
+                .unwrap(),
+            )
+        },
+        true,
+    )
+    .await;
+    fixture.seed_vectors(&service);
+    let fill = fill.unwrap();
+    let build = ReadGate::default();
+    let admitted = ReadGate::default();
+    let _release_on_failure = McpFillRelease([build.clone(), admitted.clone()]);
+    fixture
+        .head()
+        .await
+        .set_before_build_hook_for_tests(build.hook());
+    let runtime = fixture
+        .registry
+        .lock()
+        .await
+        .runtime(&fixture.identity.root_key)
+        .unwrap();
+    fs::write(
+        fixture.identity.root.join("a.js"),
+        "function orchard() {}\nfunction unrelated() {}\nfunction orchardnew() {}\n",
+    )
+    .unwrap();
+    fixture.startup.open();
+    let waiter = build.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    runtime.set_mcp_admitted_gate_for_tests(admitted.hook());
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(1),
+            "trellis_search_symbols",
+            json!({"schemaVersion":1,"query":"orchard","limit":50})
+        )
+    )
+    .unwrap();
+    let waiter = admitted.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    // Past the 3,000ms vector cutoff, inside the 5,000ms request deadline.
+    runtime.advance_mcp_clock_for_tests(Duration::from_millis(3500));
+    let scans = runtime.search_hash_scans_for_tests();
+    admitted.open();
+    let reply = next_reply(&mut reader);
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(
+        envelope["data"]["searchIndex"],
+        json!({
+            "state":"unavailable","modelId":null,"modelName":null,"backend":"cpu",
+            "declarations":3,"embedded":0,"lexical":"complete",
+            "unavailableReason":"vector_budget_exceeded"
+        }),
+        "{reply}"
+    );
+    assert_eq!(envelope["data"]["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["data"]["hits"][0]["matchedBy"], json!(["lexical"]));
+    assert_eq!(
+        runtime.search_hash_scans_for_tests(),
+        scans,
+        "optional hash scan ran past the vector cutoff"
+    );
+    build.open();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&[search_schema_pair(&reply)]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_search_cancelled_or_disconnected_cold_query_does_not_withdraw_owner() {
     let source: String = (0..17)

@@ -1176,6 +1176,10 @@ impl FillRegistration {
             }
         }
         core.changed.notify_one();
+        drop(inbox);
+        // Mark again after recording the hint: an owner that settled this
+        // head between the first mark and the inbox update cannot hide it.
+        self.head.begin();
     }
 }
 impl Drop for FillRegistration {
@@ -1426,6 +1430,10 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
             slot.retries = 0;
             slot.dirty = false;
             slot.fault_cooldown = Some(Instant::now() + FAULT_RETRY);
+            // The owner decided no retry remains: publish that the head is
+            // settled, or describe/status keep reading busy work as pending
+            // (#777). A later hint begins it again after its inbox update.
+            head.settle();
         } else {
             slot.completed = if outcome.result.is_ok() {
                 outcome.pin.map(|pin| Completed {
@@ -2975,7 +2983,12 @@ mod tests {
             !slot.running && slot.retry_at.is_none() && slot.fault_cooldown.is_some()
         });
         assert!(events.try_recv().is_err());
+        // Exhausted retries leave no work: the idle head is not pending
+        // without a new request or hint (#777).
+        let head = registration.head_slot();
+        assert!(!head.pending_for(pin(1), 0));
         registration.notify();
+        assert!(head.pending_for(pin(1), 0));
         assert_eq!(event(&events).0, pin(1));
         drop(registration);
         resume.send(()).unwrap();
