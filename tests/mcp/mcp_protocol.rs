@@ -11541,6 +11541,20 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
     // #725: check keeps one witness per instance; explain samples by its `limit`.
     assert_eq!(unknown["evidence"].as_array().unwrap().len(), 1);
     assert_eq!(unknown["omittedEvidence"], 299);
+    // #785: the sampled witness is classified and the kind counts cover every site.
+    let counts = &unknown["kindCounts"];
+    let total: u64 = ["call", "type", "import", "reference"]
+        .iter()
+        .map(|kind| counts[*kind].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 300, "{unknown}");
+    let witness = &unknown["evidence"][0];
+    assert_eq!(witness["relationKind"], "import", "{witness}");
+    assert!(witness["lines"]["start"].as_u64().unwrap() >= 1);
+    assert!(witness["spelling"].as_str().unwrap().contains("external"));
+    assert!(witness["owner"].is_object(), "{witness}");
+    assert_eq!(witness["targetReason"], "structural_only");
+    assert!(witness["target"].is_null());
     assert_eq!(data["page"]["offset"], 0);
     structured.push(json!({"name":"trellis_rules_check","structuredContent":envelope.clone()}));
     // The unscoped check pages too; its concatenated instances keep every row.

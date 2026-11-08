@@ -832,3 +832,261 @@ fn nested_boundary_sites_use_the_exact_inner_measured_call() {
     assert_eq!(evidence["caller"], site["caller"]);
     assert!(evidence["callerReason"].is_null());
 }
+
+/// Publishes `files` (relative path, text) as native evidence under `rules_text`.
+fn publish_files(
+    files: &[(&str, &str)],
+    rules_text: &str,
+) -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for (path, text) in files {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native_rows, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native_rows, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    rules(root.path(), rules_text);
+    (state, root, store, pin)
+}
+
+fn kind_total(counts: &Value) -> u64 {
+    ["call", "type", "import", "reference"]
+        .iter()
+        .map(|kind| counts[*kind].as_u64().unwrap())
+        .sum()
+}
+
+#[test]
+fn rule_evidence_carries_relation_kind_and_spelling() {
+    let (_state, _root, store, pin) = publish_files(
+        &[
+            (
+                "src/lib.rs",
+                "mod top; use crate::top::Thing; pub fn run(_: &crate::top::Thing) { crate::top::target(); }\n",
+            ),
+            ("src/top.rs", "pub struct Thing;\npub fn target() {}\n"),
+        ],
+        "version=1\n[layers.low]\norder=2\npaths=['src/lib.rs']\n[layers.top]\norder=1\npaths=['src/top.rs']\n",
+    );
+    let checked = native(&store, pin, "check");
+    let row = &checked["instances"][0];
+    assert_eq!(row["rule"], "$layers");
+    let by = |spelling: &str| {
+        row["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["spelling"] == spelling)
+            .unwrap_or_else(|| panic!("no {spelling}: {row}"))
+    };
+    let call = by("crate::top::target");
+    assert_eq!(call["relationKind"], "call", "{call}");
+    assert!(call["lines"]["start"].as_u64().unwrap() >= 1);
+    assert!(
+        row["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["spelling"] == "crate::top::Thing" && e["relationKind"] == "reference")
+    );
+    assert!(
+        row["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["relationKind"] == "import")
+    );
+    assert_eq!(row["evidence"][0]["relationKind"], "call");
+}
+
+#[test]
+fn rule_evidence_names_its_owner() {
+    let (_state, _root, store, pin) = publish_files(
+        &[
+            (
+                "src/lib.rs",
+                "mod top; use crate::top::target; pub fn run() { crate::top::target(); }\n",
+            ),
+            ("src/top.rs", "pub fn target() {}\n"),
+        ],
+        "version=1\n[layers.low]\norder=2\npaths=['src/lib.rs']\n[layers.top]\norder=1\npaths=['src/top.rs']\n",
+    );
+    let checked = native(&store, pin, "check");
+    let evidence = checked["instances"][0]["evidence"].as_array().unwrap();
+    let call = evidence
+        .iter()
+        .find(|e| e["relationKind"] == "call")
+        .unwrap();
+    assert_eq!(call["owner"]["name"], "run");
+    assert_eq!(call["owner"]["syntaxId"], call["syntaxId"]);
+    assert_eq!(call["owner"]["stableLookupKey"], "src/lib.rs::run");
+    let import = evidence
+        .iter()
+        .find(|e| e["relationKind"] == "import")
+        .unwrap();
+    assert!(import["owner"]["name"].is_null(), "{import}");
+    assert!(import["owner"]["stableLookupKey"].is_null(), "{import}");
+}
+
+#[test]
+fn structural_rule_evidence_has_no_target_and_says_why() {
+    let (_state, _root, store, pin) = publish_files(
+        &[
+            (
+                "src/lib.rs",
+                "mod top; pub fn run() { crate::top::target(); }\n",
+            ),
+            ("src/top.rs", "pub fn target() {}\n"),
+        ],
+        "version=1\n[layers.low]\norder=2\npaths=['src/lib.rs']\n[layers.top]\norder=1\npaths=['src/top.rs']\n",
+    );
+    let checked = native(&store, pin, "check");
+    for item in checked["instances"][0]["evidence"].as_array().unwrap() {
+        assert_eq!(item["kind"], "structuralReference");
+        assert!(item["target"].is_null(), "{item}");
+        assert_eq!(item["targetReason"], "structural_only");
+    }
+}
+
+#[test]
+fn typescript_imports_are_classified_evidence() {
+    let (_state, _root, store, pin) = publish_files(
+        &[
+            (
+                "web/a.ts",
+                "import { b } from './b';\nexport const a = b;\n",
+            ),
+            ("web/b.ts", "export const b = 1;\n"),
+            ("lib/c.ts", "export const c = 1;\n"),
+        ],
+        "version=1\n[layers.web]\norder=1\npaths=['web/a.ts']\n[layers.lib]\norder=2\npaths=['web/b.ts','lib/**']\n",
+    );
+    let checked = native(&store, pin, "check");
+    let row = checked["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rule"] == "$layers" && row["target"]["path"] == "web/a.ts")
+        .unwrap_or_else(|| panic!("no instance: {checked}"));
+    let evidence = row["evidence"].as_array().unwrap();
+    assert!(!evidence.is_empty());
+    for item in evidence {
+        assert_eq!(item["relationKind"], "import", "{item}");
+        assert_eq!(item["targetReason"], "structural_only");
+    }
+    assert_eq!(row["kindCounts"]["import"], row["referenceCount"]);
+}
+
+#[test]
+fn javascript_require_inside_a_function_keeps_its_caller() {
+    let (_state, _root, store, pin) = publish_files(
+        &[
+            (
+                "web/a.js",
+                "export function load() {\n  return require(\"./b.js\");\n}\n",
+            ),
+            ("web/b.js", "export const b = 1;\n"),
+        ],
+        "version=1\n[layers.web]\norder=1\npaths=['web/**']\n",
+    );
+    let references = native(&store, pin, "references");
+    let entry = references["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["source"]["path"] == "web/a.js")
+        .unwrap_or_else(|| panic!("require resolved: {references}"));
+    assert_eq!(entry["site"]["relationKind"], "import");
+    let checked = native(&store, pin, "check");
+    let row = checked["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rule"] == "$layers" && row["status"] == "unknown")
+        .unwrap_or_else(|| panic!("no unknown row: {checked}"));
+    let item = &row["evidence"][0];
+    assert_eq!(item["relationKind"], "import");
+    assert!(item["callId"].is_string());
+    assert_eq!(item["caller"]["name"], "load");
+    assert!(item["callerReason"].is_null());
+    assert_eq!(item["owner"]["name"], "load");
+    assert_eq!(item["targetReason"], "structural_only");
+    assert_eq!(row["kindCounts"]["import"], row["referenceCount"]);
+}
+
+#[test]
+fn kind_counts_are_exact_and_sum_to_reference_count() {
+    let (_state, _root, store, pin) = publish_files(
+        &[
+            (
+                "src/lib.rs",
+                "mod top; pub fn run(_: &crate::top::Thing) { crate::top::target(); }\nmod orphan_user;\n",
+            ),
+            ("src/top.rs", "pub struct Thing;\npub fn target() {}\n"),
+            (
+                "src/loose.rs",
+                "pub fn loose() { crate::top::target(); crate::nowhere::gone(); }\n",
+            ),
+        ],
+        "version=1\n[layers.low]\norder=2\npaths=['src/lib.rs','src/loose.rs']\n[layers.top]\norder=1\npaths=['src/top.rs']\n",
+    );
+    let references = native(&store, pin, "references");
+    for edge in references["production"].as_array().unwrap() {
+        assert_eq!(
+            kind_total(&edge["kindCounts"]),
+            edge["count"].as_u64().unwrap()
+        );
+    }
+    let checked = native(&store, pin, "check");
+    let rows = checked["instances"].as_array().unwrap();
+    assert!(rows.iter().any(|row| row["status"] == "unknown"));
+    for row in rows.iter().filter(|row| row["rule"] == "$layers") {
+        assert_eq!(
+            kind_total(&row["kindCounts"]),
+            row["referenceCount"].as_u64().unwrap(),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn calls_lead_the_rules_sample_past_the_sample_size() {
+    let mut types = String::new();
+    for index in 0..8 {
+        types.push_str(&format!("pub fn t{index}(_: &crate::high::T) {{}}\n"));
+    }
+    types.push_str("pub fn last() { crate::high::f(); }\n");
+    let (_state, _root, store, pin) = publish_files(
+        &[
+            ("src/lib.rs", "mod high; mod low;\n"),
+            ("src/high.rs", "pub struct T;\npub fn f() {}\n"),
+            ("src/low.rs", &types),
+        ],
+        "version=1\n[layers.high]\norder=1\npaths=['src/high.rs','src/lib.rs']\n[layers.low]\norder=2\npaths=['src/low.rs']\n",
+    );
+    let checked = native(&store, pin, "check");
+    let row = checked["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rule"] == "$layers" && row["target"]["path"] == "src/low.rs")
+        .unwrap();
+    assert_eq!(row["kindCounts"]["call"], 1);
+    assert_eq!(row["kindCounts"]["reference"], 8);
+    assert_eq!(row["evidence"][0]["relationKind"], "call", "{row}");
+}

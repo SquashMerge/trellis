@@ -889,13 +889,21 @@ CatalogEvidence = {kind:"standardLibraryCatalog",catalog:"rust-standard-library:
                    entry:<one of the pinned CPython v3.12.0 stdlib roots>}
                 | {kind:"standardLibraryCatalog",catalog:"node-standard-library:v1",
                    entry:"fs"|"path"}
-Edge = {source:Target,target:Destination,count:UInt,sites:Site[],
+Edge = {source:Target,target:Destination,count:UInt,kindCounts:KindCounts,sites:Site[],
         omittedSites:UInt,evidenceTier:"syntax"|"semantic"|"mixed",semanticSites:UInt}
 Unresolved = {source:Target,site:Site,reason:string}
 Site = {ownerSyntaxId:string|null,role:"production"|"test"|null,
         range:Range,lines:Lines,relationKind:"reference"|"import"|"call"|"type",
         spelling:string,callId:string|null,
+        caller:Caller|null,callerReason:CallerReason|null,
+        owner:SiteOwner|null,target:ReferenceTarget|null,targetReason:TargetReason|null,
         mapping:"structural"|"semantic",provenanceId:string|null}
+SiteOwner = {syntaxId:string,name:string|null,stableLookupKey:string|null}
+ReferenceTarget = {syntaxId:string,displayKey:string,document:DocumentKey,lines:Lines}
+TargetReason = "structural_only"|"unresolved"|"external"|"ambiguous"
+KindCounts = {call:UInt,type:UInt,import:UInt,reference:UInt}
+Caller = {stableLookupKey:string,syntaxId:string,name:string,document:DocumentKey}
+CallerReason = "syntax_only"|"enclosing_callable_unknown"|"stable_lookup_unavailable"|"semantic_boundary"
 ```
 
 #### Semantic bindings (#523)
@@ -1050,7 +1058,7 @@ response bytes. No cap is raised and no verdict or proof is clipped. The MCP too
 page larger selected results ([paging](mcp-readonly-pilot-contract.md#architecture-references-and-reviewed-rules-129)); the CLI and
 the browser detail reads ([Architecture view](architecture-view.md#summary-and-detail-reads-448)) keep these exact shapes.
 Modules are ordered by full document key. Edges sort by source and target identities within each role
-array; samples sort by range, kind and spelling. Unresolved sites sort by source,
+array; samples take call sites first, then the other sites, each in range, kind and spelling order. Unresolved sites sort by source,
 range, kind and reason and are not clipped. `count` is exact and
 `omittedSites = count - sites.length`. `limit` bounds samples **per edge**, not
 edge counts or verdict scope. A `callId` is present only if an actual stored
@@ -1072,13 +1080,17 @@ Instance = {rule:string,target:Target,destination:Destination|null,
             sourceLayer:string|null,destinationLayer:string|null,
             status:"conforms"|"deviates"|"unknown",excepted:boolean,
             exceptionReason:string|null,constraints:ConstraintResult[],
-            evidence:Evidence[],unresolved:string[],referenceCount:UInt}
+            evidence:Evidence[],unresolved:string[],referenceCount:UInt,
+            kindCounts?:KindCounts}
 ConstraintResult = {mode:"require"|"forbid",kind:"calls"|"extends"|"implements",
                     targetRole:string,status:"conforms"|"deviates"|"unknown",
                     evidence:Evidence[],unresolved:string[]}
 Evidence = {document:DocumentKey,revisionId:string,range:Range,
             kind:"declaration"|"call"|"structuralReference"|"semanticBinding"|"typeRelationship",
-            syntaxId:string|null,callId:string|null,provenanceId:string}
+            syntaxId:string|null,callId:string|null,provenanceId:string,
+            caller?:Caller|null,callerReason?:CallerReason|null,
+            lines?:Lines|null,relationKind?:"reference"|"import"|"call"|"type",spelling?:string,
+            owner?:SiteOwner|null,target?:ReferenceTarget|null,targetReason?:TargetReason|null}
 Counts = {comparable:UInt,conforms:UInt,deviates:UInt,unknown:UInt,excepted:UInt}
 ```
 
@@ -1135,6 +1147,48 @@ per page and each check instance keeps one evidence entry. Under the
 [#769 amendment](mcp-readonly-pilot-contract.md#amendment-769-rules-tools-point-to-the-next-call),
 a check instance that omits evidence carries `nextCall`, the ready-made
 `trellis_rules_explain` arguments that show the rest.
+
+### Classified reference evidence (#785)
+
+**Status: proposed (owner-delegated, run 802).**
+
+Reference evidence is a `structuralReference` or `semanticBinding` item of a `$layers` or
+`$external` instance, including the items of an unknown `$layers` row. It carries all of
+`caller`, `callerReason`, `lines`, `relationKind`, `spelling`, `owner`, `target` and
+`targetReason`, copied from its site. `lines` is the call site's lines. Constraint evidence
+carries only `caller` and `callerReason`; declaration evidence carries neither. A `$layers`
+or `$external` instance carries `kindCounts`, the edge's counts or, for an unknown row,
+the counts of the sites it aggregates. Declaration instances have `referenceCount:0` and no
+`kindCounts`.
+
+- **R1, relation kind** (the first match wins):
+  1. A structural `import` stays `import`, including JavaScript and TypeScript `require(...)`
+     and `import(...)` call sites.
+  2. Semantic-only sites keep `call` or `type`.
+  3. A structural `reference` becomes `call` when a stored measured call encloses the site, or
+     when the semantic binding that maps it is a call binding.
+  4. A structural `reference` mapped by a type-role semantic reference becomes `type`.
+  5. Anything else is `reference`.
+- **R2, owner.** `owner` is null if and only if `ownerSyntaxId` is null. `owner.name` is null
+  for an anonymous declaration or a module; `owner.stableLookupKey` is null when no key is
+  recoverable, and always for a file module.
+- **R3, target.** `target` is non-null only for a semantic site whose binding resolves to an
+  indexed declaration in this snapshot. `targetReason` is null if and only if `target` is
+  non-null; otherwise it is the first of `structural_only` (the document has no selected
+  semantic evidence), `external`, `ambiguous` or `unresolved`.
+- **R4, kind counts.** Every site counted in an edge's `count` adds 1 to exactly one
+  `kindCounts` bucket before sampling, so the four buckets add up to `count`
+  (`referenceCount` on an instance).
+- **R5, sampling.** An edge's sample takes its `call` sites first, then the others, each in
+  the existing order. `omittedSites` is `count` minus the sites returned.
+
+Invariants: `owner.syntaxId` equals the site's `ownerSyntaxId`, and `syntaxId` on reference
+evidence. `caller` is non-null only on `call` and `import` sites. On an `import` site it
+names the function that runs the import: a JavaScript or TypeScript `require(...)` or
+`import(...)` whose site is its measured call.
+
+Limits: structural type paths stay `reference` without semantic evidence, and the browser, CLI
+and MCP rules samples are 5 sites per pair.
 
 ## Proposal workflow
 
