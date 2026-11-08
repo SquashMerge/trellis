@@ -982,7 +982,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 11
+                  "const": 12
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -13672,7 +13672,7 @@
       ],
       "type": "object"
     },
-    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Defaults: depth 2, maxNodes 8, maxCalls 10 with full proofs; `compact:true` keeps node and stable lookup keys, names, paths, edge kinds and resolutions, drops bindings, coverage and provenance, and defaults to maxNodes 50, maxCalls 60. Each distinct semantic basis appears once in `semanticBases`; `responseOmitted` counts nodes and edges cut to fit the response. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead."
+    "description": "Build a bounded rooted call graph from one declaration, expanding only fresh exact semantic bindings. Defaults: depth 2, maxNodes 8, maxCalls 10 with full proofs; `compact:true` keeps node and stable lookup keys, names, paths, edge kinds and resolutions, drops bindings, coverage and provenance, and defaults to maxNodes 50, maxCalls 60. Each distinct semantic basis appears once in `semanticBases`; `responseOmitted` counts nodes and edges cut to fit the response. Without imported evidence every edge stops at the root; use trellis_outgoing_calls instead. Unexpanded calls whose callee is named like a project declaration rank before other names (`Some`, `clone`); `omitted.callLimit` counts the cut."
   },
   {
     "annotations": {

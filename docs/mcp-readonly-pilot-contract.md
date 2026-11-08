@@ -365,6 +365,59 @@ incoming `scopeCoverage` and the lookup alternatives other tools return keep the
   | find by lookup key `src/mcp/projection.rs::compact_graph` | 4,080 (1) | 2,949 (1) | 1,298 (1) |
   | compact call graph `src/http/worker.rs::DaemonState::enqueue_index` | 6,924 (5 nodes) | n/a | 7,260 (5 nodes, all keyed) |
 
+## Amendment (#770): a bounded prompt reference view
+
+**Status: owner-ratified 2026-11-07 (#770).** `trellis_propose_layers`
+inlined the whole `references:v2` result, so on any non-trivial checkout the prompt
+exceeded the 65,536-byte frame and failed with `response_too_large`. This section wins
+over the [proposal prompt](#one-no-argument-proposal-prompt) and
+[rules proposal workflow](rules.md#proposal-workflow) text only for what "structural
+references" means inside the prompt. The tools, their pages, the pin, the rules bytes and
+descriptor, the atomic failures and the frame are unchanged.
+
+The prompt is a hybrid: a small fixed context plus an explicit workflow that pages the
+existing tools for detail.
+
+- **Unchanged:** the server instructions and the full rules grammar (skeleton, external
+  policy, exceptions); the current exact `rules.toml` bytes and descriptor, or explicit
+  absence; the pin (`evidenceBasis`), `workspace` and `catchingUp`.
+- **`payload.references` is a summary** of the pinned references result, not the result.
+  - It keeps `referencesVersion`, `evidenceTier`, `semanticComplete`,
+    `semanticProducers`, `partial`, `counts` (scanned documents, mapped, unresolved and
+    semantic sites) and `limitations` as they are.
+  - It adds
+    `totals:{productionEdges,productionSites,testEdges,testSites,externalPackages,partialFiles}`.
+- **One overview table,** `overview:{rows,total,omitted}`.
+  - Each row is `{source,target,sites}`: production native edges summed by source and
+    target directory. A file's directory is its path up to the last slash, or `.` at the
+    root. Package destinations have no directory and are only counted.
+  - Rows are ordered by `sites` descending, then by source and target.
+  - The overview keeps the longest prefix whose rows fit a fixed budget of 12,288 bytes
+    (`PROMPT_OVERVIEW_BYTES`). The rows' bytes are their JSON array as escaped in the
+    prompt text, with separators and without brackets. If large rules bytes leave less
+    room, it keeps the longest prefix whose complete response line still fits the frame.
+    Both limits are measured on the serialized bytes. `rows.length + omitted = total`,
+    and the result is deterministic for one pin and rules text.
+  - Why 12 KiB: a directory row costs about 45 to 70 bytes, so the budget holds roughly
+    200 rows. That covers every production directory pair of mimir (74) and Trellis (67).
+    It also keeps the prompt near the #528 24 KiB agent page target.
+- **Not listed:** test, package and file-module edges, site samples, module and package
+  descriptors, unresolved sites and partial files. They are counted, not listed.
+- **Workflow.** The instructions tell the agent to:
+  1. start from the overview;
+  2. page `trellis_references` (`expectedBasis`, `paths`, `offset`) to refine particular
+     areas;
+  3. draft `rules.toml` and test it with `trellis_rules_check` /
+     `trellis_rules_explain`;
+  4. pull exact file-level edges from `trellis_references` only when writing baseline
+     exceptions.
+
+  A future `groupBy` aggregation
+  ([#775](https://github.com/SquashMerge/trellis/issues/775)) will make step 2 cheaper.
+- **Atomic failure stays.** Rules bytes are never clipped. If the fixed part
+  (instructions, rules bytes, pin and envelope) does not fit, the prompt still fails
+  atomically with `response_too_large`.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)
@@ -589,6 +642,17 @@ A separate tool for the rooted graph capability ([Decision 0012](semantic-eviden
 
 **Imported-data reach.** The current SCIP importer sets `dispatch: unknown` on every call binding, so until dispatch evidence lands (#12, #14), `trellis_call_graph` on imported data stops at the root's direct callees.
 
+**Project-named boundaries first (#778, owner-ratified 2026-11-07).** From a 2026-11-07 Claude Desktop session: without semantic evidence, compact `trellis_call_graph` from `src/http.rs::provisioned_core_answer` kept the first 60 of its calls in source order, almost all `Some`, `Ok`, `Err`, `clone`, `map_err` and `into_response`. `toolVersion` is **12** (previously 11). For this tool, the only reader of the engine, this amends step 5 of the contract-v1 [pinned bounded priority algorithm](semantic-evidence/contract-v1.md#pinned-bounded-priority-algorithm) by splitting its third rank, "other boundaries", in two:
+
+- *Third:* a boundary call with a selected binding, or an unbound boundary call whose stored callee lookup key equals the lookup key of a declaration of the call's language in the admitted snapshot. This is the [Decision 0012](semantic-evidence/decisions/0012-incoming-calls-syntax-tier.md) name relation that incoming calls use, read from the call's side.
+- *Fourth:* every other unbound boundary, including one with no provable callee key.
+
+The ranking applies only to unbound boundary calls; semantic bindings always take precedence. A call with a selected binding keeps the placement that binding gives it. It expands in rank one, is an external leaf in rank two or, under the default `includeExternal:false`, is dropped as filtered. A dispatch, ambiguous, unresolved or stale binding stays in rank three whatever its name, so it never ranks below an unbound call. The name match is only the fallback order for calls with no selected binding: no producer for the call's language, a document whose evidence is pending (catching up or needing re-import), or no binding row for the call.
+
+Ranks one (fresh admissible internal direct/constructor) and two (external leaves) are unchanged. The tie-breaks within a rank (owner depth, owner document and syntax identity, source order) are also unchanged. The name relation only orders candidates. It never targets, expands, filters or groups a call, and it changes no boundary reason, warning, `partial`, input or output schema. The `maxCalls` cut, its `callLimit` frontiers and `omitted.callLimit`, and the response-byte prefix stay exact, so a de-prioritized call that is cut is still counted. No standard-library name list is added. Sequence's external rule, a selected binding that resolves external, is already the call graph's `includeExternal` filter and is unchanged. A name match is not proof of a project target: a project `fn len` also lifts every `.len()` call.
+
+Measured on a private clone of this repository at `913b645e`, syntax only, with compact defaults: the root has 339 calls, 60 are kept and `omitted.callLimit` is 279 both before and after. Among the 60 kept edges, `Some`, `Ok`, `Err`, `clone`, `map_err` and `into_response` went from 23 to 6. The remaining 6 are `into_response`, which this repository declares. The frame went from 25,445 to 25,597 bytes.
+
 ### `trellis_read_source` (W5)
 
 Input `{schemaVersion:1,workspace?:string,path:string,startLine:UInt,endLine:UInt,expectedBasis?:Basis,expectedContentHash?:Hash}`; both guards may coexist and must pass. Indexed root-relative POSIX path, 1–4096 UTF-8 bytes: reject absolute paths, backslash, colon, NUL, and empty/`.`/`..` segments; no normalization or disk fallback. Data exactly `{path,contentHash:Hash,startLine:UInt,endLine:UInt,byteRange:Range,text:string,evidence:Evidence}`. Lines are 1-based inclusive, `1<=start<=end<=cached line count`. Locate lines by raw LF byte `0x0a` before decoding; preserve CRLF; final LF adds no empty line; empty file has zero selectable lines. Once guards and bounds pass, **strictly decode only selected cached bytes as UTF-8**. Invalid selection returns `unsupported_encoding`, retryable=false, safely verified currentBasis and null currentContentHash; never replacement U+FFFD, byte loss, transcoding, normalization, base64, changed cache/hash or live-file access. Invalid bytes elsewhere do not prevent a valid selected slice. Successful decoded text re-encodes byte-for-byte to that slice including terminators; contentHash is SHA-256 of the **whole original cached file**. At most 200 lines and 16384 raw selected bytes (equal to successful text UTF-8 length); oversized, reversed or out-of-file selections fail, never clip. Source bytes are not fabricated #22 provenance.
@@ -784,7 +848,8 @@ complete-frame cap applies, not the catalog cap.
 
 Prompt content separates server-authored task instructions from untrusted
 repository data. It supplies the verified checkout, one code pin, sampled
-`catchingUp`, structural references/limitations and production/test split; it also
+`catchingUp`, structural references/limitations and production/test split (as the
+bounded summary of [Amendment (#770)](#amendment-770-a-bounded-prompt-reference-view)); it also
 supplies current exact rules bytes and the separate checkout-config descriptor,
 or explicit absence. Missing rules permits a new proposal; malformed rules fails
 atomically, just as check/explain do. The index pin does not identify current
