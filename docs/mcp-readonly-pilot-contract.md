@@ -365,6 +365,66 @@ incoming `scopeCoverage` and the lookup alternatives other tools return keep the
   | find by lookup key `src/mcp/projection.rs::compact_graph` | 4,080 (1) | 2,949 (1) | 1,298 (1) |
   | compact call graph `src/http/worker.rs::DaemonState::enqueue_index` | 6,924 (5 nodes) | n/a | 7,260 (5 nodes, all keyed) |
 
+## Amendment (#769): rules tools point to the next call
+
+**Pending owner ratification.** From the 2026-11-07 setup of a new repository and a
+Claude Desktop session. With no rules file, nothing named the prompt that drafts one.
+A check instance's single kept evidence row gave no route to the rest, so the agent
+read source files instead. Desktop also could not call `trellis_rules_explain` at all,
+because it sent a `{language,path}` module pair as `target` and got only `Invalid tool
+arguments`. `toolVersion` is **12** (previously 11). This section wins over the #129
+failure text, the #725 instance text and the failure table below. Evaluation,
+verdicts, counts, `omittedEvidence`, instance order, paging rules and bounds are
+unchanged, as are the CLI and the browser.
+
+- **Rules file hint.** The `rules_not_found` message from check and explain is the
+  static text ``No .trellis/rules.toml. Ask the user to run the
+  `trellis_propose_layers` MCP prompt (in Claude Code:
+  /mcp__trellis__trellis_propose_layers) to draft one for review.`` Its code and
+  retryability are unchanged.
+- **Ready-made explain call.** A `trellis_rules_check` instance (in `instances` or
+  `testOnly`) with `omittedEvidence > 0` adds the optional
+  `nextCall:{tool:"trellis_rules_explain",arguments}`. `arguments` is
+  `{schemaVersion:1,rule,target,destination?,limit}`. `rule` and `target` are copied
+  verbatim from the instance, and so is `destination` when the instance's rule is
+  `$layers` or `$external` and its destination is non-null. `limit` is the
+  instance's evidence count, `1 + omittedEvidence`, at most 50.
+  - Sent back as given, these arguments validate. The explain answer lists that
+    instance with up to `limit` evidence entries, all of them when the count is 50
+    or less. A caller that chose a `workspace` for check adds the same one. It may
+    also add the check's `evidenceBasis` as `expectedBasis`, to read the same pin.
+  - An instance whose arguments would not validate as an explain request carries no
+    `nextCall`. Neither does an instance with `omittedEvidence:0`. Explain instances
+    never carry one.
+  - The hint is server-authored from the instance's own identities and adds no
+    repository text. It is part of the instance it rides on, so the page fit and the
+    instance `limit` measure each instance with its hint. A page can therefore hold
+    fewer instances than before, but no instance is split, dropped or clipped.
+- **Field-naming argument errors.** An `invalid_request` from application argument
+  validation now says which field failed and what it expects, as static server text.
+  It never echoes the caller's arguments or repository content. Validation order,
+  codes and retryability are unchanged, and so is every other code, including
+  `range_too_large`, which keeps its generic message.
+  - The message names the first failing check: first an argument the tool does not
+    accept (`Invalid tool arguments: a field is not in this tool's inputSchema`),
+    then a missing required field, then each field in the existing validation order.
+    Non-object arguments say `Tool arguments must be a JSON object`.
+  - For example, an explain `target` that is not a check identity gives `` `target`
+    must be the identity object from a trellis_rules_check instance: {sourceSetId,
+    language, path, sid} ``.
+  - The exact text of each message is server-authored, not part of this contract.
+    Each one names its field in backticks and fits the 512-byte summary.
+- **Object input properties.** In every tool's `inputSchema`, a property that is a
+  bare `$ref` to an object-valued definition also carries `"type":"object"` (allowed
+  beside `$ref` in JSON Schema 2020-12). This covers `expectedBasis` on the ten tools
+  that accept it, and explain's `target` and `destination`, because some clients
+  choose how to serialize an argument from its `type`. Accepted values are unchanged.
+- **Catalog.** Check's output `RuleInstance` adds the optional, closed `nextCall`.
+  `trellis_read_source`'s output schema drops its unreferenced `SemanticProjection`,
+  `DocumentSemanticStatus` and `Language` definitions, which no response shape uses.
+  The complete catalog is 224 bytes smaller than at `toolVersion` 11, so it keeps its
+  named headroom.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)

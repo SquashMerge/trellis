@@ -2063,7 +2063,10 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             tool(&failed, Some("invalid_request"), !legacy);
             assert_eq!(
                 failed["result"]["content"][0]["text"],
-                format!("{name} failed: invalid_request: Invalid tool arguments"),
+                format!(
+                    "{name} failed: invalid_request: Invalid tool arguments: a field is not \
+                     in this tool's inputSchema"
+                ),
                 "failure summary must identify the called tool"
             );
             schema_pairs.push(json!({"name":name,
@@ -2156,8 +2159,22 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
         for name in &names {
             let name = name.as_str().unwrap();
             for args in [json!([]), json!(42), Value::Null] {
+                // #769: non-object arguments say so; the rest is the golden envelope.
+                let mut reply = peer.ask(call(legacy, json!(heavy_id), name, args));
+                let message = "Tool arguments must be a JSON object";
+                let error = &mut reply["result"]["structuredContent"]["error"]["message"];
+                assert_eq!(*error, message);
+                *error = fixture()["expected"]["failures"]["invalid_request"][0].clone();
+                let text = &mut reply["result"]["content"][0]["text"];
+                assert_eq!(*text, format!("{name} failed: invalid_request: {message}"));
+                *text = json!(format!(
+                    "{name} failed: invalid_request: {}",
+                    fixture()["expected"]["failures"]["invalid_request"][0]
+                        .as_str()
+                        .unwrap()
+                ));
                 exact_tool_for_id(
-                    &peer.ask(call(legacy, json!(heavy_id), name, args)),
+                    &reply,
                     &json!(heavy_id),
                     Some("invalid_request"),
                     !legacy,
@@ -11668,6 +11685,269 @@ async fn rules_check_paths_scope_the_unassigned_list_through_every_page() {
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
+}
+
+/// #769: a check instance that omits evidence carries a ready-made `nextCall`. Its
+/// `trellis_rules_explain` arguments, sent back verbatim, succeed and return that
+/// instance with all of its evidence. An instance that omits nothing has no hint.
+#[tokio::test(flavor = "current_thread")]
+async fn rules_check_next_call_explains_an_instance_with_its_omitted_evidence() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            (
+                "app_main.js",
+                "import('external');\nimport('external');\nimport('external');\n",
+            ),
+            (
+                "lib_000.js",
+                "import './app_main.js';\nimport { y } from './app_main.js';\n",
+            ),
+            ("lib_001.js", "import './app_main.js';\n"),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 1\npaths = [\"app_main.js\"]\n[layers.lib]\norder = 2\npaths = [\"lib_*.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(769, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 769, None);
+    let mut ask = |id: i64, name: &str, arguments: Value| {
+        let frame = modern(
+            json!(id),
+            "tools/call",
+            json!({"name":name,"arguments":arguments}),
+        );
+        writeln!(client, "{frame}").unwrap();
+        next_reply(&mut reader)
+    };
+    let check = ask(1, "trellis_rules_check", json!({"schemaVersion":1}));
+    tool(&check, None, true);
+    let mut structured = vec![
+        json!({"name":"trellis_rules_check","structuredContent":check["result"]["structuredContent"]}),
+    ];
+    let data = &check["result"]["structuredContent"]["data"];
+    let rows: Vec<Value> = ["instances", "testOnly"]
+        .iter()
+        .flat_map(|field| data[*field].as_array().unwrap().clone())
+        .collect();
+    let mut hinted = 0;
+    for (index, row) in rows.iter().enumerate() {
+        if row["omittedEvidence"] == 0 {
+            assert!(row.get("nextCall").is_none(), "{row}");
+            continue;
+        }
+        hinted += 1;
+        let next = &row["nextCall"];
+        assert_eq!(next["tool"], "trellis_rules_explain", "{row}");
+        let arguments = &next["arguments"];
+        assert_eq!(arguments["rule"], row["rule"]);
+        assert_eq!(arguments["target"], row["target"]);
+        assert_eq!(
+            arguments.get("destination").unwrap_or(&Value::Null),
+            &row["destination"]
+        );
+        let explained = ask(
+            10 + index as i64,
+            "trellis_rules_explain",
+            arguments.clone(),
+        );
+        tool(&explained, None, true);
+        let instances = explained["result"]["structuredContent"]["data"]["instances"]
+            .as_array()
+            .unwrap();
+        let same = instances
+            .iter()
+            .find(|candidate| {
+                candidate["rule"] == row["rule"]
+                    && candidate["target"] == row["target"]
+                    && candidate["destination"] == row["destination"]
+                    && candidate["status"] == row["status"]
+            })
+            .unwrap_or_else(|| panic!("explain lists the hinted instance: {explained}"));
+        let total = row["omittedEvidence"].as_u64().unwrap() + 1;
+        assert_eq!(
+            same["evidence"].as_array().unwrap().len() as u64,
+            total,
+            "{same}"
+        );
+        assert_eq!(same["omittedEvidence"], 0, "{same}");
+        assert_eq!(same["evidence"][0], row["evidence"][0]);
+        structured.push(json!({"name":"trellis_rules_explain",
+            "structuredContent":explained["result"]["structuredContent"]}));
+    }
+    // The unknown app_main.js instance (three unresolved imports) and the lib_000.js
+    // deviation (two imports of app_main.js) omit evidence; lib_001.js does not.
+    assert_eq!(hinted, 2, "{data}");
+    validate_structured_content(&structured);
+    drop(ask);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #769: without `.trellis/rules.toml`, check and explain fail `rules_not_found` with a
+/// static hint naming the `trellis_propose_layers` prompt that drafts one.
+#[tokio::test(flavor = "current_thread")]
+async fn rules_not_found_names_the_propose_layers_prompt() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) =
+        published_inactive_checkout(temp.path(), &[("app.js", "export const a = 1;\n")]);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(7691, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 7691, None);
+    let target = json!({"sourceSetId":"app","language":"javascript","path":"app.js",
+        "sid":"sid:v1:00000000000000000000000000000000"});
+    for (id, name, arguments) in [
+        (1, "trellis_rules_check", json!({"schemaVersion":1})),
+        (
+            2,
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers","target":target}),
+        ),
+    ] {
+        let frame = modern(
+            json!(id),
+            "tools/call",
+            json!({"name":name,"arguments":arguments}),
+        );
+        writeln!(client, "{frame}").unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, Some("rules_not_found"), true);
+        let envelope = &reply["result"]["structuredContent"];
+        let message = envelope["error"]["message"].as_str().unwrap();
+        assert!(message.contains(".trellis/rules.toml"), "{message}");
+        assert!(message.contains("`trellis_propose_layers`"), "{message}");
+        assert!(
+            message.contains("/mcp__trellis__trellis_propose_layers"),
+            "{message}"
+        );
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            format!("{name} failed: rules_not_found: {message}")
+        );
+        validate_structured_content(&[json!({"name":name,"structuredContent":envelope})]);
+    }
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #769: an `invalid_request` for tool arguments names the failing field and the
+/// shape it expects, in static server text. A `{language,path}` module pair (the
+/// rules.toml exception shape) or a stringified identity is not an explain `target`.
+#[test]
+fn invalid_tool_arguments_name_the_failing_field_and_its_shape() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let mut peer = Peer::start(Some(&root));
+    let identity = json!({"sourceSetId":"app","language":"rust","path":"src/a.rs",
+        "sid":"sid:v1:00000000000000000000000000000000"});
+    let target_message = "`target` must be the identity object from a trellis_rules_check \
+        instance: {sourceSetId, language, path, sid}";
+    let cases = [
+        (
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers",
+                "target":{"language":"rust","path":"src/a.rs"}}),
+            target_message,
+        ),
+        (
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers","target":identity.to_string()}),
+            target_message,
+        ),
+        (
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers"}),
+            target_message,
+        ),
+        (
+            "trellis_rules_explain",
+            json!({"schemaVersion":1,"rule":"$layers","target":identity,
+                "destination":{"language":"rust","path":"src/b.rs"}}),
+            "`destination` must be the destination object from a trellis_rules_check \
+                instance: {sourceSetId, language, path, sid} or {kind:\"externalPackage\", \
+                sourceSetId, language, package, standardLibrary}, and only for $layers or \
+                $external",
+        ),
+        (
+            "trellis_rules_check",
+            json!({"schemaVersion":1,"status":["violates"]}),
+            "`status` must be 1 to 3 distinct values from \"conforms\", \"deviates\", \"unknown\"",
+        ),
+        (
+            "trellis_declaration",
+            json!({"schemaVersion":1,"symbolId":"sid:v1:x"}),
+            "`symbolId` must be a syntax ID: sid:v1: followed by 32 lowercase hex digits",
+        ),
+    ];
+    for (id, (name, arguments, message)) in cases.into_iter().enumerate() {
+        let reply = peer.ask(modern(
+            json!(id),
+            "tools/call",
+            json!({"name":name,"arguments":arguments}),
+        ));
+        tool(&reply, Some("invalid_request"), true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["message"], message,
+            "{name} {arguments}"
+        );
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            format!("{name} failed: invalid_request: {message}")
+        );
+    }
+    peer.assert_success("trellis mcp");
+}
+
+/// #769: every input property whose `$ref` names an object-valued definition also says
+/// `"type":"object"`, so a client serializes it as an object rather than a string.
+#[test]
+fn object_valued_input_refs_declare_type_object() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let mut peer = Peer::start(Some(&root));
+    let list = peer.ask(modern(json!(1), "tools/list", json!({})));
+    let mut checked = Vec::new();
+    for tool in list["result"]["tools"].as_array().unwrap() {
+        let schema = &tool["inputSchema"];
+        for (field, property) in schema["properties"].as_object().unwrap() {
+            let Some(reference) = property.get("$ref").and_then(Value::as_str) else {
+                continue;
+            };
+            let definition = &schema["$defs"][reference.strip_prefix("#/$defs/").unwrap()];
+            let object = definition["type"] == "object"
+                || definition["oneOf"].as_array().is_some_and(|branches| {
+                    branches.iter().all(|branch| {
+                        let name = branch["$ref"].as_str().unwrap_or_default();
+                        schema["$defs"][name.strip_prefix("#/$defs/").unwrap_or_default()]["type"]
+                            == "object"
+                    })
+                });
+            if object {
+                assert_eq!(property["type"], "object", "{} {field}", tool["name"]);
+                checked.push(format!("{}.{field}", tool["name"].as_str().unwrap()));
+            } else {
+                assert!(property.get("type").is_none(), "{} {field}", tool["name"]);
+            }
+        }
+    }
+    assert!(checked.contains(&"trellis_rules_explain.target".to_owned()));
+    assert!(checked.contains(&"trellis_rules_explain.destination".to_owned()));
+    assert!(checked.contains(&"trellis_find_symbols.expectedBasis".to_owned()));
+    assert_eq!(checked.len(), 12, "{checked:?}");
+    peer.assert_success("trellis mcp");
 }
 
 #[test]
