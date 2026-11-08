@@ -397,6 +397,42 @@ Other binding sites without a measured declaration remain candidates, but cannot
 
 **Grammar limits (pinned tree-sitter-typescript 0.23.2).** `export type * from "m"` is not parsed: the grammar accepts only `export type { … }`, so a document containing it gets a recovered-parse gap (partial coverage with a diagnostic) instead of complete measurement. A decorator written before `export` (`@sealed() export class M`) is a child of `export_statement`, so its call is owned by the enclosing file module, the innermost executable container; decorators on non-exported classes, and on members and parameters, are owned by the class or method.
 
+## Interface evidence amendment (#788)
+
+**Status: proposed (owner pre-approved 2026-11-08, #788; driver verifies scope before merge).**
+
+### The evidence kind
+
+An `interfaces[]` entry with `kind: "http"` records one HTTP interface between a client app and a server app. Its fields are:
+
+- the client and server apps;
+- `method`;
+- `pathTemplate`;
+- the handler: its `syntaxId`, its location, and `handler.kind`, which is `declaration` or `dispatchArm`;
+- the call sites, each with a `callId` and a `caller`;
+- `serverOnly` and `clientOnly`, which mark a route with no matched call site and a call site with no matched route.
+
+Extraction details (route recognition, handler identity, exclusions and the wrapper list) are specified in architecture-view.md, not here.
+
+### Matching
+
+A client path is matched against server route templates. Server templates come from axum route literals plus dispatch tables. Client paths come from configured wrappers plus a prefix rule.
+
+### Confidence
+
+Each entry carries one of four confidence values, each with exactly one meaning:
+
+| Value | Meaning |
+|---|---|
+| `exact` | a literal client path equals a literal server route |
+| `template` | a client path with substitutions matches a parameterized or dispatch segment pattern |
+| `wrapperInferred` | the path was assembled by a known wrapper plus prefix |
+| `unresolved` | there is no match |
+
+### Evidence, never proof
+
+Interface evidence is never worded "A calls B", and it is never an input to `$layers` verdicts.
+
 ## Owner-ratified native-v9 correction: Java varargs
 
 **Status: owner-ratified 2026-10-24 (#279).** This narrow Java measurement ruling is approved independently; the #279 capability and reference amendments above are also ratified by the owner, 2026-10-24.
