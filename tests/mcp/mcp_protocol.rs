@@ -12271,6 +12271,104 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
     }
 }
 
+/// #770: on a checkout whose structural references alone exceed the 65,536-byte frame,
+/// `prompts/get` still returns a fitting, deterministic proposal context: directory
+/// edges and file-module pairs with exact totals and omitted counts, and the exact
+/// current rules bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn propose_layers_prompt_fits_the_frame_when_references_exceed_it() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let mut files = Vec::new();
+    for package in 0..10 {
+        fs::create_dir_all(temp.path().join(format!("checkout/pkg{package}"))).unwrap();
+        files.push((format!("pkg{package}/__init__.py"), String::new()));
+        for module in 0..20 {
+            let mut text = String::new();
+            for other in 1..=6 {
+                let target = (package + other) % 10;
+                let name = (module + other) % 20;
+                text.push_str(&format!("from pkg{target}.m{name} import f as f{other}\n"));
+            }
+            text.push_str("def f():\n    pass\n");
+            files.push((format!("pkg{package}/m{module}.py"), text));
+        }
+    }
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let (identity, topology) = published_inactive_checkout(temp.path(), &borrowed);
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    let rules = "version = 1\n[layers.top]\norder = 1\npaths = [\"pkg0/**\"]\n";
+    fs::write(identity.root.join(".trellis/rules.toml"), rules).unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(770, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 770, None);
+    let mut raw = |id: i64, method: &str, params: Value| {
+        writeln!(client, "{}", modern(json!(id), method, params)).unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        line
+    };
+    let refs: Value = serde_json::from_str(&raw(
+        1,
+        "tools/call",
+        json!({"name":"trellis_references","arguments":{"schemaVersion":1}}),
+    ))
+    .unwrap();
+    let refs_env = &refs["result"]["structuredContent"];
+    assert!(refs_env.get("error").is_none(), "{refs}");
+    let first = raw(2, "prompts/get", json!({"name":"trellis_propose_layers"}));
+    // A small prompt: instructions, rules, pin, totals and a bounded overview.
+    assert!(first.len() < 32 * 1024, "{} bytes", first.len());
+    let prompt: Value = serde_json::from_str(&first).unwrap();
+    assert!(prompt.get("error").is_none(), "{prompt}");
+    let second = raw(3, "prompts/get", json!({"name":"trellis_propose_layers"}));
+    assert_eq!(
+        first.replacen("\"id\":2", "", 1),
+        second.replacen("\"id\":3", "", 1),
+        "deterministic"
+    );
+    let text = prompt["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("for human review"));
+    assert!(text.contains("WORKFLOW\n1. Start from the overview"));
+    assert!(text.contains("trellis_references with expectedBasis"));
+    let context: Value =
+        serde_json::from_str(text.split("UNTRUSTED REPOSITORY DATA\n").nth(1).unwrap()).unwrap();
+    let payload = &context["payload"];
+    assert_eq!(payload["rulesText"], rules);
+    assert_eq!(
+        context["evidenceBasis"], refs_env["evidenceBasis"],
+        "one pin"
+    );
+    let summary = &payload["references"];
+    assert_eq!(summary["referencesVersion"], "references:v2");
+    // 200 modules, each importing six modules of other packages: 1,200 file pairs (whose
+    // inlined references exceed the frame) in 60 directory pairs, all in the overview.
+    assert_eq!(summary["totals"]["productionEdges"], 1200, "{summary}");
+    assert_eq!(summary["totals"]["productionSites"], 1200, "{summary}");
+    assert_eq!(summary["counts"], refs_env["data"]["counts"]);
+    let overview = &summary["overview"];
+    assert_eq!(overview["total"], 60, "{overview}");
+    assert_eq!(overview["omitted"], 0);
+    let rows = overview["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 60);
+    assert!(rows.iter().all(|row| row["sites"] == 20), "{overview}");
+    assert_eq!(rows[0], json!({"source":"pkg0","target":"pkg1","sites":20}));
+    for field in ["production", "tests", "unresolved", "filePairs", "packages"] {
+        assert!(summary.get(field).is_none(), "{field}");
+    }
+    drop(raw);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn python_architecture_external_descriptors_validate_in_structured_tool_results() {
     use trellis::daemon::registry::CheckoutRegistry;
