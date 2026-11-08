@@ -38,7 +38,7 @@ export function parseArgs(args) {
     if (flag === "--fixture") fixture = rest[i];
     else root = resolve(rest[i]);
   }
-  if (!["example", "java", "rust", "python", "javascript"].includes(fixture))
+  if (!["example", "java", "rust", "python", "javascript", "typescript"].includes(fixture))
     throw new Error(`CLI.FIXTURE unknown fixture ${fixture}`);
   return { command, fixture, root, check };
 }

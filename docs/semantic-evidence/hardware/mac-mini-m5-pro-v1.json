@@ -62,9 +62,20 @@
       "version": "native-v16",
       "installedAtCapture": true,
       "capturedOn": "2026-11-07",
-      "installMethod": "cargo build --locked --features test-support --bin trellis; feature/683 s2a-2 (TypeScript grammar and detection) merged with main; descriptor and both captures reproducible from the README commands",
-      "artifactDigest": "sha256:ef89a2f1d8b91a9e9275e5ad1a45c503f670641a9b3680746fa33569bd6a4337",
-      "executableHash": "ef89a2f1d8b91a9e9275e5ad1a45c503f670641a9b3680746fa33569bd6a4337",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; feature/683 final extractor (s4-corpus-repin: TypeScript grammar, native constructs and class diagrams) merged with main; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:2ca488b0dcc0c80025ce0bcdf4eab91f44a1fa89baf90809f3c7f03419035027",
+      "executableHash": "2ca488b0dcc0c80025ce0bcdf4eab91f44a1fa89baf90809f3c7f03419035027",
+      "runtime": "trellis.native.syntax@native-v16 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; tree-sitter-typescript 0.23.2; UTF-8; source-only extractionInputs []."
+    },
+    {
+      "name": "trellis-native-v16-typescript-test-support",
+      "status": "recorded",
+      "version": "native-v16",
+      "installedAtCapture": true,
+      "capturedOn": "2026-11-07",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; feature/683 final extractor (s4-corpus-repin: TypeScript grammar, native constructs and class diagrams) merged with main; TypeScript draft corpus captured twice byte-identical; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:2ca488b0dcc0c80025ce0bcdf4eab91f44a1fa89baf90809f3c7f03419035027",
+      "executableHash": "2ca488b0dcc0c80025ce0bcdf4eab91f44a1fa89baf90809f3c7f03419035027",
       "runtime": "trellis.native.syntax@native-v16 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; tree-sitter-typescript 0.23.2; UTF-8; source-only extractionInputs []."
     },
     {

@@ -1,0 +1,34 @@
+{
+  "formatVersion": 1,
+  "document": {
+    "sourceSetId": "main",
+    "language": "typescript",
+    "path": "src/ambient.d.ts"
+  },
+  "revisionId": "r1",
+  "scenarios": [],
+  "facts": [
+    {
+      "kind": "coverage",
+      "ref": "native-coverage:src/ambient.d.ts",
+      "record": {
+        "producerId": "trellis.native.syntax",
+        "language": "typescript",
+        "sourceSetId": "main",
+        "documentPath": "src/ambient.d.ts",
+        "revisionId": "r1",
+        "requested": true,
+        "selected": true,
+        "state": "complete",
+        "supportedRoles": [
+          "definition",
+          "call"
+        ],
+        "observedRoles": [
+          "definition"
+        ],
+        "diagnostic": null
+      }
+    }
+  ]
+}

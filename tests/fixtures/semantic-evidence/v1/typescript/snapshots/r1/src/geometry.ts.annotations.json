@@ -1,0 +1,35 @@
+{
+  "formatVersion": 1,
+  "document": {
+    "sourceSetId": "main",
+    "language": "typescript",
+    "path": "src/geometry.ts"
+  },
+  "revisionId": "r1",
+  "scenarios": [],
+  "facts": [
+    {
+      "kind": "coverage",
+      "ref": "native-coverage:src/geometry.ts",
+      "record": {
+        "producerId": "trellis.native.syntax",
+        "language": "typescript",
+        "sourceSetId": "main",
+        "documentPath": "src/geometry.ts",
+        "revisionId": "r1",
+        "requested": true,
+        "selected": true,
+        "state": "complete",
+        "supportedRoles": [
+          "definition",
+          "call"
+        ],
+        "observedRoles": [
+          "definition",
+          "call"
+        ],
+        "diagnostic": null
+      }
+    }
+  ]
+}

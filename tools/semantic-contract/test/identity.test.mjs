@@ -383,6 +383,8 @@ test("IDENTITY.ORDINAL immutable document, parent, exact name and signature scop
   const documents = assignOrdinals([a, javascript]);
   assert.equal(documents.get(a), 0);
   assert.equal(documents.get(javascript), 0);
+  const typescript = { ...a, language: "typescript", nativeId: "ts-language" };
+  assert.equal(assignOrdinals([a, javascript, typescript]).get(typescript), 0);
   assert.throws(
     () => assignOrdinals([a, { ...a, nativeId: "same-language" }]),
     /duplicate native range/,
@@ -463,6 +465,22 @@ test("IDENTITY.MANIFEST pinned empty and populated bytes, sorted and sensitive",
     /unsorted/,
   );
   assert.match(sourceManifestHash([row, rust]), /^[a-f0-9]{64}$/);
+  const javascript = {
+    document: { ...row.document, language: "javascript", path: "z.js" },
+    contentHash: row.contentHash,
+  };
+  const typescript = {
+    document: { ...row.document, language: "typescript", path: "a.ts" },
+    contentHash: row.contentHash,
+  };
+  assert.match(
+    sourceManifestHash([row, rust, javascript, typescript]),
+    /^[a-f0-9]{64}$/,
+  );
+  assert.throws(
+    () => sourceManifestHash([typescript, javascript]),
+    /IDENTITY.MANIFEST unsorted/,
+  );
 });
 test("IDENTITY.CANONICAL every control and closed nested input", () => {
   const controls = Array.from(
