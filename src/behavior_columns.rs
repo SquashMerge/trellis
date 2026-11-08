@@ -351,6 +351,32 @@ mod tests {
         assert_eq!(label("g"), "graph_read");
     }
 
+    /// The browser says what a column is from its ID (#716): `module:` is a module, `type:` a
+    /// Rust type and any other ID a class (`sequenceColumnKind` in web/sequence.js).
+    #[test]
+    fn a_column_id_says_whether_it_is_a_module_or_a_rust_type() {
+        let columns = DocumentColumns {
+            language: "rust".into(),
+            nodes: nodes(vec![
+                symbol("file", "src/mcp/session.rs", SymbolKind::Module, None, 0),
+                symbol("f", "open", SymbolKind::Function, Some("file"), 1),
+            ]),
+            text: String::new(),
+        };
+        match columns.owner(&columns.nodes["f"]) {
+            Owner::Column(module) => assert!(module.id.starts_with("module:"), "{}", module.id),
+            other => panic!("{other:?}"),
+        }
+        for (written, relative, count) in [
+            ("Session", false, 1),
+            ("fmt::Error", true, 1),
+            ("Session", false, 2),
+        ] {
+            let column = id(written, relative, "src/mcp/session.rs", count);
+            assert!(column.id.starts_with("type:"), "{}", column.id);
+        }
+    }
+
     #[test]
     fn a_class_is_its_own_column_and_an_anonymous_class_defers_outward() {
         let columns = DocumentColumns {

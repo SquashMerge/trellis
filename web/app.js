@@ -1779,7 +1779,9 @@ function renderSequenceColumns() {
   sequenceHeaderEnd = 0;
   strip.replaceChildren(...headers.map(header => {
     const rect = header.getBoundingClientRect();
-    const name = element("span", header.matches(".pele-actor") ? header.textContent : header.firstChild.textContent);
+    // A wrapped header (#716) is one line here: its kind, then its name.
+    const lines = [...header.querySelectorAll("tspan")].map(line => line.textContent);
+    const name = element("span", lines.length ? lines.join(" ") : header.matches(".pele-actor") ? header.textContent : header.firstChild.textContent);
     name.style.left = `${rect.left + rect.width / 2 - box.left + diagram.scrollLeft}px`;
     sequenceHeaderEnd = Math.max(sequenceHeaderEnd, rect.bottom - box.top + diagram.scrollTop);
     return name;
