@@ -545,3 +545,110 @@ fn typescript_mixed_import_resolution() {
     assert_eq!(lodash["identity"]["standardLibrary"], false);
     assert_eq!(lodash["ecosystem"], "npm");
 }
+
+#[test]
+fn typescript_interface_property_signatures_are_fields() {
+    use trellis::{classes::Catalog, indexer::index_workspace};
+    let workspace = fixture_root();
+    let root = fs::canonicalize(workspace.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let graph = index_workspace(&IndexOptions::new(root), &cancel, |_| {}).unwrap();
+    let catalog = Catalog::build(&graph.files, &graph.nodes, &cancel).unwrap();
+    let entity = catalog
+        .classes
+        .iter()
+        .find(|c| c.qualified_name == "src.app.model.Entity")
+        .expect("Entity is catalogued");
+    assert_eq!(entity.declaration_kind, "interface");
+    assert!(
+        entity.fields.iter().any(|field| field.name == "id"),
+        "an interface property signature is a field"
+    );
+    assert!(
+        catalog
+            .relations
+            .iter()
+            .any(|relation| relation.owner == entity.symbol.id
+                && relation.kind == "field"
+                && relation.type_name == "Id"),
+        "its declared type is a field relation"
+    );
+}
+
+/// The `src/app/alias.ts` import edges after the root config files are rewritten by `setup`.
+fn alias_edges_with_root_config(setup: impl FnOnce(&Path)) -> Vec<(String, u64)> {
+    use serde_json::json;
+    let state = tempfile::tempdir().unwrap();
+    let workspace = fixture_root();
+    let root = fs::canonicalize(workspace.path()).unwrap();
+    setup(&root);
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
+    let cancel: trellis::model::CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    let response = store.evidence_response().unwrap();
+    let references = response
+        .architecture_response("references", &json!({"expectedBasis": pin}), &mut || Ok(()))
+        .unwrap();
+    response.finish(()).unwrap();
+    let mut edges: Vec<(String, u64)> = references["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|edge| edge["source"]["path"] == "src/app/alias.ts")
+        .map(|edge| {
+            let target = &edge["target"];
+            (
+                target["path"]
+                    .as_str()
+                    .or(target["package"].as_str())
+                    .unwrap()
+                    .to_owned(),
+                edge["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    edges.sort();
+    edges
+}
+
+#[test]
+fn typescript_root_config_falls_back_to_jsconfig_and_prefers_tsconfig() {
+    let tsconfig_edges = alias_edges_with_root_config(|_| {});
+    assert!(
+        tsconfig_edges
+            .iter()
+            .any(|(target, _)| target == "src/app/repo.ts"),
+        "the fixture's tsconfig paths resolve the alias: {tsconfig_edges:?}"
+    );
+
+    // No `tsconfig.json`: the root `jsconfig.json` supplies the same mapping.
+    let jsconfig_only = alias_edges_with_root_config(|root| {
+        fs::rename(root.join("tsconfig.json"), root.join("jsconfig.json")).unwrap();
+    });
+    assert_eq!(jsconfig_only, tsconfig_edges);
+
+    // Both present: a contradictory `jsconfig.json` is ignored.
+    let both = alias_edges_with_root_config(|root| {
+        fs::write(root.join("jsconfig.json"), "{}").unwrap();
+    });
+    assert_eq!(both, tsconfig_edges);
+
+    // The jsconfig fallback is really what resolved it: an empty one resolves nothing.
+    let empty = alias_edges_with_root_config(|root| {
+        fs::remove_file(root.join("tsconfig.json")).unwrap();
+        fs::write(root.join("jsconfig.json"), "{}").unwrap();
+    });
+    assert_ne!(empty, tsconfig_edges);
+}

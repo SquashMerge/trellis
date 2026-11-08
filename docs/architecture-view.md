@@ -324,7 +324,7 @@ and mean over raw [`metrics:v1`](metrics.md) callable scores. Heat explicitly st
 `role=production`; the unchecked **Include tests and fixtures in metrics** checkbox requests `all` when checked.
 Omitted API/CLI role remains `all`; `test` is available through those transports. The Architecture
 payload echoes `role` (rather than `metricsScope`). Stored native declaration roles are authoritative
-for Rust, Java, Python and JavaScript under Decision 0011, not browser path heuristics or runner
+for Rust, Java, Python, JavaScript and TypeScript under Decision 0011, not browser path heuristics or runner
 discovery. Inline Rust `cfg(test)` callables are test; feature-only `test-support` remains production.
 Each module carries per-file `roleCounts: {production, test}` independent of the selected role;
 its `declarationCount` and metrics describe the selected population. Fan-out is the measured callable metric,

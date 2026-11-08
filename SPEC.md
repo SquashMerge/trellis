@@ -405,11 +405,11 @@ an agent explanation nor a compiler declaration binding is an observed runtime t
 
 ### Current implementation versus accepted direction
 
-- Implemented: native tree-sitter JavaScript, Rust, Java and Python extraction, plus optional
+- Implemented: native tree-sitter JavaScript, TypeScript, Rust, Java and Python extraction, plus optional
   JavaScript SCIP import with paired source-hash freshness checks. The SCIP decoder/importer
   lives in `src/indexer.rs`; there is no separate `src/scip.rs` today.
 - Not implemented: semantic import for the other three languages, automatic indexer execution,
-  LSP/compiler overlays, TypeScript syntax/sequence coverage, or universal full call resolution.
+  LSP/compiler overlays, or universal full call resolution.
 - Accepted direction: generalize **artifact import first**, using a common bounded SCIP reader
   plus tested language-specific declaration/reference joins. Prioritize Java, then Rust/Python
   as independently gated slices. See [the multi-language plan](docs/scip-multilanguage-plan.md).

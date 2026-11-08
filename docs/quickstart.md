@@ -1,6 +1,6 @@
 # Trellis quickstart
 
-Trellis is a local code browser for JavaScript, Rust, Java and Python. It indexes a checkout on your machine, then shows you its architecture, file sizes, classes and static call sequences in a web app, and answers the same questions for coding agents over MCP. It reads your code without running it, and it marks what it can prove and what it can't. Everything stays on your machine.
+Trellis is a local code browser for JavaScript, TypeScript, Rust, Java and Python. It indexes a checkout on your machine, then shows you its architecture, file sizes, classes and static call sequences in a web app, and answers the same questions for coding agents over MCP. It reads your code without running it, and it marks what it can prove and what it can't. Everything stays on your machine.
 
 See [known limitations](known-limitations.md) before you rely on it.
 
@@ -207,7 +207,7 @@ Trellis accepts only the exact versions below, and never installs them for you.
 
 | Language | Producer | Version | Install |
 | --- | --- | --- | --- |
-| JavaScript | `scip-typescript` | 0.4.0 | `npm install -g @sourcegraph/scip-typescript@0.4.0` |
+| JavaScript, TypeScript | `scip-typescript` | 0.4.0 | `npm install -g @sourcegraph/scip-typescript@0.4.0` |
 | Python | `scip-python` | 0.6.6 | `npm install -g @sourcegraph/scip-python@0.6.6` |
 | Java | `scip-java` | 0.12.3 | `coursier bootstrap --standalone com.sourcegraph:scip-java_2.13:0.12.3 -o ~/.local/bin/scip-java` |
 | Rust | `rust-analyzer` | 1.98.1 | `rustup toolchain install 1.98.1 --component rust-analyzer` |
