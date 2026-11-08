@@ -886,6 +886,39 @@ fn published_db(state: &std::path::Path, root: &std::path::Path) -> std::path::P
         .join("index.db")
 }
 
+/// `graph_projections` admits `typescript` with a ready class extraction, and only then.
+#[test]
+#[cfg(feature = "test-support")]
+fn typescript_publishes_a_ready_class_projection() {
+    let (state, root, store, cancel) = fixture();
+    fs::write(
+        root.path().join("shape.ts"),
+        "export class Shape { constructor(public id: number) {} }\n",
+    )
+    .unwrap();
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let state_of = |path: &str| -> String {
+        db.query_row(
+            "SELECT g.class_extraction_state FROM graph_projections g JOIN revision_documents d ON d.gid=g.gid WHERE d.revision_id=?1 AND d.path=?2",
+            rusqlite::params![live_revision(&db), path],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(state_of("shape.ts"), "ready");
+    let tampered = db.execute(
+        "UPDATE graph_projections SET class_extraction_state='notApplicable',class_extraction_payload=NULL,class_summary_payload=NULL WHERE language='typescript'",
+        [],
+    );
+    assert!(
+        tampered.is_err(),
+        "a typescript projection cannot be notApplicable"
+    );
+}
+
 #[test]
 #[cfg(feature = "test-support")]
 fn selected_class_payload_oversize_refuses_before_json_decode() {
@@ -5522,7 +5555,7 @@ fn capped_cold_stream_preserves_plain_revision_header_and_catalog_warning() {
         warnings,
         vec![
             "Class catalog declaration limit reached (20000)",
-            "Declared types are terminal source text, not class relationships. Direct class declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery. Rust: inherent impl methods merge by scoped path; derives, macro-generated items and blanket impls are not attributed.",
+            "Declared types are terminal source text, not class relationships. Direct class declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery. Rust: inherent impl methods merge by scoped path; derives, macro-generated items and blanket impls are not attributed. TypeScript: classes inside namespaces/modules are not catalogued; enum members are listed as fields.",
             "Incomplete class declaration registry: some declarations may be absent.",
         ]
     );

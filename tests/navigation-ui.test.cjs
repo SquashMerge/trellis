@@ -661,6 +661,11 @@ test("enclosing callable and supported class actions use measured identity, not 
   h.request=async()=>response([{symbol:{...cls,path:"src/a.rs"},reason:"declaration",matchKind:"measured",action:"class"}]);
   await h.nav.open(h.event(),{path:"src/a.rs",line:4});
   assert.ok(h.latest.actions.find(a=>a.label.startsWith("Class diagram")),"Rust types are catalogued (#452)");
+  for(const path of ["src/a.ts","ui/a.tsx","src/a.mts","src/a.cts"]){
+    h.request=async()=>response([{symbol:{...cls,path},reason:"declaration",matchKind:"measured",action:"class"}]);
+    await h.nav.open(h.event(),{path,line:4});
+    assert.ok(h.latest.actions.find(a=>a.label.startsWith("Class diagram")),`TypeScript classes are catalogued (#683): ${path}`);
+  }
   h.request=async()=>response([{symbol:{...cls,path:"src/A.go"},reason:"declaration",matchKind:"measured",action:"class"}]);
   await h.nav.open(h.event(),{path:"src/A.go",line:4});
   assert.equal(h.latest.actions.some(a=>a.label.startsWith("Class diagram")),false);

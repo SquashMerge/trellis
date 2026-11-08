@@ -1,11 +1,11 @@
 # Class diagrams and related classes
 
-Class diagrams use the indexed Java, Python, JavaScript and Rust snapshot. They do not load or execute the inspected
+Class diagrams use the indexed Java, Python, JavaScript, TypeScript and Rust snapshot. They do not load or execute the inspected
 application, run package tools, fetch dependencies, or send source to a provider.
 
 ## Use the view
 
-- Right-click an indexed `.java`, `.py`, `.js`, `.mjs`, `.cjs` or `.rs` file and choose **Show class diagram**.
+- Right-click an indexed `.java`, `.py`, `.js`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`, `.cts` or `.rs` file and choose **Show class diagram**.
 - Right-click a method and choose **Show enclosing class diagram**, or use its **Class diagram** button.
 - Alternatively open **Classes**, search a class or qualified name, and choose a result.
 - The view starts with the focus and its indexed inheritance hierarchy: ancestors, subclasses and
@@ -95,13 +95,24 @@ are unchanged. Class layout itself is not saved as a durable view in this slice.
 
 - `GET /api/classes?revision=N&q=NAME&path=RELATIVE_PATH&offset=0&limit=100`
   lists indexed declarations; omit `path` for workspace search.
+TypeScript boxes come from named `class`, `abstract class`, `interface` and `enum` declarations at
+module level, including `export` and `declare` forms and those in `.tsx` and `.d.ts` files.
+`extends` and `implements` names, and `interface ... extends` names, are recorded as terminal hints;
+generic arguments of a heritage name are not. Cards show direct fields (including constructor
+parameter properties, interface properties and enum members), and methods and method signatures, with
+their declared types as hints, and field, parameter and return type references. Classes inside
+`namespace` and `module` blocks are not catalogued, and enum members are listed as fields. A
+TypeScript qualified name is the workspace-relative path without its `.d.ts`, `.tsx`, `.ts`, `.mts` or
+`.cts` suffix, with `/` written as `.`, then the name (`web/model.ts` → `web.model.Model`); module and
+path-mapping resolution are not modelled.
+
 - `POST /api/class-diagram` with `{seed, expectedRevision, expanded: [], includeUnmatched: false}`
   returns a bounded diagram. `seed` may be a class or a method with a lexical enclosing class.
   Optional `includeHierarchy: true` prioritizes bounded transitive ancestors/descendants; the UI sends
   this flag. Omission retains the original neighborhood API behavior. It does not change stored certainty.
 
 `GET /api/classes` also returns `supportedLanguages`, the source languages the catalog extracts
-(`["java","python","javascript","rust"]`). A client shows class views for a checkout that has indexed
+(`["java","python","javascript","rust","typescript"]`). A client shows class views for a checkout that has indexed
 files in one of them, and each returned class carries its own `language`.
 
 Both endpoints require existing bearer/Host/Origin guards. Responses carry their snapshot revision,

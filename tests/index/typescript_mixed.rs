@@ -376,3 +376,90 @@ fn typescript_mixed_native_constructs() {
         calls("src/app/view.tsx")
     );
 }
+
+#[test]
+fn typescript_mixed_class_catalog() {
+    use trellis::{classes::Catalog, indexer::index_workspace};
+    let workspace = fixture_root();
+    let root = fs::canonicalize(workspace.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let graph = index_workspace(&IndexOptions::new(root), &cancel, |_| {}).unwrap();
+    let catalog = Catalog::build(&graph.files, &graph.nodes, &cancel).unwrap();
+    let class = |name: &str| {
+        catalog
+            .classes
+            .iter()
+            .find(|c| c.qualified_name == name)
+            .unwrap_or_else(|| panic!("{name} is not catalogued"))
+    };
+    let names = |members: &[trellis::model::ClassMember]| -> Vec<String> {
+        members.iter().map(|m| m.name.clone()).collect()
+    };
+    let relations = |owner: &str| -> Vec<(String, String)> {
+        let id = &class(owner).symbol.id;
+        let mut out: Vec<_> = catalog
+            .relations
+            .iter()
+            .filter(|r| &r.owner == id)
+            .map(|r| (r.kind.clone(), r.type_name.clone()))
+            .collect();
+        out.sort();
+        out
+    };
+    let pairs = |items: &[(&str, &str)]| -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+            .collect()
+    };
+
+    for name in [
+        "src.app.model.Entity",
+        "src.app.model.Named",
+        "src.app.model.Base",
+        "src.app.model.Model",
+        "src.app.model.Status",
+        "src.app.view.View",
+        "src.app.types.Shape",
+    ] {
+        assert_eq!(class(name).language, "typescript", "{name}");
+    }
+    assert_eq!(class("src.app.model.Entity").declaration_kind, "interface");
+    assert_eq!(
+        relations("src.app.model.Named"),
+        pairs(&[("extends", "Entity")])
+    );
+    assert_eq!(
+        class("src.app.model.Base").declaration_kind,
+        "abstract_class"
+    );
+    assert_eq!(
+        relations("src.app.model.Base"),
+        pairs(&[("field", "Id"), ("implements", "Entity"), ("returns", "T")])
+    );
+    assert_eq!(
+        relations("src.app.model.Model"),
+        pairs(&[
+            ("extends", "Base"),
+            ("implements", "Named"),
+            ("parameter", "Id"),
+            ("returns", "Id"),
+        ])
+    );
+    let model = class("src.app.model.Model");
+    assert_eq!(names(&model.fields), ["id", "name"], "parameter properties");
+    assert_eq!(names(&model.methods), ["constructor", "describe", "rename"]);
+    assert_eq!(
+        names(&class("src.app.model.Status").fields),
+        ["Active", "Inactive"]
+    );
+    assert_eq!(class("src.app.view.View").declaration_kind, "class");
+    assert_eq!(names(&class("src.app.types.Shape").methods), ["area"]);
+    assert!(
+        catalog
+            .classes
+            .iter()
+            .all(|c| c.symbol.name != "Inner" && c.symbol.name != "Window"),
+        "classes inside namespaces and `declare global` are not catalogued"
+    );
+}

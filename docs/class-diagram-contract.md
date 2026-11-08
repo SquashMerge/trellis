@@ -29,6 +29,20 @@ caps are those of Decision 0004, unchanged. As for Java and Python, every relati
 a targeted relation). `GET /api/classes` returns `supportedLanguages` (`crate::classes::SUPPORTED_LANGUAGES`)
 so clients can gate class views by language.
 
+TypeScript (#683): a named `class_declaration`, `abstract_class_declaration`, `interface_declaration` or
+`enum_declaration` at module level, directly or under `export` and/or `declare`, with a unique measured
+`type` symbol, is a ClassDefinition (`language:"typescript"`, `declarationKind` class/abstract_class/
+interface/enum; qualified name = path without `.d.ts`/`.d.mts`/`.d.cts`/`.tsx`/`.ts`/`.mts`/`.cts`, `/`→`.`,
+then the name). Classes inside `namespace`/`module` blocks are not catalogued. Members are direct
+`public_field_definition`s, `property_signature`s, `method_definition`s, `method_signature`s and
+`abstract_method_signature`s in source order, constructor parameter properties (an accessibility,
+`override` or `readonly` modifier) as fields, and enum members as fields; the declared type, unwrapped from
+its `: T` annotation, is the hint. Relations: `extends` from a class `extends` value (an identifier or
+dotted member expression) and from an interface `extends` list, `implements` from an `implements` list
+(the heritage name only, never its generic arguments), and `field`, `parameter` and `returns` from
+annotations (generic arguments included, `T` as written). Every relation is a terminal `unmatched` hint,
+as for the other languages; Decision 0004 caps are unchanged.
+
 Rust (#452 slice 2): `struct_item`, `enum_item`, `union_item` and `trait_item` with a unique measured
 `type` symbol are ClassDefinitions (`language:"rust"`, `declarationKind` struct/enum/union/trait).
 Qualified names are `crate-key::module::Name` from the conventional Cargo layout (`src/a/b.rs` and
