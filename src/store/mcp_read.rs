@@ -2,7 +2,7 @@
 use super::*;
 
 impl EvidenceResponse {
-    pub fn mcp_language_counts(&self) -> Result<[[u64; 5]; 4]> {
+    pub fn mcp_language_counts(&self) -> Result<[[u64; 5]; 5]> {
         #[cfg(feature = "test-support")]
         if self
             .store
@@ -15,7 +15,7 @@ impl EvidenceResponse {
             return Err(SqliteContention(()).into());
         }
         let selected = self.selected(None)?;
-        let mut counts = [[0_u64; 5]; 4];
+        let mut counts = [[0_u64; 5]; 5];
         let mut rows = self.db.prepare(
             "SELECT language,coverage_selected,coverage_state FROM revision_documents WHERE revision_id=?1"
         )?;
@@ -28,16 +28,8 @@ impl EvidenceResponse {
         })?;
         for record in records {
             let (language, chosen, state) = record?;
-            let bucket = match language.as_str() {
-                "java" => 0,
-                "rust" => 1,
-                "python" => 2,
-                "javascript" => 3,
-                _ => {
-                    return Err(
-                        self.corrupt_evidence("store_unavailable: invalid selected language")
-                    );
-                }
+            let Some(bucket) = crate::semantic_evidence::language_order(&language) else {
+                return Err(self.corrupt_evidence("store_unavailable: invalid selected language"));
             };
             let category = if chosen {
                 match state.as_str() {
@@ -502,7 +494,7 @@ pub struct McpFind {
     pub symbols: Vec<McpFindSymbol>,
     /// Per language (java, rust, python, javascript):
     /// [selected, complete, partial, failed, unselected].
-    pub scope: [[u64; 5]; 4],
+    pub scope: [[u64; 5]; 5],
     pub provenance: Vec<crate::native_evidence::Provenance>,
     pub has_more: bool,
     pub pin: IndexPin,
@@ -703,7 +695,7 @@ pub struct McpFindSymbolWithLines {
 
 pub struct McpFindWithLines {
     pub symbols: Vec<McpFindSymbolWithLines>,
-    pub scope: [[u64; 5]; 4],
+    pub scope: [[u64; 5]; 5],
     pub provenance: Vec<crate::native_evidence::Provenance>,
     pub has_more: bool,
     pub pin: IndexPin,
@@ -722,7 +714,7 @@ impl EvidenceResponse {
 }
 
 pub(super) struct McpFindScope {
-    pub counts: [[u64; 5]; 4],
+    pub counts: [[u64; 5]; 5],
     scopes: BTreeMap<String, V8NativeScope>,
 }
 
@@ -752,7 +744,7 @@ impl EvidenceResponse {
             WHERE m.revision_id=?1 ORDER BY s.id,m.language,m.path",
         )?;
         let mut rows = stmt.query([&selected.key])?;
-        let mut scope_counts = [[0_u64; 5]; 4];
+        let mut scope_counts = [[0_u64; 5]; 5];
         let mut scopes = BTreeMap::new();
         while let Some(row) = rows.next()? {
             check()?;
@@ -763,15 +755,10 @@ impl EvidenceResponse {
             };
             let chosen: bool = row.get(3)?;
             let state: String = row.get(4)?;
-            let language = match key.language.as_str() {
-                "java" => 0,
-                "rust" => 1,
-                "python" => 2,
-                "javascript" => 3,
-                _ => {
-                    return Err(self
-                        .corrupt_evidence("store_unavailable: invalid native coverage language"));
-                }
+            let Some(language) = crate::semantic_evidence::language_order(&key.language) else {
+                return Err(
+                    self.corrupt_evidence("store_unavailable: invalid native coverage language")
+                );
             };
             let counts = &mut scope_counts[language];
             if chosen {
@@ -1864,7 +1851,7 @@ pub struct McpIncomingWithLines {
     pub same_name_declarations: u64,
     /// Per language (java, rust, python, javascript): selected, complete,
     /// partial, failed, unselected. Includes zero-hit scope documents.
-    pub scope: [[u64; 5]; 4],
+    pub scope: [[u64; 5]; 5],
     pub has_more: bool,
     /// #724: name-matched callers left out because their fresh, direct binding targets
     /// another declaration, counted over the ranked callers scanned: those before the first
@@ -1937,13 +1924,10 @@ impl EvidenceResponse {
             return Ok(None);
         };
         let selected_key = &owner.declaration.document;
-        let mut scope_counts = [[0_u64; 5]; 4];
-        let language_index = match selected_key.language.as_str() {
-            "java" => 0,
-            "rust" => 1,
-            "python" => 2,
-            "javascript" => 3,
-            _ => return Err(self.corrupt_evidence("store_unavailable: invalid selected language")),
+        let mut scope_counts = [[0_u64; 5]; 5];
+        let Some(language_index) = crate::semantic_evidence::language_order(&selected_key.language)
+        else {
+            return Err(self.corrupt_evidence("store_unavailable: invalid selected language"));
         };
         let keys = self.db.prepare(
             "SELECT path FROM revision_documents m JOIN native_source_sets s ON s.id=?2 WHERE m.revision_id=?1 AND m.language=?3 ORDER BY path"
@@ -3722,7 +3706,7 @@ mod find_scope_tests {
         read: &EvidenceResponse,
         selected: &ReadRevision,
     ) -> (
-        [[u64; 5]; 4],
+        [[u64; 5]; 5],
         BTreeMap<String, crate::native_evidence::Coverage>,
     ) {
         use crate::native_evidence::DocumentKey;
@@ -3744,17 +3728,14 @@ mod find_scope_tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        let mut counts = [[0_u64; 5]; 4];
+        let mut counts = [[0_u64; 5]; 5];
         let mut coverage = BTreeMap::new();
         for key in keys {
             let scope = v8_native_scope_for(&read.db, &key, selected)
                 .unwrap()
                 .unwrap();
             let row = read_native_coverage_v8(&read.db, &scope).unwrap();
-            let language = ["java", "rust", "python", "javascript"]
-                .iter()
-                .position(|name| *name == row.language)
-                .unwrap();
+            let language = crate::semantic_evidence::language_order(&row.language).unwrap();
             if row.selected {
                 counts[language][0] += 1;
                 counts[language][match row.state.as_str() {
