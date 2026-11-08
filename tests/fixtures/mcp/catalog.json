@@ -982,7 +982,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 12
+                  "const": 13
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1126,6 +1126,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "limit": {
@@ -2570,6 +2571,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "limit": {
@@ -4164,6 +4166,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "schemaVersion": {
@@ -5905,6 +5908,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "limit": {
@@ -8063,6 +8067,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "limit": {
@@ -10204,6 +10209,7 @@
           "type": "integer"
         },
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "expectedContentHash": {
@@ -10744,67 +10750,6 @@
               "type": "integer"
             }
           ]
-        },
-        "SemanticProjection": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "currentPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "semanticBasisPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "basisNativeRevisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "semanticStatus": {
-              "enum": [
-                "olderBasis",
-                "catchingUp",
-                "needsReimport"
-              ]
-            }
-          },
-          "required": [
-            "currentPin",
-            "semanticBasisPin",
-            "basisNativeRevisionId",
-            "semanticStatus"
-          ]
-        },
-        "DocumentSemanticStatus": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "type": "string",
-              "minLength": 1
-            },
-            "projection": {
-              "$ref": "#/$defs/SemanticProjection"
-            }
-          },
-          "required": [
-            "producerId",
-            "language",
-            "path",
-            "projection"
-          ]
-        },
-        "Language": {
-          "enum": [
-            "java",
-            "rust",
-            "python",
-            "javascript"
-          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -10972,6 +10917,7 @@
       "additionalProperties": false,
       "properties": {
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "schemaVersion": {
@@ -13693,6 +13639,7 @@
           "maxLength": 4096
         },
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "paths": {
@@ -16485,6 +16432,7 @@
           "maxLength": 4096
         },
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "paths": {
@@ -18060,6 +18008,48 @@
             "omittedEvidence": {
               "$ref": "#/$defs/UInt"
             },
+            "nextCall": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "tool": {
+                  "const": "trellis_rules_explain"
+                },
+                "arguments": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "schemaVersion": {
+                      "const": 1
+                    },
+                    "rule": {
+                      "$ref": "#/$defs/Text"
+                    },
+                    "target": {
+                      "$ref": "#/$defs/Identity"
+                    },
+                    "destination": {
+                      "$ref": "#/$defs/Destination"
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 50
+                    }
+                  },
+                  "required": [
+                    "schemaVersion",
+                    "rule",
+                    "target",
+                    "limit"
+                  ]
+                }
+              },
+              "required": [
+                "tool",
+                "arguments"
+              ]
+            },
             "projection": {
               "anyOf": [
                 {
@@ -19411,6 +19401,7 @@
           "maxLength": 4096
         },
         "expectedBasis": {
+          "type": "object",
           "$ref": "#/$defs/Basis"
         },
         "rule": {
@@ -19419,9 +19410,11 @@
           "maxLength": 256
         },
         "target": {
+          "type": "object",
           "$ref": "#/$defs/Identity"
         },
         "destination": {
+          "type": "object",
           "$ref": "#/$defs/Destination"
         },
         "limit": {
@@ -19701,11 +19694,14 @@
           ]
         },
         "Destination": {
+          "type": "object",
           "oneOf": [
             {
+              "type": "object",
               "$ref": "#/$defs/Identity"
             },
             {
+              "type": "object",
               "$ref": "#/$defs/ExternalIdentity"
             }
           ]

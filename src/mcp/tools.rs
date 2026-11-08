@@ -96,16 +96,18 @@ fn valid_path(s: &str) -> bool {
         && !s.contains(['\\', ':', '\0'])
         && s.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
-/// Argument validation is independent of workspace state. A malformed UInt is an invalid
-/// request even if its numeric value would exceed a narrower application cap.
-pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
-    if !TOOLS.contains(&name) {
-        return Err("invalid_request");
-    }
-    let Some(o) = args.and_then(Value::as_object) else {
-        return Err("invalid_request");
-    };
-    let (fields, required): (&[&str], &[&str]) = match name {
+/// A failed argument validation (#769): its typed code and, for `invalid_request`, the
+/// static server-authored message that names the failing field and the shape it expects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rejection {
+    pub code: &'static str,
+    pub message: Option<&'static str>,
+}
+/// The message of an argument naming no field this tool accepts.
+const UNKNOWN_FIELD: &str = "Invalid tool arguments: a field is not in this tool's inputSchema";
+/// The accepted and required argument fields of each known tool.
+fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
+    match name {
         "trellis_workspace_describe" => (&["schemaVersion", "workspace"], &["schemaVersion"]),
         "trellis_references" => (
             &[
@@ -233,17 +235,150 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             ],
             &["schemaVersion", "path", "startLine", "endLine"],
         ),
-    };
-    // `compact` (#528, #665, #715) is a closed boolean wherever a tool accepts it.
-    if !closed(o, fields, required)
-        || o.get("schemaVersion").and_then(wire::uint) != Some(1)
-        || !expected_basis(o)
-        || o.get("compact").is_some_and(|value| !value.is_boolean())
-    {
-        return Err("invalid_request");
     }
-    let validated = match name {
-        "trellis_workspace_describe" => Ok(()),
+}
+/// The static `invalid_request` message for one failing field of `name` (#769). Server
+/// text only: it never echoes the caller's arguments or repository content.
+fn field_message(name: &str, field: &str) -> &'static str {
+    match (name, field) {
+        (_, "arguments") => "Tool arguments must be a JSON object",
+        (_, "schemaVersion") => "`schemaVersion` must be 1",
+        (_, "workspace") => {
+            "`workspace` must be an absolute checkout path string of at most 4096 bytes"
+        }
+        (_, "expectedBasis") => {
+            "`expectedBasis` must be the evidenceBasis object of an earlier result: \
+             {indexGeneration, indexRevision}"
+        }
+        (_, "limit") => "`limit` must be an integer from 1 to 50",
+        (_, "offset") => "`offset` must be a non-negative integer, such as page.nextOffset",
+        (_, "paths") => {
+            "`paths` must be an array of anchored source path globs, each at most 4096 bytes"
+        }
+        (_, "status") => {
+            "`status` must be 1 to 3 distinct values from \"conforms\", \"deviates\", \"unknown\""
+        }
+        (_, "rule") => "`rule` must be a rule name of 1 to 256 bytes, such as \"$layers\"",
+        // A client that stringifies an object argument is told so (#769).
+        (_, "expectedBasis:string") => {
+            "`expectedBasis` must be a JSON object (got a string): the evidenceBasis object \
+             of an earlier result, {indexGeneration, indexRevision}"
+        }
+        (_, "target:string") => {
+            "`target` must be a JSON object (got a string): the identity object from a \
+             trellis_rules_check instance, {sourceSetId, language, path, sid}"
+        }
+        (_, "destination:string") => {
+            "`destination` must be a JSON object (got a string): the destination object \
+             from a trellis_rules_check instance"
+        }
+        (_, "target") => {
+            "`target` must be the identity object from a trellis_rules_check instance: \
+             {sourceSetId, language, path, sid}"
+        }
+        (_, "destination") => {
+            "`destination` must be the destination object from a trellis_rules_check \
+             instance: {sourceSetId, language, path, sid} or {kind:\"externalPackage\", \
+             sourceSetId, language, package, standardLibrary}, and only for $layers or \
+             $external"
+        }
+        ("trellis_search_symbols", "query") => {
+            "`query` must be a nonempty string of at most 1024 bytes"
+        }
+        (_, "query") => "`query` must be a nonempty string of at most 256 bytes",
+        (_, "query|lookupKey") => "Pass `query` or `lookupKey`, not both",
+        (_, "symbolId|lookupKey") => "Pass exactly one of `symbolId` or `lookupKey`",
+        (_, "lookupKey") => {
+            "`lookupKey` must be a nonempty lookup key string from an earlier result"
+        }
+        (_, "symbolId") => {
+            "`symbolId` must be a syntax ID: sid:v1: followed by 32 lowercase hex digits"
+        }
+        (_, "role") => "`role` must be \"any\", \"production\" or \"test\"",
+        ("trellis_call_graph", "semanticProducerId") => {
+            "`semanticProducerId` must be a nonempty producer ID string or null"
+        }
+        (_, "semanticProducerId") => {
+            "`semanticProducerId` must be a producer ID string of 1 to 512 bytes"
+        }
+        (_, "compact") => "`compact` must be true or false",
+        (_, "includeExternal") => "`includeExternal` must be true or false",
+        (_, "includeTests") => "`includeTests` must be true or false",
+        (_, "depth") => "`depth` must be an integer from 0 to 5",
+        (_, "maxNodes") => "`maxNodes` must be an integer from 1 to 150",
+        (_, "maxCalls") => "`maxCalls` must be an integer from 0 to 500",
+        (_, "path") => "`path` must be a checkout-relative file path",
+        (_, "expectedContentHash") => {
+            "`expectedContentHash` must be a 64-digit lowercase hex content hash"
+        }
+        (_, "startLine" | "endLine") => {
+            "`startLine` and `endLine` must be line numbers from 1, with `endLine` not \
+             before `startLine`"
+        }
+        _ => UNKNOWN_FIELD,
+    }
+}
+/// Argument validation is independent of workspace state. A malformed UInt is an invalid
+/// request even if its numeric value would exceed a narrower application cap.
+pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
+    check(name, args).map_err(|rejection| rejection.code)
+}
+/// [`validate`], with the failing field's message (#769).
+pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
+    if !TOOLS.contains(&name) {
+        return Err(Rejection {
+            code: "invalid_request",
+            message: None,
+        });
+    }
+    // An `invalid_request` names its field; another code keeps its own message.
+    let bad = |field: &str| Rejection {
+        code: "invalid_request",
+        message: Some(field_message(name, field)),
+    };
+    // An object field that arrived as a string says so (#769).
+    let object = |field: &'static str, stringified: &'static str| {
+        if string_field(args, field) {
+            bad(stringified)
+        } else {
+            bad(field)
+        }
+    };
+    let coded = |field: &'static str| {
+        move |code: &'static str| {
+            if code == "invalid_request" {
+                bad(field)
+            } else {
+                Rejection {
+                    code,
+                    message: None,
+                }
+            }
+        }
+    };
+    let Some(o) = args.and_then(Value::as_object) else {
+        return Err(bad("arguments"));
+    };
+    let (fields, required) = fields(name);
+    // An unknown field fails even once a missing one is added, so it is named first.
+    if !o.keys().all(|key| fields.contains(&key.as_str())) {
+        return Err(bad(""));
+    }
+    if let Some(missing) = required.iter().find(|field| !o.contains_key(**field)) {
+        return Err(bad(missing));
+    }
+    if o.get("schemaVersion").and_then(wire::uint) != Some(1) {
+        return Err(bad("schemaVersion"));
+    }
+    if !expected_basis(o) {
+        return Err(object("expectedBasis", "expectedBasis:string"));
+    }
+    // `compact` (#528, #665, #715) is a closed boolean wherever a tool accepts it.
+    if o.get("compact").is_some_and(|value| !value.is_boolean()) {
+        return Err(bad("compact"));
+    }
+    match name {
+        "trellis_workspace_describe" => {}
         "trellis_references" | "trellis_rules_check" => {
             if !o.get("paths").is_none_or(|value| {
                 value.as_array().is_some_and(|paths| {
@@ -254,117 +389,135 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                     })
                 })
             }) {
-                return Err("invalid_request");
+                return Err(bad("paths"));
             }
             if !status_filter(o) {
-                return Err("invalid_request");
+                return Err(bad("status"));
             }
-            limit(o).and_then(|()| offset(o))
+            limit(o).map_err(coded("limit"))?;
+            offset(o).map_err(coded("offset"))?;
         }
         "trellis_rules_explain" => {
-            let rule = string(o.get("rule")).ok_or("invalid_request")?;
-            if rule.is_empty()
-                || rule.len() > 256
-                || !o
-                    .get("target")
-                    .is_some_and(super::architecture::valid_identity)
-                || !o
-                    .get("destination")
-                    .is_none_or(super::architecture::valid_destination)
+            let rule = string(o.get("rule")).ok_or_else(|| bad("rule"))?;
+            if rule.is_empty() || rule.len() > 256 {
+                return Err(bad("rule"));
+            }
+            if !o
+                .get("target")
+                .is_some_and(super::architecture::valid_identity)
+            {
+                return Err(object("target", "target:string"));
+            }
+            if !o
+                .get("destination")
+                .is_none_or(super::architecture::valid_destination)
                 || (!matches!(rule, "$layers" | "$external") && o.contains_key("destination"))
             {
-                return Err("invalid_request");
+                return Err(object("destination", "destination:string"));
             }
-            limit(o).and_then(|()| offset(o))
+            limit(o).map_err(coded("limit"))?;
+            offset(o).map_err(coded("offset"))?;
         }
         "trellis_find_symbols" if o.contains_key("lookupKey") => {
-            if o.contains_key("query") || !valid_lookup_key(o.get("lookupKey")) {
-                return Err("invalid_request");
+            if o.contains_key("query") {
+                return Err(bad("query|lookupKey"));
             }
-            limit(o)
+            if !valid_lookup_key(o.get("lookupKey")) {
+                return Err(bad("lookupKey"));
+            }
+            limit(o).map_err(coded("limit"))?;
         }
         "trellis_find_symbols" | "trellis_search_symbols" => {
-            let q = string(o.get("query")).ok_or("invalid_request")?;
+            let q = string(o.get("query")).ok_or_else(|| bad("query"))?;
             let max_bytes = if name == "trellis_search_symbols" {
                 1024
             } else {
                 256
             };
-            if q.is_empty()
-                || q.len() > max_bytes
-                || (name == "trellis_search_symbols"
-                    && !o.get("role").is_none_or(|role| {
-                        matches!(role.as_str(), Some("any" | "production" | "test"))
-                    }))
-            {
-                return Err("invalid_request");
+            if q.is_empty() || q.len() > max_bytes {
+                return Err(bad("query"));
             }
-            limit(o)
+            if name == "trellis_search_symbols"
+                && !o
+                    .get("role")
+                    .is_none_or(|role| matches!(role.as_str(), Some("any" | "production" | "test")))
+            {
+                return Err(bad("role"));
+            }
+            limit(o).map_err(coded("limit"))?;
         }
         "trellis_declaration"
         | "trellis_outgoing_calls"
         | "trellis_incoming_calls"
         | "trellis_call_graph" => {
             if o.contains_key("symbolId") == o.contains_key("lookupKey") {
-                return Err("invalid_request");
+                return Err(bad("symbolId|lookupKey"));
             }
             if let Some(value) = o.get("symbolId") {
-                let sid = value.as_str().ok_or("invalid_request")?;
+                let sid = value.as_str().ok_or_else(|| bad("symbolId"))?;
                 if sid.len() != 39
                     || !sid.starts_with("sid:v1:")
                     || !sid[7..]
                         .bytes()
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 {
-                    return Err("invalid_request");
+                    return Err(bad("symbolId"));
                 }
             } else if !valid_lookup_key(o.get("lookupKey")) {
-                return Err("invalid_request");
+                return Err(bad("lookupKey"));
             }
             if name == "trellis_call_graph" {
-                return call_graph_arguments(o).and_then(|()| workspace_field(o));
-            }
-            if name != "trellis_declaration" {
-                semantic_producer(o)?;
-                if ["compact", "includeExternal"]
-                    .iter()
-                    .any(|field| o.get(*field).is_some_and(|value| !value.is_boolean()))
+                call_graph_arguments(o).map_err(bad)?;
+            } else if name != "trellis_declaration" {
+                semantic_producer(o).map_err(coded("semanticProducerId"))?;
+                if let Some(field) = ["compact", "includeExternal"]
+                    .into_iter()
+                    .find(|field| o.get(*field).is_some_and(|value| !value.is_boolean()))
                 {
-                    return Err("invalid_request");
+                    return Err(bad(field));
                 }
-                limit(o)
-            } else {
-                Ok(())
+                limit(o).map_err(coded("limit"))?;
             }
         }
         _ => {
-            let path = string(o.get("path")).ok_or("invalid_request")?;
-            if !valid_path(path)
-                || !o
-                    .get("expectedContentHash")
-                    .is_none_or(|v| string(Some(v)).is_some_and(hash))
+            let path = string(o.get("path")).ok_or_else(|| bad("path"))?;
+            if !valid_path(path) {
+                return Err(bad("path"));
+            }
+            if !o
+                .get("expectedContentHash")
+                .is_none_or(|v| string(Some(v)).is_some_and(hash))
             {
-                return Err("invalid_request");
+                return Err(bad("expectedContentHash"));
             }
             let start = o
                 .get("startLine")
                 .and_then(wire::uint)
-                .ok_or("invalid_request")?;
+                .ok_or_else(|| bad("startLine"))?;
             let end = o
                 .get("endLine")
                 .and_then(wire::uint)
-                .ok_or("invalid_request")?;
+                .ok_or_else(|| bad("endLine"))?;
             if start == 0 || end == 0 || end < start {
-                return Err("invalid_request");
+                return Err(bad("endLine"));
             }
             if end - start >= 200 {
-                return Err("range_too_large");
+                return Err(Rejection {
+                    code: "range_too_large",
+                    message: None,
+                });
             }
-            Ok(())
         }
-    };
-    validated?;
-    workspace_field(o)
+    }
+    if workspace_field(o).is_err() {
+        return Err(bad("workspace"));
+    }
+    Ok(())
+}
+/// Whether `field` of the arguments is a JSON string.
+fn string_field(args: Option<&Value>, field: &str) -> bool {
+    args.and_then(|args| args.get(field))
+        .is_some_and(Value::is_string)
 }
 fn workspace_field(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
     if o.get("workspace")
@@ -375,26 +528,27 @@ fn workspace_field(o: &serde_json::Map<String, Value>) -> Result<(), &'static st
     Ok(())
 }
 /// `trellis_call_graph` bounds are the contract's and are never clamped: an out-of-range
-/// or non-integer value is `invalid_request`, not `range_too_large`.
+/// or non-integer value is `invalid_request`, not `range_too_large`. The error is the
+/// failing field.
 fn call_graph_arguments(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
     use crate::graph_query::{MAX_CALLS, MAX_DEPTH, MAX_NODES};
-    let in_range = |field: &str, range: std::ops::RangeInclusive<u64>| match o.get(field) {
+    let in_range = |field: &'static str, range: std::ops::RangeInclusive<u64>| match o.get(field) {
         None => Ok(()),
         Some(value) if wire::uint(value).is_some_and(|n| range.contains(&n)) => Ok(()),
-        Some(_) => Err("invalid_request"),
+        Some(_) => Err(field),
     };
     in_range("depth", 0..=MAX_DEPTH)?;
     in_range("maxNodes", 1..=MAX_NODES)?;
     in_range("maxCalls", 0..=MAX_CALLS)?;
     for field in ["includeExternal", "includeTests", "compact"] {
         if o.get(field).is_some_and(|value| !value.is_boolean()) {
-            return Err("invalid_request");
+            return Err(field);
         }
     }
     match o.get("semanticProducerId") {
         None | Some(Value::Null) => Ok(()),
         Some(Value::String(producer)) if !producer.is_empty() => Ok(()),
-        Some(_) => Err("invalid_request"),
+        Some(_) => Err("semanticProducerId"),
     }
 }
 /// #665: the MCP graph's default `maxNodes` and `maxCalls`, sized so a default answer fits
@@ -458,7 +612,13 @@ fn details(code: &str) -> (&'static str, bool) {
         "daemon_unavailable" => ("Daemon is unavailable", true),
         "outcome_unknown" => ("Outcome unknown; inspect request status", false),
         "invalid_rules" => ("Invalid architecture rules", false),
-        "rules_not_found" => ("Rules file not found", false),
+        // #769: point at the prompt that drafts the missing file.
+        "rules_not_found" => (
+            "No .trellis/rules.toml. Ask the user to run the `trellis_propose_layers` MCP \
+             prompt (in Claude Code: /mcp__trellis__trellis_propose_layers) to draft one \
+             for review.",
+            false,
+        ),
         "bounded_work" => ("Architecture projection work bound exceeded", false),
         "response_too_large" => ("Architecture result is too large", false),
         _ => ("Store is unavailable", false),
@@ -681,7 +841,7 @@ pub fn prepare(
     let validation = if name == super::architecture::PROMPT_NAME {
         Ok(())
     } else {
-        validate(name, args)
+        check(name, args)
     };
     let valid_arguments = validation.is_ok();
     let invalid_workspace = args.and_then(Value::as_object).and_then(|object| {
@@ -699,8 +859,11 @@ pub fn prepare(
             .map(|_| attempted)
     });
     let envelope = match validation {
-        Err(code) => {
-            let mut envelope = failure(id, code);
+        Err(rejection) => {
+            let mut envelope = failure(id, rejection.code);
+            if let Some(message) = rejection.message {
+                envelope["error"]["message"] = json!(message);
+            }
             if let Some(value) = invalid_workspace.as_ref() {
                 envelope["error"]["attemptedWorkspace"] = attempted(value);
             }
@@ -786,6 +949,90 @@ mod tests {
     }
     fn check(name: &str, v: &Value, code: &str) {
         assert_eq!(validate(name, Some(v)), Err(code), "{name} {v}");
+    }
+    /// #769: every accepted field of every tool has its own static message, short enough
+    /// for the 512-byte summary, and a bad value of it names it. Graph bounds name the
+    /// constants they check. Other codes keep their generic message.
+    #[test]
+    fn invalid_fields_name_themselves_in_static_messages() {
+        let message = |name: &str, v: &Value| super::check(name, Some(v)).unwrap_err().message;
+        for name in TOOLS {
+            let (accepted, required) = fields(name);
+            for field in accepted {
+                let text = field_message(name, field);
+                assert_ne!(text, UNKNOWN_FIELD, "{name} {field}");
+                assert!(text.contains(&format!("`{field}`")), "{text}");
+                let summary = format!("{name} failed: invalid_request: {text}");
+                assert!(summary.len() <= 512);
+                if *field == "schemaVersion" {
+                    continue;
+                }
+                // A value of the wrong type is rejected and names the field
+                // (or the exclusive pair it belongs to).
+                let mut bad = good(name);
+                bad[*field] = json!({"wrong":"type"});
+                if *field == "lookupKey" {
+                    bad.as_object_mut().unwrap().remove("symbolId");
+                    bad.as_object_mut().unwrap().remove("query");
+                }
+                let named = message(name, &bad).expect("invalid_request message");
+                assert!(
+                    named.contains(&format!("`{field}`")),
+                    "{name} {field}: {named}"
+                );
+                if required.contains(field) {
+                    let mut missing = good(name);
+                    missing.as_object_mut().unwrap().remove(*field);
+                    assert_eq!(message(name, &missing), Some(text), "{name} {field}");
+                }
+            }
+            let mut unknown = good(name);
+            unknown["unexpected"] = json!(true);
+            assert_eq!(message(name, &unknown), Some(UNKNOWN_FIELD));
+            assert_eq!(
+                message(name, &json!([])),
+                Some("Tool arguments must be a JSON object")
+            );
+        }
+        use crate::graph_query::{MAX_CALLS, MAX_DEPTH, MAX_NODES};
+        for (field, range) in [
+            ("depth", format!("from 0 to {MAX_DEPTH}")),
+            ("maxNodes", format!("from 1 to {MAX_NODES}")),
+            ("maxCalls", format!("from 0 to {MAX_CALLS}")),
+        ] {
+            assert!(field_message("trellis_call_graph", field).ends_with(&range));
+        }
+        // An object field sent as a string (a stringifying client) says so.
+        for (name, field) in [
+            ("trellis_rules_explain", "target"),
+            ("trellis_rules_explain", "destination"),
+            ("trellis_rules_explain", "expectedBasis"),
+            ("trellis_find_symbols", "expectedBasis"),
+        ] {
+            let mut stringified = good(name);
+            let object = json!({"indexGeneration":"x"}).to_string();
+            stringified[field] = json!(object);
+            if field == "destination" {
+                stringified["rule"] = json!("$layers");
+            }
+            let named = message(name, &stringified).unwrap();
+            assert!(
+                named.starts_with(&format!("`{field}` must be a JSON object (got a string)")),
+                "{named}"
+            );
+        }
+        // A numeric cap keeps its own code and generic message.
+        let over = super::check(
+            "trellis_rules_check",
+            Some(&json!({"schemaVersion":1,"limit":51})),
+        );
+        assert_eq!(
+            over,
+            Err(Rejection {
+                code: "range_too_large",
+                message: None
+            })
+        );
     }
     #[test]
     fn closed_application_objects_and_pins() {
@@ -1104,7 +1351,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":12,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":13,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
