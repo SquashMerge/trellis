@@ -232,7 +232,7 @@ fn validate_stable(value: &Value) -> Result<()> {
     ensure!(
         matches!(
             input.language.as_str(),
-            "java" | "rust" | "python" | "javascript"
+            "java" | "rust" | "python" | "javascript" | "typescript"
         ),
         "invalid native identity language"
     );
@@ -485,7 +485,10 @@ impl IdentityRegistry {
 /// Components must already be sorted by name then hash and unique.
 pub fn extraction_context(language: &str, components: &[(String, String)]) -> Result<String> {
     ensure!(
-        matches!(language, "java" | "rust" | "python" | "javascript"),
+        matches!(
+            language,
+            "java" | "rust" | "python" | "javascript" | "typescript"
+        ),
         "invalid extraction-context language"
     );
     for (name, hash) in components {

@@ -624,3 +624,25 @@ fn native_duplicate_cross_revision_is_never_inferred_unchanged() {
         AnchorReason::UnprovenContinuity
     );
 }
+
+#[test]
+fn typescript_anchor_validates_and_other_spellings_do_not() {
+    let id = "sid:v1:0123456789abcdef0123456789abcdef";
+    let mut old = declaration(id, "rev-old", 0, 0, "run");
+    old.document.language = "typescript".into();
+    old.document.path = "src/lib.ts".into();
+    let anchor = capture_anchor(&old, std::slice::from_ref(&old)).unwrap();
+    anchor.validate().unwrap();
+    let audit = audit_anchor(
+        &anchor,
+        "rev-old",
+        Some(&old),
+        std::slice::from_ref(&old),
+        None,
+    )
+    .unwrap();
+    assert_eq!(audit.status, AnchorStatus::Attached);
+    let mut other = anchor.clone();
+    other.document.language = "TypeScript".into();
+    assert!(other.validate().is_err());
+}

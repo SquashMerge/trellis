@@ -33,6 +33,7 @@ mod indexer_java;
 mod indexer_projection_vectors_tests;
 mod indexer_python;
 mod indexer_rust;
+mod indexer_ts;
 pub mod mcp;
 pub mod metrics;
 pub mod model;
@@ -42,6 +43,8 @@ pub mod native_capture;
 pub mod native_evidence;
 pub mod native_ids;
 mod native_rust_macros;
+#[cfg(test)]
+mod native_typescript_tests;
 pub mod navigation;
 mod parallel;
 pub mod producer;

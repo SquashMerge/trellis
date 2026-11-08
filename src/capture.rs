@@ -397,11 +397,36 @@ fn admit_running_executable(
     Ok(())
 }
 
+/// Every source extension Trellis indexes, with its language. `.d.ts` ends in `ts`, so a
+/// declaration file is TypeScript. `.jsx` is not indexed.
+pub(crate) const SOURCE_EXTENSIONS: &[(&str, &str)] = &[
+    ("rs", "rust"),
+    ("java", "java"),
+    ("py", "python"),
+    ("js", "javascript"),
+    ("mjs", "javascript"),
+    ("cjs", "javascript"),
+    ("ts", "typescript"),
+    ("tsx", "typescript"),
+    ("mts", "typescript"),
+    ("cts", "typescript"),
+];
+
+/// The extensions of JavaScript and TypeScript sources: the sources scip-typescript names
+/// relative to the nearest `package.json`.
+pub(crate) const SCRIPT_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
+
+/// The language of a source path by its (case-sensitive) extension, or `None` when Trellis
+/// does not index it.
+pub(crate) fn language_of_path(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?;
+    SOURCE_EXTENSIONS
+        .iter()
+        .find_map(|(known, language)| (*known == extension).then_some(*language))
+}
+
 fn source(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|x| x.to_str()),
-        Some("js" | "mjs" | "cjs" | "rs" | "java" | "py")
-    )
+    language_of_path(path).is_some()
 }
 /// Directories strictly below `root` that contain a source with one of `extensions`,
 /// directly or nested.
@@ -754,7 +779,7 @@ impl Capture {
         // (owner ruling 2026-10-29, #443). Like the producer, only a regular file counts.
         // Rust symbol keys are scoped by Cargo target, so nested Cargo manifests of Rust
         // sources are admitted the same way (owner ruling 2026-10-30, #394).
-        let nested = nested_package_dirs(&root, &sources, &["js", "mjs", "cjs"])
+        let nested = nested_package_dirs(&root, &sources, SCRIPT_EXTENSIONS)
             .into_iter()
             .map(|dir| dir.join("package.json"))
             .chain(
@@ -830,12 +855,7 @@ impl Capture {
                 .get(path)
                 .context("source absent from inventory")?;
             let mut counts = SourceOperations::default();
-            let language = match path.extension().and_then(|e| e.to_str()) {
-                Some("rs") => "rust",
-                Some("java") => "java",
-                Some("py") => "python",
-                _ => "javascript",
-            };
+            let language = language_of_path(path).context("unsupported source extension")?;
             // One source past the per-file cap, or not UTF-8, is admitted unread rather than
             // failing the capture (#576): its text is the placeholder that marks it skipped.
             let cap = options.max_file_bytes.min(256 * 1024 * 1024);
@@ -1204,6 +1224,42 @@ impl Capture {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn language_of_path_covers_every_source_extension_and_fails_closed() {
+        for (extension, language) in SOURCE_EXTENSIONS {
+            assert_eq!(
+                language_of_path(Path::new(&format!("dir/a.{extension}"))),
+                Some(*language),
+                "{extension}"
+            );
+        }
+        assert_eq!(
+            SOURCE_EXTENSIONS
+                .iter()
+                .filter(|(_, language)| *language == "typescript")
+                .map(|(extension, _)| *extension)
+                .collect::<Vec<_>>(),
+            ["ts", "tsx", "mts", "cts"]
+        );
+        for extension in SCRIPT_EXTENSIONS {
+            assert!(
+                matches!(
+                    language_of_path(Path::new(&format!("a.{extension}"))),
+                    Some("javascript" | "typescript")
+                ),
+                "{extension}"
+            );
+        }
+        for declaration in ["a.d.ts", "a.d.mts", "a.d.cts"] {
+            assert_eq!(language_of_path(Path::new(declaration)), Some("typescript"));
+        }
+        for unknown in ["a.jsx", "a.TS", "a.Js", "a.go", "a", "Makefile", ".ts"] {
+            assert_eq!(language_of_path(Path::new(unknown)), None, "{unknown}");
+        }
+        assert!(!source(Path::new("a.jsx")));
+        assert!(source(Path::new("a.tsx")));
+    }
 
     #[test]
     fn verified_capture_matches_only_its_watcher_options_and_request_root() {

@@ -7,8 +7,8 @@ import {
 } from "../native-inventory.mjs";
 
 const producer = "trellis.native.syntax";
-const version = "native-v15";
-const languages = ["java", "rust", "python", "javascript"];
+const version = "native-v16";
+const languages = ["java", "rust", "python", "javascript", "typescript"];
 
 test("NATIVE.INVENTORY production descriptor declares each supported language", () => {
   assert.deepEqual(productionInventoryEntries(), [

@@ -98,7 +98,7 @@ fn setup() -> Fixture {
         ("Worker.java", JAVA),
         ("helper.js", "function helper() { notify(); }\n"),
         ("helper.rs", "fn helper() { notify(); }\n"),
-        ("unsupported.ts", "function unsupported(): void {}\n"),
+        ("helper.ts", "function helper(): void { notify(); }\n"),
         ("README.md", "Synthetic source-only integration fixture\n"),
     ] {
         std::fs::write(workspace.join(path), text).unwrap();
@@ -196,6 +196,7 @@ async fn mixed_catalog_tree_and_lexical_parents_remain_language_neutral() {
         ("worker.py", "python"),
         ("helper.js", "javascript"),
         ("helper.rs", "rust"),
+        ("helper.ts", "typescript"),
     ] {
         let count = f
             .graph
@@ -249,10 +250,11 @@ async fn mixed_catalog_tree_and_lexical_parents_remain_language_neutral() {
             }
         }
     }
-    assert_eq!(files["items"].as_array().unwrap().len(), 4);
+    assert_eq!(files["items"].as_array().unwrap().len(), 5);
     // Supported but not in the published snapshot is not an unsupported language.
     std::fs::write(f.workspace.join("Pending.java"), "class Pending {}\n").unwrap();
     std::fs::write(f.workspace.join("pending.py"), "pass\n").unwrap();
+    std::fs::write(f.workspace.join("pending.ts"), "export {};\n").unwrap();
     let (_, tree) = call(&f.app, "GET", "/api/tree", Value::Null).await;
     for (path, reason) in [
         (
@@ -263,7 +265,10 @@ async fn mixed_catalog_tree_and_lexical_parents_remain_language_neutral() {
             "pending.py",
             "Not indexed yet (may be excluded or size-limited)",
         ),
-        ("unsupported.ts", "TypeScript indexing not supported yet"),
+        (
+            "pending.ts",
+            "Not indexed yet (may be excluded or size-limited)",
+        ),
         ("README.md", "Unsupported source type"),
     ] {
         let entry = tree["items"]

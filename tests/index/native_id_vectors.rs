@@ -258,3 +258,25 @@ fn native_v4_occurrence_changes_only_descriptor_input() {
         Sha256::digest([b"trellis.occurrence.v2\0".as_slice(), canonical.as_slice()].concat());
     assert_eq!(current, format!("occ:v2:{}", &hex::encode(digest)[..32]));
 }
+
+#[test]
+fn typescript_is_a_native_identity_language() {
+    let context = trellis::native_ids::extraction_context("typescript", &[]).unwrap();
+    assert_ne!(
+        context,
+        trellis::native_ids::extraction_context("javascript", &[]).unwrap(),
+        "the context binds the language"
+    );
+    assert!(trellis::native_ids::extraction_context("TypeScript", &[]).is_err());
+    let input = |language: &str| {
+        json!({"sourceSet":"source-set:v1:test","path":"src/a.ts","language":language,
+            "ancestors":[],
+            "declaration":{"kind":"function","name":"run","signature":null,"ordinal":0}})
+    };
+    let mut registry = trellis::native_ids::IdentityRegistry::default();
+    let typescript = registry.stable(&input("typescript")).unwrap();
+    let javascript = registry.stable(&input("javascript")).unwrap();
+    assert!(typescript.starts_with("sid:v1:"));
+    assert_ne!(typescript, javascript, "the identity binds the language");
+    assert!(registry.stable(&input("TypeScript")).is_err());
+}

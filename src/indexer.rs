@@ -203,6 +203,7 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
     }
     let language = match old.language.as_str() {
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(&old.path),
         "java" => tree_sitter_java::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
@@ -1250,6 +1251,40 @@ mod local_classification_tests {
             hash: String::new(),
             text: text.into(),
         }
+    }
+
+    fn typescript(path: &str, text: &str) -> SourceFile {
+        SourceFile {
+            path: path.into(),
+            ..file("typescript", text)
+        }
+    }
+
+    #[test]
+    fn typescript_body_literal_edits_are_proved_under_both_grammars() {
+        for path in ["selected.ts", "selected.tsx"] {
+            assert!(
+                proved_body_only(
+                    &typescript(path, "function work(a: number): number { return 1; }"),
+                    &typescript(path, "function work(a: number): number { return 10000; }"),
+                ),
+                "{path}: a returned literal is local"
+            );
+            assert!(
+                !proved_body_only(
+                    &typescript(path, "function work(a: number): number { return 1; }"),
+                    &typescript(path, "function work(a: number): string { return 1; }"),
+                ),
+                "{path}: a header edit needs the full path"
+            );
+        }
+        assert!(
+            !proved_body_only(
+                &typescript("selected.ts", "function work() { return 1; }"),
+                &typescript("selected.tsx", "function work() { return 10000; }"),
+            ),
+            "a path change is not a body edit"
+        );
     }
 
     #[test]
