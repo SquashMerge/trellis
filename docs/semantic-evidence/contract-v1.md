@@ -397,6 +397,42 @@ Other binding sites without a measured declaration remain candidates, but cannot
 
 **Grammar limits (pinned tree-sitter-typescript 0.23.2).** `export type * from "m"` is not parsed: the grammar accepts only `export type { … }`, so a document containing it gets a recovered-parse gap (partial coverage with a diagnostic) instead of complete measurement. A decorator written before `export` (`@sealed() export class M`) is a child of `export_statement`, so its call is owned by the enclosing file module, the innermost executable container; decorators on non-exported classes, and on members and parameters, are owned by the class or method.
 
+## Interface evidence amendment (#788)
+
+**Status: owner-ratified 2026-11-08 (#788). The owner pre-approved these four points; the supervising session verified the text stays within them.**
+
+### The evidence kind
+
+An `interfaces[]` item with `kind: "http"` is an interface: it records the HTTP evidence between one client app and one server app. Its fields are:
+
+- the client and server apps;
+- `method`;
+- `pathTemplate`;
+- the handler: its `syntaxId`, its location, and `handler.kind`, which is `declaration`, `closure` or `dispatchArm`;
+- the call sites, each with a `callId` and a `caller`; each pairing of a client path with a server route is a match;
+- `serverOnly` and `clientOnly`, which mark a route with no matched call site and a call site with no matched route.
+
+Extraction details (route recognition, handler identity, segment matching rules, exclusions and the wrapper list) are specified in architecture-view.md, not here.
+
+### Matching
+
+A client path is matched against server route templates. Server templates come from axum route literals plus dispatch tables. Client paths come from configured wrappers plus a prefix rule.
+
+### Confidence
+
+Each match carries a `confidence`, and so does each `clientOnly` item, which is always `unresolved`. Every match gets exactly one of four values, each with exactly one meaning. The values are decided in the order below, and that order is the precedence:
+
+| Order | Value | Meaning |
+|---|---|---|
+| 1 | `wrapperInferred` | the match needed a known client wrapper's prefix to build the path |
+| 2 | `template` | otherwise, the match used a client path substitution, a server path parameter or tail, or a dispatch-table route |
+| 3 | `exact` | otherwise, a literal client path equals a literal server route |
+| 4 | `unresolved` | a client call whose path matched no server route |
+
+### Evidence, never proof
+
+Interface evidence is never worded "A calls B", and it is never an input to `$layers` verdicts.
+
 ## Owner-ratified native-v9 correction: Java varargs
 
 **Status: owner-ratified 2026-10-24 (#279).** This narrow Java measurement ruling is approved independently; the #279 capability and reference amendments above are also ratified by the owner, 2026-10-24.
