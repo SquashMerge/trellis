@@ -50,6 +50,16 @@ prototype assignment, factories and object-literal "classes" are not shown. A Ja
 name is the workspace-relative path without its extension, with `/` written as `.`, then the class
 name (`web/shell.js` → `web.shell.Shell`); bundler and package resolution are not modelled.
 
+TypeScript boxes come from named `class`, `abstract class`, `interface` and `enum` declarations at
+module level, including `export` and `declare` forms and those in `.tsx` and `.d.ts` files.
+`extends` and `implements` names, and `interface ... extends` names, are recorded as terminal hints;
+generic arguments of a heritage name are not. Cards show direct fields (including constructor
+parameter properties, interface properties and enum members), and methods and method signatures, with
+their declared types as hints, and field, parameter and return type references. Classes inside
+`namespace` and `module` blocks are not catalogued. A TypeScript qualified name is the workspace-relative path without its `.d.ts`,
+`.tsx`, `.ts`, `.mts` or `.cts` suffix, with `/` written as `.`, then the name (`web/model.ts` → `web.model.Model`); module and
+path-mapping resolution are not modelled.
+
 Rust boxes are `struct`, `enum`, `union` and `trait` items (the annotation shows `rust · struct`,
 `rust · trait` and so on). Structs list named fields, or `0`, `1`, … for tuple fields, with their
 declared types; enums list their variants, with the payload as the type hint. A trait lists its
@@ -95,17 +105,6 @@ are unchanged. Class layout itself is not saved as a durable view in this slice.
 
 - `GET /api/classes?revision=N&q=NAME&path=RELATIVE_PATH&offset=0&limit=100`
   lists indexed declarations; omit `path` for workspace search.
-TypeScript boxes come from named `class`, `abstract class`, `interface` and `enum` declarations at
-module level, including `export` and `declare` forms and those in `.tsx` and `.d.ts` files.
-`extends` and `implements` names, and `interface ... extends` names, are recorded as terminal hints;
-generic arguments of a heritage name are not. Cards show direct fields (including constructor
-parameter properties, interface properties and enum members), and methods and method signatures, with
-their declared types as hints, and field, parameter and return type references. Classes inside
-`namespace` and `module` blocks are not catalogued, and enum members are listed as fields. A
-TypeScript qualified name is the workspace-relative path without its `.d.ts`, `.tsx`, `.ts`, `.mts` or
-`.cts` suffix, with `/` written as `.`, then the name (`web/model.ts` → `web.model.Model`); module and
-path-mapping resolution are not modelled.
-
 - `POST /api/class-diagram` with `{seed, expectedRevision, expanded: [], includeUnmatched: false}`
   returns a bounded diagram. `seed` may be a class or a method with a lexical enclosing class.
   Optional `includeHierarchy: true` prioritizes bounded transitive ancestors/descendants; the UI sends

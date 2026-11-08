@@ -331,7 +331,7 @@ For DTO details, see [the frontend handoff](daemon-v1-api-handoff.md).
 ## Current limits
 
 The Tools tab, question planning, Jev selection, ACP answers and saved records are retired.
-Java/Python native indexing, class diagrams and static sequence diagrams remain available. There is no
-rich durable anchor model (#38), TypeScript grammar, LSP, terminal, Tauri
+JavaScript, TypeScript, Java, Python and Rust native indexing, class diagrams and static sequence diagrams
+remain available. There is no rich durable anchor model (#38), LSP, terminal, Tauri
 shell, ORM or external database connection. See [local topology](local-topology.md)
 for the shipped-versus-future boundary.

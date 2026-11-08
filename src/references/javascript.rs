@@ -2682,12 +2682,12 @@ mod tests {
         script_fixture(
             &[(
                 "decl.ts",
-                "export interface I {}\nexport enum E { A }\nexport abstract class C {}\nexport type T = number;\nexport namespace N { export const x = 1; }\nexport function f(a: string): void;\nexport function f(a: number): void;\nexport function f(a: any): void {}\nexport declare const d: number;\nexport declare function g(): void;\ndeclare module \"m\" {}\nexport namespace P.Q {}\n",
+                "export interface I {}\nexport enum E { A }\nexport abstract class C {}\nexport type T = number;\nexport namespace N { export const x = 1; }\nexport function f(a: string): void;\nexport function f(a: number): void;\nexport function f(a: any): void {}\nexport declare const d: number;\nexport declare function g(): void;\ndeclare module \"m\" {}\n",
             )],
             None,
             |resolver, index, work| {
                 let decl = index("decl.ts");
-                assert!(resolver.units[&decl].unknown_set, "dotted namespace");
+                assert!(!resolver.units[&decl].unknown_set);
                 for (name, count) in [
                     ("I", 1),
                     ("E", 1),
@@ -2701,9 +2701,21 @@ mod tests {
                     let bucket = resolver
                         .named(decl, name, 0, &Route::new(), work, &mut || Ok(()))
                         .unwrap();
-                    assert!(!bucket.unknown || resolver.units[&decl].unknown_set);
+                    assert!(!bucket.unknown, "{name}");
                     assert_eq!(bucket.candidates.len(), count, "{name}");
                 }
+            },
+        );
+    }
+
+    #[test]
+    fn typescript_dotted_namespace_unknown_set() {
+        script_fixture(
+            &[("dotted.ts", "export namespace P.Q {}\n")],
+            None,
+            |resolver, index, _| {
+                let dotted = index("dotted.ts");
+                assert!(resolver.units[&dotted].unknown_set, "dotted namespace");
             },
         );
     }

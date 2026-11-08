@@ -23,7 +23,7 @@ indexer_java::extract(g:&mut Graph,file:&SourceFile,cancel:&CancelFlag)->anyhow:
 indexer_python::extract same. pub(crate), like indexer_rust.
 behavior_java::build(revision:u64,seed:&Symbol,file:&SourceFile,calls:&[CallSite],show_all:bool)
  ->anyhow::Result<SequenceView>; behavior_python::build same.
-Language strings java/python, extensions .java/.py. No TypeScript promise or alternate Jython syntax.
+Language strings java/python, extensions .java/.py. TypeScript is outside this contract; no alternate Jython syntax.
 Use tree_sitter_java::LANGUAGE and tree_sitter_python::LANGUAGE with tree-sitter0.25 APIs.
 Root wires module registration, discovery and dispatch; do not create placeholder shared adapters.
 IndexOptions/index_workspace + Store publication should drive tests (like Rust tests).

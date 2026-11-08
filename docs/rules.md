@@ -306,8 +306,8 @@ Supported mapping is deliberately narrow:
   the checkout skipped), `baseUrl` and `rootDirs` for relative misses. A
   config that cannot be read leaves relative resolution unchanged and reports
   bare specifiers that match no package as `tsconfig_unreadable`. `export = x`
-  and `.cts` ends export following with an unknown name set. `export * from` forwards proved named exports, never `default`.
-  Explicit exported names shadow star names; distinct surviving declarations
+  sets an unknown name set; `.cts` ends export following. `export * from`
+  forwards proved named exports, never `default`. Explicit exported names shadow star names; distinct surviving declarations
   collide, while routes to the same native declaration deduplicate. Import-binding
   reexports retain the original identity; a proved local variable alias keeps its
   own native binding identity and owner, not its initializer's. Proved forwarding
