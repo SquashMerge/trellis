@@ -26,12 +26,16 @@ use std::{
 pub const CONFIG_UNRESOLVED: &str = "producer_config_unresolved";
 /// The largest config or `package.json` read from `node_modules`.
 pub const MAX_FILE_BYTES: u64 = 256 * 1024;
-/// The most files one `extends` chain may supply.
+/// The most files (configs and `package.json` manifests) one resolution reads.
 pub const MAX_CHAIN_FILES: usize = 16;
+/// The most paths one resolution inspects while looking files up.
+pub const MAX_PROBES: usize = 256;
 const ROOT: &str = "tsconfig.json";
 const NODE_MODULES: &str = "node_modules";
-/// Export conditions a config lookup may match, as TypeScript's resolver accepts them.
-const CONDITIONS: [&str; 5] = ["types", "node", "require", "import", "default"];
+/// The export conditions TypeScript 5.9 matches when it resolves a config's `extends`
+/// (`nodeNextJsonConfigResolver`: CommonJS mode, so `require`, `types` and `node`, plus
+/// `default`, which always matches). Their order here does not matter: the manifest's does.
+const CONDITIONS: [&str; 4] = ["require", "types", "node", "default"];
 const MAX_EXPORTS_DEPTH: usize = 8;
 
 /// Why one `extends` could not be supplied.
@@ -119,41 +123,175 @@ fn split_package(specifier: &str) -> Option<(String, Option<String>)> {
     Some((name.join("/"), subpath))
 }
 
+/// A package's `exports`, with every object's properties in source order: conditions are
+/// matched in the order the manifest lists them, as Node and TypeScript match them.
+/// (`serde_json::Value` sorts object keys, which would put `default` before `types`.)
+#[derive(Debug)]
+enum Exports {
+    Target(String),
+    List(Vec<Exports>),
+    Object(Vec<(String, Exports)>),
+    Other,
+}
+
+impl<'de> serde::Deserialize<'de> for Exports {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Exports;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a package.json exports value")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Exports, E> {
+                Ok(Exports::Target(value.to_owned()))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Exports, E> {
+                Ok(Exports::Other)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Exports, E> {
+                Ok(Exports::Other)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Exports, E> {
+                Ok(Exports::Other)
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Exports, E> {
+                Ok(Exports::Other)
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Exports, E> {
+                Ok(Exports::Other)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Exports, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(Exports::List(items))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Exports, A::Error> {
+                let mut entries = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, Exports>()? {
+                    entries.push((key, value));
+                }
+                Ok(Exports::Object(entries))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// The two `package.json` fields a config lookup reads.
+#[derive(Debug, serde::Deserialize)]
+struct Manifest {
+    exports: Option<Exports>,
+    tsconfig: Option<Value>,
+}
+
+/// What is at a path, without following anything but the checkout's own directories.
+enum Kind {
+    Absent,
+    File,
+    Dir,
+    Other,
+}
+
 /// The configs one root `extends` reaches, read from a checkout.
 struct Chain<'a> {
     workspace: &'a Path,
+    /// The checkout's `node_modules`, canonical: every file read must really be under it.
+    node_modules: Option<PathBuf>,
     /// Supplied files by checkout-relative path, with the bytes the worktree gets.
     files: BTreeMap<String, Vec<u8>>,
     /// Paths still being read, so a cycle is refused instead of followed.
     reading: Vec<String>,
+    /// Files read from `node_modules` (configs and manifests), against `MAX_CHAIN_FILES`.
+    reads: usize,
+    /// Paths inspected, against `MAX_PROBES`.
+    probes: usize,
 }
 
-impl Chain<'_> {
+impl<'a> Chain<'a> {
+    fn new(workspace: &'a Path) -> Self {
+        Self {
+            workspace,
+            node_modules: fs::canonicalize(workspace.join(NODE_MODULES)).ok(),
+            files: BTreeMap::new(),
+            reading: vec![ROOT.to_owned()],
+            reads: 0,
+            probes: 0,
+        }
+    }
+
     fn path(&self, relative: &str) -> PathBuf {
         self.workspace.join(relative)
     }
 
-    fn is_file(&self, relative: &str) -> bool {
-        fs::metadata(self.path(relative)).is_ok_and(|meta| meta.is_file())
-    }
-
-    fn is_dir(&self, relative: &str) -> bool {
-        fs::metadata(self.path(relative)).is_ok_and(|meta| meta.is_dir())
-    }
-
-    /// At most `MAX_FILE_BYTES` of a regular file, checked before it is opened so a FIFO or
-    /// device is never opened.
-    fn read(&self, relative: &str) -> Result<Vec<u8>, Failure> {
-        let path = self.path(relative);
-        let meta = match fs::metadata(&path) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Failure::Missing(format!("{relative} is missing")));
+    /// What `relative` is. Only absence is `Absent`; any other error is a refusal.
+    fn kind(&mut self, relative: &str) -> Result<Kind, Failure> {
+        self.probes += 1;
+        if self.probes > MAX_PROBES {
+            return Err(Failure::Invalid(format!(
+                "the extends lookup inspects more than {MAX_PROBES} paths"
+            )));
+        }
+        match fs::metadata(self.path(relative)) {
+            Ok(meta) if meta.is_file() => Ok(Kind::File),
+            Ok(meta) if meta.is_dir() => Ok(Kind::Dir),
+            Ok(_) => Ok(Kind::Other),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(Kind::Absent)
             }
-            Err(error) => return Err(Failure::Invalid(format!("{relative}: {error}"))),
-        };
+            Err(error) => Err(Failure::Invalid(format!("{relative}: {error}"))),
+        }
+    }
+
+    /// At most `MAX_FILE_BYTES` of a regular file whose real path is under the checkout's
+    /// `node_modules`. The type is checked before the file is opened, so a FIFO or device is
+    /// never opened.
+    fn read(&mut self, relative: &str) -> Result<Vec<u8>, Failure> {
+        self.reads += 1;
+        if self.reads > MAX_CHAIN_FILES {
+            return Err(Failure::Invalid(format!(
+                "the extends chain reads more than {MAX_CHAIN_FILES} files"
+            )));
+        }
+        let path = self.path(relative);
+        let real = fs::canonicalize(&path)
+            .map_err(|error| Failure::Invalid(format!("{relative}: {error}")))?;
+        if !self
+            .node_modules
+            .as_ref()
+            .is_some_and(|node_modules| real.starts_with(node_modules))
+        {
+            return Err(Failure::Invalid(format!(
+                "{relative} resolves outside the checkout's node_modules"
+            )));
+        }
+        let meta = fs::metadata(&real)
+            .map_err(|error| Failure::Invalid(format!("{relative}: {error}")))?;
         if !meta.is_file() {
-            return Err(Failure::Missing(format!("{relative} is not a file")));
+            return Err(Failure::Invalid(format!(
+                "{relative} is not a regular file"
+            )));
         }
         let too_large =
             || Failure::Invalid(format!("{relative} is larger than {MAX_FILE_BYTES} bytes"));
@@ -161,7 +299,7 @@ impl Chain<'_> {
             return Err(too_large());
         }
         let mut bytes = Vec::new();
-        fs::File::open(&path)
+        fs::File::open(&real)
             .and_then(|file| file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes))
             .map_err(|error| Failure::Invalid(format!("{relative}: {error}")))?;
         if bytes.len() as u64 > MAX_FILE_BYTES {
@@ -170,91 +308,126 @@ impl Chain<'_> {
         Ok(bytes)
     }
 
-    /// The config file a package specifier names, looked up in the `node_modules` of
-    /// `from_dir` and of each of its ancestors, as Node resolution does.
-    fn resolve_package(&self, specifier: &str, from_dir: &str) -> Result<String, Failure> {
+    /// The config file a package specifier names. The `node_modules` of `from_dir` and of each
+    /// ancestor up to the checkout root are tried in turn, as TypeScript does: a package
+    /// directory with no config passes the lookup outward, unless its `exports` decided it.
+    fn resolve_package(&mut self, specifier: &str, from_dir: &str) -> Result<String, Failure> {
         let (name, subpath) = split_package(specifier)
             .ok_or_else(|| Failure::Invalid("is not a valid package name".into()))?;
         let mut dir = Some(from_dir);
-        let package = loop {
-            let Some(at) = dir else {
-                return Err(Failure::Missing(format!(
-                    "package {name} is not in the checkout's node_modules"
-                )));
-            };
-            let candidate = join(at, &format!("{NODE_MODULES}/{name}"))
-                .ok_or_else(|| Failure::Invalid("leaves the checkout".into()))?;
-            if self.is_dir(&candidate) {
-                break candidate;
-            }
+        let mut last = format!("package {name} is not in the checkout's node_modules");
+        while let Some(at) = dir {
             dir = (!at.is_empty()).then(|| parent(at));
-        };
-        let manifest = format!("{package}/package.json");
-        let manifest: Option<Value> = if self.is_file(&manifest) {
-            let bytes = self.read(&manifest)?;
-            Some(
-                serde_json::from_slice(&bytes)
-                    .map_err(|_| Failure::Invalid(format!("{manifest} is not valid JSON")))?,
-            )
-        } else {
-            None
-        };
-        let key = subpath
-            .as_deref()
-            .map_or_else(|| ".".to_owned(), |sub| format!("./{sub}"));
-        let exported = manifest
-            .as_ref()
-            .and_then(|manifest| manifest.get("exports"))
-            .map(|exports| export_target(exports, &key));
-        let candidates: Vec<String> = match exported {
-            Some(Some(target)) => vec![target],
-            Some(None) => {
-                return Err(Failure::Missing(format!(
-                    "{package}/package.json exports no config for {key}"
+            let package = join(at, &format!("{NODE_MODULES}/{name}"))
+                .ok_or_else(|| Failure::Invalid("leaves the checkout".into()))?;
+            if !matches!(self.kind(&package)?, Kind::Dir) {
+                continue;
+            }
+            match self.resolve_in(&package, subpath.as_deref(), specifier)? {
+                Lookup::Found(path) => return Ok(path),
+                Lookup::Decided(reason) => return Err(Failure::Missing(reason)),
+                Lookup::Next(reason) => last = reason,
+            }
+        }
+        Err(Failure::Missing(last))
+    }
+
+    /// The config `specifier` names inside one package directory.
+    fn resolve_in(
+        &mut self,
+        package: &str,
+        subpath: Option<&str>,
+        specifier: &str,
+    ) -> Result<Lookup, Failure> {
+        let manifest_path = format!("{package}/package.json");
+        let manifest: Option<Manifest> = match self.kind(&manifest_path)? {
+            Kind::Absent => None,
+            Kind::File => {
+                let bytes = self.read(&manifest_path)?;
+                Some(serde_json::from_slice(&bytes).map_err(|_| {
+                    Failure::Invalid(format!("{manifest_path} is not a valid package.json"))
+                })?)
+            }
+            Kind::Dir | Kind::Other => {
+                return Err(Failure::Invalid(format!(
+                    "{manifest_path} is not a regular file"
                 )));
             }
-            None => match &subpath {
+        };
+        let key = subpath.map_or_else(|| ".".to_owned(), |sub| format!("./{sub}"));
+        // `(candidate, whether a directory there is passed over)`.
+        let candidates: Vec<(String, bool)> = match manifest
+            .as_ref()
+            .and_then(|manifest| manifest.exports.as_ref())
+        {
+            Some(exports) => export_targets(exports, &key)?
+                .into_iter()
+                .map(|target| (target, false))
+                .collect(),
+            None => match subpath {
                 Some(sub) => vec![
-                    sub.clone(),
-                    format!("{sub}.json"),
-                    format!("{sub}/tsconfig.json"),
+                    (sub.to_owned(), true),
+                    (format!("{sub}.json"), false),
+                    (format!("{sub}/tsconfig.json"), false),
                 ],
                 None => manifest
                     .as_ref()
-                    .and_then(|manifest| manifest.get("tsconfig"))
+                    .and_then(|manifest| manifest.tsconfig.as_ref())
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
+                    .map(|field| (field.to_owned(), false))
                     .into_iter()
-                    .chain(["tsconfig.json".to_owned()])
+                    .chain([("tsconfig.json".to_owned(), false)])
                     .collect(),
             },
         };
-        for candidate in candidates {
-            let path = join(&package, &candidate)
+        for (candidate, directory_passes) in candidates {
+            let path = join(package, &candidate)
                 .filter(|path| path.starts_with(&format!("{package}/")))
                 .ok_or_else(|| Failure::Invalid(format!("{candidate} leaves {package}")))?;
-            if self.is_file(&path) {
-                return Ok(path);
+            match self.kind(&path)? {
+                Kind::File => return Ok(Lookup::Found(path)),
+                Kind::Absent => {}
+                Kind::Dir if directory_passes => {}
+                Kind::Dir | Kind::Other => {
+                    return Err(Failure::Invalid(format!("{path} is not a regular file")));
+                }
             }
         }
-        Err(Failure::Missing(format!(
-            "{package} has no config file for {specifier}"
-        )))
+        let reason = format!("{package} has no config file for {specifier}");
+        Ok(
+            if manifest.is_some_and(|manifest| manifest.exports.is_some()) {
+                Lookup::Decided(reason)
+            } else {
+                Lookup::Next(reason)
+            },
+        )
     }
 
     /// The file a relative `extends` names, from the config at `from`: the path itself, else
     /// with `.json` added, as TypeScript tries them. It must stay under `node_modules`.
-    fn resolve_path(&self, specifier: &str, from: &str) -> Result<String, Failure> {
+    fn resolve_path(&mut self, specifier: &str, from: &str) -> Result<String, Failure> {
         if specifier.starts_with('/') {
             return Err(Failure::Invalid("is an absolute path".into()));
         }
         let path = join(parent(from), specifier)
             .filter(|path| path.starts_with(&format!("{NODE_MODULES}/")))
             .ok_or_else(|| Failure::Invalid("leaves the checkout's node_modules".into()))?;
-        if self.is_file(&path) || path.ends_with(".json") {
-            return Ok(path);
+        match self.kind(&path)? {
+            Kind::File => return Ok(path),
+            Kind::Absent | Kind::Dir if !path.ends_with(".json") => {}
+            Kind::Absent => return Err(Failure::Missing(format!("{path} is missing"))),
+            Kind::Dir | Kind::Other => {
+                return Err(Failure::Invalid(format!("{path} is not a regular file")));
+            }
         }
-        Ok(format!("{path}.json"))
+        let path = format!("{path}.json");
+        match self.kind(&path)? {
+            Kind::File => Ok(path),
+            Kind::Absent => Err(Failure::Missing(format!("{path} is missing"))),
+            Kind::Dir | Kind::Other => {
+                Err(Failure::Invalid(format!("{path} is not a regular file")))
+            }
+        }
     }
 
     /// Read the config at `path` and everything its `extends` reaches.
@@ -264,11 +437,6 @@ impl Chain<'_> {
         }
         if self.files.contains_key(path) {
             return Ok(());
-        }
-        if self.files.len() + self.reading.len() >= MAX_CHAIN_FILES {
-            return Err(Failure::Invalid(format!(
-                "the extends chain reaches more than {MAX_CHAIN_FILES} files"
-            )));
         }
         let bytes = self.read(path)?;
         let mut config = parse_jsonc(&bytes)
@@ -305,6 +473,15 @@ impl Chain<'_> {
     }
 }
 
+/// One package directory's answer.
+enum Lookup {
+    Found(String),
+    /// Its `exports` names no config: TypeScript stops here.
+    Decided(String),
+    /// No config, and nothing stops the lookup going outward.
+    Next(String),
+}
+
 fn within(failure: Failure, context: &str) -> Failure {
     match failure {
         Failure::Missing(reason) => Failure::Missing(format!("{context}: {reason}")),
@@ -321,30 +498,59 @@ fn set_extends(config: &mut Value, specifiers: Vec<String>) {
     config["extends"] = value;
 }
 
-/// The target `exports` gives `key` (`.` or `./sub`): a string, the first matching condition
-/// of a conditions object, or the first entry of an array that has one.
-fn export_target(exports: &Value, key: &str) -> Option<String> {
+/// The targets `exports` gives `key` (`.` or `./sub`), in the order TypeScript tries them:
+/// a string; each entry of an array; each matching condition of a conditions object, in
+/// the manifest's own order. TypeScript tries the next target when one does not resolve.
+fn export_targets(exports: &Exports, key: &str) -> Result<Vec<String>, Failure> {
     let entry = match exports {
-        Value::Object(map) if map.keys().any(|key| key.starts_with('.')) => map.get(key)?,
+        Exports::Object(entries) if entries.iter().any(|(name, _)| name.starts_with('.')) => {
+            match entries.iter().find(|(name, _)| name == key) {
+                Some((_, entry)) => entry,
+                None if entries.iter().any(|(name, _)| name.contains('*')) => {
+                    return Err(Failure::Invalid(
+                        "package.json exports uses subpath patterns, which are not supported"
+                            .into(),
+                    ));
+                }
+                None => return Ok(Vec::new()),
+            }
+        }
         _ if key == "." => exports,
-        _ => return None,
+        _ => return Ok(Vec::new()),
     };
-    conditional(entry, 0)
+    let mut targets = Vec::new();
+    conditional(entry, 0, &mut targets)?;
+    Ok(targets)
 }
 
-fn conditional(value: &Value, depth: usize) -> Option<String> {
+fn conditional(value: &Exports, depth: usize, targets: &mut Vec<String>) -> Result<(), Failure> {
     if depth > MAX_EXPORTS_DEPTH {
-        return None;
+        return Err(Failure::Invalid(format!(
+            "package.json exports nests deeper than {MAX_EXPORTS_DEPTH} levels"
+        )));
     }
     match value {
-        Value::String(target) => Some(target.clone()),
-        Value::Array(items) => items.iter().find_map(|item| conditional(item, depth + 1)),
-        Value::Object(map) => map
-            .iter()
-            .filter(|(condition, _)| CONDITIONS.contains(&condition.as_str()))
-            .find_map(|(_, value)| conditional(value, depth + 1)),
-        _ => None,
+        Exports::Target(target) => targets.push(target.clone()),
+        Exports::List(items) => {
+            for item in items {
+                conditional(item, depth + 1, targets)?;
+            }
+        }
+        Exports::Object(entries) => {
+            for (condition, value) in entries {
+                if condition.starts_with("types@") {
+                    return Err(Failure::Invalid(format!(
+                        "package.json exports uses the versioned condition {condition}, which is not supported"
+                    )));
+                }
+                if CONDITIONS.contains(&condition.as_str()) {
+                    conditional(value, depth + 1, targets)?;
+                }
+            }
+        }
+        Exports::Other => {}
     }
+    Ok(())
 }
 
 /// The typed refusal. `extends` is the JSON text of the root's `extends` entry.
@@ -374,11 +580,7 @@ pub fn apply(rules: &mut Rules, inputs: &RetainedInputs, workspace: &Path) -> Re
     if extends.iter().all(|specifier| is_path(specifier)) {
         return Ok(());
     }
-    let mut chain = Chain {
-        workspace,
-        files: BTreeMap::new(),
-        reading: vec![ROOT.to_owned()],
-    };
+    let mut chain = Chain::new(workspace);
     let mut rewritten = Vec::with_capacity(extends.len());
     for specifier in &extends {
         if is_path(specifier) {

@@ -326,3 +326,193 @@ fn roots_without_a_package_extends_are_left_alone() {
     tsconfig::apply(&mut rules, &RetainedInputs::default(), dir.path()).unwrap();
     assert_eq!(rules, ts_rules());
 }
+
+/// #808 review: conditions are matched in the manifest's order, as TypeScript 5.9.3 matches
+/// them (`types` first here gives `strict: true`), not in sorted key order, and a condition
+/// whose target is missing passes to the next.
+#[test]
+fn conditional_exports_keep_the_manifest_order() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "node_modules/base/package.json",
+        br#"{"exports":{"types":"./types.json","default":"./default.json"}}"#,
+    );
+    write(
+        dir.path(),
+        "node_modules/base/types.json",
+        br#"{"compilerOptions":{"strict":true}}"#,
+    );
+    write(
+        dir.path(),
+        "node_modules/base/default.json",
+        br#"{"compilerOptions":{"strict":false}}"#,
+    );
+    let rules = apply(r#"{"extends":"base"}"#, dir.path()).unwrap();
+    assert_eq!(
+        json_of(generated(&rules, "worktree/tsconfig.json"))["extends"],
+        "./node_modules/base/types.json"
+    );
+
+    // `import` is not a condition of a config lookup; `default` after it still matches.
+    write(
+        dir.path(),
+        "node_modules/base/package.json",
+        br#"{"exports":{".":{"import":"./types.json","default":"./default.json"}}}"#,
+    );
+    let rules = apply(r#"{"extends":"base"}"#, dir.path()).unwrap();
+    assert_eq!(
+        json_of(generated(&rules, "worktree/tsconfig.json"))["extends"],
+        "./node_modules/base/default.json"
+    );
+
+    // A matching condition whose file is missing passes to the next one.
+    write(
+        dir.path(),
+        "node_modules/base/package.json",
+        br#"{"exports":{"types":"./gone.json","default":"./default.json"}}"#,
+    );
+    let rules = apply(r#"{"extends":"base"}"#, dir.path()).unwrap();
+    assert_eq!(
+        json_of(generated(&rules, "worktree/tsconfig.json"))["extends"],
+        "./node_modules/base/default.json"
+    );
+}
+
+fn packages(dir: &Path, count: usize) -> String {
+    let mut names = Vec::new();
+    for i in 0..count {
+        let name = format!("p{i}");
+        write(
+            dir,
+            &format!("node_modules/{name}/package.json"),
+            br#"{"tsconfig":"tsconfig.json"}"#,
+        );
+        write(dir, &format!("node_modules/{name}/tsconfig.json"), b"{}");
+        names.push(name);
+    }
+    json!({ "extends": names }).to_string()
+}
+
+/// #808 review: manifests count toward the file bound. Eight packages read 16 files (eight
+/// manifests and eight configs); nine read 18.
+#[test]
+fn the_file_bound_counts_manifests() {
+    let dir = tempfile::tempdir().unwrap();
+    let at_bound = packages(dir.path(), MAX_CHAIN_FILES / 2);
+    let rules = apply(&at_bound, dir.path()).unwrap();
+    assert_eq!(rules.generated.len(), 1 + MAX_CHAIN_FILES / 2);
+
+    let over = packages(dir.path(), MAX_CHAIN_FILES / 2 + 1);
+    let error = refusal(&over, dir.path());
+    assert!(
+        error.contains(&format!("reads more than {MAX_CHAIN_FILES} files")),
+        "{error}"
+    );
+}
+
+/// #808 review: an error other than absence is a typed refusal, never the fallback.
+#[test]
+fn a_permission_error_is_refused_not_replaced() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "node_modules/base/tsconfig.json", b"{}");
+    let package = dir.path().join("node_modules/base");
+    fs::set_permissions(&package, fs::Permissions::from_mode(0o000)).unwrap();
+    let result = apply(r#"{"extends":"base"}"#, dir.path());
+    fs::set_permissions(&package, fs::Permissions::from_mode(0o700)).unwrap();
+    let error = result.unwrap_err().to_string();
+    assert!(error.starts_with(CONFIG_UNRESOLVED), "{error}");
+    assert!(error.contains("extends \"base\""), "{error}");
+    assert!(error.contains("ermission denied"), "{error}");
+}
+
+/// #808 review: a config path that is not a regular file is refused, never the fallback.
+#[test]
+fn a_non_regular_config_is_refused_not_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("node_modules/base/tsconfig.json")).unwrap();
+    let error = refusal(r#"{"extends":"base"}"#, dir.path());
+    assert!(error.contains("is not a regular file"), "{error}");
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("node_modules/base/package.json")).unwrap();
+    let error = refusal(r#"{"extends":"base"}"#, dir.path());
+    assert!(
+        error.contains("package.json is not a regular file"),
+        "{error}"
+    );
+}
+
+/// #808 review: a symlink whose real target is outside the checkout's `node_modules` is
+/// refused; one inside it (as pnpm lays packages out) is followed.
+#[test]
+fn a_symlink_out_of_node_modules_is_refused() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "outside.json", b"{}");
+    fs::create_dir_all(dir.path().join("node_modules/base")).unwrap();
+    symlink(
+        "../../outside.json",
+        dir.path().join("node_modules/base/tsconfig.json"),
+    )
+    .unwrap();
+    let error = refusal(r#"{"extends":"base"}"#, dir.path());
+    assert!(
+        error.contains("resolves outside the checkout's node_modules"),
+        "{error}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "node_modules/.pnpm/base@1/node_modules/base/tsconfig.json",
+        b"{}",
+    );
+    symlink(
+        ".pnpm/base@1/node_modules/base",
+        dir.path().join("node_modules/base"),
+    )
+    .unwrap();
+    let rules = apply(r#"{"extends":"base"}"#, dir.path()).unwrap();
+    assert_eq!(
+        generated(&rules, "worktree/node_modules/base/tsconfig.json").bytes,
+        b"{}"
+    );
+}
+
+/// #808 review: as in TypeScript 5.9.3, a nearer package directory with no config passes
+/// the lookup to the next `node_modules` outward.
+#[test]
+fn lookup_continues_past_a_package_with_no_config() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "node_modules/a/tsconfig.json",
+        br#"{"extends":"base"}"#,
+    );
+    write(
+        dir.path(),
+        "node_modules/a/node_modules/base/package.json",
+        br#"{"name":"base"}"#,
+    );
+    write(
+        dir.path(),
+        "node_modules/base/tsconfig.json",
+        br#"{"compilerOptions":{"strict":true}}"#,
+    );
+    let rules = apply(r#"{"extends":"a"}"#, dir.path()).unwrap();
+    assert!(!generated(&rules, "worktree/tsconfig.json").default_only);
+    let a = json_of(generated(&rules, "worktree/node_modules/a/tsconfig.json"));
+    assert_eq!(a["extends"], "../base/tsconfig.json");
+    generated(&rules, "worktree/node_modules/base/tsconfig.json");
+
+    // An inner package whose `exports` names no config stops the lookup, as TypeScript's does.
+    write(
+        dir.path(),
+        "node_modules/a/node_modules/base/package.json",
+        br#"{"exports":{"./other":"./other.json"}}"#,
+    );
+    let rules = apply(r#"{"extends":"a"}"#, dir.path()).unwrap();
+    assert_eq!(rules.generated, ts_rules().generated, "fell back");
+}
