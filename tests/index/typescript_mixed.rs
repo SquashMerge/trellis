@@ -239,3 +239,140 @@ fn typescript_mixed_detection_and_capture() {
     .unwrap();
     assert_eq!(inventories.len(), 1);
 }
+
+/// Declarations of `path` per kind, in kind order.
+fn kind_counts(artifact: &Artifact, path: &str) -> Vec<(String, usize)> {
+    let mut counts = std::collections::BTreeMap::new();
+    for declaration in artifact
+        .declarations
+        .iter()
+        .filter(|d| d.document.path == path)
+    {
+        *counts.entry(declaration.kind.clone()).or_insert(0) += 1;
+    }
+    counts.into_iter().collect()
+}
+
+fn counts(items: &[(&str, usize)]) -> Vec<(String, usize)> {
+    items
+        .iter()
+        .map(|(kind, count)| ((*kind).to_owned(), *count))
+        .collect()
+}
+
+#[test]
+fn typescript_mixed_native_constructs() {
+    let workspace = fixture_root();
+    let root = fs::canonicalize(workspace.path()).unwrap();
+    let artifact = native(&root);
+    let calls = |path: &str| -> Vec<(String, String)> {
+        artifact
+            .calls
+            .iter()
+            .filter(|c| c.document.path == path)
+            .map(|c| {
+                let owner = artifact
+                    .declarations
+                    .iter()
+                    .find(|d| d.syntax_id == c.owner_syntax_id)
+                    .map(|d| d.kind.clone())
+                    .unwrap();
+                (c.spelling.clone().unwrap(), owner)
+            })
+            .collect()
+    };
+    let regions = |path: &str| {
+        artifact
+            .control_regions
+            .iter()
+            .filter(|r| r.document.path == path)
+            .count()
+    };
+
+    // src/app/model.ts, per construct (§4):
+    //   1 module (the file);
+    //   type x5: interfaces Entity and Named (C4), enum Status (C5), abstract class Base
+    //     (C3) and class Model (C1);
+    //   alias x1: `type Id` (C6);
+    //   field x5: Entity.id and Named.name (property_signature), Base.id (field with a type),
+    //     Model.id and Model.name (parameter properties, C13); enum members are not
+    //     declarations;
+    //   method x4: Base.describe (abstract, C3), Model's constructor, describe and the
+    //     decorated rename (C12);
+    //   function x6: sealed, log, the three `parse` overloads (C10) and the ambient `make`
+    //     (C18);
+    //   anonymousFunction x1: the arrow returned by `sealed`;
+    //   variable x1: `made`.
+    assert_eq!(
+        kind_counts(&artifact, "src/app/model.ts"),
+        counts(&[
+            ("alias", 1),
+            ("anonymousFunction", 1),
+            ("field", 5),
+            ("function", 6),
+            ("method", 4),
+            ("module", 1),
+            ("type", 5),
+            ("variable", 1),
+        ])
+    );
+    // Calls: `super()`, the `@sealed()` decorator (owned by the file module, since the
+    // decorator belongs to the export statement), `new Model(...)`, `String(x)` and the
+    // generic `make<Model>()` (C9, C12). `@log` is a reference only.
+    let model_calls = calls("src/app/model.ts");
+    let spellings: Vec<&str> = model_calls.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(spellings.len(), 5, "{model_calls:?}");
+    for expected in ["sealed", "super", "Model", "String", "make"] {
+        assert!(spellings.contains(&expected), "{expected}: {model_calls:?}");
+    }
+    assert!(
+        model_calls.contains(&("sealed".to_owned(), "module".to_owned())),
+        "{model_calls:?}"
+    );
+    assert_eq!(regions("src/app/model.ts"), 0);
+
+    // src/space.ts: module x1; namespace x2, `A.B.C` named by its rightmost segment `C` and
+    // `module N` (C7, C8); type x1, `Inner`; variable x1, `v`.
+    assert_eq!(
+        kind_counts(&artifact, "src/space.ts"),
+        counts(&[
+            ("module", 1),
+            ("namespace", 2),
+            ("type", 1),
+            ("variable", 1)
+        ])
+    );
+    assert!(
+        artifact
+            .declarations
+            .iter()
+            .filter(|d| d.document.path == "src/space.ts" && d.kind == "namespace")
+            .map(|d| d.name.as_deref())
+            .eq([Some("C"), Some("N")])
+    );
+
+    // src/app/types.d.ts (C18, C19): module x1; namespace x1, "ambient-mod"; function x2, `f`
+    // and `helperDecl`; type x3, `Window` (in `declare global`, which declares nothing),
+    // `Shape` and `Config`; field x2, `Window.app` and `Config.x`; method x1, `Shape.area`.
+    // A declaration-only document has no calls and no control regions.
+    assert_eq!(
+        kind_counts(&artifact, "src/app/types.d.ts"),
+        counts(&[
+            ("field", 2),
+            ("function", 2),
+            ("method", 1),
+            ("module", 1),
+            ("namespace", 1),
+            ("type", 3),
+        ])
+    );
+    assert!(calls("src/app/types.d.ts").is_empty());
+    assert_eq!(regions("src/app/types.d.ts"), 0);
+
+    // The JSX `render(...)` call in the TSX grammar (C21), owned by the onClick arrow.
+    assert!(
+        calls("src/app/view.tsx").contains(&("render".to_owned(), "anonymousFunction".to_owned())),
+        "{:?}",
+        calls("src/app/view.tsx")
+    );
+}
