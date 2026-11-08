@@ -80,6 +80,15 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
         "src/dependency_rust_symbols.rs",
         "dependency source browsing, outside the workspace index",
     ),
+    ("src/interfaces.rs", "read-time HTTP interface extraction"),
+    (
+        "src/interfaces/calls.rs",
+        "read-time HTTP interface extraction",
+    ),
+    (
+        "src/interfaces/routes.rs",
+        "read-time HTTP interface extraction",
+    ),
     ("src/metrics.rs", "read-time code metrics"),
     (
         "src/semantic_import.rs",
