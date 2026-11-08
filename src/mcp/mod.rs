@@ -1234,6 +1234,10 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 if let Some(limit) = evidence_limit {
                                     architecture::sample_evidence(&mut payload, limit);
                                 }
+                                // #769: check points each sampled instance at explain.
+                                if kind == "check" {
+                                    architecture::next_calls(&mut payload);
+                                }
                                 Ok(architecture::envelope_with(id, payload, semantic))
                             }
                             // Time is left for the owner: wait for it outside this read.

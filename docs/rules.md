@@ -457,7 +457,8 @@ Its descriptor is `{path:".trellis/rules.toml",source:"checkout-config",contentH
 **The code pin does not identify these rules bytes.** Editing only rules can change
 the digest and outcome at an unchanged code pin. Code evidence never falls back
 to live source. Missing config permits a proposal from scratch; check/explain fail
-`rules_not_found`. Malformed config fails all three atomically with a located error.
+`rules_not_found`, whose MCP message names the `trellis_propose_layers` prompt (#769).
+Malformed config fails all three atomically with a located error.
 
 `trellis_rules_explain` filters the same evaluated instances by exact rule/target
 and, for `$layers` or `$external`, the actual native/external destination identity; it does not interpret a rule a second way.
@@ -875,7 +876,10 @@ reads return the complete arrays above. The
 [#725 amendment](mcp-readonly-pilot-contract.md#amendment-725-rule-evidence-bases-status-filter-and-instance-pages)
 supersedes this paragraph for MCP: evidence rows refer to a per-page `semanticBases`
 table by `basisRef`; check accepts a `status` filter, its `limit` counts instances
-per page and each check instance keeps one evidence entry.
+per page and each check instance keeps one evidence entry. Under the
+[#769 amendment](mcp-readonly-pilot-contract.md#amendment-769-rules-tools-point-to-the-next-call),
+a check instance that omits evidence carries `nextCall`, the ready-made
+`trellis_rules_explain` arguments that show the rest.
 
 ## Proposal workflow
 
