@@ -186,6 +186,49 @@ test("published Rust types merge impl methods across files and render through Pe
   });
 });
 
+const tsModel = `export interface Named { name: string }
+export class Account implements Named {
+  balance: number = 0;
+  constructor(public name: string) {}
+  deposit(amount: number): number { return this.balance + amount; }
+}
+`;
+const tsView = "export class Panel { render() { return 1; } }\n";
+
+test("published TypeScript classes render through Pele with parameter properties, menus and method sequences", {timeout:240000}, async () => {
+  await withApp([["model.ts", tsModel], ["view.tsx", tsView]], async ({page, pin, read, requests}) => {
+    const catalog = await read("GET", `classes?${new URLSearchParams({q:"", offset:"0", limit:"100", ...pin})}`);
+    assert.ok(catalog.supportedLanguages.includes("typescript"), JSON.stringify(catalog.supportedLanguages));
+    assert.deepEqual(catalog.items.map(item => item.qualifiedName).sort(), ["model.Account", "model.Named", "view.Panel"]);
+    const account = catalog.items.find(item => item.qualifiedName === "model.Account");
+    assert.equal(account.language, "typescript");
+    assert.deepEqual(memberTexts(account), ["balance: number", "name: string", "constructor()", "deposit() : number"]);
+
+    // Right-click the indexed .ts file and choose Show class diagram.
+    const file = page.locator(".file-pick[title='model.ts']").first();
+    await file.waitFor();
+    await file.click({button:"right"});
+    await page.getByRole("menuitem", {name:"Show class diagram"}).click();
+    await page.waitForFunction(() => /Pele rendered/.test(document.querySelector("#classes-state")?.textContent || ""), null, {timeout:15000});
+    assert.equal(requests.filter(row => row.url.pathname.endsWith("/classes")).at(-1).url.searchParams.get("path"), "model.ts");
+    const node = page.locator(`#classes-diagram .pele-node[data-trellis-class-id="${account.symbol.id}"]`);
+    await node.waitFor();
+    assert.match(await node.locator(".pele-annotation").textContent(), /typescript · class/);
+    assert.equal(await page.locator("#classes-diagram .pele-edge").count(), 0, "implements stays a terminal hint, never an arrow");
+    assert.deepEqual(await node.locator(".pele-member").allTextContents(), memberTexts(account));
+
+    // A method member opens its exact measured sequence at the same pin.
+    const deposit = account.methods.find(method => method.name === "deposit");
+    await Promise.all([
+      page.waitForResponse(response => /\/sequence(\?|$)/.test(response.url()) && response.request().method() === "POST"),
+      page.locator(`.pele-member[data-trellis-symbol-id="${deposit.symbolId}"]`).click(),
+    ]);
+    const sequence = requests.filter(row => row.url.pathname.endsWith("/sequence")).at(-1);
+    assert.equal(sequence.body.seed, deposit.symbolId);
+    assert.deepEqual(sequence.body.expectedRevision, pin);
+  });
+});
+
 test("a reload shows the Classes tab this browser remembers while metrics are still out", {timeout:240000}, async () => {
   await withApp([["widgets.js", widgets]], async ({page, reconnect}) => {
     await page.locator("#view-classes").waitFor({state:"visible"});

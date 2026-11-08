@@ -742,12 +742,14 @@ test("class controller uses authenticated API and clears pending source on navig
 
 test("unsupported class languages keep their ordinary file and method interactions", () => {
   const h=harness();h.context.window.TrellisClasses={showContextMenu(){throw new Error('unexpected menu');}};
-  h.run(`attachClassMenu($('go-file'),{path:'src/main.go'}); attachClassMenu($('rust-file'),{path:'src/main.rs'}); attachClassMenu($('js-file'),{path:'app.js'}); attachClassMenu($('mjs-file'),{path:'web/a.mjs'});`);
+  h.run(`attachClassMenu($('go-file'),{path:'src/main.go'}); attachClassMenu($('rust-file'),{path:'src/main.rs'}); attachClassMenu($('js-file'),{path:'app.js'}); attachClassMenu($('mjs-file'),{path:'web/a.mjs'}); attachClassMenu($('ts-file'),{path:'src/a.ts'}); attachClassMenu($('tsx-file'),{path:'ui/a.tsx'}); attachClassMenu($('mts-file'),{path:'src/a.mts'}); attachClassMenu($('cts-file'),{path:'src/a.cts'});`);
   assert.equal(h.get('go-file').listeners.contextmenu,undefined);
   // JavaScript and Rust declarations are catalogued (#452): their files offer the class menu.
   assert.equal(typeof h.get('rust-file').listeners.contextmenu,'function');
   assert.equal(typeof h.get('js-file').listeners.contextmenu,'function');
   assert.equal(typeof h.get('mjs-file').listeners.contextmenu,'function');
+  // TypeScript declarations are catalogued (#683).
+  for(const id of ['ts-file','tsx-file','mts-file','cts-file']) assert.equal(typeof h.get(id).listeners.contextmenu,'function',id);
 });
 
 

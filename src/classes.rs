@@ -27,12 +27,12 @@ const TEXT: usize = 2_048;
 const OUTPUT_TEXT: usize = 64 * 1024 * 1024;
 const REGISTRY_TEXT: usize = 32 * 1024 * 1024;
 /// Languages whose declarations the class catalog extracts, in API order.
-pub const SUPPORTED_LANGUAGES: [&str; 4] = ["java", "python", "javascript", "rust"];
+pub const SUPPORTED_LANGUAGES: [&str; 5] = ["java", "python", "javascript", "rust", "typescript"];
 /// Whether `language` documents carry a class extraction (`F`) and class rows.
 pub fn supports_language(language: &str) -> bool {
     SUPPORTED_LANGUAGES.contains(&language)
 }
-const CATALOG_NOTICE: &str = "Declared types are terminal source text, not class relationships. Direct class declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery. Rust: inherent impl methods merge by scoped path; derives, macro-generated items and blanket impls are not attributed.";
+const CATALOG_NOTICE: &str = "Declared types are terminal source text, not class relationships. Direct class declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery. Rust: inherent impl methods merge by scoped path; derives, macro-generated items and blanket impls are not attributed. TypeScript: classes inside namespaces/modules are not catalogued; enum members are listed as fields.";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +153,7 @@ fn class_node(n: Node<'_>) -> bool {
             | "enum_declaration"
             | "record_declaration"
             | "annotation_type_declaration"
+            | "abstract_class_declaration"
     )
 }
 fn method_node(n: Node<'_>) -> bool {
@@ -164,6 +165,8 @@ fn method_node(n: Node<'_>) -> bool {
             | "constructor_declaration"
             | "compact_constructor_declaration"
             | "annotation_type_element_declaration"
+            | "method_signature"
+            | "abstract_method_signature"
     )
 }
 fn declaration(mut n: Node<'_>) -> Node<'_> {
@@ -178,7 +181,21 @@ fn declaration(mut n: Node<'_>) -> Node<'_> {
     {
         n = d;
     }
+    // TypeScript `declare class X` (and `export declare class X`) wraps the declaration.
+    if n.kind() == "ambient_declaration"
+        && let Some(d) = n.named_child(0)
+    {
+        n = d;
+    }
     n
+}
+/// A TypeScript `: T` annotation stands for the type it wraps.
+fn unwrap_annotation(n: Node<'_>) -> Node<'_> {
+    if n.kind() == "type_annotation" {
+        n.named_child(0).unwrap_or(n)
+    } else {
+        n
+    }
 }
 fn join(a: &str, b: &str) -> String {
     if a.is_empty() {
@@ -199,6 +216,12 @@ fn module_name(file: &SourceFile) -> String {
         }
         // Path-derived display prefix only; no package, bundler or import-map resolution.
         "javascript" => [".js", ".mjs", ".cjs"]
+            .iter()
+            .find_map(|ext| file.path.strip_suffix(ext))
+            .unwrap_or(&file.path)
+            .replace('/', "."),
+        // Declaration suffixes first, so `a.d.ts` is `a` and not `a.d`.
+        "typescript" => [".d.ts", ".d.mts", ".d.cts", ".tsx", ".ts", ".mts", ".cts"]
             .iter()
             .find_map(|ext| file.path.strip_suffix(ext))
             .unwrap_or(&file.path)
@@ -821,6 +844,7 @@ impl FileExtraction {
                 "python" => tree_sitter_python::LANGUAGE.into(),
                 "javascript" => tree_sitter_javascript::LANGUAGE.into(),
                 "rust" => tree_sitter_rust::LANGUAGE.into(),
+                "typescript" => crate::indexer_ts::grammar(&file.path),
                 other => anyhow::bail!("class catalog does not support {other}"),
             })?;
             let mut cancelled = |_: &tree_sitter::ParseState| {
@@ -1404,7 +1428,10 @@ impl Extractor<'_, '_> {
         // Java interfaces have an unnamed extends_interfaces child, and
         // JavaScript classes an unnamed class_heritage child.
         for c in self.children(n, depth + 1)? {
-            if matches!(c.kind(), "extends_interfaces" | "class_heritage") {
+            if matches!(
+                c.kind(),
+                "extends_interfaces" | "class_heritage" | "extends_type_clause"
+            ) {
                 self.types(c, index, scope, "extends", depth + 1)?;
             }
         }
@@ -1415,6 +1442,7 @@ impl Extractor<'_, '_> {
                 self.field(p, index, scope, depth + 1)?;
             }
         }
+        let typescript_enum = self.file.language == "typescript" && n.kind() == "enum_declaration";
         for raw in children {
             if self.exhausted {
                 break;
@@ -1426,9 +1454,17 @@ impl Extractor<'_, '_> {
                 self.method(c, index, scope, depth + 1)?;
             } else if matches!(
                 c.kind(),
-                "field_declaration" | "constant_declaration" | "enum_constant" | "field_definition"
-            ) {
+                "field_declaration"
+                    | "constant_declaration"
+                    | "enum_constant"
+                    | "field_definition"
+                    | "public_field_definition"
+                    | "property_signature"
+            ) || (typescript_enum && c.kind() == "enum_assignment")
+            {
                 self.field(c, index, scope, depth + 1)?;
+            } else if typescript_enum && c.kind() == "property_identifier" {
+                self.member(c, c, None, index, false)?;
             } else if c.kind() == "expression_statement" && self.file.language == "python" {
                 for assignment in self.children(c, depth + 1)? {
                     if assignment.kind() == "assignment" {
@@ -1519,7 +1555,10 @@ impl Extractor<'_, '_> {
         if !self.details(index)? {
             return Ok(());
         }
-        let ty = n.child_by_field_name("type");
+        let mut ty = n.child_by_field_name("type");
+        if self.file.language == "typescript" {
+            ty = ty.map(unwrap_annotation);
+        }
         if let Some(ty) = ty {
             self.types(ty, index, scope, "field", depth + 1)?;
         }
@@ -1549,9 +1588,13 @@ impl Extractor<'_, '_> {
         if !self.details(index)? {
             return Ok(());
         }
-        let ty = n
+        let mut ty = n
             .child_by_field_name("return_type")
             .or_else(|| n.child_by_field_name("type"));
+        let typescript = self.file.language == "typescript";
+        if typescript {
+            ty = ty.map(unwrap_annotation);
+        }
         if let Some(name) = n.child_by_field_name("name") {
             self.member(n, name, ty, index, true)?;
         }
@@ -1581,7 +1624,20 @@ impl Extractor<'_, '_> {
             self.types(ty, index, scope, "returns", depth + 1)?;
         }
         if let Some(params) = n.child_by_field_name("parameters") {
+            let constructor = typescript
+                && n.child_by_field_name("name")
+                    .is_some_and(|name| self.text(name) == "constructor");
             for p in self.detail_children(params, index, depth + 1)? {
+                if constructor
+                    && let Some(pattern) = p
+                        .child_by_field_name("pattern")
+                        .filter(|pattern| pattern.kind() == "identifier")
+                    && matches!(p.kind(), "required_parameter" | "optional_parameter")
+                    && self.is_parameter_property(p)
+                {
+                    let ty = p.child_by_field_name("type").map(unwrap_annotation);
+                    self.member(p, pattern, ty, index, false)?;
+                }
                 if let Some(ty) = p.child_by_field_name("type") {
                     self.types(ty, index, scope, "parameter", depth + 2)?;
                 } else if p.kind() == "spread_parameter" {
@@ -1601,6 +1657,16 @@ impl Extractor<'_, '_> {
         }
         // Deliberately never inspect the function body, default values or decorators.
         Ok(())
+    }
+    /// A constructor parameter with an accessibility, `override` or `readonly` modifier declares a field.
+    fn is_parameter_property(&self, p: Node<'_>) -> bool {
+        let mut cursor = p.walk();
+        p.children(&mut cursor).any(|c| {
+            matches!(
+                c.kind(),
+                "accessibility_modifier" | "override_modifier" | "readonly"
+            )
+        })
     }
     fn imported_name(&self, name: &str, scope: usize) -> String {
         let (head, tail) = name
@@ -1653,6 +1719,9 @@ impl Extractor<'_, '_> {
                 _ => {}
             }
             return Ok(());
+        }
+        if self.file.language == "typescript" {
+            return self.ts_types(n, index, kind, depth);
         }
         let java = self.file.language == "java";
         let atom = if java {
@@ -1758,6 +1827,66 @@ impl Extractor<'_, '_> {
             for c in self.detail_children(n, index, depth + 1)? {
                 self.types(c, index, scope, kind, depth + 1)?;
             }
+        }
+        Ok(())
+    }
+    /// Declared names in TypeScript heritage clauses and type annotations. Generic arguments
+    /// are references only outside a heritage clause; everything else is not a name.
+    fn ts_types(&mut self, n: Node<'_>, index: usize, kind: &str, depth: usize) -> Result<()> {
+        match n.kind() {
+            "class_heritage" => {
+                for c in self.detail_children(n, index, depth + 1)? {
+                    self.ts_types(c, index, kind, depth + 1)?;
+                }
+            }
+            "extends_clause" => {
+                let values: Vec<_> = {
+                    let mut cursor = n.walk();
+                    n.children_by_field_name("value", &mut cursor).collect()
+                };
+                for value in values {
+                    if !self.detail_tick(index, depth + 1)? {
+                        break;
+                    }
+                    if let Some(text) = self.js_dotted(value).filter(|text| dotted(text)) {
+                        self.reference(value, &text, index, "extends")?;
+                    }
+                }
+            }
+            "implements_clause" | "extends_type_clause" => {
+                let kind = if n.kind() == "implements_clause" {
+                    "implements"
+                } else {
+                    "extends"
+                };
+                for c in self.detail_children(n, index, depth + 1)? {
+                    self.ts_types(c, index, kind, depth + 1)?;
+                }
+            }
+            "type_identifier" | "nested_type_identifier" => {
+                let text = self.text(n).to_owned();
+                if dotted(&text) {
+                    self.reference(n, &text, index, kind)?;
+                }
+            }
+            "generic_type" => {
+                let children = self.detail_children(n, index, depth + 1)?;
+                let heritage = matches!(kind, "extends" | "implements");
+                for c in children
+                    .into_iter()
+                    .take(if heritage { 1 } else { usize::MAX })
+                {
+                    self.ts_types(c, index, kind, depth + 1)?;
+                }
+            }
+            "type_annotation" | "type_arguments" | "union_type" | "intersection_type"
+            | "array_type" | "tuple_type" | "parenthesized_type" | "readonly_type"
+            | "optional_type" | "rest_type" => {
+                for c in self.detail_children(n, index, depth + 1)? {
+                    self.ts_types(c, index, kind, depth + 1)?;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

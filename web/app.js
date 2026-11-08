@@ -2572,7 +2572,7 @@ async function openCallableSequence(row, pin) {
 
 // Class diagrams are an independent, cached-source projection. They never infer
 // a sequence participant's type or call a provider.
-function classLanguage(path) { return /\.(?:java|py|js|mjs|cjs|rs)$/i.test(path || ""); }
+function classLanguage(path) { return /\.(?:java|py|js|mjs|cjs|rs|ts|tsx|mts|cts)$/i.test(path || ""); }
 async function openClasses(options = {}) {
   architecture?.clearInspection();
   treemap?.clearInspection();
