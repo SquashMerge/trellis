@@ -527,13 +527,17 @@ class A {
 fn parameter_properties() {
     let source = "\
 class A {
-  constructor(private readonly id: number, public name?: string, plain: number, override x = 1) {}
+  constructor(private readonly id: number, public name?: string, plain: number, override x = 1, readonly z: number) {}
   other(private notField: number) {}
 }
 ";
     for (path, artifact) in both(source) {
         no_gap(path, &artifact);
-        assert_eq!(names(&artifact, "field"), ["id", "name", "x"], "{path}");
+        assert_eq!(
+            names(&artifact, "field"),
+            ["id", "name", "x", "z"],
+            "{path}"
+        );
         let constructor = declaration(&artifact, "method", "constructor");
         for field in artifact.declarations.iter().filter(|d| d.kind == "field") {
             let parent = field.ancestors.last().unwrap();
@@ -801,14 +805,33 @@ fn bounded_walk_reports_gap() {
     let source = format!("const x = {}1{};\n", "(".repeat(depth), ")".repeat(depth));
     for (path, artifact) in both(&source) {
         assert!(
-            artifact.coverage.iter().any(|c| c.diagnostic.is_some()),
+            artifact.coverage.iter().any(bound_gap),
             "{path} reports the bound gap"
         );
     }
     let nested = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
     for (path, artifact) in both(&format!("const y = {nested};\n")) {
+        assert!(artifact.coverage.iter().any(bound_gap), "{path}");
+    }
+}
+
+fn bound_gap(coverage: &crate::native_evidence::Coverage) -> bool {
+    coverage
+        .diagnostic
+        .as_deref()
+        .is_some_and(|d| d.starts_with("syntax beyond native walk bounds skipped"))
+}
+
+#[test]
+fn override_modifier_is_measured() {
+    let source = "class D extends B { override run(): void {} }\n";
+    for (path, artifact) in both(source) {
+        no_gap(path, &artifact);
         assert!(
-            artifact.coverage.iter().any(|c| c.diagnostic.is_some()),
+            declaration(&artifact, "method", "run")
+                .header
+                .modifiers
+                .contains(&"override".to_owned()),
             "{path}"
         );
     }
