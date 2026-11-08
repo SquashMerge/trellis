@@ -546,7 +546,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.match(edgeDetail, /2 sampled sites.*0 omitted sites/is);
   const pair = page.locator("#architecture-inspector-content > details").first();
   await pair.locator(":scope > summary").click();
-  const sample = pair.locator(":scope > details").filter({has:page.locator('summary', {hasText:/production · reference/})}).first();
+  const sample = pair.locator(":scope > details").filter({has:page.locator('summary', {hasText:/production · call/})}).first();
   await sample.locator(":scope > summary").click();
   await sample.getByRole("button", {name:"Read indexed reference source"}).click();
   await page.waitForFunction(() => document.querySelector("#source .source-line.highlight"));
@@ -894,7 +894,7 @@ test("Architecture review keeps exact evidence, independent filters and all unas
   const pair = page.locator("#architecture-inspector-content > details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
   await pair.locator(":scope > summary").click();
   assert.match(await pair.textContent(), /2 sampled sites.*0 omitted sites/is);
-  const sample = pair.locator(":scope > details").filter({has:page.locator("summary", {hasText:/production · reference/})}).first();
+  const sample = pair.locator(":scope > details").filter({has:page.locator("summary", {hasText:/production · call/})}).first();
   await sample.locator(":scope > summary").click();
   const sampleText = await sample.textContent();
   assert.match(sampleText, /crate::top::target/);

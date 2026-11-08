@@ -347,6 +347,43 @@ fn references_sample_limit_does_not_change_exact_counts_and_source_filter_keeps_
 }
 
 #[test]
+fn calls_are_sampled_first_past_the_fiftieth_site() {
+    let signatures: String = (0..55)
+        .map(|i| format!("fn s{i}(_: crate::high::T) {{}}\n"))
+        .collect();
+    let input = snapshot(&[
+        (
+            "src/low.rs",
+            &format!("{signatures}fn caller() {{ crate::high::f(); }}\n"),
+        ),
+        ("src/high.rs", "pub struct T; pub fn f() {}"),
+        ("src/lib.rs", "mod high; mod low;"),
+    ]);
+    for limit in [50, 5] {
+        let data = references::project(&input, &[], limit, &mut || Ok(()))
+            .unwrap()
+            .data;
+        let pair = edge(&data, "production", "src/low.rs", "src/high.rs");
+        let sites = pair["sites"].as_array().unwrap();
+        assert_eq!(sites[0]["relationKind"], "call");
+        assert_eq!(sites[0]["spelling"], "crate::high::f");
+        assert_eq!(sites.len(), limit);
+        assert_eq!(pair["count"], 56);
+        assert_eq!(pair["omittedSites"], 56 - limit);
+        let counts = &pair["kindCounts"];
+        assert_eq!(counts["call"], 1);
+        assert_eq!(counts["type"], 0);
+        assert_eq!(counts["import"], 0);
+        assert_eq!(counts["reference"], 55);
+        let sum: u64 = ["call", "type", "import", "reference"]
+            .iter()
+            .map(|kind| counts[*kind].as_u64().unwrap())
+            .sum();
+        assert_eq!(sum, pair["count"].as_u64().unwrap());
+    }
+}
+
+#[test]
 fn references_filtered_closure_keeps_selected_sources_and_both_role_destinations() {
     let input = snapshot(&[
         (

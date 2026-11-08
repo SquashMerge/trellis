@@ -143,7 +143,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":14,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":15,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
@@ -229,7 +229,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 14);
+        assert_eq!(ready["data"]["toolVersion"], 15);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -547,24 +547,6 @@ for (const name of ['trellis_outgoing_calls','trellis_incoming_calls']) {
     }
 }
 
-fn display_key(d: &crate::native_evidence::Declaration) -> String {
-    let mut segments: Vec<String> = d
-        .ancestors
-        .iter()
-        .map(|key| {
-            key.name
-                .clone()
-                .unwrap_or_else(|| format!("{}@{}", key.kind, key.ordinal))
-        })
-        .collect();
-    segments.push(
-        d.name
-            .clone()
-            .unwrap_or_else(|| format!("{}@{}", d.kind, d.range.start)),
-    );
-    format!("{}#{}", d.document.path, segments.join("."))
-}
-
 /// A declaration cannot be shortened: its measured record and closure fit together or fail.
 pub fn declaration(
     id: &Value,
@@ -599,7 +581,7 @@ pub fn declaration(
         "indexRevision":result.pin.index_revision});
     let envelope = json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
         "evidenceBasis":basis,
-        "data":{"stableLookupKey":source.stable_lookup_key,"displayKey":display_key(&result.declaration),"declaration":compact,"doc":doc,"lines":source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),"documents":documents,
+        "data":{"stableLookupKey":source.stable_lookup_key,"displayKey":crate::references::display_key(&result.declaration),"declaration":compact,"doc":doc,"lines":source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),"documents":documents,
             "evidence":{"evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]},
             "coverage":result.coverage,"provenance":result.provenance},
         "warnings":warnings,"partial":incomplete,"truncated":false,"truncationReason":null});
@@ -832,7 +814,7 @@ fn symbols(
                 json!({"symbolId":d.syntax_id,"name":d.name,"stableLookupKey":symbol.source.stable_lookup_key,
                     "kind":d.kind,"role":d.role,"path":d.document.path,"lines":lines,"evidenceTier":"syntax"})
             } else {
-                json!({"symbolId":d.syntax_id,"name":d.name,"displayKey":display_key(d),"stableLookupKey":symbol.source.stable_lookup_key,
+                json!({"symbolId":d.syntax_id,"name":d.name,"displayKey":crate::references::display_key(d),"stableLookupKey":symbol.source.stable_lookup_key,
                     "kind":d.kind,"role":d.role,"doc":doc,"range":d.range,"nameRange":d.name_range,"lines":lines,
                     "evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]})
             })
@@ -2625,7 +2607,7 @@ pub fn outgoing(
     modern: bool,
 ) -> Result<Option<Value>, &'static str> {
     use std::collections::BTreeMap;
-    let owner_display = display_key(&result.owner.selected.declaration);
+    let owner_display = crate::references::display_key(&result.owner.selected.declaration);
     let basis = json!({"indexGeneration":result.owner.selected.pin.index_generation.to_string(),
         "indexRevision":result.owner.selected.pin.index_revision});
     let fits = |envelope: &Value| -> bool {
@@ -3133,7 +3115,7 @@ pub fn incoming(
             let evidence = call_evidence(bound, call_projection(semantic, &call.document))?;
             callers.push(
                 json!({"callId":call.id,"ownerSyntaxId":call.owner_syntax_id,
-                "callerDisplayKey":display_key(&item.caller),"callerRole":item.caller.role,
+                "callerDisplayKey":crate::references::display_key(&item.caller),"callerRole":item.caller.role,
                 "doc":document_ref(&refs, version).ok_or("store_unavailable: missing caller ref")?,
                 "lines":item.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),
                 "range":call.range,"calleeRange":callee_range,"calleeText":item.callee_text,
@@ -3184,7 +3166,7 @@ pub fn incoming(
         let (bases, mut provenance) = intern_bases(&mut callers, provenance.into_values())?;
         label_projected_proofs(&mut provenance, semantic, count)?;
         let mut data = json!({
-            "symbolId":owner.declaration.syntax_id,"displayKey":display_key(&owner.declaration),
+            "symbolId":owner.declaration.syntax_id,"displayKey":crate::references::display_key(&owner.declaration),
             "stableLookupKey":result.selected.source.stable_lookup_key,
             "match":{"basis":"name","sameNameDeclarations":result.same_name_declarations,
                 "limitations":["aliases","functionValues","reExports","dynamicDispatch",
