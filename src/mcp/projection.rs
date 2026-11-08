@@ -2113,27 +2113,49 @@ mod compact_symbol_tests {
         }
     }
 
+    /// Path order fights language order here (`src/a.ts` sorts before `src/b.js` by bytes),
+    /// so only the #22 language rank puts JavaScript first.
     #[test]
     fn javascript_sorts_before_typescript() {
-        let result = fixture(
-            &[
-                ("a", "typescript", "src/a.ts", false),
-                ("b", "javascript", "src/a.js", false),
-            ],
-            false,
-        );
+        let hits = [
+            ("a", "typescript", "src/a.ts", false),
+            ("b", "javascript", "src/b.js", false),
+        ];
+        let result = fixture(&hits, false);
         let typescript = document_key(&result.symbols[0].source.document);
         let javascript = document_key(&result.symbols[1].source.document);
         assert!(javascript < typescript);
         assert_eq!(language_rank("typescript"), 4);
         assert!(language_rank("javascript") < language_rank("typescript"));
-        let (documents, _) =
-            document_table(result.symbols.iter().map(|s| &s.source.document)).unwrap();
-        let order: Vec<&str> = documents
+        let page = find_page(result, false);
+        let documents = page["data"]["documents"].as_array().unwrap();
+        assert_eq!(documents[0]["ref"], 0);
+        assert_eq!(documents[0]["document"]["language"], "javascript");
+        assert_eq!(documents[0]["document"]["path"], "src/b.js");
+        assert_eq!(documents[1]["document"]["language"], "typescript");
+        let coverage: Vec<&str> = page["data"]["coverage"]
+            .as_array()
+            .unwrap()
             .iter()
-            .map(|document| document["document"]["language"].as_str().unwrap())
+            .map(|row| row["language"].as_str().unwrap())
             .collect();
-        assert_eq!(order, ["javascript", "typescript"]);
+        assert_eq!(coverage, ["javascript", "typescript"]);
+        let lookup = lookup_candidates(
+            &json!(1),
+            "trellis_declaration",
+            "src/a.ts::a",
+            fixture(&hits, false),
+            &Default::default(),
+            root(),
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            lookup["data"]["documents"][0]["document"]["language"],
+            "javascript"
+        );
     }
 
     /// PR #767 review: the empty prefix lists every searched language, a hit only its own.
@@ -3333,6 +3355,63 @@ mod outgoing_tests {
         }
     }
 
+    /// `src/a.ts` sorts before `src/b.js` by path bytes, so only the #22 language rank puts
+    /// the JavaScript coverage row first.
+    #[test]
+    fn javascript_coverage_sorts_before_typescript() {
+        let mut typescript = owner();
+        typescript.declaration.document.language = "typescript".into();
+        typescript.declaration.document.path = "src/a.ts".into();
+        typescript.coverage[0].language = "typescript".into();
+        typescript.coverage[0].document_path = "src/a.ts".into();
+        typescript.provenance[0].document = typescript.declaration.document.clone();
+        let mut target = owner();
+        target.declaration.syntax_id = "sid:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        target.declaration.document.path = "src/b.js".into();
+        target.declaration.provenance_id = "native-proof:v1:target".into();
+        target.coverage[0].document_path = "src/b.js".into();
+        target.provenance[0].document = target.declaration.document.clone();
+        target.provenance[0].id = target.declaration.provenance_id.clone();
+        let mut call = required_call(false);
+        call.call.document = typescript.declaration.document.clone();
+        call.candidates.push(McpOutgoingCandidate {
+            declaration: target.declaration,
+            coverage: target.coverage.remove(0),
+            provenance: target.provenance.remove(0),
+        });
+        let answer = outgoing_fixture(
+            &json!(1),
+            McpOutgoing {
+                owner: typescript,
+                calls: vec![call],
+                has_more: false,
+            },
+            std::path::Path::new("/workspace"),
+            false,
+            true,
+        )
+        .unwrap();
+        let rows: Vec<(&str, &str)> = answer["data"]["coverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["language"].as_str().unwrap(),
+                    row["documentPath"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [("javascript", "src/b.js"), ("typescript", "src/a.ts")]
+        );
+        assert_eq!(
+            answer["data"]["documents"][0]["document"]["language"],
+            "javascript"
+        );
+    }
+
     #[test]
     fn shown_candidate_uses_its_own_proof_not_another_valid_proof() {
         let make_result = || {
@@ -3791,6 +3870,42 @@ mod incoming_tests {
                 "result":crate::mcp::tools::result("trellis_incoming_calls",full,modern)});
             assert!(serde_json::to_vec(&frame).unwrap().len() <= crate::mcp::wire::RESPONSE_BYTES);
         }
+    }
+    /// `src/a.ts` sorts before `src/b.js` by path bytes, so only the #22 language rank puts
+    /// the JavaScript coverage row first.
+    #[test]
+    fn javascript_coverage_sorts_before_typescript() {
+        let mut result = fixture(1, false, 0);
+        result.selected.selected.coverage[0].language = "typescript".into();
+        result.selected.selected.coverage[0].document_path = "src/a.ts".into();
+        let item = &mut result.calls[0];
+        item.coverage.language = "javascript".into();
+        item.coverage.document_path = "src/b.js".into();
+        for document in [
+            &mut item.call.document,
+            &mut item.caller.document,
+            &mut item.source.document.document,
+            &mut item.provenance.document,
+        ] {
+            document.language = "javascript".into();
+            document.path = "src/b.js".into();
+        }
+        let envelope = project(result, true).unwrap();
+        let rows: Vec<(&str, &str)> = envelope["data"]["coverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["language"].as_str().unwrap(),
+                    row["documentPath"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [("javascript", "src/b.js"), ("typescript", "src/a.ts")]
+        );
     }
     #[test]
     fn incoming_scope_has_five_rows() {

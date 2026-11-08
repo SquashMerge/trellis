@@ -17726,10 +17726,8 @@ fn rules_explain_accepts_typescript_targets_and_npm_destinations() {
         ))
     };
     let accepted = explain(1, "typescript", npm.clone());
-    assert_ne!(
-        accepted["result"]["structuredContent"]["error"]["code"], "invalid_request",
-        "{accepted}"
-    );
+    // Validation passed, so the call reached the store, which has no index yet.
+    tool(&accepted, Some("index_not_ready"), false);
     let rejected = explain(2, "TypeScript", npm);
     tool(&rejected, Some("invalid_request"), false);
     let rejected = explain(
