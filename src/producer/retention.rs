@@ -181,10 +181,14 @@ fn attach_inner(db: &Connection, state: &StateDir, root_key: &str) -> Result<()>
             // not keep across reboots: the same record and inode is the same root. Any other
             // identity is a different root. The catalog is disposable, so its slots are
             // dropped rather than refused forever; nothing of the other root is admitted.
+            // These are fixed contract statements too: a missing table or column stays typed
+            // corruption, while busy, I/O and full-disk faults stay operational.
             if !same_root_other_device(&identity, root_key) {
-                tx.execute_batch("DELETE FROM retained_runs; DELETE FROM legacy_languages;")?;
+                catalog_query(
+                    tx.execute_batch("DELETE FROM retained_runs; DELETE FROM legacy_languages;"),
+                )?;
             }
-            tx.execute("UPDATE identity SET root_key=?1", [root_key])?;
+            catalog_query(tx.execute("UPDATE identity SET root_key=?1", [root_key]))?;
         }
         tx.commit()?;
     }
@@ -651,6 +655,69 @@ mod tests {
             drop(db);
             assert_eq!(catalog_identity(&state), key, "{other}");
         }
+    }
+
+    /// Review of #812: rebinding a mismatched identity must not bypass the structural
+    /// classification. A damaged catalog stays typed whichever identity it carries.
+    #[test]
+    fn rebinding_a_damaged_catalog_stays_typed() {
+        for table in ["retained_runs", "legacy_languages"] {
+            for other in ["different-root", "{record}:16777234:{inode}"] {
+                let (temp, state, record) = world();
+                let key = format!("{record}:1110064");
+                let other = other
+                    .replace("{record}", &record)
+                    .replace("{inode}", "1110064");
+                let db = Connection::open(temp.path().join("index.db")).unwrap();
+                attach(&db, &state, &key).unwrap();
+                db.execute("UPDATE retained.identity SET root_key=?1", [&other])
+                    .unwrap();
+                db.execute_batch(&format!("DROP TABLE retained.{table}"))
+                    .unwrap();
+                drop(db);
+                let db = Connection::open(temp.path().join("index.db")).unwrap();
+                let error = attach(&db, &state, &key).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with(super::super::PRODUCER_STATE_CORRUPT)
+                        && unavailable_catalog(&error),
+                    "{table} under {other}: {error:#}"
+                );
+            }
+        }
+    }
+
+    /// An operational fault while rebinding stays operational, never optional corruption.
+    #[test]
+    fn rebinding_operational_fault_is_not_catalog_corruption() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, state, record) = world();
+        let key = format!("{record}:1110064");
+        let db = Connection::open(temp.path().join("index.db")).unwrap();
+        attach(&db, &state, &key).unwrap();
+        db.execute("UPDATE retained.identity SET root_key='different-root'", [])
+            .unwrap();
+        drop(db);
+        let path = state.path().join(FILE);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        let db = Connection::open(temp.path().join("index.db")).unwrap();
+        let error = attach(&db, &state, &key).unwrap_err();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!unavailable_catalog(&error), "{error:#}");
+        assert!(
+            matches!(
+                error.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(code, _))
+                    if code.code == rusqlite::ErrorCode::ReadOnly
+            ),
+            "{error:#}"
+        );
+        assert_eq!(
+            catalog_identity(&state),
+            "different-root",
+            "nothing rebound"
+        );
     }
 
     #[test]
