@@ -939,6 +939,7 @@ fn rule_evidence_names_its_owner() {
         .iter()
         .find(|e| e["relationKind"] == "import")
         .unwrap();
+    assert!(import["owner"].is_object(), "{import}");
     assert!(import["owner"]["name"].is_null(), "{import}");
     assert!(import["owner"]["stableLookupKey"].is_null(), "{import}");
 }

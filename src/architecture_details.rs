@@ -499,4 +499,28 @@ mod tests {
             assert_eq!(item["instance"]["evidence"][0]["relationKind"], "call");
         }
     }
+
+    /// #785: pair pages pass the edge's `kindCounts` and its sites' classified fields through.
+    #[test]
+    fn pair_pages_carry_kind_counts_and_site_classification() {
+        let pair = json!({"source":{"path":"a.rs"},"target":{"path":"b.rs"},"count":2,
+            "kindCounts":{"call":1,"type":0,"import":0,"reference":1},
+            "sites":[{"relationKind":"call","owner":{"syntaxId":"s","name":"run","stableLookupKey":"a.rs::run"},
+                    "target":{"syntaxId":"t","displayKey":"b.rs#f","document":{"path":"b.rs"},"lines":{"start":1,"end":1}},
+                    "targetReason":null},
+                {"relationKind":"reference","owner":null,"target":null,"targetReason":"unresolved"}]});
+        let references = json!({"production":[pair.clone()],"tests":[]});
+        let rules = json!({"rulesFile":{"contentHash":"hash"}});
+        let native = BTreeMap::new();
+        let layers = Layers::new(&native, &rules);
+        let mut query = query(0, 1);
+        query.kind = Kind::Pairs;
+        let page = page(&query, &references, &rules, &layers, &mut || Ok(())).unwrap();
+        assert_eq!(page["items"][0]["pair"], pair);
+        assert_eq!(page["items"][0]["pair"]["kindCounts"]["call"], 1);
+        assert_eq!(
+            page["items"][0]["pair"]["sites"][1]["targetReason"],
+            "unresolved"
+        );
+    }
 }

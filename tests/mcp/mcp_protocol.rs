@@ -11577,6 +11577,19 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
             "every page carries the whole-result counts"
         );
         instances += data["instances"].as_array().unwrap().len();
+        for row in data["instances"].as_array().unwrap() {
+            if row["rule"] == "$layers" || row["rule"] == "$external" {
+                let total: u64 = ["call", "type", "import", "reference"]
+                    .iter()
+                    .map(|kind| row["kindCounts"][*kind].as_u64().unwrap())
+                    .sum();
+                assert_eq!(total, row["referenceCount"].as_u64().unwrap(), "{row}");
+                let witness = &row["evidence"][0];
+                assert!(witness["relationKind"].is_string(), "{row}");
+                assert!(witness["owner"].is_object(), "{row}");
+                assert!(witness["targetReason"].is_string(), "{row}");
+            }
+        }
         structured.push(json!({"name":"trellis_rules_check",
             "structuredContent":page["result"]["structuredContent"]}));
         pages += 1;
@@ -11599,6 +11612,14 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
     let row = &explained["result"]["structuredContent"]["data"]["instances"][0];
     assert_eq!(row["evidence"].as_array().unwrap().len(), 2);
     assert_eq!(row["omittedEvidence"], 298);
+    assert_eq!(row["kindCounts"]["import"], 300, "{row}");
+    for item in row["evidence"].as_array().unwrap() {
+        assert!(item["lines"]["start"].as_u64().unwrap() >= 1, "{item}");
+        assert_eq!(item["relationKind"], "import", "{item}");
+        assert!(item["spelling"].is_string(), "{item}");
+        assert!(item["owner"].is_object(), "{item}");
+        assert_eq!(item["targetReason"], "structural_only", "{item}");
+    }
     structured.push(json!({"name":"trellis_rules_explain",
         "structuredContent":explained["result"]["structuredContent"]}));
     let references = ask(

@@ -1155,7 +1155,7 @@ a check instance that omits evidence carries `nextCall`, the ready-made
 Reference evidence is a `structuralReference` or `semanticBinding` item of a `$layers` or
 `$external` instance, including the items of an unknown `$layers` row. It carries all of
 `caller`, `callerReason`, `lines`, `relationKind`, `spelling`, `owner`, `target` and
-`targetReason`, copied from its site. `lines` is the call site's lines. Constraint evidence
+`targetReason`, copied from its site. `lines` is the site's lines. Constraint evidence
 carries only `caller` and `callerReason`; declaration evidence carries neither. A `$layers`
 or `$external` instance carries `kindCounts`, the edge's counts or, for an unknown row,
 the counts of the sites it aggregates. Declaration instances have `referenceCount:0` and no

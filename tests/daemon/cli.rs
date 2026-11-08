@@ -3686,6 +3686,18 @@ paths = ["src/low.rs"]
     assert_eq!(violation["target"]["path"], "src/low.rs");
     assert_eq!(violation["destination"]["path"], "src/high.rs");
     assert_eq!(violation["referenceCount"], 2);
+    // #785: the one JSON document carries kind counts and classified evidence.
+    assert_eq!(
+        violation["kindCounts"],
+        serde_json::json!({"call":2,"type":0,"import":0,"reference":0})
+    );
+    for item in violation["evidence"].as_array().unwrap() {
+        assert_eq!(item["relationKind"], "call", "{item}");
+        assert!(item["lines"]["start"].as_u64().unwrap() >= 1, "{item}");
+        assert!(item["spelling"].is_string(), "{item}");
+        assert!(item["owner"]["name"].is_string(), "{item}");
+        assert_eq!(item["targetReason"], "structural_only", "{item}");
+    }
     assert_eq!(payload["testOnly"].as_array().unwrap().len(), 1);
     assert_eq!(payload["testOnly"][0]["referenceCount"], 1);
     assert_eq!(payload["rulesFile"]["path"], ".trellis/rules.toml");

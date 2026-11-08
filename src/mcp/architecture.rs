@@ -1468,6 +1468,56 @@ mod tests {
         assert_eq!(seen, many);
     }
 
+    /// #785: an unknown instance with 50 classified structural rows (the explain maximum)
+    /// pages as one item under the response cap.
+    #[test]
+    fn explain_fifty_classified_rows_fit_one_frame() {
+        let row = |i: usize| {
+            json!({"document":{"sourceSetId":"source-set:v1:735dcbe5-e5b0-4ff9-be12-000000000000",
+                    "language":"rust","path":"src/index_coordinator.rs"},
+                "revisionId":"native:v1:0123456789abcdef0123456789abcdef0123456789abcdef",
+                "range":{"startByte":i * 100,"endByte":i * 100 + 40},
+                "kind":"structuralReference",
+                "syntaxId":format!("sid:v1:{i:032x}"),
+                "callId":format!("occ:v2:{i:032x}"),
+                "provenanceId":"native:v1:fedcba9876543210fedcba9876543210fedcba9876543210",
+                "caller":null,"callerReason":"syntax_only",
+                "lines":{"start":i + 1,"end":i + 1},
+                "relationKind":"reference",
+                "spelling":"crate::coordinator::state::SomeLongTypeName".chars().take(40).collect::<String>(),
+                "owner":{"syntaxId":format!("sid:v1:{i:032x}"),
+                    "name":"an_owner_function_name",
+                    "stableLookupKey":format!("src/index_coordinator.rs::{}", "k".repeat(40))
+                        .chars().take(60).collect::<String>()},
+                "target":null,"targetReason":"structural_only"})
+        };
+        let mut instance = rule_instance(0, "unknown", (0..50).map(row).collect());
+        instance["referenceCount"] = json!(50);
+        instance["kindCounts"] = json!({"call":0,"type":0,"import":0,"reference":50});
+        instance["target"]["path"] = json!("src/index_coordinator.rs");
+        let whole = rules_envelope(vec![instance.clone()], vec![]);
+        let pages = rules_pages(
+            "trellis_rules_explain",
+            &whole,
+            json!({"schemaVersion":1,"limit":50}),
+        );
+        // `rules_pages` asserts every frame is under RESPONSE_BYTES. The instance is a lone
+        // item on the first page; the unassigned list follows on the next.
+        let counted: Vec<usize> = pages
+            .iter()
+            .map(|page| page["instances"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(counted.iter().sum::<usize>(), 1, "{counted:?}");
+        assert_eq!(counted[0], 1);
+        assert_eq!(
+            pages[0]["instances"][0]["evidence"]
+                .as_array()
+                .unwrap()
+                .len(),
+            50
+        );
+    }
+
     /// #769: a check instance that omits evidence carries its explain call, copied from
     /// the instance; one that omits nothing, or whose arguments would not validate, has
     /// none. Paging measures each instance with its hint, so every page stays within the
