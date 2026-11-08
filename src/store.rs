@@ -2677,7 +2677,8 @@ impl EvidenceResponse {
             [&selected.key],
             |row| row.get(0),
         )?;
-        // Entries of other inputs have shapes this read does not need.
+        // Entries of other inputs have shapes this read does not need. A root config
+        // entry it does need is strictly `present` with bytes or `absent`.
         #[derive(serde::Deserialize)]
         struct ConfigEntry<'a> {
             #[serde(borrow, default)]
@@ -2698,18 +2699,28 @@ impl EvidenceResponse {
             check()?;
             let ConfigEntry {
                 path: Some(path),
-                kind: Some(kind),
-                bytes: Some(bytes),
-                byte_length: Some(byte_length),
+                kind,
+                bytes,
+                byte_length,
             } = entry
             else {
                 continue;
             };
             let path = path.as_ref();
-            if kind != "present"
-                || !matches!(path, "tsconfig.json" | "jsconfig.json")
-                || (path == "jsconfig.json" && root_tsconfig.is_some())
-            {
+            if !matches!(path, "tsconfig.json" | "jsconfig.json") {
+                continue;
+            }
+            let (bytes, byte_length) = match (kind.as_deref(), bytes, byte_length) {
+                (Some("absent"), None, None) => continue,
+                (Some("present"), Some(bytes), Some(byte_length)) => (bytes, byte_length),
+                _ => {
+                    return Err(SelectedIntegrity(format!(
+                        "incompatible_index: corrupt retained {path} entry"
+                    ))
+                    .into());
+                }
+            };
+            if path == "jsconfig.json" && root_tsconfig.is_some() {
                 continue;
             }
             source_bytes = source_bytes.saturating_add(byte_length);
@@ -22038,6 +22049,59 @@ fn architecture_retained_package_components_fail_atomically_with_typed_integrity
             .architecture_response("references", &serde_json::json!({}), &mut || Ok(()))
             .unwrap_err();
         assert!(error.is::<SelectedIntegrity>(), "{fault}: {error:#}");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn architecture_malformed_retained_root_config_fails_with_typed_integrity() {
+    use serde_json::json;
+    let malformed = [
+        json!({"path":"tsconfig.json","type":"present","bytex":"7b7d","byteLength":2}),
+        json!({"path":"tsconfig.json","type":"present","bytes":"7b7d"}),
+        json!({"path":"tsconfig.json","type":"present","bytes":7,"byteLength":2}),
+        json!({"path":"tsconfig.json","bytes":"7b7d","byteLength":2}),
+        json!({"path":"tsconfig.json","type":"absentx"}),
+        json!({"path":"jsconfig.json","type":"present","byteLength":2}),
+    ];
+    // Unrelated entries of other shapes are still skipped.
+    let unrelated = [
+        json!({"nativeAdmission":{"maxFileBytes":1}}),
+        json!({"path":"other.json","type":"other"}),
+        json!({"path":"tsconfig.json","type":"absent"}),
+    ];
+    for (entry, typed) in malformed
+        .iter()
+        .map(|entry| (entry, true))
+        .chain(unrelated.iter().map(|entry| (entry, false)))
+    {
+        let (_state, _root, store) = selected_read_once_tests::published_store(1);
+        let db = store.cache_write().unwrap();
+        let (id, retained): (String, String) = db
+            .query_row(
+                "SELECT id,retained_config FROM native_revisions LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let mut inputs: Vec<serde_json::Value> = serde_json::from_str(&retained).unwrap();
+        inputs.retain(|input| input["path"] != entry["path"]);
+        inputs.push(entry.clone());
+        db.execute(
+            "UPDATE native_revisions SET retained_config=?1 WHERE id=?2",
+            params![serde_json::to_string(&inputs).unwrap(), id],
+        )
+        .unwrap();
+        drop(db);
+        let response = store.evidence_response().unwrap();
+        let result =
+            response.architecture_response("references", &serde_json::json!({}), &mut || Ok(()));
+        if typed {
+            let error = result.unwrap_err();
+            assert!(error.is::<SelectedIntegrity>(), "{entry}: {error:#}");
+        } else {
+            result.unwrap_or_else(|error| panic!("{entry}: {error:#}"));
+        }
     }
 }
 
