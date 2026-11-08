@@ -1,10 +1,16 @@
 # Trellis for Herdr
 
-A [Herdr app](https://herdr.dev) mod that shows Trellis in a pane beside the coding agents (#707). It draws the loopback daemon's **Architecture** layer stack the same way the web app does, lists the layers with their counts, and follows the file selected in the `trellis-files` panel.
+A [Herdr app](https://herdr.dev) mod that shows Trellis in a pane beside the coding agents (#707). It has two views, drawn the same way the web app draws them:
+
+- **Architecture:** the layer stack, with the layers and their counts as native rows.
+- **Sequence:** a method's static call sequence, with its steps as native rows. Clicking a proven call re-centers on that method.
+
+Both views follow the file selected in the `trellis-files` panel. The pane talks to the Trellis daemon on the machine the shown space lives on.
 
 - `src/main.js` is the pane: a checkout selector, index status, typed error states, the diagram and the layer list.
 - `src/client.js` is the daemon client: token, routes and typed errors.
-- `src/diagram.js` draws the diagram. It uses the browser's own `web/architecture-pele.js`, `web/metric-heat.js`, `web/architecture.js` helpers and the vendored Pele, bundled unchanged.
+- `src/diagram.js` draws Architecture. It uses the browser's own `web/architecture-pele.js`, `web/metric-heat.js`, `web/architecture.js` helpers and the vendored Pele, bundled unchanged.
+- `src/sequence.js` draws Sequence. It uses `web/sequence-pele.js` and the helpers in `web/sequence.js`, bundled unchanged.
 - `src/dom.js` is the small SVG DOM the adapter needs, because the mod runtime has none.
 - `trellis-files/publish-selection.patch` is the one change to a clone of Herdr's shipped Files mod.
 
@@ -20,7 +26,19 @@ See [DESIGN-NOTES.md](DESIGN-NOTES.md) for how it works, what's missing and what
   trellis serve --token-file ~/.config/trellis/serve.token
   ```
 
-## Install
+## Install on a laptop that views this Mac mini
+
+Mods run in the app that draws them. A laptop's Herdr app runs the mods in the laptop's own `~/.config/herdr-app/mods/`, so the mods have to be copied there. They still talk to the mini's daemon, through `exec` on the mini.
+
+The mini (below) builds and installs both mods. On the laptop, run this one line. `MINI` is the ssh host the laptop's Herdr uses for the mini, the name shown under Machines:
+
+```sh
+ssh MINI 'tar -C ~/.config/herdr-app/mods --exclude .render --exclude "*.d.ts" --exclude jsconfig.json -czf - trellis trellis-files' | tar -xzf - -C ~/.config/herdr-app/mods && herdr-app check ~/.config/herdr-app/mods/trellis && herdr-app check ~/.config/herdr-app/mods/trellis-files
+```
+
+**Update:** run `node build.mjs --install` on the mini, then run the same line on the laptop. The laptop needs no Node, npm or repository.
+
+## Install on the machine that builds
 
 ```sh
 cd herdr-mod
@@ -62,8 +80,15 @@ Optional `props`:
 | `url` | `http://127.0.0.1:8877` | The daemon. Only loopback (`127.0.0.1`, `localhost`, `[::1]`) is accepted. |
 | `tokenFile` | `~/.config/trellis/serve.token` | The serve token file. |
 | `checkout` | none | A root key to open. |
+| `machine` | the shown space's machine | Herdr machine whose daemon to show; `""` means this computer. |
+| `transport` | `fetch` here, `exec` elsewhere | `"exec"` forces the curl path on this computer too. |
 
 For example, `{"direction":"right","mod":"trellis","props":{"url":"http://127.0.0.1:9000"}}`.
+
+**Which daemon the pane shows:**
+
+- For a space on this computer, the pane fetches from `url` here.
+- For a space on another Herdr machine, the pane runs `curl` *on that machine*, against `127.0.0.1:<port of url>`, with that machine's token file (`~` is that machine's home). The token never leaves that machine. That machine needs `sh` and `curl`.
 
 Opening the pane doesn't choose a checkout by itself, because reading a checkout's status starts indexing it. It opens:
 
@@ -73,6 +98,7 @@ Opening the pane doesn't choose a checkout by itself, because reading a checkout
 
 ## Update
 
+- **The laptop:** see [Install on a laptop](#install-on-a-laptop-that-views-this-mac-mini).
 - **This mod:** pull the repository, then run `node build.mjs --install` again. Saving `main.js` reloads every open copy.
 - **`trellis-files`:** Herdr never updates clones. After a Herdr update changes the shipped Files mod, remove `~/.config/herdr-app/mods/trellis-files`, then clone and patch again. If the patch no longer applies, re-make the same three-line change in the new `show()`.
 
@@ -81,6 +107,6 @@ Opening the pane doesn't choose a checkout by itself, because reading a checkout
 - After every change, run `herdr-app check ~/.config/herdr-app/mods/trellis` and `herdr-app status`. Then look at the pane with `herdr-app shot <file>`.
 - `node test/harness.mjs --url <daemon> --token-file <file> [--cwd <folder>] [--select <path>] [--click layer-<name>]` runs the real `src/main.js` in Node. It runs against a live daemon, with stand-ins for Herdr's modules, and prints the text the pane would show and the drawing it wrote. It checks the data path, not the picture.
 
-- `node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs`, run from the repository root, tests the logic. It needs no install, and `tools/verify` runs it in the `checks` lane.
+- `node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs`, run from the repository root, tests the logic. `view.test.mjs` runs the real pane against a fake daemon through the exec + curl transport. It needs no install, and `tools/verify` runs it in the `checks` lane.
 
 The build itself isn't part of `tools/verify`, because it needs `npm ci`, which downloads esbuild.

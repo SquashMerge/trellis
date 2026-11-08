@@ -4,35 +4,16 @@
 // browser's web/architecture.js builds inside its DOM-bound `create()` closure are ported
 // below, with its defaults (metric cognitive, aggregate max, production role, fixed bands,
 // tests hidden); they are marked with the function names they mirror. Keep them in step.
-import makePele, { widthTable } from "trellis-web:pele";
 import makeMetricHeat from "trellis-web:metric-heat";
 import makeArchitecture from "trellis-web:architecture";
 import makeArchitecturePele from "trellis-web:architecture-pele";
-import { DOMParser, TextEncoder, createDocument, serialize } from "./dom.js";
+import { DOMParser, TextEncoder, serialize } from "./dom.js";
+import { FONT_FAMILY, document, pele } from "./runtime.js";
 
-// Pele's headless text measure (its Helvetica table), so the adapter wraps and fits labels
-// with the same widths Pele lays them out with. Mirrors Pele's `_1.width(text, size, 0)`.
-const WIDTHS = Array.from({ length: 95 }, (_, i) => parseInt(widthTable.substr(i * 2, 2), 36));
-const zeroWidth = (c) => c === 173 || (c >= 768 && c <= 879) || (c >= 8203 && c <= 8207) || (c >= 56320 && c <= 57343) || (c >= 65024 && c <= 65039) || c === 65279;
-const wide = (c) => (c >= 4352 && c <= 4447) || (c >= 11904 && c <= 42191) || (c >= 44032 && c <= 55203) || (c >= 63744 && c <= 64255) ||
-  (c >= 65072 && c <= 65103) || (c >= 65280 && c <= 65376) || (c >= 65504 && c <= 65510) || (c >= 55296 && c <= 56319);
-export function measure(text, size = 14) {
-  let units = 0;
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    if (c < 32) continue;
-    if (c < 127) units += WIDTHS[c - 32];
-    else if (!zeroWidth(c)) units += wide(c) ? 1000 : 580;
-  }
-  return (units * size) / 1000;
-}
-// The family the drawn text is set in: the metrics above are Helvetica's.
-export const FONT_FAMILY = "Helvetica, Arial, sans-serif";
+export { measure } from "./runtime.js";
 
-const document = createDocument(measure);
 const heat = makeMetricHeat({});
 const helpers = makeArchitecture({ TrellisMetricHeat: heat }, document);
-const pele = makePele({});
 const adapter = makeArchitecturePele({ pele }, document, DOMParser, TextEncoder);
 const { metricValue, createScale } = heat;
 const { moduleKey, commonDirectory, groupModules } = helpers;

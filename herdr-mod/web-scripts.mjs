@@ -18,6 +18,9 @@ const WEB = {
   // Only the pure helpers it exports (moduleKey, commonDirectory, groupModules) are used.
   architecture: { file: "architecture.js", params: "window, document", result: "window.TrellisArchitecture" },
   "architecture-pele": { file: "architecture-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisArchitecturePele" },
+  // The language-neutral Sequence helpers (labels, lanes, display); its own SVG renderer is unused.
+  sequence: { file: "sequence.js", params: "window, document", result: "window.TrellisSequence" },
+  "sequence-pele": { file: "sequence-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisPeleSequence" },
 };
 
 /** The ES module source for `trellis-web:<name>`, and the file it comes from. */

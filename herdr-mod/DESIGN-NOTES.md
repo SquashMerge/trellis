@@ -1,6 +1,6 @@
 # Trellis for Herdr: design notes (#707 foundation)
 
-This first cut is the shell plus one view, Architecture. Owner decisions of 2026-11-08 set the scope:
+This cut is the shell plus two views, Architecture and Sequence. The daemon can be on another Herdr machine (round 2, 2026-11-08). Live agent-follow is deferred to #809. Owner decisions of 2026-11-08 set the scope:
 
 - the mod mirrors the web app, but has no file list of its own, because files come from a `trellis-files` clone of Herdr's Files panel;
 - the first view is Architecture's layer stack;
@@ -14,12 +14,14 @@ This first cut is the shell plus one view, Architecture. Owner decisions of 2026
 | Shell | Checkout selector (the daemon's `/api/checkouts`, with each row's index state), index status (revision, Fresh or Catching up), polling (status every 5 s, list every 30 s, `building` retried at the daemon's `retryAfterMs`). | `test/harness.mjs` runs the real `src/main.js` against a live daemon. |
 | Typed errors | Every failure is a code and a message, and the data from that read is dropped. Codes come from the daemon (`index_not_ready`, `unauthorized`, `revision_conflict` and so on) or the mod (`token_missing`, `token_unreadable`, `token_invalid`, `daemon_unreachable`, `invalid_url`, `invalid_response`, and the adapter's `unsupported`). A drawing is shown only for the payload it was made from. | Harness against a stopped port, a non-loopback URL, a missing token and the owner's daemon. Unit tests. |
 | Architecture | Fetches the summary with the browser's parameters (`aggregate=max&role=production&workbench=true`, pinned to the status revision) and validates it as the browser's `payloadOf` does. Draws with the browser's own adapter and Pele. Lists the layers natively: order, files, max cognitive, and outgoing counts (↑ ⇄ ↓ →shared and so on, with deviations in the error colour), plus hidden, test, unassigned and coverage lines. | Harness. Unit tests, which use the browser's own Architecture fixture. |
+| Transport | A space on this computer uses `fetch`. A space on another Herdr machine runs `curl` there through `exec`, with the token read there. See [Transport](#transport). | `view.test.mjs` drives the real pane through `exec` and `curl` against a fake daemon, and checks a missing token, a rejected token and a stopped daemon. The harness ran it against the isolated daemon. |
+| Sequence | The Files selection lists the file's methods (`GET methods`). The first consequential named method opens (`POST sequence`, checked against the pin and seed as the browser checks it). The browser's own `web/sequence-pele.js` draws it. The steps are native rows. Clicking a proven call (diagram or row) re-centers on its target, with Back. Groups expand and collapse. | `view.test.mjs` re-centers on a resolved call and goes back. Harness against the isolated daemon, which is syntax-only, so it has no proven targets. |
 | Clicks | Pressing a band in the diagram, or its row in the list, opens or folds it, as the band header does in the browser. Pressing an arrow's count, a file or a note shows its full label above the drawing. | Harness (`--press L`, `--press E`, `--click layer-web`). |
 | Files follow | `trellis-files` publishes `trellis.selectedFile`. The mod switches to the checkout that holds the file. It shows the file's layer, the layer's counts, the file's module chip (name, file count, max cognitive, heat, rank in the band, whether it's drawn or in "+N more"), and the file's own metric. A drawn chip gets an accent outline. | Harness (`--select src/http.rs`, `--select web/architecture.js`). `trellis-files` passes `herdr-app check`. |
 | Theme | Every fill and stroke in the SVG is mapped from the browser's brand palette to `theme()` colours. Native text is 13 px body, 12 px secondary and 14 px headings. | A unit test asserts that no unthemed colour remains. |
 | Tests | `test/mod.test.mjs` covers the DOM, the measure, drawing, hit-testing, the client and payload checks. It needs no install, and it runs in `tools/verify`'s `checks` lane. | `node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs` |
 
-**Not yet seen in the window.** See [SVG fidelity](#svg-fidelity).
+**Not yet seen in the window.** See [SVG fidelity](#svg-fidelity). The owner views through the laptop, so the mini's window draws no frames unless someone screen-shares into the mini.
 
 ## How the diagram is drawn
 
@@ -56,7 +58,7 @@ The layout comes from the same adapter code, the same patched Pele build and the
 3. **No hover, focus or pressed states.** The image is static.
 4. **The browser's resize fit uses the canvas's inner width.** The mod uses the pane width less 24 px of padding.
 
-**Screenshot: not taken yet.** For the whole session, Herdr's window drew no new frame. `herdr-app shot` returned the same frame each time, so the window is most likely minimized or on another Space. The Trellis pane was opened with `pane.split`, but it never laid out: its `.render/` folder was never created. So nobody has looked at the SVG text in Herdr's renderer yet. That's the main open risk, because the renderer may lack system fonts for SVG `<text>`. To check it, bring the window to the front, open the pane, then run `herdr-app shot /Users/jcarreira/projects/squashmerge/trellis-evidence/707/architecture.png`.
+**Screenshot: not taken yet.** The mini's window draws frames only while someone views it locally; the owner views through the laptop. For the whole session, Herdr's window drew no new frame. `herdr-app shot` returned the same frame each time, so the window is most likely minimized or on another Space. The Trellis pane was opened with `pane.split`, but it never laid out: its `.render/` folder was never created. So nobody has looked at the SVG text in Herdr's renderer yet. That's the main open risk, because the renderer may lack system fonts for SVG `<text>`. To check it, bring the window to the front, open the pane, then run `herdr-app shot /Users/jcarreira/projects/squashmerge/trellis-evidence/707/architecture.png`.
 
 ## How clicks on the diagram work, and how they can grow
 
@@ -72,17 +74,49 @@ Next steps, in increasing cost:
 
 ## Bundle size
 
-`main.js` is **839.7 KiB**. esbuild minifies whitespace and syntax, but keeps names for readable stack traces.
+`main.js` is **910.6 KiB** with Sequence (it was 839.7 KiB with Architecture only). esbuild minifies whitespace and syntax, but keeps names for readable stack traces.
 
 | Part | Size |
 |---|---|
 | Vendored Pele (already minified) | 695.5 KiB |
 | `web/architecture.js` (only three helpers are used) | 61.2 KiB |
 | `web/architecture-pele.js` | 38.9 KiB |
-| Mod code | 40.4 KiB |
+| `web/sequence.js` and `web/sequence-pele.js` | 55.3 KiB |
+| Mod code | 57.1 KiB |
 | `web/metric-heat.js` | 2.6 KiB |
 
 `herdr-app check` loads and renders it in about 0.15 s. If size matters later, the easiest saving is to move `moduleKey`, `commonDirectory` and `groupModules` into their own browser script, which saves about 60 KiB.
+
+## Transport
+
+Mods run in the app that draws them. When the owner views the mini from the laptop, the mod runs on the laptop, and a `fetch` to `127.0.0.1` would reach the laptop. So the pane picks the machine from the shown space (`spaces()[i].machine`, `null` for this computer), unless props name one. A machine Herdr marks `unavailable` in `machines()` is a typed `machine_unavailable` state.
+
+- **This computer:** `fetch(url)`, with the token read from the token file into the client closure.
+- **Another machine:** each request is one `exec("sh", ["-c", SCRIPT, "trellis", tokenFile, port, path, body], { on: machine })`. The script runs on the daemon's machine:
+  - it expands `~` in the token file path against that machine's home;
+  - it reads and validates the token there;
+  - it runs `curl -sS --max-time 25 --max-filesize 8000000 -H @- … http://127.0.0.1:<port><path>`, with `Authorization: Bearer <token>` written to curl's stdin by the shell's builtin `printf`;
+  - it prints the body, then a `TRELLIS-STATUS <code>` line, or a `TRELLIS-ERROR` / `TRELLIS-CURL` line.
+
+  The pane turns those into the same typed errors as `fetch`:
+
+  | Failure | Code |
+  |---|---|
+  | No token file | `token_missing` |
+  | Token file not readable | `token_unreadable` |
+  | Not a token | `token_invalid` |
+  | No curl on that machine | `curl_missing` |
+  | curl exit 7 | `daemon_unreachable` |
+  | curl exit 28 | `daemon_timeout` |
+  | curl exit 63 | `response_too_large` |
+  | `exec` rejected | `machine_unreachable` |
+  | Any other curl failure | `transport_failed` |
+
+  A daemon `{error}` answer keeps its own code. Responses are bounded by curl's `--max-filesize` and `exec`'s 8 MiB cap.
+- **The token stays on the daemon's machine.** It is never in the viewing app, its logs, mod state, or the `exec` arguments. Because the header goes through stdin (`-H @-`), it isn't in curl's argv either. Older curls without `-H @-` would need the header in argv, where the bearer token would show in that machine's process list for the length of the request; that is acceptable under T00 (same user) but isn't needed with the macOS curl. A POST body (sequence seed and pin) is in curl's argv; it holds no secret.
+- **Polling:** status every 5 s locally, and every 10 s for another machine, because each poll runs a command there.
+- **The fetch path still has no timeout.** The runtime's `fetch` takes none. Setting `transport: "exec"` uses curl's timeout on this computer too.
+- **Files-panel paths:** `trellis-files` publishes `on` (its space's machine). The pane follows only a file on the machine it shows, so a remote file maps to that machine's checkouts.
 
 ## Auth
 
@@ -111,7 +145,7 @@ Next steps, in increasing cost:
 ## What each remaining view needs
 
 - **Classes.** It needs `GET classes` (the catalog), `POST class-diagram` and `web/classes.js`'s Pele adapter. That adapter also parses with `DOMParser` and uses compound and `:scope >` selectors, so it should run on `src/dom.js`. Its DOM-bound UI (members toggle, chooser) would be ported to native rows, as Architecture's options were. Clicks would use the same box hit-testing, on class and member nodes.
-- **Sequence.** It needs `POST sequence` (`{seed, expectedRevision, showAll, interactions}`) with a method chosen from `GET methods` or the followed file's symbols (`GET symbols?path=`). `web/sequence-pele.js` is the adapter, so check its selectors against `src/dom.js`. The browser's step list and source dock become native rows. Source reads (`GET source`, revision-pinned) can use the shipped `Editor` in read-only mode.
+- **Sequence: built** (`src/sequence.js`). `web/sequence-pele.js` runs unchanged, over the helpers in `web/sequence.js`, which is wrapped unchanged; only its exported helpers are used, not its own SVG renderer. Its HTML expand/collapse buttons are `foreignObject`s, which an image can't draw, so they're left out of the SVG; the step rows expand and collapse groups instead. Pele's `var(--_x)` theme slots are filled from `theme()`, as the browser's stylesheet fills them, and the selected step is filled with `selected`. Not yet: the source dock (`GET source` into the shipped read-only `Editor`), Show all steps, the inspector, and the browser's fallback renderer when Pele refuses a view. That case is a typed `unsupported` error above the native step list, which still holds the whole answer.
 - **Treemap and metrics.** It needs `GET metrics` and `web/treemap-pele.js`, which uses the same DOM pattern plus `<title>`, which `src/dom.js` handles. `web/viewer-metrics.js` holds the metric-panel logic. A followed file maps to its treemap box directly.
 - **Search.** The daemon has no browser search route today; search is MCP-only (`trellis_search_symbols` and `trellis_find_symbols`). This view needs either a new authenticated loopback route or `exec("trellis", …)` against the CLI. Results are native rows, and a click opens the file in `trellis-files` through shared state, the reverse of the current publish.
 - **Deviations.** It waits for factory runs 802 and 803, which are changing the Architecture API. It will then be a native tree over the new rule-evidence payload, paged through `architecture/details`.
@@ -120,7 +154,8 @@ Next steps, in increasing cost:
 ## Open problems
 
 1. **Visual check.** See [SVG fidelity](#svg-fidelity).
-2. **The owner's daemon.** Its checkouts report `unavailable · root_changed` or `index_not_ready` ("Storage is unavailable"). The pane shows that as a typed state. A diagram was verified only against an isolated daemon: `HOME=<scratch> trellis serve --bind 127.0.0.1:8878` on this worktree.
-3. **No request timeout.** The runtime's `fetch` takes no signal or timeout. A hung daemon leaves "Reading…" until the next poll.
-4. **Ported summary options.** They must follow `web/architecture.js`. The real fix is for the web app to export them as a pure function both sides bundle. That edit touches `web/architecture.js`, which runs 802 and 803 are changing, so it waits.
-5. **No drilled-in directories.** Only band open and fold is supported, so a directory module stays one chip.
+2. **No proven call targets on syntax-only indexes.** Re-centering follows the browser's proof rule (resolved, direct, fresh evidence). The isolated daemon has no semantic producer, so its views have no proven targets; it is tested with a resolved fixture.
+3. **The owner's daemon.** Its checkouts report `unavailable · root_changed` or `index_not_ready` ("Storage is unavailable"). The pane shows that as a typed state. Nothing listens on 8877 now: the listener came from a `trellis serve` started for this work and since stopped, so the pane shows `daemon_unreachable` until `trellis serve --token-file ~/.config/trellis/serve.token` runs. A diagram was verified only against an isolated daemon: `HOME=<scratch> trellis serve --bind 127.0.0.1:8878` on this worktree.
+4. **No request timeout on this computer.** The remote path has curl's `--max-time`. Local `fetch` has none; `transport: "exec"` is the workaround.
+5. **Ported summary options.** They must follow `web/architecture.js`. The real fix is for the web app to export them as a pure function both sides bundle. That edit touches `web/architecture.js`, which runs 802 and 803 are changing, so it waits.
+6. **No drilled-in directories.** Only band open and fold is supported, so a directory module stays one chip.

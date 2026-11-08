@@ -51,6 +51,7 @@ export class Element {
     this.parentNode = null;
     this.classList = new ClassList(this);
     this.listeners = [];
+    this.dataset = {};
   }
   get children() { return this.childNodes.filter((node) => node.nodeType === 1); }
   get attributes() { return [...this.attrs].map(([name, value]) => ({ name, value })); }
@@ -70,6 +71,8 @@ export class Element {
   }
   append(...nodes) {
     for (const node of nodes) {
+      // A fragment hands over its children, as in the DOM.
+      if (node instanceof DocumentFragment) { this.append(...node.childNodes); continue; }
       const child = typeof node === "string" ? new Text(node) : node;
       if (child.parentNode) child.parentNode.childNodes = child.parentNode.childNodes.filter((n) => n !== child);
       child.parentNode = this;
@@ -98,6 +101,10 @@ export class Element {
     return pool.filter((el) => groups.some((g) => (!g.scopeChild || el.parentNode === this) && matches(el, g.compound)));
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
+}
+
+export class DocumentFragment extends Element {
+  constructor() { super("#fragment", null); }
 }
 
 // Compound selectors only: tag or *, .class, [attr], [attr="value"]; comma lists; and
@@ -197,6 +204,7 @@ export class DOMParser {
 export function createDocument(measure) {
   return {
     createElementNS: (ns, name) => new Element(name, ns),
+    createDocumentFragment: () => new DocumentFragment(),
     createElement(name) {
       if (name !== "canvas") return new Element(name, null);
       const ctx = { font: "14px sans-serif", measureText: (text) => ({ width: measure(String(text), fontSize(ctx.font)) }) };
@@ -206,15 +214,18 @@ export function createDocument(measure) {
 }
 const fontSize = (font) => Number(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? 14);
 
-/** SVG text for an element tree. `override(el)` may return attributes to replace on output. */
+/** SVG text for an element tree. `override(el)` may return attributes to replace on output,
+ *  or `null` to leave the element out (HTML controls an image can't draw). */
 export function serialize(el, override) {
   if (el.nodeType === 3) return escapeText(el.data);
   const extra = override?.(el);
+  if (extra === null) return "";
   const attrs = new Map(el.attrs);
   if (extra) for (const [name, value] of Object.entries(extra)) attrs.set(name, String(value));
   const head = `<${el.localName}${[...attrs].map(([n, v]) => ` ${n}="${escapeAttr(v)}"`).join("")}`;
   if (!el.childNodes.length) return `${head}/>`;
-  return `${head}>${el.childNodes.map((child) => serialize(child, override)).join("")}</${el.localName}>`;
+  const inner = el.childNodes.map((child) => serialize(child, override)).join("");
+  return inner ? `${head}>${inner}</${el.localName}>` : `${head}/>`;
 }
 
 /** UTF-8 byte counts for the adapter's size bounds (the runtime has no TextEncoder). */

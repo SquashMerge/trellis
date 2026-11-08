@@ -14,7 +14,8 @@ class El {
   find(id) { if (this.props.id === id) return this; for (const k of this.kids) if (k instanceof El) { const f = k.find(id); if (f) return f; } return null; }
   all(pred, out = []) { if (pred(this)) out.push(this); for (const k of this.kids) if (k instanceof El) k.all(pred, out); return out; }
 }
-const chain = (el) => new Proxy(el, { get: (target, name) => (name in target ? target[name] : () => chain(target)) });
+// Unknown builder methods chain; `then` stays undefined so an element is never a thenable.
+const chain = (el) => new Proxy(el, { get: (target, name) => (name in target || name === "then" ? target[name] : () => chain(target)) });
 export const div = () => chain(new El("div"));
 export const image = (path) => chain(new El("image", path));
 export const svg = (path) => chain(new El("svg", path));

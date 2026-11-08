@@ -1,22 +1,28 @@
-// Trellis beside the coding agents (#707): the daemon's Architecture view as a Herdr pane.
+// Trellis beside the coding agents (#707): the daemon's Architecture and Sequence views as a
+// Herdr pane.
 //
 // Shell: a checkout selector (the daemon's checkout list), index status (revision, fresh or
-// catching up) and a typed error state that never shows partial data. View: the Architecture
-// layer diagram, drawn by the browser's own adapter and Pele (src/diagram.js) into an SVG under
-// this mod's `.render/` folder and shown with image(); the layer list and counts beside it as
-// native rows. It follows the file the `trellis-files` panel selects (shared
-// "trellis.selectedFile") to that file's layer and module chip.
+// catching up) and a typed error state that never shows partial data. The daemon is the one on
+// the machine the shown space lives on (src/client.js). Views, drawn by the browser's own
+// adapters and Pele into SVGs under this mod's `.render/` folder and shown with image():
+// - Architecture: the layer stack, with the layer list and counts as native rows;
+// - Sequence: a method's static call sequence, with its steps as native rows.
+// Both follow the file the `trellis-files` panel selects (shared "trellis.selectedFile").
 //
 // Props (all optional): { url: "http://127.0.0.1:8877", tokenFile: "~/.config/trellis/serve.token",
-// checkout: "<root key>" }. Open beside a terminal: pane.split {direction: "right", mod: "trellis"}.
+// checkout: "<root key>", machine: "<Herdr machine>", transport: "exec" }.
+// Open beside a terminal: pane.split {direction: "right", mod: "trellis"}.
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { appHome, focused, props, shared, spaces, theme } from "herdr";
+import { appHome, focused, machines, props, shared, spaces, theme } from "herdr";
 import * as fs from "fs/promises";
 import { TrellisError, architecturePayload, createClient, indexLabel, pinOf, samePin, validRootKey } from "./client.js";
 import { draw, heat, hit, plural, display } from "./diagram.js";
+import { drawSequence, helpers as sequenceHelpers, targetOf } from "./sequence.js";
 
-const STATUS_MS = 5000, LIST_MS = 30000, BUILDING_MS = 250, MAX_BUILDING_MS = 5000;
+// Polls are gentler for another machine: each one is a command run there.
+const STATUS_MS = 5000, REMOTE_STATUS_MS = 10000, LIST_MS = 30000, BUILDING_MS = 250, MAX_BUILDING_MS = 5000;
+const MAX_STEP_ROWS = 300, MAX_HISTORY = 20;
 // Re-lay out only for a width change worth a new drawing (the browser's RESIZE_SLACK).
 const WIDTH_SLACK = 8, PAD = 12;
 const SELECTED_FILE = "trellis.selectedFile";
@@ -38,24 +44,56 @@ export default class Trellis extends View {
     this.open = new Map();
     this.width = 0;
     this.listOpen = false;
-    try { this.client = createClient({ url: p.url, tokenFile: p.tokenFile }); }
-    catch (error) { this.fatal = fail(error); return; }
+    this.props = p;
+    this.files = {};
+    this.tab = (() => { try { return localStorage.getItem("trellis.tab") === "sequence" ? "sequence" : "architecture"; } catch { return "architecture"; } })();
     this.wanted = validRootKey(p.checkout) ? p.checkout : (() => { try { return localStorage.getItem("trellis.checkout"); } catch { return null; } })();
-    this.loadCheckouts(cx);
-    cx.timer.every(STATUS_MS, (cx) => this.refreshStatus(cx));
+    this.useMachine(this.shownMachine(), cx);
+    cx.timer.every(STATUS_MS, (cx) => { if (this.client?.transport === "fetch" || ++this.ticks % 2 === 0) this.refreshStatus(cx); });
     cx.timer.every(LIST_MS, (cx) => this.loadCheckouts(cx));
   }
 
   async close() {
-    if (this.drawn?.file) await fs.unlink(this.drawn.file).catch(() => {});
+    for (const file of Object.values(this.files)) await fs.unlink(file).catch(() => {});
+  }
+
+  // The machine whose daemon this pane shows: the props' choice, else the shown space's.
+  shownMachine() {
+    if (typeof this.props.machine === "string") return this.props.machine || null;
+    return spaces().find((s) => s.active)?.machine ?? null;
+  }
+
+  useMachine(machine, cx) {
+    this.machine = machine; this.ticks = 0;
+    this.checkouts = null; this.listError = null; this.fatal = null;
+    this.rootKey = undefined; this.select(null, cx);
+    try { this.client = createClient({ url: this.props.url, tokenFile: this.props.tokenFile, machine, transport: this.props.transport }); }
+    catch (error) { this.fatal = fail(error); this.client = null; return; }
+    this.loadCheckouts(cx);
+  }
+
+  // Writes one drawing under the mod's hidden `.render/` (a hidden folder: no mod reload) and
+  // deletes this copy's previous drawing of that kind. Returns the image() path.
+  async saveDrawing(kind, svg) {
+    const dir = `${appHome()}/mods/trellis/.render`;
+    await fs.mkdir(dir, { recursive: true });
+    const name = `${kind}-${this.copy}-${hash(svg)}.svg`, file = `${dir}/${name}`;
+    await fs.writeFile(file, svg);
+    const previous = this.files[kind];
+    this.files[kind] = file;
+    if (previous && previous !== file) await fs.unlink(previous).catch(() => {});
+    return `mods/trellis/.render/${name}`;
   }
 
   // --- data ---
 
   loadCheckouts(cx) {
+    const client = this.client;
+    if (!client) return;
     cx.spawn(async (cx) => {
       try {
-        const data = await this.client.checkouts();
+        const data = await client.checkouts();
+        if (client !== this.client) return;
         if (!Array.isArray(data?.checkouts)) throw new TrellisError("invalid_response", "Checkout list is invalid.");
         this.checkouts = data.checkouts.filter((row) => row && validRootKey(row.rootKey) && typeof row.state === "string");
         this.listError = null;
@@ -72,6 +110,7 @@ export default class Trellis extends View {
           this.select(pick, cx);
         }
       } catch (error) {
+        if (client !== this.client) return;
         this.listError = fail(error); this.checkouts = null;
         this.select(null, cx);
       }
@@ -82,7 +121,8 @@ export default class Trellis extends View {
   select(rootKey, cx) {
     if (rootKey === this.rootKey) return;
     this.rootKey = rootKey; this.status = null; this.statusError = null; this.view = null; this.viewError = null; this.building = null;
-    this.open = new Map(); this.tried = null; this.drawError = null;
+    this.open = new Map(); this.tried = null; this.drawError = null; this.picked = null;
+    this.seq = { history: [], expanded: new Set() };
     this.serial = (this.serial || 0) + 1;
     if (rootKey) { try { localStorage.setItem("trellis.checkout", rootKey); } catch { /* a convenience only */ } }
     if (rootKey) this.refreshStatus(cx);
@@ -101,6 +141,7 @@ export default class Trellis extends View {
         this.status = { pin, catchingUp: data?.catchingUp ?? null, workspaceRoot: data?.workspaceRoot ?? null };
         this.statusError = null;
         if (changed || (!this.view && !this.viewError && !this.loading)) this.loadArchitecture(cx);
+        if (changed) this.reloadSequence(cx);
       } catch (error) {
         if (serial !== this.serial) return;
         // Never keep data from a checkout whose status can't be read.
@@ -157,14 +198,10 @@ export default class Trellis extends View {
       try {
         const out = await draw(view, { width, open: this.open, theme: t, highlight });
         if (serial !== this.serial || view !== this.view) return;
-        const dir = `${appHome()}/mods/trellis/.render`;
-        await fs.mkdir(dir, { recursive: true });
-        const name = `architecture-${this.copy}-${hash(out.svg)}.svg`;
-        await fs.writeFile(`${dir}/${name}`, out.svg);
-        const previous = this.drawn?.file;
-        this.drawn = { ...out, view, file: `${dir}/${name}`, asset: `mods/trellis/.render/${name}` };
+        const asset = await this.saveDrawing("architecture", out.svg);
+        if (serial !== this.serial || view !== this.view) return;
+        this.drawn = { ...out, view, asset };
         this.drawError = null;
-        if (previous && previous !== this.drawn.file) await fs.unlink(previous).catch(() => {});
       } catch (error) {
         if (serial !== this.serial) return;
         this.drawn = null; this.drawError = fail(error);
@@ -179,7 +216,8 @@ export default class Trellis extends View {
 
   followed() {
     const value = shared(SELECTED_FILE);
-    if (!value || typeof value !== "object" || typeof value.root !== "string" || typeof value.path !== "string" || value.on) return null;
+    // Only a file on the machine whose daemon this pane shows (Files publishes its machine as `on`).
+    if (!value || typeof value !== "object" || typeof value.root !== "string" || typeof value.path !== "string" || (value.on ?? null) !== this.machine) return null;
     const absolute = `${value.root.replace(/\/+$/, "")}/${value.path.replace(/^\/+/, "")}`;
     const checkout = (this.checkouts || []).filter((row) => typeof row.workspaceRoot === "string" && absolute.startsWith(`${row.workspaceRoot}/`))
       .sort((a, b) => b.workspaceRoot.length - a.workspaceRoot.length)[0] || null;
@@ -219,10 +257,179 @@ export default class Trellis extends View {
   // The drawing of the payload shown now; a drawing of an earlier payload is never shown.
   current() { return this.drawn && this.drawn.view === this.view ? this.drawn : null; }
 
+  // --- Sequence ---
+
+  // Follows the Files selection to that file's methods; the first consequential named method
+  // opens unless one is open already for this file.
+  followSequence(file, cx) {
+    const path = file?.checkout?.rootKey === this.rootKey ? file.path : null;
+    if (!path || !this.status?.pin || this.seq.file === path) return;
+    this.seq = { file: path, history: [], expanded: new Set() };
+    this.loadMethods(cx);
+  }
+
+  reloadSequence(cx) {
+    if (!this.seq?.file) return;
+    const keep = this.seq.seed;
+    this.seq = { ...this.seq, methods: null, methodsError: null, data: null, error: null, drawn: null, drawError: null, keep };
+    this.seqTried = null;
+    this.loadMethods(cx);
+  }
+
+  loadMethods(cx) {
+    const { rootKey, serial } = this, pin = this.status?.pin, seq = this.seq;
+    cx.spawn(async (cx) => {
+      try {
+        const data = await this.client.methods(rootKey, pin, seq.file);
+        if (serial !== this.serial || seq !== this.seq) return;
+        if (!Array.isArray(data?.items)) throw new TrellisError("invalid_response", "Invalid method list. Nothing displayed.");
+        seq.methods = data.items.map((item) => item?.symbol).filter((symbol) => typeof symbol?.id === "string" && typeof symbol.name === "string");
+        const named = seq.methods.filter((m) => !m.name.startsWith("<"));
+        const first = seq.methods.find((m) => m.id === seq.keep?.id) || named.find((m) => data.items.find((i) => i.symbol === m)?.consequential) || named[0] || seq.methods[0];
+        if (first) this.loadSequence(first, false, cx);
+      } catch (error) {
+        if (serial !== this.serial || seq !== this.seq) return;
+        seq.methodsError = fail(error);
+      } finally { cx.notify(); }
+    });
+  }
+
+  // Opens one method's sequence; `push` keeps the current one for Back (a re-center).
+  loadSequence(symbol, push, cx) {
+    const { rootKey, serial } = this, pin = this.status?.pin, seq = this.seq;
+    if (push && seq.seed) seq.history = [...seq.history, seq.seed].slice(-MAX_HISTORY);
+    Object.assign(seq, { seed: { id: symbol.id, name: symbol.name, path: symbol.path }, data: null, error: null, selected: null, expanded: new Set(), loading: true });
+    cx.spawn(async (cx) => {
+      try {
+        const data = await this.client.sequence(rootKey, pin, symbol.id);
+        if (serial !== this.serial || seq !== this.seq || seq.seed.id !== symbol.id) return;
+        // As the browser checks it: the answer is for this revision and this seed, whole.
+        if (!samePin(data?.revision, pin) || data?.seed?.id !== symbol.id || !Array.isArray(data.steps) || !Array.isArray(data.participants)) {
+          throw new TrellisError("revision_conflict", "Sequence provenance mismatch. Nothing displayed.");
+        }
+        seq.data = data; seq.seed = { id: data.seed.id, name: data.seed.name, path: data.seed.path };
+      } catch (error) {
+        if (serial !== this.serial || seq !== this.seq) return;
+        seq.error = fail(error);
+      } finally { if (seq === this.seq) seq.loading = false; cx.notify(); }
+    });
+  }
+
+  scheduleSequenceDraw(cx) {
+    const seq = this.seq, data = seq?.data;
+    if (!data || this.seqDrawing) return;
+    const t = theme();
+    const key = JSON.stringify([data.revision, data.seed.id, seq.selected, [...seq.expanded], t.background, t.foreground, t.accent, t.selected]);
+    if (this.seqTried === key) return;
+    this.seqDrawing = true; this.seqTried = key;
+    const serial = this.serial;
+    cx.spawn(async (cx) => {
+      try {
+        const out = await drawSequence(data, { theme: t, selectedId: seq.selected, expanded: seq.expanded });
+        if (serial !== this.serial || seq !== this.seq || data !== seq.data) return;
+        seq.drawn = out.svg ? { ...out, data, asset: await this.saveDrawing("sequence", out.svg) } : { ...out, data };
+        seq.drawError = null;
+      } catch (error) {
+        if (serial !== this.serial || seq !== this.seq) return;
+        seq.drawn = null; seq.drawError = fail(error);
+      } finally { this.seqDrawing = false; cx.notify(); }
+    });
+  }
+
+  // A step: select it; a call with a proven target re-centers the view on that method, as the
+  // browser's target action does; a collapsed call chain opens or closes.
+  activateStep(step, cx) {
+    const seq = this.seq, data = seq.data;
+    if (!step || !data) return;
+    const target = targetOf(data, step);
+    if (target) { this.loadSequence({ id: target.declaration.id, name: target.declaration.name, path: target.declaration.path }, true, cx); cx.notify(); return; }
+    if (step.kind === "group") { if (seq.expanded.has(step.id)) seq.expanded.delete(step.id); else seq.expanded.add(step.id); }
+    seq.selected = step.id;
+    cx.notify();
+  }
+
+  pressSequence(event, cx) {
+    const drawn = this.seq?.drawn, at = event?.local_position;
+    if (!drawn?.boxes || !at) return;
+    const box = drawn.boxes.filter((b) => at.x >= b.x && at.x <= b.x + b.w && at.y >= b.y && at.y <= b.y + b.h).sort((a, b) => a.w * a.h - b.w * b.h)[0];
+    if (box) this.activateStep(findStep(this.seq.data.steps, box.step), cx);
+  }
+
+  sequenceBody(t, file) {
+    const seq = this.seq, out = [];
+    if (!seq.file && !seq.seed) return [this.note(t, file && !file.checkout ? "The Files selection is not in a checkout this daemon serves." : "Select a file in Files to see its methods and their call sequences.")];
+    if (seq.file) {
+      const methods = seq.methods || [];
+      out.push(v_flex().flex_none().gap(6)
+        .child(h_flex().gap(8).items_center()
+          .child(div().text_size(12).text_color(t.dim).child("Methods in"))
+          .child(div().flex_1().min_w(0).truncate().font_family(settingsMono()).text_size(12).child(seq.file)))
+        .when(Boolean(seq.methodsError), (el) => el.child(this.problem(t, seq.methodsError, "Methods")))
+        .when(!seq.methods && !seq.methodsError, (el) => el.child(this.note(t, "Reading this file's methods…")))
+        .when(Boolean(seq.methods) && !methods.length, (el) => el.child(this.note(t, "No indexed methods in this file.")))
+        .child(h_flex().gap(4).flex_wrap().children(methods.filter((m) => !m.name.startsWith("<")).slice(0, 60).map((m) =>
+          div().id(`method-${m.id}`).px(6).py(1).rounded(4).cursor_pointer().font_family(settingsMono()).text_size(12)
+            .bg(seq.seed?.id === m.id ? t.selected : t.raised).hover((st) => st.bg(t.hover))
+            .on_click((_e, cx) => { this.seq.history = []; this.loadSequence(m, false, cx); cx.notify(); })
+            .child(m.name)))));
+    }
+    if (!seq.seed) return out;
+    out.push(h_flex().flex_none().gap(8).items_center()
+      .when(seq.history.length > 0, (el) => el.child(div().id("sequence-back").px(6).rounded(4).border_1().border_color(t.border).cursor_pointer()
+        .hover((st) => st.bg(t.hover)).on_click((_e, cx) => { const back = this.seq.history.pop(); if (back) this.loadSequence(back, false, cx); cx.notify(); })
+        .child(`← ${seq.history[seq.history.length - 1]?.name ?? ""}`)))
+      .child(div().font_semibold().text_size(14).child(seq.seed.name || seq.seed.id))
+      .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.dim).child(seq.seed.path || "")));
+    if (seq.error) return [...out, this.problem(t, seq.error, "Sequence")];
+    if (!seq.data) return [...out, this.note(t, "Reading the static call sequence…")];
+    const data = seq.data;
+    out.push(div().flex_none().text_size(12).text_color(t.dim).child(`${sequenceHelpers.evidenceSummary(data)} · ${data.hiddenSteps ?? 0} incidental steps hidden${data.truncated ? " · truncated" : ""} · static possible paths, not a runtime trace`));
+    const drawn = seq.drawn?.data === data ? seq.drawn : null;
+    if (seq.drawError) out.push(this.problem(t, seq.drawError, "Diagram"));
+    else if (!drawn) out.push(this.note(t, "Drawing the sequence…"));
+    else {
+      if (drawn.empty) out.push(this.note(t, drawn.empty));
+      if (drawn.asset) out.push(div().id("sequence-diagram").flex_none().w(drawn.width).h(drawn.height).cursor_pointer()
+        .on_mouse_down("left", (event, cx) => this.pressSequence(event, cx))
+        .child(image(drawn.asset).w(drawn.width).h(drawn.height)));
+    }
+    out.push(this.stepList(t, data));
+    for (const warning of (data.warnings || []).slice(0, 20)) out.push(div().flex_none().text_size(12).text_color(t.ansi3).child(`⚠ ${typeof warning === "string" ? warning : JSON.stringify(warning)}`));
+    return out;
+  }
+
+  // The steps as rows, in source order: kind, label, line; a proven call target re-centers.
+  stepList(t, data) {
+    const rows = [], seq = this.seq;
+    const walk = (steps, depth, alternate) => {
+      for (const step of steps || []) {
+        if (rows.length >= MAX_STEP_ROWS) return;
+        const target = targetOf(data, step), line = step.range?.startLine;
+        rows.push(h_flex().id(`step-${step.id}`).min_h(24).pl(6 + depth * 14).pr(6).gap(8).items_center().rounded(4).cursor_pointer()
+          .when(seq.selected === step.id, (el) => el.bg(t.selected)).hover((st) => st.bg(t.hover))
+          .on_click((_e, cx) => this.activateStep(step, cx))
+          .child(div().w(64).flex_none().text_size(12).text_color(alternate ? t.ansi3 : t.dim).child(alternate ? `else ${step.kind}` : step.kind))
+          .child(div().flex_1().min_w(0).truncate().font_family(settingsMono()).text_size(12).child(sequenceHelpers.compactLabel(step)))
+          .when(Boolean(target), (el) => el.child(div().flex_none().text_size(12).text_color(t.accent).child(`→ ${target.declaration.name}`)))
+          .when(step.kind === "group", (el) => el.child(div().flex_none().text_size(12).text_color(t.dim).child(seq.expanded.has(step.id) ? "collapse" : "expand")))
+          .child(div().flex_none().text_size(12).text_color(t.dim).child(line ? `:${line}` : "")));
+        walk(step.children, depth + 1, false);
+        walk(step.alternate, depth + 1, true);
+      }
+    };
+    walk(data.steps, 0, false);
+    return v_flex().flex_none().gap(1)
+      .child(div().font_semibold().text_size(14).pb(4).child("Steps"))
+      .children(rows)
+      .when(rows.length >= MAX_STEP_ROWS, (el) => el.child(this.note(t, `First ${MAX_STEP_ROWS} steps shown.`)));
+  }
+
   // --- view ---
 
   render(cx) {
     const t = theme();
+    const machine = this.shownMachine();
+    if (machine !== this.machine) this.useMachine(machine, cx);
     const file = this.followed();
     if (file?.checkout && file.checkout.rootKey !== this.rootKey && file.checkout.state === "available" && file.checkout.rootKey !== this.followedSwitch) {
       // Follow the Files panel into the checkout that holds its file, once per checkout change.
@@ -231,13 +438,14 @@ export default class Trellis extends View {
     }
     const place = file?.checkout?.rootKey === this.rootKey ? this.placement(file) : null;
     const highlight = place?.group && place.layer ? [place.layer.name, place.group.name] : place?.group && !place.layer ? [null, place.group.name] : null;
-    this.scheduleDraw(cx, highlight);
+    if (this.tab === "architecture") this.scheduleDraw(cx, highlight);
+    else { this.followSequence(file, cx); this.scheduleSequenceDraw(cx); }
 
     return v_flex().id("root").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(13)
       .on_size_change((size, cx) => { if (Math.abs(size.width - this.width) >= 1) { this.width = size.width; cx.notify(); } })
       .child(this.header(t, cx))
       .child(v_flex().id("trellis-body").flex_1().min_h(0).overflow_y_scrollbar().p(PAD).gap(12)
-        .children(this.body(t, file, place)));
+        .children(this.body(t, file, place, cx)));
   }
 
   header(t, cx) {
@@ -247,7 +455,10 @@ export default class Trellis extends View {
     return v_flex().flex_none().border_b(1).border_color(t.border)
       .child(h_flex().h(40).px(PAD).gap(10).items_center()
         .child(div().font_semibold().text_size(14).child("Trellis"))
-        .child(div().text_color(t.dim).child("Architecture"))
+        .children(["architecture", "sequence"].map((tab) => div().id(`tab-${tab}`).px(8).h(24).flex().items_center().rounded(6).cursor_pointer()
+          .text_color(this.tab === tab ? t.foreground : t.dim).when(this.tab === tab, (el) => el.bg(t.selected)).hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => { this.tab = tab; try { localStorage.setItem("trellis.tab", tab); } catch { /* a convenience only */ } cx.notify(); })
+          .child(tab === "architecture" ? "Architecture" : "Sequence")))
         .child(div().flex_1())
         .child(h_flex().id("checkout-button").gap(6).items_center().px(8).h(26).rounded(6).border_1().border_color(t.input || t.border)
           .cursor_pointer().hover((s) => s.bg(t.hover))
@@ -257,7 +468,7 @@ export default class Trellis extends View {
       .when(Boolean(label), (el) => el.child(h_flex().px(PAD).pb(8).gap(6).items_center().text_size(12)
         .child(div().text_color(tone).child(label.shape))
         .child(div().text_color(tone).child(label.text))
-        .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(row?.workspaceRoot || ""))))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`${row?.workspaceRoot || ""}${this.machine ? ` · on ${this.machine}` : ""}`))))
       .when(this.listOpen, (el) => el.child(this.checkoutList(t)));
   }
 
@@ -286,6 +497,8 @@ export default class Trellis extends View {
 
   body(t, file, place) {
     if (this.fatal) return [this.problem(t, this.fatal, "Configuration")];
+    const layout = this.machine ? machines().find((m) => m.name === this.machine)?.layout : "ready";
+    if (layout === "unavailable") return [this.problem(t, new TrellisError("machine_unavailable", `Herdr can't reach ${this.machine} right now.`), "Machine")];
     if (this.listError) return [this.problem(t, this.listError, "Daemon")];
     if (!this.checkouts) return [this.note(t, "Reading the daemon's checkouts…")];
     if (!this.rootKey) return [this.note(t, !this.checkouts.length ? "No checkouts registered with this daemon."
@@ -294,6 +507,7 @@ export default class Trellis extends View {
     if (this.statusError) return [this.problem(t, this.statusError, "Index status")];
     if (!this.status) return [this.note(t, "Reading index status…")];
     if (!this.status.pin) return [this.note(t, this.status.catchingUp ? "Indexing this checkout. The diagram appears when the first revision is published." : "This checkout has no index yet.")];
+    if (this.tab === "sequence") return this.sequenceBody(t, file);
     if (this.viewError) return [this.problem(t, this.viewError, "Architecture")];
     if (this.building) {
       const phase = { reading: "reading indexed files", resolving: "resolving references", evaluating: "evaluating rules", measuring: "measuring code" }[this.building.phase] || "preparing";
@@ -402,3 +616,12 @@ export default class Trellis extends View {
 }
 
 function settingsMono() { return "JetBrains Mono"; }
+
+function findStep(steps, id) {
+  for (const step of steps || []) {
+    if (step.id === id) return step;
+    const found = findStep(step.children, id) || findStep(step.alternate, id);
+    if (found) return found;
+  }
+  return null;
+}

@@ -13,3 +13,15 @@ export const theme = () => ({ background: "#101114", foreground: "#e6e6e6", mute
   ansi3: "#e5c07b", ansi9: "#ff7a5c", ansi11: "#ffd75f" });
 export const focused = () => state.focused ?? null;
 export const spaces = () => state.spaces ?? [];
+// exec here, as Herdr runs it for this computer (`on` names another machine in the app).
+import { spawn } from "node:child_process";
+export const exec = (command, args = [], options = {}) => new Promise((resolve, reject) => {
+  state.execs = (state.execs || 0) + 1;
+  const child = spawn(command, args, { cwd: options.cwd });
+  let stdout = "", stderr = "";
+  child.stdout.on("data", (d) => { stdout += d; });
+  child.stderr.on("data", (d) => { stderr += d; });
+  child.on("error", reject);
+  child.on("close", (code) => resolve({ code, stdout, stderr }));
+});
+export const machines = () => state.machines ?? [{ name: null, layout: "ready" }];

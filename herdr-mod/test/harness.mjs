@@ -2,7 +2,7 @@
 // the host modules, and prints what its pane would show after the data settles.
 //
 //   node test/harness.mjs --url http://127.0.0.1:8877 --token-file ~/.config/trellis/serve.token \
-//        [--cwd <focused folder>] [--select <relative path>] [--click <element id>] [--press E|L] [--width 900]
+//        [--cwd <focused folder>] [--select <relative path>] [--click <element id>] [--press E|L] [--transport exec] [--width 900]
 //
 // It checks the data path (token, checkouts, status, Architecture, drawing, followed file). It
 // is not a picture of the pane: look at the real one with `herdr-app shot`.
@@ -23,7 +23,7 @@ await build({
 const { default: Trellis } = await import(out);
 const { state } = await import(join(here, "stubs", "herdr.js"));
 const appHome = mkdtempSync(join(tmpdir(), "trellis-home-"));
-Object.assign(state, { appHome, props: { url: arg("--url", "http://127.0.0.1:8877"), tokenFile: arg("--token-file") },
+Object.assign(state, { appHome, props: { url: arg("--url", "http://127.0.0.1:8877"), tokenFile: arg("--token-file"), transport: arg("--transport") },
   // The focused terminal's folder: the checkout the mod opens without being told.
   focused: arg("--cwd") ? { cwd: arg("--cwd") } : null });
 
@@ -60,6 +60,7 @@ if (press) {
   last.find("diagram").props["press-left"]({ local_position: { x: box.x + box.w / 2, y: box.y + box.h / 2 } }, cx);
   await settle();
 }
+if (state.execs) console.error(`(${state.execs} requests through exec + curl)`);
 console.log(last.text().replace(/\s+/g, " ").slice(0, 4000));
 const dir = join(appHome, "mods", "trellis", ".render"), list = () => (existsSync(dir) ? readdirSync(dir) : []);
 const rendered = list();
