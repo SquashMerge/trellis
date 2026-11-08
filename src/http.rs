@@ -183,6 +183,9 @@ pub struct DaemonState {
     startup_failures: AtomicU64,
     /// A queue disposition must be confirmed before reconciliation can finish.
     recovery_disposition: Mutex<Option<String>>,
+    /// The typed reason recovery is blocked for, without paths (#768); cleared
+    /// when a validated head commits.
+    recovery_blocked: Mutex<Option<&'static str>>,
     #[cfg(test)]
     test_worker_now: Mutex<Option<Instant>>,
     #[cfg(test)]
@@ -454,6 +457,7 @@ pub fn new_with_config(
         startup_error: Mutex::new(None),
         startup_failures: AtomicU64::new(0),
         recovery_disposition: Mutex::new(None),
+        recovery_blocked: Mutex::new(None),
         #[cfg(test)]
         test_worker_now: Mutex::new(None),
         #[cfg(test)]

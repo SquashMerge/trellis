@@ -11,6 +11,7 @@ pub mod wire;
 
 use crate::daemon::registry::SelectionError;
 use crate::store::topology::WorkspaceIdentity;
+use crate::testing::phase_hook;
 use std::os::unix::fs::MetadataExt;
 
 /// An already selected and marker-attached workspace. Never opens an index or repairs a marker.
@@ -563,7 +564,13 @@ fn evidence_read(
                         && let Some(head) = &search_head
                         && !head.resident()?
                     {
-                        return Ok(search.unavailable_query());
+                        // No query embedding without a resident matrix. The
+                        // budget still bounds a pending head's cache count.
+                        let mut query = search.unavailable_query(
+                            crate::search_model::SearchUnavailableReason::MatrixNotResident,
+                        );
+                        query.budget = Some(budget);
+                        return Ok(query);
                     }
                     match search.query_embedding(query, cancel, deadline, Some(budget.clone())) {
                         Ok(prepared) => Ok(prepared),
@@ -662,6 +669,8 @@ fn evidence_read(
 
 struct DescribedSnapshot {
     data: Option<(crate::model::IndexStatus, projection::LanguageCounts)>,
+    /// Head retrieval coverage from the same selected snapshot (#777).
+    search_head: Option<crate::search_model::SearchHeadCoverage>,
     catching_up: bool,
     state: &'static str,
     progress: Option<serde_json::Value>,
@@ -705,20 +714,40 @@ fn read_describe(
                     admitted(catching_up);
                     #[cfg(feature = "test-support")]
                     runtime.run_mcp_admitted_gate_for_tests();
-                    let data = response
+                    let read = response
                         .map(|response| {
-                            let data = (|| {
-                                let status = response.status()?;
-                                let counts = response.mcp_language_counts()?;
-                                let tiers = response.mcp_language_tiers()?;
-                                Ok((status, (counts, tiers)))
-                            })()
-                            .map_err(|error| response.report_index_failure(error))?;
-                            response.finish(data)
+                            let data: (crate::model::IndexStatus, projection::LanguageCounts) =
+                                (|| {
+                                    let status = response.status()?;
+                                    let counts = response.mcp_language_counts()?;
+                                    let tiers = response.mcp_language_tiers()?;
+                                    Ok((status, (counts, tiers)))
+                                })()
+                                .map_err(|error| response.report_index_failure(error))?;
+                            let search_head = runtime.search_head_coverage(
+                                &response,
+                                data.0.revision,
+                                &mut || {
+                                    if cancel.load(std::sync::atomic::Ordering::Acquire)
+                                        || runtime.mcp_clock_now() >= deadline
+                                    {
+                                        anyhow::bail!(
+                                            "deadline_exceeded: MCP call reached its deadline"
+                                        );
+                                    }
+                                    Ok(())
+                                },
+                            )?;
+                            response.finish((data, search_head))
                         })
                         .transpose()?;
+                    let (data, search_head) = match read {
+                        Some((data, search_head)) => (Some(data), search_head),
+                        None => (None, None),
+                    };
                     Ok(DescribedSnapshot {
                         data,
+                        search_head,
                         catching_up,
                         state,
                         progress,
@@ -752,38 +781,6 @@ fn catching_up(
 /// How soon a final selected check that could not finish is started again
 /// (#131), while the coordinator keeps deciding the connection's other calls.
 const FINAL_RECHECK_TICK: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// An opt-in, bounded fixture barrier at an actual coordinator boundary.
-/// Normal MCP calls do not connect to or wait for a test socket.
-#[cfg(feature = "test-support")]
-pub(crate) fn phase_hook(stage: &str) -> std::io::Result<()> {
-    use std::io::{Read, Write};
-    // One stage, or several separated by commas.
-    if !std::env::var("TRELLIS_TEST_MCP_PHASE")
-        .is_ok_and(|stages| stages.split(',').any(|named| named == stage))
-    {
-        return Ok(());
-    }
-    let path = std::env::var_os("TRELLIS_TEST_MCP_PHASE_SOCKET").ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "missing MCP fixture socket",
-        )
-    })?;
-    let mut stream = std::os::unix::net::UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
-    stream.write_all(stage.as_bytes())?;
-    stream.write_all(b"\n")?;
-    let mut release = [0u8; 1];
-    stream.read_exact(&mut release)?;
-    Ok(())
-}
-
-#[cfg(not(feature = "test-support"))]
-pub(crate) fn phase_hook(_: &str) -> std::io::Result<()> {
-    Ok(())
-}
 
 /// Call workers alive across all connections, each holding a permit until
 /// its thread exits, even after its call was decided (Decision 0009 §7).
@@ -1100,13 +1097,16 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         degraded,
                         search_availability,
                     }) => {
+                        let mut search_head = None;
                         match read {
                             Ok(DescribedSnapshot {
                                 data: Some((status, counts)),
+                                search_head: head,
                                 catching_up: sampled,
                                 state,
                                 progress,
                             }) => {
+                                search_head = head;
                                 sampled_catching_up = sampled;
                                 envelope = projection::describe(
                                     &id,
@@ -1123,6 +1123,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             }
                             Ok(DescribedSnapshot {
                                 data: None,
+                                search_head: _,
                                 catching_up: sampled,
                                 state,
                                 progress,
@@ -1145,8 +1146,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         match degraded {
                             Ok(degraded) if envelope.get("data").is_some() => {
                                 envelope["data"]["watcherDegraded"] = serde_json::json!(degraded);
-                                envelope["data"]["searchIndex"] =
-                                    serde_json::to_value(search_availability)?;
+                                envelope["data"]["searchIndex"] = serde_json::to_value(
+                                    search_availability.with_head(search_head),
+                                )?;
                             }
                             Err(error) => envelope = tools::failure(&id, mcp_read_error(&error)),
                             _ => {}
@@ -1200,6 +1202,10 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 let semantic = architecture::uses_semantic_evidence(&payload);
                                 if let Some(limit) = evidence_limit {
                                     architecture::sample_evidence(&mut payload, limit);
+                                }
+                                // #769: check points each sampled instance at explain.
+                                if kind == "check" {
+                                    architecture::next_calls(&mut payload);
                                 }
                                 Ok(architecture::envelope_with(id, payload, semantic))
                             }
@@ -1297,67 +1303,105 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             None
                         };
                         let resident_used = resident.is_some();
-                        let (declarations, ranked, lexical) = match resident {
-                            Some(resident) => resident,
-                            None if head.is_some() => {
-                                // Cold, capped, or concurrently replaced matrices remain
-                                // lexical-only at this admitted pin. Never stream vectors
-                                // around the resident-memory policy or wait for the owner.
-                                let declarations =
-                                    response.mcp_search_head_count(pin, &mut check)?;
-                                let lexical = response.mcp_search_lexical(
-                                    query,
-                                    pin,
-                                    declarations,
-                                    &policy,
-                                    &mut check,
-                                )?;
-                                let ranked =
-                                    crate::search_rank::fuse_lexical(&lexical, &policy, &mut check);
-                                (declarations, ranked, lexical)
-                            }
-                            None => {
-                                // Standalone registries have no matrix owner.
-                                let candidates = response.mcp_search_candidates(
-                                    query,
-                                    Some(pin),
-                                    &policy,
-                                    &mut check,
-                                )?;
-                                let mut vector_check = || {
-                                    check()?;
-                                    if let Some(budget) = prepared.budget() {
-                                        budget.check()?;
-                                    }
-                                    Ok(())
-                                };
-                                let rank = |snapshot: Option<
-                                    &crate::search_vectors::VectorSnapshot<'_>,
-                                >| {
-                                    crate::search_rank::rank_snapshot(
-                                        &candidates.cards,
-                                        &candidates.lexical,
-                                        snapshot,
-                                        prepared.model_id(),
-                                        prepared.vector.as_deref(),
-                                        &policy,
-                                        &mut vector_check,
-                                    )
-                                };
-                                let ranked = match service {
-                                    Some(service) if prepared.model_id().is_some() => {
-                                        service.with_vector_snapshot_budget(prepared.budget(), rank)
-                                    }
-                                    _ => crate::search_rank::rank_lexical(
-                                        &candidates.cards,
-                                        &candidates.lexical,
+                        let mut head_pending = None;
+                        let (declarations, ranked, lexical) =
+                            match resident {
+                                Some(resident) => resident,
+                                None if head.is_some() => {
+                                    // Cold, capped, or concurrently replaced matrices remain
+                                    // lexical-only at this admitted pin. Never stream vectors
+                                    // around the resident-memory policy or wait for the owner.
+                                    // While the owner is (re)building this head, count the
+                                    // cache's current vectors instead (#777).
+                                    let declarations =
+                                        response.mcp_search_head_count(pin, &mut check)?;
+                                    let pending =
+                                        runtime.browser_scheduler()?.search_fill_building(pin)
+                                            || head.as_ref().is_some_and(|head| {
+                                                head.pending_for(pin, declarations as u64)
+                                            });
+                                    head_pending = Some(pending);
+                                    let lexical = response.mcp_search_lexical(
+                                        query,
+                                        pin,
+                                        declarations,
                                         &policy,
                                         &mut check,
-                                    ),
-                                };
-                                (candidates.cards.len(), ranked, candidates.lexical)
-                            }
-                        };
+                                    )?;
+                                    let ranked = crate::search_rank::fuse_lexical(
+                                        &lexical, &policy, &mut check,
+                                    )
+                                    .and_then(|mut ranked| {
+                                        if pending
+                                            && prepared.counts_pending()
+                                            && let Some(service) = service
+                                        {
+                                            // Optional work: the hash scan and count stop
+                                            // at the vector cutoff as well as the request
+                                            // deadline, keeping the lexical reserve.
+                                            let mut optional = || {
+                                                check()?;
+                                                if let Some(budget) = prepared.budget() {
+                                                    budget.check()?;
+                                                }
+                                                Ok(())
+                                            };
+                                            optional()?;
+                                            #[cfg(feature = "test-support")]
+                                            runtime.count_search_hash_scan_for_tests();
+                                            let hashes = response
+                                                .mcp_search_head_card_hashes(pin, &mut optional)?;
+                                            ranked.embedded = service.cached_embedded(
+                                                &hashes,
+                                                prepared.budget(),
+                                                &mut optional,
+                                            )?;
+                                        }
+                                        Ok(ranked)
+                                    });
+                                    (declarations, ranked, lexical)
+                                }
+                                None => {
+                                    // Standalone registries have no matrix owner.
+                                    let candidates = response.mcp_search_candidates(
+                                        query,
+                                        Some(pin),
+                                        &policy,
+                                        &mut check,
+                                    )?;
+                                    let mut vector_check = || {
+                                        check()?;
+                                        if let Some(budget) = prepared.budget() {
+                                            budget.check()?;
+                                        }
+                                        Ok(())
+                                    };
+                                    let rank = |snapshot: Option<
+                                        &crate::search_vectors::VectorSnapshot<'_>,
+                                    >| {
+                                        crate::search_rank::rank_snapshot(
+                                            &candidates.cards,
+                                            &candidates.lexical,
+                                            snapshot,
+                                            prepared.model_id(),
+                                            prepared.vector.as_deref(),
+                                            &policy,
+                                            &mut vector_check,
+                                        )
+                                    };
+                                    let ranked = match service {
+                                        Some(service) if prepared.model_id().is_some() => service
+                                            .with_vector_snapshot_budget(prepared.budget(), rank),
+                                        _ => crate::search_rank::rank_lexical(
+                                            &candidates.cards,
+                                            &candidates.lexical,
+                                            &policy,
+                                            &mut check,
+                                        ),
+                                    };
+                                    (candidates.cards.len(), ranked, candidates.lexical)
+                                }
+                            };
                         let (ranked, budget_exceeded) = match ranked {
                             Ok(ranked) => (ranked, false),
                             Err(error)
@@ -1394,23 +1438,32 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             }
                             Err(error) => return Err(error),
                         };
-                        let building = runtime.browser_scheduler()?.search_fill_building(pin);
-                        let mut search_index =
-                            prepared.status(declarations as u64, ranked.embedded, building);
-                        if head.is_some() && !resident_used {
-                            search_index.state = crate::search_model::SearchIndexState::Unavailable;
-                            search_index.model_id = None;
-                            search_index.model_name = None;
-                            search_index.embedded = 0;
-                        }
+                        // A matrix head uses vectors only through its admitted
+                        // matrix; a standalone stream uses them with a query vector.
+                        let vector_used = if head.is_some() {
+                            resident_used
+                        } else {
+                            prepared.model_id().is_some()
+                        };
+                        // Used vectors keep the exact running-pin signal; only a
+                        // lexical-only head answer uses the broader pending signal.
+                        let pending = match head_pending {
+                            Some(pending) => pending,
+                            None => runtime.browser_scheduler()?.search_fill_building(pin),
+                        };
+                        let mut search_index = prepared.status(
+                            declarations as u64,
+                            ranked.embedded,
+                            vector_used,
+                            pending,
+                        );
                         if budget_exceeded {
-                            search_index.state = crate::search_model::SearchIndexState::Unavailable;
-                            search_index.model_id = None;
-                            search_index.model_name = None;
-                            search_index.embedded = 0;
-                            search_index.unavailable_reason = Some(
+                            search_index.state = crate::search_model::SearchIndexState::Unavailable(
                                 crate::search_model::SearchUnavailableReason::VectorBudgetExceeded,
                             );
+                            search_index.model_id = None;
+                            search_index.model_name = None;
+                            search_index.embedded = 0;
                         }
                         let has_more = ranked.hits.len() > limit;
                         let prefix = &ranked.hits[..ranked.hits.len().min(limit)];

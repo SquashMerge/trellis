@@ -1279,7 +1279,7 @@ impl<W: std::io::Write> Relay<'_, W> {
                     let deadline = request.call.then_some(request.deadline);
                     let value = request.value.clone();
                     let due = self.due_for(&value, DueOutcome::Reply(line), deadline, Some(relay));
-                    crate::mcp::phase_hook("relay_before_write")?;
+                    crate::testing::phase_hook("relay_before_write")?;
                     self.due.push_back(due);
                 }
                 Err(error) => {
@@ -1441,7 +1441,7 @@ impl<W: std::io::Write> Relay<'_, W> {
             }
             match due.outcome {
                 DueOutcome::Reply(line) => {
-                    crate::mcp::phase_hook("relay_after_settle")?;
+                    crate::testing::phase_hook("relay_after_settle")?;
                     // The send decision: a call's deadline is checked after
                     // settling, so settling past it never yields success.
                     let late = due
@@ -1450,7 +1450,7 @@ impl<W: std::io::Write> Relay<'_, W> {
                     if let (true, Some(expired)) = (late, &due.expired) {
                         self.write(expired)?;
                     } else {
-                        crate::mcp::phase_hook("relay_after_decision")?;
+                        crate::testing::phase_hook("relay_after_decision")?;
                         // The daemon's exact line, under the client's ID.
                         let mut out = line;
                         out.push(b'\n');

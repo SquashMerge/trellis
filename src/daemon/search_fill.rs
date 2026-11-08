@@ -261,6 +261,8 @@ impl FillBackend for LocalBackend {
                 head.settle();
                 return Ok(());
             }
+            #[cfg(any(test, feature = "test-support"))]
+            head.run_before_build_hook_for_tests();
             // No checkout snapshot or owner inbox survives model loading.
             self.0.with_model_job(cancel, |_| Ok(()))?;
             let epoch = self.0.cache_epoch();
@@ -798,6 +800,10 @@ pub(super) struct Core {
     startup_sources: Mutex<Vec<(Arc<dyn FillSource>, FillRegistration)>>,
     #[cfg(test)]
     before_startup_discovery: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs in `notify` after it released the inbox, so a test can park a
+    /// notifier at that boundary while the owner decides (#777).
+    #[cfg(test)]
+    after_notify_release: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     startup_discovery_sources: Mutex<Option<Vec<Arc<dyn FillSource>>>>,
     changed: Condvar,
@@ -973,7 +979,6 @@ impl Core {
         if !head.needs_build() {
             return;
         }
-        head.begin();
         inbox = self.inbox.lock().unwrap();
         if inbox.shutdown {
             return;
@@ -981,6 +986,10 @@ impl Core {
         let Some(slot) = inbox.slots.get_mut(&id) else {
             return;
         };
+        // Publish pending in the same inbox transition that records the work
+        // (#777): the owner's settle is also an inbox transition, so the two
+        // are totally ordered and neither can undo the other.
+        head.begin();
         if slot.running || slot.queued || slot.retry_at.is_some() {
             return;
         }
@@ -1159,11 +1168,15 @@ impl FillRegistration {
         let Some(core) = self.core.upgrade() else {
             return;
         };
-        self.head.begin();
         let mut inbox = core.inbox.lock().unwrap();
         let Some(slot) = inbox.slots.get_mut(&self.id) else {
             return;
         };
+        // Mark pending inside the inbox transition that records this hint, so
+        // it is ordered with the owner's retry/settle decision (#777). A hint
+        // recorded before an exhausting attempt ends is consumed by that
+        // settle; one recorded after it marks the head again.
+        self.head.begin();
         slot.dirty = true;
         if !slot.running && !slot.queued && slot.retry_at.is_none() {
             if let Some(until) = slot.fault_cooldown.take() {
@@ -1174,6 +1187,11 @@ impl FillRegistration {
             }
         }
         core.changed.notify_one();
+        drop(inbox);
+        #[cfg(test)]
+        if let Some(hook) = core.after_notify_release.lock().unwrap().take() {
+            hook();
+        }
     }
 }
 impl Drop for FillRegistration {
@@ -1424,6 +1442,10 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
             slot.retries = 0;
             slot.dirty = false;
             slot.fault_cooldown = Some(Instant::now() + FAULT_RETRY);
+            // The owner decided no retry remains: publish that the head is
+            // settled, or describe/status keep reading busy work as pending
+            // (#777). A later hint begins it again after its inbox update.
+            head.settle();
         } else {
             slot.completed = if outcome.result.is_ok() {
                 outcome.pin.map(|pin| Completed {
@@ -2973,7 +2995,58 @@ mod tests {
             !slot.running && slot.retry_at.is_none() && slot.fault_cooldown.is_some()
         });
         assert!(events.try_recv().is_err());
+        // Exhausted retries leave no work: the idle head is not pending
+        // without a new request or hint (#777).
+        let head = registration.head_slot();
+        assert!(!head.pending_for(pin(1), 0));
         registration.notify();
+        assert!(head.pending_for(pin(1), 0));
+        assert_eq!(event(&events).0, pin(1));
+        drop(registration);
+        resume.send(()).unwrap();
+    }
+
+    #[test]
+    fn hint_during_the_final_busy_attempt_cannot_undo_its_settlement() {
+        let (owner, events, resume) = paused(true);
+        let (_source, registration) = register(&owner, 1);
+        let head = registration.head_slot();
+        registration.notify();
+        for _ in 0..MAX_FAULT_RETRIES {
+            assert_eq!(event(&events).0, pin(1));
+            resume.send(()).unwrap();
+        }
+        // The final attempt is running. A hint records itself, releases the
+        // inbox and parks at that boundary before returning.
+        assert_eq!(event(&events).0, pin(1));
+        let (parked_tx, parked) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        *owner.core.after_notify_release.lock().unwrap() = Some(Box::new(move || {
+            parked_tx.send(()).unwrap();
+            released
+                .recv_timeout(crate::testing::HANG_BACKSTOP)
+                .unwrap();
+        }));
+        std::thread::scope(|scope| {
+            let notifier = scope.spawn(|| registration.notify());
+            parked.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+            // The owner exhausts its budget and settles while the notifier
+            // is parked after its inbox transition.
+            resume.send(()).unwrap();
+            wait_for(&owner.core, |inbox| {
+                let slot = &inbox.slots[&registration.id];
+                !slot.running && slot.retry_at.is_none() && slot.fault_cooldown.is_some()
+            });
+            assert!(!head.pending_for(pin(1), 0));
+            release.send(()).unwrap();
+            notifier.join().unwrap();
+        });
+        // Resuming the earlier notifier must not resurrect pending work.
+        assert!(!head.pending_for(pin(1), 0));
+        assert!(events.try_recv().is_err());
+        // A genuine hint after settlement is still recorded and pending.
+        registration.notify();
+        assert!(head.pending_for(pin(1), 0));
         assert_eq!(event(&events).0, pin(1));
         drop(registration);
         resume.send(()).unwrap();

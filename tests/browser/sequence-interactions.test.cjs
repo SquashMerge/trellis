@@ -95,14 +95,19 @@ function legacy(view, options = INTERACTIONS) {
 }
 const ids = (selector, attribute) => page.locator(selector).evaluateAll((nodes, attribute) => nodes.map(node => node.getAttribute(attribute)), attribute);
 const box = locator => locator.evaluate(node => { const box = node.getBoundingClientRect(); return {x:box.left + box.width / 2, y:box.top + box.height / 2, top:box.top, bottom:box.bottom, left:box.left, right:box.right}; });
-const actor = name => page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").filter({hasText:new RegExp(`^${name}$`)});
+// Each lane's header, its lines joined by a space (#716): the kind, then the wrapped name.
+const headers = selector => page.locator(selector).evaluateAll(nodes => nodes.map(node => {
+  const lines = [...node.querySelectorAll("tspan")].map(line => line.textContent);
+  return lines.length ? lines.join(" ") : node.matches(".pele-actor") ? node.textContent : node.firstChild.textContent;
+}));
+const actor = name => page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").filter({hasText:new RegExp(`»${name}$`)});
 const label = id => page.locator(`#sequence-diagram .pele-edge-label[data-trellis-step-id="${id}"]`);
 
 test("Pele draws only cross-column calls, with returns, in source order, and nothing else", async () => {
   const view = coordinateView();
   const result = await render(view);
   assert.equal(result.status, "rendered", result.reason);
-  assert.deepEqual(await page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").allTextContents(), ["mcp", "OpenedWorkspace", "Session", "Inbox", "FrameWindow", "tools"]);
+  assert.deepEqual(await headers("#sequence-diagram .pele-actor:not(.pele-actor-footer)"), ["«module» mcp", "«type» Opened Workspace", "«type» Session", "«type» Inbox", "«type» Frame Window", "«type» tools"]);
   assert.deepEqual(await ids("#sequence-diagram .pele-edge-label", "data-trellis-step-id"), ARROWS);
   assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(), LABELS);
   assert.deepEqual(await ids("#sequence-diagram .pele-message[data-trellis-return-step-id]", "data-trellis-return-step-id"), RETURNS);
@@ -186,7 +191,7 @@ test("the legacy renderer draws the same arrows, returns and loop frame, and not
   assert.equal((await render(view)).status, "rendered");
   const pele = await page.locator("#sequence-diagram .pele-edge-label").allTextContents();
   await legacy(view);
-  assert.deepEqual(await page.locator("#sequence-diagram .sequence-participant-label").evaluateAll(nodes => nodes.map(node => node.firstChild.textContent)), ["mcp", "OpenedWorkspace", "Session", "Inbox", "FrameWindow", "tools"]);
+  assert.deepEqual(await headers("#sequence-diagram .sequence-participant-label"), ["«module» mcp", "«type» OpenedWorkspace", "«type» Session", "«type» Inbox", "«type» FrameWindow", "«type» tools"]);
   assert.deepEqual(await ids("#sequence-diagram .sequence-arrow[data-trellis-call-id]", "data-trellis-call-id"), ARROWS.map(id => `callid:${id}`));
   assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ARROWS, "no other row");
   const rows = await page.locator("#sequence-diagram .sequence-source").evaluateAll(nodes => nodes.map(node => node.querySelector("text").firstChild.textContent));
@@ -203,7 +208,7 @@ test("the legacy renderer draws the same arrows, returns and loop frame, and not
     assert.ok(frame.top < arrow.y && arrow.y < frame.bottom, `${id} inside the frame`);
   }
   // Geometry: the nested call leaves Inbox's lifeline.
-  const inbox = await page.locator("#sequence-diagram .sequence-participant-label").evaluateAll(nodes => nodes.find(node => node.firstChild.textContent === "Inbox").getAttribute("x"));
+  const inbox = await page.locator("#sequence-diagram .sequence-participant-label").evaluateAll(nodes => nodes.find(node => node.textContent.startsWith("«type»Inbox")).getAttribute("x"));
   assert.match(await page.locator('#sequence-diagram .sequence-arrow[data-trellis-call-id="callid:c-deliver>show"]').getAttribute("d"), new RegExp(`^M ${inbox} `));
   await page.locator('#sequence-diagram [data-source-step-id="c-refresh"]').click();
   assert.deepEqual(await page.evaluate(() => window.picks.at(-1)), view.steps[5].children[0]);

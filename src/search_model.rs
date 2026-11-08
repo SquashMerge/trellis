@@ -118,13 +118,33 @@ fn select_backend(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+/// `unavailable` always names its cause (#777): there is no reasonless state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SearchIndexState {
     Complete,
     Building,
     Partial,
-    Unavailable,
+    Unavailable(SearchUnavailableReason),
+}
+
+impl SearchIndexState {
+    pub fn unavailable_reason(self) -> Option<SearchUnavailableReason> {
+        match self {
+            Self::Unavailable(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for SearchIndexState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Complete => "complete",
+            Self::Building => "building",
+            Self::Partial => "partial",
+            Self::Unavailable(_) => "unavailable",
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -140,11 +160,28 @@ pub enum SearchUnavailableReason {
     ModelNotConfigured,
     ModelLoadFailed,
     VectorBudgetExceeded,
+    /// This query got no query vector: the model was loading for another job,
+    /// or its inference failed.
+    ModelNotReady,
+    /// No matching resident matrix for the admitted head, and the owner has no
+    /// work queued or running to build one (memory policy, or a head race).
+    MatrixNotResident,
+}
+
+impl SearchUnavailableReason {
+    /// Model diagnostics and the call's own vector budget outrank coverage.
+    pub(crate) fn outranks_coverage(self) -> bool {
+        matches!(
+            self,
+            Self::ModelNotConfigured | Self::ModelLoadFailed | Self::VectorBudgetExceeded
+        )
+    }
 }
 
 /// Retrieval metadata only, independent of native-evidence completeness.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// `unavailableReason` is serialized from the state, so it is non-null
+/// exactly when the state is `unavailable`.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchIndexStatus {
     pub state: SearchIndexState,
     pub model_id: Option<String>,
@@ -153,12 +190,70 @@ pub struct SearchIndexStatus {
     pub declarations: u64,
     pub embedded: u64,
     pub lexical: LexicalState,
-    pub unavailable_reason: Option<SearchUnavailableReason>,
 }
 
-/// Daemon-wide diagnostics, not query-pinned retrieval coverage.
+impl SearchIndexStatus {
+    pub fn unavailable_reason(&self) -> Option<SearchUnavailableReason> {
+        self.state.unavailable_reason()
+    }
+}
+
+impl Serialize for SearchIndexStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire<'a> {
+            state: SearchIndexState,
+            model_id: &'a Option<String>,
+            model_name: &'a Option<String>,
+            backend: Option<Backend>,
+            declarations: u64,
+            embedded: u64,
+            lexical: LexicalState,
+            unavailable_reason: Option<SearchUnavailableReason>,
+        }
+        Wire {
+            state: self.state,
+            model_id: &self.model_id,
+            model_name: &self.model_name,
+            backend: self.backend,
+            declarations: self.declarations,
+            embedded: self.embedded,
+            lexical: self.lexical,
+            unavailable_reason: self.unavailable_reason(),
+        }
+        .serialize(serializer)
+    }
+}
+
+/// This checkout's retrieval coverage at its admitted head, derived from
+/// owner-published matrix/job state (#777). Describe and CLI status show it.
+/// `embedded` is null only with a `cacheDiagnostic`: the optional cache could
+/// not be read for the count (owner ruling 2026-11-07, #777). Describe and
+/// status never fail on the optional cache; search keeps `store_unavailable`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHeadCoverage {
+    pub state: SearchIndexState,
+    pub declarations: u64,
+    pub embedded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_diagnostic: Option<SearchCacheDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchCacheDiagnostic {
+    /// The vector cache could not be read (corrupt, unreadable or unsafe).
+    VectorCacheUnavailable,
+    /// The vector cache stayed busy; the count was not retried.
+    VectorCacheBusy,
+}
+
+/// Daemon-wide diagnostics plus, when known, this checkout's head coverage.
 /// A standalone registry without a search service has no selected backend or
-/// configuration knowledge; its default diagnostics stay null.
+/// configuration knowledge; its default diagnostics stay null and it has no
+/// head coverage.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchAvailability {
@@ -166,6 +261,19 @@ pub struct SearchAvailability {
     pub unavailable_reason: Option<SearchUnavailableReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configuration: Option<crate::search_config::SearchConfiguration>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub head: Option<SearchHeadCoverage>,
+}
+
+impl SearchAvailability {
+    /// With head coverage, the reason is the coverage state's own reason.
+    pub fn with_head(mut self, head: Option<SearchHeadCoverage>) -> Self {
+        if let Some(head) = head {
+            self.unavailable_reason = head.state.unavailable_reason();
+            self.head = Some(head);
+        }
+        self
+    }
 }
 
 const MODEL_AVAILABLE_OR_UNTRIED: u8 = 0;
@@ -190,6 +298,7 @@ impl SearchModelStatus {
             backend: Some(self.backend),
             unavailable_reason: self.unavailable_reason(),
             configuration: self.configuration.clone(),
+            head: None,
         }
     }
 
@@ -236,7 +345,10 @@ impl SearchModelStatus {
     ) -> SearchIndexStatus {
         SearchIndexStatus {
             state: if !ready {
-                SearchIndexState::Unavailable
+                SearchIndexState::Unavailable(
+                    self.unavailable_reason()
+                        .unwrap_or(SearchUnavailableReason::ModelNotReady),
+                )
             } else if embedded == declarations {
                 SearchIndexState::Complete
             } else if building {
@@ -250,11 +362,6 @@ impl SearchModelStatus {
             declarations,
             embedded: if ready { embedded } else { 0 },
             lexical,
-            unavailable_reason: if ready {
-                None
-            } else {
-                self.unavailable_reason()
-            },
         }
     }
 }
@@ -664,7 +771,7 @@ mod tests {
                     status
                         .snapshot("test-card-format.v1", 3, 0, LexicalState::Complete, true)
                         .state,
-                    SearchIndexState::Unavailable
+                    SearchIndexState::Unavailable(SearchUnavailableReason::ModelNotConfigured)
                 );
                 Ok(TrackedModel(drops.clone()))
             },
@@ -700,7 +807,7 @@ mod tests {
             status
                 .snapshot("test-card-format.v1", 3, 3, LexicalState::Complete, true)
                 .state,
-            SearchIndexState::Unavailable
+            SearchIndexState::Unavailable(SearchUnavailableReason::ModelNotConfigured)
         );
     }
 

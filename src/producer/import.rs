@@ -97,9 +97,65 @@ pub fn test_wait_fault() -> Result<()> {
     Ok(())
 }
 
-/// Enqueue `options` and return the accepted request's ID.
-pub fn submit(scheduler: &DaemonState, options: &GeneratedImportOptions) -> Result<String> {
-    Ok(scheduler.enqueue_generated_semantic_import(options)?.id)
+/// Test-support fault: fail the re-read that settles an enqueue error, as a queue that stays
+/// busy past the bounded wait does.
+#[cfg(all(feature = "test-support", unix))]
+fn test_acceptance_read_fault() -> Result<()> {
+    const VARIABLE: &str = "TRELLIS_TEST_PRODUCER_FAIL_ACCEPTANCE_READ";
+    ensure!(
+        std::env::var_os(VARIABLE).is_none(),
+        "storage_busy: injected {VARIABLE}"
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "test-support", unix)))]
+fn test_acceptance_read_fault() -> Result<()> {
+    Ok(())
+}
+
+/// Why `submit` did not return an accepted request.
+#[derive(Debug)]
+pub enum SubmitError {
+    /// The queue holds no request with the submitted ID: nothing was accepted.
+    Rejected(anyhow::Error),
+    /// The enqueue failed and its ID could not be re-read, so the request may have been
+    /// accepted. The caller treats it as an accepted request it can no longer observe.
+    Unknown(anyhow::Error),
+}
+
+impl From<SubmitError> for anyhow::Error {
+    fn from(error: SubmitError) -> Self {
+        match error {
+            SubmitError::Rejected(error) | SubmitError::Unknown(error) => error,
+        }
+    }
+}
+
+/// A fresh request ID, chosen before the enqueue so its outcome can be re-read.
+pub fn new_request_id() -> uuid::Uuid {
+    uuid::Uuid::new_v4()
+}
+
+/// Enqueue `options` as request `id`. An enqueue that reports an error may still have
+/// committed the row (#629), so the error is settled by re-reading `id`: a row is the accepted
+/// request, no row is a rejection, and an unreadable queue leaves acceptance unknown.
+pub fn submit(
+    store: &Store,
+    scheduler: &DaemonState,
+    options: &GeneratedImportOptions,
+    id: uuid::Uuid,
+) -> std::result::Result<String, SubmitError> {
+    let error = match scheduler.enqueue_generated_semantic_import(options, id) {
+        Ok(row) => return Ok(row.id),
+        Err(error) => error,
+    };
+    let id = id.to_string();
+    match test_acceptance_read_fault().and_then(|()| read_request(store, &id)) {
+        Ok(Some(_)) => Ok(id),
+        Ok(None) => Err(SubmitError::Rejected(error)),
+        Err(read_error) => Err(SubmitError::Unknown(read_error)),
+    }
 }
 
 /// How often a waiting import re-reads its row. The terminal-commit condvar has no timed wait
@@ -166,15 +222,4 @@ pub fn wait(
             _ => anyhow::bail!("store_unavailable: invalid request state"),
         }
     }
-}
-
-/// Enqueue `options` and block until the request is terminal. Only an error before acceptance
-/// or in reading the queue is an `Err`.
-pub fn submit_and_wait(
-    store: &Store,
-    scheduler: &DaemonState,
-    options: &GeneratedImportOptions,
-) -> Result<ImportOutcome> {
-    let id = submit(scheduler, options)?;
-    wait(store, scheduler, options, id)
 }

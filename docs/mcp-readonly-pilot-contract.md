@@ -418,6 +418,72 @@ existing tools for detail.
   (instructions, rules bytes, pin and envelope) does not fit, the prompt still fails
   atomically with `response_too_large`.
 
+## Amendment (#769): rules tools point to the next call
+
+**Status: owner-ratified 2026-11-07.** From the 2026-11-07 setup of a new repository and a
+Claude Desktop session. With no rules file, nothing named the prompt that drafts one.
+A check instance's single kept evidence row gave no route to the rest, so the agent
+read source files instead. Desktop also could not call `trellis_rules_explain` at all,
+because it sent a `{language,path}` module pair as `target` and got only `Invalid tool
+arguments`. `toolVersion` is **13** (previously 12). This section wins over the #129
+failure text, the #725 instance text and the failure table below. Evaluation,
+verdicts, counts, `omittedEvidence`, instance order, paging rules and bounds are
+unchanged, as are the CLI and the browser.
+
+- **Rules file hint.** The `rules_not_found` message from check and explain is the
+  static text ``No .trellis/rules.toml. Ask the user to run the
+  `trellis_propose_layers` MCP prompt (in Claude Code:
+  /mcp__trellis__trellis_propose_layers) to draft one for review.`` Its code and
+  retryability are unchanged.
+- **Ready-made explain call.** A `trellis_rules_check` instance (in `instances` or
+  `testOnly`) with `omittedEvidence > 0` adds the optional
+  `nextCall:{tool:"trellis_rules_explain",arguments}`. `arguments` is
+  `{schemaVersion:1,rule,target,destination?,limit}`. `rule` and `target` are copied
+  verbatim from the instance, and so is `destination` when the instance's rule is
+  `$layers` or `$external` and its destination is non-null. `limit` is the
+  instance's evidence count, `1 + omittedEvidence`, at most 50.
+  - Sent back as given, these arguments validate. The explain answer lists that
+    instance with up to `limit` evidence entries, all of them when the count is 50
+    or less. A caller that chose a `workspace` for check adds the same one. It may
+    also add the check's `evidenceBasis` as `expectedBasis`, to read the same pin.
+  - An instance whose arguments would not validate as an explain request carries no
+    `nextCall`. Neither does an instance with `omittedEvidence:0`. Explain instances
+    never carry one.
+  - The hint is server-authored from the instance's own identities and adds no
+    repository text. It is part of the instance it rides on, so the page fit and the
+    instance `limit` measure each instance with its hint. A page can therefore hold
+    fewer instances than before, but no instance is split, dropped or clipped.
+- **Field-naming argument errors.** An `invalid_request` from application argument
+  validation now says which field failed and what it expects, as static server text.
+  It never echoes the caller's arguments or repository content. Validation order,
+  codes and retryability are unchanged, and so is every other code, including
+  `range_too_large`, which keeps its generic message.
+  - The message names the first failing check: first an argument the tool does not
+    accept (`Invalid tool arguments: a field is not in this tool's inputSchema`),
+    then a missing required field, then each field in the existing validation order.
+    Non-object arguments say `Tool arguments must be a JSON object`.
+  - For example, an explain `target` that is not a check identity gives `` `target`
+    must be the identity object from a trellis_rules_check instance: {sourceSetId,
+    language, path, sid} ``.
+  - An object-valued field (`target`, `destination`, `expectedBasis`) that arrives as
+    a JSON string, as a client that stringifies object arguments sends it, says so:
+    `` `target` must be a JSON object (got a string): … ``. The server still rejects
+    it; it never parses a string as an object.
+  - The exact text of each message is server-authored, not part of this contract.
+    Each one names its field in backticks and fits the 512-byte summary.
+- **Object input properties.** In every tool's `inputSchema`, a property that is a
+  bare `$ref` to an object-valued definition also carries `"type":"object"` (allowed
+  beside `$ref` in JSON Schema 2020-12). This covers `expectedBasis` on the ten tools
+  that accept it, and explain's `target` and `destination`, because some clients
+  choose how to serialize an argument from its `type`. The same holds at any depth of
+  an input schema: explain's `Destination` union and each of its `oneOf` branches say
+  `"type":"object"` too. Accepted values are unchanged.
+- **Catalog.** Check's output `RuleInstance` adds the optional, closed `nextCall`.
+  `trellis_read_source`'s output schema drops its unreferenced `SemanticProjection`,
+  `DocumentSemanticStatus` and `Language` definitions, which no response shape uses.
+  The complete catalog is 31 bytes smaller than at `toolVersion` 12, so it keeps its
+  named headroom.
+
 ## Amendment (#783): per-app layers in the proposal prompt
 
 **Status: owner-ratified 2026-11-07 (#783).** Following the
@@ -491,22 +557,38 @@ it never enters card hashes, lookup, ranking, ordering or joins.
 `SearchIndexStatus` is exactly:
 `{state:"complete"|"building"|"partial"|"unavailable",modelId:Hash|null,
 modelName:Text|null,backend:"cpu"|"metal"|null,declarations:UInt,embedded:UInt,
-lexical:"complete"|"unavailable",unavailableReason:null|"model_not_configured"|"model_load_failed"|"vector_budget_exceeded"}`.
+lexical:"complete"|"unavailable",unavailableReason:null|"model_not_configured"|"model_load_failed"|"vector_budget_exceeded"|"model_not_ready"|"matrix_not_resident"}`.
 `declarations` counts eligible candidate declarations at the admitted head; `embedded` counts
 those with a current decoded vector for the active model and satisfies
 `embedded<=declarations`. These are admitted-head counts, independent of the role filter;
 `scopeCoverage` also remains unfiltered. No configured/verified/ready model, or no matching admitted
 resident matrix (including first search, eviction, head-change races or an oversized head),
-gives `unavailable`, null `modelId`, null `modelName`, and `embedded:0`. The zero is an
-unavailable sentinel, not a measured vector count. `unavailableReason` is
-`model_not_configured` when no model path is configured, or `model_load_failed` after a
-verification/loading failure, cleared by a successful load. Loading, idle residency or a
-missing matrix alone leave the reason null. Backend selection is independent: report the
+gives a lexical-only answer with null `modelId` and null `modelName`. Its state is `building`
+while the background owner works on this head (below), otherwise `unavailable` with
+`embedded:0`, an unavailable sentinel rather than a measured vector count.
+**Amendment (#777, owner-ratified 2026-11-07):** `toolVersion` is **14** (previously 13, #769).
+`unavailable` always has a non-null `unavailableReason`; there is no
+reasonless `unavailable`. The reason is `model_not_configured` when no model path is configured
+(including a standalone registry with no search service), or `model_load_failed` after a
+verification/loading failure, cleared by a successful load. Otherwise it is `model_not_ready`
+when this query got no query vector (the model was loading for another job, or query inference
+failed), or `matrix_not_resident` when there is no matching resident matrix and the owner has
+no work for this head (memory policy, an eviction no request has rearmed, or a head race). Model
+diagnostics and `vector_budget_exceeded` take precedence over `building`. Backend selection is independent: report the
 backend actually selected whenever known, including while loading/building or when the model
 is unavailable; `backend:null` means only that no backend has been selected. With a ready
 model and an admitted matching resident matrix, `complete` means
 all candidates have vectors, `building` means vectors are missing and a background job is
-running, and `partial` means vectors are missing and no job is running. Missing or evicted
+running, and `partial` means vectors are missing and no job is running. Without a used matrix,
+the state is `building` while the owner has queued, running or deferred work for this checkout's
+head. That covers right after a publication, before the new head's matrix exists, and work
+deferred until reconciliation ends. A no-op hint for an evicted head, or for the same head the
+memory policy declined (same declaration count at the current cache epoch), does not count; a
+different, e.g. smaller, successor head is pending again. Retry exhaustion settles the head until
+the next hint. The hits are then lexical-only, model identity is null, and `embedded` counts the
+admitted candidates with a current decoded vector in one vector-cache snapshot. Both the hash
+enumeration and that count are optional work under the vector cutoff: past it, search returns
+the complete lexical answer with `vector_budget_exceeded`. The count may equal `declarations`. Missing or evicted
 vectors do not change native coverage or evidence completeness. A candidate without a vector
 can still be returned by the lexical arm. If this call exhausts its optional vector budget,
 that query-specific reason takes precedence over model diagnostics. Then the complete vector arm is discarded, state is
@@ -573,8 +655,9 @@ and stops at cap admission failure without evicting matrices for more startup wo
 Other checkouts return complete lexical results on first search while the independent
 background owner builds their matrices. A single head that cannot fit remains lexical-only.
 When no matching matrix is retained or acquisition races with a head change, search also
-returns lexical-only with unavailable status, null model identity, embedded:0, selected
-backend and unavailableReason:null. It never waits for the owner or embeds a query without
+returns lexical-only with null model identity and the selected backend: `building` with the
+cached count while the owner works on this head, else `unavailable`, embedded:0 and
+`matrix_not_resident` (#777). It never waits for the owner or embeds a query without
 an admitted resident matrix; the streaming scorer cannot bypass the cap. This supersedes
 the earlier missing-matrix streaming fallback. Exact admitted declaration counts and lexical
 retrieval remain mandatory, and observed store faults remain typed failures rather than
@@ -614,6 +697,26 @@ Database-level vector-cache failures, including corruption, schema mismatch and 
 unsafe storage, fail store_unavailable. A vector-cache row that fails typed decoding is a
 specified miss under T00/T02, excluded from the selected cache snapshot's embedded count and
 re-embedded outside the read. This does not invalidate a valid retained published matrix.
+A cache file the owner is still creating (no version and no schema yet) reads as an absent
+cache, not a schema mismatch (#777).
+
+**Amendment (#777, owner-ratified 2026-11-07): head coverage in describe and CLI status.** Workspace describe and CLI
+status `searchIndex` (`SearchAvailability`) add optional `state:"complete"|"building"|"partial"|"unavailable"`,
+`declarations:UInt`, `embedded:UInt|null` and `cacheDiagnostic?:"vector_cache_unavailable"|"vector_cache_busy"`:
+this checkout's coverage at the admitted head. Describe and status never fail on the optional
+vector cache: if the cached count cannot be read while the owner is pending (a corrupt,
+unreadable or unsafe cache, or cache contention), they report `building` with `embedded:null`
+and that typed `cacheDiagnostic`, present only then. Search keeps its typed `store_unavailable`
+for database-level cache failures. Its
+precedence follows search without the per-query causes. A model diagnostic gives `unavailable`
+with that reason. Otherwise the matrix the owner published for that pin gives `complete`, or
+`building` while the owner runs for that pin, else `partial`. Otherwise owner work for the head
+gives `building` with the cached count, and no owner work gives `unavailable` with
+`matrix_not_resident`. With these fields, `unavailableReason` is the state's reason, so it can
+also be `matrix_not_resident`, and it is non-null exactly when the state is `unavailable`. The
+fields are omitted without a search service or matrix owner (a standalone registry keeps
+`{backend:null,unavailableReason:null}`) and without an admitted head. The other describe
+`SearchAvailability` text stands.
 
 The tool description states: “Find candidate declarations by lexical and local vector
 retrieval. Relevance is not evidence. Inspect hits with trellis_declaration at the returned

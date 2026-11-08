@@ -144,7 +144,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":12,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":14,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
@@ -199,7 +199,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 12);
+        assert_eq!(ready["data"]["toolVersion"], 14);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -1534,7 +1534,6 @@ mod search_tests {
                 declarations: 3,
                 embedded: 1,
                 lexical: LexicalState::Complete,
-                unavailable_reason: None,
             },
         }
     }
@@ -1592,7 +1591,9 @@ mod search_tests {
             assert_wire(&envelope, modern);
 
             let mut unavailable = fixture(&[], COMPLETE, false);
-            unavailable.search_index.state = SearchIndexState::Unavailable;
+            unavailable.search_index.state = SearchIndexState::Unavailable(
+                crate::search_model::SearchUnavailableReason::ModelNotConfigured,
+            );
             unavailable.search_index.model_id = None;
             unavailable.search_index.model_name = None;
             unavailable.search_index.backend = None;
@@ -1830,14 +1831,15 @@ mod compact_symbol_tests {
                 .collect(),
             symbols,
             search_index: SearchIndexStatus {
-                state: SearchIndexState::Unavailable,
+                state: SearchIndexState::Unavailable(
+                    crate::search_model::SearchUnavailableReason::ModelNotConfigured,
+                ),
                 model_id: None,
                 model_name: None,
                 backend: None,
                 declarations: 261,
                 embedded: 0,
                 lexical: LexicalState::Complete,
-                unavailable_reason: None,
             },
         }
     }

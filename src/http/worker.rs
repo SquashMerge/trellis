@@ -163,8 +163,8 @@ impl DaemonState {
         if self.startup_failures.load(Ordering::Acquire) < STARTUP_FAILURE_LIMIT {
             return None;
         }
-        self.startup_error()
-            .map(|reason| format!("recovery_blocked: {reason}"))
+        let reason = *self.recovery_blocked.lock().unwrap();
+        reason.map(|reason| format!("recovery_blocked: {reason}"))
     }
 
     /// Deterministically pause startup reconciliation after old-root settlement
@@ -380,6 +380,7 @@ impl DaemonState {
                     lifecycle();
                 }
                 *self.startup_error.lock().unwrap() = None;
+                *self.recovery_blocked.lock().unwrap() = None;
                 self.startup_failures.store(0, Ordering::Release);
                 *self.startup_backoff.lock().unwrap() = STARTUP_BACKOFF_FIRST;
                 *self.recovery_retry_after.lock().unwrap() = None;
@@ -424,10 +425,13 @@ impl DaemonState {
                     |failures| Some(failures.saturating_add(1)),
                 );
                 if self.startup_failures.load(Ordering::Acquire) >= STARTUP_FAILURE_LIMIT {
-                    let reason = format!("{error:#}");
-                    *self.startup_error.lock().unwrap() = Some(reason.clone());
+                    // The full chain stays an in-process diagnostic; the row and
+                    // the reply record only the typed reason (#445, #768).
+                    *self.startup_error.lock().unwrap() = Some(format!("{error:#}"));
+                    let reason = crate::store::requests::recovery_blocked_reason(&error);
+                    *self.recovery_blocked.lock().unwrap() = Some(reason);
                     self.note_state_change();
-                    *self.recovery_disposition.lock().unwrap() = Some(reason);
+                    *self.recovery_disposition.lock().unwrap() = Some(reason.to_owned());
                     self.confirm_recovery_disposition()?;
                 } else {
                     self.note_state_change();
@@ -724,17 +728,29 @@ impl DaemonState {
         Ok(row)
     }
 
-    /// A Trellis-written import joins the same lease, FIFO and inbox wake. Only the producer
-    /// import module calls this.
+    /// A Trellis-written import joins the same lease, FIFO and inbox wake, as request `id`
+    /// chosen by the caller. Only the producer import module calls this.
     pub(crate) fn enqueue_generated_semantic_import(
         &self,
         options: &crate::store::requests::GeneratedImportOptions,
+        id: uuid::Uuid,
     ) -> anyhow::Result<crate::store::requests::Request> {
         let lease = self.admission_lease()?;
-        let row = self.store.enqueue_generated_semantic_import(
+        let row = match self.store.enqueue_generated_semantic_import_as(
             std::path::Path::new(self.store.workspace_root()),
             options,
-        )?;
+            id,
+        ) {
+            Ok(row) => row,
+            Err(error) => {
+                // An error after COMMIT may still have accepted the row, unwoken: the worker
+                // re-reads the queue and publishes whether FIFO work really remains (#629).
+                self.fifo_pending.store(true, Ordering::Release);
+                drop(lease);
+                self.inbox.wake();
+                return Err(error);
+            }
+        };
         self.fifo_pending.store(true, Ordering::Release);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());

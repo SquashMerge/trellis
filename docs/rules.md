@@ -532,10 +532,18 @@ Supported mapping is deliberately narrow:
   literals use the resolver's documented decoding subset, not runtime execution.
   Bare imports can label captured npm dependencies or the exact reviewed Node
   catalog below. Relative misses never fall back to builtin or npm labels.
-- **Python:** captured checkout-root `m.py` or `m/__init__.py` layouts require
-  unique module ownership and proved `__init__.py` package prefixes. Relative
-  imports follow captured package membership; absolute imports use only that
-  proved root convention. No suffix search, namespace-package or `sys.path`
+- **Python:** captured `m.py` or `m/__init__.py` layouts at the checkout root or
+  a declared source root require unique module ownership and proved `__init__.py`
+  package prefixes. Declared source roots (#771, owner-ratified 2026-11-07) are the literal relative
+  directories the captured root `pyproject.toml` names in `tool.uv.workspace.members`,
+  `tool.setuptools.package-dir` key `""` and `tool.setuptools.packages.find.where`,
+  plus the parent directory of each `tool.hatch.build.targets.wheel.packages` entry.
+  Glob, absolute or traversing entries, malformed TOML and nested manifests declare
+  nothing. A top-level module name claimed under two roots is ambiguous; deeper
+  segments continue only under the root that proved their prefix, and a file
+  proved under two roots has no package membership. Relative
+  imports follow captured package membership; absolute imports use only those
+  proved root conventions. No suffix search, namespace-package or `sys.path`
   discovery is performed. A single unconditional literal `__all__` list of
   supported string literals selects exactly its proved names, including private
   spellings. Without `__all__`, proved public top-level names are exposed.
@@ -685,7 +693,8 @@ Its descriptor is `{path:".trellis/rules.toml",source:"checkout-config",contentH
 **The code pin does not identify these rules bytes.** Editing only rules can change
 the digest and outcome at an unchanged code pin. Code evidence never falls back
 to live source. Missing config permits a proposal from scratch; check/explain fail
-`rules_not_found`. Malformed config fails all three atomically with a located error.
+`rules_not_found`, whose MCP message names the `trellis_propose_layers` prompt (#769).
+Malformed config fails all three atomically with a located error.
 
 `trellis_rules_explain` filters the same evaluated instances by exact rule/target
 and, for `$layers` or `$external`, the actual native/external destination identity; it does not interpret a rule a second way.
@@ -941,7 +950,7 @@ detected installed runtime. No precise source range is invented. Package evidenc
 is capture/catalog evidence, not native measured syntax provenance; actual source
 sites and native intermediate-module proof remain separate.
 
-Captured root Cargo and package.json bytes come from the selected revision's retained dependencies
+Captured root Cargo, package.json and pyproject.toml bytes come from the selected revision's retained dependencies
 through the same admitted read and transaction as source. There are no live
 manifest reads, Cargo invocations, installed-library reads or parallel caches.
 Malformed repository manifests stay unproved, not empty dependencies. Malformed
@@ -1103,7 +1112,10 @@ reads return the complete arrays above. The
 [#725 amendment](mcp-readonly-pilot-contract.md#amendment-725-rule-evidence-bases-status-filter-and-instance-pages)
 supersedes this paragraph for MCP: evidence rows refer to a per-page `semanticBases`
 table by `basisRef`; check accepts a `status` filter, its `limit` counts instances
-per page and each check instance keeps one evidence entry.
+per page and each check instance keeps one evidence entry. Under the
+[#769 amendment](mcp-readonly-pilot-contract.md#amendment-769-rules-tools-point-to-the-next-call),
+a check instance that omits evidence carries `nextCall`, the ready-made
+`trellis_rules_explain` arguments that show the rest.
 
 ## Proposal workflow
 

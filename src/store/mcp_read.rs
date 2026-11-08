@@ -1377,7 +1377,7 @@ impl EvidenceResponse {
             });
         }
         #[cfg(feature = "test-support")]
-        crate::mcp::phase_hook("outgoing_hint_start")?;
+        crate::testing::phase_hook("outgoing_hint_start")?;
         // Leave time to finish the selected read and serialize/send its mandatory
         // answer. Optional hints never extend the accepted call's deadline.
         let required_hint_end = required_deadline
@@ -1388,7 +1388,7 @@ impl EvidenceResponse {
             end: (hint_now() + std::time::Duration::from_millis(1000)).min(required_hint_end),
         };
         #[cfg(feature = "test-support")]
-        crate::mcp::phase_hook("outgoing_hint")?;
+        crate::testing::phase_hook("outgoing_hint")?;
         // SQLite checks inside long optional statements as well as between rows.
         // The read-only selected snapshot already holds its shared lock; no new
         // connection or lock transition is needed for these candidate SELECTs.
@@ -1408,7 +1408,7 @@ impl EvidenceResponse {
         for (item_index, item) in calls.iter_mut().enumerate() {
             #[cfg(feature = "test-support")]
             if item_index == 1 {
-                crate::mcp::phase_hook("outgoing_hint_item_1")?;
+                crate::testing::phase_hook("outgoing_hint_item_1")?;
             }
             #[cfg(not(feature = "test-support"))]
             let _ = item_index;
@@ -1483,7 +1483,7 @@ impl EvidenceResponse {
                 };
                 let Some(row) = row else { break };
                 #[cfg(feature = "test-support")]
-                crate::mcp::phase_hook("outgoing_hint_row")?;
+                crate::testing::phase_hook("outgoing_hint_row")?;
                 if progress.expired() {
                     timed_out = true;
                     break;
@@ -1559,7 +1559,7 @@ impl EvidenceResponse {
                             return Ok(None);
                         }
                         #[cfg(feature = "test-support")]
-                        crate::mcp::phase_hook("outgoing_hint_verify_version")?;
+                        crate::testing::phase_hook("outgoing_hint_verify_version")?;
                         if progress.expired() {
                             return Ok(None);
                         }

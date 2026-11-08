@@ -179,6 +179,31 @@ function sequenceColumn(participant) {
   return typeof column?.id === "string" && column.id && typeof column.label === "string" && column.label
     ? column : {id:participant?.id, label:participant?.label};
 }
+// What a column is, in a word (#716), so a type `Session` and a module `session` never look
+// alike. The server names a module's column `module:…` and a Rust type's `type:…`
+// (src/behavior_columns.rs); its other columns are classes. A participant without a column
+// (a syntax hint, or the seed of a syntax-only view) is neither, so it has no kind.
+function sequenceColumnKind(participant) {
+  const column = participant?.column, id = column?.id;
+  if (typeof id !== "string" || !id || typeof column.label !== "string" || !column.label) return "";
+  return id.startsWith("module:") ? "module" : id.startsWith("type:") ? "type" : "class";
+}
+// A lane's name as lines (#716): a long name breaks after `_`, `::`, `.`, `/` or `-`, or
+// before a capital, and never inside a word, so lanes stay narrow and no name is clipped.
+const SEQUENCE_LANE_LINE = 10;
+function sequenceLaneLines(name, limit = SEQUENCE_LANE_LINE) {
+  const lines = [];
+  for (const part of String(name).split(/(?<=_|::|[./-])(?=.)|(?<=[a-z0-9])(?=[A-Z])/)) {
+    if (lines.length && (lines[lines.length - 1] + part).length <= limit) lines[lines.length - 1] += part;
+    else lines.push(part);
+  }
+  return lines;
+}
+// A lane's header, top to bottom (#716): its kind as a UML stereotype, then its name.
+function sequenceLaneHeader(participant, name, limit) {
+  const kind = sequenceColumnKind(participant);
+  return [...(kind ? [`«${kind}»`] : []), ...sequenceLaneLines(name, limit)];
+}
 // Rust's standard library crates, as a producer names their package. Other languages' producers
 // do not name one, so their external calls stay "external".
 const STANDARD_LIBRARIES = new Set(["std", "core", "alloc"]);
@@ -386,13 +411,20 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     else columns.set(column.id, {...participant, id:column.id, label:column.label, members:[participant]});
   }
   const participants = [...columns.values()];
+  // A header names its kind and wraps its name between words, as Pele's does, never cutting a
+  // word (#716). A word longer than a line widens every box and the canvas scrolls; the
+  // tallest header sets how far down the lifelines and rows start.
+  const headers = new Map(participants.map(p => [p.id, sequenceLaneHeader(p, p.label, 22)]));
+  const box = Math.max(190, Math.ceil(Math.max(0, ...[...headers.values()].flat().map(line => [...line].length)) * 7.8) + 16);
+  const spacing = box + 20, first = box / 2 + 35;
+  const head = Math.max(0, ...[...headers.values()].map(lines => lines.length - 1)) * 16;
   // Keep a readable guard column even for deeply nested input. The canvas scrolls.
-  const width = Math.max(720, participants.length * 210 + 80, visibleDepth * 10 + 400);
+  const width = Math.max(720, participants.length * spacing + 80, visibleDepth * 10 + 400);
   const svg = make("svg", {viewBox:`0 0 ${width} 200`, width, role:"group", "aria-label":"Static possible paths; resolved declarations where evidenced, not a runtime trace"});
   svg.append(make("title", {}, `${view.seed.name}: measured source steps, not a runtime trace${view.revision?.indexGeneration ? ` · revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}` : ""}`));
-  const positions = new Map(participants.map((p, i) => [p.id, 130 + i * 210]));
+  const positions = new Map(participants.map((p, i) => [p.id, first + i * spacing]));
   const columnX = id => positions.get(sequenceColumn(participantById.get(id)).id);
-  const origin = columnX(view.seed.id) || 130;
+  const origin = columnX(view.seed.id) || first;
   // Steps of an expanded callee body run on that callee's lane (#522); the seed's own
   // steps carry no lane.
   const laneX = step => (step?.lane != null && columnX(step.lane)) || origin;
@@ -404,9 +436,10 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   const compactKinds = {externalCandidate:"candidate", unresolvedReceiver:"unresolved", unresolvedCallee:"unresolved", boundary:"unknown", builtin:"source hint", import:"source hint", receiver:"source hint", internal:"indexed", method:"selected"};
   const shorten = (text, limit) => text.length > limit ? `${text.slice(0, limit-1)}…` : text;
   for (const p of participants) {
-    const x = positions.get(p.id);
-    svg.append(make("rect", {x:x-95, y:10, width:190, height:44, class:"participant"}));
-    const text = make("text", {x, y:28, "text-anchor":"middle", class:"sequence-participant-label"}, shorten(p.label, 24));
+    const x = positions.get(p.id), header = headers.get(p.id);
+    svg.append(make("rect", {x:x-box/2, y:10, width:box, height:44+head, class:"participant"}));
+    const text = make("text", {x, y:28, "text-anchor":"middle", class:"sequence-participant-label"}, header.length === 1 ? header[0] : undefined);
+    if (header.length > 1) for (const [i, line] of header.entries()) text.append(make("tspan", {x, dy:i ? 16 : 0}, line));
     text.append(make("title", {}, p.label)); svg.append(text);
     if (p.members.length === 1 && p.members[0].declaration && typeof options.onOpenTarget === "function") {
       const member = p.members[0], proof = targetProofs.get(member.id);
@@ -419,7 +452,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
         text.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });
       }
     }
-    const meta = make("text", {x, y:44, "text-anchor":"middle", class:"sequence-meta"}, (options.showDetails ? kindLabels[p.kind] : compactKinds[p.kind]) || p.kind);
+    const meta = make("text", {x, y:44+head, "text-anchor":"middle", class:"sequence-meta"}, (options.showDetails ? kindLabels[p.kind] : compactKinds[p.kind]) || p.kind);
     meta.append(make("title", {}, [kindLabels[p.kind] || p.kind, p.identification].filter(Boolean).join(" — "))); svg.append(meta);
   }
   // These are evidence categories, never runtime certainty or numeric confidence.
@@ -444,9 +477,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   };
   const quietGuard = step => !options.showDetails && step.kind === "branch" &&
     step.label === "only if the preceding path continues normally" && !step.alternate?.length;
-  if (!options.showDetails) svg.append(make("text", {x:24, y:73, class:"sequence-meta"}, displayProjection.interactions
+  if (!options.showDetails) svg.append(make("text", {x:24, y:73+head, class:"sequence-meta"}, displayProjection.interactions
     ? "Interactions between columns · select for details" : "Compact labels · select for details"));
-  let y = options.showDetails ? 78 : 98;
+  let y = (options.showDetails ? 78 : 98) + head;
   let rows = 0; // Each row's number, as Pele counts them.
   function sourceControl(group, step, x, top, display = step, evidence = step, operator = null) {
     const ordinal = ++rows;
@@ -629,11 +662,11 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   }
   draw(view.steps, svg, 0);
   y = Math.max(y+16, 160);
-  for (const x of positions.values()) lines.append(make("line", {x1:x, x2:x, y1:54, y2:y-10}));
+  for (const x of positions.values()) lines.append(make("line", {x1:x, x2:x, y1:54+head, y2:y-10}));
   svg.setAttribute("viewBox", `0 0 ${width} ${y}`); svg.setAttribute("height", y);
   container.append(svg);
   options.onRendered?.();
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty, stepColumn:sequenceStepColumn};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, laneHeader:sequenceLaneHeader, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty, stepColumn:sequenceStepColumn};

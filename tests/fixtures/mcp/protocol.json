@@ -60,7 +60,7 @@
         },
         "watcherDegraded": false,
         "languages": [],
-        "toolVersion": 12,
+        "toolVersion": 14,
         "schemaVersion": 1,
         "limits": {
           "requestBytes": 16384,
@@ -88,7 +88,7 @@
     },
     "failures": {
       "invalid_request": [
-        "Invalid tool arguments",
+        "Invalid tool arguments: a field is not in this tool's inputSchema",
         false
       ],
       "range_too_large": [
