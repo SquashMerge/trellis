@@ -2801,9 +2801,11 @@ impl EvidenceResponse {
                 continue;
             };
             let path = path.as_ref();
-            // Present nested manifests feed app detection (#784); other consumers ignore
-            // them, as they do every path that is not a root input.
-            let nested = path.ends_with("/package.json") || path.ends_with("/Cargo.toml");
+            // Present nested manifests feed app detection (#784, #807); other consumers
+            // ignore them, as they do every path that is not a root input.
+            let nested = path.ends_with("/package.json")
+                || path.ends_with("/Cargo.toml")
+                || path.ends_with("/pyproject.toml");
             if !nested && !matches!(path, "tsconfig.json" | "jsconfig.json") {
                 continue;
             }

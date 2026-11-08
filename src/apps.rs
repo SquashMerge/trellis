@@ -1,5 +1,5 @@
-//! App detection from build manifests (#784): which `Cargo.toml` and `package.json` files
-//! name a runnable application. Pure: it reads manifest bytes and the snapshot's document
+//! App detection from build manifests (#784, #807): which `Cargo.toml`, `package.json` and
+//! `pyproject.toml` files name a runnable application. Pure: it reads manifest bytes and the snapshot's document
 //! paths, and does no I/O.
 
 use crate::references::external::ManifestInput;
@@ -14,8 +14,6 @@ use std::collections::BTreeSet;
 pub(crate) enum AppKind {
     Cargo,
     Npm,
-    /// Accepted in rules; detection arrives with #807.
-    #[allow(dead_code)]
     Python,
 }
 
@@ -63,8 +61,10 @@ pub(crate) fn candidates(
         .iter()
         .filter(|manifest| {
             let path = manifest.path.as_str();
-            matches!(file_name(path), "Cargo.toml" | "package.json")
-                && !path.split('/').any(|part| part == "node_modules")
+            matches!(
+                file_name(path),
+                "Cargo.toml" | "package.json" | "pyproject.toml"
+            ) && !path.split('/').any(|part| part == "node_modules")
         })
         .collect();
     listed.sort_by(|a, b| a.path.cmp(&b.path));
@@ -85,6 +85,8 @@ pub(crate) fn candidates(
         let path = manifest.path.as_str();
         let outcome = if file_name(path) == "package.json" {
             npm_outcome(manifest, parse(manifest, work)?)
+        } else if file_name(path) == "pyproject.toml" {
+            python_outcome(manifest, parse(manifest, work)?)
         } else if path == "Cargo.toml" {
             cargo_outcome(manifest, root_parsed.take().flatten(), documents)
         } else if members
@@ -167,7 +169,7 @@ fn parse(manifest: &ManifestInput, work: &mut Work) -> Result<Option<Parsed>> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Ok(None);
     };
-    Ok(if file_name(&manifest.path) == "Cargo.toml" {
+    Ok(if file_name(&manifest.path).ends_with(".toml") {
         toml::from_str::<toml::Table>(text).ok().map(Parsed::Toml)
     } else {
         serde_json::from_str::<serde_json::Value>(text)
@@ -195,6 +197,86 @@ fn npm_outcome(manifest: &ManifestInput, parsed: Option<Parsed>) -> Outcome {
         root,
         entries: Vec::new(),
     })
+}
+
+/// A `pyproject.toml` is an app when it declares a project: a `[project]` table with a
+/// nonblank string `name`, or, without `[project]`, a Poetry `[tool.poetry]` table with one.
+/// Its entries are the modules of its `[project.scripts]`, `[project.gui-scripts]` and
+/// `[tool.poetry.scripts]` targets. Every `pyproject.toml` is judged on its own: a uv
+/// `[tool.uv.workspace]` changes nothing, because a member, an excluded project and a
+/// project outside the workspace are each an app exactly when they declare a project, and a
+/// virtual workspace root declares none.
+fn python_outcome(manifest: &ManifestInput, parsed: Option<Parsed>) -> Outcome {
+    if manifest.bytes.is_none() {
+        return Outcome::NotApp;
+    }
+    let Some(Parsed::Toml(table)) = parsed else {
+        return Outcome::Unread;
+    };
+    let Ok(project) = subtable(&table, "project") else {
+        return Outcome::Unread;
+    };
+    let Ok(tool) = subtable(&table, "tool") else {
+        return Outcome::Unread;
+    };
+    let Ok(poetry) = tool.map_or(Ok(None), |tool| subtable(tool, "poetry")) else {
+        return Outcome::Unread;
+    };
+    let declared = match (project, poetry) {
+        (Some(project), _) => project,
+        (None, Some(poetry)) if poetry.contains_key("name") => poetry,
+        // A tool-only file, such as Poetry's `package-mode = false`.
+        (None, _) => return Outcome::NotApp,
+    };
+    let name = match declared.get("name").and_then(|name| name.as_str()) {
+        Some(name) if !name.trim().is_empty() => name.to_owned(),
+        _ => return Outcome::Unread,
+    };
+    let mut entries = BTreeSet::new();
+    let tables = [
+        (project, "scripts"),
+        (project, "gui-scripts"),
+        (poetry, "scripts"),
+    ];
+    for (parent, key) in tables {
+        let Ok(scripts) = parent.map_or(Ok(None), |parent| subtable(parent, key)) else {
+            return Outcome::Unread;
+        };
+        for target in scripts.into_iter().flat_map(|scripts| scripts.values()) {
+            let reference = match target {
+                toml::Value::String(reference) => reference.as_str(),
+                // Poetry's `{ callable = "module:function" }`; a file script has no module.
+                toml::Value::Table(script) => match script.get("callable") {
+                    Some(toml::Value::String(reference)) => reference.as_str(),
+                    Some(_) => return Outcome::Unread,
+                    None => continue,
+                },
+                _ => return Outcome::Unread,
+            };
+            // `module:function [extra]`: the module is everything before the colon.
+            let module = reference.split(':').next().unwrap_or_default().trim();
+            if module.is_empty() {
+                return Outcome::Unread;
+            }
+            entries.insert(module.to_owned());
+        }
+    }
+    Outcome::App(App {
+        name,
+        kind: AppKind::Python,
+        manifest: manifest.path.clone(),
+        root: directory(&manifest.path),
+        entries: entries.into_iter().collect(),
+    })
+}
+
+/// The table at `key`: `Ok(None)` when absent, `Err` when it is not a table.
+fn subtable<'a>(table: &'a toml::Table, key: &str) -> Result<Option<&'a toml::Table>, ()> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(toml::Value::Table(value)) => Ok(Some(value)),
+        Some(_) => Err(()),
+    }
 }
 
 fn cargo_outcome(
@@ -552,7 +634,6 @@ mod tests {
                 manifest("tools/package.json", Some(b"{}")),
                 manifest("node_modules/dep/package.json", Some(b"{}")),
                 manifest("a/node_modules/dep/package.json", Some(b"[")),
-                manifest("pyproject.toml", Some(b"[project]")),
             ],
             &[],
         );
@@ -621,14 +702,250 @@ mod tests {
     }
 
     #[test]
+    fn python_project_is_an_app_with_script_and_gui_script_modules() {
+        let bytes = br#"
+[project]
+name = "mimir-agent"
+[project.scripts]
+mimir = "mimir.cli:main"
+mimir-admin = "mimir.admin.cli:run [extra]"
+also = "mimir.cli:other"
+bare = "mimir_tool"
+[project.gui-scripts]
+mimir-gui = "mimir.gui:start"
+"#;
+        let found = run(&[manifest("pyproject.toml", Some(bytes))], &[]);
+        let app = app(&found, "pyproject.toml");
+        assert_eq!(
+            (app.name.as_str(), app.kind, app.root.as_str()),
+            ("mimir-agent", AppKind::Python, ".")
+        );
+        assert_eq!(
+            app.entries,
+            ["mimir.admin.cli", "mimir.cli", "mimir.gui", "mimir_tool"]
+        );
+    }
+
+    #[test]
+    fn python_project_without_scripts_is_an_app_rooted_at_its_directory() {
+        let found = run(
+            &[manifest(
+                "plugins/cultivate/pyproject.toml",
+                Some(b"[project]\nname = \"mimir-cultivate\"\n"),
+            )],
+            &[],
+        );
+        let app = app(&found, "plugins/cultivate/pyproject.toml");
+        assert_eq!(
+            (app.name.as_str(), app.root.as_str()),
+            ("mimir-cultivate", "plugins/cultivate")
+        );
+        assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn pyproject_without_a_project_is_not_an_app() {
+        for bytes in [
+            &b""[..],
+            b"[tool.ruff]\nline-length = 100\n",
+            b"[build-system]\nrequires = [\"hatchling\"]\n",
+            b"[tool.poetry]\npackage-mode = false\n",
+        ] {
+            let found = run(&[manifest("pyproject.toml", Some(bytes))], &[]);
+            assert_eq!(
+                outcome(&found, "pyproject.toml"),
+                &Outcome::NotApp,
+                "{bytes:?}"
+            );
+        }
+        let found = run(&[manifest("pyproject.toml", None)], &[]);
+        assert_eq!(outcome(&found, "pyproject.toml"), &Outcome::NotApp);
+    }
+
+    #[test]
+    fn malformed_or_over_bound_pyproject_is_unread() {
+        for bytes in [
+            &b"[project\n"[..],
+            PLACEHOLDER,
+            &[0xff, 0xfe],
+            b"project = 1\n",
+            b"tool = 1\n",
+            b"[project]\nversion = \"1\"\n",
+            b"[project]\nname = 3\n",
+            b"[project]\nname = \" \"\n",
+            b"[project]\nname = \"a\"\nscripts = 1\n",
+            b"[project]\nname = \"a\"\n[project.scripts]\nx = 1\n",
+            b"[project]\nname = \"a\"\n[project.gui-scripts]\nx = \":main\"\n",
+            b"[tool]\npoetry = 1\n",
+            b"[tool.poetry]\nname = 4\n",
+            b"[tool.poetry]\nname = \"a\"\n[tool.poetry.scripts]\nx = { callable = 1 }\n",
+        ] {
+            for path in ["pyproject.toml", "nested/pyproject.toml"] {
+                let found = run(&[manifest(path, Some(bytes))], &[]);
+                assert_eq!(outcome(&found, path), &Outcome::Unread, "{path} {bytes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn poetry_project_is_an_app_with_script_modules() {
+        let bytes = br#"
+[tool.poetry]
+name = "legacy"
+[tool.poetry.scripts]
+run = "legacy.main:run"
+table = { callable = "legacy.table:go", extras = ["x"] }
+file = { reference = "bin/tool.sh", type = "file" }
+"#;
+        let found = run(&[manifest("svc/pyproject.toml", Some(bytes))], &[]);
+        let legacy = app(&found, "svc/pyproject.toml");
+        assert_eq!(
+            (legacy.name.as_str(), legacy.kind, legacy.root.as_str()),
+            ("legacy", AppKind::Python, "svc")
+        );
+        assert_eq!(legacy.entries, ["legacy.main", "legacy.table"]);
+        // `[project]` names the app when both are present.
+        let both = b"[project]\nname = \"new\"\n[tool.poetry]\nname = \"old\"\n";
+        let found = run(&[manifest("pyproject.toml", Some(both))], &[]);
+        assert_eq!(app(&found, "pyproject.toml").name, "new");
+    }
+
+    #[test]
+    fn uv_workspace_root_is_not_an_app_and_every_project_is_judged_alone() {
+        let root = br#"
+[tool.uv.workspace]
+members = ["packages/*"]
+exclude = ["packages/skip"]
+"#;
+        let found = run(
+            &[
+                manifest("pyproject.toml", Some(root)),
+                manifest(
+                    "packages/alpha/pyproject.toml",
+                    Some(b"[project]\nname = \"alpha\"\n"),
+                ),
+                manifest(
+                    "packages/skip/pyproject.toml",
+                    Some(b"[project]\nname = \"skip\"\n"),
+                ),
+                manifest("packages/tools/pyproject.toml", Some(b"[tool.black]\n")),
+                manifest(
+                    "elsewhere/pyproject.toml",
+                    Some(b"[project]\nname = \"elsewhere\"\n"),
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(outcome(&found, "pyproject.toml"), &Outcome::NotApp);
+        assert_eq!(app(&found, "packages/alpha/pyproject.toml").name, "alpha");
+        // Python has no member-only rule: an excluded or non-member project is still an app.
+        assert_eq!(app(&found, "packages/skip/pyproject.toml").name, "skip");
+        assert_eq!(app(&found, "elsewhere/pyproject.toml").name, "elsewhere");
+        assert_eq!(
+            outcome(&found, "packages/tools/pyproject.toml"),
+            &Outcome::NotApp
+        );
+        // A root that is both a project and a workspace is an app.
+        let both = b"[project]\nname = \"root\"\n[tool.uv.workspace]\nmembers = [\"m\"]\n";
+        let found = run(&[manifest("pyproject.toml", Some(both))], &[]);
+        assert_eq!(app(&found, "pyproject.toml").name, "root");
+    }
+
+    #[test]
+    fn hidden_pyproject_is_neither_an_app_nor_unread() {
+        let found = run(
+            &[
+                manifest("pyproject.toml", Some(b"[project]\nname = \"svc\"\n")),
+                manifest(
+                    "tests/fixtures/app/pyproject.toml",
+                    Some(b"[project]\nname = \"fixture\"\n"),
+                ),
+                manifest("tests/fixtures/bad/pyproject.toml", Some(b"[project\n")),
+            ],
+            &[],
+        );
+        let hidden: BTreeSet<String> = [
+            "tests/fixtures/app/pyproject.toml",
+            "tests/fixtures/bad/pyproject.toml",
+        ]
+        .map(String::from)
+        .into();
+        let detected = detect(&found, &hidden);
+        let names: Vec<&str> = detected.apps.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["svc"]);
+        assert_eq!(detected.unread, 0);
+        assert_eq!(detect(&found, &BTreeSet::new()).unread, 1);
+    }
+
+    /// mimir: a Python service and a Vite frontend share the checkout root, and a plugin is
+    /// its own Python project. The two root apps share root `.` (separating them is #794).
+    #[test]
+    fn mimir_layout_detects_agent_frontend_and_plugin() {
+        let found = run(
+            &[
+                manifest(
+                    "pyproject.toml",
+                    Some(b"[project]\nname = \"mimir-agent\"\n[project.scripts]\nmimir = \"mimir.main:main\"\n"),
+                ),
+                manifest(
+                    "package.json",
+                    Some(br#"{"name":"mimir-frontend","private":true,"type":"module"}"#),
+                ),
+                manifest(
+                    "plugins/cultivate/pyproject.toml",
+                    Some(b"[project]\nname = \"mimir-cultivate\"\n"),
+                ),
+            ],
+            &[
+                "mimir/main.py",
+                "mimir/agent.py",
+                "plugins/cultivate/cultivate/__init__.py",
+                "src/main.ts",
+                "src/App.ts",
+            ],
+        );
+        let detected = detect(&found, &BTreeSet::new());
+        let apps: Vec<(&str, AppKind, &str)> = detected
+            .apps
+            .iter()
+            .map(|a| (a.name.as_str(), a.kind, a.root.as_str()))
+            .collect();
+        assert_eq!(
+            apps,
+            [
+                ("mimir-frontend", AppKind::Npm, "."),
+                ("mimir-cultivate", AppKind::Python, "plugins/cultivate"),
+                ("mimir-agent", AppKind::Python, "."),
+            ]
+        );
+        assert_eq!(detected.unread, 0);
+        assert_eq!(
+            containing(&detected.apps, "plugins/cultivate/cultivate/__init__.py"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn python_kind_serializes_as_python() {
+        assert_eq!(
+            serde_json::to_value(AppKind::Python).unwrap(),
+            serde_json::json!("python")
+        );
+    }
+
+    #[test]
     fn parsing_is_bounded_and_checked_per_manifest() {
         let manifests = [
             manifest("package.json", Some(b"{}")),
             manifest("a/package.json", Some(b"{}")),
+            manifest("a/pyproject.toml", Some(b"")),
         ];
         let documents = BTreeSet::new();
         let error =
             candidates(&manifests, &documents, &mut Work::new(3), &mut || Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), "bounded_work: app manifest parsing");
+        let python = [manifest("pyproject.toml", Some(b"[project]"))];
+        let error = candidates(&python, &documents, &mut Work::new(8), &mut || Ok(())).unwrap_err();
         assert_eq!(error.to_string(), "bounded_work: app manifest parsing");
         let mut checks = 0;
         candidates(&manifests, &documents, &mut Work::new(100), &mut || {
@@ -636,7 +953,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(checks, 2);
+        assert_eq!(checks, 3);
         let error = candidates(&manifests, &documents, &mut Work::new(100), &mut || {
             anyhow::bail!("expired")
         })
