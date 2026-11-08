@@ -187,9 +187,28 @@ impl Bindings {
                         out.pattern(p, n, source);
                     }
                 }
-                "class_declaration" | "class" => {
-                    if let Some(name) = n.child_by_field_name("name") {
+                // TypeScript classes, enums and namespaces also bind values. Interfaces
+                // and type aliases do not. Any namespace counts, instantiated or not:
+                // a spare shadow only withholds a standard-global label.
+                "class_declaration"
+                | "class"
+                | "abstract_class_declaration"
+                | "enum_declaration"
+                | "internal_module"
+                | "module" => {
+                    let mut name = n.child_by_field_name("name");
+                    // `namespace A.B.C` binds `A`.
+                    while let Some(nested) = name.filter(|x| x.kind() == "nested_identifier") {
+                        name = nested.named_child(0);
+                    }
+                    if let Some(name) = name.filter(|x| x.kind() != "string") {
                         out.add(name, scope(n.parent().unwrap_or(tree), false), None, source);
+                    }
+                }
+                // `import x = require("m")` and `import x = N.B`.
+                "import_require_clause" | "import_alias" => {
+                    if let Some(name) = n.named_child(0).filter(|x| x.kind() == "identifier") {
+                        out.add(name, scope(n, false), None, source);
                     }
                 }
                 "for_in_statement" => {
