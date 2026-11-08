@@ -24,7 +24,8 @@ function harness({navigation = false} = {}) {
   function element(tagName) {
     const n = {tagName, textContent:"", className:"", attrs:{},dataset:{},style:{},children:[],listeners:{},parentNode:null,value:"",checked:false,disabled:false,tabIndex:-1,scrollTop:0,scrollLeft:0,
       setAttribute(k,v) { this.attrs[k] = String(v); if(k==="class")this.className=String(v); },
-      getAttribute(k) {return this.attrs[k];},
+      removeAttribute(k) { delete this.attrs[k]; },
+      getAttribute(k) {return this.attrs[k] ?? null;},
       get isConnected() {return this === document.body || !!this.parentNode?.isConnected;},
       addEventListener(type, fn) {(this.listeners[type] ||= []).push(fn);},
       append(...items) {for(const item of items){item.remove();item.parentNode=this;this.children.push(item);}},
@@ -405,7 +406,7 @@ test("shared member menu preserves focus and safe labels without nested buttons"
  assert.equal(descendants(h.document.body).some(n=>n.tagName==="script"||n.tagName==="img"),false);
  for(const button of descendants(h.card("A")).filter(n=>n.tagName==="button"))assert.equal(descendants(button).slice(1).some(n=>n.tagName==="button"),false);
  await h.menu().fire("keydown",{key:"Escape"});assert.equal(h.document.activeElement,anchor);assert.equal(run,0);
- await anchor.fire("click");await h.menu().children[0].fire("click");assert.equal(run,1);assert.equal(h.document.activeElement,anchor);assert.equal(anchor.getAttribute("aria-expanded"),"false");
+ await anchor.fire("click");await h.menu().children[0].fire("click");assert.equal(run,1);assert.equal(h.document.activeElement,anchor);assert.equal(anchor.getAttribute("aria-expanded"),null);
  assert.equal(h.calls.length,1);assert.equal(h.reads.length,0);
 });
 for(const change of ["session","revision","reset","hidden","fold","rerender","new diagram","pending diagram"])test(`member scope rejects stale ${change} and old triggers`,async()=>{
@@ -439,6 +440,14 @@ test("delayed shared navigation work cannot publish or act after panel changes",
 });
 
 
+test("menu label defaults to Class actions and an anchor without aria-expanded is left without it",async()=>{
+ const h=harness(),anchor=h.get("lifecycle-anchor");
+ h.controller.showContextMenu(menuEvent(anchor),[{label:"One",run(){}}]);
+ assert.equal(h.menu().getAttribute("aria-label"),"Class actions");assert.equal(anchor.getAttribute("aria-expanded"),"true");
+ h.controller.showContextMenu(menuEvent(anchor),[{label:"One",run(){}}],{label:"Line actions"});
+ assert.equal(h.menu().getAttribute("aria-label"),"Line actions");
+ h.controller.closeContextMenu();assert.equal(anchor.getAttribute("aria-expanded"),null);
+});
 const menuEvent = anchor => ({type:"keydown",currentTarget:anchor,target:anchor,preventDefault(){},stopPropagation(){}});
 test("shared menu reports replacement, action and dismissal once and preserves action focus order",async()=>{
  const h=harness(),anchor=h.get("lifecycle-anchor"),events=[];

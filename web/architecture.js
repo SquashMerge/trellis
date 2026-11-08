@@ -64,6 +64,11 @@
     const hiddenNote = get("architecture-hidden"), hiddenToggle = get("architecture-hidden-toggle"), hiddenNames = get("architecture-hidden-names");
     // The selected node's identity, re-pressed after a resize re-layout; the width last laid out.
     let pressed = null, laidOut = null, inspection = null;
+    const deviations = window.TrellisDeviations.create({details:(params, active, offset) => details(params, active, offset), current:() => usable(),
+      basis:() => basis, view:() => view, targetLabel, eligible, portable, beginDraft:(operation, scope) => beginDraft(operation, scope), reviewChips,
+      edgeText, inspectLine:(record, render) => inspectLine(record, render), overview:() => overview(), openReview:(mode, verdict) => openReview(mode, verdict),
+      onConflict:() => onConflict(), refresh:() => refresh(), readSource:(site, pin, active) => readSource(site, pin, active),
+      openSequence:(...args) => openSequence(...args), snapshot:() => snapshot()});
     const state = (message, kind = "ready") => { get("architecture-state").textContent = message; get("architecture-state").dataset.state = kind; };
     function capture() {
       const c = context();
@@ -84,7 +89,7 @@
       if (!keepDraft) setBusy(false);
       if (!keepDraft) { draft = null; get("architecture-review-panel").hidden = true; get("architecture-editor").hidden = true; }
       get("architecture-preview-result").hidden = true;
-      serial++; renderSerial++; clearInspection(); view = null; basis = null;
+      serial++; renderSerial++; clearInspection(); deviations.reset(); view = null; basis = null;
       clearTimeout(buildingTimer); buildingWake?.(); buildingTimer = buildingWake = null;
       get("architecture-diagram").replaceChildren(); get("architecture-diagram").setAttribute("aria-busy", "false");
       get("architecture-legend").replaceChildren(); get("architecture-notice-content").replaceChildren();
@@ -538,6 +543,7 @@
         if (payload.state === "no_layers") { state("No authored layers are configured. Existing authored exceptions can still be edited or removed. Review .trellis/rules.toml to configure layers.", "empty"); overview(); }
         else await render();
         if (options.keepDraft === true) { get("architecture-review-panel").hidden = false; renderReview(); }
+        void deviations.afterRefresh();
       } catch (error) {
         if (!current(c) || error.name === "AbortError") return;
         const diagnostic = error.diagnostic;
@@ -609,11 +615,11 @@
       }
       visit(metrics, ""); target.append(list);
     }
-    function openReview(mode) {
+    function openReview(mode, verdict = "deviates") {
       if (!usable()) return;
       reviewScope = null; reviewMode = mode;
-      // The deviations chip counts unexcepted production deviations; its list shows exactly those.
-      if (mode === "rules") { get("architecture-review-role").value = "production"; get("architecture-review-state").value = "deviates"; }
+      // Deviations: production rows only, the ones the chip counts. Unknown is the Deviations tree's "Inspect" list.
+      if (mode === "rules") { get("architecture-review-role").value = "production"; get("architecture-review-state").value = verdict; }
       get("architecture-review-panel").hidden = false; renderReview();
     }
     // Counted review chips head every Architecture inspection (#449); each opens its list.
@@ -624,9 +630,9 @@
       const chip = (id, count, word, open, tone) => {
         const button = make("button", `${count.toLocaleString("en-US")} ${word}`, "architecture-chip"); button.type = "button"; button.id = id;
         if (tone) button.dataset.tone = tone;
-        button.addEventListener("click", () => { if (usable() && !editBusy) return open(); }); chips.append(button);
+        button.addEventListener("click", () => { if (usable() && !editBusy) return open(button); }); chips.append(button);
       };
-      if (view.state === "ready" && Number.isSafeInteger(counts?.deviates)) chip("architecture-review", counts.deviates, counts.deviates === 1 ? "deviation" : "deviations", () => openReview("rules"), counts.deviates ? "error" : null);
+      if (view.state === "ready" && Number.isSafeInteger(counts?.deviates)) chip("architecture-review", counts.deviates, counts.deviates === 1 ? "deviation" : "deviations", button => deviations.open(button), counts.deviates ? "error" : null);
       if (view.state === "ready") {
         const unassigned = view.modules.filter(module => module.layer === null).length;
         chip("architecture-unassigned", unassigned, unassigned === 1 ? "unassigned file" : "unassigned files", () => openReview("unassigned"));
@@ -769,6 +775,16 @@
       }
       if (!rows.length && emptyNote) paragraph(target, "No rule instances match this review scope.");
     }
+    // One selected Deviations line: the module renders the panel body into the shared inspector.
+    function inspectLine(record, render) {
+      clearInspection(); inspection = {kind:"deviation", record};
+      const ticket = selectionSerial, payload = view, c = basis;
+      const active = () => usable() && view === payload && current(c) && ticket === selectionSerial && !get("architecture-inspector").hidden;
+      onInspect(); window.TrellisShell?.showArchitectureInspector();
+      const target = get("architecture-inspector-content"); target.replaceChildren(); reviewChips(target);
+      render(target, get("architecture-inspector-title"), active);
+      return active;
+    }
     function inspectRule(row) {
       if (!usable()) return;
       clearInspection(); inspection = {kind:"rule", record:row}; const ticket = selectionSerial, payload = view, c = basis;
@@ -882,7 +898,7 @@
     function snapshot() {
       return usable() && inspection ? {inspection, pressed:nodeKey(pressedNode()), rulesHash:basis.rulesHash,
         aggregate, role, reviewMode, reviewScope, reviewOpen:!get("architecture-review-panel").hidden,
-        reviewRole:get("architecture-review-role").value, reviewState:get("architecture-review-state").value} : null;
+        reviewRole:get("architecture-review-role").value, reviewState:get("architecture-review-state").value, deviations:deviations.snapshot()} : null;
     }
     async function restore(saved, active) {
       aggregate = saved.aggregate; role = saved.role;
@@ -901,13 +917,14 @@
       }
       if (!active() || !usable()) return;
       const {kind, record} = saved.inspection;
+      if (kind === "deviation") { await deviations.restore(saved.deviations, active); return; }
       if (kind === "authored") inspectAuthored(record);
       else if (kind === "rule") inspectRule(record);
       else inspect(kind, record);
       pressed = saved.pressed;
       const node = findNode(pressed); if (node) { node.setAttribute("aria-pressed", "true"); node.focus({preventScroll:true}); }
     }
-    function beginDraft(operation) {
+    function beginDraft(operation, scope = null) {
       if (!usable() || editBusy) return;
       if (draft?.needsReselect && operation.type === "editException") operation.reason = get("architecture-reason").value;
       invalidatePreview(); draft = {operation, baseHash:basis.rulesHash, basis, needsReselect:false};
@@ -915,7 +932,7 @@
       const reason = get("architecture-reason"); reason.value = operation.reason || ""; reason.hidden = !["addExceptions", "editException"].includes(operation.type);
       get("architecture-reason-label").hidden = reason.hidden;
       get("architecture-edit-title").textContent = {addExceptions:"Add finite pair exceptions",editException:"Edit exception reason",removeException:"Remove authored exception",assignFile:"Assign file to layer"}[operation.type];
-      get("architecture-edit-scope").textContent = operation.type === "addExceptions" ? `${operation.pairs.length} concrete witnessed pairs. One reason, one preview and one apply.\n${operation.pairs.map(pair => `${pair.source.path} → ${pair.destination.path}`).join("\n")}` : JSON.stringify(operation);
+      get("architecture-edit-scope").textContent = typeof scope === "string" ? scope : operation.type === "addExceptions" ? `${operation.pairs.length} concrete witnessed pairs. One reason, one preview and one apply.\n${operation.pairs.map(pair => `${pair.source.path} → ${pair.destination.path}`).join("\n")}` : JSON.stringify(operation);
       editState(`Base rules ${draft.baseHash}. Preview before confirming.`);
     }
     async function previewDraft() {
@@ -954,6 +971,7 @@
         invalidatePreview(); draft = null; get("architecture-editor").hidden = true;
         // Written rules can hide or show layers at the same code pin; other views re-read their population.
         onRulesChanged();
+        if (deviations.isOpen()) deviations.reopenAfterRefresh();
         await refresh();
         const now = context();
         if (now.rootKey !== c.rootKey || now.session !== c.session || !window.TrellisIndexPin.equal(now.pin, c.pin)) return;

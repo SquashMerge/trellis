@@ -58,7 +58,7 @@ function harness() {
   let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null, detailError = null;
   // Created nodes with an id (the inspector's review chips, #449) resolve by that id; the newest wins.
   const created = [];
-  const document = {getElementById:id => {
+  const document = {querySelector:() => null,getElementById:id => {
     const made = created.findLast(item => item.id === id);
     if (made) return made;
     if (!elements.has(id)) elements.set(id, node(id)); return elements.get(id);
@@ -66,7 +66,7 @@ function harness() {
   function node(tagName) {
     return {tagName,textContent:"",children:[],dataset:{},attrs:{},listeners:{},hidden:false,value:"",checked:false,
       append(...items) {this.children.push(...items);},replaceChildren(...items) {this.children = [...items];this.textContent="";},
-      setAttribute(key,value) {this.attrs[key]=String(value);},
+      setAttribute(key,value) {this.attrs[key]=String(value);},focus() {},
       addEventListener(name,fn) {(this.listeners[name] ||= []).push(fn);},
       async fire(name) {for (const fn of this.listeners[name] || []) await fn({target:this});}};
   }
@@ -76,7 +76,7 @@ function harness() {
     clearArchitectureInspector:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
     showArchitectureInspector:() => {get("architecture-inspector").hidden=false;},
   }};
-  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
   const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
     if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; return emulateDetails(full, url); }
     calls.push({url,current,options}); const data = await response(url,options);
@@ -347,7 +347,7 @@ function authoringFixture(hash = "rules-one") {
 const ruleRows = h => descendants(h.get("architecture-review-list")).filter(item => item.className === "architecture-rule-row").length;
 const byLabel = (node,label) => descendants(node).find(item => item.attrs["aria-label"] === label);
 async function selectTwo(h) {
-  await h.get("architecture-review").fire("click");await flush();
+  await h.get("architecture-review").fire("click");await h.get("architecture-deviations-review").fire("click");await flush();
   for (const label of ["Select src/a.rs → src/b.rs","Select src/b.rs → src/a.rs"]) {
     const input = byLabel(h.get("architecture-review-list"),label);assert.ok(input);input.checked=true;await input.fire("change");
   }
@@ -359,7 +359,7 @@ function editorResponse(hash = "rules-one") {
 
 test("review filters independent role/state, edge instances and no-edge unassigned assignments", async () => {
   const h=harness(),payload=authoringFixture();h.setResponse(async () => ({payload}));await h.controller.refresh();
-  await h.get("architecture-review").fire("click");await flush();
+  await h.get("architecture-review").fire("click");await h.get("architecture-deviations-review").fire("click");await flush();
   assert.equal(ruleRows(h),2,"the deviations chip lists the production deviations it counts");
   h.get("architecture-review-role").value="all";await h.get("architecture-review-role").fire("change");await flush();
   assert.equal(ruleRows(h),3,"two production deviations plus test-only row");
@@ -424,7 +424,7 @@ test("authored orphan edit/remove use hash-qualified entry index; reason input i
 
 test("literal file-to-layer/glob selection emits only finite witnessed native production pairs", async () => {
   const h=harness();h.setResponse(async (url) => url.endsWith("/preview") ? editorResponse() : {payload:authoringFixture()});
-  await h.controller.refresh();await h.get("architecture-review").fire("click");h.get("architecture-source-glob").value="src/**/a.*";h.get("architecture-destination-layer").value="Storage";
+  await h.controller.refresh();await h.get("architecture-review").fire("click");await h.get("architecture-deviations-review").fire("click");h.get("architecture-source-glob").value="src/**/a.*";h.get("architecture-destination-layer").value="Storage";
   await h.get("architecture-select-scope").fire("click");await h.get("architecture-add-selected").fire("click");h.get("architecture-reason").value="Selected finite pairs";await h.get("architecture-preview").fire("click");
   assert.equal(h.calls.at(-1).options.body.operations[0].pairs.length,1);assert.equal(h.calls.at(-1).options.body.operations[0].pairs[0].source.path,"src/a.rs");
 });
@@ -750,7 +750,7 @@ test("the full stack stays drawn with deviations, and counted review chips open 
   assert.equal(chips()[0].dataset.tone, "error");
   assert.doesNotMatch(text(h.get("architecture-inspector-content")), /reference sites mapped/, "#525: the coverage sentence is said once, under the arrow key");
   assert.match(text(h.get("architecture-notice-content")), /563 of 897 production rule instances unknown/, "rule counts sit behind the ⓘ");
-  await h.get("architecture-review").fire("click"); await flush();
+  await h.get("architecture-review").fire("click");await h.get("architecture-deviations-review").fire("click"); await flush();
   assert.equal(h.get("architecture-review-panel").hidden, false);
   assert.equal(h.get("architecture-review-role").value, "production"); assert.equal(h.get("architecture-review-state").value, "deviates");
   const query = new URL(h.detailCalls.at(-1).url, "http://local").searchParams;
@@ -967,10 +967,10 @@ test("deviation model: build groups files, functions and lines, with per-file ex
   deq([store.references, store.calls], [12, 3]);
   deq(plain(store.kinds), {call:3,type:4,import:1,reference:4});
   deq(plain(store.unlisted), {call:1,type:3,import:0,reference:1});
-  deq(store.functions.map(fn => fn.label), ["S::enqueue", "(module level)", "S::boot", "(anonymous)"]);
+  deq(store.functions.map(fn => fn.label), ["S::enqueue", "(module level)", "(anonymous)", "S::boot"], "a call-tagged import is not a call, so S::boot has no call lines");
   deq(store.functions[0].lines.map(line => line.evidence.lines.start), [12, 20, 40, 41], "lines follow the site line");
   assert.equal(store.functions[0].callsExact, false, "2 of 3 calls are listed, so every function of the file is a bound");
-  assert.equal(store.functions[3].refsExact, false);
+  assert.equal(store.functions[2].refsExact, false);
   assert.equal(tree.files[1].functions[0].callsExact, true);
   assert.equal(tree.files[1].functions[0].label, "(module level)", "a null owner is the module");
   deq(plain(tree.files[1].unlisted), {call:0,type:0,import:0,reference:0});
@@ -992,11 +992,31 @@ test("deviation model: filter by edge and calls only", () => {
   deq(plain(peer.files[0].unlisted), {call:0,type:0,import:0,reference:0});
   const calls = model.filter(tree, {edge:null, callsOnly:true});
   deq(plain(calls.totals).files, 2);
-  deq(calls.files[0].functions.map(fn => fn.label), ["(module level)", "S::boot", "S::enqueue"]);
+  deq(calls.files[0].functions.map(fn => fn.label), ["(module level)", "S::enqueue"], "S::boot holds only a call-tagged import");
   assert.equal(calls.files[0].functions.some(fn => fn.label === "(anonymous)"), false, "functions with no call are hidden");
   assert.equal(calls.files[0].functions.find(fn => fn.label === "S::enqueue").lines.length, 1);
   assert.equal(calls.files[0].edges.some(edge => edge.key === "Storage→Peer"), false);
   assert.equal(model.filter(tree, {edge:"Storage→Peer", callsOnly:true}).files.length, 0, "no calls on the peer edge");
+});
+
+test("deviation model: a require with a caller is tagged a call but counted as an import", () => {
+  const {model} = deviationsHarness().sandbox.window.TrellisDeviations, layers = deviationView().layers;
+  const store = docId("src/req.js", "javascript"), rules = docId("src/rules.js", "javascript");
+  const boot = {syntaxId:"o3",name:"boot",stableLookupKey:"S::boot"}, caller = {stableLookupKey:"S::boot",syntaxId:"o3",name:"boot",document:store};
+  const require = evidenceItem({document:store,relationKind:"import",callId:callId("c"),caller,owner:boot,lines:{start:2,end:2},range:{start:20,end:30}});
+  const rows = [{role:"production",instance:{rule:"$layers",status:"deviates",excepted:false,sourceLayer:"Storage",destinationLayer:"UI",target:store,destination:rules,
+    referenceCount:1,kindCounts:{call:0,type:0,import:1,reference:0},evidence:[require]}}];
+  const tree = model.build(rows, layers), file = tree.files[0];
+  assert.equal(file.functions[0].lines[0].kind, "call", "the tag keeps the caller rule");
+  deq([file.calls, file.functions[0].calls], [0, 0], "file and function call totals agree");
+  const calls = model.filter(tree, {edge:null, callsOnly:true});
+  deq(plain(calls.totals), {files:0,references:0,calls:0}, "a file whose only call-tagged line is a require is hidden under Calls only");
+  const mixed = deviationRows();
+  mixed[0].instance.evidence = mixed[0].instance.evidence.filter(item => item.relationKind === "import");
+  mixed[0].instance.kindCounts = {call:0,type:0,import:1,reference:0};
+  mixed[0].instance.referenceCount = 1;
+  const none = model.filter(model.build(mixed, layers), {edge:null, callsOnly:true});
+  deq(none.files.map(item => item.path), ["src/other.rs"], "the require-only file leaves the Calls only list");
 });
 
 test("deviation model: kind tag, chips with bound, exception note, sequence test, line key", () => {
@@ -1042,6 +1062,12 @@ test("deviations keyboard actions", () => {
   deq(act(4, "Enter"), {focus:4}, "the unlisted row has no action");
   assert.equal(model.keyAction(rows, 0, "a"), null);
   assert.equal(model.keyAction(rows, 0, "Tab"), null);
+});
+
+test("one unknown rule instance reads in the singular", async () => {
+  const h = deviationsHarness({view:{...deviationView(), rules:{counts:{unknown:1}}}});
+  await h.dev.open(h.trigger);
+  assert.match(h.notices(), /1 unknown rule instance is not a deviation\./);
 });
 
 test("deviations read sends the five filters and pages until nextOffset is null", async () => {
