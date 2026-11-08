@@ -72,7 +72,7 @@
           file.listed[evidence.relationKind]++;
           if (evidence.relationKind === "call") listedCalls++;
           const kind = kindOf(evidence);
-          if (callsOnly && kind !== "call") continue;
+          if (callsOnly && evidence.relationKind !== "call") continue;
           const id = evidence.owner ? evidence.owner.syntaxId : MODULE;
           if (!file.functions.has(id)) file.functions.set(id, {key:id, id:JSON.stringify(["fn", key, id]), label:labelOf(evidence.owner, i), lines:[]});
           file.functions.get(id).lines.push({key:lineKey(i, evidence), evidence, instance:i, kind, fn:labelOf(evidence.owner, i), direction:direction(i.sourceLayer, i.destinationLayer),
@@ -86,7 +86,7 @@
         for (const kind of KINDS) unlisted[kind] = Math.max(0, file.kinds[kind] - file.listed[kind]);
         const functions = [...file.functions.values()].map(fn => {
           sortBy(fn.lines, line => line.start, line => line.evidence.range.start);
-          const calls = fn.lines.filter(line => line.kind === "call").length;
+          const calls = fn.lines.filter(line => line.evidence.relationKind === "call").length;
           return {...fn, calls, references:fn.lines.length, callsExact:file.callsExact, refsExact:file.refsExact};
         }).filter(fn => !callsOnly || fn.calls > 0);
         sortBy(functions, fn => fn.calls > 0 ? 0 : 1, fn => -fn.references, fn => fn.label);
@@ -356,7 +356,7 @@
       if (Number.isSafeInteger(unknown) && unknown > 0) {
         const inspect = make("button", "Inspect unknown instances"); inspect.type = "button"; inspect.id = "architecture-deviations-inspect";
         inspect.addEventListener("click", () => deps.openReview("rules", "unknown"));
-        slots.unknown.append(make("span", `${plural(unknown, "unknown rule instance")} are not deviations.`), inspect);
+        slots.unknown.append(make("span", unknown === 1 ? "1 unknown rule instance is not a deviation." : `${num(unknown)} unknown rule instances are not deviations.`), inspect);
       }
       if (errorInfo) {
         const reload = make("button", "Reload deviations"); reload.type = "button"; reload.id = "architecture-deviations-reload";

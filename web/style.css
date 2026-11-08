@@ -561,3 +561,55 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 #sequence-diagram :is(path, line)[data-boundary-highlight=true],
 #sequence-diagram .pele-message[data-boundary-highlight=true] :is(path, line) { stroke:var(--sm-amber); stroke-width:3px; }
 #sequence-diagram [data-boundary-highlight=true] text { fill:var(--sm-amber); }
+
+/* Deviations tree (#786): production $layers deviations by file, function and line. */
+#architecture-deviations { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-2) 0; overflow: auto; overscroll-behavior: contain; font: 13px/1.5 var(--sans); }
+#architecture-deviations :is(p, span, label, button) { overflow-wrap: anywhere; }
+#architecture-deviations p { margin: 0; }
+#architecture-deviations .deviations-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1) var(--sp-3); }
+#architecture-deviations .deviations-header .detail { flex-basis: 100%; }
+#architecture-deviations .deviations-header #architecture-deviations-review { margin-left: auto; }
+#architecture-deviations .deviations-back { background: none; border: 0; padding: 0; min-height: 0; color: var(--link); text-decoration: underline; text-underline-offset: 3px; }
+#architecture-deviations .deviations-filters { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); }
+#architecture-deviations .deviations-filters > .detail { margin-left: auto; }
+#architecture-deviations .deviations-edges { display: flex; flex-wrap: wrap; border: 1px solid var(--line-strong); border-radius: var(--radius-card); overflow: hidden; }
+#architecture-deviations .deviations-chip { border: 0; border-radius: 0; font-size: 13px; min-height: 32px; }
+#architecture-deviations .deviations-chip + .deviations-chip { border-left: 1px solid var(--line-strong); }
+#architecture-deviations .deviations-notices > div:not(:empty) { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); padding: var(--sp-1) 0; }
+#architecture-deviations .deviations-card { max-height: 70vh; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--surface); }
+#architecture-deviations .deviations-card > .detail { padding: var(--sp-2) var(--sp-3); }
+#architecture-deviations .deviations-head, #architecture-deviations .deviation-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, 200px) 56px 72px 32px; gap: var(--sp-2); align-items: start; padding: var(--sp-1) var(--sp-3);
+}
+#architecture-deviations .deviations-head { color: var(--secondary); font-size: 12px; border-bottom: 1px solid var(--line); }
+#architecture-deviations .deviations-head span:nth-child(3), #architecture-deviations .deviations-head span:nth-child(4),
+#architecture-deviations .deviation-calls, #architecture-deviations .deviation-refs { text-align: right; }
+#architecture-deviations .deviation-row { border-bottom: 1px solid var(--line); cursor: pointer; background: var(--surface); }
+#architecture-deviations .deviation-row[data-level="3"] { background: var(--bg); }
+#architecture-deviations .deviation-row[data-level="2"] .deviation-name { padding-left: var(--sp-4); }
+#architecture-deviations .deviation-row[data-level="3"] .deviation-name { padding-left: var(--sp-5); }
+#architecture-deviations .deviation-row.deviation-more { cursor: default; }
+#architecture-deviations .deviation-row:hover { background: var(--node); }
+#architecture-deviations .deviation-row:focus-visible { outline-offset: -2px; }
+#architecture-deviations .deviation-row[aria-selected="true"], #architecture-deviations .deviation-row[aria-selected="true"] * { background: var(--selected); color: var(--on-selected); border-color: var(--on-selected); }
+#architecture-deviations .deviation-name { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1) var(--sp-2); min-width: 0; }
+#architecture-deviations .deviation-path, #architecture-deviations .deviation-label, #architecture-deviations .deviation-symbol, #architecture-deviations .deviation-target,
+#architecture-deviations .deviation-line { font: 13px/1.5 var(--mono); }
+#architecture-deviations .deviation-path { overflow-wrap: anywhere; }
+#architecture-deviations .deviation-reach { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-1); min-width: 0; }
+#architecture-deviations .deviation-reason { font-size: 12px; }
+#architecture-deviations .deviation-muted { color: var(--secondary); }
+#architecture-deviations .deviation-edge { border: 1px solid var(--error); border-radius: 999px; padding: 1px var(--sp-2); font: 12px/1.4 var(--mono); color: var(--error); }
+#architecture-deviations .deviation-calls[data-tone="error"] { color: var(--error); }
+#architecture-deviations .deviation-kind { font-size: 12px; border-radius: var(--radius-detail); margin: 0; background: none; border: 1px solid var(--line-strong); color: var(--secondary); }
+#architecture-deviations .deviation-kind[data-kind="call"] { border-color: var(--error); color: var(--error); }
+#architecture-deviations .deviation-actions { width: 28px; height: 28px; min-height: 28px; padding: 0; border: 1px solid var(--line-strong); border-radius: var(--radius-control); line-height: 1; }
+.deviation-primary { min-height: var(--control-min-height); border-radius: var(--radius-control); background: var(--primary); border-color: var(--primary); color: var(--sm-ink); font-weight: 600; }
+.deviation-primary:hover { background: var(--primary); border-color: var(--ink); }
+#architecture-inspector-content .deviation-primary, #architecture-inspector-content .deviation-secondary { display: block; margin-top: var(--sp-2); }
+#architecture-inspector-content .deviation-secondary { min-height: 32px; }
+@media (max-width: 900px) {
+  #architecture-deviations .deviations-head { display: none; }
+  #architecture-deviations .deviation-row { grid-template-columns: minmax(0, 1fr) 56px 72px 32px; }
+  #architecture-deviations .deviation-reach { grid-column: 1 / -1; grid-row: 2; }
+}

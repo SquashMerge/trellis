@@ -206,7 +206,7 @@
     // Clear ownership before DOM, callbacks or focus can re-enter dismissal.
     menu = menuAnchor = menuContext = menuOnClose = null; menuExpanded = null; menuScroll.clear();
     if (closing) closing.remove();
-    if (anchor) anchor.setAttribute("aria-expanded", expanded ?? "false");
+    if (anchor) { if (expanded === null) anchor.removeAttribute("aria-expanded"); else anchor.setAttribute("aria-expanded", expanded); }
     if (onClose) onClose(reason);
     if (restore && !menu && anchor && anchor.isConnected) anchor.focus({preventScroll: true});
   }
@@ -236,7 +236,7 @@
     menu = el("div", undefined, "classes-context-menu");
     const createdMenu = menu;
     menuOnClose = typeof options.onClose === "function" ? options.onClose : null;
-    menu.setAttribute("role", "menu"); menu.setAttribute("aria-label", "Class actions");
+    menu.setAttribute("role", "menu"); menu.setAttribute("aria-label", options.label || "Class actions");
     menuAnchor.setAttribute("aria-expanded", "true");
     const buttons = [];
     for (const action of actions) {

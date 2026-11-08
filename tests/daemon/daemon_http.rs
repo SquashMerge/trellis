@@ -508,6 +508,7 @@ async fn provisioned_page_serves_all_referenced_assets() {
         "shell.js",
         "classes.js",
         "navigation.js",
+        "architecture-deviations.js",
         "app.js",
     ] {
         assert!(html.contains(&format!("/{asset}")));
