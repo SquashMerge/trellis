@@ -999,8 +999,8 @@ impl LanguageTier {
     }
 }
 
-/// The four MCP languages in #22 order.
-pub const MCP_LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
+/// The five MCP languages in #22 order.
+pub const MCP_LANGUAGES: [&str; 5] = crate::semantic_evidence::LANGUAGE_ORDER;
 
 impl EvidenceResponse {
     /// Advisory work status from the admitted pin, not a publication eligibility proof.
@@ -1015,11 +1015,11 @@ impl EvidenceResponse {
 
     /// Each MCP language's selected semantic evidence at the admitted head, in #22 order
     /// (#528). Uses the per-language default producer, as status and the call tools do.
-    pub fn mcp_language_tiers(&self) -> Result<[LanguageTier; 4]> {
+    pub fn mcp_language_tiers(&self) -> Result<[LanguageTier; 5]> {
         let selected = self.selected(None)?;
         let defaults = default_producers(&self.db, &selected.key)?;
         let reimports = super::semantic_retention::semantic_reimport_at(&self.db, &selected.key)?;
-        let mut tiers: [LanguageTier; 4] = Default::default();
+        let mut tiers: [LanguageTier; 5] = Default::default();
         for (tier, language) in tiers.iter_mut().zip(MCP_LANGUAGES) {
             tier.freshness = "unavailable";
             tier.reimport = reimports.get(language).cloned();
@@ -1126,10 +1126,7 @@ impl EvidenceResponse {
         }
         let selection = select_producers(&self.db, &selected.key, None)?;
         for document in document_projections(&self.db, selected.pin, &selection)? {
-            if let Some(at) = MCP_LANGUAGES
-                .iter()
-                .position(|language| *language == document.language)
-            {
+            if let Some(at) = crate::semantic_evidence::language_order(&document.language) {
                 if document.projection.semantic_status == crate::model::SemanticStatus::OlderBasis {
                     let basis = semantic_pin_key(document.projection.semantic_basis_pin);
                     let tuple: Option<(bool,String)> = self.db.query_row(
@@ -1878,5 +1875,20 @@ mod reimport_tests {
         assert_eq!(tiers[1].freshness, "unavailable");
         assert_eq!(tiers[1].counts, [0; 5]);
         assert!(tiers[3].reimport.is_none());
+    }
+}
+
+#[cfg(test)]
+mod mcp_languages_tests {
+    #[test]
+    fn mcp_languages_are_the_five_language_rows_in_contract_order() {
+        assert_eq!(
+            super::MCP_LANGUAGES,
+            ["java", "rust", "python", "javascript", "typescript"]
+        );
+        assert_eq!(
+            super::MCP_LANGUAGES,
+            crate::semantic_evidence::LANGUAGE_ORDER
+        );
     }
 }

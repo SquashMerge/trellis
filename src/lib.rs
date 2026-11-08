@@ -34,6 +34,8 @@ mod indexer_projection_vectors_tests;
 mod indexer_python;
 mod indexer_rust;
 mod indexer_ts;
+#[cfg(test)]
+mod language_set_tests;
 pub mod mcp;
 pub mod metrics;
 pub mod model;

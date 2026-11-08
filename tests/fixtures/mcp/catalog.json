@@ -111,25 +111,6 @@
           ],
           "type": "object"
         },
-        "FailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "workspace_selection_failed",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
-        },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
@@ -139,7 +120,8 @@
             "java",
             "rust",
             "python",
-            "javascript"
+            "javascript",
+            "typescript"
           ]
         },
         "LanguageStatus": {
@@ -1412,25 +1394,6 @@
           ],
           "type": "object"
         },
-        "FailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "workspace_selection_failed",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
-        },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
@@ -1457,7 +1420,8 @@
             "java",
             "rust",
             "python",
-            "javascript"
+            "javascript",
+            "typescript"
           ]
         },
         "Path": {
@@ -2437,7 +2401,7 @@
                   "items": {
                     "$ref": "#/$defs/LanguageStatus"
                   },
-                  "maxItems": 4,
+                  "maxItems": 5,
                   "minItems": 0,
                   "type": "array"
                 },
@@ -2844,25 +2808,6 @@
           ],
           "type": "object"
         },
-        "FailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "workspace_selection_failed",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
-        },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
@@ -2889,7 +2834,8 @@
             "java",
             "rust",
             "python",
-            "javascript"
+            "javascript",
+            "typescript"
           ]
         },
         "Path": {
@@ -4016,7 +3962,7 @@
                   "items": {
                     "$ref": "#/$defs/LanguageStatus"
                   },
-                  "maxItems": 4,
+                  "maxItems": 5,
                   "minItems": 0,
                   "type": "array"
                 },
@@ -4670,7 +4616,8 @@
             "java",
             "rust",
             "python",
-            "javascript"
+            "javascript",
+            "typescript"
           ]
         },
         "Parameter": {
@@ -5256,25 +5203,6 @@
             "provenanceId"
           ]
         },
-        "FailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "workspace_selection_failed",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
-        },
         "ArgumentFailure": {
           "additionalProperties": false,
           "properties": {
@@ -5794,8 +5722,8 @@
                   "items": {
                     "$ref": "#/$defs/LanguageStatus"
                   },
-                  "maxItems": 4,
-                  "minItems": 4,
+                  "maxItems": 5,
+                  "minItems": 5,
                   "type": "array"
                 },
                 "documents": {
@@ -6519,7 +6447,8 @@
             "java",
             "rust",
             "python",
-            "javascript"
+            "javascript",
+            "typescript"
           ]
         },
         "MeasuredAnchor": {
@@ -7181,25 +7110,6 @@
             "revisionId",
             "contentHash",
             "provenanceId"
-          ]
-        },
-        "FailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "workspace_selection_failed",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
           ]
         },
         "ArgumentFailure": {
@@ -7953,8 +7863,8 @@
                   "items": {
                     "$ref": "#/$defs/LanguageStatus"
                   },
-                  "maxItems": 4,
-                  "minItems": 4,
+                  "maxItems": 5,
+                  "minItems": 5,
                   "type": "array"
                 },
                 "documents": {
@@ -8368,7 +8278,8 @@
             "java",
             "rust",
             "python",
-            "javascript"
+            "javascript",
+            "typescript"
           ]
         },
         "OccurrenceId": {
@@ -8864,25 +8775,6 @@
             "revisionId",
             "contentHash",
             "provenanceId"
-          ]
-        },
-        "FailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "workspace_selection_failed",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
           ]
         },
         "ArgumentFailure": {
@@ -9959,8 +9851,8 @@
                     "$ref": "#/$defs/LanguageStatus"
                   },
                   "type": "array",
-                  "minItems": 4,
-                  "maxItems": 4
+                  "minItems": 5,
+                  "maxItems": 5
                 },
                 "semanticBases": {
                   "type": "array",
@@ -10086,8 +9978,8 @@
                   "items": {
                     "$ref": "#/$defs/LanguageStatus"
                   },
-                  "maxItems": 4,
-                  "minItems": 4,
+                  "maxItems": 5,
+                  "minItems": 5,
                   "type": "array"
                 },
                 "documents": {
@@ -10380,25 +10272,6 @@
             "catchingUp"
           ],
           "type": "object"
-        },
-        "FailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "workspace_selection_failed",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
         },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -11639,7 +11512,8 @@
             "java",
             "rust",
             "python",
-            "javascript"
+            "javascript",
+            "typescript"
           ]
         },
         "Role": {
@@ -11978,25 +11852,6 @@
             "error"
           ],
           "type": "object"
-        },
-        "FailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "workspace_selection_failed",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
         },
         "ArgumentFailure": {
           "additionalProperties": false,
@@ -13547,8 +13402,8 @@
                   "items": {
                     "$ref": "#/$defs/LanguageStatus"
                   },
-                  "maxItems": 4,
-                  "minItems": 4,
+                  "maxItems": 5,
+                  "minItems": 5,
                   "type": "array"
                 },
                 "documents": {
@@ -13868,29 +13723,6 @@
           ],
           "type": "object"
         },
-        "FailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "workspace_selection_failed",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown",
-            "invalid_rules",
-            "rules_not_found",
-            "bounded_work",
-            "response_too_large"
-          ]
-        },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
@@ -13900,7 +13732,8 @@
             "java",
             "rust",
             "python",
-            "javascript"
+            "javascript",
+            "typescript"
           ]
         },
         "Path": {
@@ -15478,7 +15311,10 @@
               "if": {
                 "properties": {
                   "language": {
-                    "const": "javascript"
+                    "enum": [
+                      "javascript",
+                      "typescript"
+                    ]
                   },
                   "standardLibrary": {
                     "const": false
@@ -15497,7 +15333,10 @@
               "if": {
                 "properties": {
                   "language": {
-                    "const": "javascript"
+                    "enum": [
+                      "javascript",
+                      "typescript"
+                    ]
                   },
                   "standardLibrary": {
                     "const": true
@@ -16676,29 +16515,6 @@
           ],
           "type": "object"
         },
-        "FailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "workspace_selection_failed",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown",
-            "invalid_rules",
-            "rules_not_found",
-            "bounded_work",
-            "response_too_large"
-          ]
-        },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
@@ -16708,7 +16524,8 @@
             "java",
             "rust",
             "python",
-            "javascript"
+            "javascript",
+            "typescript"
           ]
         },
         "Path": {
@@ -18403,7 +18220,10 @@
               "if": {
                 "properties": {
                   "language": {
-                    "const": "javascript"
+                    "enum": [
+                      "javascript",
+                      "typescript"
+                    ]
                   },
                   "standardLibrary": {
                     "const": false
@@ -18422,7 +18242,10 @@
               "if": {
                 "properties": {
                   "language": {
-                    "const": "javascript"
+                    "enum": [
+                      "javascript",
+                      "typescript"
+                    ]
                   },
                   "standardLibrary": {
                     "const": true
@@ -19522,7 +19345,8 @@
             "java",
             "rust",
             "python",
-            "javascript"
+            "javascript",
+            "typescript"
           ]
         },
         "Path": {
@@ -19687,7 +19511,10 @@
               "if": {
                 "properties": {
                   "language": {
-                    "const": "javascript"
+                    "enum": [
+                      "javascript",
+                      "typescript"
+                    ]
                   },
                   "standardLibrary": {
                     "const": false
@@ -19706,7 +19533,10 @@
               "if": {
                 "properties": {
                   "language": {
-                    "const": "javascript"
+                    "enum": [
+                      "javascript",
+                      "typescript"
+                    ]
                   },
                   "standardLibrary": {
                     "const": true
@@ -19904,29 +19734,6 @@
           ],
           "type": "object"
         },
-        "FailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "workspace_selection_failed",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown",
-            "invalid_rules",
-            "rules_not_found",
-            "bounded_work",
-            "response_too_large"
-          ]
-        },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
@@ -19936,7 +19743,8 @@
             "java",
             "rust",
             "python",
-            "javascript"
+            "javascript",
+            "typescript"
           ]
         },
         "Path": {
@@ -21589,7 +21397,10 @@
               "if": {
                 "properties": {
                   "language": {
-                    "const": "javascript"
+                    "enum": [
+                      "javascript",
+                      "typescript"
+                    ]
                   },
                   "standardLibrary": {
                     "const": false
@@ -21608,7 +21419,10 @@
               "if": {
                 "properties": {
                   "language": {
-                    "const": "javascript"
+                    "enum": [
+                      "javascript",
+                      "typescript"
+                    ]
                   },
                   "standardLibrary": {
                     "const": true
