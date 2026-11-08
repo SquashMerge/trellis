@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 mod failure;
 pub(crate) use failure::TypedFailure;
+pub(crate) use failure::recovery_blocked_reason;
 pub use failure::split_error;
 
 /// A single maintenance unit's existing-only queue admission. Unknown is a

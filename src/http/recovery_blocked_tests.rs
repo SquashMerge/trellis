@@ -52,10 +52,16 @@ fn persistent_recreation_fault_fails_accepted_work_then_recovers_without_replayi
         error.to_string().contains("unsupported index sidecar"),
         "{error:#}"
     );
+    // The fault's chain names the sidecar path; the reply and the rows record
+    // only the typed cause (#445, #768). The path stays in the diagnostic.
+    assert!(
+        state
+            .startup_error()
+            .unwrap()
+            .contains(sidecar.to_str().unwrap())
+    );
     let blocker = state.recovery_blocker().unwrap();
-    assert!(blocker.starts_with("recovery_blocked: "));
-    assert!(blocker.contains("unsupported index sidecar"));
-    assert!(blocker.contains(sidecar.to_str().unwrap()));
+    assert_eq!(blocker, "recovery_blocked: internal error");
     assert!(
         store.terminal_generation() > terminal_generation,
         "confirmed failure must wake terminal waiters"
@@ -214,11 +220,9 @@ fn persistent_startup_fault_is_bounded_without_recreation() {
     let failed = store.request_by_id(&accepted.id).unwrap().unwrap();
     assert_eq!(failed.state, "failed");
     assert_eq!(failed.error_code, state.recovery_blocker());
-    assert!(
-        failed
-            .error_code
-            .unwrap()
-            .contains("persistent startup fault")
+    assert_eq!(
+        failed.error_code.as_deref(),
+        Some("recovery_blocked: internal error")
     );
     next_attempt(&state).unwrap();
     assert!(state.recovery_blocker().is_none());
