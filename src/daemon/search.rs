@@ -38,20 +38,25 @@ pub struct SearchQuery {
 
 impl SearchQuery {
     /// Standalone/test registries may have no daemon search service or selected
-    /// backend. A configured service instead preserves its selected backend.
+    /// backend; without a service there is no model, so the reason is
+    /// `model_not_configured`. A configured service instead preserves its
+    /// selected backend and names its own reason.
     pub fn unavailable(backend: Option<Backend>) -> Self {
+        Self::unavailable_because(backend, SearchUnavailableReason::ModelNotConfigured)
+    }
+
+    fn unavailable_because(backend: Option<Backend>, reason: SearchUnavailableReason) -> Self {
         Self {
             vector: None,
             budget: None,
             status: SearchIndexStatus {
-                state: SearchIndexState::Unavailable,
+                state: SearchIndexState::Unavailable(reason),
                 model_id: None,
                 model_name: None,
                 backend,
                 declarations: 0,
                 embedded: 0,
                 lexical: LexicalState::Complete,
-                unavailable_reason: None,
             },
         }
     }
@@ -66,8 +71,9 @@ impl SearchQuery {
     pub fn mark_budget_exceeded(&mut self) {
         let backend = self.status.backend;
         self.vector = None;
-        self.status = Self::unavailable(backend).status;
-        self.status.unavailable_reason = Some(SearchUnavailableReason::VectorBudgetExceeded);
+        self.status =
+            Self::unavailable_because(backend, SearchUnavailableReason::VectorBudgetExceeded)
+                .status;
     }
 
     pub fn budget(&self) -> Option<&QueryBudget> {
@@ -78,18 +84,57 @@ impl SearchQuery {
         self.status.model_id.as_deref()
     }
 
-    pub fn status(&self, declarations: u64, embedded: u64, building: bool) -> SearchIndexStatus {
+    /// Whether a pending owner job would report a measured count: false when a
+    /// model diagnostic already decides `unavailable`, so callers skip counting.
+    pub fn counts_pending(&self) -> bool {
+        self.status
+            .state
+            .unavailable_reason()
+            .is_none_or(|reason| !reason.outranks_coverage())
+    }
+
+    /// The one state precedence for search (#777). `vector_used` means this
+    /// call ranked its query vector against admitted-head vectors. `pending`
+    /// means the background owner has queued or running work for this
+    /// checkout's head, as the owner published it. `embedded` is measured:
+    /// from the used vectors, or from the cache while the owner is pending.
+    pub fn status(
+        &self,
+        declarations: u64,
+        embedded: u64,
+        vector_used: bool,
+        pending: bool,
+    ) -> SearchIndexStatus {
         let mut status = self.status.clone();
         status.declarations = declarations;
-        if status.model_id.is_some() {
+        status.embedded = 0;
+        if !self.counts_pending() {
+            return status;
+        }
+        if vector_used && status.model_id.is_some() {
             status.embedded = embedded;
             status.state = if embedded == declarations {
                 SearchIndexState::Complete
-            } else if building {
+            } else if pending {
                 SearchIndexState::Building
             } else {
                 SearchIndexState::Partial
             };
+            return status;
+        }
+        // The vector arm was not used: lexical-only, no model identity.
+        status.model_id = None;
+        status.model_name = None;
+        if pending {
+            status.embedded = embedded;
+            status.state = SearchIndexState::Building;
+        } else {
+            status.state = SearchIndexState::Unavailable(
+                self.status
+                    .state
+                    .unavailable_reason()
+                    .unwrap_or(SearchUnavailableReason::MatrixNotResident),
+            );
         }
         status
     }
@@ -305,10 +350,44 @@ impl SearchService {
         self.status.clone()
     }
 
-    pub(crate) fn unavailable_query(&self) -> SearchQuery {
-        let mut query = SearchQuery::unavailable(Some(self.status.backend()));
-        query.status.unavailable_reason = self.status.unavailable_reason();
-        query
+    /// A query that will not embed. A model diagnostic takes precedence over
+    /// the caller's `cause` (`model_not_ready` or `matrix_not_resident`).
+    pub(crate) fn unavailable_query(&self, cause: SearchUnavailableReason) -> SearchQuery {
+        SearchQuery::unavailable_because(
+            Some(self.status.backend()),
+            self.status.unavailable_reason().unwrap_or(cause),
+        )
+    }
+
+    /// Admitted-head candidates with a current decoded vector in the cache, for
+    /// a head whose matrix the owner is still building (#777). One cache
+    /// snapshot; the optional budget bounds it like any vector work.
+    pub(crate) fn cached_embedded(
+        &self,
+        card_hashes: &[String],
+        budget: Option<&QueryBudget>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<u64> {
+        let model_id = crate::search_embed::model_id_for_card_format(CardFormat::V1.as_str());
+        self.with_vector_snapshot_budget(budget, |snapshot| {
+            let Some(snapshot) = snapshot else {
+                return Ok(0);
+            };
+            let mut embedded = 0;
+            for card_hash in card_hashes {
+                check()?;
+                if let Some(budget) = budget {
+                    budget.check()?;
+                }
+                if snapshot
+                    .get(&model_id, card_hash)?
+                    .is_some_and(|vector| vector.len() == DIMENSIONS)
+                {
+                    embedded += 1;
+                }
+            }
+            Ok(embedded)
+        })
     }
 
     /// Call before acquiring any checkout/cache snapshot. Ready owners service
@@ -329,7 +408,7 @@ impl SearchService {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if admission.phase == ModelPhase::Loading {
-                let mut query = self.unavailable_query();
+                let mut query = self.unavailable_query(SearchUnavailableReason::ModelNotReady);
                 query.budget = budget;
                 return Ok(query);
             }
@@ -913,15 +992,34 @@ mod tests {
             )
             .unwrap();
         assert!(query.model_id().is_some());
-        assert_eq!(query.status(2, 1, true).state, SearchIndexState::Building);
-        assert_eq!(query.status(2, 1, false).state, SearchIndexState::Partial);
-        assert_eq!(query.status(2, 2, false).state, SearchIndexState::Complete);
+        assert_eq!(
+            query.status(2, 1, true, true).state,
+            SearchIndexState::Building
+        );
+        assert_eq!(
+            query.status(2, 1, true, false).state,
+            SearchIndexState::Partial
+        );
+        assert_eq!(
+            query.status(2, 2, true, false).state,
+            SearchIndexState::Complete
+        );
+        // A query vector that no admitted matrix used is lexical-only (#777):
+        // building with the measured count while the owner is pending, else a
+        // named matrix cause.
+        let pending = query.status(2, 1, false, true);
+        assert_eq!(pending.state, SearchIndexState::Building);
+        assert_eq!((pending.embedded, pending.model_id), (1, None));
+        assert_eq!(
+            query.status(2, 1, false, false).state,
+            SearchIndexState::Unavailable(SearchUnavailableReason::MatrixNotResident)
+        );
         assert_eq!(
             service
                 .status_handle()
                 .snapshot(CardFormat::V1.as_str(), 2, 2, LexicalState::Complete, false)
                 .state,
-            SearchIndexState::Unavailable
+            SearchIndexState::Unavailable(SearchUnavailableReason::ModelNotReady)
         );
         cancel.store(true, Ordering::Release);
         assert!(matches!(
@@ -979,16 +1077,19 @@ mod tests {
         assert!(query.vector.is_none());
         assert!(query.model_id().is_none());
         assert_eq!(
-            query.status(5, 3, true).state,
-            SearchIndexState::Unavailable
+            query.status(5, 3, true, false).state,
+            SearchIndexState::Unavailable(SearchUnavailableReason::ModelNotReady)
         );
-        assert_eq!(query.status(5, 3, true).backend, Some(Backend::Cpu));
+        assert_eq!(query.status(5, 3, true, false).backend, Some(Backend::Cpu));
         assert_eq!(service.admission.lock().unwrap().phase, ModelPhase::Idle);
     }
 
     #[test]
     fn only_loading_is_lexical_only() {
-        let (_directory, service) = service();
+        let (_directory, mut service) = service();
+        let model = SearchModel::with_embedder_for_tests(Arc::new(ConstantFactory)).unwrap();
+        service.status = model.status_handle();
+        service.model = Mutex::new(model);
         service.admission.lock().unwrap().phase = ModelPhase::Loading;
         let query = service
             .query_embedding(
@@ -1001,10 +1102,15 @@ mod tests {
         assert!(query.vector.is_none());
         assert!(query.model_id().is_none());
         assert_eq!(
-            query.status(3, 2, true).state,
-            SearchIndexState::Unavailable
+            query.status(3, 2, false, false).state,
+            SearchIndexState::Unavailable(SearchUnavailableReason::ModelNotReady)
         );
-        assert_eq!(query.status(3, 2, true).backend, Some(Backend::Cpu));
+        assert_eq!(query.status(3, 2, false, false).backend, Some(Backend::Cpu));
+        // Loading for another job is not a model fault: pending owner work
+        // still reports building with the measured count.
+        let pending = query.status(3, 2, false, true);
+        assert_eq!(pending.state, SearchIndexState::Building);
+        assert_eq!(pending.embedded, 2);
     }
 
     #[test]
@@ -1334,15 +1440,31 @@ mod tests {
     fn unavailable_budget_status_keeps_reason_and_exact_native_count() {
         let (_clock, budget) = fake_budget();
         let query = SearchQuery::budget_exceeded(Some(Backend::Cpu), budget);
-        let status = query.status(7, 3, true);
+        // A missing model outranks pending owner work and keeps its reason.
+        for reason in [
+            SearchUnavailableReason::ModelNotConfigured,
+            SearchUnavailableReason::ModelLoadFailed,
+        ] {
+            let missing = SearchQuery::unavailable_because(Some(Backend::Cpu), reason);
+            assert!(!missing.counts_pending());
+            let status = missing.status(7, 3, false, true);
+            assert_eq!(status.state, SearchIndexState::Unavailable(reason));
+            assert_eq!((status.declarations, status.embedded), (7, 0));
+        }
+        // The call's own budget outranks pending owner work.
+        let status = query.status(7, 3, false, true);
         assert!(query.vector.is_none());
         assert!(query.model_id().is_none());
         assert!(query.budget().is_some());
-        assert_eq!(status.state, SearchIndexState::Unavailable);
+        assert!(!query.counts_pending());
+        assert_eq!(
+            status.state,
+            SearchIndexState::Unavailable(SearchUnavailableReason::VectorBudgetExceeded)
+        );
         assert_eq!(status.declarations, 7);
         assert_eq!(status.embedded, 0);
         assert_eq!(
-            status.unavailable_reason,
+            status.unavailable_reason(),
             Some(SearchUnavailableReason::VectorBudgetExceeded)
         );
     }

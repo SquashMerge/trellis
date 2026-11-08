@@ -787,11 +787,39 @@
               "enum": [
                 null,
                 "model_not_configured",
-                "model_load_failed"
+                "model_load_failed",
+                "matrix_not_resident"
               ]
             },
             "configuration": {
               "$ref": "#/$defs/SearchConfiguration"
+            },
+            "state": {
+              "enum": [
+                "complete",
+                "building",
+                "partial",
+                "unavailable"
+              ]
+            },
+            "declarations": {
+              "$ref": "#/$defs/UInt"
+            },
+            "embedded": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cacheDiagnostic": {
+              "enum": [
+                "vector_cache_unavailable",
+                "vector_cache_busy"
+              ]
             }
           },
           "required": [
@@ -982,7 +1010,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 13
+                  "const": 14
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -3790,7 +3818,9 @@
                 null,
                 "vector_budget_exceeded",
                 "model_not_configured",
-                "model_load_failed"
+                "model_load_failed",
+                "model_not_ready",
+                "matrix_not_resident"
               ]
             }
           },

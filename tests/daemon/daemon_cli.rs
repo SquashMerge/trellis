@@ -601,9 +601,16 @@ fn daemon_stop_closes_idle_mcp_and_recaptures_model_configuration() {
     );
     // Status can reply while the fill owner has not yet tried the recaptured
     // model. Wait for its published load result, not merely daemon readiness.
+    // Before that attempt, head coverage (#777) is `building` (null reason)
+    // once the owner is hinted, or `matrix_not_resident` before its first
+    // hint; neither is a load result.
     trellis::testing::wait_until("restarted daemon model load failure", || {
         match &restarted["searchIndex"]["unavailableReason"] {
             Value::Null => {
+                restarted = run(&home, "status", &root);
+                false
+            }
+            Value::String(reason) if reason == "matrix_not_resident" => {
                 restarted = run(&home, "status", &root);
                 false
             }
