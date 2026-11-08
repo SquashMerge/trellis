@@ -97,6 +97,10 @@ The embedding model is **not bundled**. Only an explicit `trellis model install`
 
 Trellis accepts only one exact version of each [producer](quickstart.md#install-the-producers), and it doesn't install them. `scip-java` is checked by file hash, so a launcher built another way can be refused even at the right version.
 
+### TypeScript configs shared through npm
+
+A producer run's worktree holds no `node_modules`. When the root `tsconfig.json` `extends` an npm package, such as `@sindresorhus/tsconfig`, Trellis reads that package's config from the checkout's own `node_modules` and supplies it to the run ([#799](https://github.com/SquashMerge/trellis/issues/799)). Dependencies must be installed for this; without them, the run uses Trellis's generated tsconfig in place of the repo's, so the repo's own compiler options don't apply. The plan lists the replacement under `omitted`. Types from other installed packages are still not visible to the run. See [producer provisioning](semantic-evidence/producer-provisioning.md#scip-typescript-project-config).
+
 ## Not in 0.1
 
 - Connecting to remote machines over SSH.

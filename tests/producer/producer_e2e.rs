@@ -32,17 +32,46 @@ fn scip_typescript_javascript_restricted_end_to_end_strict() {
     assert!(real::run_case(&TYPESCRIPT, Availability::Required).is_some());
 }
 
+/// The checkout's root `tsconfig.json` in a mixed run.
+#[derive(Clone, Copy, Debug)]
+enum RootTsconfig {
+    /// The fixture's own.
+    Own,
+    /// Deleted, so the plan generates its own.
+    Generated,
+    /// `extends` an npm package (#799), present in the checkout's `node_modules` or not.
+    PackageExtends { installed: bool },
+}
+
+/// The package's options and the root's own, split as an npm-shared config splits them.
+const PACKAGE_BASE: &str =
+    r#"{"compilerOptions":{"allowJs":true,"jsx":"preserve","target":"es2022"}}"#;
+const EXTENDING_ROOT: &str = r#"{
+  "extends": "@fixture/tsconfig",
+  "compilerOptions": {"baseUrl": "src", "paths": {"@app/*": ["app/*"]}, "rootDirs": ["src", "generated"]},
+}"#;
+
 /// The mixed TypeScript and JavaScript fixture through one real scip-typescript run
-/// (Decision 0020): the artifact covers both languages. With `own_tsconfig` false the
-/// checkout's root `tsconfig.json` is deleted, so the plan generates its own.
-fn typescript_mixed(own_tsconfig: bool, availability: Availability) -> Option<String> {
+/// (Decision 0020): the artifact covers both languages.
+fn typescript_mixed(tsconfig: RootTsconfig, availability: Availability) -> Option<String> {
     let fixture =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typescript-mixed");
     let checkout = support::start_checkout(
         |root| {
             real::copy_tree(&fixture, root);
-            if !own_tsconfig {
-                std::fs::remove_file(root.join("tsconfig.json")).unwrap();
+            match tsconfig {
+                RootTsconfig::Own => {}
+                RootTsconfig::Generated => {
+                    std::fs::remove_file(root.join("tsconfig.json")).unwrap();
+                }
+                RootTsconfig::PackageExtends { installed } => {
+                    std::fs::write(root.join("tsconfig.json"), EXTENDING_ROOT).unwrap();
+                    if installed {
+                        let package = root.join("node_modules/@fixture/tsconfig");
+                        std::fs::create_dir_all(&package).unwrap();
+                        std::fs::write(package.join("tsconfig.json"), PACKAGE_BASE).unwrap();
+                    }
+                }
             }
         },
         &[],
@@ -56,7 +85,25 @@ fn typescript_mixed(own_tsconfig: bool, availability: Availability) -> Option<St
         serde_json::json!(["javascript", "typescript"])
     );
     let generated = plan["inputs"]["generatedConfig"].as_array().unwrap();
-    assert_eq!(generated.len(), usize::from(!own_tsconfig), "{generated:?}");
+    let expected = match tsconfig {
+        RootTsconfig::Own => 0,
+        // The generated default, which also replaces a root whose package is absent.
+        RootTsconfig::Generated | RootTsconfig::PackageExtends { installed: false } => 1,
+        // The rewritten root and the package's config.
+        RootTsconfig::PackageExtends { installed: true } => 2,
+    };
+    assert_eq!(generated.len(), expected, "{generated:?}");
+    let replaced = matches!(tsconfig, RootTsconfig::PackageExtends { .. });
+    assert_eq!(
+        plan["inputs"]["omitted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "tsconfig.json"),
+        replaced,
+        "{}",
+        plan["inputs"]["omitted"]
+    );
     // `ignored.jsx` is not indexed, so it is in neither count.
     let documents: usize = ["js", "mjs", "cjs", "ts", "tsx", "mts", "cts"]
         .iter()
@@ -104,7 +151,7 @@ fn typescript_mixed(own_tsconfig: bool, availability: Availability) -> Option<St
         "the run changed the workspace"
     );
     let line = format!(
-        "E2E-EVIDENCE producer=scip-typescript language=typescript rootTsconfig={own_tsconfig} documents={documents} claims={}",
+        "E2E-EVIDENCE producer=scip-typescript language=typescript rootTsconfig={tsconfig:?} documents={documents} claims={}",
         artifacts[0]["claims"]
     );
     println!("{line}");
@@ -129,15 +176,41 @@ fn real_documents(fixture: &std::path::Path, extension: &str) -> usize {
 
 #[test]
 fn scip_typescript_typescript_restricted_end_to_end() {
-    typescript_mixed(true, Availability::SkipIfUnavailable);
-    typescript_mixed(false, Availability::SkipIfUnavailable);
+    typescript_mixed(RootTsconfig::Own, Availability::SkipIfUnavailable);
+    typescript_mixed(RootTsconfig::Generated, Availability::SkipIfUnavailable);
 }
 
 #[test]
 #[ignore = "strict real-producer evidence: fails when the producer is unavailable"]
 fn scip_typescript_typescript_restricted_end_to_end_strict() {
-    assert!(typescript_mixed(true, Availability::Required).is_some());
-    assert!(typescript_mixed(false, Availability::Required).is_some());
+    assert!(typescript_mixed(RootTsconfig::Own, Availability::Required).is_some());
+    assert!(typescript_mixed(RootTsconfig::Generated, Availability::Required).is_some());
+}
+
+/// #799: a root `tsconfig.json` that `extends` an npm package runs, whether the package is
+/// supplied from the checkout's `node_modules` or the generated tsconfig replaces the root.
+#[test]
+fn scip_typescript_package_extends_restricted_end_to_end() {
+    for installed in [true, false] {
+        typescript_mixed(
+            RootTsconfig::PackageExtends { installed },
+            Availability::SkipIfUnavailable,
+        );
+    }
+}
+
+#[test]
+#[ignore = "strict real-producer evidence: fails when the producer is unavailable"]
+fn scip_typescript_package_extends_restricted_end_to_end_strict() {
+    for installed in [true, false] {
+        assert!(
+            typescript_mixed(
+                RootTsconfig::PackageExtends { installed },
+                Availability::Required
+            )
+            .is_some()
+        );
+    }
 }
 
 #[test]
