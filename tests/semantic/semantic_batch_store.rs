@@ -3914,6 +3914,68 @@ fn typescript_explicit_symbol_kinds_are_checked() {
     }
 }
 
+/// `new C()` of a TypeScript class without an explicit constructor binds the class symbol, whose
+/// native declaration kind is `type`: it is constructor, and the same shapes as JavaScript's
+/// stay unknown (`C()`, member calls of a free function).
+#[test]
+fn typescript_new_of_a_class_without_a_constructor_is_constructor() {
+    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+    let source =
+        "class W {}\nfunction m(o){ new W(); new o.W(); W(); h(); o.h(); }\nfunction h(){}\n";
+    let world = world(|root| write_files(root, &[("D.ts", source)]));
+    let mut doc = DocSpec::new("D.ts")
+        .symbol("pkg W#", 7, &[])
+        .symbol("pkg h().", 17, &[]);
+    for (needle, nth, symbol, roles) in [
+        ("W", 0, "pkg W#", 1),
+        ("h", 2, "pkg h().", 1),
+        ("W", 1, "pkg W#", 0),
+        ("W", 2, "pkg W#", 0),
+        ("W", 3, "pkg W#", 0),
+        ("h", 0, "pkg h().", 0),
+        ("h", 1, "pkg h().", 0),
+    ] {
+        doc = occ_at(doc, source, (needle, nth), None, symbol, roles);
+    }
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact_languages(&["typescript"], vec![doc]);
+    let descriptor = world.write(&fixture);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    assert_same_publication(&staged, &memory, "typescript dispatch shapes");
+    let mut dispatches: Vec<_> = staged
+        .call_bindings
+        .iter()
+        .map(|b| {
+            assert_eq!(b.resolution, Resolution::Resolved);
+            let range = &b.join.anchor.range;
+            (range.start, &source[range.start - 2..range.end], b.dispatch)
+        })
+        .collect();
+    dispatches.sort_by_key(|(start, _, _)| *start);
+    assert_eq!(
+        dispatches
+            .into_iter()
+            .map(|(_, text, dispatch)| (text, dispatch))
+            .collect::<Vec<_>>(),
+        [
+            ("w W", Constructor),
+            ("o.W", Constructor),
+            ("; W", Unknown),
+            ("; h", Direct),
+            ("o.h", Unknown),
+        ]
+    );
+}
+
 /// Anchors `doc` with an occurrence of `len` bytes at `delta` into the first `anchor` in `source`.
 fn occ_in(
     doc: DocSpec,
