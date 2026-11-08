@@ -1195,6 +1195,227 @@ test("nested source owners and ancestor descriptors, not IDs", async () => {
   );
 });
 
+// Owner ruling 2026-11-08 (#801): a call is owned by its innermost executable
+// container (module, namespace, type, implementation, function, method,
+// constructor, anonymousFunction), as production measures it. `specs` name each
+// declaration by kind, name, parent and the source text it spans.
+function containerCall(text, language, path, specs, ownerRef) {
+  const key = { sourceSetId: "main", language, path },
+    data = Buffer.from(text);
+  const byRef = new Map();
+  for (const spec of specs) {
+    const start = text.indexOf(spec.span),
+      nameStart = text.indexOf(spec.name, start);
+    byRef.set(spec.ref, {
+      ...spec,
+      start,
+      end: start + spec.span.length,
+      nameStart,
+      nameEnd: nameStart + spec.name.length,
+    });
+  }
+  const descriptor = (spec) => ({
+    kind: spec.kind,
+    name: spec.name,
+    signature: null,
+    ordinal: 0,
+  });
+  const ancestors = (spec) =>
+    spec.parentRef
+      ? [...ancestors(byRef.get(spec.parentRef)), descriptor(byRef.get(spec.parentRef))]
+      : [];
+  const idOf = (spec) =>
+    syntax({
+      sourceSet: "main",
+      path,
+      language,
+      ancestors: ancestors(spec),
+      declaration: descriptor(spec),
+    });
+  const headerOf = (spec) => ({ ...header(spec.name), kind: spec.kind });
+  const declarations = [...byRef.values()].map((spec) => ({
+    ref: spec.ref,
+    nativeId: null,
+    role: "production",
+    document: key,
+    revisionId: "r1",
+    parentRef: spec.parentRef ?? null,
+    kind: spec.kind,
+    name: spec.name,
+    range: span(spec.start, spec.end),
+    nameRange: span(spec.nameStart, spec.nameEnd),
+    header: headerOf(spec),
+    signature: null,
+    witnesses: [
+      witness("name", spec.nameStart, spec.nameEnd, spec.name),
+      witness("header.name", spec.nameStart, spec.nameEnd, spec.name),
+    ],
+  }));
+  const callStart = text.indexOf("go()"),
+    ownerId = idOf(byRef.get(ownerRef)),
+    cid = occurrence(
+      { ownerSyntaxId: ownerId, kind: "call", ordinal: 0 },
+      { text: data, language },
+    );
+  const loaded = {
+    native: {
+      formatVersion: 1,
+      producerId: "native",
+      extractionInputs: [],
+      capabilityReports: [],
+      declarations,
+      calls: [
+        {
+          ref: "call",
+          nativeId: null,
+          document: key,
+          revisionId: "r1",
+          ownerRef,
+          range: span(callStart, callStart + 4),
+          calleeRange: span(callStart, callStart + 2),
+          spelling: "go",
+          regionRefs: [],
+          witnesses: [witness("spelling", callStart, callStart + 2, "go")],
+        },
+      ],
+      controls: [],
+      references: [],
+    },
+    fixture: {
+      producers: [
+        { id: "native", version: "1", kind: "native", positionEncoding: "utf8" },
+      ],
+    },
+    sources: new Map([[JSON.stringify(["main", "r1", path]), data]]),
+    revisions: new Map([
+      [
+        JSON.stringify(["main", "r1"]),
+        { documents: [{ key, contentHash: sha(data) }] },
+      ],
+    ]),
+  };
+  const records = {
+    declarations: [...byRef.values()]
+      .map((spec) => {
+        const id = idOf(spec);
+        return {
+          syntaxId: id,
+          role: "production",
+          document: key,
+          revisionId: "r1",
+          kind: spec.kind,
+          name: spec.name,
+          lookupKey: spec.name,
+          ancestors: ancestors(spec),
+          key: descriptor(spec),
+          range: { start: spec.start, end: spec.end },
+          nameRange: { start: spec.nameStart, end: spec.nameEnd },
+          header: headerOf(spec),
+          provenanceId: `native:r1:${id}`,
+        };
+      })
+      .sort(orderSyntax),
+    calls: [
+      {
+        id: cid,
+        ownerSyntaxId: ownerId,
+        ordinal: 0,
+        document: key,
+        revisionId: "r1",
+        range: { start: callStart, end: callStart + 4 },
+        calleeRange: { start: callStart, end: callStart + 2 },
+        spelling: "go",
+        regionIds: [],
+        provenanceId: `native:r1:${cid}`,
+      },
+    ],
+    controlRegions: [],
+  };
+  return { loaded, records, ownerId };
+}
+const ownerRejected = (s, message) =>
+  assert.throws(
+    () => checkMeasurement(s.loaded, s.records),
+    (e) =>
+      e.assertion === "MEASUREMENT.OWNER" &&
+      e.code === "invalidRecord" &&
+      e.field === "ownerRef" &&
+      e.message.includes(message),
+  );
+test("a class owns its field-initializer call; the field does not", async () => {
+  const text = "class Box { f = go(); }\n",
+    specs = [
+      { ref: "Box", kind: "type", name: "Box", span: "class Box { f = go(); }" },
+      { ref: "f", kind: "field", name: "f", span: "f = go()", parentRef: "Box" },
+    ];
+  const s = containerCall(text, "javascript", "src/box.js", specs, "Box"),
+    admitted = await admitSpec(s),
+    m = checkMeasurement(admitted.loaded, s.records);
+  assert.equal(m.recordByNativeRef.get("call").ownerSyntaxId, s.ownerId);
+  ownerRejected(
+    containerCall(text, "javascript", "src/box.js", specs, "f"),
+    "executable container owner",
+  );
+});
+test("a namespace owns a call in its body", async () => {
+  const text = "namespace Tools { go(); }\n",
+    s = containerCall(
+      text,
+      "typescript",
+      "src/tools.ts",
+      [
+        {
+          ref: "Tools",
+          kind: "namespace",
+          name: "Tools",
+          span: "namespace Tools { go(); }",
+        },
+      ],
+      "Tools",
+    ),
+    admitted = await admitSpec(s),
+    m = checkMeasurement(admitted.loaded, s.records);
+  assert.equal(m.recordByNativeRef.get("call").ownerSyntaxId, s.ownerId);
+});
+test("an outer container never owns a call inside a nested executable container", () => {
+  const text = "class Box { m() { go(); } }\n",
+    specs = [
+      {
+        ref: "Box",
+        kind: "type",
+        name: "Box",
+        span: "class Box { m() { go(); } }",
+      },
+      { ref: "m", kind: "method", name: "m", span: "m() { go(); }", parentRef: "Box" },
+    ];
+  const method = containerCall(text, "javascript", "src/box.js", specs, "m");
+  checkMeasurement(method.loaded, method.records);
+  ownerRejected(
+    containerCall(text, "javascript", "src/box.js", specs, "Box"),
+    "nested executable container owns occurrence",
+  );
+  const inner = "namespace Outer { class Box { f = go(); } }\n";
+  ownerRejected(
+    containerCall(
+      inner,
+      "typescript",
+      "src/outer.ts",
+      [
+        { ref: "Outer", kind: "namespace", name: "Outer", span: inner.trimEnd() },
+        {
+          ref: "Box",
+          kind: "type",
+          name: "Box",
+          span: "class Box { f = go(); }",
+          parentRef: "Outer",
+        },
+      ],
+      "Outer",
+    ),
+    "nested executable container owns occurrence",
+  );
+});
+
 test("control containment, parent order and region membership are source-derived", () => {
   const s = sample(),
     control = s.loaded.native.controls[0];

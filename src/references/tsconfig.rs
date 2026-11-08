@@ -24,9 +24,7 @@ pub(super) struct RootTsconfig {
 
 /// Parse JSONC bytes. `serde_json` bounds nesting at 128 levels.
 pub(super) fn parse(bytes: &[u8]) -> Result<RootTsconfig, &'static str> {
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let json = strip(bytes).ok_or(UNREADABLE)?;
-    let root: Value = serde_json::from_slice(&json).map_err(|_| UNREADABLE)?;
+    let root = parse_jsonc(bytes).ok_or(UNREADABLE)?;
     let root = root.as_object().ok_or(UNREADABLE)?;
     let mut config = RootTsconfig::default();
     let Some(options) = root.get("compilerOptions").filter(|v| !v.is_null()) else {
@@ -53,6 +51,13 @@ pub(super) fn parse(bytes: &[u8]) -> Result<RootTsconfig, &'static str> {
         config.root_dirs = strings(root_dirs)?;
     }
     Ok(config)
+}
+
+/// The JSONC value of `bytes` (a leading byte order mark, comments and trailing commas
+/// allowed), or `None` when it is not JSONC. `serde_json` bounds nesting at 128 levels.
+pub(crate) fn parse_jsonc(bytes: &[u8]) -> Option<Value> {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    serde_json::from_slice(&strip(bytes)?).ok()
 }
 
 /// Remove comments outside strings, then commas directly before `}` or `]`. An

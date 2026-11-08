@@ -66,6 +66,7 @@ fn build(revision: &str, trust: TrustProfile) -> Value {
         declared: &declared,
         stub: None,
         basis: &basis(revision),
+        rules: &profiles::rules(&row),
         limits: LimitsRequest {
             timeout_secs: 1800,
             memory_mib: 8192,

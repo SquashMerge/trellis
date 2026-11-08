@@ -3,11 +3,13 @@ function sealed<T extends abstract new (...args: never[]) => object>(constructor
   return constructor;
 }
 
-function logged(_target: object, key: string, descriptor: PropertyDescriptor): void {
-  const original = descriptor.value as (...args: unknown[]) => unknown;
-  descriptor.value = function (...args: unknown[]) {
-    console.log("call", key);
-    return original.apply(this, args);
+function logged(label: string) {
+  return (_target: object, key: string, descriptor: PropertyDescriptor): void => {
+    const original = descriptor.value as (...args: unknown[]) => unknown;
+    descriptor.value = function (this: unknown, ...args: unknown[]) {
+      console.log(label, key);
+      return original.apply(this, args);
+    };
   };
 }
 
@@ -45,14 +47,14 @@ export class Rectangle extends Shape {
     return 2 * (this.width + this.height);
   }
 
-  @logged
+  @logged("scale")
   scale(@tagged factor: number): Rectangle {
     return new Rectangle(this.width * factor, this.height * factor, this.label);
   }
 }
 
 export class Square extends Rectangle implements Measurable {
-  public static readonly sides = 4;
+  public static readonly unit = new Square(1);
 
   constructor(side: number) {
     super(side, side, "square");

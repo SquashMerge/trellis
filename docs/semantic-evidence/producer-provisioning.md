@@ -25,6 +25,31 @@ rust-analyzer runs only in the trusted profile. The restricted profile refuses i
 
 scip-typescript runs `index --output <out>` in the run's worktree, with no `--infer-tsconfig` (owner ruling 2026-11-03, #652). If the checkout has no root `tsconfig.json`, the plan generates `worktree/tsconfig.json` as `{"compilerOptions":{"allowJs":true,"jsx":"preserve","target":"es2022","module":"commonjs"}}` and lists it under `generatedConfig`. That is what `--infer-tsconfig` would write, except for the ES2022 target: the inferred ES5 target can't parse ES2015+ identifiers, and an escaped astral function name in `tests/fixtures/semantic-evidence/v1/javascript` became a zero-width definition. `commonjs` keeps the module resolution the inferred config had. `allowJs` keeps JavaScript and TypeScript sources in one program, and `jsx: preserve` lets `.tsx` files parse. One scip-typescript run covers both languages: its pin lists `javascript` and `typescript`, the artifact's descriptor entry lists the languages it covers, and an empty SCIP `Document.language` binds to each document's own detected language. A checkout's own root `tsconfig.json` replaces the generated one. Nothing is written into the checkout.
 
+The worktree holds no `node_modules`, so TypeScript cannot resolve a root `tsconfig.json` whose `extends` names an npm package (TS6053, #799). The plan handles such an `extends` in this order, under either trust profile, because both use the same worktree:
+
+1. **Supply the base config.** Trellis looks the package up in the checkout's own `node_modules` as TypeScript 5.9 does for a config's `extends`. It checks the `node_modules` of the extending config's directory, then of each ancestor up to the checkout root. A package directory with no config passes the lookup outward, unless its `exports` decided it. Inside a package, the order is:
+   - the `exports` entry for `.` or the subpath, with conditions matched in the manifest's own order (`require`, `types`, `node` and `default` match, and a target that is missing passes to the next);
+   - else the `tsconfig` field of `package.json`;
+   - else `tsconfig.json`.
+
+   A subpath also tries `<subpath>.json` and `<subpath>/tsconfig.json`. Trellis reads that config and every config its `extends` chain reaches, within these bounds:
+   - only regular files whose real path, after symlinks, is under the checkout's `node_modules` are read;
+   - each file is at most 256 KiB;
+   - one resolution reads at most 16 files, configs and `package.json` manifests together, and inspects at most 256 paths;
+   - nothing is executed.
+
+   Each config is generated at its own path under `worktree/node_modules/`, so relative options in it keep their meaning, and the root's package `extends` is rewritten to a relative path. The plan lists the root under `omitted` with the packages it extends, and lists the rewritten root and every supplied file under `generatedConfig`, so a change to any of them changes `planSha256`. A file with no package `extends` is supplied byte for byte.
+2. **Fall back to the generated tsconfig.** When the package or its config file is absent from `node_modules`, for example because dependencies are not installed, the generated tsconfig above replaces the repo's (owner ruling #652, `default_only`). The plan lists `tsconfig.json` under `omitted`, with a reason that names the `extends` and says it was replaced. Only absence falls back.
+3. **Typed refusal.** Any other failure of an `extends` refuses `producer plan` and `producer run` with `producer_config_unresolved`. The message names the `extends` and the reason. Such failures include:
+   - a permission or other I/O error;
+   - a config path that is not a regular file;
+   - a real path outside `node_modules`;
+   - a malformed config or `package.json`;
+   - a cycle, a file over the cap, or a resolution over either bound;
+   - `exports` subpath patterns or versioned `types@` conditions, which are not supported.
+
+A relative `extends` in the root config is left to TypeScript, as is a root config Trellis cannot parse. scip-typescript reads only `tsconfig.json`, so a root `jsconfig.json` is not used, and the generated tsconfig is written in its place.
+
 ### scip-java JVM prerequisite
 
 Restricted scip-java runs with `COURSIER_MODE=offline` (`src/producer/profiles.rs`). The restricted worktree omits build files and writes an `lsif-java.json` with no `jvm` field, so scip-java uses its default JVM, Temurin 17.0.20.1. That JDK must already be present in `COURSIER_ARCHIVE_CACHE` as a host prerequisite, because Trellis downloads nothing. On the reference host it is at `~/Library/Caches/Coursier/arc/https/github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20.1%252B1/OpenJDK17U-jdk_aarch64_mac_hotspot_17.0.20.1_1.tar.gz/jdk-17.0.20.1+1`, created on 2026-08-21. The exact command that provisioned it is not recoverable. It is a coursier archive-cache entry from a prior manual coursier-driven JVM fetch by the owner (for example `cs java --jvm temurin:17` or an earlier online scip-java run), not from anything Trellis ran.

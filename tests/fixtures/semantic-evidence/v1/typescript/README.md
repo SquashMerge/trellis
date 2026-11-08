@@ -18,7 +18,10 @@ used to meet a floor.
 
 ## Current evidence
 
-- 133 declarations, 44 invocations, 6 control regions and 475 native reference candidates.
+- 134 declarations, 46 invocations, 6 control regions and 478 native reference candidates.
+- Two calls are owned by a class, as production measures them (owner ruling
+  2026-11-08, #801): the member decorator call `@logged("scale")` and the static
+  field initializer `new Square(1)`.
 - 7 production capability reports; every family is available with no gaps.
 - Two independent command runs are byte-identical. Semantic counts remain zero.
 - `src/ambient.d.ts` is declaration-only: it measures declarations and reference
@@ -33,7 +36,7 @@ Native measurement does no type checking, so `tsconfig.json` (`allowJs:false`,
 `include` of `src/**/*.ts` and `src/**/*.tsx`) and the dependency-free
 `package.json` describe the future semantic project, not native inputs.
 `captures/native.json` has SHA-256
-`72af4180497b6bbbffdc504d486dd1c5d8514d5ded03d7a4662bc62daf5a0e58`. The compiled
+`92febb682d97fd2b8042bef076fffd5de100984d021df3e8af181d0c676ae180`. The compiled
 native extractor hash is
 `a1c7d0caa1c76e9414ecc028aa89190bcf7d34158b59f019e8671e08e45dacd5`, pinned as
 `trellis-native-v16-typescript-test-support` in
@@ -41,6 +44,8 @@ native extractor hash is
 native-v16 extractor of #683. The #800 review re-pinned it after the extractor
 stopped measuring type-only import expressions (`typeof import("m")`,
 `import("m").T`) as calls; this corpus has none, so the recapture is byte-identical.
+The #801 recapture changed only `src/geometry.ts` (the class-owned calls above),
+under the same extractor hash.
 
 ## Reproduce
 
@@ -71,16 +76,17 @@ C22 to C26 are covered by `src/native_typescript_tests.rs`, not by this corpus.
 
 | Row | Construct | Source | Native anchor ref | Native measurement |
 |---|---|---|---|---|
-| C3 | abstract class | `src/geometry.ts:21` | `2:r1:sid:v1:2269896ca380b25af31e4033a1a79716` | `type` named `Shape`, `Header.modifiers` contains `abstract` |
-| C3/C11 | abstract method | `src/geometry.ts:22` | `2:r1:sid:v1:41af0be0ab8632e26fd249868b5f7f3f` | `method` `area` with `abstract` modifier |
-| C12 | decorator before `export` (call) | `src/geometry.ts:74` | `2:r1:occ:v2:4a5487ddd21bb2b7e7141623477a7a0c` | `@sealed()` written before `export` is a child of `export_statement`, so its call is owned by the file module |
-| C12 | decorator before `export` (reference) | `src/geometry.ts:30` | `2:r1:occ:v2:23c87624f19573c749cd61ab6bd32939` | bare `@sealed` is a reference candidate, no call |
-| C12 | member decorator (reference) | `src/geometry.ts:48` | `2:r1:occ:v2:b04725d5784ed1689f02018fa2bc614e` | bare `@logged` is a reference candidate, no call |
-| C12 | parameter decorator (reference) | `src/geometry.ts:49` | `2:r1:occ:v2:a1c7676ca266aa33e06edc3628f8482e` | bare `@tagged` is a reference candidate, no call |
-| C13 | parameter property | `src/geometry.ts:33` | `2:r1:sid:v1:5840aeb8c8bb52e7a5d015bea5fc9407` | `field` `width`, parent the constructor, modifiers `public`, `readonly` |
-| C13 | parameter property (private optional) | `src/geometry.ts:35` | `2:r1:sid:v1:793470ca398b9f80fb048d9bad59e317` | `field` `label`, modifier `private` |
-| C14 | override and accessors | `src/geometry.ts:61` | `2:r1:sid:v1:4a84e0f6e56c232002106f902bf12e6c` | `method` `area` with `override` modifier |
-| C14 | getter | `src/geometry.ts:65` | `2:r1:sid:v1:4309a95a45e15d65d7593601bdb018d4` | `method` `side` with `get` modifier |
+| C3 | abstract class | `src/geometry.ts:23` | `2:r1:sid:v1:2269896ca380b25af31e4033a1a79716` | `type` named `Shape`, `Header.modifiers` contains `abstract` |
+| C3/C11 | abstract method | `src/geometry.ts:24` | `2:r1:sid:v1:41af0be0ab8632e26fd249868b5f7f3f` | `method` `area` with `abstract` modifier |
+| C12 | decorator before `export` (call) | `src/geometry.ts:76` | `2:r1:occ:v2:5064590808080de4119f7226a30cabf3` | `@sealed()` written before `export` is a child of `export_statement`, so its call is owned by the file module |
+| C12 | decorator before `export` (reference) | `src/geometry.ts:32` | `2:r1:occ:v2:a975b00dd7aed7d7cb5b3489542aac7d` | bare `@sealed` is a reference candidate, no call |
+| C12 | member decorator (call) | `src/geometry.ts:50` | `2:r1:occ:v2:ca705d91a119273de6b3aeb4ac66f286` | `@logged("scale")` is a call owned by the class `Rectangle` |
+| #801 | static field initializer (call) | `src/geometry.ts:57` | `2:r1:occ:v2:5cdd050e39bf6623e2278a4921ed180a` | `new Square(1)` is a call owned by the class `Square`, not the field `unit` |
+| C12 | parameter decorator (reference) | `src/geometry.ts:51` | `2:r1:occ:v2:999c4a8cd20f45606ff8c6f99b72877d` | bare `@tagged` is a reference candidate, no call |
+| C13 | parameter property | `src/geometry.ts:35` | `2:r1:sid:v1:5840aeb8c8bb52e7a5d015bea5fc9407` | `field` `width`, parent the constructor, modifiers `public`, `readonly` |
+| C13 | parameter property (private optional) | `src/geometry.ts:37` | `2:r1:sid:v1:793470ca398b9f80fb048d9bad59e317` | `field` `label`, modifier `private` |
+| C14 | override and accessors | `src/geometry.ts:63` | `2:r1:sid:v1:4a84e0f6e56c232002106f902bf12e6c` | `method` `area` with `override` modifier |
+| C14 | getter | `src/geometry.ts:67` | `2:r1:sid:v1:4309a95a45e15d65d7593601bdb018d4` | `method` `side` with `get` modifier |
 | C4 | interface | `src/shapes.ts:6` | `2:r1:sid:v1:d10ebbb8d1abae54d1ebaae9ef1fda98` | `type` named `Box`; call and index signatures are not declarations |
 | C4 | interface method signature | `src/shapes.ts:8` | `2:r1:sid:v1:86eb27c6b79b3f1b5328c4b714a2900d` | `method` `map` under the interface |
 | C5 | enum | `src/shapes.ts:17` | `2:r1:sid:v1:c0e09faf25691bdeead2151f289b42f0` | `type` named `Direction`; members are not declarations |
@@ -115,9 +121,10 @@ C22 to C26 are covered by `src/native_typescript_tests.rs`, not by this corpus.
 ## Amendment-table notes (TypeScript grammar limits)
 
 These two facts come from the pinned tree-sitter-typescript 0.23.2 grammar and the
-contract's owner rule. They are recorded here for the contract-v1 TypeScript
-amendment table; the corpus deliberately avoids the first so that no artificial
-gap is needed.
+contract's owner rule (the innermost executable container owns a call; owner
+ruling 2026-11-08, #801). They are recorded in the contract-v1 TypeScript
+amendment; the corpus deliberately avoids the first so that no artificial gap is
+needed.
 
 1. **`export type * from "m"` is not parsed.** tree-sitter-typescript 0.23.2 accepts
    only `export type { … }` (`common/define-grammar.js:320-331`), not the
@@ -130,19 +137,9 @@ gap is needed.
    container (contract-v1 owner rule). Decorators on non-exported classes, and on
    members and parameters, are owned by the class or method. `src/geometry.ts`
    shows the exported form (`@sealed()` before `export class Circle`, a
-   module-owned call; bare `@sealed`, `@logged` and `@tagged` are reference
-   candidates only).
-
-## Toolkit limit: class-owned calls
-
-The corpus authors no call that production attributes to a class: a member
-decorator call such as `@logged("scale")`, or a static or instance field initializer
-call such as `new Square(1)`. `record-check/measurement.mjs` accepts only module,
-function, method, constructor and anonymous-function owners for calls and
-controls, so a class-owned call is rejected (`MEASUREMENT.OWNER`). The production
-extractor does emit these calls with the class as owner. The corpus therefore
-uses bare `@logged` and a literal static field. Lifting the toolkit restriction
-needs a change outside this corpus.
+   module-owned call) and a member decorator call (`@logged("scale")`, owned by
+   the class `Rectangle`); bare `@sealed` and `@tagged` are reference candidates
+   only.
 
 ## Future work
 
