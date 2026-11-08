@@ -27,7 +27,7 @@ pub(crate) enum Skip {
     NotUtf8,
 }
 
-const LANGUAGES: [&str; 4] = ["java", "javascript", "python", "rust"];
+pub(crate) const LANGUAGES: [&str; 5] = ["java", "javascript", "python", "rust", "typescript"];
 const SKIPS: [Skip; 2] = [Skip::Oversized, Skip::NotUtf8];
 
 impl Skip {
@@ -82,16 +82,23 @@ pub(crate) fn skipped(language: &str, text: &str) -> Option<Skip> {
 mod tests {
     use super::*;
 
-    fn parse(language: &str, text: &str) -> tree_sitter::Tree {
+    /// TypeScript sources parse under two grammars, chosen by path.
+    fn grammars(language: &str) -> Vec<tree_sitter::Language> {
+        match language {
+            "java" => vec![tree_sitter_java::LANGUAGE.into()],
+            "rust" => vec![tree_sitter_rust::LANGUAGE.into()],
+            "python" => vec![tree_sitter_python::LANGUAGE.into()],
+            "typescript" => vec![
+                crate::indexer_ts::grammar("a.ts"),
+                crate::indexer_ts::grammar("a.tsx"),
+            ],
+            _ => vec![tree_sitter_javascript::LANGUAGE.into()],
+        }
+    }
+
+    fn parse(grammar: &tree_sitter::Language, text: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&match language {
-                "java" => tree_sitter_java::LANGUAGE.into(),
-                "rust" => tree_sitter_rust::LANGUAGE.into(),
-                "python" => tree_sitter_python::LANGUAGE.into(),
-                _ => tree_sitter_javascript::LANGUAGE.into(),
-            })
-            .unwrap();
+        parser.set_language(grammar).unwrap();
         parser.parse(text, None).unwrap()
     }
 
@@ -101,24 +108,26 @@ mod tests {
             for skip in SKIPS {
                 let text = placeholder(language, skip);
                 assert_eq!(skipped(language, &text), Some(skip), "{language} {skip:?}");
-                assert!(
-                    parse(language, &text).root_node().has_error(),
-                    "{language} {skip:?} placeholder must not parse"
-                );
-                // Its only other syntax is one comment, so nothing in it can be a fact.
-                let tree = parse(language, &text);
-                let mut cursor = tree.root_node().walk();
-                let kinds: Vec<_> = tree
-                    .root_node()
-                    .named_children(&mut cursor)
-                    .map(|node| node.kind())
-                    .collect();
-                assert!(
-                    kinds
-                        .iter()
-                        .all(|kind| kind.contains("comment") || *kind == "ERROR"),
-                    "{language}: {kinds:?}"
-                );
+                for grammar in grammars(language) {
+                    let tree = parse(&grammar, &text);
+                    assert!(
+                        tree.root_node().has_error(),
+                        "{language} {skip:?} placeholder must not parse"
+                    );
+                    // Its only other syntax is one comment, so nothing in it can be a fact.
+                    let mut cursor = tree.root_node().walk();
+                    let kinds: Vec<_> = tree
+                        .root_node()
+                        .named_children(&mut cursor)
+                        .map(|node| node.kind())
+                        .collect();
+                    assert!(
+                        kinds
+                            .iter()
+                            .all(|kind| kind.contains("comment") || *kind == "ERROR"),
+                        "{language}: {kinds:?}"
+                    );
+                }
             }
         }
         assert_ne!(

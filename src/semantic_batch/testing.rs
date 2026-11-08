@@ -338,8 +338,9 @@ fn read_inventories(
     drop(statement);
     for artifact in &descriptor.artifacts {
         let mut statement = conn.prepare(
-            "SELECT canonical_bytes, fact_digest, proof_id FROM claims WHERE artifact=?1 \
-             ORDER BY source_ord, canonical_bytes",
+            "SELECT c.canonical_bytes, c.fact_digest, c.proof_id, s.language FROM claims c \
+             JOIN sources s ON s.ord=c.source_ord WHERE c.artifact=?1 \
+             ORDER BY c.source_ord, c.canonical_bytes",
         )?;
         let claims = statement
             .query_map([artifact.ordinal], |row| {
@@ -347,11 +348,12 @@ fn read_inventories(
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut captured = vec![];
-        for (canonical_bytes, fact_digest, proof) in claims {
+        for (canonical_bytes, fact_digest, proof, language) in claims {
             let value: serde_json::Value = serde_json::from_slice(&canonical_bytes)?;
             let text = |name: &str| value[name].as_str().map(str::to_owned);
             captured.push(CapturedClaim {
@@ -368,7 +370,7 @@ fn read_inventories(
                 canonical_bytes,
                 fact_digest,
                 captured_proof_id: proof,
-                language: artifact.language.clone(),
+                language,
                 artifact_hash: artifact.sha256.clone(),
             });
         }
@@ -515,10 +517,23 @@ pub fn single_artifact_batch(
     language: &str,
     artifact: &[u8],
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
+    single_artifact_batch_languages(capture, producer, &[language], artifact)
+}
+
+/// [`single_artifact_batch`] for one artifact that covers every source whose language is in
+/// `languages` (in contract order, #22); the producer's other languages are `notRequested`.
+pub fn single_artifact_batch_languages(
+    capture: &Capture,
+    producer: &str,
+    languages: &[&str],
+    artifact: &[u8],
+) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
     let root = capture.physical_root();
     let identity = crate::store::topology::WorkspaceIdentity::discover(Some(root), root)?;
     let (source_set, revision) = captured_revision_header(capture, root, &identity.record_id)?;
     let pinned = pinned_producer_by_id(producer).ok_or_else(|| anyhow!("unpinned producer"))?;
+    let mut languages = languages.to_vec();
+    languages.sort_by_key(|language| order(language));
     let mut files: Vec<_> = capture.files.iter().collect();
     files.sort_by(|a, b| {
         (order(&a.language), a.path.as_bytes()).cmp(&(order(&b.language), b.path.as_bytes()))
@@ -536,7 +551,7 @@ pub fn single_artifact_batch(
         if !pinned.languages.contains(&file.language) {
             continue;
         }
-        coverage_rows.push(if file.language == language {
+        coverage_rows.push(if languages.contains(&file.language.as_str()) {
             serde_json::json!({"artifact": 0, "exclusion": null,
                 "language": file.language, "relativePath": file.path})
         } else {
@@ -590,7 +605,7 @@ pub fn single_artifact_batch(
         "pages": entries,
         "artifacts": [{
             "ordinal": 0, "relativePath": "artifact.scip", "byteLength": artifact.len(),
-            "sha256": scip_raw::sha(artifact), "language": language,
+            "sha256": scip_raw::sha(artifact), "languages": languages,
         }],
         "generation": null,
     });

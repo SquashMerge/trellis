@@ -42,8 +42,8 @@ fn descriptor_json() -> Value {
             {"kind": "coverage", "ordinal": 0, "relativePath": "p/c0.json", "byteLength": 100, "sha256": hex('3'), "rowCount": 3},
         ],
         "artifacts": [
-            {"ordinal": 0, "relativePath": "a/0.scip", "byteLength": 10, "sha256": hex('4'), "language": "java"},
-            {"ordinal": 1, "relativePath": "a/1.scip", "byteLength": 20, "sha256": hex('5'), "language": "javascript"},
+            {"ordinal": 0, "relativePath": "a/0.scip", "byteLength": 10, "sha256": hex('4'), "languages": ["java"]},
+            {"ordinal": 1, "relativePath": "a/1.scip", "byteLength": 20, "sha256": hex('5'), "languages": ["javascript"]},
         ],
         "generation": null,
     })
@@ -245,7 +245,7 @@ fn descriptor_checks_pin_the_producer_and_total_the_entries() {
 
     let artifact_cases: [(&str, Change); 4] = [
         ("artifact language", |d| {
-            d.artifacts[0].language = "go".into()
+            d.artifacts[0].languages = vec!["go".into()]
         }),
         ("artifact totals", |d| d.totals.artifact_bytes = 1),
         ("duplicate artifact", |d| {
@@ -267,6 +267,62 @@ fn descriptor_checks_pin_the_producer_and_total_the_entries() {
         admission_detail(none.check_artifacts(&limits()).unwrap_err()),
         "artifact count"
     );
+}
+
+fn artifact_languages_error(languages: &[&str]) -> Option<String> {
+    let mut descriptor = Descriptor::parse(&descriptor_bytes(&descriptor_json())).unwrap();
+    descriptor.artifacts[1].languages = languages.iter().map(|l| (*l).into()).collect();
+    descriptor
+        .check_artifacts(&limits())
+        .err()
+        .map(admission_detail)
+}
+
+#[test]
+fn artifact_languages_accept_an_ordered_subset_of_the_pin() {
+    assert_eq!(artifact_languages_error(&["javascript"]), None);
+    assert_eq!(artifact_languages_error(&["java", "javascript"]), None);
+}
+
+#[test]
+fn artifact_languages_reject_an_empty_list() {
+    assert_eq!(
+        artifact_languages_error(&[]).as_deref(),
+        Some("artifact language")
+    );
+}
+
+#[test]
+fn artifact_languages_reject_a_duplicate() {
+    assert_eq!(
+        artifact_languages_error(&["javascript", "javascript"]).as_deref(),
+        Some("artifact language")
+    );
+}
+
+#[test]
+fn artifact_languages_reject_contract_disorder() {
+    assert_eq!(
+        artifact_languages_error(&["javascript", "java"]).as_deref(),
+        Some("artifact language")
+    );
+}
+
+#[test]
+fn artifact_languages_reject_a_language_outside_the_pin() {
+    assert_eq!(
+        artifact_languages_error(&["javascript", "typescript"]).as_deref(),
+        Some("artifact language")
+    );
+}
+
+#[test]
+fn artifact_entry_serializes_languages_json() {
+    let entry = ArtifactEntry {
+        languages: vec!["javascript".into(), "typescript".into()],
+        ..artifact(0, "javascript")
+    };
+    assert_eq!(entry.languages_json(), r#"["javascript","typescript"]"#);
 }
 
 fn page_entry(bytes: &[u8]) -> PageEntry {
@@ -360,6 +416,19 @@ fn rows_must_strictly_increase_across_pages() {
 }
 
 #[test]
+fn typescript_rows_follow_javascript() {
+    let mut source = RowOrder::source();
+    source.push("javascript", "b.js").unwrap();
+    source.push("typescript", "a.ts").unwrap();
+    let mut reversed = RowOrder::source();
+    reversed.push("typescript", "a.ts").unwrap();
+    assert_eq!(
+        admission_detail(reversed.push("javascript", "b.js").unwrap_err()),
+        "unsorted source rows"
+    );
+}
+
+#[test]
 fn coverage_row_requires_exactly_one_disposition() {
     let row = |artifact: Value, exclusion: Value| {
         serde_json::from_value::<CoverageRow>(json!({
@@ -404,7 +473,7 @@ fn artifact(ordinal: u32, language: &str) -> ArtifactEntry {
         relative_path: format!("a/{ordinal}.scip"),
         byte_length: 1,
         sha256: hex('f'),
-        language: language.into(),
+        languages: vec![language.into()],
     }
 }
 
@@ -419,6 +488,14 @@ fn basis_artifact_rule_assigns_covered_and_excluded_documents() {
     assert_eq!(basis_artifact_ordinal(&artifacts, "java", Some(0)), 0);
     assert_eq!(basis_artifact_ordinal(&artifacts, "javascript", None), 1);
     assert_eq!(basis_artifact_ordinal(&artifacts, "rust", None), 0);
+    let mixed = [
+        artifact(0, "java"),
+        ArtifactEntry {
+            languages: vec!["javascript".into(), "typescript".into()],
+            ..artifact(1, "javascript")
+        },
+    ];
+    assert_eq!(basis_artifact_ordinal(&mixed, "typescript", None), 1);
 }
 
 const RUN_ID: &str = "0123456789abcdef0123456789abcdef";

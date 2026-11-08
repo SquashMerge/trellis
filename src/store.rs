@@ -821,11 +821,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 40;
+const DATABASE_SCHEMA_VERSION: u32 = 41;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V40: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=40), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V41: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=41), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -844,7 +844,7 @@ CREATE UNIQUE INDEX native_revisions_pin ON native_revisions(published_index_rev
 CREATE INDEX native_revisions_header_cover ON native_revisions(source_set_id,published_index_revision,id);
 CREATE TABLE revision_capture_inputs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,input_key TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(revision_id,input_key));
 CREATE TABLE document_versions(vid INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,language TEXT NOT NULL,path TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),extraction_context TEXT NOT NULL CHECK(length(extraction_context)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,byte_length INTEGER NOT NULL CHECK(byte_length>=0 AND byte_length=length(source_bytes)),source_bytes BLOB NOT NULL,native_witness TEXT NOT NULL CHECK(length(native_witness)=64),UNIQUE(language,path,content_hash,extraction_context,producer_id,producer_version),UNIQUE(vid,language,path),UNIQUE(vid,language),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE graph_projections(gid INTEGER PRIMARY KEY,vid INTEGER NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL UNIQUE CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,class_summary_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((class_extraction_state='ready')=(class_summary_payload IS NOT NULL)),CHECK((language IN ('java','python','javascript','rust'))=(class_extraction_state IN ('ready'))),UNIQUE(vid,graph_hash),UNIQUE(gid,vid),FOREIGN KEY(vid,language) REFERENCES document_versions(vid,language) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE graph_projections(gid INTEGER PRIMARY KEY,vid INTEGER NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL UNIQUE CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,class_summary_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((class_extraction_state='ready')=(class_summary_payload IS NOT NULL)),CHECK((language IN ('java','python','javascript','rust','typescript'))=(class_extraction_state IN ('ready'))),UNIQUE(vid,graph_hash),UNIQUE(gid,vid),FOREIGN KEY(vid,language) REFERENCES document_versions(vid,language) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE graph_nodes(gid INTEGER NOT NULL REFERENCES graph_projections(gid) DEFERRABLE INITIALLY DEFERRED,id BLOB NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(gid,id));
 CREATE INDEX graph_nodes_search_name ON graph_nodes(name COLLATE BINARY,id,gid);
 CREATE INDEX graph_nodes_search_folded ON graph_nodes(lower(name),name COLLATE BINARY,id,gid);
@@ -905,7 +905,7 @@ CREATE TABLE semantic_coverage_reasons(tuple_id INTEGER PRIMARY KEY REFERENCES s
 CREATE TABLE semantic_basis(basis_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL REFERENCES semantic_coverage(tuple_id),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,producer_hash TEXT NOT NULL,artifact_hash TEXT NOT NULL,language TEXT NOT NULL,source_set_id TEXT NOT NULL,captured_native_revision_id TEXT NOT NULL,source_manifest_hash TEXT NOT NULL,toolchain_hash TEXT NOT NULL,config_hash TEXT NOT NULL,dependency_hash TEXT NOT NULL,UNIQUE(tuple_id,basis_id));
 CREATE TABLE semantic_basis_lookup_dependencies(basis_id INTEGER NOT NULL REFERENCES semantic_basis(basis_id),ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),lookup_key TEXT NOT NULL,PRIMARY KEY(basis_id,ordinal),UNIQUE(basis_id,lookup_key));
 CREATE TABLE semantic_raw_batches(batch_id INTEGER PRIMARY KEY,producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,profile_id TEXT NOT NULL,source_set_id TEXT NOT NULL,captured_revision TEXT NOT NULL,source_manifest_hash TEXT NOT NULL CHECK(length(source_manifest_hash)=64),descriptor_sha256 TEXT NOT NULL CHECK(length(descriptor_sha256)=64),descriptor_bytes BLOB NOT NULL,decoder_version TEXT NOT NULL,UNIQUE(producer_id,descriptor_sha256,captured_revision));
-CREATE TABLE semantic_raw_captures(capture_id INTEGER PRIMARY KEY,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),ordinal INTEGER NOT NULL,language TEXT NOT NULL,producer_id TEXT NOT NULL,artifact_hash TEXT NOT NULL CHECK(length(artifact_hash)=64),source_set_id TEXT NOT NULL,captured_revision TEXT NOT NULL,binary_bytes BLOB NOT NULL,decoder_version TEXT NOT NULL,UNIQUE(batch_id,ordinal),UNIQUE(producer_id,artifact_hash,source_set_id,captured_revision));
+CREATE TABLE semantic_raw_captures(capture_id INTEGER PRIMARY KEY,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),ordinal INTEGER NOT NULL,languages TEXT NOT NULL CHECK(json_valid(languages)),producer_id TEXT NOT NULL,artifact_hash TEXT NOT NULL CHECK(length(artifact_hash)=64),source_set_id TEXT NOT NULL,captured_revision TEXT NOT NULL,binary_bytes BLOB NOT NULL,decoder_version TEXT NOT NULL,UNIQUE(batch_id,ordinal),UNIQUE(producer_id,artifact_hash,source_set_id,captured_revision));
 CREATE INDEX semantic_raw_captures_batch ON semantic_raw_captures(batch_id);
 CREATE TABLE semantic_batch_witnesses(batch_id INTEGER PRIMARY KEY REFERENCES semantic_raw_batches(batch_id));
 CREATE TABLE semantic_batch_witness_documents(batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),language TEXT NOT NULL,path TEXT NOT NULL,snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),PRIMARY KEY(batch_id,language,path));
@@ -1716,6 +1716,7 @@ impl Store {
         let physical_lines = file.text.lines().count();
         let source = crate::metrics::SourceInput {
             language: &key.language,
+            path: &key.path,
             content_hash: &file.hash,
             text: &file.text,
         };
@@ -2655,6 +2656,94 @@ impl EvidenceResponse {
                 label
             );
         }
+        // The root TypeScript config rides the retained native config: a present
+        // `tsconfig.json`, else a present `jsconfig.json`.
+        let config_bytes: i64 = self.db.query_row(
+            "SELECT length(CAST(retained_config AS BLOB)) FROM native_revisions WHERE id=?1",
+            [&selected.key],
+            |row| row.get(0),
+        )?;
+        let config_bytes = u64::try_from(config_bytes).context(SelectedIntegrity(
+            "incompatible_index: invalid retained config length".into(),
+        ))?;
+        stored_bytes = stored_bytes.saturating_add(config_bytes);
+        ensure!(
+            stored_bytes <= 512 * 1024 * 1024,
+            "bounded_work: architecture source"
+        );
+        check()?;
+        let retained_config: String = self.db.query_row(
+            "SELECT retained_config FROM native_revisions WHERE id=?1",
+            [&selected.key],
+            |row| row.get(0),
+        )?;
+        // Entries of other inputs have shapes this read does not need. A root config
+        // entry it does need is strictly `present` with bytes or `absent`.
+        #[derive(serde::Deserialize)]
+        struct ConfigEntry<'a> {
+            #[serde(borrow, default)]
+            path: Option<std::borrow::Cow<'a, str>>,
+            #[serde(borrow, default, rename = "type")]
+            kind: Option<std::borrow::Cow<'a, str>>,
+            #[serde(borrow, default)]
+            bytes: Option<std::borrow::Cow<'a, str>>,
+            #[serde(default, rename = "byteLength")]
+            byte_length: Option<u64>,
+        }
+        let configs: Vec<ConfigEntry<'_>> = serde_json::from_str(&retained_config).context(
+            SelectedIntegrity("incompatible_index: corrupt retained config".into()),
+        )?;
+        check()?;
+        let mut root_tsconfig: Option<crate::references::tsconfig::RootTsconfigInput> = None;
+        for entry in configs {
+            check()?;
+            let ConfigEntry {
+                path: Some(path),
+                kind,
+                bytes,
+                byte_length,
+            } = entry
+            else {
+                continue;
+            };
+            let path = path.as_ref();
+            if !matches!(path, "tsconfig.json" | "jsconfig.json") {
+                continue;
+            }
+            let (bytes, byte_length) = match (kind.as_deref(), bytes, byte_length) {
+                (Some("absent"), None, None) => continue,
+                (Some("present"), Some(bytes), Some(byte_length)) => (bytes, byte_length),
+                _ => {
+                    return Err(SelectedIntegrity(format!(
+                        "incompatible_index: corrupt retained {path} entry"
+                    ))
+                    .into());
+                }
+            };
+            if path == "jsconfig.json" && root_tsconfig.is_some() {
+                continue;
+            }
+            source_bytes = source_bytes.saturating_add(byte_length);
+            ensure!(
+                byte_length <= crate::skipped_config::CONFIG_INPUT_MAX_BYTES
+                    && source_bytes <= 256 * 1024 * 1024,
+                "bounded_work: architecture source"
+            );
+            selected_ensure!(
+                byte_length.checked_mul(2) == Some(bytes.len() as u64),
+                "incompatible_index: corrupt retained {} length",
+                path
+            );
+            check()?;
+            let bytes = hex::decode(bytes.as_ref()).context(SelectedIntegrity(format!(
+                "incompatible_index: corrupt retained {path} bytes"
+            )))?;
+            root_tsconfig = Some(crate::references::tsconfig::RootTsconfigInput {
+                source_set_id: source_set_id.clone(),
+                path: path.to_owned(),
+                bytes,
+            });
+        }
         semantic_display::architecture_semantic(&self.db, &selected.key, &mut documents, check)?;
         check()?;
         Ok((
@@ -2662,6 +2751,7 @@ impl EvidenceResponse {
                 pin: selected.pin,
                 documents,
                 manifests: manifests.into_values().collect(),
+                root_tsconfig,
                 evidence_gaps,
             },
             regions,
@@ -4231,7 +4321,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V40)?;
+    expected.execute_batch(CACHE_SCHEMA_V41)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -4255,7 +4345,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V40).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V41).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -6589,7 +6679,7 @@ fn authenticate_stored_batch(
         let mut docs = Vec::new();
         for doc in &r1.revision.documents {
             let (language, path) = (&doc.key.language, &doc.key.path);
-            if *language != capture.language
+            if !capture.languages.contains(language)
                 || excluded.contains(&(language.as_str(), path.as_str()))
                 || raw
                     .documents
@@ -6720,7 +6810,7 @@ pub struct StoredRawProof {
 pub struct SelectedRawCapture {
     pub capture_id: i64,
     pub ordinal: u32,
-    pub language: String,
+    pub languages: Vec<String>,
     pub artifact_hash: String,
     pub binary_bytes: Vec<u8>,
 }
@@ -8379,7 +8469,7 @@ fn write_staged_raw_rows(
     let batch_id: i64 = db.query_row("SELECT batch_id FROM semantic_raw_batches WHERE producer_id=?1 AND descriptor_sha256=?2 AND captured_revision=?3", params![producer_id,descriptor_sha256,captured_revision], |r| r.get(0))?;
     let artifacts: Vec<(i64, String, String, i64)> = db
         .prepare(
-            "SELECT ordinal,language,sha256,byte_length FROM stage.artifacts ORDER BY ordinal",
+            "SELECT ordinal,languages,sha256,byte_length FROM stage.artifacts ORDER BY ordinal",
         )?
         .query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -8387,7 +8477,7 @@ fn write_staged_raw_rows(
         .collect::<rusqlite::Result<_>>()?;
     ensure!(!artifacts.is_empty(), "staged batch has no artifacts");
     let mut capture_ids = Vec::with_capacity(artifacts.len());
-    for (ordinal, language, sha256, length) in &artifacts {
+    for (ordinal, languages, sha256, length) in &artifacts {
         let other: Option<i64> = db.query_row("SELECT batch_id FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4", params![producer_id,sha256,source_set_id,captured_revision], |r| r.get(0)).optional()?;
         ensure!(
             other.is_none_or(|other| other == batch_id),
@@ -8403,7 +8493,7 @@ fn write_staged_raw_rows(
         let capture_id = if let Some(existing) = existing {
             existing
         } else {
-            db.execute("INSERT INTO semantic_raw_captures(batch_id,ordinal,language,producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,decoder_version) VALUES(?1,?2,?3,?4,?5,?6,?7,zeroblob(?8),?9)", params![batch_id,ordinal,language,producer_id,sha256,source_set_id,captured_revision,length,descriptor.decoder_version])?;
+            db.execute("INSERT INTO semantic_raw_captures(batch_id,ordinal,languages,producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,decoder_version) VALUES(?1,?2,?3,?4,?5,?6,?7,zeroblob(?8),?9)", params![batch_id,ordinal,languages,producer_id,sha256,source_set_id,captured_revision,length,descriptor.decoder_version])?;
             let capture_id = db.last_insert_rowid();
             fill_capture_blob(
                 db,
@@ -9887,7 +9977,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V40 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V41 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -10891,12 +10981,12 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         }
         expected.insert(format!("directory:{directory}"));
     }
-    // Nested package roots of JavaScript sources (#443) and nested Cargo manifests of Rust
-    // sources (#394); a non-regular one is not admitted.
+    // Nested package roots of JavaScript and TypeScript sources (#443) and nested Cargo
+    // manifests of Rust sources (#394); a non-regular one is not admitted.
     for source in &source_paths {
-        let manifest = match Path::new(source).extension().and_then(|x| x.to_str()) {
-            Some("js" | "mjs" | "cjs") => "package.json",
-            Some("rs") => "Cargo.toml",
+        let manifest = match crate::capture::language_of_path(Path::new(source)) {
+            Some("javascript" | "typescript") => "package.json",
+            Some("rust") => "Cargo.toml",
             _ => continue,
         };
         for dir in Path::new(source).ancestors().skip(1) {
@@ -12617,7 +12707,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V40)?;
+                db.execute_batch(CACHE_SCHEMA_V41)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -18613,12 +18703,20 @@ impl Store {
                         })?;
                 let captures = db.prepare(
                     if omit_binary {
-                        "SELECT capture_id,ordinal,language,artifact_hash,X'' FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
+                        "SELECT capture_id,ordinal,languages,artifact_hash,X'' FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
                     } else {
-                        "SELECT capture_id,ordinal,language,artifact_hash,binary_bytes FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
+                        "SELECT capture_id,ordinal,languages,artifact_hash,binary_bytes FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
                     }
-                )?.query_map([batch_id], |r| Ok(SelectedRawCapture {capture_id:r.get(0)?,ordinal:r.get(1)?,language:r.get(2)?,artifact_hash:r.get(3)?,binary_bytes:r.get(4)?}))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                )?.query_map([batch_id], |r| Ok((r.get::<_, i64>(0)?,r.get::<_, u32>(1)?,r.get::<_, String>(2)?,r.get::<_, String>(3)?,r.get::<_, Vec<u8>>(4)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|(capture_id,ordinal,languages,artifact_hash,binary_bytes)| {
+                        let languages = serde_json::from_str::<Vec<String>>(&languages).map_err(|_| {
+                            SelectedIntegrity("incompatible_index: selected raw capture".into())
+                        })?;
+                        Ok(SelectedRawCapture {capture_id,ordinal,languages,artifact_hash,binary_bytes})
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 selected_ensure!(
                     !captures.is_empty(),
                     "incompatible_index: selected capture missing"
@@ -19632,8 +19730,10 @@ impl Store {
             "incompatible_index: selected class projection invalid"
         );
         selected_ensure!(
-            matches!(language.as_str(), "java" | "python" | "javascript" | "rust")
-                && (class_state == "ready") == crate::classes::supports_language(&language)
+            matches!(
+                language.as_str(),
+                "java" | "python" | "javascript" | "rust" | "typescript"
+            ) && (class_state == "ready") == crate::classes::supports_language(&language)
                 && matches!(class_state.as_str(), "ready" | "notApplicable"),
             "incompatible_index: class extraction state invalid"
         );
@@ -20603,12 +20703,11 @@ impl Store {
         }
         let truncated = truncated || byte_limited;
         if let Some(path) = path
-            && ![".java", ".py", ".js", ".mjs", ".cjs", ".rs"]
-                .iter()
-                .any(|ext| path.ends_with(ext))
+            && !crate::capture::language_of_path(Path::new(path))
+                .is_some_and(crate::classes::supports_language)
         {
             warnings.push(
-                "Class diagrams currently support Java, Python, JavaScript and Rust declarations only."
+                "Class diagrams currently support Java, Python, JavaScript, TypeScript and Rust declarations only."
                     .into(),
             );
         }
@@ -21725,7 +21824,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V40).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V41).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -21864,7 +21963,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V40).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V41).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];
@@ -21950,6 +22049,59 @@ fn architecture_retained_package_components_fail_atomically_with_typed_integrity
             .architecture_response("references", &serde_json::json!({}), &mut || Ok(()))
             .unwrap_err();
         assert!(error.is::<SelectedIntegrity>(), "{fault}: {error:#}");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn architecture_malformed_retained_root_config_fails_with_typed_integrity() {
+    use serde_json::json;
+    let malformed = [
+        json!({"path":"tsconfig.json","type":"present","bytex":"7b7d","byteLength":2}),
+        json!({"path":"tsconfig.json","type":"present","bytes":"7b7d"}),
+        json!({"path":"tsconfig.json","type":"present","bytes":7,"byteLength":2}),
+        json!({"path":"tsconfig.json","bytes":"7b7d","byteLength":2}),
+        json!({"path":"tsconfig.json","type":"absentx"}),
+        json!({"path":"jsconfig.json","type":"present","byteLength":2}),
+    ];
+    // Unrelated entries of other shapes are still skipped.
+    let unrelated = [
+        json!({"nativeAdmission":{"maxFileBytes":1}}),
+        json!({"path":"other.json","type":"other"}),
+        json!({"path":"tsconfig.json","type":"absent"}),
+    ];
+    for (entry, typed) in malformed
+        .iter()
+        .map(|entry| (entry, true))
+        .chain(unrelated.iter().map(|entry| (entry, false)))
+    {
+        let (_state, _root, store) = selected_read_once_tests::published_store(1);
+        let db = store.cache_write().unwrap();
+        let (id, retained): (String, String) = db
+            .query_row(
+                "SELECT id,retained_config FROM native_revisions LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let mut inputs: Vec<serde_json::Value> = serde_json::from_str(&retained).unwrap();
+        inputs.retain(|input| input["path"] != entry["path"]);
+        inputs.push(entry.clone());
+        db.execute(
+            "UPDATE native_revisions SET retained_config=?1 WHERE id=?2",
+            params![serde_json::to_string(&inputs).unwrap(), id],
+        )
+        .unwrap();
+        drop(db);
+        let response = store.evidence_response().unwrap();
+        let result =
+            response.architecture_response("references", &serde_json::json!({}), &mut || Ok(()));
+        if typed {
+            let error = result.unwrap_err();
+            assert!(error.is::<SelectedIntegrity>(), "{entry}: {error:#}");
+        } else {
+            result.unwrap_or_else(|error| panic!("{entry}: {error:#}"));
+        }
     }
 }
 

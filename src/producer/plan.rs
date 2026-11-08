@@ -108,9 +108,9 @@ pub struct Basis {
     pub inputs: RetainedInputs,
 }
 
-/// Read the basis of the selected native revision. `language` counts the
+/// Read the basis of the selected native revision. `languages` counts the
 /// documents the producer's artifact will cover.
-pub fn read_basis(reader: &NativeReader<'_>, language: &str) -> Result<Basis> {
+pub fn read_basis(reader: &NativeReader<'_>, languages: &[&str]) -> Result<Basis> {
     let header = reader.header()?;
     let mut hasher = SourceManifestHasher::new(&header.source_set.id);
     let (mut documents, mut requested) = (0_u64, 0_u64);
@@ -122,7 +122,7 @@ pub fn read_basis(reader: &NativeReader<'_>, language: &str) -> Result<Basis> {
             &document.content_hash,
         );
         documents += 1;
-        requested += u64::from(document.key.language == language);
+        requested += u64::from(languages.contains(&document.key.language.as_str()));
     }
     Ok(Basis {
         source_set_id: header.source_set.id,
@@ -216,7 +216,7 @@ pub fn build(parts: &Parts<'_>) -> Value {
         "workspace": parts.workspace,
         "producer": {
             "name": row.target.name(),
-            "language": row.target.language(),
+            "languages": row.target.languages(),
             "version": parts.pin.version,
             "pinnedExecutableHash": parts.pin.executable_hash,
             "positionEncoding": encoding_name(parts.pin.position_encoding),
@@ -247,7 +247,7 @@ pub fn build(parts: &Parts<'_>) -> Value {
             },
             "documents": {
                 "total": parts.basis.documents,
-                "requestedLanguage": row.target.language(),
+                "requestedLanguages": row.target.languages(),
                 "requested": parts.basis.requested_documents,
             },
             "config": listed(&layout.config),
@@ -359,7 +359,7 @@ pub fn prepare(store: &Store, request: &PlanRequest, stub: Option<&Stub>) -> Res
     let (pin, resolution) = resolve_for(target, row.trust, &declared, executable, stub)?;
     let baseline = store.index_baseline()?;
     let basis =
-        store.with_native_reader(baseline, |reader| read_basis(reader, target.language()))?;
+        store.with_native_reader(baseline, |reader| read_basis(reader, target.languages()))?;
     Ok(Prepared {
         row,
         pin,
@@ -470,7 +470,7 @@ pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Re
             let last = runs.iter().find(|record| record.producer == target.name());
             json!({
                 "name": target.name(),
-                "language": target.language(),
+                "languages": target.languages(),
                 "detection": availability(&base),
                 "trustProfiles": {
                     "restricted": trust(TrustProfile::Restricted),

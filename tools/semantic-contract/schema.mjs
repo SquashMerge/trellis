@@ -7,7 +7,7 @@ const literal = (value) => ({ literal: value });
 const union = (tag, variants) => ({ union: { tag, variants } });
 export const types = Object.freeze({
   Text: "text",
-  Language: enumOf("java", "rust", "python", "javascript"),
+  Language: enumOf("java", "rust", "python", "javascript", "typescript"),
   UInt: "uint",
   Hash: "hash",
   Path: "path",

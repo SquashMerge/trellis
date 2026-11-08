@@ -35,6 +35,8 @@ fn n_of(id: &str) -> u64 {
 fn dkey(path: &str) -> DocumentKey {
     let language = if path.ends_with(".js") {
         "javascript"
+    } else if path.ends_with(".ts") {
+        "typescript"
     } else {
         "rust"
     };
@@ -45,10 +47,10 @@ fn dkey(path: &str) -> DocumentKey {
     }
 }
 fn language(key: &DocumentKey) -> sem::Language {
-    if key.language == "rust" {
-        sem::Language::Rust
-    } else {
-        sem::Language::Javascript
+    match key.language.as_str() {
+        "rust" => sem::Language::Rust,
+        "typescript" => sem::Language::Typescript,
+        _ => sem::Language::Javascript,
     }
 }
 fn coverage(
@@ -489,6 +491,34 @@ fn default_producers_select_per_language_and_name_conflicts() {
     assert_eq!(syntax, [multiple_producers_note("rust")]);
     // An explicit producer overrides the conflict.
     let r = run(&mut facts, &request(A, true));
+    assert_eq!(edges(&r)[0].4, BoundaryReason::None);
+    assert!(r.warnings.iter().all(|w| w.code != WarningCode::SyntaxOnly));
+}
+
+/// A TypeScript document's coverage and default producer match by the name `typescript`
+/// (I4): the producer resolves the call, and the default selects it for the language.
+#[test]
+fn typescript_documents_resolve_through_the_language_name() {
+    use trellis::graph_query::DefaultProducers;
+    let mut w = world(true);
+    w.scope = BTreeSet::from(["typescript".to_string()]);
+    for n in [A, B] {
+        w.decl(n, "src/app/model.ts");
+    }
+    w.call(A, 100, 10);
+    w.bind(100, direct(B));
+    let mut facts = w.build();
+    let r = run(&mut facts, &request(A, true));
+    assert_eq!(
+        edges(&r),
+        [(100, A, Some(B), Visit::New, BoundaryReason::None)]
+    );
+    assert!(r.warnings.iter().all(|w| w.code != WarningCode::SyntaxOnly));
+    facts.defaults = Some(DefaultProducers::from_published([(
+        PRODUCER.to_string(),
+        Some("typescript".to_string()),
+    )]));
+    let r = run(&mut facts, &request(A, false));
     assert_eq!(edges(&r)[0].4, BoundaryReason::None);
     assert!(r.warnings.iter().all(|w| w.code != WarningCode::SyntaxOnly));
 }

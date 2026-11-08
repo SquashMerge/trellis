@@ -168,6 +168,13 @@ test("loading a new view invalidates keyboard member/source callbacks in old dia
  const pending=deferred();h.setRequest(()=>pending.promise);const work=h.controller.open({seed:"B"});await member.fire("click");assert.equal(h.methods.length,0);
  pending.resolve(diagram(["B"]));await work;
 });
+test("TypeScript paths are class-capable and the unsupported message names TypeScript",async()=>{
+ for(const path of ["src/a.ts","ui/a.tsx","src/a.mts","src/a.cts","types/a.d.ts"]){
+  const h=harness();await h.controller.open({path});assert.notEqual(h.get("classes-state").dataset.state,"unsupported",path);assert.ok(h.calls.length>0,path);
+ }
+ const h=harness();await h.controller.open({path:"src/main.go"});assert.match(text(h.get("classes-state")),/Java, Python, JavaScript, TypeScript and Rust/);
+});
+
 test("unsupported, unindexed, empty, partial and error states are explicit",async()=>{
  const h=harness();await h.controller.open({path:"src/main.go"});assert.equal(h.get("classes-state").dataset.state,"unsupported");assert.equal(h.calls.length,0);
  h.setRequest(async()=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[],warnings:["Index workspace to populate class declarations."],requireIndex:true}));await h.controller.open({});assert.equal(h.get("classes-state").dataset.state,"unindexed");

@@ -161,17 +161,22 @@ pub(crate) fn compute_with_cached(
     })
 }
 
-type MemoKey = (String, String, String);
+/// Version, language, content hash and whether the TypeScript grammar is `tsx`: identical
+/// bytes parse differently under the two TypeScript grammars.
+type MemoKey = (String, String, String, bool);
 fn memo_key(source: &SourceInput<'_>) -> MemoKey {
     (
         VERSION.to_owned(),
         source.language.to_owned(),
         source.content_hash.to_owned(),
+        source.language == "typescript" && source.path.ends_with(".tsx"),
     )
 }
-/// The selected pinned source; only its language, hash and bytes enter the memo key.
+/// The selected pinned source; its language, grammar-selecting path, hash and bytes enter
+/// the memo key.
 pub struct SourceInput<'a> {
     pub language: &'a str,
+    pub path: &'a str,
     pub content_hash: &'a str,
     pub text: &'a str,
 }
@@ -224,16 +229,15 @@ fn bind(
         .any(|d| callable(&d.kind) && owned_calls(d).iter().any(|call| self_call(d, call)))
     {
         check()?;
-        let language = declarations
+        let document = &declarations
             .first()
             .context(SelectedIntegrity(
                 "corrupt: call without declaration".into(),
             ))?
-            .document
-            .language
-            .as_str();
+            .document;
+        let language = document.language.as_str();
         let mut parser = Parser::new();
-        parser.set_language(&grammar(language)?)?;
+        parser.set_language(&grammar(language, &document.path)?)?;
         let tree = parser
             .parse(source, None)
             .context("bounded_work: call syntax parse")?;
@@ -333,7 +337,7 @@ fn unqualified_call(root: Node<'_>, call: &Call, language: &str) -> bool {
         if node.start_byte() == call.range.start && node.end_byte() == call.range.end {
             let field = match language {
                 "java" => "name",
-                "javascript" if node.kind() == "new_expression" => "constructor",
+                "javascript" | "typescript" if node.kind() == "new_expression" => "constructor",
                 _ => "function",
             };
             let expression = node.child_by_field_name(field);
@@ -456,11 +460,18 @@ fn empty() -> Score {
     }
 }
 
-fn grammar(language: &str) -> Result<tree_sitter::Language> {
+/// The path of the document `declarations` belong to; the TypeScript grammar depends on it.
+fn document_path(declarations: &[Declaration]) -> &str {
+    declarations
+        .first()
+        .map_or("", |d| d.document.path.as_str())
+}
+fn grammar(language: &str, path: &str) -> Result<tree_sitter::Language> {
     Ok(match language {
         "java" => tree_sitter_java::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(path),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         _ => return Err(SelectedIntegrity("corrupt: unknown stored language".into()).into()),
     })
@@ -473,7 +484,7 @@ fn compute_source(
 ) -> Result<SourceScores> {
     check()?;
     let mut parser = Parser::new();
-    parser.set_language(&grammar(language)?)?;
+    parser.set_language(&grammar(language, document_path(declarations))?)?;
     let mut aborted = None;
     let tree = parser.parse_with_options(
         &mut |offset, _| &source.as_bytes()[offset..],
@@ -770,7 +781,8 @@ fn score(
                         .trim_start_matches(|c: char| c.is_alphabetic() || c.is_whitespace())
                         .starts_with('\'')
                 } else {
-                    matches!(language, "java" | "javascript") && node.named_child_count() > 0
+                    matches!(language, "java" | "javascript" | "typescript")
+                        && node.named_child_count() > 0
                 };
                 if labeled {
                     s.cognitive += 1;
@@ -940,7 +952,7 @@ fn score(
 }
 
 /// FIFO memo contains only source-derived scores and gaps, never native identity or calls.
-type MemoEntry = ((String, String, String), SourceScores, usize);
+type MemoEntry = (MemoKey, SourceScores, usize);
 pub struct MetricsMemo {
     entries: VecDeque<MemoEntry>,
     bytes: usize,
@@ -954,7 +966,7 @@ impl MetricsMemo {
             limit,
         }
     }
-    fn insert(&mut self, key: (String, String, String), value: SourceScores) -> Result<()> {
+    fn insert(&mut self, key: MemoKey, value: SourceScores) -> Result<()> {
         let size = key
             .0
             .capacity()
@@ -966,13 +978,7 @@ impl MetricsMemo {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Score>()),
             )
-            .saturating_add(std::mem::size_of::<(
-                String,
-                String,
-                String,
-                SourceScores,
-                usize,
-            )>());
+            .saturating_add(std::mem::size_of::<MemoEntry>());
         if size <= self.limit.min(64 * 1024 * 1024) {
             while self.bytes.saturating_add(size) > self.limit.min(64 * 1024 * 1024) {
                 if let Some((_, _, n)) = self.entries.pop_front() {

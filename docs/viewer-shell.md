@@ -103,7 +103,7 @@ and notes are not restored by this presentation behavior.
 Use [`metrics:v1`](metrics.md), explicitly scoped to **production callables** by default. The
 unchecked **Include tests and fixtures in metrics** checkbox switches the selection to `all`; unchecking it
 requests `production`. API/CLI omission still defaults to `all`, and `test` is available there.
-Stored native declaration roles are authoritative for Rust, Java, Python and JavaScript under
+Stored native declaration roles are authoritative for Rust, Java, Python, JavaScript and TypeScript under
 Decision 0011; the browser does not classify filenames. Default color is cognitive complexity
 and default aggregate is max. Max, sum and mean are server projections over declaration
 scores, never client folds of file aggregates. One revision projection supplies file and directory

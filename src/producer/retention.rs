@@ -260,8 +260,8 @@ pub(crate) fn configured_languages(
         .map(|config| config.entries)
         .unwrap_or_default();
     for producer in done.chain(pickup.into_iter().map(|entry| entry.producer)) {
-        if let Some(language) = crate::scip_admission::run_language(&producer) {
-            languages.insert(language.to_owned());
+        if let Some(run_languages) = crate::scip_admission::run_languages(&producer) {
+            languages.extend(run_languages.iter().map(|language| (*language).to_owned()));
         }
     }
     Some(languages)

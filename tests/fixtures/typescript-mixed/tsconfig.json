@@ -1,0 +1,10 @@
+{
+  // Root config read by import resolution; JSONC on purpose.
+  "compilerOptions": {
+    "baseUrl": "src",
+    "paths": { "@app/*": ["app/*"], },
+    "rootDirs": ["src", "generated",],
+    "allowJs": true,
+    "jsx": "preserve", /* kept for the TSX file */
+  },
+}

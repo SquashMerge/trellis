@@ -12,7 +12,7 @@ from pathlib import Path
 FORMAT_VERSION = 1
 MAX_PAGE_ROWS = 1000
 MAX_PAGE_BYTES = 1 << 20
-LANGUAGE_ORDER = {"java": 0, "rust": 1, "python": 2, "javascript": 3}
+LANGUAGE_ORDER = {"java": 0, "rust": 1, "python": 2, "javascript": 3, "typescript": 4}
 EXCLUSIONS = ("notRequested", "unsupported", "failed")
 
 DESCRIPTOR_KEYS = frozenset({
@@ -139,7 +139,7 @@ def write_batch(out_dir, header, sources, coverage, artifacts, rows_per_page=MAX
                      "sha256": sha256(artifact["data"])}
         else:
             entry = {key: artifact[key] for key in ("relativePath", "byteLength", "sha256")}
-        artifact_entries.append({"ordinal": ordinal, **entry, "language": artifact["language"]})
+        artifact_entries.append({"ordinal": ordinal, **entry, "languages": [artifact["language"]]})
     excluded = sum(row["exclusion"] is not None for row in coverage)
     descriptor = {
         "formatVersion": FORMAT_VERSION, **header,

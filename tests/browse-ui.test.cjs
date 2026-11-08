@@ -625,7 +625,7 @@ test("server unindexed reasons are plain text, legacy reasons remain, and indexe
   const h = harness();
   h.context.fetch = async () => response(treePage('', [
     {...treeFile('main.rs'), unindexedReason:'Rust indexing not supported yet'},
-    {...treeFile('a.ts'), unindexedReason:'TypeScript indexing not supported yet'},
+    {...treeFile('a.ts'), unindexedReason:'Not indexed yet (may be excluded or size-limited)'},
     {...treeFile('unsafe'), unindexedReason:'<img src=x onerror=boom>'},
     treeFile('legacy'),
     {...treeFile('indexed.rs', 'indexed.rs'), unindexedReason:'MUST NOT SHOW'}
@@ -633,7 +633,7 @@ test("server unindexed reasons are plain text, legacy reasons remain, and indexe
   await h.run('loadTreeRoot()');
   const rendered = text(h.get('file-tree'));
   assert.match(rendered, /Rust indexing not supported yet/);
-  assert.match(rendered, /TypeScript indexing not supported yet/);
+  assert.match(rendered, /Not indexed yet \(may be excluded or size-limited\)/);
   assert.match(rendered, /Not indexed in current workspace/);
   assert.match(rendered, /<img src=x onerror=boom>/);
   assert.doesNotMatch(rendered, /MUST NOT SHOW/);
@@ -648,7 +648,7 @@ test("unsupported source type files collapse into one quiet counted marker per f
   const unsupported = name => ({...treeFile(name), unindexedReason:'Unsupported source type'});
   h.context.fetch = async path => response(path.includes('path=docs')
     ? treePage('docs', [unsupported('docs/guide.md')])
-    : treePage('', [folder('docs'), unsupported('Cargo.toml'), unsupported('<img src=x>.lock'), {...treeFile('a.ts'), unindexedReason:'TypeScript indexing not supported yet'}, treeFile('lib.rs', 'lib.rs')]));
+    : treePage('', [folder('docs'), unsupported('Cargo.toml'), unsupported('<img src=x>.lock'), {...treeFile('a.ts'), unindexedReason:'Not indexed yet (may be excluded or size-limited)'}, treeFile('lib.rs', 'lib.rs')]));
   await h.run('loadTreeRoot()');
   await h.run("toggleDirectory('docs')");
   const markers = descendants(h.get('file-tree')).filter(n => n.className === 'unsupported-files');
@@ -659,7 +659,7 @@ test("unsupported source type files collapse into one quiet counted marker per f
   assert.ok(descendants(h.get('file-tree')).every(n => n.tagName !== 'img'), 'names stay text');
   const rendered = text(h.get('file-tree'));
   assert.equal((rendered.match(/Unsupported source type/g) || []).length, 0, 'no per-file unsupported rows');
-  assert.match(rendered, /TypeScript indexing not supported yet/, 'other unindexed reasons keep their own rows');
+  assert.match(rendered, /Not indexed yet \(may be excluded or size-limited\)/, 'other unindexed reasons keep their own rows');
   h.run(`selectedWorkspaceRoot=treeRoot;filesGitStatus={git:{state:"available"},changes:[{path:"docs/guide.md",status:"modified"},{path:"<img src=x>.lock",status:"added"}]};renderDirectoryTree()`);
   const grouped = descendants(h.get('file-tree')).filter(n => n.className === 'unsupported-files');
   const changes = grouped.flatMap(row => descendants(row).filter(n => n.className === 'git-marker'));
@@ -742,12 +742,14 @@ test("class controller uses authenticated API and clears pending source on navig
 
 test("unsupported class languages keep their ordinary file and method interactions", () => {
   const h=harness();h.context.window.TrellisClasses={showContextMenu(){throw new Error('unexpected menu');}};
-  h.run(`attachClassMenu($('go-file'),{path:'src/main.go'}); attachClassMenu($('rust-file'),{path:'src/main.rs'}); attachClassMenu($('js-file'),{path:'app.js'}); attachClassMenu($('mjs-file'),{path:'web/a.mjs'});`);
+  h.run(`attachClassMenu($('go-file'),{path:'src/main.go'}); attachClassMenu($('rust-file'),{path:'src/main.rs'}); attachClassMenu($('js-file'),{path:'app.js'}); attachClassMenu($('mjs-file'),{path:'web/a.mjs'}); attachClassMenu($('ts-file'),{path:'src/a.ts'}); attachClassMenu($('tsx-file'),{path:'ui/a.tsx'}); attachClassMenu($('mts-file'),{path:'src/a.mts'}); attachClassMenu($('cts-file'),{path:'src/a.cts'});`);
   assert.equal(h.get('go-file').listeners.contextmenu,undefined);
   // JavaScript and Rust declarations are catalogued (#452): their files offer the class menu.
   assert.equal(typeof h.get('rust-file').listeners.contextmenu,'function');
   assert.equal(typeof h.get('js-file').listeners.contextmenu,'function');
   assert.equal(typeof h.get('mjs-file').listeners.contextmenu,'function');
+  // TypeScript declarations are catalogued (#683).
+  for(const id of ['ts-file','tsx-file','mts-file','cts-file']) assert.equal(typeof h.get(id).listeners.contextmenu,'function',id);
 });
 
 

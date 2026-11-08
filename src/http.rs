@@ -3046,15 +3046,9 @@ async fn tree(
             let reason = if !absolute.starts_with(&indexed_workspace) {
                 "Outside indexed workspace"
             } else {
-                match absolute
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                {
-                    Some("ts" | "tsx") => "TypeScript indexing not supported yet",
-                    Some("js" | "mjs" | "cjs" | "rs" | "java" | "py") => {
-                        "Not indexed yet (may be excluded or size-limited)"
-                    }
-                    _ => "Unsupported source type",
+                match crate::capture::language_of_path(&absolute) {
+                    Some(_) => "Not indexed yet (may be excluded or size-limited)",
+                    None => "Unsupported source type",
                 }
             };
             item.unindexed_reason = Some(reason.into());
@@ -4698,10 +4692,12 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
                     .bytes()
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         })
-        || options
-            .language
-            .as_ref()
-            .is_some_and(|v| !matches!(v.as_str(), "java" | "python" | "javascript" | "rust"))
+        || options.language.as_ref().is_some_and(|v| {
+            !matches!(
+                v.as_str(),
+                "java" | "python" | "javascript" | "typescript" | "rust"
+            )
+        })
     {
         return Err(invalid());
     }
@@ -5453,12 +5449,9 @@ async fn provisioned_core_answer(
                     let reason = if !absolute.starts_with(&indexed_workspace) {
                         "Outside indexed workspace"
                     } else {
-                        match absolute.extension().and_then(|e| e.to_str()) {
-                            Some("ts" | "tsx") => "TypeScript indexing not supported yet",
-                            Some("js" | "mjs" | "cjs" | "rs" | "java" | "py") => {
-                                "Not indexed yet (may be excluded or size-limited)"
-                            }
-                            _ => "Unsupported source type",
+                        match crate::capture::language_of_path(&absolute) {
+                            Some(_) => "Not indexed yet (may be excluded or size-limited)",
+                            None => "Unsupported source type",
                         }
                     };
                     item.unindexed_reason = Some(reason.into());

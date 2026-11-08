@@ -1,6 +1,6 @@
 # Trellis
 
-A diagram-first code browser with native JavaScript, Rust, Java and Python indexing, SQLite snapshots,
+A diagram-first code browser with native JavaScript, TypeScript, Rust, Java and Python indexing, SQLite snapshots,
 and an authenticated local inspector. Browse files, expand their functions/methods, and
 open source-linked static sequence diagrams. These are possible paths, not runtime traces.
 
@@ -115,13 +115,13 @@ null reason does not prove vector availability. See the
 
 ## What works
 
-- Native tree-sitter JavaScript (`.js`, `.mjs`, `.cjs`), Rust (`.rs`), Java (`.java`) and Python (`.py`) extraction.
-- Optional SCIP import for all four languages through `trellis producer`; without it, calls stay syntax-only and unresolved.
+- Native tree-sitter JavaScript (`.js`, `.mjs`, `.cjs`), TypeScript (`.ts`, `.tsx`, `.mts`, `.cts`), Rust (`.rs`), Java (`.java`) and Python (`.py`) extraction.
+- Optional SCIP import for all five languages through `trellis producer`; without it, calls stay syntax-only and unresolved.
 - Source hashes, provenance, explicit unresolved boundaries, callbacks and control regions.
 - Atomic full-index publication to SQLite; background refresh, progress and cancellation.
 - Snapshot-consistent source reads and bounded, cycle-safe static call queries.
 - Loopback-only API with bearer authentication, Host/Origin checks and a cached-source viewer.
-- Inline file → method browsing and source-linked static sequence diagrams for all four supported languages.
+- Inline file → method browsing and source-linked static sequence diagrams for all five supported languages.
 - Java/Python class diagrams with scoped candidate links, right-click related-class expansion, and source/method navigation.
 - Reversible fluent Rust chain grouping, with every measured call retained.
 - Automatic local Rust/Cargo library declaration catalog and explicit source viewing. Candidate type lanes are terminal; compiler receiver/dispatch resolution is still unavailable.
@@ -270,5 +270,5 @@ The [semantic-index program](https://github.com/SquashMerge/trellis/issues/8) no
 cached snapshots through the daemon and stdio MCP ([#17](https://github.com/SquashMerge/trellis/issues/17));
 its watcher refreshes native evidence without running repository code. Next: multi-language SCIP
 import and separately gated snapshot search, diagram artifacts and embedded terminal/ACP integration.
-Continue static sequence coverage and library adapters beyond Rust/Cargo. TypeScript parsing, terminal UI,
+Continue static sequence coverage and library adapters beyond Rust/Cargo. Terminal UI,
 React/Tauri and database diagrams remain outside the current implementation.

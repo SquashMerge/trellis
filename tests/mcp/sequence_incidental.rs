@@ -188,6 +188,44 @@ fn javascript_accessors_and_logging_are_incidental() {
     });
 }
 
+#[test]
+fn typescript_accessors_and_logging_are_incidental() {
+    check(Case {
+        language: s::Language::Typescript,
+        path: "a.ts",
+        source: "function helper(): number { return 1; }\nclass S {\n  x: number = 0;\n  getX(): number { return this.x; }\n  setX(v: number): void { this.x = v; }\n  compute(): number { return helper(); }\n  run(): void { this.getX(); this.setX(1); this.compute(); getY(); console.info(\"x\"); this.logger.error(\"y\"); }\n}\n",
+        getter: "getX",
+        setter: "setX",
+        compute: "compute",
+        getter_call: "this.getX()",
+        setter_call: "this.setX(1)",
+        compute_call: "this.compute()",
+        unresolved_call: "getY()",
+        logging: &["console.info", "this.logger.error"],
+    });
+}
+
+/// A TypeScript `constructor` is object creation, never an accessor, however small.
+#[test]
+fn a_typescript_constructor_is_not_an_accessor() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let source = "class S {\n  x: number = 0;\n  constructor(v: number) { this.x = v; }\n}\nfunction run() { new S(1); }\n";
+    let mut spec = Spec::new(&[("a.ts", source)]);
+    spec.languages = vec![s::Language::Typescript];
+    spec.bindings = vec![bind("run", 0, "constructor")];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "run");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.incidental_steps, 0, "{view:#?}");
+    assert!(flatten(&view.steps).iter().all(|step| !step.hidden));
+}
+
 /// Review follow-ups: more logging spellings match (constructors and compound assignment
 /// are unit-tested in `behavior_incidental`), and an operand container is hidden whole.
 #[test]

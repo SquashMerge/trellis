@@ -61,6 +61,10 @@ pub(crate) fn snapshot_bytes(
         check()?;
         bytes = bytes.saturating_add(manifest.bytes.as_ref().map_or(0, Vec::len));
     }
+    if let Some(config) = &snapshot.root_tsconfig {
+        check()?;
+        bytes = bytes.saturating_add(config.bytes.len());
+    }
     Ok(bytes)
 }
 
@@ -129,9 +133,22 @@ mod tests {
                 calls: Vec::new(),
             }],
             manifests: vec![manifest, present],
+            root_tsconfig: None,
             evidence_gaps: Default::default(),
         };
         assert_eq!(snapshot_bytes(&snapshot, &mut || Ok(())).unwrap(), 4);
+        let mut with_config = Snapshot {
+            root_tsconfig: Some(super::super::tsconfig::RootTsconfigInput {
+                source_set_id: "source".into(),
+                path: "tsconfig.json".into(),
+                bytes: b"{}".to_vec(),
+            }),
+            ..snapshot
+        };
+        assert_eq!(snapshot_bytes(&with_config, &mut || Ok(())).unwrap(), 6);
+        with_config.root_tsconfig = None;
+        assert_eq!(snapshot_bytes(&with_config, &mut || Ok(())).unwrap(), 4);
+        let snapshot = with_config;
         assert_eq!(
             snapshot_bytes(&snapshot, &mut || anyhow::bail!("cancelled"))
                 .unwrap_err()

@@ -2,6 +2,8 @@
 #![cfg(feature = "test-support")]
 #[path = "support/child.rs"]
 mod child;
+#[path = "support/real_producers.rs"]
+mod real;
 #[path = "support/semantic_batch.rs"]
 mod semantic_batch_support;
 #[path = "support/producer.rs"]
@@ -242,7 +244,7 @@ impl World {
         let version: u32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 40);
+        assert_eq!(version, 41);
         db.pragma_update(None, "user_version", version - 1).unwrap();
         drop(db);
         // The real daemon establishes the new native head and owns retained FIFO work.
@@ -2044,4 +2046,108 @@ fn structurally_corrupt_retention_identity_does_not_block_native_index_fifo() {
             .unwrap(),
     );
     assert_eq!(world.invocation_count(), 1);
+}
+
+/// A real one-run, two-language scip-typescript artifact (Decision 0020) is retained with its
+/// `languages` and re-admitted after an upgrade without rerunning the producer: the retained
+/// continuation binds every document to its own language (RC5, DS6). Skips when scip-typescript
+/// is not provisioned.
+#[test]
+fn multi_language_scip_typescript_run_is_readmitted_after_upgrade() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typescript-mixed");
+    let checkout = start_checkout(|root| real::copy_tree(&fixture, root), &[]);
+    let Some(plan) = real::Availability::SkipIfUnavailable.resolve(
+        "scip-typescript",
+        real::plan(&checkout, "scip-typescript", "restricted", &[]),
+    ) else {
+        return;
+    };
+    let run = reply(
+        "producer run",
+        real::producer_command(
+            &checkout,
+            "run",
+            "scip-typescript",
+            &[
+                "--trust",
+                "restricted",
+                "--plan-sha256",
+                plan["planSha256"].as_str().unwrap(),
+            ],
+        )
+        .output()
+        .unwrap(),
+    );
+    assert_eq!(run["outcome"], "imported", "{run}");
+    let roots =
+        TopologyRoots::isolated_for_tests(cache_dir(&checkout.home), data_dir(&checkout.home));
+    let identity = WorkspaceIdentity::discover(Some(&checkout.root), &checkout.root).unwrap();
+    let (index, requests) = (roots.index_db(&identity), roots.requests_db(&identity));
+    let languages = |db: &Connection| -> String {
+        db.query_row("SELECT languages FROM semantic_raw_captures", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    };
+    let before = Connection::open_with_flags(&index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(languages(&before), r#"["javascript","typescript"]"#);
+    drop(before);
+
+    support::stop_daemon(&checkout.home);
+    let db = Connection::open(&index).unwrap();
+    let version: u32 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    db.pragma_update(None, "user_version", version - 1).unwrap();
+    drop(db);
+    let rows = || -> Vec<(String, String)> {
+        let db = Connection::open_with_flags(&requests, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.prepare("SELECT state,COALESCE(error_code,'') FROM requests WHERE request_kind='semanticImport' ORDER BY seq")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    reply(
+        "index after upgrade",
+        checkout
+            .cli()
+            .args(["index", "--workspace"])
+            .arg(&checkout.root)
+            .output()
+            .unwrap(),
+    );
+    trellis::testing::wait_until("retained run published by worker FIFO", || {
+        let rows = rows();
+        rows.len() == 2 && matches!(rows[1].0.as_str(), "done" | "failed")
+    });
+    let rows = rows();
+    assert_eq!(rows[1].0, "done", "automatic re-import refused: {rows:?}");
+    let status = reply(
+        "status",
+        checkout
+            .cli()
+            .args(["status", "--workspace"])
+            .arg(&checkout.root)
+            .output()
+            .unwrap(),
+    );
+    for language in ["javascript", "typescript"] {
+        let row = status["semanticLanguages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["language"] == language)
+            .unwrap_or_else(|| panic!("no {language} row: {status}"));
+        assert_eq!(row["reimport"], Value::Null, "{language}: {row}");
+        assert_eq!(row["semanticProducerId"], "scip-typescript", "{language}");
+        assert_eq!(row["coverage"]["failed"], 0, "{language}: {row}");
+        assert!(
+            row["coverage"]["complete"].as_u64().unwrap() > 0,
+            "{language}: {row}"
+        );
+    }
+    let after = Connection::open_with_flags(&index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(languages(&after), r#"["javascript","typescript"]"#);
 }

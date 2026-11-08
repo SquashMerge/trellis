@@ -278,7 +278,7 @@ class SchemaParity(unittest.TestCase):
         db.execute("INSERT INTO semantic_raw_batches VALUES(1,'scip-typescript','1','profile',?,?,?,?,?,?)",
                    (source_set, natives["r1"], header["manifest_hash"], sha, descriptor_bytes,
                     RUNNER.DECODER_VERSION))
-        db.execute("INSERT INTO semantic_raw_captures VALUES(1,1,0,'javascript','scip-typescript',?,?,?,x'01',?)",
+        db.execute("INSERT INTO semantic_raw_captures VALUES(1,1,0,'[\"javascript\"]','scip-typescript',?,?,?,x'01',?)",
                    (artifact, source_set, natives["r1"], RUNNER.DECODER_VERSION))
         db.execute("INSERT INTO semantic_raw_exclusions VALUES(1,'javascript','js/b.js','notRequested')")
         db.execute("INSERT INTO semantic_raw_documents VALUES(1,'javascript','js/a.js',?,?,0)",

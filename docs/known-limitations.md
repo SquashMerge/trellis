@@ -50,7 +50,7 @@ Classes shows declarations, fields and methods. It draws no inheritance or imple
 
 Every language has syntax evidence only until you [import semantic evidence](quickstart.md#5-add-semantic-evidence). For Java and Python this matters most, because many of their calls go through objects whose type syntax alone can't determine. A call without a verified target stays labelled and isn't followed.
 
-`scip-typescript` covers JavaScript only. Trellis doesn't index `.ts`, `.tsx` or `.jsx` files.
+Trellis doesn't index `.jsx`.
 
 ### Semantic evidence after an upgrade
 

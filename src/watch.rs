@@ -868,10 +868,7 @@ fn safe_regular(root: &Path, relative: &Path) -> bool {
 }
 
 fn source(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("js" | "mjs" | "cjs" | "rs" | "java" | "py")
-    )
+    crate::capture::language_of_path(path).is_some()
 }
 
 fn relevant_input(path: &Path) -> bool {
@@ -883,6 +880,21 @@ fn relevant_input(path: &Path) -> bool {
             .iter()
             .any(|name| path == Path::new(name))
 }
+#[cfg(test)]
+mod source_relevance_tests {
+    use super::*;
+
+    #[test]
+    fn typescript_sources_are_relevant_and_jsx_is_not() {
+        for relevant in ["a.ts", "a.tsx", "a.mts", "a.cts", "a.d.ts", "dir/a.js"] {
+            assert!(source(Path::new(relevant)), "{relevant}");
+        }
+        for irrelevant in ["a.jsx", "a.TS", "a.go", "a"] {
+            assert!(!source(Path::new(irrelevant)), "{irrelevant}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod ingress_tests {
     use super::*;

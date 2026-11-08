@@ -1,4 +1,4 @@
-# JavaScript conformance corpus — native-v15 DRAFT
+# JavaScript conformance corpus — native-v16 DRAFT
 
 An independently authored event-processing workbench for #28: ten ES modules
 cover parsing, normalization, stages, editing, history and runtime extensions.
@@ -18,7 +18,7 @@ family, dropped record or artificial tagged-template gap is used to meet a floor
 - 10 production capability reports; every family is available with no gaps.
 - Two independent command runs are byte-identical. Semantic counts remain zero.
 
-The raw capture comes from Trellis's actual `trellis.native.syntax@native-v15`
+The raw capture comes from Trellis's actual `trellis.native.syntax@native-v16`
 extractor through the #95 `native-capture` command. It uses UTF-8 byte coordinates,
 not the old helper's UTF-16 offsets. Native identifier-site candidates carry no
 inferred semantic role or target. Narrow explicit renamed imports have measured
@@ -31,7 +31,29 @@ barrel. Zero calls is not unsupported. Annotations contain native coverage only;
 scenario arrays, semantic artifacts, dispositions, callable negatives and rooted
 answers are empty. `generated/manifest.json` selects the content-addressed bundle.
 
-## Current native-v15 recapture
+## Current native-v16 recapture
+
+The #683 TypeScript work (TypeScript becomes its own native language, with its own
+native constructs and class diagrams) re-ran the production `native-capture`
+command twice on these unchanged snapshots using pinned Rust 1.99.1 and
+`test-support`, at the final native-v16 extractor. Both outputs were byte-identical
+(SHA-256 `0f90e1e4cd6484fbbaddda296304b57347387b4af6d76b6d7fe742d974880965`) and equal
+to the previously stored `captures/native.json`. The compiled native extractor hash
+is `a1c7d0caa1c76e9414ecc028aa89190bcf7d34158b59f019e8671e08e45dacd5`, pinned as
+`trellis-native-v16-javascript-test-support` in the hardware profile. The #800
+review re-pinned it after a TypeScript-only extractor fix (type-only import
+expressions are not calls); the JavaScript recapture is byte-identical.
+
+JavaScript measurement is unchanged from the native-v15 capture: only the producer
+version, extractor hash and occurrence IDs (which include the producer version)
+differ, and the producer's declared language list gains `typescript`. The final
+extraction changes (TypeScript native constructs and class diagrams) do not alter
+any JavaScript record, so only the hash pins in `fixture.json` and the generated
+manifest changed. The extractor hash also covers `tree-sitter-typescript` 0.23.2,
+`src/indexer_ts.rs` and `src/classes.rs`. This corpus does not exercise TypeScript;
+the TypeScript draft corpus lives in `../typescript/`.
+
+## Historical native-v15 recapture
 
 The #576 slice (a source that wasn't read keeps only its file module and a coverage gap, and
 a file whose bytes equal its placeholder now measures the same way) re-ran the production
@@ -113,7 +135,7 @@ No executable, parser archive or fixture-local replacement extractor is vendored
 The obsolete TypeScript capture script and script-plus-parser archive pins are
 removed. F7's Python/tarfile reproducibility dependency no longer exists.
 
-## Reproduce the current native-v15 capture
+## Reproduce the current native-v16 capture
 
 The commands below reproduce the current capture, not the historical native-v10
 or native-v11 hashes above. From the repository root, use an owned target directory and the

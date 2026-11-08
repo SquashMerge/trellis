@@ -165,7 +165,7 @@ fn string_node(language: &str, node: Node<'_>) -> bool {
         "rust" => matches!(node.kind(), "string_literal" | "raw_string_literal"),
         "java" => node.kind() == "string_literal",
         "python" => node.kind() == "string",
-        "javascript" => matches!(node.kind(), "string" | "template_string"),
+        "javascript" | "typescript" => matches!(node.kind(), "string" | "template_string"),
         _ => false,
     }
 }
@@ -254,7 +254,7 @@ fn blank_line(gap: &str) -> bool {
 }
 fn attached_doc(node: Node<'_>, file: &SourceFile) -> String {
     let mut parts = Vec::new();
-    let mut current = if file.language == "javascript"
+    let mut current = if matches!(file.language.as_str(), "javascript" | "typescript")
         && node
             .parent()
             .is_some_and(|parent| parent.kind() == "export_statement")

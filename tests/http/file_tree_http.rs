@@ -209,8 +209,15 @@ async fn reasons_distinguish_languages_pending_files_and_workspace_boundary() {
             "main.rs",
             "Not indexed yet (may be excluded or size-limited)",
         ),
-        ("main.ts", "TypeScript indexing not supported yet"),
-        ("main.tsx", "TypeScript indexing not supported yet"),
+        (
+            "main.ts",
+            "Not indexed yet (may be excluded or size-limited)",
+        ),
+        (
+            "main.tsx",
+            "Not indexed yet (may be excluded or size-limited)",
+        ),
+        ("main.jsx", "Unsupported source type"),
         ("README.md", "Unsupported source type"),
         ("no-extension", "Unsupported source type"),
         (

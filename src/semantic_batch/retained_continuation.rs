@@ -432,7 +432,7 @@ impl RetainedStageContinuation {
                                         && descriptor
                                             .artifacts
                                             .get(*ordinal as usize)
-                                            .is_some_and(|a| a.language == language),
+                                            .is_some_and(|a| a.languages.contains(&language)),
                                     "retained document assignment"
                                 );
                                 self.covered += 1;
@@ -491,7 +491,7 @@ impl RetainedStageContinuation {
                 let (ord, language, path) =
                     self.missing_source.as_ref().expect("assignment source");
                 if let Some(entry) = descriptor.artifacts.get(self.missing_artifact) {
-                    if entry.language != *language {
+                    if !entry.languages.contains(language) {
                         self.missing_artifact += 1;
                         self.missing_proof.clear();
                     } else {
@@ -523,7 +523,7 @@ impl RetainedStageContinuation {
                         let mut entries = descriptor
                             .artifacts
                             .iter()
-                            .filter(|entry| entry.language == *language);
+                            .filter(|entry| entry.languages.contains(language));
                         let artifact = entries
                             .next()
                             .ok_or_else(|| admission("retained document assignment"))?;
@@ -561,8 +561,8 @@ impl RetainedStageContinuation {
             }
             Phase::Artifact => {
                 if let Some(entry) = descriptor.artifacts.get(self.artifact) {
-                    self.capture_id = db.prepare_cached("SELECT capture_id FROM semantic_raw_captures WHERE batch_id=?1 AND ordinal=?2 AND language=?3 AND producer_id=?4 AND artifact_hash=?5 AND source_set_id=?6 AND captured_revision=?7 AND decoder_version=?8 AND length(binary_bytes)=?9")?.query_row(
-                        params![self.batch_id, entry.ordinal, entry.language, self.producer.name, entry.sha256,
+                    self.capture_id = db.prepare_cached("SELECT capture_id FROM semantic_raw_captures WHERE batch_id=?1 AND ordinal=?2 AND languages=?3 AND producer_id=?4 AND artifact_hash=?5 AND source_set_id=?6 AND captured_revision=?7 AND decoder_version=?8 AND length(binary_bytes)=?9")?.query_row(
+                        params![self.batch_id, entry.ordinal, entry.languages_json(), self.producer.name, entry.sha256,
                             descriptor.source_set.id, descriptor.source_revision, descriptor.decoder_version, entry.byte_length as i64], |row| row.get(0),
                     ).optional()?.ok_or_else(|| admission("retained artifact metadata"))?;
                     self.copy_offset = 0;
@@ -880,7 +880,10 @@ fn advance_witness_proof(
         let digest: String = row.get(2)?;
         let language: String = row.get(3)?;
         let path: String = row.get(4)?;
-        ensure!(language == entry.language, "retained proof language");
+        ensure!(
+            entry.languages.contains(&language),
+            "retained proof language"
+        );
         let cached = assigned.get(&path).copied();
         let copied = match (cached, copy) {
             (None, Some((filter, source_set_id))) => filter.copies(
@@ -900,9 +903,9 @@ fn advance_witness_proof(
                 None
             }
             None => {
-                let source =
-                    super::super::staging::lookup_assigned(conn, entry.ordinal, &language, &path)?
-                        .ok_or_else(|| admission("retained unlisted proof"))?;
+                let source = super::super::staging::lookup_assigned(conn, entry.ordinal, &path)?
+                    .ok_or_else(|| admission("retained unlisted proof"))?;
+                ensure!(source.language == language, "retained proof language");
                 let present: bool = conn
                     .prepare_cached(
                         "SELECT EXISTS(SELECT 1 FROM documents WHERE source_ord=?1 AND artifact=?2)",
@@ -968,9 +971,13 @@ fn advance_document(
         let Some((_id, language, path, hash, wire, capped)) = row else {
             return Ok(None);
         };
-        ensure!(language == entry.language, "retained document language");
-        let source = super::super::staging::lookup_assigned(conn, entry.ordinal, &language, &path)?
+        ensure!(
+            entry.languages.contains(&language),
+            "retained document language"
+        );
+        let source = super::super::staging::lookup_assigned(conn, entry.ordinal, &path)?
             .ok_or_else(|| admission("retained unlisted document"))?;
+        ensure!(source.language == language, "retained document language");
         ensure!(source.content_hash == hash, "retained document source");
         conn.execute(
             "INSERT INTO documents VALUES(?1,?2,?3,?4,?5)",
@@ -1015,9 +1022,13 @@ fn advance_proof(
             return Ok(None);
         };
         byte_length = bytes.len() as u64;
-        ensure!(language == entry.language, "retained proof language");
-        let source = super::super::staging::lookup_assigned(conn, entry.ordinal, &language, &path)?
+        ensure!(
+            entry.languages.contains(&language),
+            "retained proof language"
+        );
+        let source = super::super::staging::lookup_assigned(conn, entry.ordinal, &path)?
             .ok_or_else(|| admission("retained unlisted proof"))?;
+        ensure!(source.language == language, "retained proof language");
         let present: bool = conn
             .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM documents WHERE source_ord=?1 AND artifact=?2)",
@@ -1079,13 +1090,13 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let mut stage = Stage::create(parent.path(), "test", "compare").unwrap();
         let conn = stage.conn().unwrap();
-        conn.execute_batch("INSERT INTO sources VALUES(0,'java','a.java','h',1),(1,'java','b.java','h',1); INSERT INTO artifacts(ordinal,path,language,sha256,byte_length) VALUES(0,'raw','java','hash',0); INSERT INTO documents VALUES(0,0,'a.java','wa',0),(1,0,'b.java','wb',0)").unwrap();
+        conn.execute_batch("INSERT INTO sources VALUES(0,'java','a.java','h',1),(1,'java','b.java','h',1); INSERT INTO artifacts(ordinal,path,languages,sha256,byte_length) VALUES(0,'raw','[\"java\"]','hash',0); INSERT INTO documents VALUES(0,0,'a.java','wa',0),(1,0,'b.java','wb',0)").unwrap();
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE semantic_raw_documents(capture_id INTEGER,language TEXT,path TEXT,source_hash TEXT,wire_digest TEXT,capped INTEGER); INSERT INTO semantic_raw_documents VALUES(1,'java','b.java','h','wb',0)").unwrap();
         let entry = super::super::super::descriptor::ArtifactEntry {
             ordinal: 0,
             relative_path: "raw".into(),
-            language: "java".into(),
+            languages: vec!["java".into()],
             sha256: "hash".into(),
             byte_length: 0,
         };
@@ -1138,7 +1149,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let mut stage = Stage::create(parent.path(), "test", "trusted").unwrap();
         let conn = stage.conn().unwrap();
-        conn.execute_batch("INSERT INTO sources VALUES(0,'java','a.java','ha',1),(1,'java','b.java','hb',1); INSERT INTO coverage VALUES(0,0,NULL),(1,0,NULL); INSERT INTO artifacts(ordinal,path,language,sha256,byte_length) VALUES(0,'raw','java','hash',0)").unwrap();
+        conn.execute_batch("INSERT INTO sources VALUES(0,'java','a.java','ha',1),(1,'java','b.java','hb',1); INSERT INTO coverage VALUES(0,0,NULL),(1,0,NULL); INSERT INTO artifacts(ordinal,path,languages,sha256,byte_length) VALUES(0,'raw','[\"java\"]','hash',0)").unwrap();
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE semantic_raw_documents(capture_id INTEGER,language TEXT,path TEXT,source_hash TEXT,wire_digest TEXT,capped INTEGER,PRIMARY KEY(capture_id,language,path)); CREATE TABLE semantic_raw_proofs(capture_id INTEGER,proof_id TEXT,record_kind TEXT,fact_digest TEXT,language TEXT,path TEXT,canonical_bytes BLOB,PRIMARY KEY(capture_id,proof_id)); INSERT INTO semantic_raw_documents VALUES(1,'java','a.java','ha','wire-a',0),(1,'java','b.java','hb','wire-b',1)").unwrap();
         let bytes = br#"{"formatVersion":1,"recordKind":"symbolInformation","relativePath":"a.java","positionEncoding":1,"raw":{"symbol":"A#"}}"#;
@@ -1148,7 +1159,7 @@ mod tests {
         let entry = super::super::super::descriptor::ArtifactEntry {
             ordinal: 0,
             relative_path: "raw".into(),
-            language: "java".into(),
+            languages: vec!["java".into()],
             sha256: "hash".into(),
             byte_length: 0,
         };

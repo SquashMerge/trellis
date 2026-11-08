@@ -133,6 +133,7 @@ fn typescript_writes_a_default_tsconfig_unless_the_checkout_has_one() {
         serde_json::from_slice(profiles::SCIP_TYPESCRIPT_TSCONFIG).expect("valid JSON");
     assert_eq!(tsconfig["compilerOptions"]["target"], "es2022");
     assert_eq!(tsconfig["compilerOptions"]["allowJs"], true);
+    assert_eq!(tsconfig["compilerOptions"]["jsx"], "preserve");
     let source = retained();
     let dir = run(
         &source,

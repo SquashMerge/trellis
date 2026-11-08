@@ -249,14 +249,14 @@ mod with_store {
         let dir = world._state.path().join(format!("pickups-{ID}"));
         fs::create_dir_all(dir.join("out")).unwrap();
         fs::write(dir.join(batch::ARTIFACT_PATH), bytes).unwrap();
-        let (pin, language) = batch::pickup_target("scip-typescript").unwrap();
+        let (pin, languages) = batch::pickup_target("scip-typescript").unwrap();
         let head = world.store.index_baseline().unwrap();
         let written = world.store.with_native_reader(head, |reader| {
             batch::write_batch(
                 reader,
                 &BatchSpec {
                     pin: &pin,
-                    language,
+                    languages,
                     workspace: &world.root,
                     dir: &dir,
                     generation: batch::pickup_generation(ID),
@@ -402,7 +402,7 @@ mod with_store {
         }
         let dir = world._state.path().join("empty");
         fs::create_dir_all(&dir).unwrap();
-        let (pin, language) = batch::pickup_target("scip-typescript").unwrap();
+        let (pin, languages) = batch::pickup_target("scip-typescript").unwrap();
         let head = world.store.index_baseline().unwrap();
         let error = world
             .store
@@ -411,7 +411,7 @@ mod with_store {
                     reader,
                     &BatchSpec {
                         pin: &pin,
-                        language,
+                        languages,
                         workspace: &world.root,
                         dir: &dir,
                         generation: batch::pickup_generation(ID),
@@ -421,6 +421,157 @@ mod with_store {
             })
             .unwrap_err();
         assert!(error.to_string().starts_with("producer_output_missing"));
+    }
+
+    fn mixed() -> Vec<(String, String)> {
+        [
+            ("src/a.js", "function a() {}\n"),
+            ("src/b.ts", "function b(): void {}\n"),
+            ("src/c.tsx", "function c(): void {}\n"),
+            ("tools/d.py", "def d():\n    pass\n"),
+        ]
+        .into_iter()
+        .map(|(path, text)| (path.to_owned(), text.to_owned()))
+        .collect()
+    }
+
+    fn write_languages(
+        world: &World,
+        bytes: &[u8],
+        languages: &[&str],
+    ) -> anyhow::Result<(PathBuf, Descriptor)> {
+        let dir = world._state.path().join(format!("pickups-{ID}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("out")).unwrap();
+        fs::write(dir.join(batch::ARTIFACT_PATH), bytes).unwrap();
+        let (pin, _) = batch::pickup_target("scip-typescript").unwrap();
+        let head = world.store.index_baseline().unwrap();
+        let written = world.store.with_native_reader(head, |reader| {
+            batch::write_batch(
+                reader,
+                &BatchSpec {
+                    pin: &pin,
+                    languages,
+                    workspace: &world.root,
+                    dir: &dir,
+                    generation: batch::pickup_generation(ID),
+                    snapshot: false,
+                },
+            )
+        })?;
+        let descriptor = Descriptor::parse(&fs::read(&written.descriptor).unwrap()).unwrap();
+        Ok((dir, descriptor))
+    }
+
+    fn coverage(
+        dir: &Path,
+        descriptor: &Descriptor,
+    ) -> Vec<(String, String, serde_json::Value, serde_json::Value)> {
+        let page = descriptor
+            .pages
+            .iter()
+            .find(|page| page.kind == PageKind::Coverage)
+            .unwrap();
+        rows(dir, page)
+            .into_iter()
+            .map(|row| {
+                (
+                    row["language"].as_str().unwrap().to_owned(),
+                    row["relativePath"].as_str().unwrap().to_owned(),
+                    row["artifact"].clone(),
+                    row["exclusion"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mixed_inventory_is_one_artifact_covering_both_languages_in_contract_order() {
+        let world = world(&mixed());
+        let bytes = artifact("", &["src/c.tsx", "src/b.ts", "src/a.js"]);
+        let (dir, descriptor) =
+            write_languages(&world, &bytes, &["typescript", "javascript"]).unwrap();
+        assert_eq!(descriptor.artifacts.len(), 1);
+        assert_eq!(
+            descriptor.artifacts[0].languages,
+            ["javascript", "typescript"]
+        );
+        assert_eq!(descriptor.completion, crate::scip_raw::Completion::Complete);
+        assert_eq!(descriptor.totals.source_documents, 4);
+        assert_eq!(descriptor.totals.covered_documents, 3);
+        assert_eq!(descriptor.totals.excluded_documents, 0);
+        let none = serde_json::Value::Null;
+        assert_eq!(
+            coverage(&dir, &descriptor),
+            [
+                (
+                    "javascript".into(),
+                    "src/a.js".into(),
+                    0.into(),
+                    none.clone()
+                ),
+                (
+                    "typescript".into(),
+                    "src/b.ts".into(),
+                    0.into(),
+                    none.clone()
+                ),
+                ("typescript".into(), "src/c.tsx".into(), 0.into(), none),
+            ],
+            "the python document is outside the pin, so it has a source row and no coverage row"
+        );
+        let limits = BatchLimits::PRODUCTION;
+        descriptor.check_pages(&limits).unwrap();
+        descriptor.check_artifacts(&limits).unwrap();
+    }
+
+    #[test]
+    fn a_typescript_document_the_artifact_omits_is_failed() {
+        let world = world(&mixed());
+        let (dir, descriptor) = write_languages(
+            &world,
+            &artifact("", &["src/a.js", "src/b.ts"]),
+            &["javascript", "typescript"],
+        )
+        .unwrap();
+        assert_eq!(descriptor.completion, crate::scip_raw::Completion::Partial);
+        let rows = coverage(&dir, &descriptor);
+        assert_eq!(
+            rows[2],
+            (
+                "typescript".into(),
+                "src/c.tsx".into(),
+                serde_json::Value::Null,
+                "failed".into()
+            )
+        );
+    }
+
+    #[test]
+    fn a_language_outside_the_spec_is_not_requested() {
+        let world = world(&mixed());
+        let (dir, descriptor) =
+            write_languages(&world, &artifact("", &["src/a.js"]), &["javascript"]).unwrap();
+        assert_eq!(descriptor.artifacts[0].languages, ["javascript"]);
+        assert_eq!(descriptor.totals.covered_documents, 1);
+        assert_eq!(descriptor.totals.excluded_documents, 2);
+        let rows = coverage(&dir, &descriptor);
+        assert_eq!(rows[1].3, "notRequested");
+        assert_eq!(rows[2].3, "notRequested");
+    }
+
+    #[test]
+    fn spec_languages_must_be_pinned_and_nonempty() {
+        let world = world(&mixed());
+        for languages in [&["python"][..], &["javascript", "rust"][..], &[][..]] {
+            let error = write_languages(&world, &artifact("", &["src/a.js"]), languages)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("artifact language"),
+                "{languages:?}: {error}"
+            );
+        }
     }
 
     fn write_again(world: &World, bytes: &[u8]) -> (PathBuf, Descriptor) {

@@ -2,16 +2,10 @@
 use serde_json::{Value, json};
 
 /// Build refs from precisely the items that survive the wire byte budget.
-type DocumentKey = (u8, String, String, String);
+type DocumentKey = (usize, String, String, String);
 fn document_key(version: &crate::store::mcp_read::McpDocumentVersion) -> DocumentKey {
-    let language = match version.document.language.as_str() {
-        "java" => 0,
-        "rust" => 1,
-        "python" => 2,
-        _ => 3,
-    };
     (
-        language,
+        language_rank(&version.document.language),
         version.document.source_set_id.clone(),
         version.document.path.clone(),
         version.revision_id.clone(),
@@ -48,23 +42,23 @@ fn document_ref(
 }
 
 /// Semantic tiers per language in #22 order (#528); the default is syntax only everywhere.
-pub type Tiers = [crate::store::LanguageTier; 4];
+pub type Tiers = [crate::store::LanguageTier; 5];
 
 /// Native tuple counts per language with each language's semantic tier, as describe reads them.
-pub type LanguageCounts = ([[u64; 5]; 4], Tiers);
+pub type LanguageCounts = ([[u64; 5]; 5], Tiers);
 
 fn counts(row: &[u64; 5]) -> Value {
     json!({"selected":row[0],"complete":row[1],"partial":row[2],"failed":row[3],"unselected":row[4]})
 }
 
-/// The four `LanguageStatus` rows, in #22 language order, from per-language native
+/// The five `LanguageStatus` rows, in #22 language order, from per-language native
 /// tuple counts [selected, complete, partial, failed, unselected] and each language's
 /// selected imported evidence (#528). `nativeCoverageTier` and `coverage` describe the
 /// native syntax tuples; `semantic` separately reports the selected producer, its
 /// freshness and its tuple counts, with `available` true when it is selected, fresh and
 /// covers at least one document. Partial coverage of either stays visible.
-fn language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
-    ["java", "rust", "python", "javascript"]
+fn language_status(rows: &[[u64; 5]; 5], tiers: &Tiers) -> Vec<Value> {
+    crate::semantic_evidence::LANGUAGE_ORDER
         .into_iter()
         .zip(rows)
         .zip(tiers)
@@ -80,7 +74,7 @@ fn language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
 
 /// Describe's `LanguageStatus` rows: each semantic block also says why its partial tuples
 /// are partial (#520), or `null` when none is.
-fn describe_language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
+fn describe_language_status(rows: &[[u64; 5]; 5], tiers: &Tiers) -> Vec<Value> {
     let mut languages = language_status(rows, tiers);
     for (status, tier) in languages.iter_mut().zip(tiers) {
         status["semantic"]["partialReasons"] =
@@ -95,7 +89,12 @@ fn describe_language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
     languages
 }
 
-const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
+const LANGUAGES: [&str; 5] = crate::semantic_evidence::LANGUAGE_ORDER;
+
+/// Sort rank of a document language in #22 order; an unknown language sorts last.
+fn language_rank(language: &str) -> usize {
+    crate::semantic_evidence::language_order(language).unwrap_or(LANGUAGES.len())
+}
 
 /// The `syntaxOnly` warning for `languages` (#528). It says the answer itself is
 /// syntax-derived and names the languages without selected fresh semantic evidence; it is
@@ -180,12 +179,43 @@ mod tests {
     }
 
     #[test]
+    fn describe_has_five_rows_typescript_last() {
+        let basis =
+            json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1});
+        let mut rows = [[0; 5]; 5];
+        rows[4] = [3, 3, 0, 0, 1];
+        let ready = describe(
+            &json!(2),
+            "project",
+            "ready",
+            None,
+            Some((rows, Tiers::default())),
+            Some(basis),
+            false,
+        );
+        let languages: Vec<&str> = ready["data"]["languages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["language"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            languages,
+            ["java", "rust", "python", "javascript", "typescript"]
+        );
+        assert_eq!(
+            ready["data"]["languages"][4]["coverage"],
+            json!({"selected":3,"complete":3,"partial":0,"failed":0,"unselected":1})
+        );
+    }
+
+    #[test]
     fn describe_closed_ready_and_missing_head() {
         let empty = describe(&json!(1), "project", "reconciling", None, None, None, false);
         assert!(empty["evidenceBasis"].is_null());
         assert_eq!(empty["data"]["languages"], json!([]));
         assert_eq!(empty["partial"], true);
-        let rows = [[0, 0, 0, 0, 0], [2, 1, 1, 0, 3], [0; 5], [0; 5]];
+        let rows = [[0, 0, 0, 0, 0], [2, 1, 1, 0, 3], [0; 5], [0; 5], [0; 5]];
         let basis =
             json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1});
         let ready = describe(
@@ -206,7 +236,7 @@ mod tests {
             "selected":2,"complete":1,"partial":1,"failed":0,"unselected":3})
         );
         assert_eq!(ready["partial"], true);
-        assert_eq!(ready["data"]["languages"].as_array().unwrap().len(), 4);
+        assert_eq!(ready["data"]["languages"].as_array().unwrap().len(), 5);
         // Without imported evidence every language is syntax, with no producer.
         for language in ready["data"]["languages"].as_array().unwrap() {
             assert_eq!(language["nativeCoverageTier"], "syntax");
@@ -223,7 +253,7 @@ mod tests {
         tiers[1].reimport = Some(crate::model::SemanticReimport::NeedsReimport {
             reason: "producer profile pin changed".into(),
         });
-        let rows = [[0; 5]; 4];
+        let rows = [[0; 5]; 5];
         let described = describe(
             &json!(1),
             "project",
@@ -267,7 +297,7 @@ mod tests {
         let basis = json!({
             "indexGeneration":"123e4567-e89b-42d3-a456-426614174000", "indexRevision":1
         });
-        let mut rows = [[0; 5]; 4];
+        let mut rows = [[0; 5]; 5];
         rows[1] = [1, 1, 0, 0, 0];
         let mut described = describe(
             &json!(1),
@@ -432,7 +462,7 @@ for (const name of ['trellis_outgoing_calls','trellis_incoming_calls']) {
             "ready",
             None,
             Some((
-                [[0; 5], [355, 300, 55, 0, 0], [0; 5], [0; 5]],
+                [[0; 5], [355, 300, 55, 0, 0], [0; 5], [0; 5], [0; 5]],
                 tiers.clone(),
             )),
             None,
@@ -452,7 +482,7 @@ for (const name of ['trellis_outgoing_calls','trellis_incoming_calls']) {
         );
         // Only describe carries the reasons; scope coverage keeps its compact shape.
         assert!(
-            language_status(&[[0; 5]; 4], &tiers)[1]["semantic"]
+            language_status(&[[0; 5]; 5], &tiers)[1]["semantic"]
                 .get("partialReasons")
                 .is_none()
         );
@@ -460,7 +490,13 @@ for (const name of ['trellis_outgoing_calls','trellis_incoming_calls']) {
 
     #[test]
     fn describe_reports_the_imported_semantic_tier_per_language() {
-        let rows = [[1, 1, 0, 0, 0], [355, 22, 333, 0, 0], [0; 5], [0; 5]];
+        let rows = [
+            [1, 1, 0, 0, 0],
+            [355, 22, 333, 0, 0],
+            [0; 5],
+            [0; 5],
+            [0; 5],
+        ];
         let basis =
             json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1});
         let fresh = describe(
@@ -773,12 +809,6 @@ fn symbols(
     let scope = language_status(&result.scope, tiers);
     let basis = json!({"indexGeneration":result.pin.index_generation.to_string(),
         "indexRevision":result.pin.index_revision});
-    let language_order = |language: &str| match language {
-        "java" => 0,
-        "rust" => 1,
-        "python" => 2,
-        _ => 3,
-    };
     let mut last = None;
     // The empty prefix carries only the fixed envelope and the scope rows; if
     // neither it nor any hit prefix fits, the answer is range_too_large.
@@ -852,14 +882,14 @@ fn symbols(
         coverage.sort_by(|a, b| {
             (
                 &a.producer_id,
-                language_order(&a.language),
+                language_rank(&a.language),
                 &a.source_set_id,
                 &a.document_path,
                 &a.revision_id,
             )
                 .cmp(&(
                     &b.producer_id,
-                    language_order(&b.language),
+                    language_rank(&b.language),
                     &b.source_set_id,
                     &b.document_path,
                     &b.revision_id,
@@ -958,7 +988,7 @@ mod find_tests {
     /// Hits `(name, source set, path)`, each in its own proof unless a path repeats.
     pub(super) fn fixture(
         hits: &[(String, &str, String)],
-        scope: [[u64; 5]; 4],
+        scope: [[u64; 5]; 5],
         has_more: bool,
     ) -> McpFindWithLines {
         let mut symbols = Vec::new();
@@ -1033,13 +1063,15 @@ mod find_tests {
         (name.into(), "source-set:v1:test", path.into())
     }
     /// The #156 smoke checkout: 270 documents, 111 partial Rust files.
-    const LARGE_SCOPE: [[u64; 5]; 4] = [
+    const LARGE_SCOPE: [[u64; 5]; 5] = [
         [4, 4, 0, 0, 0],
         [117, 6, 111, 0, 0],
         [9, 9, 0, 0, 0],
         [140, 140, 0, 0, 0],
+        [0; 5],
     ];
-    const COMPLETE_SCOPE: [[u64; 5]; 4] = [[1, 1, 0, 0, 0], [0; 5], [0; 5], [3, 3, 0, 0, 0]];
+    const COMPLETE_SCOPE: [[u64; 5]; 5] =
+        [[1, 1, 0, 0, 0], [0; 5], [0; 5], [3, 3, 0, 0, 0], [0; 5]];
 
     fn assert_wire(envelope: Value, id: &Value, modern: bool) -> Value {
         let result = super::super::tools::result("trellis_find_symbols", envelope.clone(), modern);
@@ -1206,7 +1238,7 @@ mod find_tests {
             assert_wire(large, &id, modern);
 
             // A failed selected tuple alone also flags the scope.
-            let failed = [[0; 5], [0; 5], [1, 0, 0, 1, 0], [0; 5]];
+            let failed = [[0; 5], [0; 5], [1, 0, 0, 1, 0], [0; 5], [0; 5]];
             let envelope = find(
                 &id,
                 fixture(&[], failed, false),
@@ -1222,7 +1254,7 @@ mod find_tests {
             assert_eq!(envelope["warnings"][0]["code"], "coverageIncomplete");
 
             // Unselected-only tuples (and zero-language rows) flag nothing.
-            let unselected = [[0; 5], [0, 0, 0, 0, 3], [0; 5], [2, 2, 0, 0, 0]];
+            let unselected = [[0; 5], [0, 0, 0, 0, 3], [0; 5], [2, 2, 0, 0, 0], [0; 5]];
             let envelope = find(
                 &id,
                 fixture(&[], unselected, false),
@@ -1512,9 +1544,9 @@ mod search_tests {
     use crate::search_embed::Backend;
     use crate::search_model::{LexicalState, SearchIndexState, SearchIndexStatus};
 
-    const COMPLETE: [[u64; 5]; 4] = [[0; 5], [0; 5], [0; 5], [3, 3, 0, 0, 0]];
+    const COMPLETE: [[u64; 5]; 5] = [[0; 5], [0; 5], [0; 5], [3, 3, 0, 0, 0], [0; 5]];
 
-    fn fixture(names: &[(&str, &str)], scope: [[u64; 5]; 4], has_more: bool) -> SearchResult {
+    fn fixture(names: &[(&str, &str)], scope: [[u64; 5]; 5], has_more: bool) -> SearchResult {
         let hits: Vec<_> = names
             .iter()
             .map(|(name, path)| ((*name).to_owned(), "source-set:v1:test", (*path).to_owned()))
@@ -1610,7 +1642,7 @@ mod search_tests {
             ] {
                 assert_eq!(empty["data"][field], json!([]));
             }
-            let incomplete = [[0; 5], [2, 1, 1, 0, 0], [0; 5], [3, 3, 0, 0, 0]];
+            let incomplete = [[0; 5], [2, 1, 1, 0, 0], [0; 5], [3, 3, 0, 0, 0], [0; 5]];
             let empty = project(fixture(&[], incomplete, false), modern)
                 .unwrap()
                 .unwrap();
@@ -1774,11 +1806,12 @@ mod compact_symbol_tests {
 
     const MACRO_GAP: &str = "opaque Rust macro/attribute token trees skipped; calls and definitions inside were not measured";
     /// Java, Rust (mostly partial) and JavaScript tuples are selected; Python has none.
-    const SCOPE: [[u64; 5]; 4] = [
+    const SCOPE: [[u64; 5]; 5] = [
         [4, 4, 0, 0, 0],
         [117, 6, 111, 0, 0],
         [0; 5],
         [140, 140, 0, 0, 0],
+        [0; 5],
     ];
 
     /// Hits `(name, language, path, partial)`, each keyed `path::name`.
@@ -2016,7 +2049,7 @@ mod compact_symbol_tests {
             assert_eq!(languages(&empty), ["java", "rust", "javascript"]);
             super::size_tests::assert_catalog_valid("trellis_find_symbols", &[&javascript]);
         }
-        // Lookup alternatives for the other tools keep all four rows.
+        // Lookup alternatives for the other tools keep all five rows.
         let candidates = lookup_candidates(
             &json!(1),
             "trellis_declaration",
@@ -2031,7 +2064,97 @@ mod compact_symbol_tests {
         .unwrap();
         assert_eq!(
             languages(&candidates),
-            ["java", "rust", "python", "javascript"]
+            ["java", "rust", "python", "javascript", "typescript"]
+        );
+    }
+
+    /// TypeScript follows the #715 rule: a result lists only its own languages, in #22 order,
+    /// and with no items the searched languages that have selected tuples.
+    #[test]
+    fn typescript_scope_rows_follow_the_715_rule() {
+        let typescript = |hits: &[(&str, &str, &str, bool)]| {
+            let mut result = fixture(hits, false);
+            result.scope[4] = [5, 5, 0, 0, 0];
+            result
+        };
+        for compact in [false, true] {
+            let only = find_page(
+                typescript(&[("Model", "typescript", "src/model.ts", false)]),
+                compact,
+            );
+            assert_eq!(languages(&only), ["typescript"]);
+            assert_eq!(
+                only["data"]["scopeCoverage"][0],
+                language_status(&typescript(&[]).scope, &Default::default())[4]
+            );
+            let both = find_page(
+                typescript(&[
+                    ("helper", "typescript", "src/util.ts", false),
+                    ("helper", "javascript", "web/util.js", false),
+                ]),
+                compact,
+            );
+            assert_eq!(languages(&both), ["javascript", "typescript"]);
+            let searched = search_page(
+                typescript(&[("Model", "typescript", "src/model.ts", false)]),
+                compact,
+            );
+            assert_eq!(languages(&searched), ["typescript"]);
+            let empty = find_page(typescript(&[]), compact);
+            assert_eq!(
+                languages(&empty),
+                ["java", "rust", "javascript", "typescript"]
+            );
+            super::size_tests::assert_catalog_valid(
+                "trellis_find_symbols",
+                &[&only, &both, &empty],
+            );
+            super::size_tests::assert_catalog_valid("trellis_search_symbols", &[&searched]);
+        }
+    }
+
+    /// Path order fights language order here (`src/a.ts` sorts before `src/b.js` by bytes),
+    /// so only the #22 language rank puts JavaScript first.
+    #[test]
+    fn javascript_sorts_before_typescript() {
+        let hits = [
+            ("a", "typescript", "src/a.ts", false),
+            ("b", "javascript", "src/b.js", false),
+        ];
+        let result = fixture(&hits, false);
+        let typescript = document_key(&result.symbols[0].source.document);
+        let javascript = document_key(&result.symbols[1].source.document);
+        assert!(javascript < typescript);
+        assert_eq!(language_rank("typescript"), 4);
+        assert!(language_rank("javascript") < language_rank("typescript"));
+        let page = find_page(result, false);
+        let documents = page["data"]["documents"].as_array().unwrap();
+        assert_eq!(documents[0]["ref"], 0);
+        assert_eq!(documents[0]["document"]["language"], "javascript");
+        assert_eq!(documents[0]["document"]["path"], "src/b.js");
+        assert_eq!(documents[1]["document"]["language"], "typescript");
+        let coverage: Vec<&str> = page["data"]["coverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["language"].as_str().unwrap())
+            .collect();
+        assert_eq!(coverage, ["javascript", "typescript"]);
+        let lookup = lookup_candidates(
+            &json!(1),
+            "trellis_declaration",
+            "src/a.ts::a",
+            fixture(&hits, false),
+            &Default::default(),
+            root(),
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            lookup["data"]["documents"][0]["document"]["language"],
+            "javascript"
         );
     }
 
@@ -2620,23 +2743,17 @@ pub fn outgoing(
                 "historicalFreshness":evidence.historical_freshness,"projection":evidence.projection}));
         }
         let mut coverage: Vec<_> = coverage.into_values().collect();
-        let language_order = |language: &str| match language {
-            "java" => 0,
-            "rust" => 1,
-            "python" => 2,
-            _ => 3,
-        };
         coverage.sort_by(|a, b| {
             (
                 &a.producer_id,
-                language_order(&a.language),
+                language_rank(&a.language),
                 &a.source_set_id,
                 &a.document_path,
                 &a.revision_id,
             )
                 .cmp(&(
                     &b.producer_id,
-                    language_order(&b.language),
+                    language_rank(&b.language),
                     &b.source_set_id,
                     &b.document_path,
                     &b.revision_id,
@@ -3028,23 +3145,17 @@ pub fn incoming(
             );
         }
         let mut coverage: Vec<_> = coverage.into_values().collect();
-        let language_order = |language: &str| match language {
-            "java" => 0,
-            "rust" => 1,
-            "python" => 2,
-            _ => 3,
-        };
         coverage.sort_by(|a, b| {
             (
                 &a.producer_id,
-                language_order(&a.language),
+                language_rank(&a.language),
                 &a.source_set_id,
                 &a.document_path,
                 &a.revision_id,
             )
                 .cmp(&(
                     &b.producer_id,
-                    language_order(&b.language),
+                    language_rank(&b.language),
                     &b.source_set_id,
                     &b.document_path,
                     &b.revision_id,
@@ -3242,6 +3353,63 @@ mod outgoing_tests {
             )
             .unwrap(),
         }
+    }
+
+    /// `src/a.ts` sorts before `src/b.js` by path bytes, so only the #22 language rank puts
+    /// the JavaScript coverage row first.
+    #[test]
+    fn javascript_coverage_sorts_before_typescript() {
+        let mut typescript = owner();
+        typescript.declaration.document.language = "typescript".into();
+        typescript.declaration.document.path = "src/a.ts".into();
+        typescript.coverage[0].language = "typescript".into();
+        typescript.coverage[0].document_path = "src/a.ts".into();
+        typescript.provenance[0].document = typescript.declaration.document.clone();
+        let mut target = owner();
+        target.declaration.syntax_id = "sid:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        target.declaration.document.path = "src/b.js".into();
+        target.declaration.provenance_id = "native-proof:v1:target".into();
+        target.coverage[0].document_path = "src/b.js".into();
+        target.provenance[0].document = target.declaration.document.clone();
+        target.provenance[0].id = target.declaration.provenance_id.clone();
+        let mut call = required_call(false);
+        call.call.document = typescript.declaration.document.clone();
+        call.candidates.push(McpOutgoingCandidate {
+            declaration: target.declaration,
+            coverage: target.coverage.remove(0),
+            provenance: target.provenance.remove(0),
+        });
+        let answer = outgoing_fixture(
+            &json!(1),
+            McpOutgoing {
+                owner: typescript,
+                calls: vec![call],
+                has_more: false,
+            },
+            std::path::Path::new("/workspace"),
+            false,
+            true,
+        )
+        .unwrap();
+        let rows: Vec<(&str, &str)> = answer["data"]["coverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["language"].as_str().unwrap(),
+                    row["documentPath"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [("javascript", "src/b.js"), ("typescript", "src/a.ts")]
+        );
+        assert_eq!(
+            answer["data"]["documents"][0]["document"]["language"],
+            "javascript"
+        );
     }
 
     #[test]
@@ -3637,7 +3805,7 @@ mod incoming_tests {
             selected,
             calls,
             same_name_declarations: 3,
-            scope: [[0; 5], [0; 5], [0; 5], [2, 2, 0, 0, 4]],
+            scope: [[0; 5], [0; 5], [0; 5], [2, 2, 0, 0, 4], [0; 5]],
             has_more,
             bound_elsewhere_omitted: 0,
         }
@@ -3701,6 +3869,60 @@ mod incoming_tests {
             let frame = json!({"jsonrpc":"2.0","id":1,
                 "result":crate::mcp::tools::result("trellis_incoming_calls",full,modern)});
             assert!(serde_json::to_vec(&frame).unwrap().len() <= crate::mcp::wire::RESPONSE_BYTES);
+        }
+    }
+    /// `src/a.ts` sorts before `src/b.js` by path bytes, so only the #22 language rank puts
+    /// the JavaScript coverage row first.
+    #[test]
+    fn javascript_coverage_sorts_before_typescript() {
+        let mut result = fixture(1, false, 0);
+        result.selected.selected.coverage[0].language = "typescript".into();
+        result.selected.selected.coverage[0].document_path = "src/a.ts".into();
+        let item = &mut result.calls[0];
+        item.coverage.language = "javascript".into();
+        item.coverage.document_path = "src/b.js".into();
+        for document in [
+            &mut item.call.document,
+            &mut item.caller.document,
+            &mut item.source.document.document,
+            &mut item.provenance.document,
+        ] {
+            document.language = "javascript".into();
+            document.path = "src/b.js".into();
+        }
+        let envelope = project(result, true).unwrap();
+        let rows: Vec<(&str, &str)> = envelope["data"]["coverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["language"].as_str().unwrap(),
+                    row["documentPath"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [("javascript", "src/b.js"), ("typescript", "src/a.ts")]
+        );
+    }
+    #[test]
+    fn incoming_scope_has_five_rows() {
+        for modern in [false, true] {
+            let mut result = fixture(1, false, 0);
+            result.scope[4] = [1, 1, 0, 0, 0];
+            let envelope = project(result, modern).unwrap();
+            let rows = envelope["data"]["scopeCoverage"].as_array().unwrap();
+            let languages: Vec<&str> = rows
+                .iter()
+                .map(|row| row["language"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                languages,
+                ["java", "rust", "python", "javascript", "typescript"]
+            );
+            assert_eq!(rows[4]["coverage"]["selected"], 1);
         }
     }
     #[test]
@@ -4282,7 +4504,7 @@ mod size_tests {
                 selected,
                 calls,
                 same_name_declarations: 1,
-                scope: [[0; 5], [355, 22, 333, 0, 0], [0; 5], [0; 5]],
+                scope: [[0; 5], [355, 22, 333, 0, 0], [0; 5], [0; 5], [0; 5]],
                 has_more: true,
                 bound_elsewhere_omitted: 0,
             },

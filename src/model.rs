@@ -757,7 +757,7 @@ impl DurableAnchor {
         anyhow::ensure!(
             matches!(
                 self.document.language.as_str(),
-                "java" | "rust" | "python" | "javascript"
+                "java" | "rust" | "python" | "javascript" | "typescript"
             ),
             "invalid durable anchor document language"
         );

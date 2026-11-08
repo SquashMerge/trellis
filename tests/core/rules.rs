@@ -63,6 +63,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
         },
         documents,
         manifests: vec![],
+        root_tsconfig: None,
         evidence_gaps: Default::default(),
     }
 }
@@ -1724,4 +1725,111 @@ require=[{calls="any"}]
         .collect();
     assert!(targets.contains(&"A.java"), "{evaluated}");
     assert!(targets.contains(&"Deep.java"), "{evaluated}");
+}
+
+fn selected_paths(data: &Value, rule: &str) -> Vec<String> {
+    let mut paths: Vec<String> = data["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["rule"] == rule)
+        .map(|r| r["target"]["path"].as_str().unwrap().to_owned())
+        .collect();
+    paths.sort();
+    paths
+}
+
+#[test]
+fn rules_typescript_selectors_read_heritage_from_the_path_selected_grammar() {
+    let input = snapshot(&[
+        (
+            "src/class.ts",
+            "interface Port {}\nclass Base<T> {}\nclass Resource extends Base<number> implements Port, Other<string> {}\n",
+        ),
+        (
+            "src/abstract.ts",
+            "abstract class Resource extends Base {}\n",
+        ),
+        ("src/iface.ts", "interface Resource extends Base, Port {}\n"),
+        (
+            "src/view.tsx",
+            "class Resource extends Base { render() { return <b/>; } }\n",
+        ),
+        ("src/color.ts", "enum Resource { A }\n"),
+        ("src/alias.ts", "type Resource = Base;\n"),
+        ("src/plain.js", "class Resource extends Base {}\n"),
+    ]);
+    let text = r#"version=1
+[roles.generic]
+select={language=["typescript"],name="Resource",extends="Base<number>"}
+[roles.plain]
+select={language=["typescript"],name="Resource",extends="Base"}
+[roles.port]
+select={language=["typescript"],name="Resource",implements="Port"}
+[roles.generic_port]
+select={language=["typescript"],name="Resource",implements="Other<string>"}
+[roles.any]
+select={paths=["**"]}
+[[rules]]
+id="generic-check"
+for_each="generic"
+require=[{calls="any"}]
+[[rules]]
+id="plain-check"
+for_each="plain"
+require=[{calls="any"}]
+[[rules]]
+id="port-check"
+for_each="port"
+require=[{calls="any"}]
+[[rules]]
+id="other-check"
+for_each="generic_port"
+require=[{calls="any"}]
+"#;
+    let data = evaluate(text, &input);
+    // The value text runs through its type arguments, so `Base<number>` is not `Base`.
+    assert_eq!(selected_paths(&data, "generic-check"), ["src/class.ts"]);
+    assert_eq!(
+        selected_paths(&data, "plain-check"),
+        ["src/abstract.ts", "src/iface.ts", "src/view.tsx"]
+    );
+    // Interface `extends` is an extends base; enums and aliases have no bases at all, and an
+    // interface or class that does not list `Port` is excluded, not unknown.
+    assert_eq!(selected_paths(&data, "port-check"), ["src/class.ts"]);
+    assert_eq!(selected_paths(&data, "other-check"), ["src/class.ts"]);
+}
+
+#[test]
+fn rules_accept_a_typescript_npm_external_destination() {
+    let input = snapshot(&[("src/lib.rs", "pub fn run(){}")]);
+    let refs = projected_package(&input, "std", true);
+    let config = rules::parse(
+        "version=1\n[external_policy]\ndeny=[{language='typescript',package='left-pad',stdlib=false}]",
+    )
+    .unwrap();
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    let target = data["unassigned"][0].clone();
+    let destination = |package: &str, language: &str| {
+        json!({"kind":"externalPackage","sourceSetId":"set","language":language,
+            "package":package,"standardLibrary":false})
+    };
+    let error = rules::explain(
+        data.clone(),
+        "$external",
+        &target,
+        Some(&destination("@scope/left-pad", "typescript")),
+        &mut || Ok(()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().starts_with("not_found"), "{error}");
+    let error = rules::explain(
+        data,
+        "$external",
+        &target,
+        Some(&destination("Left Pad", "typescript")),
+        &mut || Ok(()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().starts_with("invalid_request"), "{error}");
 }

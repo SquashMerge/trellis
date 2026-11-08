@@ -628,7 +628,7 @@ impl Run<'_> {
                 reader,
                 &BatchSpec {
                     pin: &prepared.pin,
-                    language: row.target.language(),
+                    languages: row.target.languages(),
                     workspace: Path::new(store.workspace_root()),
                     dir: &self.dir,
                     generation,

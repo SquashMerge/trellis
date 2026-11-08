@@ -41,6 +41,8 @@ enum BindingKind {
 struct Binding {
     start: usize,
     kind: BindingKind,
+    /// A TypeScript function declaration or signature: several of one name overload.
+    overload: bool,
 }
 enum Export {
     Local(String),
@@ -79,6 +81,11 @@ struct Resolver<'a> {
     hazards: BTreeMap<usize, Hazards>,
     memo: BTreeMap<(usize, usize, Route), Arc<Names>>,
     named_memo: BTreeMap<(usize, String, usize, Route), Arc<Bucket>>,
+    /// The root config and the source set it belongs to; `Err` is its typed reason.
+    tsconfig: Option<(
+        String,
+        std::result::Result<tsconfig::RootTsconfig, &'static str>,
+    )>,
 }
 impl Catalog {
     #[allow(clippy::too_many_arguments)]
@@ -88,11 +95,25 @@ impl Catalog {
         documents: &BTreeMap<DocumentKey, usize>,
         selected: &[usize],
         packages: &external::JavascriptPackages,
+        root_tsconfig: Option<&tsconfig::RootTsconfigInput>,
         work: &mut Work,
         request: &parallel_check::RequestCheck<'_>,
         workers: usize,
     ) -> Result<Self> {
         let check = &mut request.worker();
+        let tsconfig = match root_tsconfig {
+            Some(input) => {
+                ensure!(
+                    work.charge(input.bytes.len()),
+                    "bounded_work: reference tsconfig parsing"
+                );
+                check()?;
+                let parsed = tsconfig::parse(&input.bytes);
+                check()?;
+                Some((input.source_set_id.clone(), parsed))
+            }
+            None => None,
+        };
         let mut resolver = Resolver {
             docs,
             trees,
@@ -101,9 +122,10 @@ impl Catalog {
             hazards: BTreeMap::new(),
             memo: BTreeMap::new(),
             named_memo: BTreeMap::new(),
+            tsconfig,
         };
         for (document, doc) in docs.iter().enumerate() {
-            if doc.key.language != "javascript" {
+            if !script_family(&doc.key.language) {
                 continue;
             }
             let mut native = BTreeMap::<_, Vec<&Declaration>>::new();
@@ -232,19 +254,28 @@ impl Catalog {
                         Err(reason) => resolution.residual = Some(reason),
                     }
                 }
+                // A package is the fallback only when no local module matched. An
+                // ambiguous local mapping stays ambiguous.
                 if source.supported
                     && let Some(specifier) = source.specifier.as_deref()
                     && !relative(specifier)
+                    && resolver
+                        .target(document, Some(specifier), work, check)?
+                        .is_err_and(|reason| reason != "module_path_ambiguous")
                 {
+                    let key = &docs[document].key;
                     charge(
                         specifier.len()
-                            + packages
-                                .resolution_work(&docs[document].key.source_set_id, specifier),
+                            + packages.resolution_work(
+                                &key.source_set_id,
+                                specifier,
+                                &key.language,
+                            ),
                         work,
                         check,
                     )?;
                     if let Some(package) =
-                        packages.resolve(&docs[document].key.source_set_id, specifier)
+                        packages.resolve(&key.source_set_id, specifier, &key.language)
                     {
                         charge_package(&package, work, check)?;
                         resolution
@@ -299,6 +330,15 @@ impl Catalog {
     }
 }
 impl Resolver<'_> {
+    fn config(
+        &self,
+        document: usize,
+    ) -> Option<&std::result::Result<tsconfig::RootTsconfig, &'static str>> {
+        self.tsconfig
+            .as_ref()
+            .filter(|(source_set_id, _)| *source_set_id == self.docs[document].key.source_set_id)
+            .map(|(_, config)| config)
+    }
     fn target(
         &self,
         document: usize,
@@ -311,7 +351,7 @@ impl Resolver<'_> {
             return Ok(Err("import_escape_unsupported"));
         };
         if !relative(specifier) {
-            return Ok(Err("absolute_or_bare_import"));
+            return self.bare_target(document, specifier, work, check);
         }
         charge(
             self.docs[document].key.path.len() + specifier.len(),
@@ -321,31 +361,167 @@ impl Resolver<'_> {
         let Some(path) = relative_path(&self.docs[document].key.path, specifier) else {
             return Ok(Err("relative_import_outside_source"));
         };
-        let candidates = if specifier.ends_with('/') {
-            charge(path.len() + 1, work, check)?;
-            vec![if path.is_empty() {
-                "index.js".to_owned()
-            } else {
-                format!("{path}/index.js")
-            }]
-        } else if path.rsplit('/').next().is_some_and(|p| p.contains('.')) {
-            vec![path]
-        } else {
-            charge(path.len() * 4 + 4, work, check)?;
-            vec![
-                format!("{path}.js"),
-                format!("{path}.mjs"),
-                format!("{path}.cjs"),
-                format!("{path}/index.js"),
-            ]
+        let directory = specifier.ends_with('/');
+        let mut found = self.lookup(document, &path, directory, work, check)?;
+        if found.is_empty()
+            && let Some(Ok(config)) = self.config(document)
+        {
+            found = self.root_dirs(document, config, &path, directory, work, check)?;
+        }
+        Ok(outcome(&found))
+    }
+    /// A non-relative specifier: `paths`, then `baseUrl`, of a readable root config.
+    /// Packages and the standard library are the caller's, after this falls through.
+    fn bare_target(
+        &self,
+        document: usize,
+        specifier: &str,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<std::result::Result<usize, &'static str>> {
+        const UNRESOLVED: &str = "absolute_or_bare_import";
+        if specifier.starts_with('/') {
+            return Ok(Err(UNRESOLVED));
+        }
+        let config = match self.config(document) {
+            None => return Ok(Err(UNRESOLVED)),
+            Some(Err(reason)) => return Ok(Err(reason)),
+            Some(Ok(config)) => config,
         };
-        charge(candidates.len(), work, check)?;
-        let found = find(self.docs[document], &candidates, self.documents);
-        Ok(match found.as_slice() {
-            [target] => Ok(*target),
-            [] => Err("module_path_not_indexed"),
-            _ => Err("module_path_ambiguous"),
-        })
+        let base = match config.base_url.as_deref() {
+            Some(base_url) => tsconfig::normalize(base_url),
+            None => Some(String::new()),
+        };
+        let Some(base) = base else {
+            return Ok(Err(UNRESOLVED));
+        };
+        charge(config.paths.len() + specifier.len() + 1, work, check)?;
+        let mut chosen = config
+            .paths
+            .get_key_value(specifier)
+            .map(|(_, targets)| (targets, None));
+        if chosen.is_none() {
+            let mut best: Option<(usize, &Vec<String>, &str)> = None;
+            for (key, targets) in &config.paths {
+                let Some((prefix, suffix)) = key.split_once('*') else {
+                    continue;
+                };
+                if !suffix.contains('*')
+                    && specifier.len() >= prefix.len() + suffix.len()
+                    && specifier.starts_with(prefix)
+                    && specifier.ends_with(suffix)
+                    && best.is_none_or(|(longest, _, _)| prefix.len() > longest)
+                {
+                    best = Some((
+                        prefix.len(),
+                        targets,
+                        &specifier[prefix.len()..specifier.len() - suffix.len()],
+                    ));
+                }
+            }
+            chosen = best.map(|(_, targets, star)| (targets, Some(star)));
+        }
+        if let Some((targets, star)) = chosen {
+            for target in targets {
+                owner_step(work, check)?;
+                let target = match star {
+                    Some(star) => target.replacen('*', star, 1),
+                    None => target.clone(),
+                };
+                charge(base.len() + target.len() + 1, work, check)?;
+                let Some(path) = tsconfig::normalize(&join(&base, &target)) else {
+                    continue;
+                };
+                let found = self.lookup(document, &path, target.ends_with('/'), work, check)?;
+                if !found.is_empty() {
+                    return Ok(outcome(&found));
+                }
+            }
+        }
+        if config.base_url.is_some() {
+            charge(base.len() + specifier.len() + 1, work, check)?;
+            if let Some(path) = tsconfig::normalize(&join(&base, specifier)) {
+                let found = self.lookup(document, &path, specifier.ends_with('/'), work, check)?;
+                if !found.is_empty() {
+                    return Ok(outcome(&found));
+                }
+            }
+        }
+        Ok(Err(UNRESOLVED))
+    }
+    /// The same relative path under the other `rootDirs`, in config order.
+    fn root_dirs(
+        &self,
+        document: usize,
+        config: &tsconfig::RootTsconfig,
+        path: &str,
+        directory: bool,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<usize>> {
+        let importer = &self.docs[document].key.path;
+        let importer = importer.rsplit_once('/').map_or("", |(dir, _)| dir);
+        charge(config.root_dirs.len() + path.len() + 1, work, check)?;
+        let dirs: Vec<Option<String>> = config
+            .root_dirs
+            .iter()
+            .map(|dir| tsconfig::normalize(dir))
+            .collect();
+        let contains = |dir: &str, path: &str| {
+            dir.is_empty()
+                || path == dir
+                || path
+                    .strip_prefix(dir)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        let Some((own, root)) = dirs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, dir)| Some((index, dir.as_deref()?)))
+            .filter(|(_, dir)| contains(dir, importer) && contains(dir, path))
+            .max_by_key(|(_, dir)| dir.len())
+        else {
+            return Ok(Vec::new());
+        };
+        let rest = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .trim_start_matches('/');
+        for (index, other) in dirs.iter().enumerate() {
+            let Some(other) = other else {
+                continue;
+            };
+            if index == own {
+                continue;
+            }
+            charge(other.len() + rest.len() + 1, work, check)?;
+            let joined = join(other, rest);
+            let found = self.lookup(document, &joined, directory, work, check)?;
+            if !found.is_empty() {
+                return Ok(found);
+            }
+        }
+        Ok(Vec::new())
+    }
+    fn lookup(
+        &self,
+        document: usize,
+        path: &str,
+        directory: bool,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<usize>> {
+        let candidates = candidates(path, directory);
+        charge(
+            path.len() * candidates.len() + candidates.len(),
+            work,
+            check,
+        )?;
+        Ok(find_script(
+            self.docs[document],
+            &candidates,
+            self.documents,
+        ))
     }
     fn source_exports(
         &mut self,
@@ -376,8 +552,7 @@ impl Resolver<'_> {
         if depth > FOLLOW
             || route.contains(&(document, "*".into()))
             || (depth > 0
-                && (self.units[&document].test_only
-                    || self.docs[document].key.path.ends_with(".cjs")))
+                && (self.units[&document].test_only || commonjs(&self.docs[document].key.path)))
         {
             return Ok(Arc::new(unknown_names()));
         }
@@ -434,8 +609,7 @@ impl Resolver<'_> {
         if depth > FOLLOW
             || route.contains(&(document, name.to_owned()))
             || (depth > 0
-                && (self.units[&document].test_only
-                    || self.docs[document].key.path.ends_with(".cjs")))
+                && (self.units[&document].test_only || commonjs(&self.docs[document].key.path)))
         {
             return Ok(Arc::new(unknown_bucket()));
         }
@@ -489,7 +663,11 @@ impl Resolver<'_> {
         let Some(exports) = unit.explicit.get(name) else {
             return Ok(unknown_bucket());
         };
-        if exports.len() != 1 {
+        // TypeScript overloads export one local name once per signature.
+        let overloads = self.docs[document].key.language == "typescript"
+            && matches!(exports.as_slice(), [Export::Local(first), rest @ ..]
+                if rest.iter().all(|export| matches!(export, Export::Local(local) if local == first)));
+        if exports.len() != 1 && !overloads {
             return Ok(unknown_bucket());
         }
         let mut bucket = match &exports[0] {
@@ -534,6 +712,41 @@ impl Resolver<'_> {
             let Some(bindings) = unit.bindings.get(&name) else {
                 return Ok(unknown_bucket());
             };
+            if bindings.len() > 1
+                && bindings
+                    .iter()
+                    .all(|binding| binding.overload && binding.start < before)
+            {
+                // The overloads of one name stand for one declaration: the first.
+                let mut first: Option<&Binding> = None;
+                for binding in bindings {
+                    if !matches!(binding.kind, BindingKind::Direct(_)) {
+                        return Ok(unknown_bucket());
+                    }
+                    if first.is_none_or(|first| binding.start < first.start) {
+                        first = Some(binding);
+                    }
+                }
+                let Some(Binding {
+                    kind: BindingKind::Direct(id),
+                    ..
+                }) = first
+                else {
+                    return Ok(unknown_bucket());
+                };
+                charge(id.sid.len() + 2, work, check)?;
+                let bucket = Bucket {
+                    candidates: BTreeMap::from([(
+                        id.clone(),
+                        Candidate {
+                            id: id.clone(),
+                            proof: BTreeSet::from([document]),
+                        },
+                    )]),
+                    unknown: false,
+                };
+                return local_alias(bucket, alias, work, check);
+            }
             if bindings.len() != 1 || bindings[0].start >= before {
                 return Ok(unknown_bucket());
             }
@@ -772,6 +985,103 @@ fn add_bucket(
 fn relative(specifier: &str) -> bool {
     specifier.starts_with("./") || specifier.starts_with("../")
 }
+fn join(dir: &str, path: &str) -> String {
+    if dir.is_empty() {
+        path.to_owned()
+    } else if path.is_empty() {
+        dir.to_owned()
+    } else {
+        format!("{dir}/{path}")
+    }
+}
+/// `.cjs` and `.cts` are CommonJS: export following ends there.
+fn commonjs(path: &str) -> bool {
+    path.ends_with(".cjs") || path.ends_with(".cts")
+}
+fn outcome(found: &[usize]) -> std::result::Result<usize, &'static str> {
+    match found {
+        [target] => Ok(*target),
+        [] => Err("module_path_not_indexed"),
+        _ => Err("module_path_ambiguous"),
+    }
+}
+/// The paths an import specifier may name. `path` is the root-relative specifier without
+/// its trailing slash; `directory` is whether the specifier had one.
+fn candidates(path: &str, directory: bool) -> Vec<String> {
+    let index = |dir: &str| {
+        let stem = if dir.is_empty() {
+            "index".to_owned()
+        } else {
+            format!("{dir}/index")
+        };
+        ["ts", "tsx", "d.ts", "js"].map(|extension| format!("{stem}.{extension}"))
+    };
+    if directory {
+        return index(path).into();
+    }
+    let with = |stem: &str, extensions: &[&str]| -> Vec<String> {
+        extensions
+            .iter()
+            .map(|extension| format!("{stem}.{extension}"))
+            .collect()
+    };
+    if [".ts", ".tsx", ".mts", ".cts"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+    {
+        return vec![path.to_owned()];
+    }
+    for (suffix, extensions) in [
+        (".js", &["js", "ts", "tsx", "d.ts"][..]),
+        (".mjs", &["mjs", "mts", "d.mts"]),
+        (".cjs", &["cjs", "cts", "d.cts"]),
+        (".jsx", &["tsx"]),
+    ] {
+        if let Some(stem) = path.strip_suffix(suffix) {
+            return with(stem, extensions);
+        }
+    }
+    let mut result = with(path, &["ts", "tsx", "d.ts", "js", "mjs", "cjs"]);
+    result.extend(index(path));
+    result
+}
+/// The documents the candidates name, from the first non-empty precedence class:
+/// implementations in the importer's language, implementations in the other script
+/// language, then declaration-only documents.
+fn find_script(
+    doc: &DocumentInput,
+    candidates: &[String],
+    documents: &BTreeMap<DocumentKey, usize>,
+) -> Vec<usize> {
+    let mut classes: [Vec<usize>; 3] = Default::default();
+    for path in candidates {
+        let Some(language) = crate::capture::language_of_path(std::path::Path::new(path))
+            .filter(|language| script_family(language))
+        else {
+            continue;
+        };
+        let key = DocumentKey {
+            source_set_id: doc.key.source_set_id.clone(),
+            language: language.to_owned(),
+            path: path.clone(),
+        };
+        let Some(&index) = documents.get(&key) else {
+            continue;
+        };
+        let class = if crate::indexer_ts::declaration_only(path) {
+            2
+        } else if language == doc.key.language {
+            0
+        } else {
+            1
+        };
+        classes[class].push(index);
+    }
+    classes
+        .into_iter()
+        .find(|class| !class.is_empty())
+        .unwrap_or_default()
+}
 fn literal(doc: &DocumentInput, node: Node<'_>) -> Option<String> {
     let value = text(doc, node);
     if node.kind() != "string" || value.contains('\\') {
@@ -781,7 +1091,7 @@ fn literal(doc: &DocumentInput, node: Node<'_>) -> Option<String> {
 }
 fn name(doc: &DocumentInput, node: Node<'_>) -> Option<String> {
     match node.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => {
+        "identifier" | "type_identifier" | "shorthand_property_identifier_pattern" => {
             crate::native_evidence::lookup("javascript", text(doc, node)).ok()
         }
         "default" => Some("default".into()),
@@ -799,8 +1109,14 @@ fn star(node: Node<'_>) -> bool {
         && child(node, "export_clause").is_none()
         && child(node, "namespace_export").is_none()
 }
+/// The module specifier of an import or export, including `import x = require("m")`.
+fn source_node(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("source").or_else(|| {
+        child(node, "import_require_clause").and_then(|clause| clause.child_by_field_name("source"))
+    })
+}
 fn source(doc: &DocumentInput, node: Node<'_>) -> Option<Source> {
-    let source = node.child_by_field_name("source")?;
+    let source = source_node(node)?;
     let star = star(node);
     let site = if star { node } else { source };
     Some(Source {
@@ -820,10 +1136,11 @@ fn insert_binding(
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     charge(name.len() + 1, work, check)?;
-    unit.bindings
-        .entry(name)
-        .or_default()
-        .push(Binding { start, kind });
+    unit.bindings.entry(name).or_default().push(Binding {
+        start,
+        kind,
+        overload: false,
+    });
     Ok(())
 }
 fn insert_export(
@@ -846,6 +1163,9 @@ fn imported_name(doc: &DocumentInput, node: Node<'_>) -> Option<(String, Option<
             name(doc, node.child_by_field_name("alias").unwrap_or(original))
                 .map(|local| (local, name(doc, original)))
         }),
+        "import_require_clause" => child(node, "identifier")
+            .and_then(|n| name(doc, n))
+            .map(|local| (local, None)),
         "namespace_import" => {
             let mut cursor = node.walk();
             node.named_children(&mut cursor)
@@ -886,10 +1206,10 @@ fn inventory(
             unit.sources.push(source);
         }
         if statement.kind() == "import_statement" {
-            if let Some(clause) = child(statement, "import_clause") {
-                let specifier = statement
-                    .child_by_field_name("source")
-                    .and_then(|n| literal(doc, n));
+            if let Some(clause) = child(statement, "import_clause")
+                .or_else(|| child(statement, "import_require_clause"))
+            {
+                let specifier = source_node(statement).and_then(|n| literal(doc, n));
                 let supported = child(statement, "import_attribute").is_none();
                 walk(clause, check, &mut |node, check| {
                     let pair = imported_name(doc, node);
@@ -944,6 +1264,14 @@ fn inventory(
         }
         if !exported {
             continue;
+        }
+        let assignment = {
+            let mut cursor = statement.walk();
+            statement.children(&mut cursor).any(|n| n.kind() == "=")
+        };
+        if assignment {
+            // `export = x` replaces the module's whole export surface.
+            unit.unknown_set = true;
         }
         if default && declaration.is_none() {
             // Named default expressions can be native function/class nodes too.
@@ -1028,6 +1356,29 @@ fn declarations(
                 doc, node, document, native, unit, exported, false, work, check,
             )?;
         }
+    } else if declaration.kind() == "ambient_declaration" {
+        let mut cursor = declaration.walk();
+        for inner in declaration.named_children(&mut cursor) {
+            declarations(
+                doc, inner, document, native, unit, exported, default, work, check,
+            )?;
+        }
+    } else if matches!(declaration.kind(), "internal_module" | "module") {
+        match declaration.child_by_field_name("name") {
+            Some(name) if name.kind() == "identifier" => record_declaration(
+                doc,
+                declaration,
+                document,
+                native,
+                unit,
+                exported,
+                default,
+                work,
+                check,
+            )?,
+            // A dotted or string-named namespace exports a name this inventory does not read.
+            _ => unit.unknown_set |= exported,
+        }
     } else if matches!(
         declaration.kind(),
         "function_declaration"
@@ -1036,6 +1387,11 @@ fn declarations(
             | "function_expression"
             | "generator_function"
             | "class"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "type_alias_declaration"
+            | "function_signature"
     ) {
         record_declaration(
             doc,
@@ -1086,7 +1442,13 @@ fn record_declaration(
     };
     let kind = match node.kind() {
         "variable_declarator" => "variable",
-        "class_declaration" | "class" => "type",
+        "class_declaration"
+        | "class"
+        | "abstract_class_declaration"
+        | "interface_declaration"
+        | "enum_declaration" => "type",
+        "type_alias_declaration" => "alias",
+        "internal_module" | "module" => "namespace",
         _ => "function",
     };
     owner_step(work, check)?;
@@ -1139,6 +1501,15 @@ fn record_declaration(
         binding = BindingKind::Unknown;
     }
     insert_binding(unit, local.clone(), node.start_byte(), binding, work, check)?;
+    if doc.key.language == "typescript"
+        && matches!(node.kind(), "function_declaration" | "function_signature")
+        && let Some(last) = unit
+            .bindings
+            .get_mut(&local)
+            .and_then(|bindings| bindings.last_mut())
+    {
+        last.overload = true;
+    }
     if exported {
         insert_export(
             unit,
@@ -1186,6 +1557,12 @@ fn pattern_names(
                 .or_else(|| node.child_by_field_name("left"))
             {
                 pending.push((value, depth + 1));
+            }
+        } else if matches!(node.kind(), "required_parameter" | "optional_parameter") {
+            // A TypeScript parameter binds only its pattern: its type, default value
+            // and decorators bind nothing.
+            if let Some(pattern) = node.child_by_field_name("pattern") {
+                pending.push((pattern, depth + 1));
             }
         } else if !matches!(
             node.kind(),
@@ -1333,10 +1710,12 @@ fn body_hazards(
             let names = pattern_names(doc, pattern, work, check)?;
             let conditional = owner.kind() == "program"
                 && node.kind() == "variable_declarator"
-                && node
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .is_some_and(|p| !matches!(p.kind(), "program" | "export_statement"));
+                && node.parent().and_then(|p| p.parent()).is_some_and(|p| {
+                    !matches!(
+                        p.kind(),
+                        "program" | "export_statement" | "ambient_declaration"
+                    )
+                });
             for name in names {
                 charge(name.len() + 1, work, check)?;
                 scopes.entry(owner.id()).or_default().insert(name.clone());
@@ -1454,7 +1833,7 @@ pub(super) fn extract(
     let mut result = Vec::new();
     walk(tree.root_node(), check, &mut |node, check| {
         if matches!(node.kind(), "import_statement" | "export_statement")
-            && let Some(source) = node.child_by_field_name("source")
+            && let Some(source) = source_node(node)
         {
             let site = if star(node) { node } else { source };
             charge(site.end_byte() - site.start_byte() + 1, work, check)?;
@@ -1553,6 +1932,7 @@ mod tests {
             hazards: BTreeMap::new(),
             memo: BTreeMap::new(),
             named_memo: BTreeMap::new(),
+            tsconfig: None,
         };
         let mut work = Work::new(work::reference_limit(docs.len(), 0));
         for (document, doc) in docs.iter().enumerate() {
@@ -1713,5 +2093,638 @@ mod tests {
         assert!(nested.dynamic);
         let (write, _) = hazards_for("import value from './m.js'; value = 2;");
         assert_eq!(write.writes, BTreeSet::from(["value".to_string()]));
+    }
+
+    /// Index `files` and hand the test a resolver over them, with `config` as the root
+    /// tsconfig of the one source set.
+    fn script_fixture(
+        files: &[(&str, &str)],
+        config: Option<&str>,
+        test: impl FnOnce(&mut Resolver<'_>, &dyn Fn(&str) -> usize, &mut Work),
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        for (path, text) in files {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let identity =
+            crate::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+                .unwrap();
+        let (graph, native) = crate::indexer::index_workspace_with_native(
+            &crate::indexer::IndexOptions::new(root.path().to_owned()),
+            &identity.record_id,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let mut documents: Vec<_> = graph
+            .files
+            .into_iter()
+            .map(|file| {
+                let key = native
+                    .revision
+                    .documents
+                    .iter()
+                    .find(|doc| doc.key.path == file.path)
+                    .unwrap()
+                    .key
+                    .clone();
+                DocumentInput {
+                    semantic: Default::default(),
+                    declarations: native
+                        .declarations
+                        .iter()
+                        .filter(|row| row.document == key)
+                        .cloned()
+                        .collect(),
+                    calls: Vec::new(),
+                    key,
+                    file,
+                }
+            })
+            .collect();
+        documents.sort_by(|a, b| a.key.cmp(&b.key));
+        let docs: Vec<_> = documents.iter().collect();
+        let trees: Vec<_> = docs
+            .iter()
+            .map(|doc| parse(doc, &mut || Ok(())).unwrap())
+            .collect();
+        let document_map: BTreeMap<_, _> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, doc)| (doc.key.clone(), i))
+            .collect();
+        let source_set = docs[0].key.source_set_id.clone();
+        let mut resolver = Resolver {
+            docs: &docs,
+            trees: &trees,
+            documents: &document_map,
+            units: BTreeMap::new(),
+            hazards: BTreeMap::new(),
+            memo: BTreeMap::new(),
+            named_memo: BTreeMap::new(),
+            tsconfig: config.map(|text| (source_set, tsconfig::parse(text.as_bytes()))),
+        };
+        let mut work = Work::new(work::reference_limit(docs.len(), 0));
+        for (document, doc) in docs.iter().enumerate() {
+            let mut native = BTreeMap::<_, Vec<&Declaration>>::new();
+            for row in &doc.declarations {
+                native
+                    .entry((row.range.start, row.range.end, row.kind.as_str()))
+                    .or_default()
+                    .push(row);
+            }
+            let unit = inventory(
+                doc,
+                trees[document].root_node(),
+                document,
+                &native,
+                &mut work,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            resolver.units.insert(document, Arc::new(unit));
+        }
+        let index = |path: &str| {
+            docs.iter()
+                .position(|doc| doc.key.path == path)
+                .unwrap_or_else(|| panic!("{path} is not indexed"))
+        };
+        test(&mut resolver, &index, &mut work);
+    }
+    /// The path a specifier resolves to from `from`, or its reason.
+    fn resolve_from(
+        resolver: &Resolver<'_>,
+        index: &dyn Fn(&str) -> usize,
+        work: &mut Work,
+        from: &str,
+        specifier: &str,
+    ) -> std::result::Result<String, &'static str> {
+        resolver
+            .target(index(from), Some(specifier), work, &mut || Ok(()))
+            .unwrap()
+            .map(|target| resolver.docs[target].key.path.clone())
+    }
+    fn check(
+        files: &[(&str, &str)],
+        config: Option<&str>,
+        cases: &[(&str, &str, Result<&str, &str>)],
+    ) {
+        script_fixture(files, config, |resolver, index, work| {
+            for (from, specifier, expected) in cases {
+                assert_eq!(
+                    resolve_from(resolver, index, work, from, specifier),
+                    expected.map(str::to_owned),
+                    "{from}: {specifier}"
+                );
+            }
+        });
+    }
+    const EMPTY: &str = "export const a = 1;";
+
+    #[test]
+    fn resolves_extensionless_to_typescript() {
+        check(
+            &[
+                ("a.ts", EMPTY),
+                ("x.ts", EMPTY),
+                ("y.js", EMPTY),
+                ("z/index.tsx", EMPTY),
+                ("w.config.ts", EMPTY),
+                ("both.ts", EMPTY),
+                ("both.tsx", EMPTY),
+            ],
+            None,
+            &[
+                ("a.ts", "./x", Ok("x.ts")),
+                ("a.ts", "./y", Ok("y.js")),
+                ("a.ts", "./z", Ok("z/index.tsx")),
+                ("a.ts", "./w.config", Ok("w.config.ts")),
+                ("a.ts", "./both", Err("module_path_ambiguous")),
+                ("a.ts", "./absent", Err("module_path_not_indexed")),
+            ],
+        );
+    }
+
+    #[test]
+    fn js_specifier_maps_to_ts() {
+        check(
+            &[
+                ("a.ts", EMPTY),
+                ("b.js", EMPTY),
+                ("m.ts", EMPTY),
+                ("both.js", EMPTY),
+                ("both.ts", EMPTY),
+                ("view.tsx", EMPTY),
+            ],
+            None,
+            &[
+                ("a.ts", "./m.js", Ok("m.ts")),
+                ("a.ts", "./both.js", Ok("both.ts")),
+                ("b.js", "./both.js", Ok("both.js")),
+                ("b.js", "./m.js", Ok("m.ts")),
+                ("a.ts", "./view.js", Ok("view.tsx")),
+            ],
+        );
+    }
+
+    #[test]
+    fn module_extension_mapping() {
+        check(
+            &[
+                ("a.ts", EMPTY),
+                ("x.mts", EMPTY),
+                ("y.cts", EMPTY),
+                ("z.tsx", EMPTY),
+                ("w.d.mts", "export declare const w: number;"),
+                ("v.d.cts", "export declare const v: number;"),
+            ],
+            None,
+            &[
+                ("a.ts", "./x.mjs", Ok("x.mts")),
+                ("a.ts", "./y.cjs", Ok("y.cts")),
+                ("a.ts", "./z.jsx", Ok("z.tsx")),
+                ("a.ts", "./w.mjs", Ok("w.d.mts")),
+                ("a.ts", "./v.cjs", Ok("v.d.cts")),
+                ("a.ts", "./x.cjs", Err("module_path_not_indexed")),
+            ],
+        );
+    }
+
+    #[test]
+    fn explicit_ts_extension_literal() {
+        check(
+            &[
+                ("a.ts", EMPTY),
+                ("m.ts", EMPTY),
+                ("m.js", EMPTY),
+                ("n.d.ts", "export declare const n: number;"),
+                ("o.mts", EMPTY),
+                ("o.cts", EMPTY),
+                ("p.tsx", EMPTY),
+            ],
+            None,
+            &[
+                ("a.ts", "./m.ts", Ok("m.ts")),
+                ("a.ts", "./m.tsx", Err("module_path_not_indexed")),
+                ("a.ts", "./n.d.ts", Ok("n.d.ts")),
+                ("a.ts", "./o.mts", Ok("o.mts")),
+                ("a.ts", "./o.cts", Ok("o.cts")),
+                ("a.ts", "./p.tsx", Ok("p.tsx")),
+            ],
+        );
+    }
+
+    #[test]
+    fn directory_index() {
+        check(
+            &[
+                ("a.ts", EMPTY),
+                ("dir.ts", EMPTY),
+                ("dir/index.ts", EMPTY),
+                ("only/index.d.ts", "export declare const o: number;"),
+                ("legacy/index.js", EMPTY),
+                ("nested/a.ts", EMPTY),
+                ("index.ts", EMPTY),
+            ],
+            None,
+            &[
+                ("a.ts", "./dir/", Ok("dir/index.ts")),
+                ("a.ts", "./dir", Err("module_path_ambiguous")),
+                ("a.ts", "./only/", Ok("only/index.d.ts")),
+                ("a.ts", "./legacy/", Ok("legacy/index.js")),
+                ("nested/a.ts", "../", Ok("index.ts")),
+                ("a.ts", "./nested/", Err("module_path_not_indexed")),
+            ],
+        );
+    }
+
+    #[test]
+    fn declaration_file_is_last_resort() {
+        check(
+            &[
+                ("a.ts", EMPTY),
+                ("x.js", EMPTY),
+                ("x.d.ts", "export declare const a: number;"),
+                ("y.d.ts", "export declare const a: number;"),
+            ],
+            None,
+            &[
+                ("a.ts", "./x", Ok("x.js")),
+                ("a.ts", "./x.js", Ok("x.js")),
+                ("a.ts", "./y", Ok("y.d.ts")),
+                ("a.ts", "./y.js", Ok("y.d.ts")),
+            ],
+        );
+        script_fixture(
+            &[
+                ("a.ts", "export * from './y';"),
+                ("y.d.ts", "export declare function f(): void;"),
+            ],
+            None,
+            |resolver, index, work| {
+                let names = resolver
+                    .exports(index("y.d.ts"), 1, &Route::new(), work, &mut || Ok(()))
+                    .unwrap();
+                assert_eq!(names.names["f"].candidates.len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn type_only_imports_resolve() {
+        script_fixture(
+            &[
+                (
+                    "use.ts",
+                    "import type { A } from './a';\nimport { type B, c } from './a';\nexport type { A as AA } from './a';\nimport type D from './a';\nexport * from './a';",
+                ),
+                (
+                    "a.ts",
+                    "export interface A {}\nexport interface B {}\nexport const c = 1;\nexport default class D {}",
+                ),
+            ],
+            None,
+            |resolver, index, work| {
+                let unit = Arc::clone(&resolver.units[&index("use.ts")]);
+                assert_eq!(unit.sources.len(), 5);
+                for source in &unit.sources {
+                    let target = resolver
+                        .target(
+                            index("use.ts"),
+                            source.specifier.as_deref(),
+                            work,
+                            &mut || Ok(()),
+                        )
+                        .unwrap();
+                    assert_eq!(target, Ok(index("a.ts")));
+                }
+                resolver
+                    .hazards(index("use.ts"), work, &mut || Ok(()))
+                    .unwrap();
+                for name in ["A", "B", "c", "D"] {
+                    let bucket = resolver
+                        .binding(
+                            index("use.ts"),
+                            name,
+                            0,
+                            &Route::new(),
+                            work,
+                            &mut || Ok(()),
+                        )
+                        .unwrap();
+                    assert!(!bucket.unknown, "{name}");
+                    assert_eq!(bucket.candidates.len(), 1, "{name}");
+                }
+            },
+        );
+    }
+
+    const CONFIG: &str = r#"{
+      // comment
+      "compilerOptions": {
+        "paths": {
+          "@app/*": ["src/app/*", "lib/*"],
+          "@app/special/*": ["special/*"],
+          "exact": ["src/exact.ts"],
+          "esc/*": ["../out/*"],
+          "none/*": ["nothing/*"],
+        },
+      },
+    }"#;
+
+    #[test]
+    fn paths_wildcard_first_match() {
+        check(
+            &[
+                ("a.ts", EMPTY),
+                ("src/app/foo.ts", EMPTY),
+                ("lib/foo.ts", EMPTY),
+                ("lib/bar.ts", EMPTY),
+                ("special/x.ts", EMPTY),
+                ("src/app/special/x.ts", EMPTY),
+                ("src/exact.ts", EMPTY),
+                ("pkg/index.ts", EMPTY),
+            ],
+            Some(CONFIG),
+            &[
+                ("a.ts", "@app/foo", Ok("src/app/foo.ts")),
+                ("a.ts", "@app/bar", Ok("lib/bar.ts")),
+                ("a.ts", "@app/special/x", Ok("special/x.ts")),
+                ("a.ts", "exact", Ok("src/exact.ts")),
+                ("a.ts", "esc/a", Err("absolute_or_bare_import")),
+                ("a.ts", "none/a", Err("absolute_or_bare_import")),
+                ("a.ts", "unmapped", Err("absolute_or_bare_import")),
+                ("a.ts", "@app/missing", Err("absolute_or_bare_import")),
+            ],
+        );
+    }
+
+    #[test]
+    fn base_url_bare_specifier() {
+        check(
+            &[
+                ("a.ts", EMPTY),
+                ("src/util/x.ts", EMPTY),
+                ("src/dir/index.ts", EMPTY),
+                ("util/x.ts", EMPTY),
+            ],
+            Some(r#"{"compilerOptions":{"baseUrl":"./src"}}"#),
+            &[
+                ("a.ts", "util/x", Ok("src/util/x.ts")),
+                ("a.ts", "dir/", Ok("src/dir/index.ts")),
+                ("a.ts", "lodash", Err("absolute_or_bare_import")),
+                ("a.ts", "/abs", Err("absolute_or_bare_import")),
+            ],
+        );
+        check(
+            &[("a.ts", EMPTY), ("util/x.ts", EMPTY)],
+            Some(r#"{"compilerOptions":{"baseUrl":".."}}"#),
+            &[("a.ts", "util/x", Err("absolute_or_bare_import"))],
+        );
+        check(
+            &[("a.ts", EMPTY), ("util/x.ts", EMPTY)],
+            Some(r#"{"compilerOptions":{}}"#),
+            &[("a.ts", "util/x", Err("absolute_or_bare_import"))],
+        );
+    }
+
+    #[test]
+    fn root_dirs_virtual_merge() {
+        check(
+            &[
+                ("src/views/a.ts", EMPTY),
+                ("src/views/local.ts", EMPTY),
+                ("generated/views/b.ts", EMPTY),
+                ("other/c.ts", EMPTY),
+                ("extra/views/d.ts", EMPTY),
+            ],
+            Some(r#"{"compilerOptions":{"rootDirs":["src","generated","extra"]}}"#),
+            &[
+                ("src/views/a.ts", "./b", Ok("generated/views/b.ts")),
+                ("src/views/a.ts", "./d", Ok("extra/views/d.ts")),
+                ("src/views/a.ts", "./local", Ok("src/views/local.ts")),
+                (
+                    "src/views/a.ts",
+                    "./missing",
+                    Err("module_path_not_indexed"),
+                ),
+                ("generated/views/b.ts", "./a", Ok("src/views/a.ts")),
+                ("generated/views/b.ts", "../../other/c", Ok("other/c.ts")),
+            ],
+        );
+        check(
+            &[("src/a.ts", EMPTY), ("generated/b.ts", EMPTY)],
+            Some(r#"{"compilerOptions":{}}"#),
+            &[("src/a.ts", "./b", Err("module_path_not_indexed"))],
+        );
+    }
+
+    #[test]
+    fn cross_boundary_imports() {
+        check(
+            &[
+                ("a.ts", EMPTY),
+                ("b.js", EMPTY),
+                ("t.ts", EMPTY),
+                ("u.js", EMPTY),
+                ("c.cjs", EMPTY),
+            ],
+            None,
+            &[
+                ("b.js", "./t", Ok("t.ts")),
+                ("b.js", "./t.js", Ok("t.ts")),
+                ("a.ts", "./u", Ok("u.js")),
+                ("a.ts", "./u.js", Ok("u.js")),
+                ("a.ts", "./c.cjs", Ok("c.cjs")),
+            ],
+        );
+    }
+
+    #[test]
+    fn tsconfig_unreadable_typed() {
+        check(
+            &[
+                ("src/a.ts", EMPTY),
+                ("src/b.ts", EMPTY),
+                ("generated/c.ts", EMPTY),
+            ],
+            Some("{ not json"),
+            &[
+                ("src/a.ts", "lodash", Err("tsconfig_unreadable")),
+                ("src/a.ts", "@app/x", Err("tsconfig_unreadable")),
+                ("src/a.ts", "./b", Ok("src/b.ts")),
+                ("src/a.ts", "./missing", Err("module_path_not_indexed")),
+                ("src/a.ts", "../generated/c", Ok("generated/c.ts")),
+                ("src/a.ts", "/abs", Err("absolute_or_bare_import")),
+            ],
+        );
+    }
+
+    #[test]
+    fn existing_unknown_reasons_keep_their_strings() {
+        script_fixture(
+            &[("a.js", EMPTY), ("b.ts", EMPTY), ("b.tsx", EMPTY)],
+            None,
+            |resolver, index, work| {
+                let reason = |from: &str, specifier: Option<&str>, work: &mut Work| {
+                    resolver
+                        .target(index(from), specifier, work, &mut || Ok(()))
+                        .unwrap()
+                };
+                assert_eq!(reason("a.js", None, work), Err("import_escape_unsupported"));
+                assert_eq!(
+                    reason("a.js", Some("lodash"), work),
+                    Err("absolute_or_bare_import")
+                );
+                assert_eq!(
+                    reason("a.js", Some("../../x"), work),
+                    Err("relative_import_outside_source")
+                );
+                assert_eq!(
+                    reason("a.js", Some("./b"), work),
+                    Err("module_path_ambiguous")
+                );
+                assert_eq!(
+                    reason("a.js", Some("./nope"), work),
+                    Err("module_path_not_indexed")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn import_require_clause_static() {
+        script_fixture(
+            &[
+                (
+                    "use.ts",
+                    "import m = require(\"./model\");\nexport const v = m;\nconst w = 1;",
+                ),
+                ("model.ts", EMPTY),
+            ],
+            None,
+            |resolver, index, work| {
+                let use_ts = index("use.ts");
+                let unit = Arc::clone(&resolver.units[&use_ts]);
+                assert_eq!(unit.sources.len(), 1);
+                assert_eq!(unit.sources[0].specifier.as_deref(), Some("./model"));
+                assert!(unit.sources[0].supported && !unit.sources[0].star);
+                assert!(matches!(
+                    unit.bindings["m"][0].kind,
+                    BindingKind::Imported { name: None, .. }
+                ));
+                assert_eq!(
+                    resolver
+                        .target(use_ts, Some("./model"), work, &mut || Ok(()))
+                        .unwrap(),
+                    Ok(index("model.ts"))
+                );
+                let sites = extract(
+                    resolver.docs[use_ts],
+                    &resolver.trees[use_ts],
+                    work,
+                    &mut || Ok(()),
+                )
+                .unwrap();
+                assert_eq!(sites.len(), 1);
+                assert_eq!(sites[0].spelling, "\"./model\"");
+                assert_eq!(sites[0].start, unit.sources[0].start);
+                // The namespace binding shadows CommonJS names.
+                let hazards = body_hazards(
+                    resolver.docs[use_ts],
+                    resolver.trees[use_ts].root_node(),
+                    work,
+                    &mut || Ok(()),
+                )
+                .unwrap();
+                assert!(!hazards.dynamic);
+            },
+        );
+    }
+
+    #[test]
+    fn export_assignment_unknown() {
+        script_fixture(
+            &[("a.ts", "export = 1;"), ("b.ts", "export const b = 1;")],
+            None,
+            |resolver, index, _| {
+                assert!(resolver.units[&index("a.ts")].unknown_set);
+                assert!(!resolver.units[&index("b.ts")].unknown_set);
+            },
+        );
+    }
+
+    #[test]
+    fn cts_ends_export_following() {
+        script_fixture(
+            &[
+                (
+                    "use.ts",
+                    "export * from './c.cts';\nexport * from './d.mts';",
+                ),
+                ("c.cts", "export const a = 1;"),
+                ("d.mts", "export const b = 1;"),
+            ],
+            None,
+            |resolver, index, work| {
+                let c = resolver
+                    .exports(index("c.cts"), 1, &Route::new(), work, &mut || Ok(()))
+                    .unwrap();
+                assert!(c.unknown_set && c.names.is_empty());
+                let c = resolver
+                    .named(index("c.cts"), "a", 1, &Route::new(), work, &mut || Ok(()))
+                    .unwrap();
+                assert!(c.unknown);
+                let d = resolver
+                    .exports(index("d.mts"), 1, &Route::new(), work, &mut || Ok(()))
+                    .unwrap();
+                assert!(d.names.contains_key("b") && !d.unknown_set);
+            },
+        );
+    }
+
+    #[test]
+    fn typescript_declarations_export() {
+        script_fixture(
+            &[(
+                "decl.ts",
+                "export interface I {}\nexport enum E { A }\nexport abstract class C {}\nexport type T = number;\nexport namespace N { export const x = 1; }\nexport function f(a: string): void;\nexport function f(a: number): void;\nexport function f(a: any): void {}\nexport declare const d: number;\nexport declare function g(): void;\ndeclare module \"m\" {}\n",
+            )],
+            None,
+            |resolver, index, work| {
+                let decl = index("decl.ts");
+                assert!(!resolver.units[&decl].unknown_set);
+                for (name, count) in [
+                    ("I", 1),
+                    ("E", 1),
+                    ("C", 1),
+                    ("T", 1),
+                    ("N", 1),
+                    ("f", 1),
+                    ("d", 1),
+                    ("g", 1),
+                ] {
+                    let bucket = resolver
+                        .named(decl, name, 0, &Route::new(), work, &mut || Ok(()))
+                        .unwrap();
+                    assert!(!bucket.unknown, "{name}");
+                    assert_eq!(bucket.candidates.len(), count, "{name}");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn typescript_dotted_namespace_unknown_set() {
+        script_fixture(
+            &[("dotted.ts", "export namespace P.Q {}\n")],
+            None,
+            |resolver, index, _| {
+                let dotted = index("dotted.ts");
+                assert!(resolver.units[&dotted].unknown_set, "dotted namespace");
+            },
+        );
     }
 }

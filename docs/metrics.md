@@ -11,7 +11,7 @@ selection is available through API/CLI, not a third browser control. The payload
 
 Role comes directly from each pinned native `Declaration.role` under
 [Decision 0011](semantic-evidence/decisions/0011-test-production-declaration-role.md), for Rust,
-Java, Python and JavaScript. It is syntax/convention classification, not test-runner discovery.
+Java, Python, JavaScript and TypeScript. It is syntax/convention classification, not test-runner discovery.
 Rust inline `#[cfg(test)]` callables inherit test; `#[cfg(feature = "test-support")]` by itself
 remains production. Browsers do not classify filenames or source text. Missing or invalid stored
 roles are typed index corruption, not silently production or partial results.
@@ -109,7 +109,7 @@ Count lexical leaves of the callable body only: signature names, parameter and r
 | --- | --- |
 | Java | `new instanceof return throw if else for while do switch case catch finally break continue`; `true false null` are literals. |
 | Python | `and or not is in if elif else for while match case try except finally return raise lambda await yield`; `True False None` are literals. |
-| JavaScript | `new typeof instanceof in delete void await yield return throw if else for while do switch case catch finally break continue`; `true false null` are literals; `undefined` is an identifier. |
+| JavaScript, TypeScript | `new typeof instanceof in delete void await yield return throw if else for while do switch case catch finally break continue`; `true false null` are literals; `undefined` is an identifier. |
 | Rust | `if else for while loop match return break continue as await move ref mut let ?`; `true false` are literals; `None` is an identifier. |
 
 Let `n1,n2` be distinct operator/operand spellings and `N1,N2` their occurrence counts. `n=n1+n2`, `N=N1+N2`, volume `V=N*log2(max(n,1))` (zero when N=0), difficulty `D=(n1/2)*(N2/max(n2,1))` (zero when n2=0), effort `D*V`, and estimated bugs `V/3000`. Counts are exact integers; round derived f64 values to six decimal places, normalize negative zero. Nonfinite values or overflow cause typed bounded-work failure. Normalized `maintainabilityIndex` has no comment weighting: `clamp((171 - 5.2*ln(max(V,1)) - 0.23*cyclomatic - 16.2*ln(max(loc,1)))*100/171,0,100)` rounded to six decimals.
@@ -120,7 +120,7 @@ Let `n1,n2` be distinct operator/operand spellings and `N1,N2` their occurrence 
 | --- | --- | --- | --- |
 | Java | `if_statement`, `for_statement`, `enhanced_for_statement`, `while_statement`, `do_statement`, `switch_expression`/`switch_statement`, `switch_block_statement_group`/`switch_rule`, `catch_clause`, `ternary_expression` | `lambda_expression` | `&&`, `||` |
 | Python | `if_statement`, `elif_clause`, `for_statement`, `while_statement`, `match_statement`, `case_clause`, `except_clause`, `conditional_expression` | `lambda` | `and`, `or` |
-| JavaScript | `if_statement`, `for_statement`, `for_in_statement`, `while_statement`, `do_statement`, `switch_statement`, `switch_case`/`switch_default`, `catch_clause`, `ternary_expression` | `arrow_function`, `function_expression` | `&&`, `||` |
+| JavaScript, TypeScript | `if_statement`, `for_statement`, `for_in_statement`, `while_statement`, `do_statement`, `switch_statement`, `switch_case`/`switch_default`, `catch_clause`, `ternary_expression` | `arrow_function`, `function_expression` | `&&`, `||` |
 | Rust | `if_expression`, `for_expression`, `while_expression`, `loop_expression`, `match_expression`, `match_arm`, `closure_expression`, `try_expression` (`?` adds zero) | `closure_expression` | `&&`, `||` |
 
 A selected pinned source that parses with a tree-sitter `ERROR` or `MISSING`, even outside a callable, is reported and never refuses the request (owner ruling 2026-10-31, #563): the file is a `partialFiles` row with reason `syntax_error`, and every other file is served. Its callables are scored from the recovered tree, and a callable whose body the parser lost has an unmeasured body, so its scores are lower bounds. A valid file with zero callables succeeds. Cancellation and deadlines are separate `cancelled`/`deadline_exceeded`, not syntax errors.

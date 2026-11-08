@@ -262,7 +262,7 @@ fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_rank::Searc
 // fallback, then retain binary raw-name equality after this indexed prefilter.
 fn search_exact_lookup_keys(query: &str) -> BTreeSet<String> {
     let mut keys = BTreeSet::from([query.to_owned()]);
-    for language in ["rust", "python", "java", "javascript"] {
+    for language in ["rust", "python", "java", "javascript", "typescript"] {
         if let Ok(key) = crate::native_evidence::lookup(language, query) {
             keys.insert(key);
         }

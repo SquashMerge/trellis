@@ -778,3 +778,16 @@ fn exact_lookup_prefilter_includes_raw_javascript_fallback() {
     assert!(search_exact_lookup_keys("Kelvin").contains("Kelvin"));
     assert!(search_exact_lookup_keys(r"caf\u00e9").contains("café"));
 }
+
+#[test]
+fn exact_lookup_prefilter_derives_every_native_language_key() {
+    for query in ["Kelvin", "r#type", r"café", r"abc", "caf\u{e9}"] {
+        let keys = search_exact_lookup_keys(query);
+        for language in crate::native_evidence::LANGUAGES {
+            if let Ok(key) = crate::native_evidence::lookup(language, query) {
+                assert!(keys.contains(&key), "{language} key of {query:?}");
+            }
+        }
+    }
+    assert!(search_exact_lookup_keys(r"abc").contains("abc"));
+}

@@ -99,6 +99,7 @@ fn snapshot_at(
         },
         documents,
         manifests: Vec::new(),
+        root_tsconfig: None,
         evidence_gaps: gaps,
     }
 }

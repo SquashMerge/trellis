@@ -116,7 +116,15 @@ pub struct ArtifactEntry {
     pub relative_path: String,
     pub byte_length: u64,
     pub sha256: String,
-    pub language: String,
+    /// The languages the artifact covers, in contract order (#22).
+    pub languages: Vec<String>,
+}
+
+impl ArtifactEntry {
+    /// The canonical JSON array stored as `languages`.
+    pub fn languages_json(&self) -> String {
+        serde_json::to_string(&self.languages).expect("a string array serializes")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,7 +473,17 @@ impl Descriptor {
             if usize::try_from(artifact.ordinal) != Ok(index) {
                 return Err(admission("artifact ordinals"));
             }
-            if !self.producer.languages.contains(&artifact.language) {
+            let ordered = artifact
+                .languages
+                .windows(2)
+                .all(|pair| order(&pair[0]) < order(&pair[1]));
+            if artifact.languages.is_empty()
+                || !ordered
+                || !artifact
+                    .languages
+                    .iter()
+                    .all(|language| self.producer.languages.contains(language))
+            {
                 return Err(admission("artifact language"));
             }
             if artifact.byte_length > limits.artifact_bytes {
@@ -663,7 +681,7 @@ impl RowOrder {
 }
 
 /// The ordinal of the artifact that carries a document's basis (§4.4 e). A covered document
-/// uses its assigned artifact. An excluded one uses the lowest-ordinal artifact of its own
+/// uses its assigned artifact. An excluded one uses the lowest-ordinal artifact that covers its
 /// language, or artifact 0 when none matches. Staged joins and native rejoin both call this.
 pub fn basis_artifact_ordinal(
     artifacts: &[ArtifactEntry],
@@ -674,7 +692,7 @@ pub fn basis_artifact_ordinal(
         .or_else(|| {
             artifacts
                 .iter()
-                .filter(|artifact| artifact.language == language)
+                .filter(|artifact| artifact.languages.iter().any(|l| l == language))
                 .map(|artifact| artifact.ordinal)
                 .min()
         })

@@ -1908,3 +1908,192 @@ fn over_deep_files_limit_the_catalog_and_never_fail_it() {
         );
     }
 }
+
+fn ts_relations(c: &Catalog, owner: &str) -> Vec<(String, String)> {
+    let owner = &class(c, owner).symbol.id;
+    let mut out: Vec<_> = c
+        .relations
+        .iter()
+        .filter(|r| &r.owner == owner)
+        .map(|r| (r.kind.clone(), r.type_name.clone()))
+        .collect();
+    out.sort();
+    out
+}
+fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+        .collect()
+}
+
+#[test]
+fn typescript_interfaces_and_classes_record_heritage_as_terminal_hints() {
+    let (_g, c) = index(&[(
+        "src/repo.ts",
+        r#"export interface Entity { id: number }
+export interface Named { name: string }
+export interface Both extends Entity, Named {}
+export class Repo<T> {}
+export class Store<T extends Entity> extends Repo<T> implements Entity, Named {
+  id = 1;
+  name = "s";
+}
+class Dotted extends ns.Repo<string> {}
+"#,
+    )]);
+    let both = class(&c, "src.repo.Both");
+    assert_eq!(both.language, "typescript");
+    assert_eq!(both.declaration_kind, "interface");
+    assert_eq!(
+        ts_relations(&c, "src.repo.Both"),
+        pairs(&[("extends", "Entity"), ("extends", "Named")])
+    );
+    let store = class(&c, "src.repo.Store");
+    assert_eq!(store.declaration_kind, "class");
+    assert_eq!(
+        ts_relations(&c, "src.repo.Store"),
+        pairs(&[
+            ("extends", "Repo"),
+            ("implements", "Entity"),
+            ("implements", "Named"),
+        ])
+    );
+    assert_eq!(
+        ts_relations(&c, "src.repo.Dotted"),
+        pairs(&[("extends", "ns.Repo")]),
+        "a heritage name never records its generic arguments"
+    );
+    assert!(
+        c.relations
+            .iter()
+            .all(|r| r.target.is_none() && r.match_kind == "unmatched")
+    );
+}
+
+#[test]
+fn typescript_abstract_classes_and_typed_members_are_catalogued() {
+    let (g, c) = index(&[(
+        "src/shapes.ts",
+        r#"export abstract class Shape implements Drawable {
+  abstract area(): number;
+  abstract name: string;
+  protected tags: Tag[] = [];
+  readonly owner?: Owner;
+  describe(prefix: Label, ...rest: Extra[]): Promise<Result<Item>> { return null as never; }
+}
+"#,
+    )]);
+    let shape = class(&c, "src.shapes.Shape");
+    assert_eq!(shape.language, "typescript");
+    assert_eq!(shape.declaration_kind, "abstract_class");
+    assert_eq!(names(&shape.methods), ["area", "describe"]);
+    assert_eq!(names(&shape.fields), ["name", "tags", "owner"]);
+    assert_eq!(shape.fields[1].type_hint.as_deref(), Some("Tag[]"));
+    assert_eq!(shape.fields[2].type_hint.as_deref(), Some("Owner"));
+    assert_eq!(
+        shape.methods[1].type_hint.as_deref(),
+        Some("Promise<Result<Item>>")
+    );
+    for method in &shape.methods {
+        let id = method.symbol_id.as_ref().expect("measured method symbol");
+        assert!(g.nodes.iter().any(|n| &n.id == id));
+    }
+    assert_eq!(
+        ts_relations(&c, "src.shapes.Shape"),
+        pairs(&[
+            ("field", "Owner"),
+            ("field", "Tag"),
+            ("implements", "Drawable"),
+            ("parameter", "Extra"),
+            ("parameter", "Label"),
+            ("returns", "Item"),
+            ("returns", "Promise"),
+            ("returns", "Result"),
+        ])
+    );
+}
+
+#[test]
+fn typescript_parameter_properties_are_fields_and_plain_parameters_are_not() {
+    let (_g, c) = index(&[(
+        "src/model.ts",
+        r#"export class Model extends Base {
+  constructor(public id: number, private readonly name: Label, readonly flag: boolean, plain: Other, override extra?: Extra) { super(); }
+}
+"#,
+    )]);
+    let model = class(&c, "src.model.Model");
+    assert_eq!(names(&model.fields), ["id", "name", "flag", "extra"]);
+    assert_eq!(model.fields[0].type_hint.as_deref(), Some("number"));
+    assert_eq!(model.fields[1].type_hint.as_deref(), Some("Label"));
+    assert_eq!(names(&model.methods), ["constructor"]);
+    assert!(
+        ts_relations(&c, "src.model.Model").contains(&("parameter".into(), "Other".into())),
+        "every parameter type is still a parameter reference"
+    );
+}
+
+#[test]
+fn typescript_enums_list_members_as_fields() {
+    let (_g, c) = index(&[(
+        "src/status.ts",
+        "export enum Status { Active, Inactive = 2, Gone = \"g\" }\nexport const enum Flag { A = 1 }\n",
+    )]);
+    let status = class(&c, "src.status.Status");
+    assert_eq!(status.declaration_kind, "enum");
+    assert_eq!(names(&status.fields), ["Active", "Inactive", "Gone"]);
+    assert!(status.methods.is_empty());
+    assert_eq!(names(&class(&c, "src.status.Flag").fields), ["A"]);
+}
+
+#[test]
+fn typescript_tsx_and_declaration_files_are_catalogued_and_namespaces_are_not() {
+    let (_g, c) = index(&[
+        (
+            "ui/view.tsx",
+            "export class View extends Base { render(): JSX.Element { return <div/>; } }\n",
+        ),
+        (
+            "types/shape.d.ts",
+            "export declare class Shape { area(): number; }\ndeclare class Hidden {}\ndeclare namespace Geo { class Inner {} }\n",
+        ),
+        (
+            "src/ns.ts",
+            "export namespace Outer { export class Inner {} }\nnamespace Plain { class Other {} }\nclass Top {}\n",
+        ),
+    ]);
+    let mut qualified: Vec<_> = c
+        .classes
+        .iter()
+        .map(|c| c.qualified_name.as_str())
+        .collect();
+    qualified.sort();
+    assert_eq!(
+        qualified,
+        [
+            "src.ns.Top",
+            "types.shape.Hidden",
+            "types.shape.Shape",
+            "ui.view.View"
+        ],
+        "suffixes are stripped from the module name; namespace classes are absent"
+    );
+    assert_eq!(names(&class(&c, "types.shape.Shape").methods), ["area"]);
+    assert_eq!(
+        ts_relations(&c, "ui.view.View"),
+        pairs(&[("extends", "Base"), ("returns", "JSX.Element")])
+    );
+}
+
+#[test]
+fn typescript_catalog_carries_the_namespace_notice() {
+    let (_g, c) = index(&[("a.ts", "class A {}\n")]);
+    assert!(
+        c.warnings
+            .iter()
+            .any(|w| w.contains("TypeScript: classes inside namespaces/modules are not catalogued")),
+        "{:?}",
+        c.warnings
+    );
+}

@@ -158,6 +158,11 @@ fn native_components(
 pub fn language_of(path: &str) -> s::Language {
     if path.ends_with(".js") {
         s::Language::Javascript
+    } else if [".ts", ".tsx", ".mts", ".cts"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+    {
+        s::Language::Typescript
     } else if path.ends_with(".py") {
         s::Language::Python
     } else if path.ends_with(".java") {
@@ -170,6 +175,7 @@ pub fn language_of(path: &str) -> s::Language {
 fn language_name(language: s::Language) -> &'static str {
     match language {
         s::Language::Javascript => "javascript",
+        s::Language::Typescript => "typescript",
         s::Language::Rust => "rust",
         s::Language::Python => "python",
         s::Language::Java => "java",

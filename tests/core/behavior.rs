@@ -12,8 +12,11 @@ use trellis::{
 };
 
 fn fixture(source: &str, name: &str) -> (Graph, SequenceView) {
+    fixture_at("fixture.js", source, name)
+}
+fn fixture_at(path: &str, source: &str, name: &str) -> (Graph, SequenceView) {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("fixture.js"), source).unwrap();
+    std::fs::write(dir.path().join(path), source).unwrap();
     let graph = index_workspace(
         &IndexOptions::new(dir.path().to_owned()),
         &Arc::new(AtomicBool::new(false)),
@@ -586,6 +589,48 @@ fn builtin_identification_respects_lexical_parameters_and_mutations() {
         let (_, view) = fixture(source, "run");
         assert_eq!(
             participant_for(&view, "JSON.stringify").kind,
+            "builtin",
+            "{source}"
+        );
+    }
+}
+#[test]
+fn typescript_value_declarations_shadow_standard_globals_and_types_do_not() {
+    for source in [
+        "abstract class Math { static abs(n: number): number { return n; } }\nfunction run(): number { return Math.abs(-1); }",
+        "enum Math { A }\nfunction run() { return Math.abs(-1); }",
+        "const enum Math { A }\nfunction run() { return Math.abs(-1); }",
+        "namespace Math { export const abs = (n: number) => n; }\nfunction run() { return Math.abs(-1); }",
+        "module Math { export const abs = (n: number) => n; }\nfunction run() { return Math.abs(-1); }",
+        "namespace Math.Inner { export const x = 1; }\nfunction run() { return Math.abs(-1); }",
+        "import Math = require(\"m\");\nfunction run() { return Math.abs(-1); }",
+        "import Math = Other.Math;\nfunction run() { return Math.abs(-1); }",
+        "declare const Math: { abs(n: number): number };\nfunction run() { return Math.abs(-1); }",
+        "declare namespace Math { function abs(n: number): number; }\nfunction run() { return Math.abs(-1); }",
+    ] {
+        let (_, view) = fixture_at("fixture.ts", source, "run");
+        assert_ne!(
+            participant_for(&view, "Math.abs").kind,
+            "builtin",
+            "{source}"
+        );
+    }
+    // Ambient and overload function signatures bind their name like a declaration.
+    for source in [
+        "declare function Math(): number;\nexport function run() { return Math(); }",
+        "export function run() { return Math(); }\nfunction Math(): number;\nfunction Math(): number { return 1; }",
+    ] {
+        let (_, view) = fixture_at("fixture.ts", source, "run");
+        assert_ne!(participant_for(&view, "Math").kind, "builtin", "{source}");
+    }
+    for source in [
+        "interface Math { x: number }\nfunction run() { return Math.abs(-1); }",
+        "type Math = number;\nfunction run() { return Math.abs(-1); }",
+        "function run() { return Math.abs(-1); }",
+    ] {
+        let (_, view) = fixture_at("fixture.ts", source, "run");
+        assert_eq!(
+            participant_for(&view, "Math.abs").kind,
             "builtin",
             "{source}"
         );

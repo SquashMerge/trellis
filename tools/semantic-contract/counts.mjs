@@ -634,7 +634,7 @@ export function checkCounts(
   );
   const directory = loaded.root?.replaceAll("\\", "/").split("/").at(-1);
   const literalExample = directory === "example";
-  const languageDirectory = ["java", "rust", "python", "javascript"].includes(
+  const languageDirectory = ["java", "rust", "python", "javascript", "typescript"].includes(
     directory,
   );
   // Draft corpora check every invariant except the floors; the final corpus
@@ -696,6 +696,10 @@ const sharedFloors = {
 };
 const languageFloors = {
   javascript: {
+    ...sharedFloors,
+    outcomes: { ...sharedFloors.outcomes, unsupported: 0 },
+  },
+  typescript: {
     ...sharedFloors,
     outcomes: { ...sharedFloors.outcomes, unsupported: 0 },
   },

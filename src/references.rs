@@ -16,6 +16,7 @@ mod javascript;
 pub(crate) mod parallel_check;
 mod python;
 mod rust;
+pub mod tsconfig;
 pub(crate) mod work;
 
 const FOLLOW: usize = 4;
@@ -36,6 +37,8 @@ pub struct Snapshot {
     pub pin: IndexPin,
     pub documents: Vec<DocumentInput>,
     pub manifests: Vec<external::ManifestInput>,
+    /// The root `tsconfig.json`, else `jsconfig.json`, when the revision captured one.
+    pub root_tsconfig: Option<tsconfig::RootTsconfigInput>,
     /// Documents published with no evidence but their file module, and their `partialFiles`
     /// reason: over the evidence budget (#564), or not read (#576).
     pub evidence_gaps: BTreeMap<DocumentKey, &'static str>,
@@ -357,6 +360,16 @@ fn resolve(
             "bounded_work: reference source bytes"
         );
     }
+    if let Some(config) = &snapshot.root_tsconfig {
+        check()?;
+        total_bytes = total_bytes
+            .checked_add(config.bytes.len())
+            .context("bounded_work: reference bytes")?;
+        ensure!(
+            config.bytes.len() <= SOURCE_BYTES && total_bytes <= TOTAL_BYTES,
+            "bounded_work: reference source bytes"
+        );
+    }
     for (i, doc) in docs.iter().enumerate() {
         check()?;
         ensure!(
@@ -450,7 +463,7 @@ fn resolve(
             3 => {
                 let catalog = if selected
                     .iter()
-                    .any(|&i| docs[i].key.language == "javascript")
+                    .any(|&i| script_family(&docs[i].key.language))
                 {
                     let packages = external::JavascriptPackages::new(
                         &snapshot.manifests,
@@ -463,6 +476,7 @@ fn resolve(
                         &document_map,
                         &selected,
                         &packages,
+                        snapshot.root_tsconfig.as_ref(),
                         &mut work,
                         request,
                         workers,
@@ -593,7 +607,7 @@ fn resolve(
                         &mut rust.work,
                         check,
                     )?),
-                    Some(item) if doc.key.language == "javascript" => Some(
+                    Some(item) if script_family(&doc.key.language) => Some(
                         javascript
                             .as_ref()
                             .expect("selected JavaScript catalog")
@@ -1166,18 +1180,23 @@ fn map_all_hooked<T: Sync, R: Send>(
         .collect()
 }
 
-fn grammar(language: &str) -> Result<tree_sitter::Language> {
-    Ok(match language {
+/// JavaScript and TypeScript share one import-resolution family.
+fn script_family(language: &str) -> bool {
+    matches!(language, "javascript" | "typescript")
+}
+fn grammar(key: &DocumentKey) -> Result<tree_sitter::Language> {
+    Ok(match key.language.as_str() {
         "java" => tree_sitter_java::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(&key.path),
         _ => anyhow::bail!("store_unavailable: reference language"),
     })
 }
 fn parse(doc: &DocumentInput, check: &mut impl FnMut() -> Result<()>) -> Result<Tree> {
     let mut parser = Parser::new();
-    parser.set_language(&grammar(&doc.key.language)?)?;
+    parser.set_language(&grammar(&doc.key)?)?;
     let mut aborted = None;
     let tree = parser.parse_with_options(
         &mut |offset, _| &doc.file.text.as_bytes()[offset..],
@@ -1371,7 +1390,7 @@ fn extract(
     if doc.key.language == "python" {
         return python::extract(doc, tree, work, check);
     }
-    if doc.key.language == "javascript" {
+    if script_family(&doc.key.language) {
         return javascript::extract(doc, tree, work, check);
     }
     Ok(Vec::new())
@@ -1604,6 +1623,7 @@ mod parallel_tests {
             },
             documents,
             manifests: Vec::new(),
+            root_tsconfig: None,
             evidence_gaps: Default::default(),
         }
     }

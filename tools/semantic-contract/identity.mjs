@@ -33,7 +33,7 @@ export function sourceManifestHash(rows) {
   validate("SourceManifestInput", rows);
   const seen = new Set();
   let previous = null;
-  const languages = ["java", "rust", "python", "javascript"];
+  const languages = ["java", "rust", "python", "javascript", "typescript"];
   for (const row of rows) {
     const key = row.document;
     const identity = canonicalBytes(key).toString("hex");

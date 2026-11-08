@@ -238,7 +238,7 @@ async fn javascript_classes_are_served_with_supported_languages_and_method_seeds
     assert_eq!(status, 200, "{page}");
     assert_eq!(
         page["supportedLanguages"],
-        json!(["java", "python", "javascript", "rust"])
+        json!(["java", "python", "javascript", "rust", "typescript"])
     );
     assert!(
         page["warnings"]
@@ -314,6 +314,53 @@ async fn javascript_classes_are_served_with_supported_languages_and_method_seeds
     assert_eq!(search["items"].as_array().unwrap().len(), 1);
     assert_eq!(search["items"][0]["qualifiedName"], "web.view.View");
 }
+#[tokio::test]
+async fn typescript_classes_are_served_without_an_unsupported_warning() {
+    let (_dir, store, _graph, app, _session) = setup_files(&[
+        (
+            "web/model.ts",
+            "export interface Named { name: string }\nexport class Model implements Named {\n  constructor(public name: string) {}\n  label(): string { return this.name; }\n}\n",
+        ),
+        (
+            "web/view.tsx",
+            "export class View { render() { return 1; } }\n",
+        ),
+    ]);
+    let pin = store.status().unwrap().revision;
+    for (path, qualified) in [
+        ("web/model.ts", "web.model.Model"),
+        ("web/view.tsx", "web.view.View"),
+    ] {
+        let (status, page) = call(
+            &app,
+            "GET",
+            &format!("/api/classes?path={path}&{}", pin_query(pin)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "{page}");
+        assert!(
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["qualifiedName"] == qualified && c["language"] == "typescript"),
+            "{page}"
+        );
+        assert!(
+            page["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|w| !w.as_str().unwrap().contains("currently support")),
+            "{page}"
+        );
+        assert_eq!(
+            page["supportedLanguages"],
+            json!(["java", "python", "javascript", "rust", "typescript"])
+        );
+    }
+}
 /// Real-shaped Rust: this repository's own `JoinIndex`/`JoinSink` traits and
 /// their implementations, at their real paths, read from the checkout.
 #[tokio::test]
@@ -359,7 +406,7 @@ async fn rust_join_traits_and_impls_from_this_repository_are_served() {
     let sinks = page("JoinSink").await;
     assert_eq!(
         sinks["supportedLanguages"],
-        json!(["java", "python", "javascript", "rust"])
+        json!(["java", "python", "javascript", "rust", "typescript"])
     );
     let sink = found(&sinks, "semantic_import::join_store::JoinSink");
     assert_eq!(sink["language"], "rust");
@@ -817,7 +864,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         (version, marker.as_str(), generation, revision),
         (
-            40,
+            41,
             "native-v6-delta-v1",
             prior.index_generation.to_string(),
             prior.index_revision as i64
@@ -826,7 +873,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        40
+        41
     );
     assert!(
         store

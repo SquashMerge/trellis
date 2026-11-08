@@ -57,6 +57,28 @@
       "runtime": "trellis.native.syntax@native-v10 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
     },
     {
+      "name": "trellis-native-v16-javascript-test-support",
+      "status": "recorded",
+      "version": "native-v16",
+      "installedAtCapture": true,
+      "capturedOn": "2026-11-08",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; feature/683 final extractor (s4-corpus-repin: TypeScript grammar, native constructs and class diagrams; re-pinned for the #800 review fix that skips type-only import expressions as calls, captures unchanged) merged with main; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:a1c7d0caa1c76e9414ecc028aa89190bcf7d34158b59f019e8671e08e45dacd5",
+      "executableHash": "a1c7d0caa1c76e9414ecc028aa89190bcf7d34158b59f019e8671e08e45dacd5",
+      "runtime": "trellis.native.syntax@native-v16 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; tree-sitter-typescript 0.23.2; UTF-8; source-only extractionInputs []."
+    },
+    {
+      "name": "trellis-native-v16-typescript-test-support",
+      "status": "recorded",
+      "version": "native-v16",
+      "installedAtCapture": true,
+      "capturedOn": "2026-11-08",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; feature/683 final extractor (s4-corpus-repin: TypeScript grammar, native constructs and class diagrams; re-pinned for the #800 review fix that skips type-only import expressions as calls, captures unchanged) merged with main; TypeScript draft corpus captured twice byte-identical; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:a1c7d0caa1c76e9414ecc028aa89190bcf7d34158b59f019e8671e08e45dacd5",
+      "executableHash": "a1c7d0caa1c76e9414ecc028aa89190bcf7d34158b59f019e8671e08e45dacd5",
+      "runtime": "trellis.native.syntax@native-v16 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; tree-sitter-typescript 0.23.2; UTF-8; source-only extractionInputs []."
+    },
+    {
       "name": "trellis-native-v15-javascript-test-support",
       "status": "recorded",
       "version": "native-v15",

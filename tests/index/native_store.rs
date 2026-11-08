@@ -253,7 +253,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        40
+        41
     );
     let count: i64 = db
         .query_row(
@@ -758,7 +758,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         let version: String = db
             .query_row("SELECT version FROM native_producers", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, "native-v15");
+        assert_eq!(version, "native-v16");
         let calls: Vec<String> = db
             .prepare("SELECT 'occ:v2:'||lower(hex(id)) FROM native_version_calls")
             .unwrap()
@@ -855,7 +855,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        40
+        41
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -866,7 +866,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
     let version: String = rebuilt
         .query_row("SELECT version FROM native_producers", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, "native-v15");
+    assert_eq!(version, "native-v16");
     let roles = store
         .native_declarations_at(pin, "javascript", "hello")
         .unwrap();
@@ -884,6 +884,39 @@ fn published_db(state: &std::path::Path, root: &std::path::Path) -> std::path::P
                 .root_key,
         )
         .join("index.db")
+}
+
+/// `graph_projections` admits `typescript` with a ready class extraction, and only then.
+#[test]
+#[cfg(feature = "test-support")]
+fn typescript_publishes_a_ready_class_projection() {
+    let (state, root, store, cancel) = fixture();
+    fs::write(
+        root.path().join("shape.ts"),
+        "export class Shape { constructor(public id: number) {} }\n",
+    )
+    .unwrap();
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let state_of = |path: &str| -> String {
+        db.query_row(
+            "SELECT g.class_extraction_state FROM graph_projections g JOIN revision_documents d ON d.gid=g.gid WHERE d.revision_id=?1 AND d.path=?2",
+            rusqlite::params![live_revision(&db), path],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(state_of("shape.ts"), "ready");
+    let tampered = db.execute(
+        "UPDATE graph_projections SET class_extraction_state='notApplicable',class_extraction_payload=NULL,class_summary_payload=NULL WHERE language='typescript'",
+        [],
+    );
+    assert!(
+        tampered.is_err(),
+        "a typescript projection cannot be notApplicable"
+    );
 }
 
 #[test]
@@ -3529,7 +3562,7 @@ fn schemas16_19_23_24_26_27_28_29_30_31_38_and39_recreate_exclusively_without_mi
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            40
+            41
         );
         assert_eq!(
             rebuilt
@@ -3538,7 +3571,7 @@ fn schemas16_19_23_24_26_27_28_29_30_31_38_and39_recreate_exclusively_without_mi
                     0
                 ))
                 .unwrap(),
-            40
+            41
         );
         for table in [
             "native_version_references",
@@ -3580,7 +3613,7 @@ fn selected_capture_keeps_r1_and_all_raw_proofs_until_last_selector_expires() {
         let hash = "0".repeat(64);
         db.execute("INSERT INTO semantic_raw_batches(producer_id,producer_version,profile_id,source_set_id,captured_revision,source_manifest_hash,descriptor_sha256,descriptor_bytes,decoder_version) SELECT 'fixture','fixture','fixture',source_set_id,native_revision_id,?2,?2,x'02','fixture' FROM native_revisions WHERE published_index_revision=?1", rusqlite::params![r1.index_revision as i64, hash])?;
         let batch_id = db.last_insert_rowid();
-        db.execute("INSERT INTO semantic_raw_captures(batch_id,ordinal,language,producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,decoder_version) SELECT ?1,0,'javascript','fixture',?3,source_set_id,native_revision_id,x'01','fixture' FROM native_revisions WHERE published_index_revision=?2", rusqlite::params![batch_id, r1.index_revision as i64, hash])?;
+        db.execute("INSERT INTO semantic_raw_captures(batch_id,ordinal,languages,producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,decoder_version) SELECT ?1,0,'[\"javascript\"]','fixture',?3,source_set_id,native_revision_id,x'01','fixture' FROM native_revisions WHERE published_index_revision=?2", rusqlite::params![batch_id, r1.index_revision as i64, hash])?;
         let capture_id = db.last_insert_rowid();
         db.execute("INSERT INTO semantic_raw_exclusions(batch_id,language,path,reason) VALUES(?1,'javascript','flow.js','failed')", [batch_id])?;
         for i in 0..70_u32 {
@@ -3683,7 +3716,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=41").unwrap();
+    db.execute_batch("PRAGMA user_version=42").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3703,13 +3736,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 41);
+    assert_eq!(version, 42);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 40);
+    assert_eq!(metadata_version, 41);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
@@ -5522,7 +5555,7 @@ fn capped_cold_stream_preserves_plain_revision_header_and_catalog_warning() {
         warnings,
         vec![
             "Class catalog declaration limit reached (20000)",
-            "Declared types are terminal source text, not class relationships. Direct class declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery. Rust: inherent impl methods merge by scoped path; derives, macro-generated items and blanket impls are not attributed.",
+            "Declared types are terminal source text, not class relationships. Direct class declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery. Rust: inherent impl methods merge by scoped path; derives, macro-generated items and blanket impls are not attributed. TypeScript: classes inside namespaces/modules are not catalogued; enum members are listed as fields.",
             "Incomplete class declaration registry: some declarations may be absent.",
         ]
     );

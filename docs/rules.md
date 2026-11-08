@@ -383,7 +383,7 @@ shared = true
 external = [{ language = "rust", package = "std", stdlib = true }]
 ```
 
-`language` is `rust`, `java`, `python` or `javascript`. `package` is a literal
+`language` is `rust`, `java`, `python`, `javascript` or `typescript`. `package` is a literal
 canonical identity, not a glob, import alias or version; `stdlib` is required and
 distinguishes standard-library targets from declared dependencies of the same
 spelling. Canonical dependency names are Cargo's upstream declared package name
@@ -433,7 +433,7 @@ start empty. (#783: no top-level `[[apps]]` key is added. An ordered layer gains
 layer gains `apps`; see
 [Amendment (#783)](#amendment-783-apps-and-per-app-layers).) A selector has at least one of `paths`, `name`, `language`, `extends`
 and `implements`. Keys combine with AND; entries within `paths` or `language`
-combine with OR. Languages are `java`, `rust`, `python`, `javascript`. Name patterns
+combine with OR. Languages are `java`, `rust`, `python`, `javascript`, `typescript`. Name patterns
 match the measured nullable name; null never receives an invented name.
 
 `extends` and `implements` **selectors** match direct header syntax spelling where
@@ -516,11 +516,28 @@ Supported mapping is deliberately narrow:
   Captured Cargo declarations and reviewed `std/core/alloc` roots prove package
   targets, never semantic calls. Custom roots/`#[path]`, macro/cfg uncertainty,
   ambiguous ownership and depth beyond four remain unknown.
-- **JavaScript:** static relative imports/reexports/side-effect imports use a
-  unique explicit indexed extension or `.js`/`.mjs`/`.cjs` and `index.js`
-  convention. A trailing `/` selects only a directory's `index.js`, never a
-  sibling file. `export * from` forwards proved named exports, never `default`.
-  Explicit exported names shadow star names; distinct surviving declarations
+- **JavaScript and TypeScript:** the two languages share one resolver. Static
+  relative imports/reexports/side-effect imports (also `import type`,
+  `export type` and `import x = require("m")`) try the extensionless candidates
+  `.ts`, `.tsx`, `.d.ts`, `.js`, `.mjs`, `.cjs` and `index.*` of a directory,
+  including for dotted names such as `./x.config`. `./x.js` also names `x.ts`,
+  `x.tsx` and `x.d.ts`; `./x.mjs` and `./x.cjs` name `.mts`/`.d.mts` and
+  `.cts`/`.d.cts`; `./x.jsx` names `x.tsx`; an explicit TypeScript extension is
+  literal. A trailing `/` selects only a directory's `index` file, never a
+  sibling file. Several hits are partitioned by precedence: implementations in
+  the importer's language, then implementations in the other language, then
+  declaration-only `.d.ts` files; one hit resolves and several in the winning
+  class are `module_path_ambiguous`. A JavaScript importer may therefore resolve
+  to a TypeScript target and the reverse. The root `tsconfig.json` (else
+  `jsconfig.json`; JSONC, `extends` is not followed) adds `paths` (exact key,
+  else the longest `prefix*suffix` pattern, targets in order, targets leaving
+  the checkout skipped), `baseUrl` and `rootDirs` for relative misses. A bare
+  specifier falls back to a package only when no local module matched; an
+  ambiguous local match stays `module_path_ambiguous`. A
+  config that cannot be read leaves relative resolution unchanged and reports
+  bare specifiers that match no package as `tsconfig_unreadable`. `export = x`
+  sets an unknown name set; `.cts` ends export following. `export * from`
+  forwards proved named exports, never `default`. Explicit exported names shadow star names; distinct surviving declarations
   collide, while routes to the same native declaration deduplicate. Import-binding
   reexports retain the original identity; a proved local variable alias keeps its
   own native binding identity and owner, not its initializer's. Proved forwarding
@@ -531,7 +548,9 @@ Supported mapping is deliberately narrow:
   an explicit proved export settles only its matching name. Supported static
   literals use the resolver's documented decoding subset, not runtime execution.
   Bare imports can label captured npm dependencies or the exact reviewed Node
-  catalog below. Relative misses never fall back to builtin or npm labels.
+  catalog below, after `paths`/`baseUrl` fall through; the identity carries the
+  importing file's language (`javascript` or `typescript`). Relative misses never
+  fall back to builtin or npm labels.
 - **Python:** captured `m.py` or `m/__init__.py` layouts at the checkout root or
   a declared source root require unique module ownership and proved `__init__.py`
   package prefixes. Declared source roots (#771, owner-ratified 2026-11-07) are the literal relative
@@ -575,7 +594,7 @@ are syntax. Unsupported coverage and unresolved counts stay visible. Paths hidde
 behind unproved aliases are not claimed covered. Rust/Java external-name
 uncertainty does not veto an independently proved in-repo wildcard name; two
 native candidates, macro/cfg uncertainty or unproved explicit bindings still do.
-Python/JavaScript retain wildcard-only names as unknown under external-name
+Python/JavaScript/TypeScript retain wildcard-only names as unknown under external-name
 uncertainty unless an explicit/local binding settles them. This is **syntactic,
 structurally mapped reference evidence**, not a compiler dependency graph,
 resolved library membership or call binding. A positive mapped upward reference can deviate under this syntax contract;
@@ -625,8 +644,8 @@ destination = { language = "rust", path = "src/navigation.rs" }
 reason = "Concrete reviewed justification for this observed pair"
 ```
 
-Both fields are required at each endpoint. Language is `rust`, `java`, `python`
-or `javascript`. Paths are nonempty, literal, case-sensitive repository-relative
+Both fields are required at each endpoint. Language is `rust`, `java`, `python`,
+`javascript` or `typescript`. Paths are nonempty, literal, case-sensitive repository-relative
 paths, not globs, basenames or suffix matches. Wildcard markers `*` and `?` are
 invalid, as are absolute paths, backslashes, NUL, colons, empty components, `.` and
 `..` components. Existing path-length bounds apply. There is no case normalization
@@ -759,7 +778,7 @@ an over-deep one:
 - In Rust, every scope of the file is opaque, and an explicit name there is unknown too. A
   file below it that its text names, but its tree doesn't declare, could have it as a second
   owner, so that file and everything below it have no proved crate.
-- In JavaScript and Python, the file counts as dynamic: its exports are unknown.
+- In JavaScript, TypeScript and Python, the file counts as dynamic: its exports are unknown.
 - In Java, no type root or explicit import of the file is proved, and neither is any type of
   its package, nor any name another file's type root could lose to a type hidden there. A
   broken package declaration, or a broken file with none that still spells `package`, leaves
@@ -769,7 +788,7 @@ an over-deep one:
 - A selector's `extends` or `implements` on a type in the file is unknown, not false.
 
 Sites that survive in the recovered tree keep the resolution their language gives them: an
-intact `import` of a broken JavaScript or Python file still maps its literal path.
+intact `import` of a broken JavaScript, TypeScript or Python file still maps its literal path.
 
 `evidence_budget` names a document published with no evidence but its file module, because
 its facts exceed a [per-file budget](daemon-v1.md#current-limits) (#564). `range` is the whole file and
@@ -979,7 +998,7 @@ No Python third-party mapping table, installed-distribution lookup or additional
 mapping-metadata capture is part of this slice.
 
 
-JavaScript uses `ecosystem:"npm"` only for supported declarations in the captured
+JavaScript and TypeScript use `ecosystem:"npm"` only for supported declarations in the captured
 root `package.json`: `dependencies`, `devDependencies`, `optionalDependencies`
 and `peerDependencies`. Constraints are literal decimal `M.m.p`, `^M.m.p` or
 `~M.m.p`, without leading-zero components, whitespace, suffixes or compound ranges.
