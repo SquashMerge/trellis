@@ -277,7 +277,8 @@
       chrome.back.focus();
       return reading;
     }
-    function reset() {
+    function reset(keepReopen = false) {
+      if (!keepReopen) pending = null;
       ticket++; opened = false; showHidden(); lineActive = null;
       base = tree = null; phase = "idle"; progress = ""; errorInfo = null; hiddenNotice = false; feedback = null; activeKey = null; visible = []; nodes.clear();
       state().selected = null;

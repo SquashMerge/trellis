@@ -1166,7 +1166,7 @@ test("deviations reload reopens with the same filters and no selection", async (
   await h.dev.open(h.trigger);
   await h.get("architecture-deviations-reload").dispatch("click");
   assert.equal(h.calls.refreshes, 1);
-  h.dev.reset();
+  h.dev.reset(true);
   assert.equal(h.dev.isOpen(), false);
   assert.equal(h.statics.get("#architecture-diagram").hidden, false);
   h.state.error = null;
@@ -1181,13 +1181,27 @@ test("deviations reload reopens with the same filters and no selection", async (
   await h.expandAll();
   await h.treeRows().find(row => row.dataset.level === "3").dispatch("click");
   h.dev.reopenAfterRefresh();
-  h.dev.reset();
+  h.dev.reset(true);
   await h.dev.afterRefresh();
   assert.equal(chip("Storage→UI").attrs["aria-pressed"], "true");
   assert.equal(h.get("architecture-deviations-calls").checked, true);
   assert.equal(h.dev.snapshot().selected, null);
   assert.equal(h.treeRows().filter(row => row.attrs["aria-selected"] === "true").length, 0);
   await h.dev.afterRefresh();
+});
+
+test("a reset that is not a refresh drops the pending reopen request", async () => {
+  const h = deviationsHarness();
+  await h.dev.open(h.trigger);
+  h.dev.reopenAfterRefresh();
+  h.dev.reset();
+  await h.dev.afterRefresh();
+  assert.equal(h.dev.isOpen(), false, "a later successful refresh does not reopen the tree");
+  await h.dev.open(h.trigger);
+  h.dev.reopenAfterRefresh();
+  h.dev.reset(true);
+  await h.dev.afterRefresh();
+  assert.equal(h.dev.isOpen(), true, "the refresh's own reset keeps the request");
 });
 
 test("deviations line menu: three triggers pass the same actions and label", async () => {

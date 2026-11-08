@@ -1799,3 +1799,126 @@ test("Deviations tree keyboard navigation", {timeout:240000}, async () => {
     assert.equal(await tree.locator(`.deviation-row[data-level="3"][aria-selected="true"]`).count(), 1, "re-expanding shows the selected line");
   }, new Map(), base);
 });
+
+const highlights = page => page.locator("#sequence-diagram [data-boundary-highlight='true']");
+async function showHighlight(page) {
+  await page.waitForFunction(() => document.querySelector("#sequence-diagram [data-boundary-highlight='true']") || document.querySelector("#sequence-boundary-status")?.textContent.includes("Show all steps"));
+  const status = page.locator("#sequence-boundary-status");
+  if (await status.getByRole("button", {name:"Show all steps", exact:true}).count()) await status.getByRole("button", {name:"Show all steps", exact:true}).click();
+  await highlights(page).first().waitFor({state:"visible"});
+}
+const hashCallIds = page => page.evaluate(() => new URLSearchParams(location.hash.slice(location.hash.indexOf("?") + 1)).getAll("callId"));
+
+test("Deviations Open in Sequence keeps its highlight through Back, Forward and reload", {timeout:240000}, async () => {
+  const {config, base} = deviationsFixture();
+  await published(config, async selected => {
+    const {page, paths} = selected;
+    await ready(page);
+    await openDeviations(page);
+    await chipNamed(page, /low → top/).click();
+    await expandTree(page);
+    const line = lineRow(page, "src/low.rs", 1);
+    await line.click();
+    await line.locator(".deviation-actions").click();
+    await page.locator('[role=menu][aria-label="Line actions"]').getByRole("menuitem", {name:"Open in Sequence"}).click();
+    await showHighlight(page);
+    assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true");
+    assert.equal(await highlights(page).count(), 1);
+    const ids = await hashCallIds(page);
+    assert.equal(ids.length, 1, `exactly one callId in ${await page.evaluate(() => location.hash)}`);
+    assert.match(ids[0], /^occ:v2:[0-9a-f]{32}$/);
+    assert.equal(await highlights(page).first().getAttribute("data-trellis-call-id"), ids[0]);
+    assert.match(await page.locator("#sequence-boundary-status").textContent(), /1 boundary call highlighted\./);
+
+    await page.goBack();
+    await page.locator("#architecture-deviations-tree").waitFor({state:"visible"});
+    const back = lineRow(page, "src/low.rs", 1);
+    await back.waitFor({state:"visible"});
+    assert.equal(await chipNamed(page, /low → top/).getAttribute("aria-pressed"), "true", "Back keeps the chip");
+    assert.equal(await back.getAttribute("aria-selected"), "true", "Back reselects the line");
+    assert.equal(await back.evaluate(node => node === document.activeElement), true, "Back focuses the line");
+    assert.equal(await page.locator("#architecture-inspector-title").textContent(), "src/low.rs:1");
+
+    await page.goForward();
+    await showHighlight(page);
+    assert.equal(await highlights(page).count(), 1, "Forward keeps the in-memory highlight");
+
+    await page.reload({waitUntil:"domcontentloaded"});
+    await page.locator("#token").fill(paths.token);
+    await page.locator("#connect-form button[type=submit]").click();
+    await showHighlight(page);
+    assert.equal(await highlights(page).count(), 1, "a reload rebuilds the highlight from the link");
+    assert.deepEqual(await hashCallIds(page), ids);
+
+    await page.goBack();
+    await page.goForward();
+    await showHighlight(page);
+    assert.equal(await highlights(page).count(), 1);
+    assert.deepEqual(await hashCallIds(page), ids);
+  }, new Map(), base);
+});
+
+test("Deviations Reload reopens the tree after a rules conflict, with the same chip and no selection", {timeout:240000}, async () => {
+  const {config, base} = deviationsFixture();
+  await published(config, async selected => {
+    const {page, paths} = selected;
+    await ready(page);
+    await openDeviations(page);
+    await chipNamed(page, /low → top/).click();
+    await expandTree(page);
+    await lineRow(page, "src/low.rs", 1).click();
+    await page.locator("#architecture-deviations-calls").check();
+    await page.locator("#architecture-deviations-back").click();
+    writeFileSync(rulesPath(paths), `${config}\n# an external editor changed the rules at the same revision\n`);
+    const reload = page.locator("#architecture-deviations-reload");
+    await page.locator("#architecture-review").click();
+    await reload.waitFor({state:"visible"});
+    assert.match(await page.locator("#architecture-deviations-notices").textContent(), /Rules changed since these deviations were loaded\. Reload deviations\./);
+    assert.equal(await page.locator("#architecture-deviations-tree .deviation-row").count(), 0, "no partial tree");
+    await reload.click();
+    await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
+    assert.equal(await chipNamed(page, /low → top/).getAttribute("aria-pressed"), "true", "Reload keeps the chip");
+    assert.equal(await page.locator("#architecture-deviations-calls").isChecked(), true, "Reload keeps Calls only");
+    assert.equal(await page.locator("#architecture-deviations-tree [aria-selected=true]").count(), 0, "Reload selects nothing");
+    assert.equal(await page.locator("#architecture-deviations-reload").count(), 0);
+  }, new Map(), base);
+});
+
+test("Deviations exception flow previews, confirms and removes the pair from the tree", {timeout:240000}, async () => {
+  const {config, base} = deviationsFixture();
+  await published(config, async selected => {
+    const {page, paths} = selected;
+    await ready(page);
+    await openDeviations(page);
+    await chipNamed(page, /low → top/).click();
+    await expandTree(page);
+    const line = lineRow(page, "src/low.rs", 1);
+    await line.click();
+    await line.locator(".deviation-actions").click();
+    await page.locator('[role=menu][aria-label="Line actions"]').getByRole("menuitem", {name:/^Add exception for this file pair/}).click();
+    await page.locator("#architecture-editor").waitFor({state:"visible"});
+    assert.equal(await page.locator("#architecture-edit-scope").textContent(), "Approves all 3 references from src/low.rs to src/top.rs, including future ones on this pair.");
+    await page.locator("#architecture-reason").fill("Approved while the tree is open");
+    const preview = await previewChange(selected);
+    assert.equal(rulesPosts(selected, "apply").length, 0, "preview writes nothing");
+    await confirmChange(selected, preview);
+    await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
+    assert.equal(await fileRow(page, "src/low.rs").count(), 0, "the excepted pair left the tree");
+    assert.equal(await page.locator("#architecture-deviations-tree [aria-selected=true]").count(), 0);
+    assert.equal(await page.locator("#architecture-deviations-reload").count(), 0);
+  }, new Map(), base);
+});
+
+test("Deviations notice counts unknown instances and opens them in the review panel", {timeout:240000}, async () => {
+  const {config, base} = deviationsFixture();
+  await published(config, async selected => {
+    const {page} = selected;
+    await ready(page);
+    await openDeviations(page);
+    const notice = page.locator("#architecture-deviations-notices");
+    assert.match(await notice.textContent(), /^.*\d+ unknown rule instances? (?:is|are) not deviations\./s);
+    await page.locator("#architecture-deviations-notices").getByRole("button", {name:"Inspect unknown instances"}).click();
+    await page.locator("#architecture-review-panel").waitFor({state:"visible"});
+    assert.equal(await page.locator("#architecture-review-state").inputValue(), "unknown");
+  }, new Map(), base);
+});

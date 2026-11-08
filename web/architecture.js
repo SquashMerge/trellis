@@ -84,12 +84,12 @@
       selectionSerial++; pressed = null; inspection = null;
       window.TrellisShell?.clearArchitectureInspector();
     }
-    function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false) {
+    function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false, keepReopen = false) {
       editSerial++; preview = null; selected.clear();
       if (!keepDraft) setBusy(false);
       if (!keepDraft) { draft = null; get("architecture-review-panel").hidden = true; get("architecture-editor").hidden = true; }
       get("architecture-preview-result").hidden = true;
-      serial++; renderSerial++; clearInspection(); deviations.reset(); view = null; basis = null;
+      serial++; renderSerial++; clearInspection(); deviations.reset(keepReopen); view = null; basis = null;
       clearTimeout(buildingTimer); buildingWake?.(); buildingTimer = buildingWake = null;
       get("architecture-diagram").replaceChildren(); get("architecture-diagram").setAttribute("aria-busy", "false");
       get("architecture-legend").replaceChildren(); get("architecture-notice-content").replaceChildren();
@@ -513,7 +513,7 @@
       return `Building Architecture for this revision: ${phase}${count}…`;
     }
     async function refresh(options = {}) {
-      reset(undefined, options.keepDraft === true);
+      reset(undefined, options.keepDraft === true, true);
       const c = capture();
       if (!c.rootKey || !c.pin) { state("Choose an indexed checkout, then open Architecture.", "empty"); return; }
       loadDisplay(c.rootKey);

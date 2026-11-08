@@ -157,9 +157,10 @@ are lower bounds`, #525). The rule-instance counts (`740 of 1,095 production rul
 unknown`) and the longer prose live behind the ⓘ.
 
 The inspector opens on the counted review chips, **23 deviations · 156 unassigned ·
-0 exceptions**, and every Architecture inspection keeps them at its head. They open the
-review list (production deviations, which is what the first chip counts), the unassigned
-files and the authored exceptions. Deviations are `rules.counts.deviates`, unassigned files
+0 exceptions**, and every Architecture inspection keeps them at its head. The deviations
+chip opens the Deviations tree below; the review list is reached through **Review all rule
+instances** there and through edge inspection. The other chips open the unassigned files and
+the authored exceptions. Deviations are `rules.counts.deviates`, unassigned files
 are the full native module inventory with no assigned layer (including module-only files),
 and exceptions is `exceptionCount`. The evidence disclosure separately labels
 `rules.unassignedCount` as identities, including external packages. There is no refresh button: the
@@ -196,6 +197,53 @@ Non-call syntax references and unavailable callers stay listed with a reason, wi
 guessed method. Rules check/explain evidence carries the same caller key for MCP chaining;
 it does not upgrade the target reference's evidence tier. Sampled counts remain sampled.
 
+Status: proposed (owner-delegated, run 802). A generated Sequence link carries up to 50
+repeated `callId` parameters for the highlighted calls. Reload, Back and Forward keep the
+highlight: Back and Forward restore it from the in-memory entry, and a reload rebuilds it
+from the link. A group of more than 50 calls highlights in memory only; its link omits
+`callId`, and the status says that reloading shows the sequence without highlights.
+
+## Deviations tree (#786)
+
+Status: proposed (owner-delegated, run 802).
+
+The deviations chip replaces the diagram with a tree of every production deviation, found
+without choosing an edge first. It reads `kind=instances`, `rule=$layers`, `status=deviates`,
+`role=production`, `excepted=false` at the view's pin and rules hash, page by page, and
+shows nothing if any page fails. Files are grouped under the edge they reach up or across
+to, then functions, then lines, sorted by references. A line's function reads "(module
+level)" for file-level code and "(anonymous)" when no name was captured.
+
+- **Filters.** The chips are **All deviations** and one per edge, `↑` upward and `⇄` peer or
+  shared. A chip reads `≥N` when the edge count is a lower bound. **Calls only** keeps lines
+  tagged `call`; type uses, imports and other references are hidden.
+- **Counts.** Only a file's `referenceCount` and `kindCounts` are exact. Lines are sampled per
+  file pair, calls first, so a function count reads `≥N` when any instance of its file was
+  truncated, and the footer says so.
+- **Line actions.** One menu with the label "Line actions" opens from the `⋯` button, a
+  right-click or Shift+F10: **Open in Sequence** (only when the line has a measured caller),
+  **Go to call site**, **Go to definition** (only with a target), **Copy location** and
+  **Add exception for this file pair…**. The exception note reads "Approves all N references
+  from A to B, including future ones on this pair." and goes through the normal preview and
+  confirm; once it is applied the pair leaves the tree.
+- **Keyboard.** The tree has one tab stop. Arrow keys move and expand, Home and End jump,
+  Enter or Space toggle a file or function, and Enter selects a line.
+- **Hidden selection.** A filter that hides the selected line clears the selection and says
+  "Selected line is hidden by this filter." **Clear filter** returns to All deviations with
+  Calls only off and selects nothing. A line is never selected for the user.
+- **Unknown.** "N unknown rule instances are not deviations." opens the review panel on the
+  unknown verdict.
+- **Open in Sequence and Back.** The browser history entry keeps whether the tree was open,
+  the chip, Calls only, the expanded rows, the selected line and focus. **Back** reopens the
+  tree and reselects and focuses that line. If the line is gone it says "The selected line is
+  no longer listed." and selects nothing.
+- **Refresh and conflicts.** A moved revision reads "The index moved to a newer revision.
+  Reload deviations."; changed rules read "Rules changed since these deviations were loaded.
+  Reload deviations."; a building index reads "Architecture is still building for this
+  revision." **Reload deviations** re-reads and reopens the tree with the same chip and Calls
+  only and no selection. Applying an exception does the same. A reset for any other reason,
+  such as leaving the tab, drops that request.
+
 ## One computation per revision (#556)
 
 The daemon computes what Architecture needs once per published revision and rules file, in the
@@ -211,7 +259,7 @@ A build reads each document once in one read transaction, ends it, and only then
 references, prepares rule rows and measures metrics. A publication or a retirement waits for
 that read at most, never for the computing, and a read waits for the owner before it admits
 its own transaction. A build keeps no source text, syntax trees or semantic rows, only the
-per-source reference rows (up to 50 sampled sites per edge), rule rows, metric rows and each
+per-source reference rows (up to 50 sampled sites per edge, calls first), rule rows, metric rows and each
 finished summary, so a checkout holds one result, bounded by the existing reference and rule
 budgets. A checkout keeps at most two: the head's, and the one it replaced or an older retained
 revision a page is showing. Every read projects from the result.
