@@ -201,6 +201,20 @@ fn external_rules_explain_closure_and_native_metrics_do_not_create_package_modul
         .find(|row| row["rule"] == "$external")
         .unwrap();
     assert_eq!(ban["status"], "deviates");
+    // #785: the ban row carries its edge's exact kind counts.
+    let counts = &ban["kindCounts"];
+    let total: u64 = ["call", "type", "import", "reference"]
+        .iter()
+        .map(|kind| counts[*kind].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, ban["referenceCount"].as_u64().unwrap(), "{ban}");
+    let edge = refs["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| edge["target"] == ban["destination"] && edge["source"] == ban["target"])
+        .unwrap();
+    assert_eq!(*counts, edge["kindCounts"]);
     assert!(
         check["testOnly"]
             .as_array()
