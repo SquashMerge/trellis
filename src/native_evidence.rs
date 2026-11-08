@@ -1962,13 +1962,13 @@ pub(crate) fn assemble_selected_revision(
     Ok(artifact)
 }
 
-fn kind(lang: &str, n: Node<'_>) -> Option<&'static str> {
+fn kind(lang: &str, n: Node<'_>, text: &str) -> Option<&'static str> {
     match lang {
         "java" => crate::indexer_java::native_kind(n),
         "rust" => crate::indexer_rust::native_kind(n),
         "python" => crate::indexer_python::native_kind(n),
         "javascript" => crate::indexer::native_js_kind(n),
-        "typescript" => crate::indexer_ts::native_ts_kind(n),
+        "typescript" => crate::indexer_ts::native_ts_kind(n, text),
         _ => None,
     }
 }
@@ -2206,7 +2206,14 @@ fn name(n: Node<'_>, f: &SourceFile) -> Option<(String, Range)> {
     {
         return None;
     }
-    let node = if matches!(n.kind(), "import_specifier" | "use_as_clause") {
+    let typescript_name = if f.language == "typescript" {
+        crate::indexer_ts::name_node(n)
+    } else {
+        None
+    };
+    let node = if let Some(decided) = typescript_name {
+        decided
+    } else if matches!(n.kind(), "import_specifier" | "use_as_clause") {
         n.child_by_field_name("alias")
     } else {
         n.child_by_field_name("name")
@@ -2239,7 +2246,11 @@ fn name(n: Node<'_>, f: &SourceFile) -> Option<(String, Range)> {
     .or_else(|| (n.kind() == "identifier").then_some(n))?;
     if !matches!(
         node.kind(),
-        "identifier" | "property_identifier" | "field_identifier" | "type_identifier"
+        "identifier"
+            | "property_identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "string_fragment"
     ) {
         return None;
     }
@@ -2344,6 +2355,15 @@ fn modifier_keyword(value: &str) -> bool {
     )
 }
 
+/// A TypeScript type annotation measures as the type it wraps, without the `: `.
+fn annotated<'t>(f: &SourceFile, node: Node<'t>) -> Node<'t> {
+    if f.language == "typescript" {
+        crate::indexer_ts::unwrap_annotation(node)
+    } else {
+        node
+    }
+}
+
 fn header_with_witnesses(
     n: Node<'_>,
     f: &SourceFile,
@@ -2365,7 +2385,7 @@ fn header_with_witnesses(
     let mut cursor = n.walk();
     for child in n.children(&mut cursor) {
         match child.kind() {
-            "visibility_modifier" => {
+            "visibility_modifier" | "accessibility_modifier" | "override_modifier" => {
                 if let Some(value) = from(child) {
                     modifier_tokens.push((child, value));
                 }
@@ -2432,6 +2452,7 @@ fn header_with_witnesses(
             } else {
                 p.child_by_field_name("type")
             })
+            .map(|node| annotated(f, node))
             .and_then(|node| measured!(format!("header.parameters[{_i}].type"), node));
             Parameter {
                 name: pname,
@@ -2451,6 +2472,7 @@ fn header_with_witnesses(
                 .then(|| n.child_by_field_name("type"))
                 .flatten()
         })
+        .map(|node| annotated(f, node))
         .and_then(|node| measured!("header.resultType".into(), node));
     let bases = [
         "superclass",
@@ -2706,6 +2728,8 @@ fn extract_document(
         macro_parser: None,
         visit_ceiling: VISIT_LIMIT,
         reserved_until: 0,
+        declaration_only: f.language == "typescript"
+            && crate::indexer_ts::declaration_only(&f.path),
     };
     let mut macros = Vec::new();
     let skipped = crate::skipped_source::skipped(&f.language, &f.text);
@@ -2868,6 +2892,9 @@ struct ParserState<'a> {
     /// runs to. A nested expansion must leave room for the rest of its enclosing one.
     visit_ceiling: usize,
     reserved_until: usize,
+    /// A `.d.ts`-style document: no calls, no control regions, and function bodies are
+    /// skipped without a gap (Q2, Q7).
+    declaration_only: bool,
 }
 /// Per-document walk bounds. The walk skips what lies past them and leaves a gap (#554). A
 /// macro expansion measures completely or not at all, so it reserves its extent first and
@@ -3041,6 +3068,9 @@ impl ParserState<'_> {
             }
             return Ok(());
         }
+        if self.declaration_only && crate::indexer_ts::is_executable_body(n) {
+            return Ok(());
+        }
         self.visits += 1;
         // Rust token trees and attributes are opaque source syntax: a call-shaped token
         // inside one is not a measured call. Only allowlisted expression macros are
@@ -3094,7 +3124,7 @@ impl ParserState<'_> {
         // Most nodes declare nothing, and a key can carry a whole Java signature.
         let mut ancestry = std::borrow::Cow::Borrowed(ancestors);
         let mut regions = regions.to_vec();
-        if let Some(k) = kind(&self.file.language, n)
+        if let Some(k) = kind(&self.file.language, n, &self.file.text)
             && (matches!(k, "implementation" | "anonymousFunction") || name(n, self.file).is_some())
         {
             let mut key = key_of(n, self.file, k);
@@ -3181,7 +3211,7 @@ impl ParserState<'_> {
             }
             ancestry.to_mut().push(key);
         }
-        if is_region(n) {
+        if !self.declaration_only && is_region(n) {
             let count = self.control_ordinals.entry(owner.clone()).or_default();
             let ordinal = *count;
             *count += 1;
@@ -3209,7 +3239,7 @@ impl ParserState<'_> {
             });
             regions.push(id);
         }
-        if is_call(&self.file.language, n) {
+        if !self.declaration_only && is_call(&self.file.language, n) {
             let count = self.call_ordinals.entry(owner.clone()).or_default();
             let ordinal = *count;
             *count += 1;
@@ -5114,6 +5144,12 @@ mod declaration_role_tests {
         assert!(test_path("src/button.integration.test.ts"));
         assert!(test_path("src/button.spec.ts"));
         assert!(!test_path("src/button.ts"));
+        assert!(test_path("src/button.spec.tsx"));
+        assert!(test_path("tests/button.mts"));
+        assert!(test_path("tests/types.d.ts"));
+        assert!(test_path("src/button.test.d.ts"));
+        assert!(!test_path("src/types.d.ts"));
+        assert!(!test_path("src/button.d.mts"));
         assert!(test_path("tests/case.rs"));
         assert!(test_path("src/conftest.py"));
         assert!(!test_path("src/testing.rs"));
