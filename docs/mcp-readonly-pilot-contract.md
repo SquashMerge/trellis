@@ -365,6 +365,59 @@ incoming `scopeCoverage` and the lookup alternatives other tools return keep the
   | find by lookup key `src/mcp/projection.rs::compact_graph` | 4,080 (1) | 2,949 (1) | 1,298 (1) |
   | compact call graph `src/http/worker.rs::DaemonState::enqueue_index` | 6,924 (5 nodes) | n/a | 7,260 (5 nodes, all keyed) |
 
+## Amendment (#770): a bounded prompt reference view
+
+**Status: owner-ratified 2026-11-07 (#770).** `trellis_propose_layers`
+inlined the whole `references:v2` result, so on any non-trivial checkout the prompt
+exceeded the 65,536-byte frame and failed with `response_too_large`. This section wins
+over the [proposal prompt](#one-no-argument-proposal-prompt) and
+[rules proposal workflow](rules.md#proposal-workflow) text only for what "structural
+references" means inside the prompt. The tools, their pages, the pin, the rules bytes and
+descriptor, the atomic failures and the frame are unchanged.
+
+The prompt is a hybrid: a small fixed context plus an explicit workflow that pages the
+existing tools for detail.
+
+- **Unchanged:** the server instructions and the full rules grammar (skeleton, external
+  policy, exceptions); the current exact `rules.toml` bytes and descriptor, or explicit
+  absence; the pin (`evidenceBasis`), `workspace` and `catchingUp`.
+- **`payload.references` is a summary** of the pinned references result, not the result.
+  - It keeps `referencesVersion`, `evidenceTier`, `semanticComplete`,
+    `semanticProducers`, `partial`, `counts` (scanned documents, mapped, unresolved and
+    semantic sites) and `limitations` as they are.
+  - It adds
+    `totals:{productionEdges,productionSites,testEdges,testSites,externalPackages,partialFiles}`.
+- **One overview table,** `overview:{rows,total,omitted}`.
+  - Each row is `{source,target,sites}`: production native edges summed by source and
+    target directory. A file's directory is its path up to the last slash, or `.` at the
+    root. Package destinations have no directory and are only counted.
+  - Rows are ordered by `sites` descending, then by source and target.
+  - The overview keeps the longest prefix whose rows fit a fixed budget of 12,288 bytes
+    (`PROMPT_OVERVIEW_BYTES`). The rows' bytes are their JSON array as escaped in the
+    prompt text, with separators and without brackets. If large rules bytes leave less
+    room, it keeps the longest prefix whose complete response line still fits the frame.
+    Both limits are measured on the serialized bytes. `rows.length + omitted = total`,
+    and the result is deterministic for one pin and rules text.
+  - Why 12 KiB: a directory row costs about 45 to 70 bytes, so the budget holds roughly
+    200 rows. That covers every production directory pair of mimir (74) and Trellis (67).
+    It also keeps the prompt near the #528 24 KiB agent page target.
+- **Not listed:** test, package and file-module edges, site samples, module and package
+  descriptors, unresolved sites and partial files. They are counted, not listed.
+- **Workflow.** The instructions tell the agent to:
+  1. start from the overview;
+  2. page `trellis_references` (`expectedBasis`, `paths`, `offset`) to refine particular
+     areas;
+  3. draft `rules.toml` and test it with `trellis_rules_check` /
+     `trellis_rules_explain`;
+  4. pull exact file-level edges from `trellis_references` only when writing baseline
+     exceptions.
+
+  A future `groupBy` aggregation
+  ([#775](https://github.com/SquashMerge/trellis/issues/775)) will make step 2 cheaper.
+- **Atomic failure stays.** Rules bytes are never clipped. If the fixed part
+  (instructions, rules bytes, pin and envelope) does not fit, the prompt still fails
+  atomically with `response_too_large`.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)
@@ -795,7 +848,8 @@ complete-frame cap applies, not the catalog cap.
 
 Prompt content separates server-authored task instructions from untrusted
 repository data. It supplies the verified checkout, one code pin, sampled
-`catchingUp`, structural references/limitations and production/test split; it also
+`catchingUp`, structural references/limitations and production/test split (as the
+bounded summary of [Amendment (#770)](#amendment-770-a-bounded-prompt-reference-view)); it also
 supplies current exact rules bytes and the separate checkout-config descriptor,
 or explicit absence. Missing rules permits a new proposal; malformed rules fails
 atomically, just as check/explain do. The index pin does not identify current

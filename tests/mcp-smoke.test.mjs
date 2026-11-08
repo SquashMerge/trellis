@@ -18,7 +18,10 @@ const destination = {...identity, path: 'src/core.rs'};
 const document = {ref: 7, document: {sourceSetId: 'fixture', language: 'rust', path: 'src/main.rs'}, contentHash: 'a'.repeat(64)};
 const symbol = {kind: 'function', symbolId: identity.sid, doc: 7};
 const instance = {rule: '$layers', target: identity, destination};
+const promptName = 'trellis_propose_layers';
+const promptResult = {description: 'proposal', messages: [{role: 'user', content: {type: 'text', text: 'SECRET prompt text'}}]};
 function response(name) {
+  if (name === promptName) return structuredClone(promptResult);
   let data = {};
   let evidenceBasis = basis;
   if (name === 'trellis_workspace_describe') data = {indexState: 'ready', watcherDegraded: false, languages: [{language: 'rust', semantic: {producerId: 'rust-analyzer', available: true, freshness: 'fresh'}}], searchIndex: {unavailableReason: null}};
@@ -36,10 +39,14 @@ function response(name) {
 const liveTools = tools.map(tool => ({...tool, outputSchema: {
   type: 'object', required: ['liveMarker', 'data'], properties: {liveMarker: {const: true}, data: {type: 'object'}},
 }}));
-function clientFor(transform = (_, result) => result) {
+function clientFor(transform = (_, result) => result, promptTransform = result => result) {
   const calls = [];
   return {calls, async request(request) {
     const {name, arguments: args} = request.params;
+    if (request.method === 'prompts/get') {
+      calls.push({name, args, method: request.method});
+      return promptTransform(response(name));
+    }
     calls.push({name, args});
     return transform(name, response(name), args);
   }};
@@ -49,7 +56,9 @@ test('all eleven live tools use discovered inputs, declaration refs and pinned r
   const client = clientFor();
   const report = await exercise(client, liveTools, '/fixture', 'fixtureMain');
   assert.equal(report.ok, true, JSON.stringify(report));
-  assert.deepEqual(new Set(client.calls.map(call => call.name)), new Set(tools.map(tool => tool.name)));
+  assert.deepEqual(new Set(client.calls.map(call => call.name)), new Set([...tools.map(tool => tool.name), promptName]));
+  assert.deepEqual(client.calls.at(-1), {name: promptName, args: {}, method: 'prompts/get'});
+  assert.equal(report.calls, tools.length);
   const source = client.calls.find(call => call.name === 'trellis_read_source').args;
   assert.deepEqual(source, {schemaVersion: 1, workspace: '/fixture', expectedBasis: declarationBasis,
     path: 'src/discovered.rs', expectedContentHash: document.contentHash, startLine: 10, endLine: 14});
@@ -72,7 +81,7 @@ test('schema-valid typed failures remain failures and every catalog recipe is ac
   }}));
   const report = await exercise(client, tools, '/fixture', 'main');
   assert.equal(report.ok, false);
-  assert.equal(new Set(report.results.map(row => row.tool)).size, tools.length);
+  assert.equal(new Set(report.results.map(row => row.tool)).size, tools.length + 1);
   assert.ok(report.results.filter(row => row.reason === 'tool_error').length >= 5);
   assert.ok(report.results.filter(row => row.reason === 'tool_error').every(row => row.code === 'deadline_exceeded'));
   assert.ok(!JSON.stringify(report).includes('SECRET'));
@@ -91,7 +100,7 @@ test('live schema mismatches, thrown transport errors and lexical-only search fa
     const failed = report.results.filter(row => row.status === 'fail');
     assert.equal(failed.length, 1, JSON.stringify(report));
     assert.equal(failed[0].reason, {schema: 'output_schema_mismatch', transport: 'transport_error', model: 'missing_search_capability'}[mode]);
-    assert.equal(client.calls.length, tools.length);
+    assert.equal(client.calls.length, tools.length + 1);
     assert.ok(!JSON.stringify(report).includes('SECRET'));
   }
 });
@@ -129,7 +138,7 @@ test('installed-binary stdio entry point suppresses child stderr, tool text and 
   try {
     const binary = join(temporary, 'installed-trellis');
     const fixture = join(temporary, 'responses.json');
-    writeFileSync(fixture, JSON.stringify({tools: liveTools, responses: Object.fromEntries(tools.map(tool => [tool.name, response(tool.name)]))}));
+    writeFileSync(fixture, JSON.stringify({tools: liveTools, prompt: promptResult, responses: Object.fromEntries(tools.map(tool => [tool.name, response(tool.name)]))}));
     writeFileSync(binary, `#!/usr/bin/env node
 const {createInterface} = require('node:readline');
 const fixture = JSON.parse(require('node:fs').readFileSync(${JSON.stringify(fixture)}));
@@ -139,7 +148,8 @@ createInterface({input: process.stdin}).on('line', line => {
  const request = JSON.parse(line);
  if (!('id' in request)) return;
  let result;
- if (request.method === 'initialize') result = {protocolVersion:'2025-11-25',capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}};
+ if (request.method === 'initialize') result = {protocolVersion:'2025-11-25',capabilities:{tools:{},prompts:{}},serverInfo:{name:'fixture',version:'1'}};
+ if (request.method === 'prompts/get') result = fixture.prompt;
  if (request.method === 'tools/list') result = {tools:fixture.tools};
  if (request.method === 'tools/call') result = fixture.responses[request.params.name];
  process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result})+'\\n');
@@ -150,7 +160,9 @@ createInterface({input: process.stdin}).on('line', line => {
     assert.equal(result.status, 0, result.stdout + result.stderr);
     const report = JSON.parse(result.stdout);
     assert.equal(report.ok, true);
-    assert.equal(report.results.length, tools.length);
+    assert.equal(report.results.length, tools.length + 1);
+    assert.equal(report.results.at(-1).tool, promptName);
+    assert.equal(report.results.at(-1).status, 'pass');
     for (const loads of Object.values(report.loadAverage)) {
       assert.equal(loads.length, 3);
       assert.ok(loads.every(value => Number.isFinite(value) && value >= 0));
@@ -263,4 +275,29 @@ test('CLI requires explicit absolute installed binary and checkout', () => {
   assert.deepEqual(parseArgs(['--binary', '/installed/trellis', '--workspace', '/fixture']), {binary: '/installed/trellis', workspace: '/fixture', query: 'main'});
   assert.throws(() => parseArgs(['--binary', 'trellis', '--workspace', '/fixture']));
   assert.throws(() => parseArgs(['--workspace', '/fixture']));
+});
+
+test('the proposal prompt fails on a protocol error, an oversized frame or a missing message, with only bounded codes', async () => {
+  for (const [mode, reason, code] of [
+    ['too_large_error', 'prompt_error', 'response_too_large'],
+    ['secret_error', 'prompt_error', 'other'],
+    ['oversized', 'response_too_large', undefined],
+    ['empty', 'prompt_shape_invalid', undefined],
+  ]) {
+    const client = clientFor(undefined, result => {
+      if (mode.endsWith('_error')) {
+        throw Object.assign(new Error('SECRET message'), {code: -32603,
+          data: {code: mode === 'too_large_error' ? 'response_too_large' : 'SECRET_CODE'}});
+      }
+      if (mode === 'oversized') result.messages[0].content.text = `SECRET ${'x'.repeat(65_536)}`;
+      if (mode === 'empty') result.messages = [];
+      return result;
+    });
+    const report = await exercise(client, liveTools, '/fixture', 'main');
+    assert.equal(report.ok, false, mode);
+    const failed = report.results.filter(row => row.status === 'fail');
+    assert.deepEqual(failed.map(row => [row.tool, row.kind, row.reason, row.code]),
+      [[promptName, 'prompt', reason, code]], mode);
+    assert.ok(!JSON.stringify(report).includes('SECRET'));
+  }
 });
