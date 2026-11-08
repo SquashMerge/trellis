@@ -735,3 +735,41 @@ fn an_ambiguous_paths_alias_is_not_a_package_import() {
         "{unmapped:#}"
     );
 }
+
+/// Parameter type and default syntax binds no name, so a `module` written there does not
+/// hide a CommonJS `module.exports` write from the provider's export-set hazard.
+#[test]
+fn typescript_parameter_types_and_defaults_bind_no_names() {
+    for parameter in [
+        "unused: number",
+        "unused: typeof module",
+        "unused: number = module",
+        "{ a }: { a: typeof module }",
+        "unused?: typeof module",
+    ] {
+        let provider = format!(
+            "export const x = 1;\nfunction replace({parameter}) {{ module.exports = {{}}; }}\n"
+        );
+        let references = references_of(&[
+            (
+                "package.json",
+                r#"{"devDependencies":{"@types/node":"^22.0.0"}}"#,
+            ),
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"module":"CommonJS"}}"#,
+            ),
+            ("provider.ts", &provider),
+            ("use.ts", "export * from \"./provider\";\n"),
+        ]);
+        assert_eq!(
+            references["production"],
+            serde_json::json!([]),
+            "{parameter}: {references:#}"
+        );
+        assert_eq!(
+            references["unresolved"][0]["reason"], "javascript_wildcard_name_ambiguous",
+            "{parameter}: {references:#}"
+        );
+    }
+}

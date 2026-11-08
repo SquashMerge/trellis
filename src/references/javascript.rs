@@ -1558,6 +1558,12 @@ fn pattern_names(
             {
                 pending.push((value, depth + 1));
             }
+        } else if matches!(node.kind(), "required_parameter" | "optional_parameter") {
+            // A TypeScript parameter binds only its pattern: its type, default value
+            // and decorators bind nothing.
+            if let Some(pattern) = node.child_by_field_name("pattern") {
+                pending.push((pattern, depth + 1));
+            }
         } else if !matches!(
             node.kind(),
             "string"
