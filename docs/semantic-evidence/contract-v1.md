@@ -399,7 +399,7 @@ Other binding sites without a measured declaration remain candidates, but cannot
 
 ## Interface evidence amendment (#788)
 
-**Status: proposed (owner pre-approved 2026-11-08, #788; driver verifies scope before merge).**
+**Status: owner-ratified 2026-11-08 (#788). The owner pre-approved these four points; the supervising session verified the text stays within them.**
 
 ### The evidence kind
 
