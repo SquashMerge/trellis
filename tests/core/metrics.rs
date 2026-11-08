@@ -1195,6 +1195,10 @@ fn labeled_break_adds_flat_cognitive_without_branch() {
             "javascript",
             "function calc() { outer: while (true) { break outer; } }",
         ),
+        (
+            "typescript",
+            "function calc(): void { outer: while (true) { break outer; } }",
+        ),
         ("rust", "fn calc() { 'outer: loop { break 'outer; } }"),
     ] {
         let score = metrics::compute(
@@ -1599,4 +1603,23 @@ fn typescript_scores_follow_the_grammar_its_path_selects() {
         "a `<T>x` cast parses only in .ts, so the two documents must not share scores"
     );
     assert_eq!(scored("src/b.ts")[0].metrics, ts[0].metrics);
+}
+
+#[test]
+fn a_typescript_new_self_call_is_syntactic_recursion() {
+    let recursive = native_rows(
+        "typescript",
+        "case.ts",
+        "function Calc(): void { new Calc(); }\n",
+    );
+    let other = native_rows(
+        "typescript",
+        "case.ts",
+        "function Calc(): void { new Other(); }\n",
+    );
+    assert_eq!(recursive[0].metrics.fan_out, 1);
+    assert_eq!(
+        recursive[0].metrics.cognitive,
+        other[0].metrics.cognitive + 1
+    );
 }

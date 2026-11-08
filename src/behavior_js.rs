@@ -770,6 +770,16 @@ mod tests {
     }
 
     #[test]
+    fn calls_inside_typescript_casts_are_still_walked() {
+        let text = "function f() {\n  g() as T;\n  h() satisfies T;\n  k()!;\n  <T>m();\n}\n";
+        let view = sequence("typescript", "a.ts", text, "function f", "\n}");
+        assert_eq!(
+            boundaries(&view.steps),
+            ["Call has no matching measured call site; target unknown."; 4]
+        );
+    }
+
+    #[test]
     fn a_typescript_signature_has_no_body() {
         let text = "declare function f(a: number): void;\n";
         let view = sequence("typescript", "a.d.ts", text, "function f", ";");

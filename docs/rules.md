@@ -356,7 +356,7 @@ are syntax. Unsupported coverage and unresolved counts stay visible. Paths hidde
 behind unproved aliases are not claimed covered. Rust/Java external-name
 uncertainty does not veto an independently proved in-repo wildcard name; two
 native candidates, macro/cfg uncertainty or unproved explicit bindings still do.
-Python/JavaScript retain wildcard-only names as unknown under external-name
+Python/JavaScript/TypeScript retain wildcard-only names as unknown under external-name
 uncertainty unless an explicit/local binding settles them. This is **syntactic,
 structurally mapped reference evidence**, not a compiler dependency graph,
 resolved library membership or call binding. A positive mapped upward reference can deviate under this syntax contract;
@@ -549,7 +549,7 @@ an over-deep one:
 - A selector's `extends` or `implements` on a type in the file is unknown, not false.
 
 Sites that survive in the recovered tree keep the resolution their language gives them: an
-intact `import` of a broken JavaScript or Python file still maps its literal path.
+intact `import` of a broken JavaScript, TypeScript or Python file still maps its literal path.
 
 `evidence_budget` names a document published with no evidence but its file module, because
 its facts exceed a [per-file budget](daemon-v1.md#current-limits) (#564). `range` is the whole file and
