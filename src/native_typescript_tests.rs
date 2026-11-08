@@ -836,3 +836,19 @@ fn override_modifier_is_measured() {
         );
     }
 }
+
+#[test]
+fn type_only_import_expressions_are_not_calls() {
+    let source = "\
+export type ApiModule = typeof import(\"./api\");
+export type Api = import(\"./api\").Api;
+export const lazy = () => import(\"./api\");
+const v = x as import(\"./api\").Api;
+const w = import(\"./api\") as Promise<unknown>;
+";
+    for (path, artifact) in both(source) {
+        no_gap(path, &artifact);
+        let (_, calls) = measured(&artifact);
+        assert_eq!(calls, ["import", "import"], "only runtime calls: {path}");
+    }
+}

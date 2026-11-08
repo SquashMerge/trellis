@@ -113,3 +113,37 @@ pub(crate) fn unwrap_annotation(n: Node<'_>) -> Node<'_> {
         n
     }
 }
+
+/// A call written in type syntax, such as `typeof import("m")` or `import("m").T`. Types
+/// are erased, so it is no invocation. Type syntax never encloses runtime code, so the walk
+/// stops at the first statement, block or class body.
+pub(crate) fn in_type_context(n: Node<'_>) -> bool {
+    let mut child = n;
+    while let Some(parent) = child.parent() {
+        match parent.kind() {
+            "type_annotation"
+            | "type_predicate_annotation"
+            | "asserts_annotation"
+            | "opting_type_annotation"
+            | "omitting_type_annotation"
+            | "adding_type_annotation"
+            | "type_alias_declaration"
+            | "type_arguments"
+            | "type_parameters"
+            | "type_query"
+            | "interface_declaration"
+            | "implements_clause"
+            | "extends_type_clause" => return true,
+            // `x as T` and `x satisfies T`: the type follows the expression.
+            "as_expression" | "satisfies_expression" => {
+                return parent
+                    .named_child(0)
+                    .is_some_and(|value| value.id() != child.id());
+            }
+            "program" | "statement_block" | "class_body" => return false,
+            kind if kind.ends_with("_statement") => return false,
+            _ => child = parent,
+        }
+    }
+    false
+}

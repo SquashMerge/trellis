@@ -1980,11 +1980,10 @@ fn is_call(lang: &str, n: Node<'_>) -> bool {
             "method_invocation" | "object_creation_expression" | "explicit_constructor_invocation"
         ) | ("rust", "call_expression" | "method_call_expression")
             | ("python", "call")
-            | (
-                "javascript" | "typescript",
-                "call_expression" | "new_expression"
-            )
-    )
+            | ("javascript", "call_expression" | "new_expression")
+    ) || (lang == "typescript"
+        && matches!(n.kind(), "call_expression" | "new_expression")
+        && !crate::indexer_ts::in_type_context(n))
 }
 fn is_region(n: Node<'_>) -> bool {
     matches!(

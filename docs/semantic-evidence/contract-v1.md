@@ -392,6 +392,7 @@ Other binding sites without a measured declaration remain candidates, but cannot
 | typed members | `field`/`method`; `Parameter.type` and `resultType` are the annotated type without `:`; `accessibility_modifier` and `override_modifier` are modifiers |
 | type-only imports/exports, `import = require`, `import A = N.B` | no declarations except the narrow alias rule |
 | `as`, `satisfies`, `!`, `<T>x`, instantiation expressions; JSX | no facts of their own; contained calls are measured |
+| import types in type syntax: `typeof import("m")`, `import("m").T` | not calls (types are erased); a dynamic `import("m")` expression is a call |
 | `Header.bases` | empty, as for JavaScript |
 
 **Grammar limits (pinned tree-sitter-typescript 0.23.2).** `export type * from "m"` is not parsed: the grammar accepts only `export type { … }`, so a document containing it gets a recovered-parse gap (partial coverage with a diagnostic) instead of complete measurement. A decorator written before `export` (`@sealed() export class M`) is a child of `export_statement`, so its call is owned by the enclosing file module, the innermost executable container; decorators on non-exported classes, and on members and parameters, are owned by the class or method.

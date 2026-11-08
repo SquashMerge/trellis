@@ -35,10 +35,12 @@ Native measurement does no type checking, so `tsconfig.json` (`allowJs:false`,
 `captures/native.json` has SHA-256
 `72af4180497b6bbbffdc504d486dd1c5d8514d5ded03d7a4662bc62daf5a0e58`. The compiled
 native extractor hash is
-`2ca488b0dcc0c80025ce0bcdf4eab91f44a1fa89baf90809f3c7f03419035027`, pinned as
+`a1c7d0caa1c76e9414ecc028aa89190bcf7d34158b59f019e8671e08e45dacd5`, pinned as
 `trellis-native-v16-typescript-test-support` in
 `docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json`. It is the final
-native-v16 extractor of #683; no extraction module changes after it.
+native-v16 extractor of #683. The #800 review re-pinned it after the extractor
+stopped measuring type-only import expressions (`typeof import("m")`,
+`import("m").T`) as calls; this corpus has none, so the recapture is byte-identical.
 
 ## Reproduce
 

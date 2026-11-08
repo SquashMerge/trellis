@@ -39,8 +39,10 @@ command twice on these unchanged snapshots using pinned Rust 1.99.1 and
 `test-support`, at the final native-v16 extractor. Both outputs were byte-identical
 (SHA-256 `0f90e1e4cd6484fbbaddda296304b57347387b4af6d76b6d7fe742d974880965`) and equal
 to the previously stored `captures/native.json`. The compiled native extractor hash
-is `2ca488b0dcc0c80025ce0bcdf4eab91f44a1fa89baf90809f3c7f03419035027`, pinned as
-`trellis-native-v16-javascript-test-support` in the hardware profile.
+is `a1c7d0caa1c76e9414ecc028aa89190bcf7d34158b59f019e8671e08e45dacd5`, pinned as
+`trellis-native-v16-javascript-test-support` in the hardware profile. The #800
+review re-pinned it after a TypeScript-only extractor fix (type-only import
+expressions are not calls); the JavaScript recapture is byte-identical.
 
 JavaScript measurement is unchanged from the native-v15 capture: only the producer
 version, extractor hash and occurrence IDs (which include the producer version)
