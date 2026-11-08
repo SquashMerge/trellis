@@ -131,6 +131,9 @@ pub(crate) struct ArchitectureCore {
     rules: Option<RulesPart>,
     /// `None` when this core was computed for one read that has no use for metrics.
     metrics: Option<Result<ArchitectureMetrics, CoreFailure>>,
+    /// Every build manifest's app-detection outcome, before any rules file hides some.
+    #[cfg_attr(not(test), allow(dead_code))]
+    app_candidates: Result<crate::apps::Candidates, CoreFailure>,
     /// Finished summaries; one per valid role, aggregate and workbench choice.
     summaries: Mutex<BTreeMap<SummaryKey, Arc<serde_json::Value>>>,
 }
@@ -158,6 +161,10 @@ impl ArchitectureCore {
             Some(metrics) => metrics.as_ref().map_err(CoreFailure::error),
             None => anyhow::bail!("store_unavailable: architecture metrics part"),
         }
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn app_candidates(&self) -> Result<&crate::apps::Candidates> {
+        self.app_candidates.as_ref().map_err(CoreFailure::error)
     }
     /// Metrics rows for a read that can compute its own if this core failed them.
     pub(crate) fn metrics_if_computed(&self) -> Option<&ArchitectureMetrics> {
@@ -280,12 +287,28 @@ impl ArchitectureCore {
         } else {
             None
         };
+        let app_candidates = {
+            let documents: std::collections::BTreeSet<&str> = snapshot
+                .documents
+                .iter()
+                .map(|document| document.key.path.as_str())
+                .collect();
+            let mut work = crate::references::work::Work::new(
+                crate::references::work::rules_limit(snapshot.documents.len(), 0),
+            );
+            match crate::apps::candidates(&snapshot.manifests, &documents, &mut work, check) {
+                Ok(candidates) => Ok(candidates),
+                Err(error) if CoreFailure::repeats(&error) => Err(CoreFailure::of(&error)),
+                Err(error) => return Err(error),
+            }
+        };
         check()?;
         Ok(Self {
             pin: snapshot.pin,
             references,
             rules,
             metrics,
+            app_candidates,
             summaries: Mutex::default(),
         })
     }

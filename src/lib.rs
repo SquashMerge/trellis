@@ -1,3 +1,4 @@
+pub(crate) mod apps;
 pub mod architecture_details;
 pub mod auth;
 pub mod behavior;

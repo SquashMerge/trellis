@@ -2707,7 +2707,10 @@ impl EvidenceResponse {
                 continue;
             };
             let path = path.as_ref();
-            if !matches!(path, "tsconfig.json" | "jsconfig.json") {
+            // Present nested manifests feed app detection (#784); other consumers ignore
+            // them, as they do every path that is not a root input.
+            let nested = path.ends_with("/package.json") || path.ends_with("/Cargo.toml");
+            if !nested && !matches!(path, "tsconfig.json" | "jsconfig.json") {
                 continue;
             }
             let (bytes, byte_length) = match (kind.as_deref(), bytes, byte_length) {
@@ -2738,6 +2741,27 @@ impl EvidenceResponse {
             let bytes = hex::decode(bytes.as_ref()).context(SelectedIntegrity(format!(
                 "incompatible_index: corrupt retained {path} bytes"
             )))?;
+            if nested {
+                use sha2::{Digest, Sha256};
+                let content_hash = hex::encode(Sha256::digest(&bytes));
+                selected_ensure!(
+                    manifests
+                        .insert(
+                            path.to_owned(),
+                            crate::references::external::ManifestInput {
+                                source_set_id: source_set_id.clone(),
+                                native_revision_id: native_revision_id.clone(),
+                                dependency_hash: dependency_hash.clone(),
+                                path: path.into(),
+                                bytes: Some(bytes),
+                                content_hash: Some(content_hash),
+                            },
+                        )
+                        .is_none(),
+                    "incompatible_index: duplicate retained nested manifest"
+                );
+                continue;
+            }
             root_tsconfig = Some(crate::references::tsconfig::RootTsconfigInput {
                 source_set_id: source_set_id.clone(),
                 path: path.to_owned(),
@@ -4953,6 +4977,8 @@ pub fn terminal_status_sqlite_contention(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod admit_once_tests;
+#[cfg(test)]
+mod architecture_apps_tests;
 #[cfg(test)]
 mod published_admission_tests;
 #[cfg(test)]
