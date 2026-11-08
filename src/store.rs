@@ -2594,13 +2594,12 @@ impl EvidenceResponse {
             let path = match &input {
                 RetainedInput::Present { path, .. } | RetainedInput::Absent { path } => *path,
             };
-            if !matches!(path, "Cargo.toml" | "package.json") {
-                continue;
-            }
-            let label = if path == "Cargo.toml" {
-                "Cargo"
-            } else {
-                "package.json"
+            // pyproject.toml declares Python source roots (#771); it is not required.
+            let label = match path {
+                "Cargo.toml" => "Cargo",
+                "package.json" => "package.json",
+                "pyproject.toml" => "pyproject",
+                _ => continue,
             };
             selected_ensure!(
                 !manifests.contains_key(path),

@@ -30,6 +30,7 @@ mod metrics_store;
 mod pins;
 mod privacy;
 mod python_behavior;
+mod python_source_roots;
 mod rules;
 mod rust_behavior;
 mod search_card;
