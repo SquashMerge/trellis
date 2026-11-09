@@ -1632,7 +1632,9 @@ test("Deviations tree classifies lines and opens one menu three ways", {timeout:
     assert.equal(await page.locator("#architecture-diagram").isHidden(), true, "the diagram is hidden, not destroyed");
     assert.match(await page.locator("#architecture-deviations-summary").textContent(), /^\d+ files? · \d+ deviating references? · \d+ calls?$/);
     const badges = await page.locator("#architecture-deviations-tree .deviation-edge").allTextContents();
-    assert.ok(badges.length > 0 && badges.every(text => /deviations?$/.test(text)), `every badge says "deviation": ${JSON.stringify(badges)}`);
+    assert.ok(badges.length > 0 && badges.every(text => / · [\d,]+ references?$/.test(text)), `every badge counts references: ${JSON.stringify(badges)}`);
+    const chips = await page.locator("#architecture-deviations-edges button").allTextContents();
+    assert.ok(chips.length > 1 && chips.every(text => / · ≥?[\d,]+ references?$/.test(text)), `every chip counts references, not deviations (#816): ${JSON.stringify(chips)}`);
     assert.equal(await page.evaluate(() => globalThis.architectureExecuted), undefined, "a hostile layer name is text");
     assert.equal(await page.locator("#architecture-deviations-edges button").filter({hasText:hostileLayer}).count(), 1, "the hostile layer name renders literally in its chip");
     assert.equal(await page.locator("#architecture-deviations img").count(), 0);
@@ -1719,6 +1721,9 @@ test("Deviations tree explains a selection that a filter hides", {timeout:240000
     assert.match(await notice.textContent(), new RegExp(hidden.replace(".", "\\.")));
     assert.equal(await page.locator("#architecture-deviations-tree [aria-selected=true]").count(), 0);
     assert.equal(await page.evaluate(() => document.activeElement?.id), "architecture-deviations-calls", "focus stays on Calls only");
+    await expandTree(page);
+    const tags = await page.locator('#architecture-deviations-tree .deviation-row[data-level="3"] .deviation-kind').evaluateAll(nodes => nodes.map(node => node.dataset.kind));
+    assert.ok(tags.length > 0 && tags.every(kind => kind === "call"), `Calls only shows exactly the lines tagged call (#816): ${JSON.stringify(tags)}`);
     await clear();
   }, new Map(), base);
 });

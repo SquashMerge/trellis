@@ -856,6 +856,9 @@ test("#523: inspectors describe semantic evidence for mixed edges and bound rule
   assert.doesNotMatch(edgeText, /not compiler-resolved calls/);
   const rule = descendants(h.get("architecture-review-list")).find(item => item.tagName === "button" && item.textContent.startsWith("$layers · "));
   assert.ok(rule); await rule.fire("click"); await flush();
+  const [, pair] = rule.textContent.split("$layers · ");
+  assert.match(pair, / → /);
+  assert.equal(h.get("architecture-inspector-title").textContent, `$layers · ${pair}`, "the rule inspector names the modules from → to (#816)");
   const ruleText = text(h.get("architecture-inspector-content"));
   assert.match(ruleText, /Semantic evidence names a fresh producer binding/);
   assert.doesNotMatch(ruleText, /not destination symbol bindings/);
@@ -1013,36 +1016,41 @@ test("deviation model: filter by edge and calls only", () => {
   deq(plain(peer.files[0].unlisted), {call:0,type:0,import:0,reference:0});
   const calls = model.filter(tree, {edge:null, callsOnly:true});
   deq(plain(calls.totals).files, 2);
-  deq(calls.files[0].functions.map(fn => fn.label), ["(module level)", "S::enqueue"], "S::boot holds only a call-tagged import");
+  deq(calls.files[0].functions.map(fn => fn.label), ["(module level)", "S::enqueue"], "S::boot holds only an import with a caller");
   assert.equal(calls.files[0].functions.some(fn => fn.label === "(anonymous)"), false, "functions with no call are hidden");
   assert.equal(calls.files[0].functions.find(fn => fn.label === "S::enqueue").lines.length, 1);
   assert.equal(calls.files[0].edges.some(edge => edge.key === "Storage→Peer"), false);
   assert.equal(model.filter(tree, {edge:"Storage→Peer", callsOnly:true}).files.length, 0, "no calls on the peer edge");
 });
 
-test("deviation model: a require with a caller is tagged a call but counted as an import", () => {
+test("deviation model: Calls only and the kind tag agree; a require with a caller is an import (#816)", () => {
   const {model} = deviationsHarness().sandbox.window.TrellisDeviations, layers = deviationView().layers;
   const store = docId("src/req.js", "javascript"), rules = docId("src/rules.js", "javascript");
   const boot = {syntaxId:"o3",name:"boot",stableLookupKey:"S::boot"}, caller = {stableLookupKey:"S::boot",syntaxId:"o3",name:"boot",document:store};
   const require = evidenceItem({document:store,relationKind:"import",callId:callId("c"),caller,owner:boot,lines:{start:2,end:2},range:{start:20,end:30}});
-  const rows = [{role:"production",instance:{rule:"$layers",status:"deviates",excepted:false,sourceLayer:"Storage",destinationLayer:"UI",target:store,destination:rules,
-    referenceCount:1,kindCounts:{call:0,type:0,import:1,reference:0},evidence:[require]}}];
-  const tree = model.build(rows, layers), file = tree.files[0];
-  assert.equal(file.functions[0].lines[0].kind, "call", "the tag keeps the caller rule");
-  deq([file.calls, file.functions[0].calls], [0, 0], "file and function call totals agree");
-  const calls = model.filter(tree, {edge:null, callsOnly:true});
-  deq(plain(calls.totals), {files:0,references:0,calls:0}, "a file whose only call-tagged line is a require is hidden under Calls only");
-  const mixed = deviationRows();
-  mixed[0].instance.evidence = mixed[0].instance.evidence.filter(item => item.relationKind === "import");
-  mixed[0].instance.kindCounts = {call:0,type:0,import:1,reference:0};
-  mixed[0].instance.referenceCount = 1;
-  const none = model.filter(model.build(mixed, layers), {edge:null, callsOnly:true});
-  deq(none.files.map(item => item.path), ["src/other.rs"], "the require-only file leaves the Calls only list");
+  const run = evidenceItem({document:store,relationKind:"call",callId:callId("d"),caller,owner:boot,lines:{start:3,end:3},range:{start:40,end:50}});
+  const instance = (evidence, kindCounts) => [{role:"production",instance:{rule:"$layers",status:"deviates",excepted:false,sourceLayer:"Storage",destinationLayer:"UI",
+    target:store,destination:rules,referenceCount:evidence.length,kindCounts,evidence}}];
+  // Negative control: a require that carries a caller is tagged an import and leaves the Calls only list.
+  const only = model.build(instance([require], {call:0,type:0,import:1,reference:0}), layers);
+  assert.equal(only.files[0].functions[0].lines[0].kind, "import", "the tag is the relation kind, not the caller");
+  deq([only.files[0].calls, only.files[0].functions[0].calls], [0, 0], "file and function call totals agree with the tag");
+  deq(plain(model.filter(only, {edge:null, callsOnly:true}).totals), {files:0,references:0,calls:0}, "no call-tagged line, nothing under Calls only");
+  // Positive: in the same function, the call-tagged line stays under Calls only and the import does not.
+  const both = model.filter(model.build(instance([require, run], {call:1,type:0,import:1,reference:0}), layers), {edge:null, callsOnly:true});
+  deq(plain(both.totals), {files:1,references:2,calls:1});
+  deq(both.files[0].functions[0].lines.map(line => line.kind), ["call"], "Calls only keeps exactly the lines tagged call");
+  assert.equal(both.files[0].functions[0].calls, 1);
+  // Every line Calls only shows is tagged call, and every call-tagged line in the full tree is shown.
+  const tree = model.build(deviationRows(), layers), lines = view => view.files.flatMap(file => file.functions.flatMap(fn => fn.lines));
+  const kept = lines(model.filter(tree, {edge:null, callsOnly:true}));
+  assert.ok(kept.length > 0 && kept.every(line => line.kind === "call"));
+  deq(kept.map(line => line.key).sort(), lines(tree).filter(line => line.kind === "call").map(line => line.key).sort());
 });
 
 test("deviation model: kind tag, chips with bound, exception note, sequence test, line key", () => {
   const {model} = deviationsHarness().sandbox.window.TrellisDeviations;
-  assert.equal(model.kindOf({caller:{},relationKind:"import"}), "call", "a caller makes it a call");
+  assert.equal(model.kindOf({caller:{},relationKind:"import"}), "import", "a caller does not make it a call");
   assert.equal(model.kindOf({caller:null,relationKind:"type",callId:callId("a")}), "type", "never by callId");
   assert.equal(model.kindOf({relationKind:"call"}), "call");
   const chips = model.chips(deviationView(), deviationEdgeText);
@@ -1115,19 +1123,20 @@ test("deviation rows: names, badges, kind tags, tabindex and unlisted footer", a
   const h = deviationsHarness();
   await h.dev.open(h.trigger);
   const file = h.byLabel("src/store.rs");
-  assert.equal(file.attrs["aria-label"], "src/store.rs, 3 calls, 12 references, upward deviations: UI 10, deviations: Peer 2");
-  assert.match(text(file), /↑ UI · 10 deviations/);
-  assert.match(text(file), /⇄ Peer · 2 deviations/);
+  assert.equal(file.attrs["aria-label"], "src/store.rs, 3 calls, 12 references, upward: UI 10 references, peer or shared: Peer 2 references");
+  assert.match(text(file), /↑ UI · 10 references/);
+  assert.match(text(file), /⇄ Peer · 2 references/);
+  assert.equal(/deviations?\b/.test(text(file)), false, "a file row counts references, not deviations");
   assert.equal(file.attrs["aria-expanded"], "false");
   await h.expandAll();
   const enqueue = h.byLabel("S::enqueue");
   assert.equal(enqueue.attrs["aria-label"], "S::enqueue, calls: at least 1, sampled, references: at least 4, sampled");
-  assert.equal(h.byLabel("src/other.rs").attrs["aria-label"], "src/other.rs, 1 call, 1 reference, upward deviations: UI 1");
+  assert.equal(h.byLabel("src/other.rs").attrs["aria-label"], "src/other.rs, 1 call, 1 reference, upward: UI 1 reference");
   const more = h.treeRows().find(row => row.attrs["aria-label"].startsWith("+ 5 more not listed"));
   assert.equal(more.attrs["aria-label"], "+ 5 more not listed: 1 call · 3 type uses · 1 reference");
   assert.equal(more.attrs["aria-expanded"], undefined);
   const kinds = h.treeRows().filter(row => row.dataset.level === "3").map(row => descendants(row).find(item => item.className.includes("deviation-kind")));
-  deq(kinds.map(tag => [tag.dataset.kind, tag.textContent]).sort(), [["call", "call"], ["call", "call"], ["call", "call"], ["call", "call"], ["reference", "reference"], ["reference", "reference"], ["reference", "reference"], ["type", "type use"]].sort());
+  deq(kinds.map(tag => [tag.dataset.kind, tag.textContent]).sort(), [["call", "call"], ["call", "call"], ["call", "call"], ["import", "import"], ["reference", "reference"], ["reference", "reference"], ["reference", "reference"], ["type", "type use"]].sort());
   const unresolved = h.treeRows().find(row => /no semantic binding for this site/.test(text(row)));
   assert.match(text(unresolved), /→ src\/rules\.rs · file only/);
   assert.match(unresolved.attrs["aria-label"], /file only: no semantic binding for this site$/);
@@ -1376,8 +1385,8 @@ test("deviations hidden selection: notice, Clear filter, never auto-selected", a
   assert.equal(h.inspections.length, selections, "nothing is selected");
   assert.equal(h.treeRows().filter(row => row.attrs["aria-selected"] === "true").length, 0);
   const chip = descendants(h.get("architecture-deviations-edges")).find(item => item.dataset.key === "Storage→Peer");
-  assert.match(chip.attrs["aria-label"], /at least 2 deviations \(lower bound\)/);
-  assert.match(chip.textContent, /≥2 deviations/);
+  assert.match(chip.attrs["aria-label"], /at least 2 references \(lower bound\)/);
+  assert.match(chip.textContent, /≥2 references$/);
   await chip.dispatch("click");
   const pressed = descendants(h.get("architecture-deviations-edges")).find(item => item.dataset.key === "Storage→Peer");
   assert.equal(pressed.attrs["aria-pressed"], "true");

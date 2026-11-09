@@ -889,7 +889,7 @@
       for (const pair of values) {
         const details = make("details"); details.append(make("summary", `${targetLabel(pair.source)} → ${targetLabel(pair.target)} · ${pair.count} reference sites`));
         paragraph(details, `${pair.sites.length} sampled sites · ${pair.omittedSites} omitted sites. Counts remain exact; samples are not exhaustive.`);
-        disclosure(details, "Exact reference-pair identity", {source:pair.source, target:pair.target, evidenceTier:pair.evidenceTier, semanticSites:pair.semanticSites});
+        disclosure(details, "Exact reference-pair identity", {from:pair.source, to:pair.target, evidenceTier:pair.evidenceTier, semanticSites:pair.semanticSites});
         if (external(pair.target)) {
           const descriptor = view.references.externalPackages.find(item => same(item.identity, pair.target));
           disclosure(details, "External package evidence", descriptor);
@@ -1170,7 +1170,7 @@
       const active = () => usable() && view === payload && current(c) && ticket === selectionSerial && !get("architecture-inspector").hidden;
       onInspect(); window.TrellisShell?.showArchitectureInspector();
       const r = row.instance, target = get("architecture-inspector-content"); target.replaceChildren();
-      get("architecture-inspector-title").textContent = `${r.rule} · ${targetLabel(r.target)}`;
+      get("architecture-inspector-title").textContent = `${r.rule} · ${targetLabel(r.target)}${r.destination ? ` → ${targetLabel(r.destination)}` : ""}`;
       reviewChips(target);
       paragraph(target, `${row.role} · ${r.status} · ${r.excepted ? `excepted: ${r.exceptionReason}` : "not excepted"} · ${r.referenceCount ?? 0} exact reference sites.`);
       paragraph(target, `Code ${window.TrellisIndexPin.label(payload)} · rules ${c.rulesHash}. ${ruleEvidence(r)}`);
