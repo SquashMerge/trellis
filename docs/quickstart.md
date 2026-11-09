@@ -279,15 +279,19 @@ You always need a new plan. An old hash fails with `plan_changed`. If you edit a
 
 - **Rust:** the Cargo features that your workspace's binaries, tests, benches and examples list in `required-features`, such as a `test-support` feature, so the code behind them is analyzed. Nothing else is turned on, never all features. The plan also lists the workspace members it read.
 - **TypeScript and JavaScript:** the root `tsconfig.json`, else the root `jsconfig.json`, else a config Trellis generates.
+- **Python, trusted:** the project name and version from `pyproject.toml` (`[project]`, else `[tool.poetry]`). The restricted profile doesn't read `pyproject.toml`, so it uses `trellis-workspace` and `0`.
+- **Java, trusted:** Maven if the root has `pom.xml`, Gradle if it has `build.gradle`, `build.gradle.kts` or `settings.gradle`. Having both is refused; pick one with `--java-build-tool`.
 
 To use other values, pass them to both `plan` and `run`. They replace what the plan read:
 
 ```sh
 trellis producer plan --producer rust-analyzer --trust trusted --cargo-features test-support,extra
 trellis producer plan --producer scip-typescript --ts-project generated
+trellis producer plan --producer scip-python --python-project-name myapp --python-project-version 1.0
+trellis producer plan --producer scip-java --trust trusted --java-build-tool gradle
 ```
 
-`--cargo-features ''` turns on no extra features. `--ts-project` takes `tsconfig.json`, `jsconfig.json` or `generated`. If your project config can't be parsed, or contradicts itself, `plan` fails with `producer_config_unresolved` and names the file. It never falls back to defaults.
+`--cargo-features ''` turns on no extra features. `--ts-project` takes `tsconfig.json`, `jsconfig.json` or `generated`. `--java-build-tool` takes `maven` or `gradle`, in the trusted profile only. If your project config can't be parsed, or contradicts itself, `plan` fails with `producer_config_unresolved` and names the file. It never falls back to defaults.
 
 ### Upgrading Trellis
 
