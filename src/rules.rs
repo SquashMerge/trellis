@@ -1051,7 +1051,11 @@ impl<'a> AppScope<'a> {
     /// The one app a rule row counts under; `None` is "no app" (#784). A `$layers` row between
     /// two layers belongs to their single common app. Every other row follows its target file,
     /// through the row's source layer or, when that is null, the file's own assigned layer.
-    fn bucket(&self, assignments: &BTreeMap<&str, Option<&str>>, row: &Value) -> Option<usize> {
+    pub(crate) fn bucket(
+        &self,
+        assignments: &BTreeMap<&str, Option<&str>>,
+        row: &Value,
+    ) -> Option<usize> {
         if self.apps.is_empty() {
             return None;
         }

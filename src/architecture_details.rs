@@ -52,6 +52,8 @@ pub struct Query {
     pub source_layer: Option<String>,
     pub destination_layer: Option<String>,
     pub layer: Option<String>,
+    /// `instances`: the name of the app the instance counts under.
+    pub app: Option<String>,
     pub path: Option<String>,
     pub source: Option<Value>,
     pub target: Option<Value>,
@@ -97,6 +99,7 @@ impl Query {
                 "sourceLayer",
                 "destinationLayer",
                 "layer",
+                "app",
                 "path",
             ],
             Kind::Pairs => &["role", "path", "source", "target", "layer", "unlayered"],
@@ -202,6 +205,7 @@ impl Query {
             source_layer: fields.remove("sourceLayer"),
             destination_layer: fields.remove("destinationLayer"),
             layer: fields.remove("layer"),
+            app: fields.remove("app"),
             path: fields.remove("path"),
             source: identity(fields.remove("source"))?,
             target: identity(fields.remove("target"))?,
@@ -218,6 +222,7 @@ impl Query {
 pub struct Layers<'a> {
     native: &'a BTreeMap<&'a str, Option<&'a str>>,
     external: BTreeMap<String, Option<String>>,
+    apps: Option<crate::rules::AppScope<'a>>,
 }
 
 impl<'a> Layers<'a> {
@@ -233,7 +238,24 @@ impl<'a> Layers<'a> {
                 }
             }
         }
-        Self { native, external }
+        Self {
+            native,
+            external,
+            apps: None,
+        }
+    }
+    /// Let `app` filters resolve instances to their app.
+    pub(crate) fn with_apps(mut self, apps: crate::rules::AppScope<'a>) -> Self {
+        self.apps = Some(apps);
+        self
+    }
+    /// Whether `row` counts under an app named `name` (a shared name matches each of its apps).
+    fn counts_under(&self, name: &str, row: &Value) -> bool {
+        self.apps.as_ref().is_some_and(|apps| {
+            apps.bucket(self.native, row)
+                .and_then(|index| apps.name(index))
+                == Some(name)
+        })
     }
     /// The layer of a native identity or external package; None when unassigned.
     pub fn of(&self, identity: &Value) -> Option<&str> {
@@ -349,7 +371,12 @@ pub(crate) fn page(
                         row["target"]["path"].as_str() == Some(path)
                             || row["destination"]["path"].as_str() == Some(path)
                     });
-                    if text_is(&row["rule"], &query.rule)
+                    let in_app = query
+                        .app
+                        .as_deref()
+                        .is_none_or(|app| layers.counts_under(app, row));
+                    if in_app
+                        && text_is(&row["rule"], &query.rule)
                         && text_is(&row["status"], &query.status)
                         && query
                             .excepted
@@ -574,5 +601,48 @@ mod tests {
             page["items"][0]["pair"]["sites"][1]["targetReason"],
             "unresolved"
         );
+    }
+    /// #784: the `app` filter keeps the rows whose bucket's name matches, so two apps that
+    /// share a name answer to one filter value, and a row with no app matches none.
+    #[test]
+    fn the_app_filter_matches_every_app_of_that_name() {
+        let app = |name: &str, root: &str| crate::apps::App {
+            name: name.into(),
+            kind: crate::apps::AppKind::Npm,
+            manifest: format!("{root}/package.json"),
+            root: root.into(),
+            entries: Vec::new(),
+        };
+        let apps = [app("web", "a"), app("web", "b"), app("api", "c")];
+        let config = crate::rules::parse("version=1\n[layers.l]\norder=1\npaths=['**']\n").unwrap();
+        let row = |path: &str| {
+            json!({"rule":"$external","status":"conforms","excepted":false,"exceptionReason":null,
+                "sourceLayer":null,"destinationLayer":null,"target":{"path":path}})
+        };
+        let rules = json!({"rulesFile":{"contentHash":"hash"},
+            "instances":[row("a/x.js"), row("b/x.js"), row("c/x.js"), row("d/x.js")],"testOnly":[]});
+        let native = BTreeMap::new();
+        let layers =
+            Layers::new(&native, &rules).with_apps(crate::rules::AppScope::new(&config, &apps));
+        let paths = |app: &str| {
+            let mut query = query(0, 10);
+            query.kind = Kind::Instances;
+            query.app = Some(app.into());
+            let page = page(&query, &json!({}), &rules, &layers, None, &mut || Ok(())).unwrap();
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    item["instance"]["target"]["path"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths("web"), ["a/x.js", "b/x.js"]);
+        assert_eq!(paths("api"), ["c/x.js"]);
+        assert!(paths("missing").is_empty());
     }
 }

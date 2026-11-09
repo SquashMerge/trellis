@@ -1,7 +1,6 @@
 //! App detection from build manifests (#784): which `Cargo.toml` and `package.json` files
 //! name a runnable application. Pure: it reads manifest bytes and the snapshot's document
 //! paths, and does no I/O.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::references::external::ManifestInput;
 use crate::references::work::Work;
@@ -15,6 +14,8 @@ use std::collections::BTreeSet;
 pub(crate) enum AppKind {
     Cargo,
     Npm,
+    /// Accepted in rules; detection arrives with #807.
+    #[allow(dead_code)]
     Python,
 }
 
