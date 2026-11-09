@@ -80,7 +80,7 @@ fn parse_pin(key: &str) -> Result<IndexPin> {
 }
 
 pub(super) fn clear(db: &Connection) -> Result<()> {
-    db.execute_batch("DELETE FROM semantic_pending_target; DELETE FROM semantic_pending_selections; DELETE FROM semantic_catchup_commits; DELETE FROM semantic_projection_documents; DELETE FROM semantic_projection_origins; DELETE FROM semantic_projection_dependencies; DELETE FROM semantic_projection_lookup_dependencies; DELETE FROM semantic_projection_contexts;")?;
+    db.execute_batch("DELETE FROM semantic_pending_target; DELETE FROM semantic_pending_selections; DELETE FROM semantic_catchup_commits; DELETE FROM semantic_projection_documents; DELETE FROM semantic_projection_origins; DELETE FROM semantic_projection_dependencies; DELETE FROM semantic_projection_dependency_targets; DELETE FROM semantic_projection_lookup_dependencies; DELETE FROM semantic_projection_contexts;")?;
     Ok(())
 }
 
@@ -93,6 +93,30 @@ pub(super) fn write_pending(
     config: &[serde_json::Value],
     dependencies: &[serde_json::Value],
     cancel: &CancelFlag,
+) -> Result<()> {
+    write_pending_within(
+        db,
+        prior,
+        pin,
+        root_id,
+        config,
+        dependencies,
+        cancel,
+        semantic_payload::TERM_LOOKUP_BOUND,
+    )
+}
+
+/// [`write_pending`] with its dependency-term lookup bound given.
+#[allow(clippy::too_many_arguments)]
+fn write_pending_within(
+    db: &Connection,
+    prior: IndexPin,
+    pin: IndexPin,
+    root_id: &str,
+    config: &[serde_json::Value],
+    dependencies: &[serde_json::Value],
+    cancel: &CancelFlag,
+    lookup_bound: usize,
 ) -> Result<()> {
     let old = semantic_pin_key(prior);
     let key = semantic_pin_key(pin);
@@ -155,11 +179,53 @@ pub(super) fn write_pending(
         JOIN revision_documents p ON p.revision_id=o.basis_pin
         LEFT JOIN revision_documents n ON n.revision_id=?1 AND n.language=p.language AND n.path=p.path
         WHERE o.revision_id=?1 AND (n.vid IS NULL OR n.vid<>p.vid)", [&key])?;
-    db.execute("UPDATE semantic_projection_documents SET pending=1 WHERE revision_id=?1 AND (producer_id,language,path) IN (
-        SELECT c.producer_id,c.language,c.path FROM native_first_changed x
+    // A changed dependency makes a dependent pending only when its dependency term differs at
+    // the new revision from the one the basis payload recorded, or when the check is over its
+    // bound (Decision 0021 D4); a NULL term is pending on any change.
+    let mut dependents = db.prepare("SELECT c.producer_id,c.language,c.path,e.payload_id,e.language,e.path,e.term,s.captured_pin
+        FROM native_first_changed x
         CROSS JOIN semantic_projection_dependencies e INDEXED BY semantic_projection_reverse ON e.language=x.language AND e.path=x.path
         JOIN semantic_coverage c ON c.payload_id=e.payload_id AND c.revision_id=x.basis_pin
-        JOIN semantic_projection_origins o ON o.revision_id=?1 AND o.producer_id=c.producer_id AND o.basis_pin=x.basis_pin)", [&key])?;
+        JOIN semantic_projection_origins o ON o.revision_id=?1 AND o.producer_id=c.producer_id AND o.basis_pin=x.basis_pin
+        LEFT JOIN semantic_revision_raw_selections s ON s.revision_id=?1 AND s.producer_id=c.producer_id")?;
+    let mut targets = db.prepare("SELECT syntax_id,call FROM semantic_projection_dependency_targets WHERE payload_id=?1 AND language=?2 AND path=?3")?;
+    let mut mark = db.prepare("UPDATE semantic_projection_documents SET pending=1 WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4")?;
+    let mut marked = BTreeSet::new();
+    let mut budget = lookup_bound;
+    let mut rows = dependents.query([&key])?;
+    while let Some(row) = rows.next()? {
+        let tuple: (String, String, String) = (row.get(0)?, row.get(1)?, row.get(2)?);
+        if marked.contains(&tuple) {
+            continue;
+        }
+        let (payload, language, path): (i64, String, String) =
+            (row.get(3)?, row.get(4)?, row.get(5)?);
+        let (stored, captured): (Option<String>, Option<String>) = (row.get(6)?, row.get(7)?);
+        let pending = match (stored, captured) {
+            (Some(stored), Some(captured)) => {
+                let targets: Vec<(Vec<u8>, bool)> = targets
+                    .query_map(params![payload, language, path], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                if targets.len() >= budget {
+                    budget = 0;
+                    true
+                } else {
+                    budget -= targets.len() + 1;
+                    semantic_payload::dependency_term(
+                        db, &key, &captured, &language, &path, &targets,
+                    )? != stored
+                }
+            }
+            _ => true,
+        };
+        if pending {
+            mark.execute(params![key, tuple.0, tuple.1, tuple.2])?;
+            marked.insert(tuple);
+        }
+    }
+    drop(rows);
     db.execute_batch("DELETE FROM native_first_changed")?;
     context::mark_pending(db, &key, config, dependencies, cancel)?;
     db.execute("INSERT INTO semantic_pending_selections SELECT s.revision_id,s.producer_id,s.batch_id,s.captured_pin,o.basis_pin FROM semantic_revision_raw_selections s JOIN semantic_projection_origins o ON o.revision_id=s.revision_id AND o.producer_id=s.producer_id WHERE s.revision_id=?1", [&key])?;
@@ -609,6 +675,7 @@ impl Store {
                         .find(|selection| selection.producer_id == producer.id)
                         .context("selected semantic batch missing")?;
                     let inputs = self.payload_key_inputs();
+                    let captured_key = semantic_pin_key(selection.captured_pin);
                     // Copied and staged documents are written in canonical key order, as one
                     // settlement of every document would have written them. Corruption read or
                     // written while publishing is reported, so it schedules a re-index as a
@@ -620,7 +687,7 @@ impl Store {
                                 &tx,
                                 &key,
                                 document,
-                                Some(selection.batch_id),
+                                Some((selection.batch_id, &captured_key)),
                                 &inputs,
                             )?,
                             // A copied document names its basis row's payload: its manifest

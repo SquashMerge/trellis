@@ -26,16 +26,29 @@ pub(in crate::store) fn owned_provenance<'a>(
         .collect()
 }
 
+/// The syntax IDs of one other document that a payload's rows target, each with whether a call
+/// binding's declared target is it.
+pub(in crate::store) type DependencyTargets = BTreeMap<String, bool>;
+
 /// The documents the tuple's rows name: the union of every internal endpoint, join anchor,
-/// candidate and dispatch document. A change to any of them invalidates the payload.
+/// candidate and dispatch document, with the syntax IDs targeted in each. A change to any of
+/// them can invalidate the payload; [`dependency_term`] says which.
 pub(in crate::store) fn projection_dependencies(
     owns: &BTreeSet<&str>,
     publication: &sem::SemanticPublication,
-) -> BTreeSet<(String, String)> {
-    let mut out = BTreeSet::new();
-    let mut target = |t: &sem::Target| {
-        if let sem::Target::Internal { document, .. } = t {
-            out.insert((document.language.clone(), document.path.clone()));
+) -> BTreeMap<(String, String), DependencyTargets> {
+    let mut out: BTreeMap<(String, String), DependencyTargets> = BTreeMap::new();
+    let mut target = |t: &sem::Target, call: bool| {
+        if let sem::Target::Internal {
+            document,
+            syntax_id,
+            ..
+        } = t
+        {
+            *out.entry((document.language.clone(), document.path.clone()))
+                .or_default()
+                .entry(syntax_id.clone())
+                .or_default() |= call;
         }
     };
     for symbol in publication
@@ -43,7 +56,7 @@ pub(in crate::store) fn projection_dependencies(
         .iter()
         .filter(|s| owns.contains(s.provenance_id.as_str()))
     {
-        symbol.declarations.iter().for_each(&mut target);
+        symbol.declarations.iter().for_each(|t| target(t, false));
     }
     let mut anchors = Vec::new();
     for binding in publication
@@ -61,17 +74,20 @@ pub(in crate::store) fn projection_dependencies(
         .iter()
         .filter(|r| owns.contains(r.provenance_id.as_str()))
     {
-        reference.declared_target.iter().for_each(&mut target);
-        reference.candidates.iter().for_each(&mut target);
+        reference
+            .declared_target
+            .iter()
+            .for_each(|t| target(t, false));
+        reference.candidates.iter().for_each(|t| target(t, false));
     }
     for call in publication
         .call_bindings
         .iter()
         .filter(|b| owns.contains(b.provenance_id.as_str()))
     {
-        call.declared_target.iter().for_each(&mut target);
-        call.candidates.iter().for_each(&mut target);
-        call.possible_dispatch.iter().for_each(&mut target);
+        call.declared_target.iter().for_each(|t| target(t, true));
+        call.candidates.iter().for_each(|t| target(t, false));
+        call.possible_dispatch.iter().for_each(|t| target(t, false));
         anchors.push((
             call.join.anchor.document.language.clone(),
             call.join.anchor.document.path.clone(),
@@ -82,11 +98,97 @@ pub(in crate::store) fn projection_dependencies(
         .iter()
         .filter(|r| owns.contains(r.provenance_id.as_str()))
     {
-        target(&relationship.source);
-        target(&relationship.target);
+        target(&relationship.source, false);
+        target(&relationship.target, false);
     }
-    out.extend(anchors);
+    for anchor in anchors {
+        out.entry(anchor).or_default();
+    }
     out
+}
+
+/// A dependency's recorded term and targets, as stored with its payload.
+pub(in crate::store) struct DependencyRecord {
+    pub language: String,
+    pub path: String,
+    /// `None` for the payload's own document and for a payload with no reuse key: a change to
+    /// that document then always invalidates the payload.
+    pub term: Option<String>,
+    pub targets: Vec<(Vec<u8>, bool)>,
+}
+
+/// How many targeted syntax IDs one pending decision may look up; beyond it every remaining
+/// dependent is conservatively pending.
+pub(in crate::store) const TERM_LOOKUP_BOUND: usize = 200_000;
+
+/// The dependency term of document `language`/`path` for a payload that targets `targets`
+/// (syntax ID BLOB, call-bound), read at `revision` with `captured_pin` as the capture
+/// (owner ruling 2026-11-09, Decision 0021 D4). Equal terms mean the payload's settled tuple is
+/// equal, because the term holds everything the settlement reads of another document D:
+///
+/// - whether D is present (`retarget` keeps a target only when `doc_row(N, D)` exists);
+/// - for each targeted syntax ID of D, the declaration status the settlement reads
+///   (`declaration_status`: none, or named, name matches, method), which is read by `retarget`,
+///   `check_row`'s `known` and `rejoined_dispatch`;
+/// - only when a call binding's declared target is a method of D, whether D's content hash
+///   equals its hash at the capture. The destination row's declared target is cleared for a
+///   changed D (`staged/witness.rs` `reused_source`, FULL's `StagedSide::unchanged`), and only
+///   `rejoined_dispatch` reads it, turning a captured `Direct` call on a method into `Unknown`.
+///   It compares content hashes, not versions: a config-only change keeps the bytes and the
+///   dispatch.
+///
+/// No byte offset, range or anchor of D is read or stored: anchors are own-document, targets
+/// are `(syntax_id, document)` and syntax IDs survive comment and body edits. A future
+/// settlement read of another document must extend this term. Captured-side reads and
+/// external targets are constant for the batch and so for the key.
+pub(in crate::store) fn dependency_term(
+    db: &Connection,
+    revision: &str,
+    captured_pin: &str,
+    language: &str,
+    path: &str,
+    targets: &[(Vec<u8>, bool)],
+) -> Result<String> {
+    let document = |revision: &str| -> Result<Option<(i64, String)>> {
+        Ok(db
+            .prepare_cached("SELECT d.vid,v.content_hash FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?1 AND d.language=?2 AND d.path=?3")?
+            .query_row(params![revision, language, path], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    };
+    let current = document(revision)?;
+    let mut call_method = false;
+    let mut statuses = Vec::with_capacity(targets.len());
+    for (syntax_id, call) in targets {
+        let status: Option<(bool, bool, bool)> = match &current {
+            Some((vid, _)) => db
+                .prepare_cached("SELECT name_start IS NOT NULL,name_start IS NOT NULL AND name IS NOT NULL,kind='method' FROM native_version_declarations WHERE vid=?1 AND syntax_id=?2")?
+                .query_row(params![vid, syntax_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()?,
+            None => None,
+        };
+        call_method |= *call && status.is_some_and(|(_, _, method)| method);
+        statuses.push(serde_json::json!([
+            super::id_codec::decode_sid(syntax_id)?,
+            status
+        ]));
+    }
+    let unchanged = match (&current, call_method) {
+        (Some((_, hash)), true) => Some(
+            revision == captured_pin
+                || document(captured_pin)?.is_some_and(|(_, captured)| captured == *hash),
+        ),
+        _ => None,
+    };
+    Ok(crate::native_ids::digest(
+        b"trellis.semantic-dependency-term.v1\0",
+        &crate::native_ids::canonical(&serde_json::json!({
+            "language": language,
+            "path": path,
+            "present": current.is_some(),
+            "targets": statuses,
+            "unchanged": unchanged,
+        })),
+    ))
 }
 
 /// What a payload key hashes besides the document's own identity: the join-inputs digest
@@ -139,7 +241,9 @@ impl KeyInputs {
     }
 }
 
-/// The input key (B): equal keys name equal payloads. `None` when the inputs disable reuse.
+/// The input key (B): equal keys name equal payloads. `terms` are the sorted dependency terms
+/// of the payload's other documents; its own document enters by `version`. `None` when the
+/// inputs disable reuse.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::store) fn payload_key(
     inputs: &KeyInputs,
@@ -149,7 +253,7 @@ pub(in crate::store) fn payload_key(
     language: &str,
     path: &str,
     version: &str,
-    dependencies: &[(String, String, String)],
+    terms: &[(String, String, String)],
 ) -> Option<String> {
     if !inputs.reuse {
         return None;
@@ -161,7 +265,7 @@ pub(in crate::store) fn payload_key(
             "producer": {"id": producer.id, "version": producer.version, "executableHash": producer.executable_hash},
             "batch": {"descriptorSha256": descriptor_sha256, "capturedRevision": captured_revision},
             "document": {"language": language, "path": path, "version": version},
-            "dependencies": dependencies.iter().map(|(l, p, v)| serde_json::json!({"language": l, "path": p, "version": v})).collect::<Vec<_>>(),
+            "dependencies": terms.iter().map(|(l, p, t)| serde_json::json!({"language": l, "path": p, "term": t})).collect::<Vec<_>>(),
         })),
     ))
 }
@@ -348,7 +452,7 @@ pub(in crate::store) fn cleanup_payload_candidates(
         ("semantic_declaration_bindings", "payload"),
         ("semantic_call_bindings", "payload"),
     ];
-    const TAIL: [(&str, &str); 8] = [
+    const TAIL: [(&str, &str); 9] = [
         ("semantic_provenance", "payload"),
         (
             "semantic_basis_lookup_dependencies",
@@ -356,6 +460,7 @@ pub(in crate::store) fn cleanup_payload_candidates(
         ),
         ("semantic_basis", "payload"),
         ("semantic_projection_dependencies", "payload"),
+        ("semantic_projection_dependency_targets", "payload"),
         ("semantic_projection_lookup_dependencies", "payload"),
         ("semantic_projection_contexts", "payload"),
         ("semantic_coverage_roles", "payload"),
@@ -578,7 +683,7 @@ mod tests {
         let owns = owned_provenance(&coverage, &publication);
         let paths: Vec<String> = projection_dependencies(&owns, &publication)
             .into_iter()
-            .map(|(_, path)| path)
+            .map(|((_, path), _)| path)
             .collect();
         assert_eq!(
             paths,
@@ -604,7 +709,7 @@ mod tests {
         let owns = owned_provenance(&coverage, &publication);
         assert!(
             !projection_dependencies(&owns, &publication)
-                .iter()
+                .keys()
                 .any(|(_, path)| path == "symbol-target.js")
         );
     }
@@ -634,6 +739,48 @@ mod tests {
                 && format!("{error:#}").contains("semantic dependency endpoint missing"),
             "{error:#}"
         );
+    }
+
+    /// A payload written without a batch has no reuse key and so no term: any change to a
+    /// document it names makes it pending.
+    #[test]
+    fn unbatched_payload_records_null_terms_and_no_targets() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(CACHE_SCHEMA_V42).unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
+        let (_, mut publication) = every_endpoint();
+        publication.producers.push(sem::Producer {
+            id: "producer".into(),
+            version: "1".into(),
+            executable_hash: "a".repeat(64),
+            kind: sem::SemanticKind::Semantic,
+            languages: vec![sem::Language::Javascript],
+            position_encoding: sem::PositionEncoding::Utf8,
+        });
+        publication.references.clear();
+        let paths: BTreeSet<String> = projection_dependencies(
+            &owned_provenance(&publication.coverage[0], &publication),
+            &publication,
+        )
+        .into_keys()
+        .map(|(_, path)| path)
+        .chain(["main.js".to_owned()])
+        .collect();
+        for (vid, path) in paths.iter().enumerate() {
+            let vid = vid as i64 + 1;
+            db.execute("INSERT INTO document_versions(vid,id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness) VALUES(?1,?2,'javascript',?3,?4,?4,'p','1',0,x'',?4)", params![vid, format!("v{vid}"), path, format!("{vid:064}")]).unwrap();
+            db.execute("INSERT INTO revision_documents VALUES('key','javascript',?1,?2,1,NULL,NULL,1,1,'complete',NULL,?2,1)", params![path, vid]).unwrap();
+        }
+        write_import_coverage(&db, "key", &publication, None, &KeyInputs::current()).unwrap();
+        let (rows, terms, targets): (i64, i64, i64) = db
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM semantic_projection_dependencies),(SELECT COUNT(term) FROM semantic_projection_dependencies),(SELECT COUNT(*) FROM semantic_projection_dependency_targets)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, terms, targets), (8, 0, 0));
     }
 
     fn payload_with_children(db: &Connection, key: Option<&str>, symbols: usize) {

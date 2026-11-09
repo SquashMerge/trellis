@@ -811,6 +811,7 @@ fn sqlite_snapshot(
         "semantic_producers",
         "semantic_projection_contexts",
         "semantic_projection_dependencies",
+        "semantic_projection_dependency_targets",
         "semantic_projection_documents",
         "semantic_projection_lookup_dependencies",
         "semantic_projection_origins",

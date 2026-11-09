@@ -760,7 +760,7 @@ impl Store {
                     .downcast_ref::<crate::semantic_batch::staging::WitnessFallback>()
                     .map(|fallback| fallback.0)
                     .or_else(|| resource_limit(&error).then_some(WITNESS_LIMIT_FALLBACK));
-                if let Some(_reason) = fallback {
+                if let Some(reason) = fallback {
                     let current = state
                         .current
                         .as_mut()
@@ -771,10 +771,11 @@ impl Store {
                         current.join = None;
                         current.authority = None;
                         current.full = true;
+                        Self::semantic_phase_diagnostic("full_fallback", reason);
                         // FULL is bounded as a fresh attempt, not by the witness's spent steps.
                         current.budget = LookupBudget::new(&limits);
                         #[cfg(feature = "test-support")]
-                        crate::semantic_import::note_local_witness_outcome(Some(_reason));
+                        crate::semantic_import::note_local_witness_outcome(Some(reason));
                         return Ok(SemanticUnitOutcome::Progress);
                     }
                 }

@@ -302,7 +302,8 @@ class SchemaParity(unittest.TestCase):
                    (pins["r2"], pins["import"]))
         db.execute("INSERT INTO semantic_projection_documents VALUES(?,'scip-typescript','javascript','js/a.js',0)",
                    (pins["r2"],))
-        db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js','version-b')", (payload_id,))
+        db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js','term-b')", (payload_id,))
+        db.execute("INSERT INTO semantic_projection_dependency_targets VALUES(?,'javascript','js/b.js',?,1)", (payload_id, bytes(16)))
         db.execute("INSERT INTO semantic_projection_contexts VALUES(?)", (payload_id,))
         db.execute("INSERT INTO semantic_projection_lookup_dependencies VALUES(?,'lookup')", (payload_id,))
         db.execute("INSERT INTO semantic_payloads VALUES(?,NULL,'scip-typescript','1','javascript','js/a.js','version-old',1,NULL)",
@@ -313,7 +314,8 @@ class SchemaParity(unittest.TestCase):
                    (pins["r1"], pins["r1"]))
         db.execute("INSERT INTO semantic_projection_documents VALUES(?,'scip-typescript','javascript','js/a.js',0)",
                    (pins["r1"],))
-        db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js','version-old')", (payload_id + 1,))
+        db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js','term-old')", (payload_id + 1,))
+        db.execute("INSERT INTO semantic_projection_dependency_targets VALUES(?,'javascript','js/b.js',?,0)", (payload_id + 1, bytes(16)))
         db.execute("INSERT INTO semantic_projection_contexts VALUES(?)", (payload_id + 1,))
         db.execute("INSERT INTO semantic_projection_lookup_dependencies VALUES(?,'old-lookup')", (payload_id + 1,))
         report = {"producerId": "scip-typescript", "identityKind": "executable",
@@ -339,6 +341,7 @@ class SchemaParity(unittest.TestCase):
                       "semantic_basis", "semantic_provenance",
                       "semantic_import_reports", "semantic_reimport", "semantic_projection_origins",
                       "semantic_projection_documents", "semantic_projection_dependencies",
+                      "semantic_projection_dependency_targets",
                       "semantic_projection_contexts", "semantic_projection_lookup_dependencies"):
             columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
             query = f'SELECT * FROM "{table}" selected WHERE {RUNNER.selected_where(table)}'
@@ -347,8 +350,8 @@ class SchemaParity(unittest.TestCase):
             self.assertTrue(rows[table], table)
         self.assertEqual(len(rows["semantic_reimport"]), 1)
         for table in ("semantic_projection_origins", "semantic_projection_documents",
-                      "semantic_projection_dependencies", "semantic_projection_contexts",
-                      "semantic_projection_lookup_dependencies"):
+                      "semantic_projection_dependencies", "semantic_projection_dependency_targets",
+                      "semantic_projection_contexts", "semantic_projection_lookup_dependencies"):
             self.assertEqual(len(rows[table]), 1, table)
         # Pending and catchup rows are different workflow phases; exercise each
         # identity mapping without manufacturing a combined database state.

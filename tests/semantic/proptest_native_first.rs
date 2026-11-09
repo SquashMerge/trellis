@@ -9,7 +9,10 @@
 //!
 //! 1. N is readable before S, and pinned reads never mix revisions.
 //! 2. Changed documents and their actual dependents are `catchingUp`/`needsReimport`,
-//!    never a negative semantic conclusion.
+//!    never a negative semantic conclusion. A dependent is actual only when a changed
+//!    dependency's term differs (Decision 0021 D4): the dependency is gone, or a syntax ID
+//!    the dependent targets is no longer declared in it. A comment or body edit that leaves
+//!    those declarations alone keeps the dependent older-basis.
 //! 3. Unchanged documents keep P evidence as `olderBasis` (never effective `fresh`),
 //!    and no traversal follows an edge into a pending document as current.
 //! 4. After S the published result equals FULL (the in-S oracle) and every retained
@@ -274,6 +277,8 @@ struct Model {
     basis_files: BTreeMap<String, String>,
     /// `owner path -> internal endpoint paths` of P's published rows.
     basis_endpoints: BTreeMap<String, BTreeSet<String>>,
+    /// `owner path -> (dependency path, targeted syntax ID)` of P's published rows.
+    basis_targets: BTreeMap<String, BTreeSet<(String, String)>>,
     basis_snapshot: SemanticSnapshot,
     basis_native: String,
     producer: String,
@@ -341,6 +346,52 @@ fn endpoints(snapshot: &SemanticSnapshot) -> BTreeMap<String, BTreeSet<String>> 
     out
 }
 
+/// Independently derive, per document, the `(dependency path, syntax ID)` pairs P's rows
+/// target in other documents: the declarations a dependency term reads.
+fn targeted_ids(snapshot: &SemanticSnapshot) -> BTreeMap<String, BTreeSet<(String, String)>> {
+    let owner: BTreeMap<&str, &str> = snapshot
+        .provenance
+        .iter()
+        .map(|p| (p.id.as_str(), p.document.path.as_str()))
+        .collect();
+    let mut out: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut add = |proof: &str, targets: Vec<&Target>| {
+        let Some(doc) = owner.get(proof) else {
+            return;
+        };
+        for target in targets {
+            if let Target::Internal {
+                document,
+                syntax_id,
+                ..
+            } = target
+            {
+                out.entry((*doc).to_owned())
+                    .or_default()
+                    .insert((document.path.clone(), syntax_id.clone()));
+            }
+        }
+    };
+    for s in &snapshot.symbols {
+        add(&s.provenance_id, s.declarations.iter().collect());
+    }
+    for r in &snapshot.references {
+        let mut t: Vec<&Target> = r.candidates.iter().collect();
+        t.extend(r.declared_target.as_ref());
+        add(&r.provenance_id, t);
+    }
+    for c in &snapshot.call_bindings {
+        let mut t: Vec<&Target> = c.candidates.iter().collect();
+        t.extend(c.possible_dispatch.iter());
+        t.extend(c.declared_target.as_ref());
+        add(&c.provenance_id, t);
+    }
+    for r in &snapshot.type_relationships {
+        add(&r.provenance_id, vec![&r.source, &r.target]);
+    }
+    out
+}
+
 impl Model {
     fn at(world: &World, basis: IndexPin) -> Result<Self, String> {
         let snapshot = world
@@ -380,6 +431,7 @@ impl Model {
             basis,
             basis_files: world.files(),
             basis_endpoints: endpoints(&snapshot),
+            basis_targets: targeted_ids(&snapshot),
             basis_native: native_id(world, basis)?,
             basis_snapshot: snapshot,
             producer,
@@ -399,20 +451,41 @@ impl Model {
         changed
     }
 
-    /// Changed documents plus documents whose P evidence has an endpoint in one.
-    fn pending(&self, files: &BTreeMap<String, String>) -> BTreeSet<String> {
+    /// Changed documents plus documents with a changed dependency whose term differs at
+    /// `n`: the dependency is gone, or a syntax ID the document's P rows target in it is not
+    /// declared in it at `n`. (The fixtures declare plain named functions, so a declaration's
+    /// read status is its presence; a dependency's comment or body edit keeps its IDs.)
+    fn pending(
+        &self,
+        world: &World,
+        n: IndexPin,
+        files: &BTreeMap<String, String>,
+    ) -> Result<BTreeSet<String>, String> {
         let changed = self.changed(files);
-        files
+        let declared = declarations(world, n)?;
+        let term_differs = |owner: &str, dependency: &str| {
+            !files.contains_key(dependency)
+                || self.basis_targets.get(owner).is_some_and(|targets| {
+                    targets
+                        .iter()
+                        .filter(|(path, _)| path == dependency)
+                        .any(|(_, sid)| {
+                            declared.get(sid).is_none_or(|(path, _)| path != dependency)
+                        })
+                })
+        };
+        Ok(files
             .keys()
             .filter(|path| {
                 changed.contains(*path)
-                    || self
-                        .basis_endpoints
-                        .get(*path)
-                        .is_some_and(|ends| ends.iter().any(|end| changed.contains(end)))
+                    || self.basis_endpoints.get(*path).is_some_and(|ends| {
+                        ends.iter().any(|end| {
+                            end != *path && changed.contains(end) && term_differs(path, end)
+                        })
+                    })
             })
             .cloned()
-            .collect()
+            .collect())
     }
 
     /// P's rows for `path` as a per-document answer projection serves them.
@@ -1012,6 +1085,7 @@ impl<'w> Harness<'w> {
                 basis: world.store.index_baseline().unwrap(),
                 basis_files: BTreeMap::new(),
                 basis_endpoints: BTreeMap::new(),
+                basis_targets: BTreeMap::new(),
                 basis_snapshot: world
                     .store
                     .semantic_at(world.store.index_baseline().unwrap())
@@ -1304,7 +1378,7 @@ impl<'w> Harness<'w> {
         files: &BTreeMap<String, String>,
         actual: &Projections,
     ) -> Result<(), String> {
-        let pending = self.model.pending(files);
+        let pending = self.model.pending(self.world, n, files)?;
         let changed = self.model.changed(files);
         for (path, projection) in actual {
             let projection = projection
@@ -1499,7 +1573,7 @@ impl<'w> Harness<'w> {
             return Ok(());
         };
         let world = self.world;
-        let eligible = self.copy_eligible();
+        let eligible = self.copy_eligible()?;
         let n_native = native_id(world, n)?;
         clear_work_counts();
         let completed = world
@@ -1592,9 +1666,10 @@ impl<'w> Harness<'w> {
 
     /// The model's copy eligibility at the outstanding N: not pending, P published a tuple
     /// that omitted nothing, and captured bytes equal current bytes.
-    fn copy_eligible(&mut self) -> BTreeSet<String> {
+    fn copy_eligible(&mut self) -> Result<BTreeSet<String>, String> {
         let files = self.world.files();
-        let pending = self.model.pending(&files);
+        let n = self.model.outstanding.ok_or("no outstanding N")?;
+        let pending = self.model.pending(self.world, n, &files)?;
         let mut eligible = BTreeSet::new();
         for (path, content) in &files {
             if pending.contains(path) || !self.model.basis_tuples.contains(path) {
@@ -1608,7 +1683,7 @@ impl<'w> Harness<'w> {
                 eligible.insert(path.clone());
             }
         }
-        eligible
+        Ok(eligible)
     }
 
     /// #669 H1, #680: S copies a document by naming its basis payload without reading the
@@ -1626,7 +1701,7 @@ impl<'w> Harness<'w> {
         let Some(n) = self.model.outstanding else {
             return Ok(());
         };
-        let eligible: Vec<String> = self.copy_eligible().into_iter().collect();
+        let eligible: Vec<String> = self.copy_eligible()?.into_iter().collect();
         if eligible.is_empty() {
             return Ok(());
         }
@@ -1941,10 +2016,10 @@ fn native_first_control_history() {
         return;
     }
     let stats = run_history(&[
-        // B (target) changes: A (run calls target) is a dependent; C (helper calls run) is not.
-        Op::Edit {
+        // B (target) goes away: A (run calls target) is a dependent; C (helper calls run) is
+        // not.
+        Op::Remove {
             path: 1,
-            choice: 1,
             defer: true,
         },
         Op::FailS,
@@ -1973,6 +2048,42 @@ fn native_first_control_history() {
         "{stats:?}"
     );
     assert!(stats.failed_s > 0 && stats.catch_ups > 0, "{stats:?}");
+}
+
+/// Decision 0021 D4: a comment edit and a body edit of the dependency `B` leave the targeted
+/// declaration alone, so `A` stays older-basis (no dependent is pending) and S copies it; a
+/// rename of the declaration makes `A` a dependent.
+#[test]
+fn native_first_dependency_term_control() {
+    if !isolated("proptest_native_first::native_first_dependency_term_control") {
+        return;
+    }
+    let comment_and_body = run_history(&[
+        // CONTENTS[8]: `// note` before `target`, then CONTENTS[4]: a body edit.
+        Op::Edit {
+            path: 1,
+            choice: 3,
+            defer: false,
+        },
+        Op::Edit {
+            path: 1,
+            choice: 1,
+            defer: false,
+        },
+    ])
+    .unwrap();
+    eprintln!("term control stats: {comment_and_body:?}");
+    assert_eq!(comment_and_body.dependent_only, 0, "{comment_and_body:?}");
+    assert!(
+        comment_and_body.older_basis_docs > 0,
+        "{comment_and_body:?}"
+    );
+    let removed = run_history(&[Op::Remove {
+        path: 1,
+        defer: true,
+    }])
+    .unwrap();
+    assert!(removed.dependent_only > 0, "{removed:?}");
 }
 
 /// #669 H1 controls: a below-head import that lost B omits A's association to `target`,
@@ -2198,11 +2309,10 @@ fn native_first_reduced_limit_histories() {
     if !isolated_with(name, &[("TRELLIS_TEST_SEMANTIC_LIMITS", REDUCED_LIMITS)]) {
         return;
     }
-    // B (target) changes, so A (run calls target) is a pending dependent the witness settles.
+    // B (target) goes away, so A (run calls target) is a pending dependent the witness settles.
     let control = run_history(&[
-        Op::Edit {
+        Op::Remove {
             path: 1,
-            choice: 1,
             defer: false,
         },
         Op::Edit {

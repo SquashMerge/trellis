@@ -47,6 +47,14 @@ fn payload_files(root: &std::path::Path) {
 /// `notRequested`. The batch is imported; the oracle and work counts are on.
 fn payload_world() -> (World, IndexPin, PathBuf) {
     let world = world(payload_files);
+    let counts = instrument(&world);
+    let descriptor = payload_batch(&world);
+    let (import, _, _) = world.publish(&descriptor).unwrap();
+    (world, import, counts)
+}
+
+/// Turns on the FULL oracle and the work counts, and fixes the retention clock.
+fn instrument(world: &World) -> PathBuf {
     let counts = world._state.path().join("work-counts.json");
     // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
     unsafe {
@@ -54,9 +62,7 @@ fn payload_world() -> (World, IndexPin, PathBuf) {
         std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
     }
     world.store.set_retention_clock_for_tests(1_000, 0);
-    let descriptor = payload_batch(&world);
-    let (import, _, _) = world.publish(&descriptor).unwrap();
-    (world, import, counts)
+    counts
 }
 
 /// The batch over `payload_files`: every document but `G`, which it excludes as `notRequested`.
@@ -92,7 +98,7 @@ fn payload_of(world: &World, revision: IndexPin, path: &str) -> Option<i64> {
         .unwrap()
 }
 
-const TABLES: [&str; 22] = [
+const TABLES: [&str; 23] = [
     "semantic_payloads",
     "semantic_coverage",
     "semantic_coverage_freshness",
@@ -115,6 +121,7 @@ const TABLES: [&str; 22] = [
     "semantic_call_join_candidates",
     "semantic_type_relationships",
     "semantic_projection_dependencies",
+    "semantic_projection_dependency_targets",
 ];
 
 fn row_counts(world: &World) -> BTreeMap<&'static str, i64> {
@@ -157,10 +164,11 @@ fn payload_rows(world: &World, table: &str, payloads: &[i64]) -> i64 {
     world.count(&format!("SELECT COUNT(*) FROM {table} WHERE {scope}"))
 }
 
-/// AC1: an S that changes `B` writes the rows of the two payloads it changes (`B`, and `A`,
-/// which depends on it) and one manifest row, plus a freshness row, per document.
+/// AC1: an S that edits the body of `B` writes the rows of the one payload it changes (`B`;
+/// `A` depends on `B` but targets only a declaration the edit leaves alone) and one manifest
+/// row, plus a freshness row, per document.
 #[test]
-fn s_commit_writes_changed_and_dependent_rows_only() {
+fn s_commit_writes_changed_rows_only() {
     let (world, import, counts) = payload_world();
     let before = row_counts(&world);
     let max_before = world.count("SELECT MAX(payload_id) FROM semantic_payloads");
@@ -172,11 +180,15 @@ fn s_commit_writes_changed_and_dependent_rows_only() {
     let after = row_counts(&world);
     let new_payloads: Vec<i64> =
         ((max_before + 1)..=world.count("SELECT MAX(payload_id) FROM semantic_payloads")).collect();
-    assert_eq!(new_payloads.len(), 2, "payloads written for A and B");
+    assert_eq!(new_payloads.len(), 1, "a payload written for B alone");
     assert_eq!(
         after["semantic_payloads"] - before["semantic_payloads"],
-        2,
+        1,
         "{before:?} {after:?}"
+    );
+    assert_eq!(
+        payload_of(&world, head, "src/A.js"),
+        payload_of(&world, import, "src/A.js")
     );
     // Each revision has a manifest row per document, and a freshness row per fact-bearing one.
     assert_eq!(
@@ -194,7 +206,7 @@ fn s_commit_writes_changed_and_dependent_rows_only() {
         after["semantic_coverage_freshness"] - before["semantic_coverage_freshness"],
         bearing
     );
-    // Every payload-keyed table grows by exactly the two new payloads' rows.
+    // Every payload-keyed table grows by exactly the new payload's rows.
     for table in TABLES {
         if matches!(table, "semantic_coverage" | "semantic_coverage_freshness") {
             continue;
@@ -234,13 +246,6 @@ fn s_commit_writes_changed_and_dependent_rows_only() {
         )
         .unwrap();
     assert!(roles <= 7 && reasons <= 1, "{roles} {reasons}");
-    println!("S row deltas: {:?}", {
-        let mut delta = BTreeMap::new();
-        for table in TABLES {
-            delta.insert(table, after[table] - before[table]);
-        }
-        delta
-    });
 }
 
 /// AC3: a payload is evidence of a revision only through that revision's manifest row.
@@ -429,11 +434,13 @@ fn edited_document_does_not_hit_the_retained_payload() {
     );
 }
 
-/// AC4: an unchanged document whose dependency changed does not reuse the payload.
+/// AC4: an unchanged document whose dependency's term changed does not reuse the payload: the
+/// declaration it targets is gone.
 #[test]
-fn dependency_version_change_misses() {
+fn dependency_term_change_misses() {
     let (world, import, counts) = payload_world();
-    let head = edit_b(&world, &counts, "return 1;");
+    local_edit(&world, "src/B.js", "function other(){ }\n", &counts);
+    let head = world.store.index_baseline().unwrap();
     assert_ne!(
         payload_of(&world, head, "src/A.js"),
         payload_of(&world, import, "src/A.js")
@@ -442,6 +449,153 @@ fn dependency_version_change_misses() {
         payload_of(&world, head, "src/C.js"),
         payload_of(&world, import, "src/C.js")
     );
+}
+
+/// AC4: a dependency edit that leaves the declarations the document targets alone does not
+/// change the dependency's term, so the document keeps its payload. Neither a comment, a body
+/// edit nor a new unrelated declaration is read by the settlement.
+#[test]
+fn dependency_edit_leaving_its_targets_alone_keeps_the_payload() {
+    let (world, import, counts) = payload_world();
+    let a = payload_of(&world, import, "src/A.js");
+    for text in [
+        "// note\nfunction target(){ }\n",
+        "function target(){ return 1; }\n",
+        "function target(){ }\nfunction extra(){ }\n",
+    ] {
+        local_edit(&world, "src/B.js", text, &counts);
+        let head = world.store.index_baseline().unwrap();
+        assert_eq!(payload_of(&world, head, "src/A.js"), a, "{text}");
+        assert_ne!(
+            payload_of(&world, head, "src/B.js"),
+            payload_of(&world, import, "src/B.js"),
+            "{text}"
+        );
+    }
+}
+
+/// Callers of `target` in `B`, one document each: the dependents of `B`.
+const CALLERS: [&str; 6] = ["c", "d", "e", "f", "h", "i"];
+
+fn caller_path(name: &str) -> String {
+    format!("src/{}.js", name.to_uppercase())
+}
+
+fn caller_text(name: &str) -> String {
+    format!("function run{name}(){{ target(); }}\n")
+}
+
+/// `B` and the documents that call it. The oracle and work counts are on.
+fn heavy_world() -> (World, IndexPin, PathBuf) {
+    let world = world(|root| {
+        write_files(root, &[("src/B.js", DEFINITIONS_B)]);
+        for name in CALLERS {
+            write_files(root, &[(&caller_path(name), &caller_text(name))]);
+        }
+    });
+    let counts = instrument(&world);
+    let (_, b) = crate::semantic_batch_store::definitions_docs();
+    let callers = CALLERS.map(|name| {
+        let width = format!("run{name}").len() as i32;
+        DocSpec::new(&caller_path(name))
+            .occurrence(&[0, 9, 9 + width], &[], &format!("pkg run{name}."), 1)
+            .occurrence(
+                &[0, 13 + width, 19 + width],
+                &[0, 13 + width, 21 + width],
+                "pkg target.",
+                0,
+            )
+            .symbol(&format!("pkg run{name}."), 17, &[])
+    });
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", [vec![b], callers.to_vec()].concat());
+    let descriptor = world.write(&fixture);
+    let (import, _, _) = world.publish(&descriptor).unwrap();
+    (world, import, counts)
+}
+
+fn payloads(world: &World) -> i64 {
+    world.count("SELECT COUNT(*) FROM semantic_payloads")
+}
+
+/// AC1, owner ruling 2026-11-09: a comment edit to a dependency of many documents writes at
+/// most two payloads (here one: the edited document) and rotates none of its dependents.
+#[test]
+fn dependency_comment_edit_writes_at_most_two_payloads() {
+    let (world, import, counts) = heavy_world();
+    let dependents = world.count(
+        "SELECT COUNT(DISTINCT payload_id) FROM semantic_projection_dependencies WHERE path='src/B.js' AND term IS NOT NULL",
+    );
+    assert_eq!(
+        dependents,
+        CALLERS.len() as i64,
+        "every caller depends on B"
+    );
+    let before = payloads(&world);
+    local_edit(
+        &world,
+        "src/B.js",
+        "function target(){ }\n// note\n",
+        &counts,
+    );
+    let head = world.store.index_baseline().unwrap();
+    assert!(payloads(&world) - before <= 2);
+    for name in CALLERS {
+        let path = caller_path(name);
+        assert_eq!(
+            payload_of(&world, head, &path),
+            payload_of(&world, import, &path),
+            "{path}"
+        );
+    }
+    assert_ne!(
+        payload_of(&world, head, "src/B.js"),
+        payload_of(&world, import, "src/B.js")
+    );
+}
+
+/// A declaration-status change rotates exactly the documents that target it, and a revert
+/// names the import's payloads again (D5).
+#[test]
+fn declaration_change_rotates_exactly_the_dependents_that_target_it() {
+    let (world, import, counts) = heavy_world();
+    let before = payloads(&world);
+    local_edit(&world, "src/B.js", "function other(){ }\n", &counts);
+    let renamed = world.store.index_baseline().unwrap();
+    assert_eq!(payloads(&world) - before, CALLERS.len() as i64 + 1);
+    for name in CALLERS {
+        let path = caller_path(name);
+        assert_ne!(
+            payload_of(&world, renamed, &path),
+            payload_of(&world, import, &path),
+            "{path}"
+        );
+    }
+    local_edit(&world, "src/B.js", DEFINITIONS_B, &counts);
+    let back = world.store.index_baseline().unwrap();
+    for path in std::iter::once("src/B.js".to_owned()).chain(CALLERS.map(caller_path)) {
+        assert_eq!(
+            payload_of(&world, back, &path),
+            payload_of(&world, import, &path),
+            "{path}"
+        );
+    }
+}
+
+/// A keyed payload records a term and its targeted syntax IDs for every other document it
+/// depends on.
+#[test]
+fn keyed_payload_records_a_term_for_every_other_document() {
+    let (world, _import, _counts) = heavy_world();
+    let keyed = world.count(
+        "SELECT COUNT(*) FROM semantic_projection_dependencies d JOIN semantic_payloads p ON p.payload_id=d.payload_id WHERE d.term IS NULL AND p.payload_key IS NOT NULL AND d.path<>p.path",
+    );
+    assert_eq!(
+        keyed, 0,
+        "a keyed payload records a term for every other document"
+    );
+    let targets = world.count("SELECT COUNT(*) FROM semantic_projection_dependency_targets");
+    assert!(targets >= CALLERS.len() as i64);
 }
 
 /// AC4: a target that goes away and returns is settled again, not copied from the revision
@@ -538,9 +692,9 @@ fn shared_payload_survives_release_of_one_revision() {
     let first = edit_b(&world, &counts, "return 1;");
     let head = edit_b(&world, &counts, "return 2;");
     let shared = payload_of(&world, first, "src/C.js").unwrap();
-    let first_only = payload_of(&world, first, "src/A.js").unwrap();
+    let first_only = payload_of(&world, first, "src/B.js").unwrap();
     assert_eq!(payload_of(&world, head, "src/C.js"), Some(shared));
-    assert_ne!(payload_of(&world, head, "src/A.js"), Some(first_only));
+    assert_ne!(payload_of(&world, head, "src/B.js"), Some(first_only));
     world.store.set_retention_clock_for_tests(3_000, 2_000);
     let leader = world.store.publication_for_tests().unwrap();
     for _ in 0..4096 {
@@ -719,8 +873,8 @@ fn copy_does_not_name_a_payload_another_join_digest_wrote() {
     }
     assert_eq!(
         world.count("SELECT COUNT(*) FROM semantic_payloads"),
-        payloads + 2,
-        "only A and B wrote payloads"
+        payloads + 1,
+        "only B wrote a payload"
     );
 }
 
