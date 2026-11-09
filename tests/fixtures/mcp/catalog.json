@@ -992,7 +992,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 18
+                  "const": 17
                 },
                 "watcherDegraded": {
                   "type": "boolean"

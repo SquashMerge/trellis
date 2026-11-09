@@ -579,7 +579,7 @@ changes, only the order of rows within two arrays. This section wins over the #7
 
 ## Amendment (#818): `trellis_show` takes the user's viewers to a target
 
-**Status: proposed, for ratification under the 2026-11-08 owner delegation on #818.** `toolVersion` is **18** (previously 17 (run 803), which follows 16 for #798). If run 803 has not landed when this merges, the gap at 17 is intentional: 17 stays reserved for it. The 2026-11-08 owner rulings on #818 set the scope: views `sequence`, `class` and `source`; every open viewer of the checkout follows; following is on by default and a pin opts out; validation as the #787 deep links validate; typed answers, never partial.
+**Status: proposed, for ratification under the 2026-11-08 owner delegation on #818.** `toolVersion` is **17** (previously 16, #798). The 2026-11-08 owner rulings on #818 set the scope: views `sequence`, `class` and `source`; every open viewer of the checkout follows; following is on by default and a pin opts out; validation as the #787 deep links validate; typed answers, never partial.
 
 - **One new tool.** `trellis_show` is entry 12 of the catalog, after `trellis_rules_explain` ([catalog entry](#trellis_show-818)). The eleven earlier tools, their schemas and their answers are unchanged. With #798's catalog it is 233,137 compact bytes before and 241,268 after; the modern `tools/list` frame is 241,625 bytes against the 245,760-byte named headroom limit.
 - **What it changes.** Only what open viewers of the checkout display. It never writes the index, the rules, `requests.db` or any saved state, and it never moves terminal or window focus. Its `readOnlyHint` is true; `idempotentHint` is false, because each call is a new request that an open viewer follows again.
