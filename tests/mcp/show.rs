@@ -116,27 +116,26 @@ async fn show_checks_targets_records_one_latest_request_and_answers_typed_outcom
             json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}}),
         );
         let started = std::time::Instant::now();
-        let (owner, shape, area) = loop {
+        // Each name is found by its own query: a shared substring query may rank one out.
+        let mut id = |name: &str| loop {
             let found = mcp.ask(
                 "tools/call",
-                json!({"name":"trellis_find_symbols","arguments":{"schemaVersion":1,"query":"a"}}),
+                json!({"name":"trellis_find_symbols","arguments":{"schemaVersion":1,"query":name}}),
             )["result"]["structuredContent"]
                 .clone();
-            let symbols = found["data"]["symbols"].as_array().cloned().unwrap_or_default();
-            let id = |name: &str| {
-                symbols
-                    .iter()
-                    .find(|symbol| symbol["name"] == name)
-                    .map(|symbol| symbol["symbolId"].as_str().unwrap().to_owned())
-            };
+            let symbol = found["data"]["symbols"]
+                .as_array()
+                .and_then(|symbols| symbols.iter().find(|symbol| symbol["name"] == name))
+                .map(|symbol| symbol["symbolId"].as_str().unwrap().to_owned());
             if found["catchingUp"] == false
-                && let (Some(owner), Some(shape), Some(area)) = (id("Owner"), id("Shape"), id("area"))
+                && let Some(symbol) = symbol
             {
-                break (owner, shape, area);
+                break symbol;
             }
             assert!(started.elapsed() < trellis::testing::HANG_BACKSTOP, "{found}");
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
+        let (owner, shape, area) = (id("Owner"), id("Shape"), id("area"));
         let mut pairs = Vec::new();
         let mut show = |mcp: &mut Session, arguments: Value| {
             let answer = mcp.show(arguments);
@@ -323,7 +322,7 @@ fn paused_at_launch_final(
         let answer = mcp.show(arguments);
         (answer, mcp)
     });
-    let (mut held, _) = listener.accept().unwrap();
+    let mut held = trellis::testing::accept_within_backstop(&listener);
     let mut stage = [0u8; 13];
     held.read_exact(&mut stage).unwrap();
     assert_eq!(&stage, b"launch_final\n");
