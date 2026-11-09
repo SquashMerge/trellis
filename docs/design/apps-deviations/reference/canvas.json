@@ -1,0 +1,55 @@
+{
+ "v": 3,
+ "createdOnFiles": {
+  "v": 1,
+  "at": "2026-10-23T14:00:00Z"
+ },
+ "title": "Trellis Workbench",
+ "launch": {
+  "view": "canvas",
+  "page": "apps"
+ },
+ "pages": [
+  {
+   "id": "apps",
+   "name": "Apps & findings"
+  }
+ ],
+ "boards": {
+  "Apps.dc.html": {
+   "x": 0,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "Architecture \u00b7 apps (#685)",
+   "page": "apps",
+   "expand": "fill",
+   "is_interactive": true
+  },
+  "Findings.dc.html": {
+   "x": 1520,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "Deviations \u00b7 file \u2192 function \u2192 line",
+   "page": "apps",
+   "expand": "fill",
+   "is_interactive": true
+  }
+ },
+ "order": [
+  "Apps.dc.html",
+  "Findings.dc.html"
+ ],
+ "notes": {
+  "t3": {
+   "x": 0,
+   "y": -260,
+   "text": "Apps & findings \u00b7 per-app layers, deviations by call",
+   "kind": "title1",
+   "maxW": 2960,
+   "page": "apps"
+  }
+ },
+ "designSystems": []
+}
