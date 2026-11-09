@@ -377,31 +377,64 @@ test('a malformed building answer fails the call even when a retry would pass', 
   }
 });
 
-test('no building retry starts once its wait would end past the budget', async () => {
-  let clock = 0;
-  const starts = [];
+// A fake clock the smoke reads, a client that advances it per request, and a watchdog: after
+// five requests the mock answers normally, so a smoke that ignores the budget still ends at
+// once and fails on the request count instead of hanging.
+function budgetHarness({requestMs, sleep}) {
+  const clock = {now: 0};
+  const starts = {tool: [], prompt: []};
   const timeouts = [];
-  const client = clientFor((name, result) => name === 'trellis_rules_check' ? building(name) : result);
+  const watchdog = 5;
+  const client = clientFor(
+    (name, result) => name === 'trellis_rules_check' && starts.tool.length <= watchdog ? building(name) : result,
+    result => {
+      if (starts.prompt.length <= watchdog) {
+        throw Object.assign(Error('SECRET'), {code: -32603, data: building(promptName).structuredContent.error});
+      }
+      return result;
+    });
   const request = client.request;
   client.request = async (req, schema, options) => {
-    if (req.params.name === 'trellis_rules_check') {
-      starts.push(clock);
-      if (options) timeouts.push(options.timeout);
-      clock += 4_000; // each call waits for the owner
+    const path = req.method === 'prompts/get' ? 'prompt' : req.params.name === 'trellis_rules_check' ? 'tool' : null;
+    if (path) {
+      starts[path].push(clock.now);
+      if (path === 'tool' && options) timeouts.push(options.timeout);
+      clock.now += requestMs;
     }
     return request(req, schema, options);
   };
-  const report = await exercise(client, buildingTools, '/fixture', 'main', {
-    ...dependencies(), buildingBudgetMs: 10_000, now: () => clock, sleep: async ms => { clock += ms; },
-  });
+  const deps = {...dependencies(), buildingBudgetMs: 10_000, now: () => clock.now,
+    sleep: async ms => { clock.now += sleep(ms); }};
+  return {client, starts, timeouts, deps};
+}
+
+test('no building retry starts once its wait would end past the budget', async () => {
+  const {client, starts, timeouts, deps} = budgetHarness({requestMs: 4_000, sleep: ms => ms});
+  const report = await exercise(client, buildingTools, '/fixture', 'main', deps);
   const row = report.results.find(item => item.tool === 'trellis_rules_check');
   assert.deepEqual([row.reason, row.code], ['tool_error', 'building']);
-  // Calls start at 0 and 4007; a third would start at 8014 and run past 10000 only through
-  // its bounded timeout, which is what is left of the budget.
-  assert.deepEqual(starts, [0, 4_007, 8_014]);
+  // Requests start at 0, 4007 and 8014; a fourth would start at 12021, past 10000.
+  assert.deepEqual(starts.tool, [0, 4_007, 8_014]);
   assert.deepEqual(timeouts, [5_993, 1_986]);
-  assert.ok(starts.every(at => at < 10_000));
   assert.equal(row.buildingRetries, 2);
+  const prompt = report.results.find(item => item.tool === promptName);
+  assert.deepEqual([prompt.reason, prompt.code], ['prompt_error', 'building']);
+  assert.deepEqual(starts.prompt, [0, 4_007, 8_014].map(at => at + starts.prompt[0]));
+});
+
+test('a retry wait that wakes past the budget sends nothing more', async () => {
+  // The wait fits when it starts (4000 + 7 < 10000), but the timer wakes at 10007.
+  const {client, starts, deps} = budgetHarness({requestMs: 4_000, sleep: ms => ms + 6_000});
+  const report = await exercise(client, buildingTools, '/fixture', 'main', deps);
+  const row = report.results.find(item => item.tool === 'trellis_rules_check');
+  assert.deepEqual([row.reason, row.code], ['tool_error', 'building']);
+  assert.equal(starts.tool.length, 1, `tool requests started at ${starts.tool}`);
+  assert.equal(row.buildingRetries, undefined);
+  const prompt = report.results.find(item => item.tool === promptName);
+  assert.deepEqual([prompt.reason, prompt.code], ['prompt_error', 'building']);
+  assert.equal(starts.prompt.length, 1, `prompt requests started at ${starts.prompt}`);
+  assert.equal(prompt.buildingRetries, undefined);
+  assert.ok(!JSON.stringify(report).includes('SECRET'));
 });
 
 test('a building answer that outlasts the retry budget stays a typed failure', async () => {

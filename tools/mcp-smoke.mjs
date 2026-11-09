@@ -50,6 +50,8 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
   function retryFits(started, delay) {
     return now() - started + delay < buildingBudget;
   }
+  // A timer can wake later than asked: after the wait, a retry starts only with budget left.
+  const exhausted = started => now() - started >= buildingBudget;
   const remaining = started => ({timeout: Math.max(1, Math.floor(buildingBudget - (now() - started)))});
   const results = [];
   let calls = 0;
@@ -105,8 +107,10 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
         if (Buffer.byteLength(JSON.stringify(result)) > 65_536) break;
         const error = result.structuredContent?.error;
         if (error?.code !== 'building' || !retryFits(started, retryAfter(error))) break;
-        row.buildingRetries = (row.buildingRetries ?? 0) + 1;
         await sleep(retryAfter(error));
+        // The last building answer stands as the typed failure; nothing more is sent.
+        if (exhausted(started)) break;
+        row.buildingRetries = (row.buildingRetries ?? 0) + 1;
       }
       row.resultBytes = Buffer.byteLength(JSON.stringify(result));
       const value = result.structuredContent;
@@ -168,8 +172,9 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
         } catch (error) {
           if (error?.code !== -32603 || error.data?.code !== 'building'
             || !retryFits(started, retryAfter(error.data))) throw error;
-          row.buildingRetries = (row.buildingRetries ?? 0) + 1;
           await sleep(retryAfter(error.data));
+          if (exhausted(started)) throw error;
+          row.buildingRetries = (row.buildingRetries ?? 0) + 1;
         }
       }
       row.resultBytes = Buffer.byteLength(JSON.stringify(result));
