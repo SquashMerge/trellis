@@ -422,8 +422,10 @@ fn resolve(
         total_bytes = total_bytes
             .checked_add(bytes)
             .context("bounded_work: reference bytes")?;
+        // Nested manifests (#784) count toward the total only: the cap guards the root inputs.
+        let root = !manifest.path.contains('/');
         ensure!(
-            bytes <= SOURCE_BYTES && total_bytes <= TOTAL_BYTES,
+            (!root || bytes <= SOURCE_BYTES) && total_bytes <= TOTAL_BYTES,
             "bounded_work: reference source bytes"
         );
     }

@@ -37,7 +37,6 @@ pub struct LifecycleTick {
 pub enum SelectionError {
     NotAbsolute,
     NotCheckout,
-    DifferentRepository,
     IdentityChanged,
     Unavailable,
     StorageBusy,
@@ -57,7 +56,6 @@ impl SelectionError {
         match self {
             Self::NotAbsolute => "not_absolute",
             Self::NotCheckout => "not_checkout",
-            Self::DifferentRepository => "different_repository",
             Self::IdentityChanged => "identity_changed",
             Self::Unavailable => "unavailable",
             Self::StorageBusy => "storage_busy",
@@ -397,15 +395,12 @@ impl SelectionProbe {
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
         let root = checkout_root(selected)?;
-        // Membership must be established before marker attachment, which can create
-        // a marker in a previously untouched linked worktree.
+        // Any verified checkout may be selected (#839); its Git common directory
+        // is captured before marker attachment so later checks can see it change.
         let unattached = WorkspaceIdentity::discover_unattached(Some(&root), &root)
             .map_err(|_| SelectionError::Unavailable)?;
         let launch_common = common_identity(launch)?;
         let selected_common = common_identity_unattached(&unattached)?;
-        if launch_common != selected_common {
-            return Err(SelectionError::DifferentRepository);
-        }
         let identity = unattached
             .attach_marker()
             .map_err(|_| SelectionError::Unavailable)?;
@@ -1368,9 +1363,6 @@ impl CheckoutRegistry {
         };
         let launch_common = inode(common_dir(launch)?)?;
         let selected_common = inode(common_dir(&identity)?)?;
-        if launch_common != selected_common {
-            return Err(SelectionError::IdentityChanged);
-        }
         let witness = SelectedCheckout {
             launch: Arc::new(
                 launch
@@ -1732,7 +1724,6 @@ impl SelectedCheckout {
         };
         if inode(&dirs.launch)? != self.launch_common
             || inode(&dirs.selected)? != self.selected_common
-            || self.launch_common != self.selected_common
         {
             return Err(SelectionError::IdentityChanged);
         }
@@ -2533,6 +2524,14 @@ impl CheckoutRuntime {
         if let Ok(resources) = self.resources() {
             resources.scheduler.set_startup_hook_for_tests(hook);
         }
+    }
+
+    /// The typed `recovery_blocked: <reason>` of a startup recovery that hit
+    /// its failure limit, as `cli_status` reports it (#768).
+    pub fn recovery_blocker(&self) -> Option<String> {
+        self.resources()
+            .ok()
+            .and_then(|resources| resources.scheduler.recovery_blocker())
     }
 
     /// The first error of the current startup reconciliation run.
@@ -3877,9 +3876,12 @@ mod selection_tests {
         let mut registry = CheckoutRegistry::new();
         registry.attach_launch(17, &identity).unwrap();
         assert_eq!(registry.entries.len(), 1);
+        // A symlink alias is refused before any marker is written in its target.
+        let alias = temp.path().canonicalize().unwrap().join("alias");
+        std::os::unix::fs::symlink(&foreign, &alias).unwrap();
         assert_eq!(
-            registry.select(17, &identity, &foreign).unwrap_err(),
-            SelectionError::DifferentRepository
+            registry.select(17, &identity, &alias).unwrap_err(),
+            SelectionError::NotCheckout
         );
         assert!(!foreign.join(".git/trellis/workspace-id").exists());
         assert_eq!(

@@ -193,7 +193,7 @@ Start `claude` in the repository and approve the server when asked. `claude mcp 
 }
 ```
 
-**In use.** The first call on a new checkout can return `index_not_ready` while it indexes. It's safe to retry after a few seconds. Agents get tools for finding symbols, reading source, following calls and references, and checking architecture rules. `trellis_workspace_describe` is the place to start: it reports what evidence each language has.
+**In use.** The first call on a new checkout can return `index_not_ready` while it indexes. It's safe to retry after a few seconds. A CLI read (`trellis symbols`, `query`, `references`, `rules check`, `metrics` or `status`) on a new checkout instead starts indexing and waits for it, printing progress to stderr; you never need to run `trellis index` first (owner ruling 2026-11-09, #842). Agents get tools for finding symbols, reading source, following calls and references, and checking architecture rules. `trellis_workspace_describe` is the place to start: it reports what evidence each language has.
 
 ## 5. Add semantic evidence
 

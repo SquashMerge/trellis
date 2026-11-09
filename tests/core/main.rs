@@ -12,6 +12,7 @@ mod common;
 #[path = "../common/graph_fixtures.rs"]
 mod graph_fixtures;
 
+mod apps;
 mod architecture_external;
 mod architecture_semantic;
 mod architecture_store;
@@ -23,6 +24,7 @@ mod dependency_declarations;
 mod dependency_links;
 mod file_tree;
 mod files_view_store;
+mod interfaces;
 mod java_behavior;
 mod metrics;
 mod metrics_oracle;

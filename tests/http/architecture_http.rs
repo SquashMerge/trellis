@@ -186,6 +186,8 @@ async fn architecture_route_pin_aggregate_setup_and_located_diagnostics() {
     let (status, missing) = request(app.clone(), &key, "").await;
     assert_eq!(status, StatusCode::OK, "{missing}");
     assert_eq!(missing["payload"]["state"], "missing_rules");
+    assert_eq!(missing["payload"]["apps"], serde_json::json!([]));
+    assert!(missing["payload"]["noApp"].is_null());
     assert_eq!(missing["payload"]["aggregate"], "max");
     assert_eq!(missing["payload"]["role"], "all");
     assert!(missing["payload"].get("metricsScope").is_none());
@@ -938,6 +940,8 @@ async fn architecture_summary_counts_equal_cli_and_details_page_at_the_same_pin(
         checked["unassigned"].as_array().unwrap().len()
     );
     assert_eq!(summary["references"]["counts"], references["counts"]);
+    assert_eq!(summary["apps"], serde_json::json!([]));
+    assert_eq!(summary["noApp"]["counts"], summary["rules"]["counts"]);
     let hash = summary["rulesFile"]["contentHash"].as_str().unwrap();
     let pinned = format!(
         "indexGeneration={}&indexRevision={}&rulesHash={hash}",
@@ -1176,6 +1180,234 @@ async fn architecture_summary_reports_layer_site_coverage_and_exception_count() 
     assert_eq!(status, StatusCode::OK, "{missing}");
     assert_eq!(missing["payload"]["state"], "missing_rules");
     assert!(missing["payload"]["exceptionCount"].is_null());
+}
+
+/// #788: the summary carries the apps' interfaces, `kind=interfaces` pages them over the real
+/// router, a `confidence` filter is `invalid_request`, and a changed rules file is a conflict.
+#[tokio::test]
+async fn interfaces_summary_counts_and_detail_pages() {
+    let (base, _runtime, browser, key) = fixture_with_sources(
+        false,
+        &[
+            ("Cargo.toml", "[package]\nname = \"srv\"\n"),
+            (
+                "src/main.rs",
+                "async fn health() {}\nasync fn unused() {}\nfn router() -> Router {\n    Router::new().route(\"/health\", get(health)).route(\"/unused\", get(unused))\n}\nfn main() {}\n",
+            ),
+            ("web/package.json", "{\"name\":\"web-app\"}\n"),
+            (
+                "web/app.js",
+                "async function load(api) {\n  await api(\"/health\");\n  await api(\"/missing\");\n}\n",
+            ),
+        ],
+    )
+    .await;
+    let rules = "version=1\n[layers.server]\napp='srv'\norder=1\npaths=['src/**']\n[layers.client]\napp='web-app'\norder=1\npaths=['web/**']";
+    write_rules(&base, rules);
+    let app = browser.router();
+    let (status, summary) = summary(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let summary = &summary["payload"];
+    let interfaces = summary["interfaces"].as_array().unwrap();
+    assert_eq!(interfaces.len(), 1, "{summary}");
+    let counts = &interfaces[0]["counts"];
+    assert_eq!(
+        (
+            counts["matchedRoutes"].as_u64(),
+            counts["serverOnly"].as_u64(),
+            counts["clientOnly"].as_u64()
+        ),
+        (Some(1), Some(1), Some(1))
+    );
+    let hash = summary["rulesFile"]["contentHash"].as_str().unwrap();
+    let pinned = format!(
+        "indexGeneration={}&indexRevision={}&rulesHash={hash}",
+        summary["indexGeneration"].as_str().unwrap(),
+        summary["indexRevision"]
+    );
+    let items = all_details(
+        &app,
+        &key,
+        &format!("kind=interfaces&{pinned}&client=web-app&server=srv"),
+        1,
+    )
+    .await;
+    assert_eq!(items.len(), 3);
+    let lists: Vec<_> = items
+        .iter()
+        .map(|item| item["list"].as_str().unwrap())
+        .collect();
+    assert_eq!(lists, ["matched", "serverOnly", "clientOnly"]);
+    assert_eq!(items[0]["entry"]["callSites"][0]["layer"], "client");
+    assert_eq!(items[0]["entry"]["handler"]["layer"], "server");
+    let only = all_details(
+        &app,
+        &key,
+        &format!("kind=interfaces&{pinned}&list=clientOnly"),
+        5,
+    )
+    .await;
+    assert_eq!(only, items[2..]);
+    for bad in ["confidence=exact", "list=other", "path=src%2Fmain.rs"] {
+        let (status, _) = request(
+            app.clone(),
+            &key,
+            &format!("/details?kind=interfaces&{pinned}&{bad}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    write_rules(
+        &base,
+        &format!("{rules}\n[layers.extra]\norder=2\npaths=['absent/**']"),
+    );
+    let (status, conflict) = request(
+        app.clone(),
+        &key,
+        &format!("/details?kind=interfaces&{pinned}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error"]["code"], "rules_conflict");
+}
+
+/// #784: the summary lists the detected apps with the CLI's per-app counts, gives each module
+/// its app, leaves the cross-app pair out of `edges` while it stays an `unknown`, and the
+/// `kind=instances` `app` filter pages exactly one app's rows.
+#[tokio::test]
+async fn apps_summary_counts_equal_rules_check_and_the_app_filter_pages_one_app() {
+    let (base, runtime, browser, key) = fixture_with_sources(
+        false,
+        &[
+            ("a/package.json", "{\"name\":\"alpha\"}\n"),
+            ("b/package.json", "{\"name\":\"beta\"}\n"),
+            (
+                "a/main.js",
+                "import { g } from '../b/lib.js';\nimport { h } from './low.js';\nexport function f() { g(); h(); }\n",
+            ),
+            ("a/low.js", "export function h() {}\n"),
+            ("b/lib.js", "export function g() {}\n"),
+            ("b/loose.js", "export function loose() {}\n"),
+            ("c/other.js", "export function other() {}\n"),
+        ],
+    )
+    .await;
+    write_rules(
+        &base,
+        "version=1\n[layers.high]\napp='alpha'\norder=1\npaths=['a/main.js']\n[layers.low]\napp='alpha'\norder=2\npaths=['a/low.js']\n[layers.beta]\napp='beta'\norder=1\npaths=['b/lib.js']\n",
+    );
+    let app = browser.router();
+    let (status, summary) = summary(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let summary = &summary["payload"];
+    let (response, _) = runtime.evidence_response().unwrap();
+    let pin: trellis::model::IndexPin = serde_json::from_value(serde_json::json!({
+        "indexGeneration": summary["indexGeneration"], "indexRevision": summary["indexRevision"]
+    }))
+    .unwrap();
+    let checked = response
+        .architecture_response(
+            "check",
+            &serde_json::json!({ "expectedBasis": pin }),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    response.finish(()).unwrap();
+    let apps = summary["apps"].as_array().unwrap();
+    assert_eq!(apps.len(), 2, "{summary}");
+    for (index, (name, manifest, files, unassigned)) in [
+        ("alpha", "a/package.json", 2, 0),
+        ("beta", "b/package.json", 2, 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let entry = &apps[index];
+        assert_eq!(entry["name"], name);
+        assert_eq!(entry["manifest"], manifest);
+        assert_eq!(entry["kind"], "npm");
+        assert_eq!(entry["source"], "manifest");
+        assert_eq!(entry["fileCount"], files, "{name}");
+        assert_eq!(entry["unassignedFileCount"], unassigned, "{name}");
+        assert_eq!(entry["languages"], serde_json::json!(["javascript"]));
+        assert_eq!(entry["counts"], checked["apps"][index]["counts"], "{name}");
+    }
+    assert_eq!(summary["noApp"]["counts"], checked["noApp"]["counts"]);
+    assert_eq!(summary["noApp"]["unassignedFileCount"], 5);
+    assert!(summary["noApp"]["counts"]["unknown"].as_u64().unwrap() >= 1);
+    let total = |field: &str| -> u64 {
+        apps.iter()
+            .map(|entry| entry["counts"][field].as_u64().unwrap())
+            .chain([summary["noApp"]["counts"][field].as_u64().unwrap()])
+            .sum()
+    };
+    for field in ["comparable", "conforms", "deviates", "unknown", "excepted"] {
+        assert_eq!(total(field), summary["rules"]["counts"][field], "{field}");
+    }
+    let module_app = |path: &str| {
+        summary["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["identity"]["path"] == path)
+            .unwrap()["app"]
+            .clone()
+    };
+    assert_eq!(module_app("a/main.js"), "alpha");
+    assert_eq!(module_app("b/loose.js"), "beta");
+    assert!(module_app("c/other.js").is_null());
+    assert!(module_app("sample.js").is_null());
+    let drawn = summary["edges"].as_array().unwrap();
+    assert!(
+        drawn
+            .iter()
+            .all(|edge| !(edge["sourceLayer"] == "high" && edge["destinationLayer"] == "beta")),
+        "{drawn:?}"
+    );
+    assert!(drawn.iter().any(|edge| edge["destinationLayer"] == "low"));
+    let hash = summary["rulesFile"]["contentHash"].as_str().unwrap();
+    let pinned = format!(
+        "indexGeneration={}&indexRevision={}&rulesHash={hash}",
+        pin.index_generation, pin.index_revision
+    );
+    for (index, name) in ["alpha", "beta"].into_iter().enumerate() {
+        let rows = all_details(
+            &app,
+            &key,
+            &format!("kind=instances&{pinned}&role=production&app={name}"),
+            1,
+        )
+        .await;
+        let counts = &checked["apps"][index]["counts"];
+        assert_eq!(
+            rows.len() as u64,
+            counts["comparable"].as_u64().unwrap(),
+            "{name}"
+        );
+        let status = |wanted: &str| {
+            rows.iter()
+                .filter(|row| {
+                    row["instance"]["excepted"] == false && row["instance"]["status"] == wanted
+                })
+                .count() as u64
+        };
+        assert_eq!(
+            status("deviates"),
+            counts["deviates"].as_u64().unwrap(),
+            "{name}"
+        );
+        assert_eq!(
+            status("conforms"),
+            counts["conforms"].as_u64().unwrap(),
+            "{name}"
+        );
+    }
+    assert!(
+        checked["apps"][0]["counts"]["comparable"].as_u64().unwrap() > 0,
+        "alpha has rows to filter"
+    );
+    let none = all_details(&app, &key, &format!("kind=instances&{pinned}&app=gamma"), 5).await;
+    assert!(none.is_empty());
 }
 
 fn url_encode(text: &str) -> String {

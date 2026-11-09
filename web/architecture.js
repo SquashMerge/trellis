@@ -57,6 +57,11 @@
   function create({request, context, readSource, openTreemap, openSequence, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, reviewSerial = 0, view = null, basis = null, buildingTimer = null, buildingWake = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
+    // The app whose stack is drawn: null for all apps, else an app name (never compared with a literal). Memory only; a new checkout starts at "all".
+    // `drawn` is the view the last render laid out (the scoped slice, or `view` itself).
+    let scope = null, scopeRoot = null, drawn = null;
+    // The band that holds the selected stub's end, so its label can say `client end` / `server end` (AC25).
+    let endMark = null;
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
     const callables = () => role === "all" ? "indexed callables" : "production callables";
     const population = () => role === "all" ? "all indexed callables" : callables();
@@ -64,15 +69,16 @@
     const hiddenNote = get("architecture-hidden"), hiddenToggle = get("architecture-hidden-toggle"), hiddenNames = get("architecture-hidden-names");
     // The selected node's identity, re-pressed after a resize re-layout; the width last laid out.
     let pressed = null, laidOut = null, inspection = null;
-    const deviations = window.TrellisDeviations.create({details:(params, active, offset) => details(params, active, offset), current:() => usable(),
-      basis:() => basis, view:() => view, targetLabel, eligible, portable, beginDraft:(operation, scope) => beginDraft(operation, scope), reviewChips,
+    const apps = window.TrellisArchitectureApps;
+    const deviations = window.TrellisDeviations.create({details:(params, active, offset) => details(appFilter(params), active, offset), current:() => usable(),
+      basis:() => basis, view:() => deviationsView(), targetLabel, eligible, portable, beginDraft:(operation, scope) => beginDraft(operation, scope), reviewChips,
       edgeText, inspectLine:(record, render) => inspectLine(record, render), overview:() => overview(), openReview:(mode, verdict) => openReview(mode, verdict),
       onConflict:() => onConflict(), refresh:() => refresh(), readSource:(site, pin, active) => readSource(site, pin, active),
       openSequence:(...args) => openSequence(...args), snapshot:() => snapshot()});
     const state = (message, kind = "ready") => { get("architecture-state").textContent = message; get("architecture-state").dataset.state = kind; };
     function capture() {
       const c = context();
-      return {rootKey:c.rootKey, session:c.session, pin:c.pin && window.TrellisIndexPin.copy(c.pin), aggregate, role, serial};
+      return {rootKey:c.rootKey, session:c.session, pin:c.pin && window.TrellisIndexPin.copy(c.pin), aggregate, role, serial, rulesEpoch:c.rulesEpoch};
     }
     function current(c) {
       const now = context();
@@ -80,11 +86,30 @@
         !!c.pin && window.TrellisIndexPin.equal(c.pin, now.pin);
     }
     function usable() { return view && current(basis) && view.rulesFile?.contentHash === basis.rulesHash; }
+    // The app group the view is scoped to; null for the whole checkout (and for a name the data no longer has).
+    // With fewer than two detected apps there is no switcher, so no scope: the stack is checkout-wide.
+    const scopeGroup = (payload = view) => scope === null || payload?.state !== "ready" || !(payload.apps?.length >= 2) ? null : apps.group(payload, scope);
+    const settleScope = payload => { if (scope !== null && !scopeGroup(payload)) scope = null; };
+    // The Deviations tree sees the app's slice: its layers and edges, and the group's counts.
+    let treeView = null;
+    function deviationsView() {
+      const group = scopeGroup();
+      if (!group) return view;
+      if (treeView?.of !== view || treeView.scope !== scope) treeView = {of:view, scope, value:{...apps.scoped(view, scope), rules:{...view.rules, counts:group.counts}}};
+      return treeView.value;
+    }
+    const model = () => drawn ?? view;
+    const unassignedOf = (payload, group) => payload.modules.filter(module => module.layer === null && (!group || module.app === group.name));
+    // A one-app scope narrows instance lists to that app; every other list is unchanged.
+    const appFilter = params => { const group = scopeGroup(); return group && params.kind === "instances" ? {...params, app:group.name} : params; };
     function clearInspection() {
       selectionSerial++; pressed = null; inspection = null;
       window.TrellisShell?.clearArchitectureInspector();
+      // Leaving a stub drops its band's word; the drawing is swapped in place, keeping what else is selected.
+      if (endMark) { endMark = null; if (usable() && view.state === "ready") void render({keepSelection:true}); }
     }
     function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false, keepReopen = false) {
+      drawn = null; get("architecture-apps").hidden = true; get("architecture-source-line").hidden = true; get("architecture-key-interface").hidden = true; get("architecture-footnote").hidden = true;
       editSerial++; preview = null; selected.clear();
       if (!keepDraft) setBusy(false);
       if (!keepDraft) { draft = null; get("architecture-review-panel").hidden = true; get("architecture-editor").hidden = true; }
@@ -103,7 +128,7 @@
         const error = new Error("Architecture snapshot changed. Refresh status."); error.code = "revision_conflict"; error.status = 409; throw error;
       }
       if (payload.state === "building") return payload;
-      if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || payload.aggregate !== c.aggregate || payload.role !== c.role ||
+      if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || !Array.isArray(payload.apps) || !Array.isArray(payload.interfaces) || payload.aggregate !== c.aggregate || payload.role !== c.role ||
           payload.workbench !== true || payload.metricsVersion !== "metrics:v1" ||
           !["syntax", "mixed"].includes(payload.evidenceTier) || payload.semanticComplete !== false ||
           !Array.isArray(payload.layers) || !Array.isArray(payload.modules) || !Array.isArray(payload.edges) ||
@@ -123,9 +148,9 @@
       paragraph(target, `${references?.counts?.mappedSites ?? 0} mapped reference sites · ${references?.counts?.semanticSites ?? 0} bound by semantic evidence · ${references?.counts?.unresolvedSites ?? 0} unresolved. Missing sites do not prove absence.`);
       if (ruleCounts(view)) paragraph(target, ruleCounts(view));
       for (const limitation of references?.limitations || []) paragraph(target, limitation);
-      const unassigned = view.modules.filter(module => module.layer === null);
-      paragraph(target, view.state === "no_layers" ? "No layer graph or file assignment inventory is available until layers are configured." : `${unassigned.length} unassigned native file modules remain unknown.`);
-      if (view.state === "ready" && Number.isSafeInteger(view.rules?.unassignedCount)) paragraph(target, `${view.rules.unassignedCount} unassigned identities (native files and external packages) in the rule-check catalog.`);
+      const group = scopeGroup(), unassigned = unassignedOf(view, group);
+      paragraph(target, view.state === "no_layers" ? "No layer graph or file assignment inventory is available until layers are configured." : `${unassigned.length} unassigned native file modules remain unknown${group ? ` in ${group.name}` : ""}.`);
+      if (view.state === "ready" && Number.isSafeInteger(view.rules?.unassignedCount)) paragraph(target, `${view.rules.unassignedCount} unassigned identities (native files and external packages) in the rule-check catalog${group ? " (whole checkout)" : ""}.`);
       if (references?.externalPackages?.length) disclosure(target, "External packages and captured evidence", references.externalPackages);
       const choose = (label, action) => { const button = make("button", label); button.type = "button"; button.addEventListener("click", action); target.append(button); };
       const c = basis;
@@ -188,35 +213,59 @@
         excepted:String(!!edge.excepted), ...(edge.exceptionReason ? {exceptionReason:edge.exceptionReason} : {})};
     }
     function layerLabel(layer) {
-      const modules = view.modules.filter(module => module.layer === layer.name);
+      const modules = model().modules.filter(module => module.layer === layer.name);
       const values = modules.map(module => metricValue(module.metrics, metric)).filter(finite);
       const packages = (view.references?.externalPackages || []).filter(item => layerOf(item.identity) === layer.name);
       const max = values.length ? String(values.reduce((most, value) => Math.max(most, value), -Infinity)) : "—";
       // The narrow shared box stacks its header; ordered bands keep one line.
       const parts = [`${layer.shared ? "Shared" : layer.order} · ${layer.name}`, `${plural(modules.length, "file")}${packages.length ? ` · ${packages.length} external packages` : ""}`];
       if (metric !== "layer") parts.push(`max ${max}`);
+      if (endMark?.layer === layer.name) parts.push(`${endMark.side} end`);
       return parts.join(layer.shared ? "\n" : " · ");
     }
     // Outgoing production reference sites by verdict: the same summary edges the arrows draw.
-    function layerCounts(layer) {
-      const byName = new Map(view.layers.map(item => [item.name, item]));
-      const counts = {up:0, cross:0, down:0, shared:0, allowed:0, excepted:0, unknown:0};
-      for (const edge of view.edges) {
+    function layerCounts(layer, source = model()) {
+      const byName = new Map(source.layers.map(item => [item.name, item]));
+      const counts = {up:0, cross:0, down:0, shared:0, allowed:0, excepted:0, unknown:0}, upTo = new Map();
+      for (const edge of source.edges) {
         if (edge.sourceLayer !== layer.name || edge.role !== "production") continue;
         const destination = byName.get(edge.destinationLayer), ordered = !layer.shared && destination && !destination.shared;
         if (edge.excepted) counts.excepted += edge.count;
-        else if (edge.status === "deviates") counts[ordered && destination.order < layer.order ? "up" : "cross"] += edge.count;
+        else if (edge.status === "deviates") {
+          const up = ordered && destination.order < layer.order;
+          counts[up ? "up" : "cross"] += edge.count;
+          if (up) upTo.set(destination.name, (upTo.get(destination.name) || 0) + edge.count);
+        }
         else if (edge.status !== "conforms") counts.unknown += edge.count;
         else if (destination?.shared) counts.shared += edge.count;
         else counts[ordered && destination.order > layer.order ? "down" : "allowed"] += edge.count;
       }
-      return counts;
+      return {...counts, upTo};
     }
-    // Only non-zero counts become chips; deviations carry the error tone and a glyph.
-    function layerStats(layer) {
-      const counts = layerCounts(layer), bound = lowerBound(layer.name, "production") ? "≥" : "";
-      return STATS.filter(([key]) => counts[key] > 0).map(([key, glyph, words, error]) =>
+    // Only non-zero counts become chips; deviations carry the error tone and a glyph. Upward deviations
+    // get one chip per destination layer, each a control that opens the Deviations tree on that edge
+    // (AC10), in every stack.
+    // `source` is the slice the band is drawn from: a column's chips sum that app's own edges.
+    function layerStats(layer, appName = scopeGroup()?.name, source = model()) {
+      const counts = layerCounts(layer, source), bound = lowerBound(layer.name, "production") ? "≥" : "";
+      const stats = STATS.filter(([key]) => key !== "up" && counts[key] > 0).map(([key, glyph, words, error]) =>
         ({key, count:counts[key], text:`${glyph}${bound}${counts[key]}`, label:`${bound ? "at least " : ""}${counts[key]} outgoing production reference sites · ${words}`, tone:error ? "error" : "neutral"}));
+      const up = [...counts.upTo].map(([destination, count]) => ({key:"up", count, text:`↑${bound}${count} deviation · ${destination}`, tone:"error",
+        label:`${bound ? "at least " : ""}${count} upward production reference sites from ${layer.name} to ${destination} · deviation · open in Deviations`,
+        id:JSON.stringify(["up", layer.name, destination]), action:{sourceLayer:layer.name, destinationLayer:destination}}));
+      return [...up, ...stats, ...interfaceStats(layer, appName)];
+    }
+    // The stubs of a one-app stack: this layer's end of an HTTP interface of the scoped app (AC15). The
+    // action carries `interface`, which routes the control to the interface inspector.
+    function interfaceStats(layer, appName) {
+      return appName === undefined ? [] : apps.stubs(model(), appName, layer.name).map(stub => {
+        const count = `${stub.atLeast ? "≥" : ""}${plural(stub.routes, "route")}`, client = stub.side === "client";
+        const id = JSON.stringify(["interface", stub.client, stub.server, stub.side, layer.name]);
+        return {key:"interface", tone:"neutral", tag:"Selected", id,
+          text:client ? `→ ${stub.server} · ${count} · ${plural(stub.callSites, "call site")}` : `← ${stub.client} · ${count}`,
+          label:client ? `HTTP interface to ${stub.server}: ${count}, ${plural(stub.callSites, "call site")}` : `HTTP interface from ${stub.client}: ${count}`,
+          action:{id, interface:{client:stub.client, server:stub.server}, side:stub.side, layer:layer.name}};
+      });
     }
     // Summary-first display (#391): presentation state only, remembered per checkout.
     let shown = null, shownRoot = null;
@@ -367,7 +416,7 @@
       hiddenNames.textContent = layout.hidden.map(layer => layout.tests.has(layer.name) ? `${layer.name} (tests/fixtures; include them to show)` : layer.name).join(", ");
     }
     // A drawn node's stable identity (its data attribute), so a new drawing can find it again.
-    const NODE_KEYS = ["data-trellis-module-id", "data-trellis-edge-id", "data-trellis-layer-id", "data-trellis-directory-id", "data-trellis-unassigned", "data-trellis-note-id"];
+    const NODE_KEYS = ["data-trellis-module-id", "data-trellis-edge-id", "data-trellis-layer-id", "data-trellis-directory-id", "data-trellis-unassigned", "data-trellis-note-id", "data-trellis-action-id"];
     function nodeKey(node) {
       if (!node) return null;
       if (node === hiddenToggle) return ["id", hiddenToggle.id];
@@ -399,6 +448,58 @@
       if (!await render() || !usable() || !current(c)) return;
       after?.(); refocus(target);
     }
+    // The switcher and source line (#789): shown only with two or more detected apps. Choosing a
+    // button re-draws the held snapshot and never reads.
+    function switcher(payload) {
+      const target = get("architecture-apps"), line = get("architecture-source-line"), groups = apps.groups(payload);
+      const show = payload.state === "ready" && payload.apps.length >= 2 && groups.length > 0;
+      const refocus = show && !target.hidden && !!target.contains?.(document.activeElement);
+      target.hidden = line.hidden = !show; target.replaceChildren(); line.replaceChildren();
+      const footnote = get("architecture-footnote"); footnote.hidden = !show;
+      if (show) footnote.textContent = `Apps are detected from build manifests (Cargo binary packages and package.json). Layer order is compared within an app. Band and arrow counts are reference sites at ${window.TrellisIndexPin.label(payload)}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
+      if (!show) return;
+      const choose = (name, text) => {
+        const button = make("button", text); button.type = "button"; button.setAttribute("aria-pressed", String(scope === name));
+        button.addEventListener("click", () => { void setScope(name); }); target.append(button);
+        if (refocus && scope === name) button.focus?.();
+      };
+      choose(null, "All apps");
+      for (const item of groups) choose(item.name, apps.label(item));
+      const group = scopeGroup(payload);
+      line.append(make("span", apps.sourceLine(group, payload.apps.length)));
+      if (group?.duplicate) line.append(make("span", apps.duplicateNotice(group), "architecture-app-notice"));
+    }
+    // A `↑` badge opens 802's Deviations tree on its edge, unselected and with Calls only off (AC10).
+    function openDeviations(action) {
+      if (!usable() || view.state !== "ready" || editBusy) return;
+      return deviations.openEdge(action.sourceLayer, action.destinationLayer);
+    }
+    function setScope(next) {
+      if (!usable() || view.state !== "ready" || editBusy || next === scope) return;
+      if (next !== null && !apps.group(view, next)) return;
+      scope = next; reviewScope = null; deviations.reset(); coverage();
+      if (!get("architecture-review-panel").hidden) renderReview();
+      return render();
+    }
+    // AC13: an app that no ordered layer names has nothing to draw. It gets the setup help and its
+    // unassigned files, so none is dropped. The list is bounded like a drawing; the chip lists all.
+    function noLayers(full) {
+      const group = scopeGroup(full), files = unassignedOf(full, group), canvas = get("architecture-diagram"), ticket = renderSerial;
+      get("architecture-legend").replaceChildren(); hiddenNote.hidden = true;
+      get("architecture-coverage").textContent = coverageSummary(full);
+      get("architecture-summary").textContent = `${plural(files.length, "unassigned file")} in ${group.name} · no layers yet.`;
+      get("architecture-exclusions").textContent = "";
+      const list = make("ul", undefined, "architecture-app-files");
+      for (const module of files.slice(0, BOX_CAP)) {
+        const item = make("li"), button = make("button", module.identity.path); button.type = "button";
+        button.addEventListener("click", () => { if (ticket === renderSerial) inspect("module", module); });
+        item.append(button); list.append(item);
+      }
+      if (files.length > BOX_CAP) list.append(make("li", `${plural(files.length - BOX_CAP, "file")} not listed here · open the unassigned files chip to list them all`));
+      canvas.replaceChildren(list); laidOut = canvas.clientWidth;
+      state(`${group.name} has no layers yet. Its files are listed as unassigned below. The trellis_propose_layers MCP prompt can propose layers per app; this browser does not call it. Review .trellis/rules.toml to add layers with app = "${group.name}".`, "empty");
+      return true;
+    }
     const flip = (set, key) => { if (set.has(key)) set.delete(key); else set.add(key); };
     function legend(scale) {
       const target = get("architecture-legend"); target.replaceChildren();
@@ -419,20 +520,34 @@
       if (rows.some(row => row.unresolvedSites > 0)) parts.push("≥ counts are lower bounds");
       return parts.join(" · ");
     }
+    // One app: the name's summed counts, as the CLI reports them per app; otherwise the checkout's.
     function ruleCounts(payload) {
-      const counts = payload.rules?.counts;
+      const group = scopeGroup(payload), counts = group ? group.counts : payload.rules?.counts;
       return counts && Number.isSafeInteger(counts.unknown) && Number.isSafeInteger(counts.comparable)
-        ? `${counts.unknown.toLocaleString("en-US")} of ${counts.comparable.toLocaleString("en-US")} production rule instances unknown.` : "";
+        ? `${counts.unknown.toLocaleString("en-US")} of ${counts.comparable.toLocaleString("en-US")} production rule instances unknown${group ? ` in ${group.name}` : ""}.` : "";
     }
     // `keepSelection` re-lays out the same view for a new panel width (#515, #525): the
     // inspector and the selected node stay; the drawing is swapped in place.
     async function render({keepSelection = false} = {}) {
       if (!usable() || view.state !== "ready") return false;
-      const c = basis, payload = view, ticket = ++renderSerial;
-      const active = () => current(c) && view === payload && ticket === renderSerial && payload.rulesFile.contentHash === c.rulesHash;
+      // `full` is the snapshot; `payload` is what this drawing shows: the whole stack, or one app's slice of it.
+      // With no app chosen and two or more named apps, the drawing is one column per app (#790).
+      const c = basis, full = view, ticket = ++renderSerial;
+      if (!keepSelection) endMark = null;
+      if (scope !== null && !scopeGroup(full)) scope = null;
+      const columns = scope === null && full.apps.length >= 2 ? apps.groups(full) : [], allApps = columns.length >= 2;
+      const payload = scope === null ? full : apps.scoped(full, scope);
+      const active = () => current(c) && view === full && ticket === renderSerial && full.rulesFile.contentHash === c.rulesHash;
+      drawn = payload; switcher(full);
+      get("architecture-key-interface").hidden = !allApps;
       // The inspector's review overview opens before measuring, so the drawing fits the width it gets.
       if (!keepSelection) { clearInspection(); overview(); get("architecture-diagram").replaceChildren(); }
-      const layout = summary(payload);
+      if (scope !== null && !payload.layers.some(layer => !layer.shared)) return noLayers(full);
+      const parts = allApps ? columns.map(group => {
+        const slice = apps.scoped(full, group.name);
+        return {group, slice, layout:summary(slice), budget:{left:Math.floor(BOX_CAP / columns.length), truncated:0}};
+      }) : [{group:null, slice:payload, layout:summary(payload), budget:{left:BOX_CAP, truncated:0}}];
+      const layout = allApps ? summary(full) : parts[0].layout;
       // Collapsing layers or directories changes representation, not their module population. The
       // unassigned row is always drawn (as metric chips when collapsed, #449), so it is always in the scale.
       const visible = payload.modules.filter(module =>
@@ -441,29 +556,42 @@
       const scale = createScale(metric, aggregate, values, relative);
       legend(scale);
       displayState(payload, layout);
-      get("architecture-coverage").textContent = coverageSummary(payload);
-      const unassigned = payload.modules.filter(module => module.layer === null).length, budget = {left:BOX_CAP, truncated:0};
+      get("architecture-coverage").textContent = coverageSummary(full);
       // The canvas's inner width; the adapter fits that many chip columns. A re-layout
       // returns keyboard focus to the same band, chip, arrow or toggle afterwards.
       const canvas = get("architecture-diagram"), drawnFor = canvas.clientWidth;
       const focused = keepSelection && canvas.contains?.(document.activeElement) ? nodeKey(document.activeElement) : null;
       const style = window.getComputedStyle?.(canvas), padding = style ? parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) : 0;
-      try {
-        if (!window.TrellisArchitecturePele) throw new Error("Architecture renderer unavailable. Nothing displayed.");
-        const outcome = await window.TrellisArchitecturePele.render(canvas, payload, {
-          showTests, metric, aggregate, isCurrent:active, width:canvas.clientWidth - (padding || 0),
+      const stack = (part, extra) => {
+        const slice = part.slice, budget = part.budget, cap = part.budget.left, name = part.group?.name;
+        const unassigned = slice.modules.filter(module => module.layer === null).length;
+        return {
+          showTests, metric, aggregate, isCurrent:active, ...extra,
           moduleValue:module => metric === "layer" ? undefined : metricValue(module.metrics, metric),
           moduleBand:module => metric === "layer" ? null : scale.band(metricValue(module.metrics, metric)),
-          layerLabel, layerStats, edgeText, edgeTone,
-          display:{layers:layout.layers, expanded:name => budget.left > 0 && expanded(payload.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, scale, budget), reset:() => { budget.left = BOX_CAP; budget.truncated = 0; },
+          layerLabel, layerStats:name === undefined ? layerStats : layer => layerStats(layer, name, slice), edgeText, edgeTone,
+          display:{layers:part.layout.layers, expanded:name => budget.left > 0 && expanded(slice.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, scale, budget), reset:() => { budget.left = cap; budget.truncated = 0; },
             summary:(key, modules, columns) => summaryChips(key, modules, columns, scale, budget),
             edge:() => true,
             unassigned:{label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, get expanded() { return shown.unassigned && budget.left > 0; }}},
-          onSelectModule:module => { if (active() && payload.modules.includes(module)) { inspect("module", module); pressed = nodeKey(pressedNode()); } },
-          onSelectEdge:edge => { if (active() && payload.edges.includes(edge)) { inspect("edge", edge); pressed = nodeKey(pressedNode()); } },
-          onSelectLayer:layer => { if (active() && payload.layers.includes(layer)) inspect("layer", layer); },
+          onOpenDeviation:action => {
+            const named = name => slice.layers.some(layer => layer.name === name);
+            if (active() && named(action?.sourceLayer) && named(action?.destinationLayer)) return openDeviations(action);
+          },
+          onSelectInterface:action => {
+            const entry = apps.link(slice, action?.interface?.client, action?.interface?.server);
+            if (!active() || !entry) return;
+            inspect("interface", entry);
+            const stub = typeof action.id === "string" ? findNode(["data-trellis-action-id", action.id]) : null;
+            for (const node of get("architecture-diagram").querySelectorAll?.("[aria-pressed]") || []) node.setAttribute("aria-pressed", String(node === stub));
+            pressed = nodeKey(stub);
+            endMark = {layer:action.layer, side:action.side}; void render({keepSelection:true});
+          },
+          onSelectModule:module => { if (active() && slice.modules.includes(module)) { inspect("module", module); pressed = nodeKey(pressedNode()); } },
+          onSelectEdge:edge => { if (active() && slice.edges.includes(edge)) { inspect("edge", edge); pressed = nodeKey(pressedNode()); } },
+          onSelectLayer:layer => { if (active() && slice.layers.includes(layer)) inspect("layer", layer); },
           onToggleLayer:layer => {
-            if (!active() || !payload.layers.includes(layer)) return;
+            if (!active() || !slice.layers.includes(layer)) return;
             shown.open.set(layer.name, !expanded(layer)); saveDisplay();
             return rerender({layer:layer.name}, () => inspect("layer", layer));
           },
@@ -474,13 +602,22 @@
           onToggleUnassigned:() => { if (!active()) return; shown.unassigned = !shown.unassigned; saveDisplay(); return rerender({unassigned:true}); },
           onSelectNote:entry => {
             if (!active()) return;
-            const layer = payload.layers.find(item => item.name === entry?.layerKey);
+            const layer = slice.layers.find(item => item.name === entry?.layerKey);
             if (layer) inspect("layer", layer); else inspect("unknown", null);
             pressed = nodeKey(pressedNode());
           },
-        });
-        if (!active()) return false;
-        if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
+        };
+      };
+      try {
+        if (!window.TrellisArchitecturePele) throw new Error("Architecture renderer unavailable. Nothing displayed.");
+        const width = canvas.clientWidth - (padding || 0);
+        if (allApps) {
+          if (!await drawApps({full, parts, canvas, width, stack, active, layout})) return false;
+        } else {
+          const outcome = await window.TrellisArchitecturePele.render(canvas, payload, stack(parts[0], {width, ...(scope === null ? {} : {title:`${scope} · ordered layers`})}));
+          if (!active()) return false;
+          if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
+        }
         laidOut = drawnFor; if (canvas.dataset) canvas.dataset.layoutWidth = String(drawnFor);
         // The hidden-layer note is part of the drawing's layout, right under it (#525).
         canvas.append(hiddenNote);
@@ -488,12 +625,14 @@
           // Only a selectable node is re-pressed; a band that stands in for a removed note only takes focus.
           const again = findNode(pressed);
           if (again?.hasAttribute("aria-pressed")) again.setAttribute("aria-pressed", "true");
+          syncCards();
           findNode(focused)?.focus();
         }
         const production = payload.edges.filter(edge => edge.role === "production").reduce((sum, edge) => sum + edge.count, 0);
         const tests = payload.edges.filter(edge => edge.role === "test").reduce((sum, edge) => sum + edge.count, 0);
+        const truncated = parts.reduce((sum, part) => sum + part.budget.truncated, 0);
         // The counts live behind the ⓘ with the heat exclusions; nothing but the drawing sits above it (#449, #525).
-        get("architecture-summary").textContent = `${payload.modules.length} file modules · ${production} production / ${tests} test-only cross-layer sites${showTests ? "" : " (tests hidden)"}${budget.truncated ? ` · ${plural(budget.truncated, "file")} not drawn (size cap ${BOX_CAP} chips)` : ""} · Metrics: ${aggregate}, ${population()}.`;
+        get("architecture-summary").textContent = `${payload.modules.length} file modules · ${production} production / ${tests} test-only cross-layer sites${showTests ? "" : " (tests hidden)"}${truncated ? ` · ${plural(truncated, "file")} not drawn (size cap ${BOX_CAP} chips)` : ""} · Metrics: ${aggregate}, ${population()}.`;
         state("", "ready");
         get("architecture-exclusions").textContent = `Heat: ${exclusions(payload.modules)}.`;
         return true;
@@ -503,6 +642,144 @@
         state(error.message || "Architecture rendering failed. Nothing displayed.", "error");
         return false;
       }
+    }
+    // ---- All apps (#790). Every string below that comes from the repository reaches the page through
+    // textContent (make) or setAttribute; the overlay is built with createElementNS. ----
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const cardEntries = new WeakMap();
+    const css = (node, props) => { if (node.style) Object.assign(node.style, props); };
+    // A card or header says Selected, in words and in its name, exactly while it is pressed; its overlay lines follow.
+    function syncCards() {
+      const root = get("architecture-diagram"), on = new Set();
+      for (const card of root.querySelectorAll?.("[data-trellis-card]") || []) {
+        const entry = cardEntries.get(card), pressedNow = card.getAttribute("aria-pressed") === "true";
+        if (!entry) continue;
+        card.setAttribute("aria-label", apps.cardName(entry, pressedNow));
+        if (pressedNow) on.add(apps.key(entry));
+      }
+      for (const line of root.querySelectorAll?.("[data-interface]") || []) line.setAttribute("data-selected", String(on.has(line.getAttribute("data-interface"))));
+    }
+    // Presses one drawn control and no other; the selection survives a re-layout through its action id.
+    function pressOnly(node) {
+      for (const other of get("architecture-diagram").querySelectorAll?.("[aria-pressed]") || []) other.setAttribute("aria-pressed", String(other === node));
+      pressed = nodeKey(node); syncCards();
+    }
+    async function drawApps({full, parts, canvas, width, stack, active, layout}) {
+      let plan = apps.layout({width, count:parts.length});
+      const pele = window.TrellisArchitecturePele, grid = make("div", undefined, "architecture-apps-grid"), columns = [], boxes = [], bandsOf = new Map();
+      const place = () => {
+        grid.dataset.layout = plan.sideBySide ? "columns" : "stacked";
+        css(grid, {width:`${plan.width}px`, gridTemplateColumns:plan.sideBySide ? plan.widths.map(each => `${each}px`).join(" ") : `${plan.width}px`, columnGap:`${plan.gutter}px`});
+      };
+      place();
+      for (const part of parts) {
+        const group = part.group, layered = part.slice.layers.some(layer => !layer.shared);
+        const column = make("div", undefined, "architecture-app-column"), box = make("div", undefined, "architecture-app-stack");
+        column.setAttribute("role", "group"); column.setAttribute("aria-label", group.name);
+        const worstValue = worst(part.slice.modules.filter(module => module.layer !== null));
+        const info = apps.header(group, {layered, metric, max:worstValue === undefined ? "" : `${metric === "maintainabilityIndex" ? "min" : "max"} ${display(worstValue)}`});
+        const head = make("button", undefined, "architecture-app-header"); head.type = "button"; head.setAttribute("aria-pressed", "false");
+        head.setAttribute("data-trellis-action-id", JSON.stringify(["app", group.name]));
+        const line = make("span", info.deviations ? `${info.detail} · ` : info.detail, "architecture-app-line");
+        if (info.deviations) { const tone = make("span", info.deviations); tone.dataset.tone = "error"; line.append(tone); }
+        head.append(make("span", info.name, "architecture-app-name"), line);
+        if (info.manifests) head.append(make("span", `Detected from ${info.manifests}`, "architecture-app-line"));
+        head.append(make("span", "Selected", "architecture-selected-tag"));
+        head.addEventListener("click", () => { if (!active()) return; inspect("app", group); pressOnly(head); });
+        column.append(head, box); grid.append(column); columns.push(column); boxes.push(box);
+        if (!layered) {
+          const files = group.unassignedFileCount, button = make("button", `◇ ${files} unassigned · listed, never dropped`, "architecture-aside-box");
+          button.type = "button"; button.dataset.tone = "warning"; button.addEventListener("click", () => { if (active()) openReview("unassigned"); });
+          box.append(button); continue;
+        }
+        const outcome = await window.TrellisArchitecturePele.render(box, part.slice, stack(part, {width:plan.widths[columns.length - 1], title:`${group.name} · ordered layers`}));
+        if (!active()) return false;
+        if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
+        bandsOf.set(group.name, outcome.bands);
+      }
+      canvas.replaceChildren(grid);
+      // A drawing wider than its column (an unbreakable name) widens the column; the diagram scrolls.
+      plan = apps.layout({width, count:parts.length, natural:boxes.map(box => Math.ceil(box.scrollWidth || 0))}); place();
+      // Frames are in each drawing's own coordinates; the overlay and the cards live in the grid's.
+      const rect = node => node.getBoundingClientRect?.() || null, origin = rect(grid), places = new Map();
+      parts.forEach((part, index) => {
+        const at = origin && rect(boxes[index]), dx = at ? at.left - origin.left : plan.columns[index].x, dy = at ? at.top - origin.top : 0;
+        const bands = new Map([...(bandsOf.get(part.group.name) || [])].filter(([, frame]) => frame).map(([name, frame]) => [name, {x:frame.x + dx, y:frame.y + dy, w:frame.w, h:frame.h}]));
+        places.set(part.group.name, {index, bands, top:dy});
+      });
+      const entriesOf = full.interfaces.filter(entry => entry && places.has(entry.client) && places.has(entry.server) && entry.client !== entry.server);
+      const routed = apps.routes({interfaces:entriesOf}, plan, places, pele.edgeWidth), floor = new Map(), rest = make("div", undefined, "architecture-apps-cards");
+      let bottom = 0;
+      for (const entry of entriesOf) {
+        const words = apps.endsText(entry, routed.undrawn.get(entry) || []), button = make("button", undefined, "architecture-interface-card");
+        button.type = "button"; button.setAttribute("aria-pressed", "false"); button.setAttribute("data-trellis-action-id", apps.key(entry)); button.setAttribute("data-trellis-card", "interface");
+        for (const row of apps.cardText(entry)) {
+          const item = make("span", row.text, "architecture-card-line");
+          if (row.strong) item.dataset.strong = "true";
+          if (row.tone) item.dataset.tone = row.tone;
+          button.append(item);
+        }
+        for (const text of words) button.append(make("span", text, "architecture-card-ends"));
+        button.append(make("span", "Selected", "architecture-selected-tag"));
+        button.setAttribute("aria-label", apps.cardName(entry)); cardEntries.set(button, entry);
+        button.addEventListener("click", () => { if (!active()) return; inspect("interface", entry); pressOnly(button); });
+        const client = places.get(entry.client), server = places.get(entry.server), gutter = Math.min(client.index, server.index);
+        if (!plan.sideBySide) columns[client.index].after(button);
+        else if (Math.abs(client.index - server.index) === 1) {
+          // Below its own lines, so the card never covers a run; later cards in the gutter stack under it.
+          const ys = routed.lines.filter(item => item.entry === entry).map(item => item.y), start = ys.length ? Math.max(...ys) + 14 : Math.min(client.top, server.top);
+          const top = Math.max(start, floor.get(gutter) || 0);
+          button.dataset.gutter = "true"; css(button, {left:`${plan.columns[gutter].x + plan.columns[gutter].width}px`, top:`${top}px`, width:`${plan.gutter}px`});
+          columns[client.index].after(button);
+          const height = button.offsetHeight || 96;
+          floor.set(gutter, top + height + 8); bottom = Math.max(bottom, top + height);
+        } else rest.append(button);
+      }
+      if (plan.sideBySide && bottom) css(grid, {minHeight:`${bottom + 8}px`});
+      if (routed.lines.length) {
+        const overlay = document.createElementNS(SVG_NS, "svg");
+        overlay.setAttribute("class", "architecture-apps-overlay"); overlay.setAttribute("aria-hidden", "true"); overlay.setAttribute("focusable", "false");
+        overlay.setAttribute("width", String(plan.width)); overlay.setAttribute("height", String(Math.max(grid.scrollHeight || 0, bottom + 8)));
+        for (const item of routed.lines) {
+          const path = document.createElementNS(SVG_NS, "path"), arrow = document.createElementNS(SVG_NS, "polygon");
+          path.setAttribute("class", "architecture-apps-line"); path.setAttribute("d", item.path); path.setAttribute("stroke-width", String(item.width));
+          arrow.setAttribute("class", "architecture-apps-arrow"); arrow.setAttribute("points", item.arrow);
+          for (const node of [path, arrow]) { node.setAttribute("data-interface", apps.key(item.entry)); node.setAttribute("data-selected", "false"); overlay.append(node); }
+        }
+        grid.append(overlay);
+      }
+      if (rest.children.length) canvas.append(rest);
+      if (!entriesOf.length) {
+        const names = parts.map(part => part.group.name), last = names.pop();
+        canvas.append(make("p", `No HTTP interface measured between ${names.length ? `${names.join(", ")} and ` : ""}${last}. This does not prove absence.`, "detail"));
+      }
+      canvas.append(asideBoxes(full, parts, layout, active));
+      return true;
+    }
+    // Below the columns: a dashed box for each hidden layer, which is the toggle's face while the layers are hidden,
+    // and the unassigned files per app plus those outside every app. Counts are the DTO's.
+    function asideBoxes(full, parts, layout, active) {
+      const aside = make("div", undefined, "architecture-apps-aside"), seen = new Set();
+      const open = () => { if (!active()) return; openReview("unassigned"); };
+      if (!shown.hidden) for (const part of parts) for (const layer of part.layout.hidden) {
+        if (seen.has(layer.name)) continue;
+        seen.add(layer.name);
+        const files = full.modules.filter(module => module.layer === layer.name).length;
+        const box = make("button", undefined, "architecture-aside-box"); box.type = "button"; box.dataset.kind = "hidden"; box.setAttribute("aria-expanded", "false");
+        box.append(make("span", `${layer.name} · ${layer.shared ? "shared" : part.group.name}`, "architecture-card-line"), make("span", `${plural(files, "file")} · hidden`, "architecture-card-line"),
+          make("span", layout.tests.has(layer.name) ? `${layer.name} (tests/fixtures; include them to show)` : layer.name, "architecture-card-ends"));
+        box.addEventListener("click", () => { if (!active()) return; shown.hidden = !shown.hidden; saveDisplay(); void rerender({hidden:true}); });
+        aside.append(box);
+      }
+      const unassigned = (name, count) => {
+        if (!(count > 0)) return;
+        const box = make("button", undefined, "architecture-aside-box"); box.type = "button"; box.dataset.kind = "unassigned"; box.dataset.tone = "warning";
+        box.append(make("span", name, "architecture-card-line"), make("span", `◇ ${count} unassigned · listed, never dropped`, "architecture-card-line"));
+        box.addEventListener("click", open); aside.append(box);
+      };
+      for (const part of parts) unassigned(part.group.name, part.group.unassignedFileCount);
+      unassigned("no app", full.noApp?.unassignedFileCount);
+      return aside;
     }
     // The daemon computes Architecture once per revision (#556). Until it has, a read answers
     // `building` with progress. `refresh` asks again and settles only on the outcome, which
@@ -516,9 +793,28 @@
       reset(undefined, options.keepDraft === true, true);
       const c = capture();
       if (!c.rootKey || !c.pin) { state("Choose an indexed checkout, then open Architecture.", "empty"); return; }
+      if (c.rootKey !== scopeRoot) { scope = null; scopeRoot = c.rootKey; }
       loadDisplay(c.rootKey);
       state("Reading indexed architecture and reviewed rules…", "loading"); get("architecture-diagram").setAttribute("aria-busy", "true");
       return read(c, options);
+    }
+    // Opening the tab again draws the held snapshot when nothing it rests on changed: the checkout,
+    // session, pin, aggregate, role and the rules epoch (a rules edit or conflict advances it).
+    // Anything else reads again. A stale serial never revives: `suspend` bumped it, and the held
+    // basis only adopts the current one here.
+    function reopen() {
+      const now = context();
+      const same = !!view && view.state === "ready" && !!basis && basis.rootKey === now.rootKey && basis.session === now.session &&
+        !!now.pin && window.TrellisIndexPin.equal(basis.pin, now.pin) && basis.aggregate === aggregate && basis.role === role &&
+        basis.rulesEpoch === now.rulesEpoch;
+      if (!same) return refresh();
+      basis = {...basis, serial}; coverage();
+      return render();
+    }
+    function suspend() {
+      const held = {view, basis};
+      reset(undefined, false, false);
+      view = held.view; basis = held.basis;
     }
     function pause(delay) {
       return new Promise(resolve => { buildingWake = resolve; buildingTimer = setTimeout(resolve, delay); });
@@ -540,7 +836,7 @@
         if (payload.state === "missing_rules") {
           state("No reviewed rules file. Create or review .trellis/rules.toml. The trellis_propose_layers MCP prompt can help propose layers; this browser does not call it.", "empty"); return;
         }
-        view = payload; basis = {...c, rulesHash:payload.rulesFile.contentHash}; coverage();
+        view = payload; basis = {...c, rulesHash:payload.rulesFile.contentHash}; settleScope(payload); coverage();
         if (payload.state === "no_layers") { state("No authored layers are configured. Existing authored exceptions can still be edited or removed. Review .trellis/rules.toml to configure layers.", "empty"); overview(); }
         else await render();
         if (options.keepDraft === true) { get("architecture-review-panel").hidden = false; renderReview(); }
@@ -556,12 +852,12 @@
       }
     }
     function same(a, b) { return moduleKey(a) === moduleKey(b); }
-    function inspectorSource(target, identity, site, active) {
+    function inspectorSource(target, identity, site, active, label = "Read indexed reference source") {
       const lines = site?.lines;
       const range = lines && Number.isSafeInteger(lines.start) && lines.start > 0 && Number.isSafeInteger(lines.end) && lines.end >= lines.start
         ? {startLine:lines.start, endLine:lines.end, startByte:site.range?.start, endByte:site.range?.end} : null;
       if (!range) return;
-      const button = make("button", "Read indexed reference source"); button.type = "button";
+      const button = make("button", label); button.type = "button";
       button.addEventListener("click", () => { if (active()) return readSource({path:identity.path, range}, basis.pin, active); }); target.append(button);
     }
     const NO_PAIRS = "No mapped pairs in this scope. This does not prove absence.";
@@ -628,7 +924,7 @@
     // Counted review chips head every Architecture inspection (#449); each opens its list.
     // File assignments count native modules; the rule-check catalog also includes external identities.
     function reviewChips(target) {
-      const chips = make("div", undefined, "architecture-review-chips"), counts = view.rules?.counts;
+      const group = scopeGroup(), chips = make("div", undefined, "architecture-review-chips"), counts = group ? group.counts : view.rules?.counts;
       chips.setAttribute("role", "group"); chips.setAttribute("aria-label", "Review counts");
       const chip = (id, count, word, open, tone) => {
         const button = make("button", `${count.toLocaleString("en-US")} ${word}`, "architecture-chip"); button.type = "button"; button.id = id;
@@ -637,7 +933,7 @@
       };
       if (view.state === "ready" && Number.isSafeInteger(counts?.deviates)) chip("architecture-review", counts.deviates, counts.deviates === 1 ? "deviation" : "deviations", button => deviations.open(button), counts.deviates ? "error" : null);
       if (view.state === "ready") {
-        const unassigned = view.modules.filter(module => module.layer === null).length;
+        const unassigned = unassignedOf(view, group).length;
         chip("architecture-unassigned", unassigned, unassigned === 1 ? "unassigned file" : "unassigned files", () => openReview("unassigned"));
       }
       if (Number.isSafeInteger(view.exceptionCount)) chip("architecture-authored", view.exceptionCount, view.exceptionCount === 1 ? "exception" : "exceptions", showAuthored);
@@ -648,6 +944,9 @@
     function overview() {
       if (!usable() || !["ready", "no_layers"].includes(view.state)) return;
       clearInspection(); window.TrellisShell?.showArchitectureInspector({drawer:false});
+      // Nothing is selected any more, so no drawn node may say it is (a stub shows the word Selected).
+      for (const node of get("architecture-diagram").querySelectorAll?.('[aria-pressed="true"]') || []) node.setAttribute("aria-pressed", "false");
+      syncCards();
       get("architecture-inspector-title").textContent = "Architecture review";
       const target = get("architecture-inspector-content"); target.replaceChildren();
       reviewChips(target);
@@ -670,6 +969,79 @@
       return semantic
         ? "Semantic evidence names a fresh producer binding and its proof; structural spelling and source-owner identities remain syntax evidence."
         : "Captured spelling and source-owner identities are syntax evidence, not destination symbol bindings.";
+    }
+    const str = value => typeof value === "string" ? value : "";
+    // One interface row of a detail list: the route, its confidence, and a source read for the handler and each call site.
+    const endpointRows = active => (list, items) => {
+      for (const item of items) {
+        const entry = item?.entry, row = make("div", undefined, "architecture-rule-row");
+        if (!entry || typeof entry !== "object") continue;
+        const handler = entry.handler, sites = item.list === "clientOnly" ? [entry.callSite] : Array.isArray(entry.callSites) ? entry.callSites : [];
+        const route = `${str(entry.method) || "unresolved method"} ${str(entry.pathTemplate) || "(unresolved path)"}`;
+        row.dataset.list = str(item.list);
+        const tail = item.list === "matched" ? ` · ${str(entry.confidence)} · ${plural(sites.length, "call site")}` : "";
+        paragraph(row, `${route}${tail}`);
+        if (handler?.path && handler.lines) {
+          paragraph(row, `Handler ${handler.path}:${handler.lines.start}`, "detail");
+          inspectorSource(row, {path:handler.path}, {lines:handler.lines}, active, "Read handler source");
+        }
+        for (const site of sites) if (site?.document?.path) {
+          paragraph(row, `Call site ${site.document.path}:${site.lines?.start}`, "detail");
+          inspectorSource(row, {path:site.document.path}, site, active, "Read call-site source");
+        }
+        list.append(row);
+      }
+    };
+    // The interface inspector (AC15): its ends, counts and wrappers, the one-sided routes and calls, and Open endpoints for the matched ones.
+    function inspectInterface(target, title, entry, active) {
+      title.textContent = `${entry.client} → ${entry.server}`;
+      const ends = Array.isArray(entry.ends) ? entry.ends : [], counts = entry.counts || {}, confidence = counts.confidence || {};
+      const layers = key => [...new Set(ends.map(end => end?.[key]))].map(name => typeof name === "string" ? name : "no layer").join(", ") || "no layer";
+      paragraph(target, "HTTP · method and path match · structural evidence, not proof", "detail");
+      paragraph(target, `Client end: ${entry.client} · ${layers("clientLayer")}`);
+      paragraph(target, `Server end: ${entry.server} · ${layers("serverLayer")}`);
+      const grid = make("dl", undefined, "metric-inspector-values");
+      const row = (name, value, tone) => { const item = make("dd", display(value)); if (tone) item.dataset.tone = tone; grid.append(make("dt", name), item); };
+      row("Matched routes", counts.matchedRoutes); row("Client call sites", counts.callSites);
+      row("◆ Server-only routes", counts.serverOnly, "warning"); row("◆ Client-only calls", counts.clientOnly, "warning");
+      row("exact", confidence.exact); row("template", confidence.template); row("wrapper-inferred", confidence.wrapperInferred); row("unresolved", confidence.unresolved);
+      target.append(grid);
+      const wrappers = entry.wrappers, prefix = wrappers?.prefix;
+      if (Array.isArray(wrappers?.callees)) paragraph(target, `Wrappers: ${wrappers.callees.filter(name => typeof name === "string").join(", ")}${prefix ? ` · Client prefix: ${str(prefix.client)} → ${str(prefix.server)}` : ""}`, "detail architecture-mono");
+      const params = list => ({kind:"interfaces", client:entry.client, server:entry.server, list});
+      const matched = make("div", undefined, "architecture-endpoints"), open = make("button", "Open endpoints", "architecture-open-endpoints"); open.type = "button";
+      open.addEventListener("click", () => {
+        if (!active() || open.disabled) return;
+        open.disabled = true; open.setAttribute("aria-expanded", "true");
+        detailList(matched, params("matched"), active, endpointRows(active), "No matched routes at this pin.");
+      });
+      target.append(open, matched);
+      paragraph(target, "◆ Server-only routes: no call matched them", "detail");
+      detailList(target, params("serverOnly"), active, endpointRows(active), "No server-only routes.");
+      paragraph(target, "◆ Client-only calls: no route matched them. This does not prove absence.", "detail");
+      detailList(target, params("clientOnly"), active, endpointRows(active), "No client-only calls.");
+    }
+    // The app inspector: what was detected, how much of it has layers, and the interfaces it takes part in.
+    function inspectApp(target, title, group, payload, active) {
+      title.textContent = group.name;
+      paragraph(target, `${group.languages.join(", ") || "no languages"} · ${group.roots.map(root => root || "./").join(", ") || "no roots"}`, "detail");
+      const ordered = payload.layers.filter(layer => !layer.shared && layer.app === group.name).length;
+      const shared = payload.layers.filter(layer => layer.shared && (layer.apps == null || layer.apps.includes(group.name))).length;
+      const grid = make("dl", undefined, "metric-inspector-values");
+      const row = (name, value, tone) => { const item = make("dd", value); if (tone) item.dataset.tone = tone; grid.append(make("dt", name), item); };
+      const unassigned = unassignedOf(payload, group).length, deviates = Number.isSafeInteger(group.counts?.deviates) ? group.counts.deviates : 0;
+      row("Files", String(group.fileCount)); row("Layers", `${ordered} + ${shared} shared`);
+      for (const entry of payload.interfaces) if (entry?.client === group.name) row(`Calls to ${entry.server}`, display(entry.counts?.callSites));
+      row("Deviations", deviates ? `↑ ${deviates} ${deviates === 1 ? "deviation" : "deviations"}` : "0", deviates ? "error" : null);
+      row("Unassigned", unassigned ? `◇ ${unassigned} unassigned` : "0", unassigned ? "warning" : null);
+      target.append(grid);
+      paragraph(target, `Detected from ${group.manifests.join(", ")}${group.kinds.length ? ` (${group.kinds.join(", ")})` : ""}`, "detail");
+      if (group.duplicate) paragraph(target, apps.duplicateNotice(group), "architecture-app-notice");
+      if (!ordered) paragraph(target, `${group.name} has no layers yet. The trellis_propose_layers MCP prompt can propose layers per app; this browser does not call it. Review .trellis/rules.toml to add layers with app = "${group.name}".`);
+      for (const entry of payload.interfaces) if (entry?.client === group.name || entry?.server === group.name) {
+        const button = make("button", `HTTP: ${entry.client} → ${entry.server}`); button.type = "button";
+        button.addEventListener("click", () => { if (active()) inspect("interface", entry); }); target.append(button);
+      }
     }
     function inspect(kind, record) {
       if (!usable() || view.state !== "ready") return;
@@ -704,7 +1076,7 @@
         title.textContent = `${record.sourceLayer} → ${record.destinationLayer}`;
         paragraph(target, `${record.count} exact ${record.role} ${edgeSites(record)} · ${record.status}${record.excepted ? ` · excepted: ${record.exceptionReason}` : " · not excepted"}${record.role === "test" ? " · hypothetical policy only; never a production violation" : ""}.`);
         reviewScope = record; reviewMode = "rules"; get("architecture-review-state").value = "all"; get("architecture-review-panel").hidden = false; renderReview();
-        detailList(target, {kind:"instances", ...edgeFilters(record)}, active, instanceItems(active), "No rule instances match this review scope.");
+        detailList(target, appFilter({kind:"instances", ...edgeFilters(record)}), active, instanceItems(active), "No rule instances match this review scope.");
         pairs(target, record.pairs, active);
       } else if (kind === "layer") {
         title.textContent = record.name; paragraph(target, layerLabel(record));
@@ -716,7 +1088,11 @@
         paragraph(target, "Reference pairs from or to this layer", "detail");
         detailList(target, {kind:"pairs", layer:record.name}, active, pairItems(active), NO_PAIRS);
         paragraph(target, "Layer policy and exceptions", "detail");
-        detailList(target, {kind:"instances", layer:record.name}, active, instanceItems(active), "No rule instances name this layer.");
+        detailList(target, appFilter({kind:"instances", layer:record.name}), active, instanceItems(active), "No rule instances name this layer.");
+      } else if (kind === "interface" || kind === "app") {
+        const found = kind === "interface" ? apps.link(payload, record?.client, record?.server) : apps.group(payload, record?.name);
+        if (!found) { overview(); return; }
+        if (kind === "interface") inspectInterface(target, title, found, active); else inspectApp(target, title, found, payload, active);
       } else if (kind === "unresolved") {
         title.textContent = "Unresolved structural references";
         paragraph(target, `${references.counts?.unresolvedSites ?? 0} unresolved sites.`);
@@ -740,7 +1116,7 @@
     // Review filters as one exact detail scope; null when the role/verdict selects
     // contradict the chosen edge, so nothing can match.
     function reviewFilters(roleFilter, verdict) {
-      const params = {kind:"instances", ...(reviewScope ? edgeFilters(reviewScope) : {})};
+      const params = {kind:"instances", ...(reviewScope ? edgeFilters(reviewScope) : appFilter({kind:"instances"}))};
       const set = (key, value) => { if (key in params && params[key] !== value) return false; params[key] = value; return true; };
       if (roleFilter !== "all" && !set("role", roleFilter)) return null;
       if (verdict === "excepted" && !set("excepted", "true")) return null;
@@ -808,15 +1184,16 @@
     function renderReview() {
       if (!usable()) return;
       const target = get("architecture-review-list"); target.replaceChildren();
-      get("architecture-review-scope").textContent = reviewMode === "unassigned" ? "Unassigned files (including files without edges)" :
-        reviewMode === "authored" ? "Authored exceptions" : reviewScope ? `${reviewScope.sourceLayer} → ${reviewScope.destinationLayer} · ${reviewScope.role}` : "All rule instances";
+      const inApp = scopeGroup() ? ` in ${scopeGroup().name}` : "";
+      get("architecture-review-scope").textContent = reviewMode === "unassigned" ? `Unassigned files${inApp} (including files without edges)` :
+        reviewMode === "authored" ? "Authored exceptions" : reviewScope ? `${reviewScope.sourceLayer} → ${reviewScope.destinationLayer} · ${reviewScope.role}` : `All rule instances${inApp}`;
       get("architecture-exceptions").hidden = reviewMode !== "authored";
       const c = basis, ticket = ++reviewSerial, active = () => usable() && current(c);
       const listed = () => active() && ticket === reviewSerial;
       if (reviewMode === "unassigned" && view.state === "no_layers") {
         paragraph(target, "No layers configured. File assignment inventory is unavailable until layers are configured; authored exceptions remain editable.");
       } else if (reviewMode === "unassigned") {
-        for (const module of view.modules.filter(item => item.layer === null)) {
+        for (const module of unassignedOf(view, scopeGroup())) {
           const row = make("div", undefined, "architecture-rule-row"); row.dataset.source = module.identity.path;
           action(row, module.identity.path, () => inspect("module", module), active);
           const label = make("label", "Assign to layer "), select = make("select");
@@ -900,14 +1277,17 @@
     }
     function snapshot() {
       return usable() && inspection ? {inspection, pressed:nodeKey(pressedNode()), rulesHash:basis.rulesHash,
-        aggregate, role, reviewMode, reviewScope, reviewOpen:!get("architecture-review-panel").hidden,
+        aggregate, role, scope, reviewMode, reviewScope, reviewOpen:!get("architecture-review-panel").hidden,
         reviewRole:get("architecture-review-role").value, reviewState:get("architecture-review-state").value, deviations:deviations.snapshot()} : null;
     }
     async function restore(saved, active) {
       aggregate = saved.aggregate; role = saved.role;
       get("architecture-aggregate").value = aggregate;
+      // The saved scope applies to this checkout; refresh keeps it because the root key matches.
+      scope = saved.scope ?? null; scopeRoot = context().rootKey;
       await refresh();
       if (!active() || !usable()) return;
+      settleScope(view);
       if (basis.rulesHash !== saved.rulesHash) throw new Error("Architecture rules changed. Select the boundary again.");
       if (saved.reviewOpen) {
         if (saved.reviewMode === "authored") await showAuthored();
@@ -925,7 +1305,7 @@
       else if (kind === "rule") inspectRule(record);
       else inspect(kind, record);
       pressed = saved.pressed;
-      const node = findNode(pressed); if (node) { node.setAttribute("aria-pressed", "true"); node.focus({preventScroll:true}); }
+      const node = findNode(pressed); if (node) { node.setAttribute("aria-pressed", "true"); node.focus({preventScroll:true}); syncCards(); }
     }
     function beginDraft(operation, scope = null) {
       if (!usable() || editBusy) return;
@@ -1117,7 +1497,7 @@
       if (!["max", "sum", "mean"].includes(event.target.value) || event.target.value === aggregate) return;
       aggregate = event.target.value; return refresh();
     });
-    return {refresh, reset, clearInspection, restore};
+    return {refresh, reset, clearInspection, restore, reopen, suspend};
   }
   window.TrellisArchitecture = {create, moduleKey, quartiles, band, metricValue, commonDirectory, groupModules};
 })();

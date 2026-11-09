@@ -111,3 +111,34 @@ test("#449: collapsed bands draw summary chips, width sets chip columns, arrows 
   const raw=pele.render(wide.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
   for(const id of wide.nodes.keys()) assert.equal((raw.match(new RegExp(`data-id="${id}"`,"g"))||[]).length,1);
 });
+test("AC26: a long label wraps to at most twelve lines, keeps its full accessible name, and the title is the stack header",()=>{
+  const {adapter}=setup(), view=fixture(), long="segment/".repeat(240);
+  const display={layers:new Set(view.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[]};
+  const p=adapter.project(view,{display,title:"web · ordered layers",measureText:text=>Array.from(text).length*7,layerLabel:layer=>layer.name==="Store"?`${long}\nOrder 1`:`${layer.name}\nOrder ${layer.order}`});
+  const store=[...p.nodes.values()].find(n=>n.kind==="L"&&n.record.name==="Store");
+  assert.equal(store.display.length,13,"twelve wrapped lines plus the order line");
+  assert.ok(store.display[11].endsWith("…"));assert.ok(store.full.startsWith(long));
+  assert.ok([...p.nodes.values()].some(n=>n.kind==="B"&&n.full==="web · ordered layers"));
+});
+test("AC26: a label within the twelve-line cap wraps whole, with nothing dropped and the full accessible name",()=>{
+  const {adapter}=setup(), view=fixture(), label="src/web_app/layer_name-with.separators/".repeat(4).slice(0,120);
+  assert.equal(label.length,120);
+  const display={layers:new Set(view.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[]};
+  const p=adapter.project(view,{display,measureText:text=>Array.from(text).length*7,layerLabel:layer=>layer.name==="Store"?`${label}\nOrder 1`:`${layer.name}\nOrder ${layer.order}`});
+  const store=[...p.nodes.values()].find(n=>n.kind==="L"&&n.record.name==="Store");
+  const lines=store.display.slice(0,-1);
+  assert.ok(lines.length>1&&lines.length<=12);
+  assert.ok(lines.every(line=>!line.includes("…")));
+  assert.equal(lines.join(""),label);
+  assert.equal(store.full,`${label}\nOrder 1`);
+});
+test("AC25: a stat with a tag always reserves room for it, so selecting an interface stub never moves the layout",()=>{
+  const {adapter}=setup(), view=fixture();
+  const display={layers:new Set(view.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[]};
+  const stats=tag=>layer=>layer.name==="Store"?[{text:"→ daemon · 3 routes · 5 call sites".padEnd(33,"."),label:"to daemon",tone:"neutral",tag,action:{interface:{client:"web",server:"daemon"}}},
+    {text:"↑2 deviation · Core".padEnd(33,"."),label:"up",tone:"error"}]:[];
+  const lines=tag=>[...adapter.project(view,{display,measureText:text=>Array.from(text).length*9,layerStats:stats(tag)}).nodes.values()].find(n=>n.kind==="L"&&n.record.name==="Store").statLines.map(line=>line.stats.length);
+  const plain=lines(undefined), tagged=lines("Selected");
+  assert.deepEqual([...plain],[2],"both chips fit one header line without the tag");
+  assert.deepEqual([...tagged],[1,1],"the reserved tag takes room the chips would otherwise share");
+});

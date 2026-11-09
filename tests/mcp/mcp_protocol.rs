@@ -782,16 +782,20 @@ fn rules_envelopes_accept_classified_evidence_and_kind_counts() {
             "data":{"rulesVersion":"rules:v2","indexGeneration":"g","indexRevision":1,
                 "rulesFile":{"path":".trellis/rules.toml","source":"checkout-config","contentHash":"0".repeat(64)},
                 "instances":[instance],"testOnly":[],"counts":counts,"testCounts":counts,
+                "apps":[{"name":"trellis","manifest":"Cargo.toml","counts":counts}],"noApp":{"counts":counts},
                 "unassignedFileCount":0,"unassigned":[],"partialFiles":[],"limitations":[],
                 "externalPackages":[],"page":page,"semanticBases":[]},
             "warnings":[],"partial":false,"truncated":false,"truncationReason":null,
             "workspace":"/selected","catchingUp":false})
     };
+    // #784: explain does not carry the per-app counts.
+    let mut explain = envelope(json!({"offset":0,"nextOffset":null,"total":1}));
+    explain["data"].as_object_mut().unwrap().remove("apps");
+    explain["data"].as_object_mut().unwrap().remove("noApp");
     validate_structured_content(&[
         json!({"name":"trellis_rules_check","structuredContent":
             envelope(json!({"offset":0,"nextOffset":null,"total":1,"status":null}))}),
-        json!({"name":"trellis_rules_explain","structuredContent":
-            envelope(json!({"offset":0,"nextOffset":null,"total":1}))}),
+        json!({"name":"trellis_rules_explain","structuredContent":explain}),
     ]);
 }
 
@@ -2867,7 +2871,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
         json!({
         "inputField":"workspace","maxUtf8Bytes":4096,"attemptedValueBytes":256,
         "resolvedFields":["workspace","catchingUp"],
-        "reasons":["not_absolute","not_checkout","different_repository","identity_changed","unavailable"]})
+        "reasons":["not_absolute","not_checkout","identity_changed","unavailable"]})
     );
     fn git(cwd: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -2906,12 +2910,8 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
             "HEAD",
         ],
     );
-    let foreign = temp.path().join("foreign");
-    git(temp.path(), &["init", "--quiet", foreign.to_str().unwrap()]);
     let main = main.canonicalize().unwrap();
     let linked = linked.canonicalize().unwrap();
-    let foreign = foreign.canonicalize().unwrap();
-    let foreign_marker = foreign.join(".git/trellis/workspace-id");
     let git_pointer = fs::read_to_string(linked.join(".git")).unwrap();
     let linked_git =
         fs::canonicalize(linked.join(git_pointer.trim().strip_prefix("gitdir: ").unwrap()))
@@ -2994,23 +2994,19 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
             launch["result"]["structuredContent"]["data"]["workspaceLabel"],
             "main"
         );
-        for (id, value, reason) in [
-            (12, json!("relative"), "not_absolute"),
-            (13, json!(foreign), "different_repository"),
-        ] {
-            let answer = describe(&mut peer, id, json!({"schemaVersion":1,"workspace":value}));
-            tool(&answer, Some("workspace_selection_failed"), !legacy);
-            let envelope = &answer["result"]["structuredContent"];
-            assert!(envelope.get("workspace").is_none());
-            assert!(envelope.get("catchingUp").is_none());
-            assert_eq!(envelope["error"]["reason"], reason);
-            assert_eq!(envelope["error"]["attemptedWorkspace"]["value"], value);
-            assert_eq!(envelope["error"]["currentBasis"], Value::Null);
-        }
-        assert!(
-            !foreign_marker.exists(),
-            "foreign selection cannot create a marker"
+        let relative = json!("relative");
+        let answer = describe(
+            &mut peer,
+            12,
+            json!({"schemaVersion":1,"workspace":relative}),
         );
+        tool(&answer, Some("workspace_selection_failed"), !legacy);
+        let envelope = &answer["result"]["structuredContent"];
+        assert!(envelope.get("workspace").is_none());
+        assert!(envelope.get("catchingUp").is_none());
+        assert_eq!(envelope["error"]["reason"], "not_absolute");
+        assert_eq!(envelope["error"]["attemptedWorkspace"]["value"], relative);
+        assert_eq!(envelope["error"]["currentBasis"], Value::Null);
         let symlink = temp.path().join("link-to-linked");
         if !symlink.exists() {
             std::os::unix::fs::symlink(&linked, &symlink).unwrap();
@@ -3068,6 +3064,124 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
         );
         peer.assert_success("trellis mcp");
     }
+}
+
+/// #839: a client launched in checkout A may select any verified local Git
+/// checkout B, sharing no Git common directory with A: a separate `git init`
+/// repository and a `git clone --local` copy. Each answer is B's evidence and
+/// names B as its top-level `workspace`.
+#[test]
+fn per_call_selection_admits_unrelated_checkouts() {
+    let temp = tempfile::tempdir().unwrap();
+    let launch = temp.path().join("launch");
+    git_selection(temp.path(), &["init", "--quiet", launch.to_str().unwrap()]);
+    fs::write(
+        launch.join("launch.py"),
+        "def only_in_launch():\n    pass\n",
+    )
+    .unwrap();
+    git_selection(&launch, &["add", "."]);
+    git_selection(&launch, &["commit", "--quiet", "-m", "launch"]);
+    let unrelated = temp.path().join("unrelated");
+    git_selection(
+        temp.path(),
+        &["init", "--quiet", unrelated.to_str().unwrap()],
+    );
+    fs::write(
+        unrelated.join("unrelated.py"),
+        "def only_in_unrelated():\n    pass\n",
+    )
+    .unwrap();
+    git_selection(&unrelated, &["add", "."]);
+    git_selection(&unrelated, &["commit", "--quiet", "-m", "unrelated"]);
+    let clone = temp.path().join("clone");
+    git_selection(
+        temp.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--local",
+            launch.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    // The clone has its own Git directory; an uncommitted edit is its own work.
+    fs::write(clone.join("edit.py"), "def only_in_clone():\n    pass\n").unwrap();
+    let launch = launch.canonicalize().unwrap();
+    let unrelated = unrelated.canonicalize().unwrap();
+    let clone = clone.canonicalize().unwrap();
+    let mut peer = Peer::start(Some(&launch));
+    let mut id = 10;
+    for (selected, label, only, absent, file) in [
+        (
+            &unrelated,
+            "unrelated",
+            "only_in_unrelated",
+            "only_in_launch",
+            "unrelated.py",
+        ),
+        (
+            &clone,
+            "clone",
+            "only_in_clone",
+            "only_in_unrelated",
+            "edit.py",
+        ),
+    ] {
+        let mut ask = |name: &str, mut arguments: Value| {
+            id += 1;
+            arguments["workspace"] = json!(selected);
+            let answer = peer.ask(call(false, json!(id), name, arguments));
+            tool(&answer, None, true);
+            let envelope = answer["result"]["structuredContent"].clone();
+            assert_eq!(envelope["workspace"], json!(selected), "{answer}");
+            envelope
+        };
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+        loop {
+            let status = ask("trellis_workspace_describe", json!({"schemaVersion":1}));
+            assert_eq!(status["data"]["workspaceLabel"], label);
+            if status["data"]["indexState"] == "ready" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{label} checkout head was not admitted"
+            );
+            std::thread::yield_now();
+        }
+        let found = ask(
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":only}),
+        );
+        let symbols = found["data"]["symbols"].as_array().unwrap();
+        assert!(
+            symbols.iter().any(|symbol| symbol["name"] == only),
+            "{found}"
+        );
+        let missing = ask(
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":absent}),
+        );
+        assert_eq!(missing["data"]["symbols"], json!([]), "{missing}");
+        let source = ask(
+            "trellis_read_source",
+            json!({"schemaVersion":1,"path":file,"startLine":1,"endLine":1}),
+        );
+        assert!(source.to_string().contains(only), "{source}");
+    }
+    let back = peer.ask(call(
+        false,
+        json!(99),
+        "trellis_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&back, None, true);
+    assert_eq!(
+        back["result"]["structuredContent"]["workspace"],
+        json!(launch)
+    );
+    peer.assert_success("trellis mcp");
 }
 
 #[test]
@@ -11705,6 +11819,9 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
     assert_eq!(witness["targetReason"], "structural_only");
     assert!(witness["target"].is_null());
     assert_eq!(data["page"]["offset"], 0);
+    // #784: with no detected app the check carries `apps: []` and `noApp` holds every count.
+    assert_eq!(data["apps"], json!([]));
+    assert_eq!(data["noApp"]["counts"], data["counts"]);
     structured.push(json!({"name":"trellis_rules_check","structuredContent":envelope.clone()}));
     // The unscoped check pages too; its concatenated instances keep every row.
     let mut offset = 0;
@@ -11725,6 +11842,8 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
             data["counts"], *whole,
             "every page carries the whole-result counts"
         );
+        assert_eq!(data["apps"], json!([]));
+        assert_eq!(data["noApp"]["counts"], *whole);
         instances += data["instances"].as_array().unwrap().len();
         for row in data["instances"].as_array().unwrap() {
             if row["rule"] == "$layers" || row["rule"] == "$external" {
@@ -11758,7 +11877,10 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
         json!({"schemaVersion":1,"expectedBasis":basis,"rule":"$layers","target":unknown["target"],"limit":2}),
     );
     tool(&explained, None, true);
-    let row = &explained["result"]["structuredContent"]["data"]["instances"][0];
+    let explained_data = &explained["result"]["structuredContent"]["data"];
+    assert!(explained_data.get("apps").is_none(), "{explained_data}");
+    assert!(explained_data.get("noApp").is_none(), "{explained_data}");
+    let row = &explained_data["instances"][0];
     assert_eq!(row["evidence"].as_array().unwrap().len(), 2);
     assert_eq!(row["omittedEvidence"], 298);
     assert_eq!(row["kindCounts"]["import"], 300, "{row}");
@@ -12520,6 +12642,11 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
                 .unwrap()
                 .contains("\"rulesText\":null")
         );
+        let absent_text = absent["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(absent_text.contains("\"apps\":[]"), "{absent_text}");
+        assert!(!absent_text.contains("PER-APP LAYERS"));
         let missing = ask(
             8,
             "tools/call",
@@ -12634,6 +12761,83 @@ async fn propose_layers_prompt_fits_the_frame_when_references_exceed_it() {
         assert!(summary.get(field).is_none(), "{field}");
     }
     drop(raw);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #783: `payload.apps` follows the current rules bytes. A manifest a hidden layer selects
+/// is left out; with no rules file every manifest is listed, and two apps add the per-app
+/// instructions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn propose_layers_prompt_lists_apps_against_the_current_rules() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    for directory in ["src", "tools"] {
+        fs::create_dir_all(temp.path().join("checkout").join(directory)).unwrap();
+    }
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"svc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/main.rs", "fn main() {}\n"),
+            ("tools/package.json", "{\"name\":\"tooling\"}\n"),
+            ("tools/build.js", "module.exports = 1;\n"),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    let rules_path = identity.root.join(".trellis/rules.toml");
+    fs::write(
+        &rules_path,
+        "version = 1\n[layers.tools]\norder = 1\ndisplay = \"hidden\"\npaths = [\"tools/**\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(783, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 783, None);
+    let mut prompt = |id: i64| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "prompts/get",
+                json!({"name":"trellis_propose_layers"})
+            )
+        )
+        .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert!(reply.get("error").is_none(), "{reply}");
+        let text = reply["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let context: Value =
+            serde_json::from_str(text.split("UNTRUSTED REPOSITORY DATA\n").nth(1).unwrap())
+                .unwrap();
+        (text, context["payload"]["apps"].clone())
+    };
+    let svc = json!({"name":"svc","kind":"cargo","manifest":"Cargo.toml","roots":["."],
+        "entries":["svc"]});
+    let (text, apps) = prompt(1);
+    assert_eq!(apps, json!([svc]));
+    assert!(!text.contains("PER-APP LAYERS"));
+    fs::remove_file(&rules_path).unwrap();
+    let (text, apps) = prompt(2);
+    assert_eq!(
+        apps,
+        json!([svc, {"name":"tooling","kind":"npm","manifest":"tools/package.json",
+            "roots":["tools"],"entries":[]}])
+    );
+    assert!(text.contains("PER-APP LAYERS"));
+    drop(prompt);
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();

@@ -21,6 +21,7 @@ pub enum Kind {
     Instances,
     Pairs,
     Unresolved,
+    Interfaces,
 }
 
 impl Kind {
@@ -29,6 +30,7 @@ impl Kind {
             Self::Instances => "instances",
             Self::Pairs => "pairs",
             Self::Unresolved => "unresolved",
+            Self::Interfaces => "interfaces",
         }
     }
 }
@@ -50,10 +52,18 @@ pub struct Query {
     pub source_layer: Option<String>,
     pub destination_layer: Option<String>,
     pub layer: Option<String>,
+    /// `instances`: the name of the app the instance counts under.
+    pub app: Option<String>,
     pub path: Option<String>,
     pub source: Option<Value>,
     pub target: Option<Value>,
     pub unlayered: bool,
+    /// `interfaces`: the client app's name.
+    pub client: Option<String>,
+    /// `interfaces`: the server app's name.
+    pub server: Option<String>,
+    /// `interfaces`: `matched`, `serverOnly` or `clientOnly`.
+    pub list: Option<String>,
 }
 
 /// A malformed detail query; the HTTP route answers `invalid_request`.
@@ -76,6 +86,7 @@ impl Query {
             Some("instances") => Kind::Instances,
             Some("pairs") => Kind::Pairs,
             Some("unresolved") => Kind::Unresolved,
+            Some("interfaces") => Kind::Interfaces,
             _ => return Err(InvalidQuery),
         };
         let allowed: &[&str] = match kind {
@@ -88,10 +99,12 @@ impl Query {
                 "sourceLayer",
                 "destinationLayer",
                 "layer",
+                "app",
                 "path",
             ],
             Kind::Pairs => &["role", "path", "source", "target", "layer", "unlayered"],
             Kind::Unresolved => &["path"],
+            Kind::Interfaces => &["client", "server", "list"],
         };
         let common = [
             "indexGeneration",
@@ -166,6 +179,13 @@ impl Query {
                 _ => Err(InvalidQuery),
             },
         };
+        let list = fields.remove("list");
+        if list
+            .as_deref()
+            .is_some_and(|list| crate::interfaces::List::parse(list).is_none())
+        {
+            return Err(InvalidQuery);
+        }
         let unlayered = match flag(fields.remove("unlayered"))? {
             None => false,
             Some(true) => true,
@@ -185,10 +205,14 @@ impl Query {
             source_layer: fields.remove("sourceLayer"),
             destination_layer: fields.remove("destinationLayer"),
             layer: fields.remove("layer"),
+            app: fields.remove("app"),
             path: fields.remove("path"),
             source: identity(fields.remove("source"))?,
             target: identity(fields.remove("target"))?,
             unlayered,
+            client: fields.remove("client"),
+            server: fields.remove("server"),
+            list,
         })
     }
 }
@@ -198,6 +222,7 @@ impl Query {
 pub struct Layers<'a> {
     native: &'a BTreeMap<&'a str, Option<&'a str>>,
     external: BTreeMap<String, Option<String>>,
+    apps: Option<crate::rules::AppScope<'a>>,
 }
 
 impl<'a> Layers<'a> {
@@ -213,7 +238,24 @@ impl<'a> Layers<'a> {
                 }
             }
         }
-        Self { native, external }
+        Self {
+            native,
+            external,
+            apps: None,
+        }
+    }
+    /// Let `app` filters resolve instances to their app.
+    pub(crate) fn with_apps(mut self, apps: crate::rules::AppScope<'a>) -> Self {
+        self.apps = Some(apps);
+        self
+    }
+    /// Whether `row` counts under an app named `name` (a shared name matches each of its apps).
+    fn counts_under(&self, name: &str, row: &Value) -> bool {
+        self.apps.as_ref().is_some_and(|apps| {
+            apps.bucket(self.native, row)
+                .and_then(|index| apps.name(index))
+                == Some(name)
+        })
     }
     /// The layer of a native identity or external package; None when unassigned.
     pub fn of(&self, identity: &Value) -> Option<&str> {
@@ -272,11 +314,12 @@ pub fn summary(references: &Value, rules: &Value, layers: &Layers<'_>) -> Result
 
 /// One page of details. `total` counts every matching item; items keep the
 /// evaluation's order, production before test.
-pub fn page(
+pub(crate) fn page(
     query: &Query,
     references: &Value,
     rules: &Value,
     layers: &Layers<'_>,
+    interfaces: Option<&crate::interfaces::Projection<'_>>,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Value> {
     let path_is = |identity: &Value, path: &Option<String>| {
@@ -328,7 +371,12 @@ pub fn page(
                         row["target"]["path"].as_str() == Some(path)
                             || row["destination"]["path"].as_str() == Some(path)
                     });
-                    if text_is(&row["rule"], &query.rule)
+                    let in_app = query
+                        .app
+                        .as_deref()
+                        .is_none_or(|app| layers.counts_under(app, row));
+                    if in_app
+                        && text_is(&row["rule"], &query.rule)
                         && text_is(&row["status"], &query.status)
                         && query
                             .excepted
@@ -398,6 +446,18 @@ pub fn page(
                 }
             }
         }
+        Kind::Interfaces => {
+            let interfaces =
+                interfaces.context("store_unavailable: architecture interfaces part")?;
+            let list = query
+                .list
+                .as_deref()
+                .and_then(crate::interfaces::List::parse);
+            for row in interfaces.rows(query.client.as_deref(), query.server.as_deref(), list) {
+                check()?;
+                admit(&|| interfaces.item(row))?;
+            }
+        }
     }
     ensure!(query.offset <= total, "invalid_request: detail offset");
     Ok(json!({
@@ -449,6 +509,7 @@ mod tests {
                 &references,
                 &rules,
                 &layers,
+                None,
                 &mut || Ok(()),
             )
             .unwrap();
@@ -458,8 +519,26 @@ mod tests {
         }
         // The oversized item alone, then two thirds that fit, then the rest.
         assert_eq!(pages, vec![1, 2, 2]);
-        assert!(page(&query(6, 1), &references, &rules, &layers, &mut || Ok(())).is_err());
-        let end = page(&query(5, 1), &references, &rules, &layers, &mut || Ok(())).unwrap();
+        assert!(
+            page(
+                &query(6, 1),
+                &references,
+                &rules,
+                &layers,
+                None,
+                &mut || Ok(())
+            )
+            .is_err()
+        );
+        let end = page(
+            &query(5, 1),
+            &references,
+            &rules,
+            &layers,
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
         assert_eq!(end["items"], json!([]));
         assert!(end["nextOffset"].is_null());
     }
@@ -487,7 +566,7 @@ mod tests {
         let mut offset = Some(0);
         while let Some(at) = offset {
             query.offset = at;
-            let page = page(&query, &references, &rules, &layers, &mut || Ok(())).unwrap();
+            let page = page(&query, &references, &rules, &layers, None, &mut || Ok(())).unwrap();
             assert_eq!(page["total"], 3);
             items.extend(page["items"].as_array().unwrap().iter().cloned());
             offset = page["nextOffset"].as_u64().map(|next| next as usize);
@@ -515,12 +594,55 @@ mod tests {
         let layers = Layers::new(&native, &rules);
         let mut query = query(0, 1);
         query.kind = Kind::Pairs;
-        let page = page(&query, &references, &rules, &layers, &mut || Ok(())).unwrap();
+        let page = page(&query, &references, &rules, &layers, None, &mut || Ok(())).unwrap();
         assert_eq!(page["items"][0]["pair"], pair);
         assert_eq!(page["items"][0]["pair"]["kindCounts"]["call"], 1);
         assert_eq!(
             page["items"][0]["pair"]["sites"][1]["targetReason"],
             "unresolved"
         );
+    }
+    /// #784: the `app` filter keeps the rows whose bucket's name matches, so two apps that
+    /// share a name answer to one filter value, and a row with no app matches none.
+    #[test]
+    fn the_app_filter_matches_every_app_of_that_name() {
+        let app = |name: &str, root: &str| crate::apps::App {
+            name: name.into(),
+            kind: crate::apps::AppKind::Npm,
+            manifest: format!("{root}/package.json"),
+            root: root.into(),
+            entries: Vec::new(),
+        };
+        let apps = [app("web", "a"), app("web", "b"), app("api", "c")];
+        let config = crate::rules::parse("version=1\n[layers.l]\norder=1\npaths=['**']\n").unwrap();
+        let row = |path: &str| {
+            json!({"rule":"$external","status":"conforms","excepted":false,"exceptionReason":null,
+                "sourceLayer":null,"destinationLayer":null,"target":{"path":path}})
+        };
+        let rules = json!({"rulesFile":{"contentHash":"hash"},
+            "instances":[row("a/x.js"), row("b/x.js"), row("c/x.js"), row("d/x.js")],"testOnly":[]});
+        let native = BTreeMap::new();
+        let layers =
+            Layers::new(&native, &rules).with_apps(crate::rules::AppScope::new(&config, &apps));
+        let paths = |app: &str| {
+            let mut query = query(0, 10);
+            query.kind = Kind::Instances;
+            query.app = Some(app.into());
+            let page = page(&query, &json!({}), &rules, &layers, None, &mut || Ok(())).unwrap();
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    item["instance"]["target"]["path"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths("web"), ["a/x.js", "b/x.js"]);
+        assert_eq!(paths("api"), ["c/x.js"]);
+        assert!(paths("missing").is_empty());
     }
 }

@@ -179,13 +179,13 @@ fn connected_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
 }
 
 /// Test-scope guard for only the daemon elected under this disposable HOME.
-struct FixtureDaemon(std::path::PathBuf, std::cell::Cell<bool>);
+pub(crate) struct FixtureDaemon(std::path::PathBuf, std::cell::Cell<bool>);
 impl FixtureDaemon {
-    fn new(home: &std::path::Path) -> Self {
+    pub(crate) fn new(home: &std::path::Path) -> Self {
         Self(home.to_path_buf(), std::cell::Cell::new(false))
     }
 
-    fn stop_attested(&self) -> Result<(), &'static str> {
+    pub(crate) fn stop_attested(&self) -> Result<(), &'static str> {
         // Explicit calls may retire a restarted fixture. Drop must not discover one.
         self.1.set(true);
         let marker = self.0.join("auto-daemon.pid");
@@ -251,7 +251,7 @@ impl Drop for FixtureDaemon {
     }
 }
 
-fn isolated_command(home: &std::path::Path) -> Command {
+pub(crate) fn isolated_command(home: &std::path::Path) -> Command {
     let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     // ProjectDirs uses inherited XDG roots before HOME on Linux.
     cmd.env("HOME", home)
@@ -260,7 +260,7 @@ fn isolated_command(home: &std::path::Path) -> Command {
     cmd
 }
 
-fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Command {
+pub(crate) fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Command {
     let mut c = isolated_command(state);
     // Selected graph oracles must first stop the daemon they would otherwise
     // compete with; record its test-scoped identity for an attested stop.
@@ -1851,7 +1851,7 @@ fn selected_graph(root: &std::path::Path, home: &std::path::Path) -> Value {
 }
 
 // Read the normalized publication, including every native row, from the real daemon's database.
-fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
     fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         for entry in fs::read_dir(dir).ok()?.flatten() {
             let path = entry.path();
@@ -3678,6 +3678,9 @@ paths = ["src/low.rs"]
     assert_eq!(payload["indexGeneration"], basis["indexGeneration"]);
     assert_eq!(payload["indexRevision"], basis["indexRevision"]);
     assert_eq!(payload["counts"]["deviates"], 1);
+    // #784: no app is detected here, so `apps` is empty and `noApp` holds the whole count.
+    assert_eq!(payload["apps"], serde_json::json!([]));
+    assert_eq!(payload["noApp"]["counts"], payload["counts"]);
     assert_eq!(payload["instances"].as_array().unwrap().len(), 1);
     let violation = &payload["instances"][0];
     assert_eq!(violation["rule"], "$layers");
@@ -3869,6 +3872,59 @@ require = [{ calls = "destination" }]
             .iter()
             .any(|evidence| evidence["kind"] == "call" && evidence["callId"].is_string())
     );
+}
+
+#[test]
+fn rules_check_json_per_app_and_cross_app_exit_zero() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    fs::create_dir(root.join(".trellis")).unwrap();
+    fs::write(root.join("a/package.json"), "{\"name\":\"alpha\"}\n").unwrap();
+    fs::write(root.join("b/package.json"), "{\"name\":\"beta\"}\n").unwrap();
+    fs::write(
+        root.join("a/main.js"),
+        "import { g } from '../b/lib.js';\nexport function f() { g(); }\n",
+    )
+    .unwrap();
+    fs::write(root.join("b/lib.js"), "export function g() {}\n").unwrap();
+    fs::write(
+        root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.low]\napp = \"alpha\"\norder = 2\npaths = [\"a/**\"]\n[layers.high]\napp = \"beta\"\norder = 1\npaths = [\"b/**\"]\n",
+    )
+    .unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    crate::child::assert_cli_success(&indexed, "indexed");
+    let checked = isolated_command(&home)
+        .args(["rules", "check", "--format", "json", "--workspace"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    crate::child::assert_cli_success(&checked, "a cross-app pair is not a deviation");
+    let checked: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    let payload = &checked["payload"];
+    assert_eq!(payload["counts"]["deviates"], 0);
+    assert_eq!(payload["counts"]["unknown"], 1);
+    let apps = payload["apps"].as_array().unwrap();
+    let names: Vec<_> = apps
+        .iter()
+        .map(|app| {
+            (
+                app["name"].as_str().unwrap(),
+                app["manifest"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [("alpha", "a/package.json"), ("beta", "b/package.json")]
+    );
+    assert_eq!(apps[0]["counts"]["comparable"], 0);
+    assert_eq!(apps[1]["counts"]["comparable"], 0);
+    assert_eq!(payload["noApp"]["counts"], payload["counts"]);
 }
 
 #[test]

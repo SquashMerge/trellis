@@ -547,7 +547,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]
@@ -1020,7 +1019,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 18
+                  "const": 20
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1938,7 +1937,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]
@@ -3254,7 +3252,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]
@@ -5093,7 +5090,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]
@@ -7002,7 +6998,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]
@@ -8667,7 +8662,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]
@@ -10528,7 +10522,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]
@@ -11787,7 +11780,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]
@@ -14004,7 +13996,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]
@@ -16478,7 +16469,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]
@@ -18561,6 +18551,41 @@
                 "testCounts": {
                   "$ref": "#/$defs/RuleCounts"
                 },
+                "apps": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "name",
+                      "manifest",
+                      "counts"
+                    ],
+                    "properties": {
+                      "name": {
+                        "$ref": "#/$defs/Text"
+                      },
+                      "manifest": {
+                        "$ref": "#/$defs/Path"
+                      },
+                      "counts": {
+                        "$ref": "#/$defs/RuleCounts"
+                      }
+                    }
+                  }
+                },
+                "noApp": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "counts"
+                  ],
+                  "properties": {
+                    "counts": {
+                      "$ref": "#/$defs/RuleCounts"
+                    }
+                  }
+                },
                 "unassignedFileCount": {
                   "$ref": "#/$defs/UInt"
                 },
@@ -18658,6 +18683,8 @@
                 "testOnly",
                 "counts",
                 "testCounts",
+                "apps",
+                "noApp",
                 "unassignedFileCount",
                 "unassigned",
                 "partialFiles",
@@ -19414,7 +19441,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]
@@ -21920,7 +21946,6 @@
                   "enum": [
                     "not_absolute",
                     "not_checkout",
-                    "different_repository",
                     "identity_changed",
                     "unavailable"
                   ]

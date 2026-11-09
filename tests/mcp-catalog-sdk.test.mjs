@@ -62,7 +62,7 @@ test("the twelve-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain", "trellis_show",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 18);
+  assert.equal(describe.toolVersion.const, 20);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
