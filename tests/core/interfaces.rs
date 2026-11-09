@@ -507,3 +507,51 @@ fn a_method_accessor_is_unreadable_not_default_get() {
     assert_eq!(client_only[0]["entry"]["pathTemplate"], "/health");
     assert_eq!(client_only[0]["entry"]["confidence"], "unresolved");
 }
+
+/// A dispatch-table route whose answer serves a static asset is excluded like a direct
+/// registration of that handler (#843 review), whether the arm delegates to a function that
+/// embeds the asset or embeds it inline.
+#[test]
+fn a_dispatch_table_route_that_serves_an_asset_is_excluded() {
+    let server = r#"
+async fn core(m: Method, s: String) { answer(Core::parse(&m, &s).unwrap()).await; }
+async fn asset() -> &'static str { include_str!("asset.txt") }
+async fn data() {}
+async fn answer(route: Core) {
+    match route {
+        Core::Asset => asset().await,
+        Core::Inline => { include_bytes!("inline.bin"); }
+        Core::Data => data().await,
+    }
+}
+impl Core {
+    fn parse(method: &Method, suffix: &str) -> Option<Self> {
+        match (method, suffix) {
+            (&Method::GET, "asset") => Some(Self::Asset),
+            (&Method::GET, "inline") => Some(Self::Inline),
+            (&Method::GET, "data") => Some(Self::Data),
+            _ => None,
+        }
+    }
+}
+fn router() -> Router { Router::new().route("/api/{*rest}", get(core)) }
+fn main() {}
+"#;
+    let published = publish(&[
+        (".trellis/rules.toml", RULES),
+        ("Cargo.toml", "[package]\nname = \"srv\"\n"),
+        ("src/main.rs", server),
+        ("web/package.json", "{\"name\":\"web-app\"}\n"),
+        (
+            "web/app.js",
+            "function go(api) { api('/api/asset'); api('/api/inline'); api('/api/data'); }",
+        ),
+    ]);
+    let rows = details(&published, &[], 100);
+    let routes: Vec<&str> = rows
+        .iter()
+        .filter(|item| item["list"] != "clientOnly")
+        .map(|item| item["entry"]["pathTemplate"].as_str().unwrap())
+        .collect();
+    assert_eq!(routes, ["/api/data"], "{rows:#?}");
+}

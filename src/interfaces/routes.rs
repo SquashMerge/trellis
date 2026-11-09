@@ -605,13 +605,17 @@ impl<'a> Document<'a> {
         let prefix = &template[..template.len() - last.len()];
         let mut routes = Vec::new();
         for entry in table.entries.iter().filter(|entry| entry.method == method) {
+            // A route whose answer serves a static asset is excluded, as a direct one is.
+            let Some(handler) = self.dispatch_handler(table, entry, function, arms, check)? else {
+                continue;
+            };
             let path_template = format!("{prefix}{}", entry.suffix);
             routes.push(Route {
                 method: method.into(),
                 segments: segments(&path_template),
                 path_template,
                 from_table: true,
-                handler: self.dispatch_handler(table, entry, function, arms, check)?,
+                handler,
             });
         }
         Ok(Some(routes))
@@ -640,7 +644,8 @@ impl<'a> Document<'a> {
     }
 
     /// The code that answers a table variant: the first arm outside the table function that
-    /// names it, else the catch-all handler itself.
+    /// names it, else the catch-all handler itself. `None` when that code serves a static
+    /// asset: the arm's own expression, the function it delegates to, or the catch-all.
     fn dispatch_handler(
         &self,
         table: &Table,
@@ -648,7 +653,7 @@ impl<'a> Document<'a> {
         registered: &Declaration,
         arms: &[Arm<'a>],
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<Handler> {
+    ) -> Result<Option<Handler>> {
         let variant = Some(entry.variant.as_str());
         let qualified = format!("{}::{}", table.ty, entry.variant);
         let own = format!("Self::{}", entry.variant);
@@ -665,18 +670,33 @@ impl<'a> Document<'a> {
             check()?;
         }
         let Some(arm) = answering else {
-            return Ok(self.declaration_handler(registered, variant));
+            if let Some(body) = self.function_node(registered)
+                && self.embeds(body, check)?
+            {
+                return Ok(None);
+            }
+            return Ok(Some(self.declaration_handler(registered, variant)));
         };
-        let delegate = arm
-            .child_by_field_name("value")
+        let value = arm.child_by_field_name("value");
+        if let Some(value) = value
+            && self.embeds(value, check)?
+        {
+            return Ok(None);
+        }
+        let delegate = value
             .map(unwrap)
             .filter(|value| value.kind() == "call_expression")
             .and_then(|call| call.child_by_field_name("function"))
             .and_then(|function| self.function(function));
-        Ok(match delegate {
+        if let Some(body) = delegate.and_then(|function| self.function_node(function))
+            && self.embeds(body, check)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(match delegate {
             Some(function) => self.declaration_handler(function, variant),
             None => self.span_handler(HandlerKind::DispatchArm, Self::range(arm), variant),
-        })
+        }))
     }
 }
 
