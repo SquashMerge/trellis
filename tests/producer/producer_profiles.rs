@@ -153,6 +153,7 @@ fn env_canaries_absent_per_profile_row() {
             &world.declared,
             Some(&stub),
             &pin,
+            &profiles::rules(row),
             &run_text,
         );
         // The stub takes the row's place as argv[0], keeping every argument.
@@ -193,7 +194,15 @@ fn restricted_python_child_cannot_resolve_interpreter() {
     // The stub is `node` and the mode file is `main.js`.
     let resolution = world.resolution(&mode);
     let run_text = run.display().to_string();
-    let spec = profiles::command(&row, &resolution, &world.declared, None, &pin, &run_text);
+    let spec = profiles::command(
+        &row,
+        &resolution,
+        &world.declared,
+        None,
+        &pin,
+        &profiles::rules(&row),
+        &run_text,
+    );
     assert_eq!(spec.env["PATH"], format!("{run_text}/bin"));
     write_bin_links(&run, &spec.bin_links).unwrap();
     assert_eq!(spec.argv[0], stub_path().display().to_string());

@@ -5,6 +5,7 @@
 use super::detect::{self, Declared, Environment, Resolution};
 use super::exec::Limits;
 use super::profiles::{self, GenerationTable, Row, Rules, Stub, Target};
+use super::settings::{Overrides, Setting};
 use super::state::{RunRecord, StateDir};
 use super::worktree::{self, RetainedInputs};
 use super::{PRODUCER_UNAVAILABLE, TrustProfile};
@@ -44,6 +45,9 @@ pub struct PlanRequest {
     pub limits: LimitsRequest,
     pub executable: Option<String>,
     pub environment: Environment,
+    /// Settings that replace the ones derived from the project (#717).
+    #[serde(default)]
+    pub settings: Overrides,
 }
 
 /// The `producer_status` payload.
@@ -80,6 +84,7 @@ impl PlanRequest {
             );
         }
         request.environment.validate()?;
+        request.settings.validate(&request.producer)?;
         Ok(request)
     }
 }
@@ -176,6 +181,8 @@ pub struct Parts<'a> {
     pub basis: &'a Basis,
     /// The row's worktree omissions and additions for this basis.
     pub rules: &'a Rules,
+    /// The effective settings read from the project or overridden (#717).
+    pub settings: &'a [Setting],
     pub limits: LimitsRequest,
     /// `<state dir>/runs/{runId}`: the literal placeholder stands for the
     /// run's ID.
@@ -204,6 +211,7 @@ pub fn build(parts: &Parts<'_>) -> Value {
         parts.declared,
         parts.stub,
         parts.pin,
+        parts.rules,
         run,
     );
     let layout = worktree::layout(&parts.basis.inputs, parts.rules);
@@ -234,6 +242,7 @@ pub fn build(parts: &Parts<'_>) -> Value {
             "cwd": format!("{run}/worktree"),
             "env": spec.env,
         },
+        "settings": parts.settings,
         "runtimeExecutables": parts.resolution.runtime_executables(),
         "generation": generation,
         "inputs": {
@@ -329,8 +338,10 @@ pub struct Prepared {
     pub resolution: Resolution,
     pub declared: Declared,
     pub basis: Basis,
-    /// The row's rules, with a root `tsconfig.json` package `extends` resolved (#799).
+    /// The row's rules, with a root `tsconfig.json` package `extends` resolved (#799) and the
+    /// project's settings applied (#717).
     pub rules: Rules,
+    pub settings: Vec<Setting>,
     pub limits: LimitsRequest,
 }
 
@@ -346,9 +357,34 @@ impl Prepared {
             stub,
             basis: &self.basis,
             rules: &self.rules,
+            settings: &self.settings,
             limits: self.limits,
             run_dir,
         })
+    }
+}
+
+/// The producer's settings, read from the retained root inputs (and, for a scip-typescript
+/// package `extends`, the checkout's `node_modules`), with `overrides` replacing them.
+pub(crate) fn settings_for(
+    target: Target,
+    rules: &mut Rules,
+    inputs: &RetainedInputs,
+    workspace: &Path,
+    overrides: &Overrides,
+) -> Result<Vec<Setting>> {
+    use super::ProducerName::{RustAnalyzer, ScipTypescript};
+    match target {
+        Target::Real(ScipTypescript) => Ok(vec![super::tsconfig::apply(
+            rules,
+            inputs,
+            workspace,
+            overrides.typescript_project,
+        )?]),
+        Target::Real(RustAnalyzer) => {
+            super::settings::rust(rules, inputs, overrides.cargo_features.as_deref())
+        }
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -367,9 +403,13 @@ pub fn prepare(store: &Store, request: &PlanRequest, stub: Option<&Stub>) -> Res
     let basis =
         store.with_native_reader(baseline, |reader| read_basis(reader, target.languages()))?;
     let mut rules = profiles::rules(&row);
-    if target == Target::Real(super::ProducerName::ScipTypescript) {
-        super::tsconfig::apply(&mut rules, &basis.inputs, Path::new(store.workspace_root()))?;
-    }
+    let settings = settings_for(
+        target,
+        &mut rules,
+        &basis.inputs,
+        Path::new(store.workspace_root()),
+        &request.settings,
+    )?;
     Ok(Prepared {
         row,
         pin,
@@ -377,6 +417,7 @@ pub fn prepare(store: &Store, request: &PlanRequest, stub: Option<&Stub>) -> Res
         declared,
         basis,
         rules,
+        settings,
         limits: request.limits,
     })
 }

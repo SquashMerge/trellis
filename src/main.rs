@@ -289,6 +289,13 @@ struct ProducerPlanArgs {
     /// Launcher to use instead of resolving one on PATH.
     #[arg(long)]
     executable: Option<PathBuf>,
+    /// rust-analyzer: the Cargo features to enable, comma-separated, instead of the
+    /// `required-features` the plan reads from the workspace manifests. Empty enables none.
+    #[arg(long)]
+    cargo_features: Option<String>,
+    /// scip-typescript: the project config to use instead of the one the plan chooses.
+    #[arg(long, value_parser = ["tsconfig.json", "jsconfig.json", "generated"])]
+    ts_project: Option<String>,
 }
 #[derive(Args)]
 struct ProducerRunArgs {
@@ -987,6 +994,18 @@ fn producer_plan_payload(args: &ProducerPlanArgs) -> Result<serde_json::Value> {
                 .to_owned())
         })
         .transpose()?;
+    let mut settings = serde_json::Map::new();
+    if let Some(features) = &args.cargo_features {
+        let features: Vec<&str> = features
+            .split(',')
+            .map(str::trim)
+            .filter(|feature| !feature.is_empty())
+            .collect();
+        settings.insert("cargoFeatures".into(), serde_json::json!(features));
+    }
+    if let Some(project) = &args.ts_project {
+        settings.insert("typescriptProject".into(), serde_json::json!(project));
+    }
     Ok(serde_json::json!({
         "version": 1,
         "producer": args.producer,
@@ -994,6 +1013,7 @@ fn producer_plan_payload(args: &ProducerPlanArgs) -> Result<serde_json::Value> {
         "limits": {"timeoutSecs": args.timeout_secs, "memoryMiB": args.memory_mib},
         "executable": executable,
         "environment": trellis::producer::detect::Environment::from_process()?,
+        "settings": settings,
     }))
 }
 

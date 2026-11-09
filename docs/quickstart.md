@@ -273,28 +273,21 @@ done
 
 You always need a new plan. An old hash fails with `plan_changed`. If you edit a file during a run, it fails with `stale_basis`, and you run it again.
 
-### Feature-gated Rust code
+### Project settings
 
-`trellis producer run` analyzes Rust with default Cargo features only. Code behind a feature, such as a `test-support` feature, isn't compiled, so it gets no semantic evidence. Such files show up as `failed` in the coverage counts.
+`plan` reads each producer's settings from your project's own files, so you don't write producer config. Its `settings` list shows each setting, where it came from, and the hashes of those files. The settings are part of `planSha256`.
 
-To turn features on, run `rust-analyzer` yourself and have Trellis pick up the result. Keep the config and the output outside your checkout:
+- **Rust:** the Cargo features that your workspace's binaries, tests, benches and examples list in `required-features`, such as a `test-support` feature, so the code behind them is analyzed. Nothing else is turned on, never all features. The plan also lists the workspace members it read.
+- **TypeScript and JavaScript:** the root `tsconfig.json`, else the root `jsconfig.json`, else a config Trellis generates.
+
+To use other values, pass them to both `plan` and `run`. They replace what the plan read:
 
 ```sh
-mkdir -p ~/trellis-scip
-echo '{"cargo":{"features":["test-support"]}}' > ~/trellis-scip/rust-analyzer.json
-
-cd /path/to/your/repo
-CARGO_TARGET_DIR=~/trellis-scip/target \
-  rustup run 1.98.1 rust-analyzer scip . \
-  --config-path ~/trellis-scip/rust-analyzer.json \
-  --output ~/trellis-scip/rust.scip
-
-trellis producer pickup --producer rust-analyzer --artifact ~/trellis-scip/rust.scip | jq '{state, errorCode}'
+trellis producer plan --producer rust-analyzer --trust trusted --cargo-features test-support,extra
+trellis producer plan --producer scip-typescript --ts-project generated
 ```
 
-`pickup` imports the file now and watches it from then on. To refresh after edits, re-run only the `rust-analyzer` command, and Trellis imports the new file a few seconds later. This runs your build scripts and proc macros, like `--trust trusted`.
-
-The file must come from `rust-analyzer` 1.98.1: another version fails with `invalid_artifact: tool binding`. To stop watching, run `trellis producer pickup --producer rust-analyzer --clear`.
+`--cargo-features ''` turns on no extra features. `--ts-project` takes `tsconfig.json`, `jsconfig.json` or `generated`. If your project config can't be parsed, or contradicts itself, `plan` fails with `producer_config_unresolved` and names the file. It never falls back to defaults.
 
 ### Upgrading Trellis
 
@@ -382,7 +375,7 @@ trellis status | jq '.semanticLanguages[] | {language, semanticState, semanticPr
 
 - **MCP answers** have `partial: true` when the answer was cut off, or when any searched file has incomplete evidence. `warnings` and the per-language coverage counts say which.
 - **`trellis status`** counts each language's files as complete, partial or failed under `coverage`. `coverage.summary` gives the common reasons, failed first, such as `partial: 1 · native macro/attribute gaps only` or `failed: 2 · not in producer output; partial: 1 · native macro/attribute gaps only`.
-- **`failed` under `coverage`** means the imported evidence doesn't cover a file. Usually the file wasn't compiled, as with [feature-gated Rust](#feature-gated-rust-code), or it changed after the import.
+- **`failed` under `coverage`** means the imported evidence doesn't cover a file. Usually the file wasn't compiled, as with Rust behind a feature that no target requires (see [Project settings](#project-settings)), or it changed after the import.
 
 The most common cause is Rust macros. A macro Trellis can't see into is shown as a boundary, and the file counts as partial. See [known limitations](known-limitations.md#rust-macros).
 
