@@ -482,6 +482,8 @@ pub struct CheckoutRegistry {
     test_next_dependency_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     #[cfg(feature = "test-support")]
     test_native_watcher: bool,
+    #[cfg(feature = "test-support")]
+    test_architecture_on_demand: bool,
 }
 
 impl Default for CheckoutRegistry {
@@ -516,6 +518,8 @@ impl CheckoutRegistry {
             test_next_dependency_hook: None,
             #[cfg(feature = "test-support")]
             test_native_watcher: false,
+            #[cfg(feature = "test-support")]
+            test_architecture_on_demand: false,
         }
     }
 
@@ -542,6 +546,15 @@ impl CheckoutRegistry {
     #[doc(hidden)]
     pub fn hold_next_startup_backoff_for_tests(&mut self) {
         self.test_hold_next_startup_backoff = true;
+    }
+
+    /// Every later activation's Architecture owner builds only once a read asks, as before
+    /// #798, so a metrics test can time a read that computes its own rows. Installed before its
+    /// worker starts.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn architecture_on_demand_for_tests(&mut self) {
+        self.test_architecture_on_demand = true;
     }
 
     /// Observe or pause the next activation's dependency catalog builds,
@@ -678,10 +691,13 @@ impl CheckoutRegistry {
             pickup: crate::producer::pickup::PickupOwner::default(),
             producer: crate::producer::run::ProducerOwner::default(),
             search: self.search.clone(),
+            search_coverage: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "test-support")]
             search_hash_scans: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "test-support")]
+            search_coverage_scans: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-support")]
             mcp_hint_clock_origin: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
@@ -721,6 +737,10 @@ impl CheckoutRegistry {
         #[cfg(feature = "test-support")]
         if self.test_native_watcher {
             scheduler.enable_native_watcher_for_tests();
+        }
+        #[cfg(feature = "test-support")]
+        if self.test_architecture_on_demand {
+            scheduler.set_architecture_on_demand_for_tests();
         }
         if let Some(search_fill) = &self.search_fill {
             scheduler.set_search_fill(search_fill.register(&scheduler));
@@ -1828,6 +1848,9 @@ pub struct CheckoutRuntime {
     /// Optional pending-head hash scans that MCP search started (#777).
     #[cfg(feature = "test-support")]
     search_hash_scans: std::sync::atomic::AtomicUsize,
+    /// Pending-head cache scans that describe/status coverage started (#806).
+    #[cfg(feature = "test-support")]
+    search_coverage_scans: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-support")]
     mcp_call_clock_origin: std::sync::Mutex<Option<Instant>>,
     /// Optional hint clock can be frozen separately from the real mandatory deadline.
@@ -1848,6 +1871,8 @@ pub struct CheckoutRuntime {
     evidence_sampled_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
     search: Option<Arc<super::search::SearchService>>,
+    /// The last head coverage describe/status measured without a matrix (#806).
+    search_coverage: std::sync::Mutex<Option<CoverageMemo>>,
     /// Released because its root was lost: a stale handle answers root_changed.
     root_lost: std::sync::atomic::AtomicBool,
     initial_indexing: bool,
@@ -1856,6 +1881,19 @@ pub struct CheckoutRuntime {
     pickup: crate::producer::pickup::PickupOwner,
     /// The only owner of this checkout's producer runs.
     producer: crate::producer::run::ProducerOwner,
+}
+
+/// Head coverage measured for one admitted pin while its matrix was not
+/// resident (#806), so describe and CLI status do not rescan the head on
+/// every call. A pin's declaration count is immutable. The embedded count is
+/// keyed by the cache epoch and vector-write generation sampled before its
+/// scan, so any later cache write or replacement makes the next call measure
+/// again.
+struct CoverageMemo {
+    pin: crate::model::IndexPin,
+    declarations: u64,
+    /// `(epoch, writes, embedded)`.
+    embedded: Option<(u64, u64, u64)>,
 }
 
 /// Startup reconciliation is due or running (not waiting out a backoff).
@@ -1959,6 +1997,8 @@ impl CheckoutRuntime {
     /// causes: model diagnostics, then the matrix the owner published for this
     /// pin, then owner work pending (counted from the cache), else
     /// `matrix_not_resident`. `None` without a search service or matrix owner.
+    /// Without a matrix for `pin`, the head is counted once per pin and the
+    /// cache once per cache write (#806), not on every call.
     pub(crate) fn search_head_coverage(
         &self,
         response: &crate::store::EvidenceResponse,
@@ -1974,7 +2014,7 @@ impl CheckoutRuntime {
         if let Some(reason) = search.status_handle().unavailable_reason() {
             return Ok(Some(SearchHeadCoverage {
                 state: SearchIndexState::Unavailable(reason),
-                declarations: response.mcp_search_head_count(pin, &mut check)? as u64,
+                declarations: self.search_head_declarations(response, pin, check)?,
                 embedded: Some(0),
                 cache_diagnostic: None,
             }));
@@ -2003,8 +2043,22 @@ impl CheckoutRuntime {
                 cache_diagnostic: None,
             }));
         }
-        let declarations = response.mcp_search_head_count(pin, &mut check)? as u64;
+        let declarations = self.search_head_declarations(response, pin, check)?;
         if running || head.pending_for(pin, declarations) {
+            // Sample the generation before the scan: a write that lands
+            // during it leaves this memo keyed to a superseded generation.
+            let generation = (search.cache_epoch(), search.vector_writes());
+            if let Some(embedded) = self.memo_embedded(pin, generation) {
+                return Ok(Some(SearchHeadCoverage {
+                    state: SearchIndexState::Building,
+                    declarations,
+                    embedded: Some(embedded),
+                    cache_diagnostic: None,
+                }));
+            }
+            #[cfg(feature = "test-support")]
+            self.search_coverage_scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let hashes = response.mcp_search_head_card_hashes(pin, &mut check)?;
             // Owner ruling 2026-11-07 (#777): the optional cache never fails
             // describe/status. A cache fault or cache contention leaves the
@@ -2012,7 +2066,10 @@ impl CheckoutRuntime {
             // its deadline retrying a cache-only read. The request deadline
             // and index reads stay typed errors.
             let (embedded, cache_diagnostic) = match search.cached_embedded(&hashes, None, check) {
-                Ok(embedded) => (Some(embedded), None),
+                Ok(embedded) => {
+                    self.remember_embedded(pin, generation, embedded);
+                    (Some(embedded), None)
+                }
                 Err(error) if error.is::<crate::search_vectors::StoreUnavailable>() => {
                     (None, Some(SearchCacheDiagnostic::VectorCacheUnavailable))
                 }
@@ -2034,6 +2091,51 @@ impl CheckoutRuntime {
             embedded: Some(0),
             cache_diagnostic: None,
         }))
+    }
+
+    /// The head's declaration count at `pin`, read once per pin (#806).
+    fn search_head_declarations(
+        &self,
+        response: &crate::store::EvidenceResponse,
+        pin: crate::model::IndexPin,
+        mut check: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<u64> {
+        if let Some(memo) = self.search_coverage.lock().unwrap().as_ref()
+            && memo.pin == pin
+        {
+            return Ok(memo.declarations);
+        }
+        let declarations = response.mcp_search_head_count(pin, &mut check)? as u64;
+        let mut memo = self.search_coverage.lock().unwrap();
+        if memo.as_ref().is_none_or(|memo| memo.pin != pin) {
+            *memo = Some(CoverageMemo {
+                pin,
+                declarations,
+                embedded: None,
+            });
+        }
+        Ok(declarations)
+    }
+
+    fn memo_embedded(&self, pin: crate::model::IndexPin, generation: (u64, u64)) -> Option<u64> {
+        let memo = self.search_coverage.lock().unwrap();
+        let memo = memo.as_ref().filter(|memo| memo.pin == pin)?;
+        memo.embedded
+            .filter(|(epoch, writes, _)| (*epoch, *writes) == generation)
+            .map(|(_, _, embedded)| embedded)
+    }
+
+    fn remember_embedded(
+        &self,
+        pin: crate::model::IndexPin,
+        generation: (u64, u64),
+        embedded: u64,
+    ) {
+        if let Some(memo) = self.search_coverage.lock().unwrap().as_mut()
+            && memo.pin == pin
+        {
+            memo.embedded = Some((generation.0, generation.1, embedded));
+        }
     }
 
     /// Invoked through a weak edge AFTER a queue tick releases all stream and
@@ -2607,6 +2709,14 @@ impl CheckoutRuntime {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Pending-head cache scans describe and CLI status started (#806).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn search_coverage_scans_for_tests(&self) -> usize {
+        self.search_coverage_scans
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Optional pending-head hash scans MCP search started on this checkout.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
@@ -2954,13 +3064,7 @@ impl CheckoutRuntime {
             } else {
                 ArchitectureRules::Unused
             };
-            // A scoped read can compute its answer, so it gives the owner only a page's wait.
-            let wait = match self.resources() {
-                Ok(resources) if parsed.scoped() => {
-                    wait.min(resources.scheduler.architecture_browser_wait())
-                }
-                _ => wait,
-            };
+            // A scoped read waits like any other: it does not repeat the owner's build (#798).
             self.await_architecture(parsed.pin(), rules, false, wait, check);
         }
     }
@@ -3028,15 +3132,10 @@ impl CheckoutRuntime {
                 )
             });
         match answer {
-            // The revision is over a whole-revision budget or still building, and a narrow
-            // read need not be: it computes its own scope within its deadline.
-            Err(error)
-                if parsed.scoped()
-                    && (error.to_string().starts_with("bounded_work")
-                        || error
-                            .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
-                            .is_some()) =>
-            {
+            // The revision is over a whole-revision budget, and a narrow read need not be: it
+            // computes its own scope within its deadline. A read that finds the owner still
+            // building answers `building` instead of repeating the build's work (#798).
+            Err(error) if parsed.scoped() && error.to_string().starts_with("bounded_work") => {
                 response.architecture_response_scoped(
                     kind,
                     arguments,
@@ -3411,6 +3510,8 @@ mod selection_tests {
         let runtime = CheckoutRuntime {
             resources: std::sync::Mutex::new(Some(resources.clone())),
             search: None,
+            search_coverage: std::sync::Mutex::new(None),
+            search_coverage_scans: std::sync::atomic::AtomicUsize::new(0),
             root_lost: std::sync::atomic::AtomicBool::new(false),
             initial_indexing: true,
             rules_edit_owner: std::sync::Mutex::new(()),

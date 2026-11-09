@@ -6,7 +6,7 @@ import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawnSync} from 'node:child_process';
 import {createRequire} from 'node:module';
-import {exercise, parseArgs} from '../tools/mcp-smoke.mjs';
+import {dependencies, exercise, parseArgs} from '../tools/mcp-smoke.mjs';
 
 const require = createRequire(new URL('./mcp/package.json', import.meta.url));
 const tools = JSON.parse(readFileSync(new URL('./fixtures/mcp/catalog.json', import.meta.url)));
@@ -317,4 +317,132 @@ test('the proposal prompt fails on a protocol error, an oversized frame or a mis
       [[promptName, 'prompt', reason, code]], mode);
     assert.ok(!JSON.stringify(report).includes('SECRET'));
   }
+});
+
+// #798: a typed `building` answer is read again after `retryAfterMs`, then passes.
+function building(name) {
+  return {isError: true, content: [{type: 'text', text: 'SECRET'}], structuredContent: {
+    schemaVersion: 1, requestId: 1, workspace: '/fixture', catchingUp: false,
+    error: {code: 'building', message: 'SECRET', retryable: true, currentBasis: basis, currentContentHash: null,
+      progress: {phase: 'measuring', completed: 3, total: 9}, retryAfterMs: 7},
+  }};
+}
+const architectureTools = ['trellis_references', 'trellis_rules_check', 'trellis_rules_explain'];
+// Each architecture tool's checked-in schema plus the live success branch, so a building
+// answer is validated against the real `BuildingFailure` branch and the mock success still
+// passes.
+const buildingTools = liveTools.map(tool => {
+  if (!architectureTools.includes(tool.name)) return tool;
+  const real = tools.find(entry => entry.name === tool.name).outputSchema;
+  const {$schema, ...live} = tool.outputSchema;
+  return {...tool, outputSchema: {...real, oneOf: [...real.oneOf, live]}};
+});
+
+test('architecture tools and the prompt that answer building are retried until they answer', async () => {
+  const left = new Map([...architectureTools, promptName].map(name => [name, 2]));
+  const take = name => left.get(name) > 0 && left.set(name, left.get(name) - 1);
+  const client = clientFor((name, result) => take(name) ? building(name) : result, result => {
+    if (take(promptName)) throw Object.assign(Error('SECRET'), {code: -32603, data: building(promptName).structuredContent.error});
+    return result;
+  });
+  const slept = [];
+  const report = await exercise(client, buildingTools, '/fixture', 'main', {...dependencies(), sleep: async ms => { slept.push(ms); }});
+  assert.equal(report.ok, true, JSON.stringify(report));
+  for (const name of [...architectureTools, promptName]) {
+    assert.equal(report.results.find(row => row.tool === name).buildingRetries, 2, name);
+    assert.equal(client.calls.filter(call => call.name === name).length, 3, name);
+  }
+  assert.deepEqual(slept, Array(8).fill(7));
+  assert.ok(!JSON.stringify(report).includes('SECRET'));
+});
+
+test('a malformed building answer fails the call even when a retry would pass', async () => {
+  for (const damage of [
+    error => { delete error.progress; },
+    error => { error.currentBasis = null; },
+    error => { error.currentContentHash = 'a'.repeat(64); },
+  ]) {
+    let first = true;
+    const client = clientFor((name, result) => {
+      if (name !== 'trellis_rules_check' || !first) return result;
+      first = false;
+      const reply = building(name);
+      damage(reply.structuredContent.error);
+      return reply;
+    });
+    const report = await exercise(client, buildingTools, '/fixture', 'main', {...dependencies(), sleep: async () => {}});
+    const row = report.results.find(item => item.tool === 'trellis_rules_check');
+    assert.equal(row.reason, 'output_schema_mismatch', JSON.stringify(row));
+    assert.equal(client.calls.filter(call => call.name === 'trellis_rules_check').length, 1);
+  }
+});
+
+// A fake clock the smoke reads, a client that advances it per request, and a watchdog: after
+// five requests the mock answers normally, so a smoke that ignores the budget still ends at
+// once and fails on the request count instead of hanging.
+function budgetHarness({requestMs, sleep}) {
+  const clock = {now: 0};
+  const starts = {tool: [], prompt: []};
+  const timeouts = [];
+  const watchdog = 5;
+  const client = clientFor(
+    (name, result) => name === 'trellis_rules_check' && starts.tool.length <= watchdog ? building(name) : result,
+    result => {
+      if (starts.prompt.length <= watchdog) {
+        throw Object.assign(Error('SECRET'), {code: -32603, data: building(promptName).structuredContent.error});
+      }
+      return result;
+    });
+  const request = client.request;
+  client.request = async (req, schema, options) => {
+    const path = req.method === 'prompts/get' ? 'prompt' : req.params.name === 'trellis_rules_check' ? 'tool' : null;
+    if (path) {
+      starts[path].push(clock.now);
+      if (path === 'tool' && options) timeouts.push(options.timeout);
+      clock.now += requestMs;
+    }
+    return request(req, schema, options);
+  };
+  const deps = {...dependencies(), buildingBudgetMs: 10_000, now: () => clock.now,
+    sleep: async ms => { clock.now += sleep(ms); }};
+  return {client, starts, timeouts, deps};
+}
+
+test('no building retry starts once its wait would end past the budget', async () => {
+  const {client, starts, timeouts, deps} = budgetHarness({requestMs: 4_000, sleep: ms => ms});
+  const report = await exercise(client, buildingTools, '/fixture', 'main', deps);
+  const row = report.results.find(item => item.tool === 'trellis_rules_check');
+  assert.deepEqual([row.reason, row.code], ['tool_error', 'building']);
+  // Requests start at 0, 4007 and 8014; a fourth would start at 12021, past 10000.
+  assert.deepEqual(starts.tool, [0, 4_007, 8_014]);
+  assert.deepEqual(timeouts, [5_993, 1_986]);
+  assert.equal(row.buildingRetries, 2);
+  const prompt = report.results.find(item => item.tool === promptName);
+  assert.deepEqual([prompt.reason, prompt.code], ['prompt_error', 'building']);
+  assert.deepEqual(starts.prompt, [0, 4_007, 8_014].map(at => at + starts.prompt[0]));
+});
+
+test('a retry wait that wakes past the budget sends nothing more', async () => {
+  // The wait fits when it starts (4000 + 7 < 10000), but the timer wakes at 10007.
+  const {client, starts, deps} = budgetHarness({requestMs: 4_000, sleep: ms => ms + 6_000});
+  const report = await exercise(client, buildingTools, '/fixture', 'main', deps);
+  const row = report.results.find(item => item.tool === 'trellis_rules_check');
+  assert.deepEqual([row.reason, row.code], ['tool_error', 'building']);
+  assert.equal(starts.tool.length, 1, `tool requests started at ${starts.tool}`);
+  assert.equal(row.buildingRetries, undefined);
+  const prompt = report.results.find(item => item.tool === promptName);
+  assert.deepEqual([prompt.reason, prompt.code], ['prompt_error', 'building']);
+  assert.equal(starts.prompt.length, 1, `prompt requests started at ${starts.prompt}`);
+  assert.equal(prompt.buildingRetries, undefined);
+  assert.ok(!JSON.stringify(report).includes('SECRET'));
+});
+
+test('a building answer that outlasts the retry budget stays a typed failure', async () => {
+  const client = clientFor((name, result) => name === 'trellis_rules_check' ? building(name) : result);
+  const report = await exercise(client, buildingTools, '/fixture', 'main', {...dependencies(), sleep: async () => {}, buildingBudgetMs: 0});
+  assert.equal(report.ok, false);
+  const failed = report.results.filter(row => row.status === 'fail');
+  assert.deepEqual(failed.map(row => [row.tool, row.reason, row.code]),
+    [['trellis_rules_check', 'tool_error', 'building'], ['trellis_rules_explain', 'missing_rule_instance', undefined]]);
+  assert.equal(client.calls.filter(call => call.name === 'trellis_rules_check').length, 1);
 });

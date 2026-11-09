@@ -17,10 +17,18 @@ const failureCodes = new Set(['invalid_request', 'range_too_large', 'unsupported
   'revision_conflict', 'index_not_ready', 'not_found', 'too_many_requests', 'deadline_exceeded',
   'rebuild_in_progress', 'root_changed', 'store_unavailable', 'workspace_selection_failed',
   'checkout_capacity', 'daemon_unavailable', 'outcome_unknown', 'invalid_rules',
-  'rules_not_found', 'bounded_work', 'response_too_large', 'storage_busy']);
+  'rules_not_found', 'bounded_work', 'response_too_large', 'storage_busy', 'building']);
 const modelReasons = new Set(['model_not_configured', 'model_load_failed', 'vector_budget_exceeded']);
+// #798: an architecture tool answers the typed `building` while the daemon computes the
+// revision. The smoke reads again after `retryAfterMs`, for at most this long per call.
+const buildingBudgetMs = 60_000;
+const defaultSleep = ms => new Promise(done => setTimeout(done, ms));
+function retryAfter(error) {
+  const ms = error?.retryAfterMs;
+  return Number.isSafeInteger(ms) && ms >= 0 ? Math.min(ms, 5_000) : 250;
+}
 
-function dependencies() {
+export function dependencies() {
   return {
     Client: require('@modelcontextprotocol/sdk/client/index.js').Client,
     StdioClientTransport: require('@modelcontextprotocol/sdk/client/stdio.js').StdioClientTransport,
@@ -34,6 +42,17 @@ function dependencies() {
 // server messages, validator errors, exceptions, or the child's stderr.
 export async function exercise(client, tools, workspace, query, deps = dependencies()) {
   const ajv = new deps.Ajv2020({strict: false, allErrors: true});
+  const sleep = deps.sleep ?? defaultSleep;
+  const buildingBudget = deps.buildingBudgetMs ?? buildingBudgetMs;
+  const now = deps.now ?? (() => performance.now());
+  // A retry starts only if its wait ends inside the budget, and its request is bounded by
+  // what is left, so a call that answers building never runs past the budget.
+  function retryFits(started, delay) {
+    return now() - started + delay < buildingBudget;
+  }
+  // A timer can wake later than asked: after the wait, a retry starts only with budget left.
+  const exhausted = started => now() - started >= buildingBudget;
+  const remaining = started => ({timeout: Math.max(1, Math.floor(buildingBudget - (now() - started)))});
   const results = [];
   let calls = 0;
   const called = new Set();
@@ -67,7 +86,7 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
     const schema = catalog.get(name);
     if (!schema) return null;
     const input = {schemaVersion: 1, workspace, ...args};
-    const started = performance.now();
+    const started = now();
     const row = {tool: name, status: 'fail', reason: 'transport_error', elapsedMs: 0};
     results.push(row);
     try {
@@ -78,8 +97,21 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
       // request() leaves output validation here, so even isError results are checked.
       calls += 1;
       called.add(name);
-      const result = await client.request({method: 'tools/call', params: {name, arguments: input}},
-        deps.CallToolResultSchema);
+      let result;
+      for (;;) {
+        result = await client.request({method: 'tools/call', params: {name, arguments: input}},
+          deps.CallToolResultSchema, ...(row.buildingRetries ? [remaining(started)] : []));
+        // #798: a building answer is checked like any other before the retry decision, so a
+        // malformed or oversized one fails even when a later attempt would pass.
+        if (!schema.output(result.structuredContent)) break;
+        if (Buffer.byteLength(JSON.stringify(result)) > 65_536) break;
+        const error = result.structuredContent?.error;
+        if (error?.code !== 'building' || !retryFits(started, retryAfter(error))) break;
+        await sleep(retryAfter(error));
+        // The last building answer stands as the typed failure; nothing more is sent.
+        if (exhausted(started)) break;
+        row.buildingRetries = (row.buildingRetries ?? 0) + 1;
+      }
       row.resultBytes = Buffer.byteLength(JSON.stringify(result));
       const value = result.structuredContent;
       if (!schema.output(value)) {
@@ -122,17 +154,29 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
       if (error?.code === -32001) row.reason = 'client_timeout';
       return null;
     } finally {
-      row.elapsedMs = Math.round((performance.now() - started) * 100) / 100;
+      row.elapsedMs = Math.round((now() - started) * 100) / 100;
     }
   }
   // #770: the no-argument proposal prompt must fit the frame on a real checkout.
   async function prompt() {
-    const started = performance.now();
+    const started = now();
     const row = {tool: promptName, kind: 'prompt', status: 'fail', reason: 'transport_error', elapsedMs: 0};
     results.push(row);
     try {
-      const result = await client.request({method: 'prompts/get', params: {name: promptName, arguments: {}}},
-        deps.GetPromptResultSchema);
+      let result;
+      for (;;) {
+        try {
+          result = await client.request({method: 'prompts/get', params: {name: promptName, arguments: {}}},
+            deps.GetPromptResultSchema, ...(row.buildingRetries ? [remaining(started)] : []));
+          break;
+        } catch (error) {
+          if (error?.code !== -32603 || error.data?.code !== 'building'
+            || !retryFits(started, retryAfter(error.data))) throw error;
+          await sleep(retryAfter(error.data));
+          if (exhausted(started)) throw error;
+          row.buildingRetries = (row.buildingRetries ?? 0) + 1;
+        }
+      }
       row.resultBytes = Buffer.byteLength(JSON.stringify(result));
       if (typeof result.messages?.[0]?.content?.text !== 'string') {
         row.reason = 'prompt_shape_invalid';
@@ -150,7 +194,7 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
         row.code = failureCodes.has(code) ? code : 'other';
       }
     } finally {
-      row.elapsedMs = Math.round((performance.now() - started) * 100) / 100;
+      row.elapsedMs = Math.round((now() - started) * 100) / 100;
     }
   }
   const describe = await call('trellis_workspace_describe', {});

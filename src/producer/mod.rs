@@ -15,6 +15,7 @@ pub mod process_info;
 pub mod profiles;
 pub(crate) mod retention;
 pub mod run;
+pub mod settings;
 pub mod state;
 pub mod tsconfig;
 pub mod worktree;
@@ -37,6 +38,8 @@ mod process_info_tests;
 mod profiles_tests;
 #[cfg(test)]
 mod run_tests;
+#[cfg(test)]
+mod settings_tests;
 #[cfg(test)]
 mod state_tests;
 #[cfg(test)]

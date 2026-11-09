@@ -1097,6 +1097,10 @@ mod tests {
         let (tmp, store, state, options, cancel, _native) = two_pending_producers_fixture();
         let session = state.runtime.lock().unwrap().session().unwrap().clone();
         state.worker_step().unwrap();
+        // That step's publication starts the head's eager Architecture build (#798), whose read
+        // holds an admission lease. Retirement correctly declines while it is held, so the
+        // tests below start once the owner is idle.
+        state.await_architecture_idle_for_tests();
         state.next_wake();
         state.inbox.wait(Some(Instant::now()));
         assert_eq!(state.maintenance_priority_reason(&session, &options), None);
@@ -1190,6 +1194,7 @@ mod tests {
     #[test]
     fn retirement_closes_a_held_semantic_read_connection() {
         let (_tmp, store, state, _cancel, semantic) = held_read_fixture();
+        assert_eq!(store.held_semantic_reads_for_tests(), 1);
         assert_eq!(
             state.request_retire(|_| true),
             super::super::RetireOutcome::Requested

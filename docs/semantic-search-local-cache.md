@@ -210,6 +210,9 @@ never delays daemon socket acceptance and stops at matrix-cap admission failure 
 evicting matrices for another startup checkout. Search result state remains unavailable while
 the model is not ready, unless the owner is building the head. CLI status and describe report
 only owner-published coverage and measured cache counts; GC does not report search coverage.
+A measured count is taken once and reused until the admitted head, the cache epoch or a
+vector-cache write changes it (#806), so repeated calls while the owner builds a large head
+do not rescan it.
 
 Under the [#358 owner ruling](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6441405819),
 one immutable published matrix snapshot supplies vector ranks and embedded counts for the

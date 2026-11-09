@@ -286,6 +286,63 @@ fn tsconfig_package_extends_is_supplied_replaced_or_refused() {
     assert!(!run.contains("producer_failed"), "{run}");
 }
 
+/// #717: the plan reads the project's own settings (a root `jsconfig.json` here), lists them
+/// with their source, and a `producer plan`/`run` flag replaces them. The run must repeat the
+/// override: a run without it is a different plan.
+#[test]
+fn project_settings_and_their_override_reach_plan_and_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ts = fake_npm_install(
+        &tmp.path().join("ts"),
+        "scip-typescript",
+        &pinned_version("scip-typescript"),
+    );
+    let checkout = start_checkout(
+        |root| {
+            sources(root);
+            fs::write(root.join("jsconfig.json"), "{\"compilerOptions\":{}}\n").unwrap();
+        },
+        &[],
+    );
+    let base = ["producer", "plan", "--producer", "scip-typescript"];
+    let derived = json_out(&with_path(&checkout, &[&ts], &base));
+    let setting = &derived["settings"][0];
+    assert_eq!(setting["name"], "typescript.project");
+    assert_eq!(setting["value"], "jsconfig.json");
+    assert_eq!(setting["source"], "project");
+    assert_eq!(setting["from"][0]["path"], "jsconfig.json");
+
+    let overridden = json_out(&with_path(
+        &checkout,
+        &[&ts],
+        &[&base[..], &["--ts-project", "generated"]].concat(),
+    ));
+    assert_eq!(overridden["settings"][0]["value"], "generated");
+    assert_eq!(overridden["settings"][0]["source"], "override");
+    assert_ne!(overridden["planSha256"], derived["planSha256"]);
+
+    let run = stderr(&with_path(
+        &checkout,
+        &[&ts],
+        &[
+            "producer",
+            "run",
+            "--producer",
+            "scip-typescript",
+            "--plan-sha256",
+            overridden["planSha256"].as_str().unwrap(),
+        ],
+    ));
+    assert!(run.contains("plan_changed"), "{run}");
+
+    let wrong = stderr(&with_path(
+        &checkout,
+        &[&ts],
+        &[&base[..], &["--cargo-features", "x"]].concat(),
+    ));
+    assert!(wrong.contains("invalid_request"), "{wrong}");
+}
+
 #[test]
 fn plan_and_status_execute_nothing() {
     let tmp = tempfile::tempdir().unwrap();
@@ -482,6 +539,7 @@ fn trusted_java_and_rust_plans_declare_downloads_and_caches() {
             stub: None,
             basis: &basis,
             rules: &trellis::producer::profiles::rules(&row),
+            settings: &[],
             limits: LimitsRequest {
                 timeout_secs: 60,
                 memory_mib: 1024,

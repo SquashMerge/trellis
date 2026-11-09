@@ -19,7 +19,7 @@ The scip-java and rust-analyzer rows are confirmed by the strict runs of the sli
 
 ### rust-analyzer trusted profile
 
-rust-analyzer runs only in the trusted profile. The restricted profile refuses it with `profile_unsupported`, because `rust-analyzer scip` cannot disable build scripts or proc macros. The trusted run therefore executes the fixture's build scripts and proc macros, and cargo may download crates into `CARGO_HOME`. The command is `rustup run 1.98.1 rust-analyzer scip . --output <out>` with `RUSTUP_HOME`, `CARGO_HOME`, `RUSTUP_AUTO_INSTALL=0` and `CARGO_TARGET_DIR=<run directory>/target`, so build output goes to the run directory and the workspace tree digest is unchanged. The fixture (`tests/fixtures/producers/rust/`) has no dependencies, so the strict run needs no network.
+rust-analyzer runs only in the trusted profile. The restricted profile refuses it with `profile_unsupported`, because `rust-analyzer scip` cannot disable build scripts or proc macros. The trusted run therefore executes the fixture's build scripts and proc macros, and cargo may download crates into `CARGO_HOME`. The command is `rustup run 1.98.1 rust-analyzer scip . --output <out>`, plus `--config-path <run>/producer-config/rust-analyzer.json` when the plan enables Cargo features (see [Project settings](#project-settings)), with `RUSTUP_HOME`, `CARGO_HOME`, `RUSTUP_AUTO_INSTALL=0` and `CARGO_TARGET_DIR=<run directory>/target`, so build output goes to the run directory and the workspace tree digest is unchanged. The fixture (`tests/fixtures/producers/rust/`) has no dependencies, so the strict run needs no network.
 
 ### scip-typescript project config
 
@@ -48,7 +48,25 @@ The worktree holds no `node_modules`, so TypeScript cannot resolve a root `tscon
    - a cycle, a file over the cap, or a resolution over either bound;
    - `exports` subpath patterns or versioned `types@` conditions, which are not supported.
 
-A relative `extends` in the root config is left to TypeScript, as is a root config Trellis cannot parse. scip-typescript reads only `tsconfig.json`, so a root `jsconfig.json` is not used, and the generated tsconfig is written in its place.
+A relative `extends` in the root config is left to TypeScript. A root config Trellis cannot parse is refused with `producer_config_unresolved` (#717). The project config is chosen as [Project settings](#project-settings) describes; the same `extends` handling applies to a root `jsconfig.json`.
+
+### Project settings
+
+A plan reads each producer's settings from the project's own files (#717), read-only and bounded, and executes nothing to find them: no build, build script, package manager or network fetch. The plan's `settings` list gives each effective setting as `{name, value, source, from, detail}`. `source` is `project` (read from the files in `from`, with their retained hashes), `override` (given on the command) or `default` (nothing sets it). The settings and the files they came from are part of `planSha256`, so `run` refuses with `plan_changed` unless it derives the same settings.
+
+An explicit override on `producer plan` and `producer run` replaces the derived value; it is never merged with it. Unparseable or contradictory project config refuses `plan` and `run` with `producer_config_unresolved`, naming the file and the reason; it never falls back to defaults.
+
+**rust-analyzer.**
+
+- `cargo.workspaceMembers`: the root package, and each retained nested `Cargo.toml` that the root `[workspace] members` globs match and `exclude` does not. A manifest outside the members, such as a test fixture, is not read.
+- `cargo.features`: the union of the `required-features` of every member's `[[bin]]`, `[[test]]`, `[[bench]]` and `[[example]]` targets. In a workspace of more than one package, a feature is qualified as `package/feature`. Nothing else is enabled: never all features, so a platform feature such as `metal` stays off. When the list is non-empty, the plan generates `producer-config/rust-analyzer.json` as `{"cargo":{"features":[...]}}`, lists it under `generatedConfig`, and passes it with `--config-path`. `--cargo-features a,b` replaces the list, and `--cargo-features ''` enables none.
+- Refusals: a root or member manifest that is not UTF-8 or not TOML, or was over the config input cap; a non-table `[workspace]` or `[package]`; members, exclude or `required-features` that are not arrays of strings; an invalid member glob; a member without `[package]` or a package name; a target table that is not an array of tables; a required feature that is not a Cargo feature name, or that `[features]` and the optional dependencies do not declare; more than 256 features. A Cargo feature name follows Cargo's own rule: a Unicode XID start character, `_` or an ASCII digit, then Unicode XID continue characters, `-`, `+` or `.`, at most 128 bytes. As in Cargo, an optional dependency declares an implicit feature of its name only while no `[features]` value names it as `dep:<name>`.
+
+Whether `rust-analyzer scip` 1.98.1 reads a root `rust-analyzer.toml` is not verified, so the plan does not read it.
+
+**scip-typescript.** `typescript.project` is the root `tsconfig.json`, else the root `jsconfig.json`, else `generated` (#652). scip-typescript reads only `tsconfig.json`, so a `jsconfig.json` project is used through a generated `worktree/tsconfig.json` of `{"extends":"./jsconfig.json","compilerOptions":{"allowJs":true}}`: a config reached through `extends` keeps none of TypeScript's `jsconfig.json` defaults, and `allowJs` is the one the program needs. `--ts-project tsconfig.json|jsconfig.json|generated` replaces the choice. A root config the override does not use is left out of the worktree and listed under `omitted`, so it is never read and one over the config input cap does not refuse the run; a `jsconfig.json` that the chosen `tsconfig.json` extends by a relative path is used, so it is kept. An override naming a config the checkout does not hold is refused.
+
+scip-python and scip-java derive no settings yet.
 
 ### scip-java JVM prerequisite
 
