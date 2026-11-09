@@ -14,11 +14,12 @@
 // Open beside a terminal: pane.split {direction: "right", mod: "trellis"}.
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { appHome, focused, machines, props, shared, spaces, theme } from "herdr";
+import { appHome, focused, layout, machines, props, setShared, shared, spaces, theme } from "herdr";
 import * as fs from "fs/promises";
 import { TrellisError, architecturePayload, createClient, indexLabel, pinOf, samePin, validRootKey } from "./client.js";
 import { draw, heat, hit, plural, display } from "./diagram.js";
 import { drawSequence, helpers as sequenceHelpers, targetOf } from "./sequence.js";
+import { ensureFilesPanel } from "./panels.js";
 
 // Polls are gentler for another machine: each one is a command run there.
 const STATUS_MS = 5000, REMOTE_STATUS_MS = 10000, LIST_MS = 30000, BUILDING_MS = 250, MAX_BUILDING_MS = 5000;
@@ -53,6 +54,8 @@ export default class Trellis extends View {
     this.files = {};
     this.tab = (() => { try { return localStorage.getItem("trellis.tab") === "sequence" ? "sequence" : "architecture"; } catch { return "architecture"; } })();
     this.wanted = validRootKey(p.checkout) ? p.checkout : (() => { try { return localStorage.getItem("trellis.checkout"); } catch { return null; } })();
+    // The layout's trellis-files is reached only through the tab bar's Files button.
+    try { ensureFilesPanel({ shared, setShared, layout }); } catch { /* the pane works without it */ }
     this.useMachine(this.shownMachine(), cx);
     cx.timer.every(STATUS_MS, (cx) => { if (this.client?.transport === "fetch" || ++this.ticks % 2 === 0) this.refreshStatus(cx); });
     cx.timer.every(LIST_MS, (cx) => this.loadCheckouts(cx));

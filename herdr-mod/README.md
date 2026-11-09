@@ -13,6 +13,8 @@ Both views follow the file selected in the `trellis-files` panel. The pane talks
 - `src/sequence.js` draws Sequence. It uses `web/sequence-pele.js` and the helpers in `web/sequence.js`, bundled unchanged.
 - `src/dom.js` is the small SVG DOM the adapter needs, because the mod runtime has none.
 - `trellis-files/publish-selection.patch` is the one change to a clone of Herdr's shipped Files mod.
+- `src/panels.js` turns on the tab bar's Files button in the `trellis` layout.
+- `layout/trellis.json` is the `trellis` layout, and `setup-viewer.sh` sets up a viewing laptop.
 
 See [DESIGN-NOTES.md](DESIGN-NOTES.md) for how it works, what's missing and what comes next.
 
@@ -28,13 +30,22 @@ See [DESIGN-NOTES.md](DESIGN-NOTES.md) for how it works, what's missing and what
 
 ## Install on a laptop that views this Mac mini
 
-Mods run in the app that draws them. A laptop's Herdr app runs the mods in the laptop's own `~/.config/herdr-app/mods/`, so the mods have to be copied there. They still talk to the mini's daemon, through `exec` on the mini.
+Mods run in the app that draws them. A laptop's Herdr app runs the mods in the laptop's own `~/.config/herdr-app/mods/`, so the mods and the layout have to be copied there. They still talk to the mini's daemon, through `exec` on the mini.
 
-The mini (below) builds and installs both mods. On the laptop, run this one line. `MINI` is the ssh host the laptop's Herdr uses for the mini, the name shown under Machines:
+The mini (below) builds and installs both mods, the `trellis` layout and `setup-viewer.sh`. On the laptop, run this one line. `MINI` is the ssh host the laptop's Herdr uses for the mini, the name shown under Machines:
 
 ```sh
-ssh MINI 'tar -C ~/.config/herdr-app/mods --exclude .render --exclude "*.d.ts" --exclude jsconfig.json -czf - trellis trellis-files' | tar -xzf - -C ~/.config/herdr-app/mods && herdr-app check ~/.config/herdr-app/mods/trellis && herdr-app check ~/.config/herdr-app/mods/trellis-files
+ssh MINI 'cat ~/.config/herdr-app/mods/trellis/setup-viewer.sh' | sh -s MINI
 ```
+
+`setup-viewer.sh` (POSIX sh, safe to run again):
+
+1. copies `mods/trellis`, `mods/trellis-files` and `layouts/trellis.json` from the mini in one `tar` over ssh, leaving out `.render`, `*.d.ts` and `jsconfig.json`;
+2. installs them into the laptop's `~/.config/herdr-app` (`$HERDR_APP_HOME`), keeping a different existing `layouts/trellis.json` as `trellis.json.bak`;
+3. runs `herdr-app check` on both mods, when `herdr-app` is on PATH;
+4. switches the app to the `trellis` layout and opens the side panel on Files.
+
+It writes nothing else: no shipped mod or layout, and no token (the serve token stays on the mini). It stops with a message when ssh fails or the mini lacks a piece.
 
 **Update:** run `node build.mjs --install` on the mini, then run the same line on the laptop. The laptop needs no Node, npm or repository.
 
@@ -43,7 +54,7 @@ ssh MINI 'tar -C ~/.config/herdr-app/mods --exclude .render --exclude "*.d.ts" -
 ```sh
 cd herdr-mod
 npm ci                       # esbuild 0.28.2 (pinned, with the lockfile)
-node build.mjs --install     # bundles dist/main.js and copies it to ~/.config/herdr-app/mods/trellis
+node build.mjs --install     # bundles dist/main.js and installs mods/trellis (with setup-viewer.sh) and layouts/trellis.json
 herdr-app check ~/.config/herdr-app/mods/trellis
 ```
 
@@ -65,7 +76,9 @@ To use the panel, open it as a pane:
 herdr-app do pane.split '{"direction":"right","mod":"trellis-files"}'
 ```
 
-Or point a layout's Files block at it. For a shipped layout, clone the layout first (`layout.clone`), then set the Files block's `content.mod` to `trellis-files`.
+Or use the `trellis` layout that `node build.mjs --install` installs from `layout/trellis.json`: a clone of Herdr's `main` whose side panel holds `trellis-files` (in the Files slot) or Changes, with the Trellis pane beside it. A different existing `layouts/trellis.json` is kept as `trellis.json.bak`. Switch to it with `herdr-app do layout.switch '{"name":"trellis"}'`.
+
+The tab bar shows a Files button only when shared `"workspace.panels"` includes `"files"`, and the welcome can leave just `["changes"]`. So when the Trellis pane starts in a layout whose Files slot is `trellis-files`, it adds `"files"` there; see [DESIGN-NOTES.md](DESIGN-NOTES.md#reaching-trellis-files).
 
 ## Open the Trellis pane
 
@@ -107,6 +120,6 @@ Opening the pane doesn't choose a checkout by itself, because reading a checkout
 - After every change, run `herdr-app check ~/.config/herdr-app/mods/trellis` and `herdr-app status`. Then look at the pane with `herdr-app shot <file>`.
 - `node test/harness.mjs --url <daemon> --token-file <file> [--cwd <folder>] [--select <path>] [--click layer-<name>]` runs the real `src/main.js` in Node. It runs against a live daemon, with stand-ins for Herdr's modules, and prints the text the pane would show and the drawing it wrote. It checks the data path, not the picture.
 
-- `node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs`, run from the repository root, tests the logic. `view.test.mjs` runs the real pane against a fake daemon through the exec + curl transport. It needs no install, and `tools/verify` runs it in the `checks` lane.
+- `node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs herdr-mod/test/setup.test.mjs`, run from the repository root, tests the logic. `view.test.mjs` runs the real pane against a fake daemon through the exec + curl transport. `setup.test.mjs` runs `setup-viewer.sh` against a stand-in mini (an `ssh` script over a temporary home). They need no install, and `tools/verify` runs them in the `checks` lane.
 
 The build itself isn't part of `tools/verify`, because it needs `npm ci`, which downloads esbuild.

@@ -165,6 +165,22 @@ Mods run in the app that draws them. When the owner views the mini from the lapt
 
 `show()` is where the Files panel opens a file and where it clears one. The patch publishes `{root, path, on}` and only writes when the value changes. `on` (a remote machine) is published, but the Trellis pane ignores remote files.
 
+## Reaching trellis-files
+
+The `trellis` layout (`layout/trellis.json`) is a clone of Herdr's `main`. Its side panel `panel` is a row: the stack `panel-body`, which shows `files` (`{mod: "trellis-files"}`) or `changes`, and the `trellis` pane beside it. The shipped `tabs` mod opens that panel. Its Files and Changes buttons run `layout.select {stack: "panel-body", child}` and `layout.show {id: "panel"}`, and it draws a button only for the names in shared `"workspace.panels"` (both when unset). The welcome can set that to `["changes"]`, as it did on the owner's laptop. Then nothing ever selects `files`, and `trellis-files` can't be reached: Changes shows the changes and the Trellis pane, and nothing else.
+
+**Choice (2026-11-08): the Trellis pane adds `"files"` to `"workspace.panels"`** (`src/panels.js`, called from `init()`), with `setShared`, the supported way for a mod to set shared state. It does so only when the shown layout's `panel-body` has a `files` child whose mod is `trellis-files`, and only when the value is set and lacks `"files"`. It writes nothing otherwise, so a second start changes nothing, and a Trellis pane opened in another layout leaves the value alone. The tab bar then shows Files and Changes, exactly as in Herdr's default.
+
+Why this, rather than restructuring the layout:
+
+- **It uses the tab bar as designed.** `"workspace.panels"` is the documented switch for exactly these buttons, and the layout keeps `main`'s ids and shape, which the `tabs` mod finds them by. Files opens `trellis-files` with the Trellis pane; Changes opens the changes with it.
+- **The layout alternatives were worse.** As long as Changes is the only button, the only state it can reach is the panel shown on `changes`. So `trellis-files` would have to sit outside the stack: either always beside the changes (three columns whenever the panel opens), or in a second, always-shown column that no button toggles. A stack `"header": {"content": "tabs"}` (the documented built-in strip) parses in this Herdr build, but draws no strip, so it can't switch the stack either.
+- **No hand edit of `shared.json`.** There is no app command that sets shared state, so the setting has to come from a mod. The Trellis pane is in the layout that needs it.
+
+The cost: the value is shared, so `main` also shows a Files button (the shipped Files panel), as it does by default. The pane starts the first time the panel shows, so on a fresh install the Files button appears once the panel has been opened (Changes) or once `setup-viewer.sh` has run, which opens it.
+
+Checked on the mini (2026-11-08): reinstalling the mod reloaded the pane, and `"workspace.panels"` went from `["changes"]` to `["files", "changes"]`. `herdr-app status` shows layout `trellis`, no errors. The in-app screenshot couldn't be taken: the mini's screen was locked, so the window drew no new frames and `herdr-app shot` returned a stale frame. The state is recorded in `trellis-evidence/707/viewer-files-reachable-state.txt`. A unit test covers the rule against `layout/trellis.json`.
+
 ## What each remaining view needs
 
 - **Classes.** It needs `GET classes` (the catalog), `POST class-diagram` and `web/classes.js`'s Pele adapter. That adapter also parses with `DOMParser` and uses compound and `:scope >` selectors, so it should run on `src/dom.js`. Its DOM-bound UI (members toggle, chooser) would be ported to native rows, as Architecture's options were. Clicks would use the same box hit-testing, on class and member nodes.

@@ -114,3 +114,23 @@ test("yielding between drawing phases changes nothing in either drawing", async 
   assert.deepEqual(stepped.boxes, flat.boxes);
   assert.ok(pauses - before >= 4, `Sequence yields between phases (${pauses - before})`);
 });
+
+test("the trellis layout's Files button is enabled when the welcome left only Changes, and nothing else changes", async () => {
+  const { panelsWithFiles, ensureFilesPanel } = await import("../src/panels.js");
+  const layout = JSON.parse(readFileSync(new URL("../layout/trellis.json", import.meta.url), "utf8"));
+  assert.deepEqual(panelsWithFiles(["changes"], layout), ["files", "changes"]);
+  assert.deepEqual(panelsWithFiles([], layout), ["files"]);
+  assert.equal(panelsWithFiles(["files", "changes"], layout), null);
+  assert.equal(panelsWithFiles(undefined, layout), null, "unset already shows both buttons");
+  // A layout whose Files block is the shipped panel (Herdr's main) is left alone.
+  const shipped = structuredClone(layout);
+  const walk = (node) => { if (node.id === "files") node.content.mod = "files"; (node.children ?? []).forEach(walk); };
+  walk(shipped);
+  assert.equal(panelsWithFiles(["changes"], shipped), null);
+  assert.equal(panelsWithFiles(["changes"], null), null);
+  const store = { "workspace.panels": ["changes"] };
+  const deps = { shared: (k) => store[k], setShared: (k, v) => { store[k] = v; }, layout: () => layout };
+  assert.deepEqual(ensureFilesPanel(deps), ["files", "changes"]);
+  assert.deepEqual(store["workspace.panels"], ["files", "changes"]);
+  assert.equal(ensureFilesPanel(deps), null, "a second start writes nothing");
+});

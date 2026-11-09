@@ -13,6 +13,7 @@ export const theme = () => ({ background: "#101114", foreground: "#e6e6e6", mute
   ansi3: "#e5c07b", ansi9: "#ff7a5c", ansi11: "#ffd75f" });
 export const focused = () => state.focused ?? null;
 export const spaces = () => state.spaces ?? [];
+export const layout = () => state.layout ?? null;
 // exec here, as Herdr runs it for this computer (`on` names another machine in the app).
 import { spawn } from "node:child_process";
 export const exec = (command, args = [], options = {}) => new Promise((resolve, reject) => {
