@@ -14,9 +14,10 @@ export const theme = () => ({ background: "#101114", foreground: "#e6e6e6", mute
 export const focused = () => state.focused ?? null;
 export const spaces = () => state.spaces ?? [];
 export const layout = () => state.layout ?? null;
-// exec here, as Herdr runs it for this computer (`on` names another machine in the app).
+// exec here, as Herdr runs it for this computer (`on` names another machine in the app). A test
+// may stand in for the program with `state.exec(command, args, options)`.
 import { spawn } from "node:child_process";
-export const exec = (command, args = [], options = {}) => new Promise((resolve, reject) => {
+export const exec = (command, args = [], options = {}) => state.exec ? (state.execs = (state.execs || 0) + 1, state.exec(command, args, options)) : new Promise((resolve, reject) => {
   state.execs = (state.execs || 0) + 1;
   const child = spawn(command, args, { cwd: options.cwd });
   let stdout = "", stderr = "";

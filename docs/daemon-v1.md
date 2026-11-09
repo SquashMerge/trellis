@@ -328,6 +328,24 @@ latest 100 job records are retained in memory; restart does not resume old jobs.
 
 For DTO details, see [the frontend handoff](daemon-v1-api-handoff.md).
 
+### `trellis api`: browser routes through the CLI (#817)
+
+`trellis api` reads one browser API route through the per-user daemon socket, the way every other CLI command reaches the daemon (it connects, or starts the daemon, as `trellis status` does). It exists for the Herdr mod, which runs in the viewing app and so can't `fetch` another machine's loopback listener: the mod runs `trellis api` *on* that machine through Herdr's `exec`.
+
+```sh
+trellis api GET '/api/checkouts'
+trellis api GET '/api/checkouts/<rootKey>/status'
+trellis api GET '/api/checkouts/<rootKey>/architecture?aggregate=max&role=production&workbench=true&indexGeneration=…&indexRevision=…'
+trellis api GET '/api/checkouts/<rootKey>/methods?indexGeneration=…&indexRevision=…&path=src/main.rs'
+trellis api POST '/api/checkouts/<rootKey>/sequence' --body '{"seed":"…","expectedRevision":{…},"showAll":false,"interactions":true}'
+```
+
+- **Authentication.** The private per-user socket is the caller's authentication, as for the rest of the CLI. No serve token is read, `trellis serve` need not be running, and nothing new listens.
+- **Allowlist.** Exactly the routes above, with those methods: `GET /api/checkouts` (no query), `GET …/status` (no query), `GET …/architecture`, `GET …/methods` and `POST …/sequence` (no query), with a 64-hex `rootKey`. Anything else is refused with `route_not_allowed` before the daemon is reached, and refused again by the daemon. GET takes no body and POST requires one.
+- **Same handlers, same bounds.** Each request runs the provisioned browser's own handler for that route, with the same checkout selection, query validation, revision pins and typed errors. The target is at most 4,096 bytes of printable ASCII. A POST body is JSON of at most 64 KiB, inline or from stdin with `--body -`; that is tighter than the browser's 1 MiB because it travels in one 1 MiB socket frame. An answer over 16 MiB is `response_too_large`. The CLI waits at most 25 s per socket read on a silent daemon.
+- **Output.** Stdout is one line of JSON. Exit 0: the daemon's 2xx answer. Exit 1: the daemon's `{error:{code,message}}` answer, unchanged, so its code is kept. Exit 2: a typed failure with no daemon answer, printed as `{error:{code,message}}`: `route_not_allowed`, `invalid_request`, `body_too_large`, `daemon_unavailable` (no daemon could be reached or started, or the connection failed twice), `deadline_exceeded` (a daemon silent for 25 s), or `daemon_outdated` (a running daemon older than `trellis api`; restart it). Clap's own usage errors also exit 2, on stderr with nothing on stdout.
+- **Reading status starts indexing,** exactly as a browser read does: a selected checkout's runtime is activated and kept for the browser lifetime.
+
 ## Current limits
 
 The Tools tab, question planning, Jev selection, ACP answers and saved records are retired.

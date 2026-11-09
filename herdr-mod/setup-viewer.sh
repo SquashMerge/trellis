@@ -11,8 +11,9 @@
 #
 # It writes only ~/.config/herdr-app/mods/trellis, mods/trellis-files and layouts/trellis.json
 # (an existing, different trellis.json is kept as trellis.json.bak). Herdr's shipped mods and
-# layouts are never touched, and no token is copied: the mods read the mini's serve token on
-# the mini, through `exec`. Running it again updates the copies.
+# layouts are never touched, and no token is copied: the mods run `trellis api` on the mini,
+# through `exec`, and it reaches the mini's daemon over its own socket. Running it again
+# updates the copies.
 #
 # Environment: HERDR_APP_HOME (this machine's app home, default ~/.config/herdr-app);
 # TRELLIS_REMOTE_APP_HOME (the mini's, relative to its home, default .config/herdr-app).

@@ -1,5 +1,7 @@
 // The pane end to end in Node: the real src/main.js, with stand-ins for Herdr's modules, against
-// a fake loopback daemon, through the exec + curl transport the mod uses for another machine.
+// a fake loopback daemon, through the `trellis api` exec transport the mod uses for another
+// machine. A fake `trellis` stands in for the CLI: it relays to the fake daemon and prints and
+// exits as `trellis api` does (#817).
 //   node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/view.test.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -69,6 +71,26 @@ function fakeDaemon({ ready = false, checkouts = [{ key: KEY, root: ROOT }] } = 
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ server, seen, port: server.address().port })));
 }
 
+// `trellis api` as the CLI behaves: exit 0 with the daemon's 2xx JSON, exit 1 with its {error}
+// answer unchanged, exit 2 with a typed {error} when no daemon answers. `mode` "timeout" stands
+// for exec's own timeout, which rejects.
+function fakeTrellis(port, { mode = "ok" } = {}) {
+  const calls = [];
+  state.exec = async (command, args, options) => {
+    calls.push({ command, args, on: options?.on ?? null, timeout: options?.timeout });
+    if (command !== "trellis" || args[0] !== "api") return { code: 127, stdout: "", stderr: "not found" };
+    if (mode === "timeout") throw new Error("exec timed out after 30000 ms");
+    if (mode === "unreachable") return { code: 2, stdout: '{"error":{"code":"daemon_unavailable","message":"The daemon call failed (daemon_unavailable)."}}\n', stderr: "" };
+    const [, method, target, flag, body] = args;
+    assert.ok(method === "GET" ? args.length === 3 : flag === "--body", `argv shape: ${args}`);
+    const response = await fetch(`http://127.0.0.1:${port}${target}`, method === "GET" ? { headers: { Authorization: `Bearer ${TOKEN}` } }
+      : { method, headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" }, body });
+    const text = await response.text();
+    return { code: response.ok ? 0 : 1, stdout: `${text}\n`, stderr: "" };
+  };
+  return calls;
+}
+
 // `hang` stands for a task the Herdr runtime ended over its synchronous-run cap: the drawing's
 // first yield never returns, and the watchdog's 15 s are 40 ms.
 function mount(props, { hang = false } = {}) {
@@ -103,24 +125,26 @@ function mount(props, { hang = false } = {}) {
   return { view, cx, settle, until, el: () => last };
 }
 
-test("Sequence follows the Files selection, draws, and re-centers on a proven call, all through exec + curl", async () => {
+test("Sequence follows the Files selection, draws, and re-centers on a proven call, all through trellis api on the space's machine", async () => {
   const { server, seen, port } = await fakeDaemon();
-  const dir = mkdtempSync(join(tmpdir(), "trellis-view-")), tokenFile = join(dir, "token");
-  writeFileSync(tokenFile, `${TOKEN}\n`);
-  Object.assign(state, { appHome: dir, focused: { cwd: ROOT }, shared: {}, spaces: [], execs: 0 });
+  const dir = mkdtempSync(join(tmpdir(), "trellis-view-"));
+  Object.assign(state, { appHome: dir, focused: { cwd: ROOT }, shared: {}, spaces: [{ active: true, machine: "mini" }], machines: [{ name: "mini", layout: "ready" }], execs: 0 });
+  const calls = fakeTrellis(port);
   try {
-    const { view, cx, settle } = mount({ url: `http://127.0.0.1:${port}`, tokenFile, transport: "exec" });
+    const { view, cx, settle } = mount({});
     let root = await settle();
     root.find("root").props.size({ width: 900, height: 700 }, cx);
     root = await settle();
     assert.match(root.text(), /No reviewed rules file/, "Architecture shows the daemon's typed state");
     root.find("tab-sequence").props.click({}, cx);
-    state.shared["trellis.selectedFile"] = { root: ROOT, path: "fixture.rs", on: null };
+    state.shared["trellis.selectedFile"] = { root: ROOT, path: "fixture.rs", on: "mini" };
     root = await settle();
     assert.match(root.text(), /Methods in fixture\.rs/);
     assert.match(root.text(), /\[image mods\/trellis\/\.render\/sequence-/);
     assert.match(root.text(), /→ helper/, "the proven call names its target");
-    assert.ok(state.execs > 0 && seen.every((r) => r.auth === `Bearer ${TOKEN}`));
+    assert.ok(calls.length > 0 && calls.every((c) => c.command === "trellis" && c.on === "mini" && c.timeout === 30000));
+    assert.ok(calls.every((c) => !c.args.join(" ").includes(TOKEN)), "no token in the command");
+    assert.ok(calls.some((c) => c.args[1] === "POST" && c.args[3] === "--body" && JSON.parse(c.args[4]).seed === "fixture-seed"));
 
     // A press on the call's drawn step re-centers on the target, with Back to the seed.
     const box = view.seq.drawn.boxes.find((b) => b.step === "call-helper");
@@ -132,24 +156,45 @@ test("Sequence follows the Files selection, draws, and re-centers on a proven ca
     root = await settle();
     assert.equal(view.seq.seed.id, "fixture-seed");
     await view.close();
-  } finally { server.close(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { delete state.exec; state.spaces = []; delete state.machines; server.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("the exec transport types a missing token, a stopped daemon and a rejected token", async () => {
+test("trellis api failures are typed: a daemon error keeps its code, an unreachable daemon, a timeout, no trellis", async () => {
   const { server, port } = await fakeDaemon();
   const dir = mkdtempSync(join(tmpdir(), "trellis-view-"));
   Object.assign(state, { appHome: dir, focused: { cwd: ROOT }, shared: {}, spaces: [] });
+  const run = async (mode, props = {}) => {
+    fakeTrellis(port, { mode });
+    const { view, settle } = mount({ transport: "exec", ...props });
+    const text = (await settle()).text();
+    await view.close();
+    return text;
+  };
   try {
-    const run = async (props) => { const { settle } = mount({ transport: "exec", ...props }); return (await settle()).text(); };
-    assert.match(await run({ url: `http://127.0.0.1:${port}`, tokenFile: join(dir, "missing") }), /token_missing/);
-    writeFileSync(join(dir, "wrong"), "c".repeat(64));
-    assert.match(await run({ url: `http://127.0.0.1:${port}`, tokenFile: join(dir, "wrong") }), /unauthorized/);
-    writeFileSync(join(dir, "token"), TOKEN);
-    server.close();
-    const stopped = await run({ url: `http://127.0.0.1:${port}`, tokenFile: join(dir, "token") });
-    assert.match(stopped, /daemon_unreachable/);
-    assert.ok(!stopped.includes(TOKEN) && !stopped.includes("c".repeat(64)));
-  } finally { server.close(); rmSync(dir, { recursive: true, force: true }); }
+    // A daemon error answer (exit 1) is shown with the daemon's own code.
+    state.focused = { pane: "p", terminal: "t", cwd: ROOT };
+    fakeTrellis(port);
+    const failing = state.exec;
+    state.exec = (command, args, options) => args[2].endsWith("/status")
+      ? Promise.resolve({ code: 1, stdout: '{"error":{"code":"index_not_ready","message":"reindex required"}}\n', stderr: "" }) : failing(command, args, options);
+    let { view, settle } = mount({ transport: "exec" });
+    assert.match((await settle()).text(), /Index not ready \(index_not_ready: reindex required\)/);
+    await view.close();
+    assert.match(await run("unreachable"), /daemon_unavailable/);
+    const timeout = await run("timeout");
+    assert.match(timeout, /daemon_timeout/);
+    assert.match(timeout, /did not answer within 30 s/);
+    // No `trellis` on that machine's PATH.
+    state.exec = async () => ({ code: 127, stdout: "", stderr: "trellis: command not found" });
+    ({ view, settle } = mount({ transport: "exec" }));
+    assert.match((await settle()).text(), /trellis_missing/);
+    await view.close();
+    // An older trellis without the `api` command.
+    state.exec = async () => ({ code: 2, stdout: "", stderr: "error: unrecognized subcommand 'api'" });
+    ({ view, settle } = mount({ transport: "exec" }));
+    assert.match((await settle()).text(), /trellis_outdated/);
+    await view.close();
+  } finally { delete state.exec; server.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("a drawing the runtime ends is a typed timeout, not Drawing… for ever, in both views", async () => {
@@ -157,6 +202,7 @@ test("a drawing the runtime ends is a typed timeout, not Drawing… for ever, in
   const dir = mkdtempSync(join(tmpdir(), "trellis-view-")), tokenFile = join(dir, "token");
   writeFileSync(tokenFile, `${TOKEN}\n`);
   Object.assign(state, { appHome: dir, focused: { cwd: ROOT }, shared: {}, spaces: [] });
+  fakeTrellis(port);
   try {
     const { view, cx, until } = mount({ url: `http://127.0.0.1:${port}`, tokenFile, transport: "exec" }, { hang: true });
     let root = await until(/Drawing the layer stack/);
@@ -170,7 +216,7 @@ test("a drawing the runtime ends is a typed timeout, not Drawing… for ever, in
     assert.match(root.text(), /draw_timeout/);
     assert.equal(view.seqDrawing, false);
     await view.close();
-  } finally { server.close(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { delete state.exec; server.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 // #809: the pane follows the focused agent's checkout; a mod pane's focus (cwd null) keeps it;
@@ -184,12 +230,13 @@ async function following(fn) {
   const dir = mkdtempSync(join(tmpdir(), "trellis-view-")), tokenFile = join(dir, "token");
   writeFileSync(tokenFile, `${TOKEN}\n`);
   Object.assign(state, { appHome: dir, focused: agentIn("p1", `${ROOT}/src`), shared: {}, spaces: [] });
+  fakeTrellis(port);
   try {
     const pane = mount({ url: `http://127.0.0.1:${port}`, tokenFile, transport: "exec" });
     await pane.settle();
     await fn({ ...pane, seen, statusReads: (key) => seen.filter((r) => r.url === `/api/checkouts/${key}/status`).length });
     await pane.view.close();
-  } finally { server.close(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { delete state.exec; server.close(); rmSync(dir, { recursive: true, force: true }); }
 }
 
 test("the pane follows the focused agent from one checkout to another, and reads only those", async () => {

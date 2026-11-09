@@ -1,20 +1,20 @@
-// The daemon client: the same routes and bearer token the browser uses, on the machine the
-// shown space lives on.
+// The daemon client: the same routes the browser uses, on the machine the shown space lives on.
 //
-// Same machine: `fetch` to the loopback URL, with the token read from the serve token file
-// (default ~/.config/trellis/serve.token) into this closure only.
-// Another machine (a space on a Herdr machine): one `exec("sh", …, { on: machine })` per
-// request runs curl *there*, against 127.0.0.1:<port>. The token file is read by that shell and
-// handed to curl on stdin (`-H @-`), so the token never reaches this app, its logs or curl's
-// argv; responses are bounded (curl --max-filesize, exec's 8 MiB) and timed out (--max-time).
+// Same machine: `fetch` to the loopback URL, with the bearer token read from the serve token
+// file (default ~/.config/trellis/serve.token) into this closure only.
+// Another machine (a space on a Herdr machine), or `transport: "exec"`: one
+// `exec("trellis", ["api", …], { on: machine })` per request (#817). The CLI reaches that
+// machine's daemon over its private socket, as every Trellis command does, so no token is read
+// by the mod or a shell there. It serves only the routes this client uses, with the browser's
+// bounds, and prints the daemon's JSON. Responses are bounded by exec's 8 MiB and timed out.
 // The token is never logged, put in state, written anywhere, or included in an error message.
 import { exec, home, readTextFile } from "herdr";
 
 const LOOPBACK = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})$/;
 const TOKEN = /^[A-Za-z0-9_-]{1,512}$/;
-const MAX_SECONDS = 25, MAX_BYTES = 8000000;
+// `trellis api` gives up on a silent daemon after 25 s; exec's own backstop is a little later.
+const EXEC_TIMEOUT_MS = 30000;
 export const DEFAULT_URL = "http://127.0.0.1:8877";
-const DEFAULT_TOKEN_FILE = "~/.config/trellis/serve.token";
 export const validRootKey = (key) => typeof key === "string" && /^[0-9a-f]{64}$/.test(key);
 
 /** A typed failure: `code` names it (the daemon's own code where it gave one). */
@@ -32,33 +32,16 @@ const tokenMessages = (file) => ({
   token_invalid: `The daemon token file ${file} does not hold a token.`,
 });
 
-// Runs on the daemon's machine: $1 token file, $2 port, $3 path, $4 JSON body (POST) or "".
-// Prints the body, then a status line; or one error line. The token goes to curl on stdin.
-const REMOTE = `
-tf=$1 port=$2 path=$3 body=$4
-case $tf in "~/"*) tf=$HOME/\${tf#"~/"};; esac
-[ -e "$tf" ] || { echo "TRELLIS-ERROR token_missing"; exit 0; }
-[ -r "$tf" ] || { echo "TRELLIS-ERROR token_unreadable"; exit 0; }
-tok=$(head -c 513 "$tf" | tr -d ' \t\r\n')
-case $tok in ""|*[!A-Za-z0-9_-]*) echo "TRELLIS-ERROR token_invalid"; exit 0;; esac
-command -v curl >/dev/null 2>&1 || { echo "TRELLIS-ERROR curl_missing"; exit 0; }
-if [ -n "$body" ]; then set -- -X POST -H "Content-Type: application/json" --data-binary "$body"; else set --; fi
-printf 'Authorization: Bearer %s\n' "$tok" | curl -sS --max-time ${MAX_SECONDS} --max-filesize ${MAX_BYTES} -H @- "$@" -w '\nTRELLIS-STATUS %{http_code}\n' "http://127.0.0.1:$port$path" 2>/dev/null
-rc=$?
-[ $rc -eq 0 ] || echo "TRELLIS-CURL $rc"
-`;
-const CURL_ERRORS = { 7: "daemon_unreachable", 28: "daemon_timeout", 63: "response_too_large" };
-
 /**
  * `machine`: a Herdr machine name (a space's `machine`), or null for this computer.
- * `transport`: "fetch" (default here) or "exec" (always used for another machine).
+ * `transport`: "fetch" (default here) or "exec" (`trellis api`; always used for another machine).
  */
 export function createClient({ url = DEFAULT_URL, tokenFile, machine = null, transport } = {}) {
   const base = String(url).replace(/\/+$/, "");
   const port = Number(LOOPBACK.exec(base)?.[1]);
   if (!(port > 0 && port < 65536)) throw new TrellisError("invalid_url", `Not a loopback daemon address: ${base}. Use http://127.0.0.1:<port>.`);
   const viaExec = machine !== null || transport === "exec";
-  const file = tokenFile || (viaExec ? DEFAULT_TOKEN_FILE : `${home()}/.config/trellis/serve.token`);
+  const file = tokenFile || `${home()}/.config/trellis/serve.token`;
   const where = machine ? `${base} on ${machine}` : base;
   let token = null;
 
@@ -96,33 +79,31 @@ export function createClient({ url = DEFAULT_URL, tokenFile, machine = null, tra
     return answer(response.status, data);
   }
 
-  async function viaShell(path, body) {
+  // `trellis api` on the daemon's machine. Exit 0: the daemon's 2xx JSON. Exit 1: the daemon's
+  // own `{error}` answer. Exit 2: a typed failure with no answer (refused route, daemon down).
+  async function viaCli(path, body) {
+    const args = body === undefined ? ["api", "GET", path] : ["api", "POST", path, "--body", JSON.stringify(body)];
+    const on = machine ?? "this computer";
     let result;
-    try { result = await exec("sh", ["-c", REMOTE, "trellis", file, String(port), path, body === undefined ? "" : JSON.stringify(body)], { on: machine }); }
-    catch { throw new TrellisError("machine_unreachable", `Cannot run a command on ${machine ?? "this computer"}.`); }
-    const out = result.stdout || "";
-    const error = /^TRELLIS-ERROR (\w+)\s*$/.exec(out);
-    if (error) throw new TrellisError(error[1], tokenMessages(file)[error[1]] || "curl is not installed on the daemon's machine.");
-    const curl = /\nTRELLIS-CURL (\d+)\s*$/.exec(out) || /^TRELLIS-CURL (\d+)\s*$/.exec(out);
-    if (curl) {
-      const code = CURL_ERRORS[curl[1]] || "transport_failed";
-      throw new TrellisError(code, code === "daemon_unreachable" ? `No Trellis daemon answers at ${where}. Start \`trellis serve\`.`
-        : code === "daemon_timeout" ? `The daemon at ${where} did not answer within ${MAX_SECONDS} s.`
-        : code === "response_too_large" ? "The daemon's answer is larger than the mod reads." : `curl failed (${curl[1]}) on ${machine ?? "this computer"}.`);
+    try { result = await exec("trellis", args, { on: machine, timeout: EXEC_TIMEOUT_MS }); }
+    catch (error) {
+      if (/time(d)? ?out/i.test(String(error?.message ?? error))) throw new TrellisError("daemon_timeout", `trellis api on ${on} did not answer within ${EXEC_TIMEOUT_MS / 1000} s.`);
+      throw new TrellisError("machine_unreachable", `Cannot run trellis on ${on}: the machine is unreachable or trellis isn't on its PATH.`);
     }
-    const at = out.lastIndexOf("\nTRELLIS-STATUS ");
-    const status = at >= 0 ? Number(/^\d{3}/.exec(out.slice(at + 16))?.[0]) : NaN;
-    if (!Number.isInteger(status) || status === 0) throw new TrellisError("invalid_response", "The daemon's answer was cut short or unreadable.");
-    const text = out.slice(0, at);
-    let data = null;
-    if (status !== 204) {
-      try { data = JSON.parse(text); }
-      catch { throw new TrellisError("invalid_response", `The daemon sent an unreadable answer (${status}).`, status); }
+    if (result.code === 127) throw new TrellisError("trellis_missing", `trellis isn't on the PATH on ${on}.`);
+    let data;
+    try { data = JSON.parse(result.stdout); }
+    catch {
+      if (/unrecognized subcommand/.test(result.stderr || "")) throw new TrellisError("trellis_outdated", `The trellis on ${on} has no \`api\` command. Install a newer Trellis there.`);
+      throw new TrellisError("invalid_response", `trellis api on ${on} printed no JSON (exit ${result.code}).`);
     }
-    return answer(status, data);
+    if (result.code === 0) return data;
+    const code = typeof data?.error?.code === "string" ? data.error.code : `exit_${result.code}`;
+    const message = typeof data?.error?.message === "string" ? data.error.message : `trellis api failed (exit ${result.code}).`;
+    throw new TrellisError(code, message);
   }
 
-  const request = viaExec ? viaShell : viaFetch;
+  const request = viaExec ? viaCli : viaFetch;
   const checkout = (rootKey, suffix, body) => {
     if (!validRootKey(rootKey)) throw new TrellisError("invalid_checkout", "Choose an available checkout.");
     return request(`/api/checkouts/${rootKey}/${suffix}`, body);

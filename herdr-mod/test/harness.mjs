@@ -64,7 +64,7 @@ if (press) {
   last.find("diagram").props["press-left"]({ local_position: { x: box.x + box.w / 2, y: box.y + box.h / 2 } }, cx);
   await settle();
 }
-if (state.execs) console.error(`(${state.execs} requests through exec + curl)`);
+if (state.execs) console.error(`(${state.execs} requests through exec + trellis api)`);
 console.log(last.text().replace(/\s+/g, " ").slice(0, 4000));
 const dir = join(appHome, "mods", "trellis", ".render"), list = () => (existsSync(dir) ? readdirSync(dir) : []);
 const rendered = list();

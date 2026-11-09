@@ -13,9 +13,9 @@ This cut is the shell plus two views, Architecture and Sequence. The daemon can 
 | Build | esbuild bundles `src/main.js`, the browser scripts, Pele and the mod's code into one `main.js`. | `node build.mjs --install`, then `herdr-app check` passes and `herdr-app status` shows no errors. |
 | Follow | The pane shows the checkout the focused agent or terminal works in, or the Files selection's, whichever is more recent. A pin stops agent follow. See [Which checkout is shown](#which-checkout-is-shown). | `view.test.mjs`: agent A then B, a mod-pane focus, pinned, a later Files selection, an unknown folder. Harness with `--cwd`. |
 | Shell | The followed checkout's label and pin (the daemon's `/api/checkouts`, with each row's index state), index status (revision, Fresh or Catching up), polling (status every 5 s, list every 30 s, `building` retried at the daemon's `retryAfterMs`). | `test/harness.mjs` runs the real `src/main.js` against a live daemon. |
-| Typed errors | Every failure is a code and a message, and the data from that read is dropped. Codes come from the daemon (`index_not_ready`, `unauthorized`, `revision_conflict` and so on) or the mod (`token_missing`, `token_unreadable`, `token_invalid`, `daemon_unreachable`, `invalid_url`, `invalid_response`, and the adapter's `unsupported`). A drawing is shown only for the payload it was made from. | Harness against a stopped port, a non-loopback URL, a missing token and the owner's daemon. Unit tests. |
+| Typed errors | Every failure is a code and a message, and the data from that read is dropped. Codes come from the daemon (`index_not_ready`, `unauthorized`, `revision_conflict` and so on), from `trellis api` (`daemon_unavailable`, `route_not_allowed`, `daemon_outdated` and so on) or from the mod (`token_missing`, `token_unreadable`, `token_invalid`, `daemon_unreachable`, `daemon_timeout`, `trellis_missing`, `trellis_outdated`, `machine_unreachable`, `invalid_url`, `invalid_response`, and the adapter's `unsupported`). A drawing is shown only for the payload it was made from. | Harness against a stopped port, a non-loopback URL, a missing token and the owner's daemon. Unit tests. |
 | Architecture | Fetches the summary with the browser's parameters (`aggregate=max&role=production&workbench=true`, pinned to the status revision) and validates it as the browser's `payloadOf` does. Draws with the browser's own adapter and Pele. Lists the layers natively: order, files, max cognitive, and outgoing counts (↑ ⇄ ↓ →shared and so on, with deviations in the error colour), plus hidden, test, unassigned and coverage lines. | Harness. Unit tests, which use the browser's own Architecture fixture. |
-| Transport | A space on this computer uses `fetch`. A space on another Herdr machine runs `curl` there through `exec`, with the token read there. See [Transport](#transport). | `view.test.mjs` drives the real pane through `exec` and `curl` against a fake daemon, and checks a missing token, a rejected token and a stopped daemon. The harness ran it against the isolated daemon. |
+| Transport | A space on this computer uses `fetch`. A space on another Herdr machine runs `trellis api` there through `exec` (#817). See [Transport](#transport). | `view.test.mjs` drives the real pane through a stand-in `trellis api` on a named machine, and checks a daemon error, an unreachable daemon, an exec timeout, no `trellis` and an old `trellis`. The Rust tests in `tests/daemon/daemon_cli.rs` cover the CLI itself. The harness ran through the real CLI against an isolated daemon, including a 1.5 MB Architecture answer (`trellis-evidence/707/trellis-api-isolated-e2e.txt`). |
 | Sequence | The Files selection lists the file's methods (`GET methods`). The first consequential named method opens (`POST sequence`, checked against the pin and seed as the browser checks it). The browser's own `web/sequence-pele.js` draws it. The steps are native rows. Clicking a proven call (diagram or row) re-centers on its target, with Back. Groups expand and collapse. | `view.test.mjs` re-centers on a resolved call and goes back. Harness against the isolated daemon, which is syntax-only, so it has no proven targets. |
 | Clicks | Pressing a band in the diagram, or its row in the list, opens or folds it, as the band header does in the browser. Pressing an arrow's count, a file or a note shows its full label above the drawing. | Harness (`--press L`, `--press E`, `--click layer-web`). |
 | Files follow | `trellis-files` publishes `trellis.selectedFile`. The mod switches to the checkout that holds the file. It shows the file's layer, the layer's counts, the file's module chip (name, file count, max cognitive, heat, rank in the band, whether it's drawn or in "+N more"), and the file's own metric. A drawn chip gets an accent outline. | Harness (`--select src/http.rs`, `--select web/architecture.js`). `trellis-files` passes `herdr-app check`. |
@@ -113,33 +113,25 @@ Next steps, in increasing cost:
 
 ## Transport
 
-Mods run in the app that draws them. When the owner views the mini from the laptop, the mod runs on the laptop, and a `fetch` to `127.0.0.1` would reach the laptop. So the pane picks the machine from the shown space (`spaces()[i].machine`, `null` for this computer), unless props name one. A machine Herdr marks `unavailable` in `machines()` is a typed `machine_unavailable` state.
+Mods run in the app that draws them. When the owner views the mini from the laptop, the mod runs on the laptop, and a `fetch` to `127.0.0.1` would reach the laptop. Herdr has no remote `fetch` and no port forwarding. So the pane picks the machine from the shown space (`spaces()[i].machine`, `null` for this computer), unless props name one. A machine Herdr marks `unavailable` in `machines()` is a typed `machine_unavailable` state.
 
 - **This computer:** `fetch(url)`, with the token read from the token file into the client closure.
-- **Another machine:** each request is one `exec("sh", ["-c", SCRIPT, "trellis", tokenFile, port, path, body], { on: machine })`. The script runs on the daemon's machine:
-  - it expands `~` in the token file path against that machine's home;
-  - it reads and validates the token there;
-  - it runs `curl -sS --max-time 25 --max-filesize 8000000 -H @- … http://127.0.0.1:<port><path>`, with `Authorization: Bearer <token>` written to curl's stdin by the shell's builtin `printf`;
-  - it prints the body, then a `TRELLIS-STATUS <code>` line, or a `TRELLIS-ERROR` / `TRELLIS-CURL` line.
+- **Another machine (#817):** each request is one `exec("trellis", ["api", METHOD, target, ("--body", JSON)], { on: machine, timeout: 30000 })`. `trellis api` is a bounded CLI passthrough to exactly the routes this mod uses (checkouts, status, Architecture, methods, sequence). It reaches that machine's daemon over the private per-user socket, the way `trellis status` does, so no token is read by the mod or by any shell, and `trellis serve` needn't be running there. Its contract is in [`docs/daemon-v1.md`](../docs/daemon-v1.md#trellis-api-browser-routes-through-the-cli-817). The pane reads its stdout and exit code:
 
-  The pane turns those into the same typed errors as `fetch`:
-
-  | Failure | Code |
+  | Outcome | Code |
   |---|---|
-  | No token file | `token_missing` |
-  | Token file not readable | `token_unreadable` |
-  | Not a token | `token_invalid` |
-  | No curl on that machine | `curl_missing` |
-  | curl exit 7 | `daemon_unreachable` |
-  | curl exit 28 | `daemon_timeout` |
-  | curl exit 63 | `response_too_large` |
-  | `exec` rejected | `machine_unreachable` |
-  | Any other curl failure | `transport_failed` |
+  | Exit 0 | the daemon's answer |
+  | Exit 1 | the daemon's own `{error}` code, unchanged |
+  | Exit 2 | the CLI's typed code: `daemon_unavailable`, `deadline_exceeded`, `route_not_allowed`, `daemon_outdated` and so on |
+  | Exit 127 | `trellis_missing` |
+  | No JSON, and clap's "unrecognized subcommand" | `trellis_outdated` |
+  | `exec` rejected with a timeout | `daemon_timeout` |
+  | `exec` rejected otherwise | `machine_unreachable` |
 
-  A daemon `{error}` answer keeps its own code. Responses are bounded by curl's `--max-filesize` and `exec`'s 8 MiB cap.
-- **The token stays on the daemon's machine.** It is never in the viewing app, its logs, mod state, or the `exec` arguments. Because the header goes through stdin (`-H @-`), it isn't in curl's argv either. Older curls without `-H @-` would need the header in argv, where the bearer token would show in that machine's process list for the length of the request; that is acceptable under T00 (same user) but isn't needed with the macOS curl. A POST body (sequence seed and pin) is in curl's argv; it holds no secret.
+  Answers are bounded by the CLI's 16 MiB and exec's 8 MiB. The CLI gives up on a silent daemon after 25 s, before exec's 30 s. A POST body (sequence seed and pin) is in the command's argv; it holds no secret.
+- **Why `fetch` stays for this computer.** The brief allowed either. `fetch` works with a daemon started before `trellis api` existed, so the owner's pane on the mini keeps working until the new binary is installed and the daemon restarts. It also spawns no process per poll. Its one gap is the missing request timeout (the runtime's `fetch` takes none); `transport: "exec"` uses the CLI here too, with its 25 s bound, and needs no token. Once every machine runs a `trellis` with `api`, switching this computer to the CLI as well would remove the token handling from the mod entirely; it would be equally bounded.
+- **The token, on this computer only.** It is never in the viewing app's logs, mod state or any `exec` argument. On another machine there is no token in the mod's path at all.
 - **Polling:** status every 5 s locally, and every 10 s for another machine, because each poll runs a command there.
-- **The fetch path still has no timeout.** The runtime's `fetch` takes none. Setting `transport: "exec"` uses curl's timeout on this computer too.
 - **Files-panel paths:** `trellis-files` publishes `on` (its space's machine). The pane follows only a file on the machine it shows, so a remote file maps to that machine's checkouts.
 
 ## Auth
@@ -206,6 +198,6 @@ Checked on the mini (2026-11-08): reinstalling the mod reloaded the pane, and `"
 1. **The synchronous-run cap** is undocumented. The numbers above are measurements, and Herdr could change them. A drawing that grows past it shows `draw_timeout` instead of hanging. Feedback asking Herdr to document the cap and report it was drafted for the owner on 2026-11-08.
 2. **No proven call targets on syntax-only indexes.** Re-centering follows the browser's proof rule (resolved, direct, fresh evidence). The isolated daemon has no semantic producer, so its views have no proven targets; it is tested with a resolved fixture.
 3. **Driving the Files panel from a script.** Nothing but a real click sets `trellis.selectedFile`. Posted mouse events need Accessibility permission, which the agent's shell doesn't have. So the in-app Sequence check used a temporary build that stood in for the selection (`src/daemon/mod.rs`) and opened the Sequence tab. The selection path itself is covered by `view.test.mjs` and the harness (`--select src/daemon/mod.rs --click tab-sequence`, against the owner's daemon on 8877).
-4. **No request timeout on this computer.** The remote path has curl's `--max-time`. Local `fetch` has none; `transport: "exec"` is the workaround.
+4. **No request timeout on this computer.** The remote path has the CLI's 25 s bound and exec's 30 s. Local `fetch` has none; `transport: "exec"` is the workaround.
 5. **Ported summary options.** They must follow `web/architecture.js`. The real fix is for the web app to export them as a pure function both sides bundle. That edit touches `web/architecture.js`, which runs 802 and 803 are changing, so it waits.
 6. **No drilled-in directories.** Only band open and fold is supported, so a directory module stays one chip.
