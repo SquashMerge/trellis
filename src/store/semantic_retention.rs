@@ -92,17 +92,16 @@ pub(super) fn discarded(
     Ok(())
 }
 
+/// The reboot-stable root identity a retention catalog is bound to.
+pub(crate) fn retention_root_key(identity: &super::topology::WorkspaceIdentity) -> String {
+    format!("{}:{}", identity.record_id, identity.inode)
+}
+
 impl Store {
     pub(crate) fn attach_retention(&self, db: &Connection) -> Result<StateDir> {
         let state = StateDir::open(&self.roots, &self.identity)?;
-        retention::attach(
-            db,
-            &state,
-            &format!(
-                "{}:{}:{}",
-                self.identity.record_id, self.identity.device, self.identity.inode
-            ),
-        )?;
+        // Never `st_dev`: APFS renumbers it across reboots (#811).
+        retention::attach(db, &state, &retention_root_key(&self.identity))?;
         Ok(state)
     }
 
@@ -259,7 +258,19 @@ impl Store {
             if !needed || attempted_generation.as_deref() == Some(&generation) {
                 continue;
             }
-            if retention::inputs_present(&options)?
+            let present = retention::inputs_present(&options)?;
+            if present && !retention::descriptor_admissible(&options, &batch_publication_limits())?
+            {
+                // An inadmissible retained descriptor is a missing input: its needs-reimport
+                // row stays published, and the slot goes so it is never queued again (#811).
+                // Releasing the hold lets cleanup strip the run's inputs.
+                db.execute(
+                    "DELETE FROM retained.retained_runs WHERE producer=?1",
+                    [&producer],
+                )?;
+                continue;
+            }
+            if present
                 && !pending
                     .iter()
                     .any(|(origin, id)| *origin == options.origin && *id == options.generation_id)

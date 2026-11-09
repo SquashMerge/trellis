@@ -25,6 +25,9 @@ use uuid::Uuid;
 pub const MAX_ARTIFACT_PATH_BYTES: usize = 4096;
 /// A transient failure for the same bytes is retried no sooner than this.
 pub const TRANSIENT_RETRY_MILLIS: u64 = 60_000;
+/// Each further consecutive failure for the same bytes and revision doubles the transient
+/// retry interval, at most this many times (64 minutes at the default interval, #811).
+pub const MAX_RETRY_DOUBLINGS: u32 = 6;
 /// Failure classes that repeat for the same bytes against the same head.
 const DETERMINISTIC_CLASSES: [&str; 4] = [
     "invalid_artifact",
@@ -114,11 +117,43 @@ pub fn decide_with_retry(
         } else {
             Decision::Import
         }
-    } else if now.saturating_sub(last.attempted_at) >= retry_ms {
-        Decision::Import
     } else {
-        Decision::Skip
+        // The backoff is for the same bytes against the same revision; a new head waits
+        // only the base interval.
+        let failures = if last.source_revision == head_revision {
+            last.failures
+        } else {
+            1
+        };
+        if now.saturating_sub(last.attempted_at) >= backoff(retry_ms, failures) {
+            Decision::Import
+        } else {
+            Decision::Skip
+        }
     }
+}
+
+/// The wait before a transient retry after `failures` consecutive failures.
+pub fn backoff(retry_ms: u64, failures: u32) -> u64 {
+    let doublings = failures.saturating_sub(1).min(MAX_RETRY_DOUBLINGS);
+    retry_ms.saturating_mul(1 << doublings)
+}
+
+/// `last` with its consecutive failure count: one more than `previous` when that also failed
+/// for the same bytes against the same revision, else one; zero when `last` is done.
+pub(super) fn counted(mut last: LastImported, previous: Option<&LastImported>) -> LastImported {
+    last.failures = if last.state == "done" {
+        0
+    } else {
+        previous
+            .filter(|p| {
+                p.state != "done"
+                    && p.sha256 == last.sha256
+                    && p.source_revision == last.source_revision
+            })
+            .map_or(1, |p| p.failures.saturating_add(1))
+    };
+    last
 }
 
 /// What `reconcile` found for the request behind a failed `lastImported`.
@@ -597,6 +632,7 @@ impl PickupOwner {
                         state: "failed".into(),
                         error_code: Some(code.clone()),
                         attempted_at,
+                        failures: 0,
                     };
                     return Ok((
                         failure(producer, &entry, Some((&sha256, &revision)), &code),
@@ -621,6 +657,7 @@ impl PickupOwner {
                 state: "failed".into(),
                 error_code: None,
                 attempted_at,
+                failures: 0,
             });
             if let Some(error) = unobservable {
                 return Err(error);
@@ -634,6 +671,7 @@ impl PickupOwner {
                 state: outcome.state.into(),
                 error_code: outcome.error_code.clone(),
                 attempted_at,
+                failures: 0,
             };
             let reply = json!({
                 "producer": producer,
@@ -658,6 +696,7 @@ impl PickupOwner {
                 let message = format!("{error:#}");
                 let class = message.split(':').next().unwrap_or(&message);
                 last.error_code = Some(class.chars().take(120).collect());
+                let last = counted(last, entry.last_imported.as_ref());
                 let _ = self.record_last(state, &mut config, producer, last);
                 return Err(error);
             }
@@ -668,6 +707,7 @@ impl PickupOwner {
         };
         let (reply, last) = result?;
         if let Some(last) = last {
+            let last = counted(last, entry.last_imported.as_ref());
             self.record_last(state, &mut config, producer, last)?;
         }
         Ok(reply)
@@ -722,6 +762,7 @@ fn unchanged(
         state: "done".into(),
         error_code: None,
         attempted_at: now_millis(),
+        failures: 0,
     });
     let reply = json!({
         "producer": producer,
