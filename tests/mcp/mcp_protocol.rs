@@ -736,6 +736,65 @@ for (const {name, structuredContent} of inputs) {
     let output = child.wait_with_output().unwrap();
     crate::child::assert_cli_success(&output, "structuredContent schema validation");
 }
+/// #785: the golden accepts the classified rule evidence and rejects nothing the rules tools
+/// will emit; every new field is optional there and closed in its own object.
+#[test]
+fn rules_envelopes_accept_classified_evidence_and_kind_counts() {
+    let sid = |c: &str| format!("sid:v1:{}", c.repeat(32));
+    let document = json!({"sourceSetId":"app","language":"rust","path":"src/low.rs"});
+    let identity =
+        json!({"sourceSetId":"app","language":"rust","path":"src/low.rs","sid":sid("a")});
+    let destination =
+        json!({"sourceSetId":"app","language":"rust","path":"src/top.rs","sid":sid("b")});
+    let evidence = |extra: Value| {
+        let mut row = json!({"document":document,"revisionId":"r","range":{"start":0,"end":4},
+            "kind":"structuralReference","syntaxId":sid("c"),"callId":null,"provenanceId":"p",
+            "caller":null,"callerReason":"syntax_only"});
+        row.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        row
+    };
+    let unbound = evidence(
+        json!({"lines":null,"relationKind":"reference","spelling":"crate::top::T",
+        "owner":null,"target":null,"targetReason":"unresolved"}),
+    );
+    let bound = evidence(json!({"kind":"semanticBinding","lines":{"start":3,"end":3},
+        "relationKind":"call","spelling":"target",
+        "owner":{"syntaxId":sid("d"),"name":"run","stableLookupKey":"src/low.rs::run"},
+        "target":{"syntaxId":sid("e"),"displayKey":"src/top.rs#target","document":
+            {"sourceSetId":"app","language":"rust","path":"src/top.rs"},"lines":{"start":1,"end":2}},
+        "targetReason":null}));
+    let module_level = evidence(json!({"lines":{"start":1,"end":1},"relationKind":"import",
+        "spelling":"crate::top","owner":{"syntaxId":sid("a"),"name":null,"stableLookupKey":null},
+        "target":null,"targetReason":"structural_only"}));
+    let constraint = json!({"mode":"require","kind":"calls","targetRole":"any","status":"conforms",
+        "evidence":[evidence(json!({}))],"unresolved":[]});
+    let instance = json!({"rule":"$layers","target":identity,"destination":destination,
+        "sourceLayer":"low","destinationLayer":"top","status":"deviates","excepted":false,
+        "exceptionReason":null,"constraints":[constraint],
+        "evidence":[unbound,bound,module_level],"unresolved":[],"referenceCount":3,
+        "omittedEvidence":0,"kindCounts":{"call":1,"type":0,"import":1,"reference":1}});
+    let counts = json!({"comparable":1,"conforms":0,"deviates":1,"unknown":0,"excepted":0});
+    let envelope = |page: Value| {
+        json!({"schemaVersion":1,"requestId":"1",
+            "evidenceBasis":{"indexGeneration":"11111111-1111-4111-8111-111111111111","indexRevision":1},
+            "data":{"rulesVersion":"rules:v2","indexGeneration":"g","indexRevision":1,
+                "rulesFile":{"path":".trellis/rules.toml","source":"checkout-config","contentHash":"0".repeat(64)},
+                "instances":[instance],"testOnly":[],"counts":counts,"testCounts":counts,
+                "unassignedFileCount":0,"unassigned":[],"partialFiles":[],"limitations":[],
+                "externalPackages":[],"page":page,"semanticBases":[]},
+            "warnings":[],"partial":false,"truncated":false,"truncationReason":null,
+            "workspace":"/selected","catchingUp":false})
+    };
+    validate_structured_content(&[
+        json!({"name":"trellis_rules_check","structuredContent":
+            envelope(json!({"offset":0,"nextOffset":null,"total":1,"status":null}))}),
+        json!({"name":"trellis_rules_explain","structuredContent":
+            envelope(json!({"offset":0,"nextOffset":null,"total":1}))}),
+    ]);
+}
+
 fn expected_envelope(
     id: &Value,
     code: Option<&str>,
@@ -11126,8 +11185,24 @@ async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_i
     assert_eq!(edge["count"], 2);
     assert_eq!(edge["sites"].as_array().unwrap().len(), 1);
     assert_eq!(edge["omittedSites"], 1);
+    // #785: exact kind counts, and the owner and target fields of every site.
+    assert_eq!(
+        edge["kindCounts"],
+        json!({"call":0,"type":0,"import":2,"reference":0})
+    );
+    let site = &edge["sites"][0];
+    assert_eq!(site["relationKind"], "import");
+    assert_eq!(site["owner"]["syntaxId"], site["ownerSyntaxId"]);
+    assert_eq!(site["owner"]["name"], Value::Null);
+    assert_eq!(site["target"], Value::Null);
+    assert_eq!(site["targetReason"], "structural_only");
     assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
     assert_eq!(data["unresolved"][0]["source"], modules[0]["identity"]);
+    assert!(data["unresolved"][0]["site"]["owner"].is_object());
+    assert_eq!(
+        data["unresolved"][0]["site"]["targetReason"],
+        "structural_only"
+    );
     assert_eq!(
         data["counts"],
         json!({"scannedDocuments":1,"mappedSites":2,"unresolvedSites":1,"semanticSites":0})
@@ -11188,6 +11263,11 @@ async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_i
     }
     assert!(pages.len() > 1, "selected evidence spans several pages");
     assert_eq!(unresolved.len(), 300);
+    for row in &unresolved {
+        assert!(row["site"]["owner"].is_object());
+        assert!(row["site"]["target"].is_null());
+        assert_eq!(row["site"]["targetReason"], "structural_only");
+    }
     let past = ask(
         90,
         json!({"schemaVersion":1,"expectedBasis":basis,"paths":["module_001.js"],"offset":10_000}),
@@ -11461,6 +11541,20 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
     // #725: check keeps one witness per instance; explain samples by its `limit`.
     assert_eq!(unknown["evidence"].as_array().unwrap().len(), 1);
     assert_eq!(unknown["omittedEvidence"], 299);
+    // #785: the sampled witness is classified and the kind counts cover every site.
+    let counts = &unknown["kindCounts"];
+    let total: u64 = ["call", "type", "import", "reference"]
+        .iter()
+        .map(|kind| counts[*kind].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 300, "{unknown}");
+    let witness = &unknown["evidence"][0];
+    assert_eq!(witness["relationKind"], "import", "{witness}");
+    assert!(witness["lines"]["start"].as_u64().unwrap() >= 1);
+    assert!(witness["spelling"].as_str().unwrap().contains("external"));
+    assert!(witness["owner"].is_object(), "{witness}");
+    assert_eq!(witness["targetReason"], "structural_only");
+    assert!(witness["target"].is_null());
     assert_eq!(data["page"]["offset"], 0);
     structured.push(json!({"name":"trellis_rules_check","structuredContent":envelope.clone()}));
     // The unscoped check pages too; its concatenated instances keep every row.
@@ -11483,6 +11577,19 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
             "every page carries the whole-result counts"
         );
         instances += data["instances"].as_array().unwrap().len();
+        for row in data["instances"].as_array().unwrap() {
+            if row["rule"] == "$layers" || row["rule"] == "$external" {
+                let total: u64 = ["call", "type", "import", "reference"]
+                    .iter()
+                    .map(|kind| row["kindCounts"][*kind].as_u64().unwrap())
+                    .sum();
+                assert_eq!(total, row["referenceCount"].as_u64().unwrap(), "{row}");
+                let witness = &row["evidence"][0];
+                assert!(witness["relationKind"].is_string(), "{row}");
+                assert!(witness["owner"].is_object(), "{row}");
+                assert!(witness["targetReason"].is_string(), "{row}");
+            }
+        }
         structured.push(json!({"name":"trellis_rules_check",
             "structuredContent":page["result"]["structuredContent"]}));
         pages += 1;
@@ -11505,6 +11612,14 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
     let row = &explained["result"]["structuredContent"]["data"]["instances"][0];
     assert_eq!(row["evidence"].as_array().unwrap().len(), 2);
     assert_eq!(row["omittedEvidence"], 298);
+    assert_eq!(row["kindCounts"]["import"], 300, "{row}");
+    for item in row["evidence"].as_array().unwrap() {
+        assert!(item["lines"]["start"].as_u64().unwrap() >= 1, "{item}");
+        assert_eq!(item["relationKind"], "import", "{item}");
+        assert!(item["spelling"].is_string(), "{item}");
+        assert!(item["owner"].is_object(), "{item}");
+        assert_eq!(item["targetReason"], "structural_only", "{item}");
+    }
     structured.push(json!({"name":"trellis_rules_explain",
         "structuredContent":explained["result"]["structuredContent"]}));
     let references = ask(

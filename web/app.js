@@ -147,8 +147,11 @@ function captureSourceEntry() {
     scroll:{source:offsets("source"), panel:offsets("workspace-source-panel"), dock:offsets("source-dock"),
       x:window.scrollX || 0, y:window.scrollY || 0}};
 }
-function sequenceHash(id, revision) {
+const SEQUENCE_LINK_CALL_IDS = 50, CALL_ID = /^occ:v2:[0-9a-f]{32}$/;
+function sequenceHash(id, revision, boundary = null) {
   const query = new URLSearchParams({sid:id, rootKey:selectedRootKey, indexGeneration:revision.indexGeneration, indexRevision:String(revision.indexRevision)});
+  const callIds = boundary?.symbolId === id ? boundary.callIds : [];
+  if (callIds.length >= 1 && callIds.length <= SEQUENCE_LINK_CALL_IDS) for (const callId of callIds) query.append("callId", callId);
   return `#sequence?${query}`;
 }
 async function navigateDiagram(symbol, revision, kind = "sequence", admitted = null, showAll = false, boundary = null, architectureEntry = null) {
@@ -161,9 +164,9 @@ async function navigateDiagram(symbol, revision, kind = "sequence", admitted = n
   if (architectureEntry) rememberNavigation({kind:"architecture", architecture:architectureEntry}, true, "#architecture");
   else if (source) rememberNavigation(source, true, "#source");
   else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id && IndexPin.equal(diagramSequence.revision, revision)) {
-    rememberNavigation({kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked, boundary:sequenceBoundary}, true, sequenceHash(selectedMethod.id, revision));
+    rememberNavigation({kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked, boundary:sequenceBoundary}, true, sequenceHash(selectedMethod.id, revision, sequenceBoundary));
   } else if (!window.location?.hash) rememberNavigation({kind:"unavailable"}, true, "");
-  rememberNavigation({kind, symbol, admitted, showAll, boundary}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
+  rememberNavigation({kind, symbol, admitted, showAll, boundary}, false, kind === "sequence" ? sequenceHash(symbol.id, revision, boundary) : "#classes");
   window.TrellisClasses?.reset();
   clearSource(); diagramSequence = null;
   await setSection("diagrams", kind === "class" ? "classes" : "sequence");
@@ -271,6 +274,10 @@ async function readNavigationLocation(force = false) {
       const requested = IndexPin.copy({indexGeneration:query.get("indexGeneration"), indexRevision:Number(value)});
       if (!IndexPin.equal(requested, revision)) throw new Error("Sequence link is stale for the selected index snapshot. Reload or select a current link.");
     }
+    const callIds = query.getAll("callId");
+    if (callIds.length && (callIds.length > SEQUENCE_LINK_CALL_IDS || new Set(callIds).size !== callIds.length || !callIds.every(callId => CALL_ID.test(callId)) ||
+        !query.has("rootKey") || !query.has("indexGeneration") || !query.has("indexRevision"))) throw new Error("Sequence link has invalid call IDs.");
+    const boundary = callIds.length ? {symbolId:id, callIds} : null;
     clearSource(); diagramSequence = null;
     await setSection("diagrams", "sequence");
     if (!current()) return;
@@ -281,8 +288,8 @@ async function readNavigationLocation(force = false) {
     if (!IndexPin.equal(data?.revision, revision) || data?.seed?.id !== id) throw new Error("Sequence link provenance mismatch. Nothing displayed.");
     $("all-steps").checked = false;
     // A resolved route stores only a key in browser history; seed/DTO remain in memory.
-    rememberNavigation({kind:"sequence", symbol:data.seed, admitted:data, showAll:false}, true, hash);
-    await selectMethod(data.seed, data, current);
+    rememberNavigation({kind:"sequence", symbol:data.seed, admitted:data, showAll:false, boundary}, true, hash);
+    await selectMethod(data.seed, data, current, boundary);
   } catch (error) {
     if (current() && error.name !== "AbortError") navigationError(`Cannot open sequence: ${error.message}`);
   }
@@ -1633,6 +1640,7 @@ function highlightSequenceBoundary(data, options) {
     const show = element("button", "Show all steps"); show.type = "button";
     show.addEventListener("click", () => { if (options.isCurrent()) { $("all-steps").checked = true; void loadSequence(); } }); notice.append(show);
   }
+  if (focus.callIds.length > SEQUENCE_LINK_CALL_IDS) notice.append(element("span", `Links keep at most ${SEQUENCE_LINK_CALL_IDS} highlighted calls, so reloading this link shows the sequence without highlights.`));
   if (first) first.scrollIntoView({block:"nearest", inline:"nearest"});
 }
 async function loadSequence(admitted = null, preserveSource = false, callerCurrent = () => true) {

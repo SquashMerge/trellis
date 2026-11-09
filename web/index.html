@@ -20,6 +20,7 @@
   <script src="/viewer-metrics.js" defer></script>
   <script src="/files.js" defer></script>
   <script src="/architecture-pele.js" defer></script>
+  <script src="/architecture-deviations.js" defer></script>
   <script src="/architecture.js" defer></script>
   <link rel="stylesheet" href="/treemap.css">
   <script src="/treemap-pele.js" defer></script>
@@ -195,6 +196,7 @@
               </section>
             </section>
             <div class="architecture-status"><p id="architecture-state" role="status" aria-live="polite">Open Architecture to read the indexed snapshot and reviewed rules.</p></div>
+            <section id="architecture-deviations" aria-labelledby="architecture-deviations-title" hidden></section>
             <div id="architecture-diagram" tabindex="0" aria-label="Authored layer architecture. Select a layer band to fold it or a module chip to open its files; select a file or edge for evidence."><div id="architecture-hidden" class="architecture-display-footer" hidden><button id="architecture-hidden-toggle" type="button" aria-expanded="false" aria-controls="architecture-diagram"></button><span id="architecture-hidden-names" class="detail"></span></div></div>
             <div id="architecture-legend" class="metric-legend" aria-label="Architecture metric heat legend"></div>
             <div class="architecture-edge-legend" role="group" aria-label="Arrow key"><span class="architecture-key"><b>↓</b> down · allowed</span><span class="architecture-key" data-tone="error"><b>↑</b> up · deviation</span><span class="architecture-key" data-tone="error"><b>↔</b> peer</span><span class="architecture-key"><b>→</b> into shared</span><span class="architecture-key" data-tone="error"><b>←</b> shared out</span><span class="architecture-key"><b>≥</b> lower bound</span><span class="architecture-key"><b>%</b> source sites mapped</span><span class="architecture-key"><b class="architecture-key-line"></b> production</span><span class="architecture-key"><b class="architecture-key-line" data-dash="true"></b> test-only</span><span class="architecture-key" data-tone="dim"><b class="architecture-key-line"></b> dimmed: allowed or excepted</span><span class="architecture-key"><b class="architecture-key-line" data-tone="neutral"></b> grey: unknown verdict</span><span class="architecture-key architecture-key-widths" aria-label="Arrow width grows with reference sites: 1, 10, 100, 1000 or more">width: <b class="architecture-key-line" data-width="1"></b> 1 <b class="architecture-key-line" data-width="10"></b> 10 <b class="architecture-key-line" data-width="100"></b> 100 <b class="architecture-key-line" data-width="1000"></b> ≥1000 sites</span>
