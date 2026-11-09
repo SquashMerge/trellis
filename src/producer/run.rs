@@ -501,7 +501,7 @@ impl Run<'_> {
             &prepared.pin,
             &dir_text,
         );
-        let rules = profiles::rules(&row);
+        let rules = &prepared.rules;
 
         if self.cancelled() {
             return Ok(self.cancel_finish(None));
@@ -512,7 +512,7 @@ impl Run<'_> {
                 reader.header()?.revision.id == revision,
                 "stale_basis: head revision changed"
             );
-            worktree::materialize(reader, &rules, &self.dir, &self.active.cancel)
+            worktree::materialize(reader, rules, &self.dir, &self.active.cancel)
         });
         if let Err(error) = materialized {
             return Ok(self.finish_from_error(&error, None));

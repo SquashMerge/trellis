@@ -11,14 +11,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:5c6cde7c300b70a166528216ae6f1f0c",
+      "nativeId": "occ:v2:7d7a50158232a27f32ea9961d511ecb0",
       "ownerRef": "2:r1:sid:v1:41fb0d71c1b577fe3aa9d3e2a59e34c1",
       "range": {
         "encoding": "utf8",
         "end": 118,
         "start": 92
       },
-      "ref": "2:r1:occ:v2:5c6cde7c300b70a166528216ae6f1f0c",
+      "ref": "2:r1:occ:v2:7d7a50158232a27f32ea9961d511ecb0",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "freeze",
@@ -39,22 +39,22 @@
     {
       "calleeRange": {
         "encoding": "utf8",
-        "end": 371,
-        "start": 368
+        "end": 422,
+        "start": 419
       },
       "document": {
         "language": "typescript",
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:095e1c6ea8dfea4ead5102c3097a4374",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:73050865ea6a4becf9e261e25a18f337",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 384,
-        "start": 360
+        "end": 434,
+        "start": 411
       },
-      "ref": "2:r1:occ:v2:095e1c6ea8dfea4ead5102c3097a4374",
+      "ref": "2:r1:occ:v2:73050865ea6a4becf9e261e25a18f337",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "log",
@@ -64,8 +64,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 371,
-              "start": 368
+              "end": 422,
+              "start": 419
             },
             "text": "log"
           }
@@ -75,22 +75,22 @@
     {
       "calleeRange": {
         "encoding": "utf8",
-        "end": 411,
-        "start": 406
+        "end": 463,
+        "start": 458
       },
       "document": {
         "language": "typescript",
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:2da6e1f2825c27dde2c7f8f2c7290dec",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:8bc226bfd36b0bc13990471b92251b75",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 423,
-        "start": 397
+        "end": 475,
+        "start": 449
       },
-      "ref": "2:r1:occ:v2:2da6e1f2825c27dde2c7f8f2c7290dec",
+      "ref": "2:r1:occ:v2:8bc226bfd36b0bc13990471b92251b75",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "apply",
@@ -100,8 +100,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 411,
-              "start": 406
+              "end": 463,
+              "start": 458
             },
             "text": "apply"
           }
@@ -111,22 +111,22 @@
     {
       "calleeRange": {
         "encoding": "utf8",
-        "end": 782,
-        "start": 775
+        "end": 841,
+        "start": 834
       },
       "document": {
         "language": "typescript",
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:e9a308fea377fac463368fac9af35bf2",
+      "nativeId": "occ:v2:9f61fb15c213865fab9322ef7a806f26",
       "ownerRef": "2:r1:sid:v1:92a2f7f18241894224faceeb4c6b338d",
       "range": {
         "encoding": "utf8",
-        "end": 785,
-        "start": 763
+        "end": 844,
+        "start": 822
       },
-      "ref": "2:r1:occ:v2:e9a308fea377fac463368fac9af35bf2",
+      "ref": "2:r1:occ:v2:9f61fb15c213865fab9322ef7a806f26",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "toFixed",
@@ -136,8 +136,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 782,
-              "start": 775
+              "end": 841,
+              "start": 834
             },
             "text": "toFixed"
           }
@@ -147,22 +147,22 @@
     {
       "calleeRange": {
         "encoding": "utf8",
-        "end": 772,
-        "start": 768
+        "end": 831,
+        "start": 827
       },
       "document": {
         "language": "typescript",
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:5f95ea8b207041f3812f66cdcf62f916",
+      "nativeId": "occ:v2:2e3d79ec9210c49d292fe05f5a0ba64f",
       "ownerRef": "2:r1:sid:v1:92a2f7f18241894224faceeb4c6b338d",
       "range": {
         "encoding": "utf8",
-        "end": 774,
-        "start": 763
+        "end": 833,
+        "start": 822
       },
-      "ref": "2:r1:occ:v2:5f95ea8b207041f3812f66cdcf62f916",
+      "ref": "2:r1:occ:v2:2e3d79ec9210c49d292fe05f5a0ba64f",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "area",
@@ -172,8 +172,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 772,
-              "start": 768
+              "end": 831,
+              "start": 827
             },
             "text": "area"
           }
@@ -187,14 +187,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:9c556e2da1e35c1d178d17eea4584b38",
+      "nativeId": "occ:v2:216f4c2bbcce2b26ff2e88398d07fc0d",
       "ownerRef": "2:r1:sid:v1:dbe9c81d2e79469c0228b5495ee5eaa3",
       "range": {
         "encoding": "utf8",
-        "end": 968,
-        "start": 961
+        "end": 1027,
+        "start": 1020
       },
-      "ref": "2:r1:occ:v2:9c556e2da1e35c1d178d17eea4584b38",
+      "ref": "2:r1:occ:v2:216f4c2bbcce2b26ff2e88398d07fc0d",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "super",
@@ -204,8 +204,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 966,
-              "start": 961
+              "end": 1025,
+              "start": 1020
             },
             "text": "super"
           }
@@ -215,22 +215,58 @@
     {
       "calleeRange": {
         "encoding": "utf8",
-        "end": 1187,
-        "start": 1178
+        "end": 1176,
+        "start": 1170
       },
       "document": {
         "language": "typescript",
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:7b4212e704d00bf257e38e407d084d56",
+      "nativeId": "occ:v2:ca705d91a119273de6b3aeb4ac66f286",
+      "ownerRef": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
+      "range": {
+        "encoding": "utf8",
+        "end": 1185,
+        "start": 1170
+      },
+      "ref": "2:r1:occ:v2:ca705d91a119273de6b3aeb4ac66f286",
+      "regionRefs": [],
+      "revisionId": "r1",
+      "spelling": "logged",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "end": 1176,
+              "start": 1170
+            },
+            "text": "logged"
+          }
+        }
+      ]
+    },
+    {
+      "calleeRange": {
+        "encoding": "utf8",
+        "end": 1255,
+        "start": 1246
+      },
+      "document": {
+        "language": "typescript",
+        "path": "src/geometry.ts",
+        "sourceSetId": "main"
+      },
+      "nativeId": "occ:v2:bb24b20bdc6ea1555f4372703a28ece3",
       "ownerRef": "2:r1:sid:v1:5225a16160e4172ca327892521c5fb60",
       "range": {
         "encoding": "utf8",
-        "end": 1242,
-        "start": 1174
+        "end": 1310,
+        "start": 1242
       },
-      "ref": "2:r1:occ:v2:7b4212e704d00bf257e38e407d084d56",
+      "ref": "2:r1:occ:v2:bb24b20bdc6ea1555f4372703a28ece3",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "Rectangle",
@@ -240,10 +276,46 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1187,
-              "start": 1178
+              "end": 1255,
+              "start": 1246
             },
             "text": "Rectangle"
+          }
+        }
+      ]
+    },
+    {
+      "calleeRange": {
+        "encoding": "utf8",
+        "end": 1423,
+        "start": 1417
+      },
+      "document": {
+        "language": "typescript",
+        "path": "src/geometry.ts",
+        "sourceSetId": "main"
+      },
+      "nativeId": "occ:v2:5cdd050e39bf6623e2278a4921ed180a",
+      "ownerRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
+      "range": {
+        "encoding": "utf8",
+        "end": 1426,
+        "start": 1413
+      },
+      "ref": "2:r1:occ:v2:5cdd050e39bf6623e2278a4921ed180a",
+      "regionRefs": [],
+      "revisionId": "r1",
+      "spelling": "Square",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "end": 1423,
+              "start": 1417
+            },
+            "text": "Square"
           }
         }
       ]
@@ -255,14 +327,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:8861a0e76e1ad7b75c70f67ae978c195",
+      "nativeId": "occ:v2:30628e4377aab6c12c399ec6a703e63e",
       "ownerRef": "2:r1:sid:v1:20260f49d1c81783f14905a5d9975d41",
       "range": {
         "encoding": "utf8",
-        "end": 1411,
-        "start": 1384
+        "end": 1490,
+        "start": 1463
       },
-      "ref": "2:r1:occ:v2:8861a0e76e1ad7b75c70f67ae978c195",
+      "ref": "2:r1:occ:v2:30628e4377aab6c12c399ec6a703e63e",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "super",
@@ -272,8 +344,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1389,
-              "start": 1384
+              "end": 1468,
+              "start": 1463
             },
             "text": "super"
           }
@@ -283,22 +355,22 @@
     {
       "calleeRange": {
         "encoding": "utf8",
-        "end": 1467,
-        "start": 1463
+        "end": 1546,
+        "start": 1542
       },
       "document": {
         "language": "typescript",
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:163d8cb34ef24cb731d273d326b85d7d",
+      "nativeId": "occ:v2:449abf4230667b6e70c461b5e5e3d942",
       "ownerRef": "2:r1:sid:v1:4a84e0f6e56c232002106f902bf12e6c",
       "range": {
         "encoding": "utf8",
-        "end": 1469,
-        "start": 1457
+        "end": 1548,
+        "start": 1536
       },
-      "ref": "2:r1:occ:v2:163d8cb34ef24cb731d273d326b85d7d",
+      "ref": "2:r1:occ:v2:449abf4230667b6e70c461b5e5e3d942",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "area",
@@ -308,8 +380,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1467,
-              "start": 1463
+              "end": 1546,
+              "start": 1542
             },
             "text": "area"
           }
@@ -319,22 +391,22 @@
     {
       "calleeRange": {
         "encoding": "utf8",
-        "end": 1572,
-        "start": 1566
+        "end": 1651,
+        "start": 1645
       },
       "document": {
         "language": "typescript",
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:93fa4195fc2fb77abfc4a65c3d4c3009",
+      "nativeId": "occ:v2:e45843dcaae50df37f80dc3ec2bb5f70",
       "ownerRef": "2:r1:sid:v1:94a78571832efedf745c8133216e539e",
       "range": {
         "encoding": "utf8",
-        "end": 1611,
-        "start": 1559
+        "end": 1690,
+        "start": 1638
       },
-      "ref": "2:r1:occ:v2:93fa4195fc2fb77abfc4a65c3d4c3009",
+      "ref": "2:r1:occ:v2:e45843dcaae50df37f80dc3ec2bb5f70",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "assign",
@@ -344,8 +416,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1572,
-              "start": 1566
+              "end": 1651,
+              "start": 1645
             },
             "text": "assign"
           }
@@ -355,22 +427,22 @@
     {
       "calleeRange": {
         "encoding": "utf8",
-        "end": 1627,
-        "start": 1621
+        "end": 1706,
+        "start": 1700
       },
       "document": {
         "language": "typescript",
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:4a5487ddd21bb2b7e7141623477a7a0c",
+      "nativeId": "occ:v2:5064590808080de4119f7226a30cabf3",
       "ownerRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 1629,
-        "start": 1621
+        "end": 1708,
+        "start": 1700
       },
-      "ref": "2:r1:occ:v2:4a5487ddd21bb2b7e7141623477a7a0c",
+      "ref": "2:r1:occ:v2:5064590808080de4119f7226a30cabf3",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "sealed",
@@ -380,8 +452,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1627,
-              "start": 1621
+              "end": 1706,
+              "start": 1700
             },
             "text": "sealed"
           }
@@ -395,14 +467,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:75330b3401f9bd3c34edbb7e90a90402",
+      "nativeId": "occ:v2:0daef38f34796e1a03d0c29efc66e8e6",
       "ownerRef": "2:r1:sid:v1:b88d006c86386194b7940d180ef9486d",
       "range": {
         "encoding": "utf8",
-        "end": 1726,
-        "start": 1719
+        "end": 1805,
+        "start": 1798
       },
-      "ref": "2:r1:occ:v2:75330b3401f9bd3c34edbb7e90a90402",
+      "ref": "2:r1:occ:v2:0daef38f34796e1a03d0c29efc66e8e6",
       "regionRefs": [],
       "revisionId": "r1",
       "spelling": "super",
@@ -412,8 +484,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1724,
-              "start": 1719
+              "end": 1803,
+              "start": 1798
             },
             "text": "super"
           }
@@ -3139,7 +3211,7 @@
       "parentRef": null,
       "range": {
         "encoding": "utf8",
-        "end": 1864,
+        "end": 1943,
         "start": 0
       },
       "ref": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
@@ -3271,22 +3343,12 @@
         "name": "logged",
         "parameters": [
           {
-            "name": "_target",
-            "type": "object",
-            "variadic": false
-          },
-          {
-            "name": "key",
+            "name": "label",
             "type": "string",
-            "variadic": false
-          },
-          {
-            "name": "descriptor",
-            "type": "PropertyDescriptor",
             "variadic": false
           }
         ],
-        "resultType": "void",
+        "resultType": null,
         "typeParameters": []
       },
       "kind": "function",
@@ -3300,7 +3362,7 @@
       "parentRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 431,
+        "end": 490,
         "start": 145
       },
       "ref": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
@@ -3335,8 +3397,78 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 168,
+              "end": 166,
               "start": 161
+            },
+            "text": "label"
+          }
+        },
+        {
+          "field": "header.parameters[0].type",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "end": 174,
+              "start": 168
+            },
+            "text": "string"
+          }
+        }
+      ]
+    },
+    {
+      "document": {
+        "language": "typescript",
+        "path": "src/geometry.ts",
+        "sourceSetId": "main"
+      },
+      "header": {
+        "bases": [],
+        "kind": "anonymousFunction",
+        "modifiers": [],
+        "name": null,
+        "parameters": [
+          {
+            "name": "_target",
+            "type": "object",
+            "variadic": false
+          },
+          {
+            "name": "key",
+            "type": "string",
+            "variadic": false
+          },
+          {
+            "name": "descriptor",
+            "type": "PropertyDescriptor",
+            "variadic": false
+          }
+        ],
+        "resultType": "void",
+        "typeParameters": []
+      },
+      "kind": "anonymousFunction",
+      "name": null,
+      "nameRange": null,
+      "nativeId": "sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
+      "parentRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "range": {
+        "encoding": "utf8",
+        "end": 487,
+        "start": 187
+      },
+      "ref": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
+      "revisionId": "r1",
+      "role": "production",
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "header.parameters[0].name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "end": 195,
+              "start": 188
             },
             "text": "_target"
           }
@@ -3346,8 +3478,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 176,
-              "start": 170
+              "end": 203,
+              "start": 197
             },
             "text": "object"
           }
@@ -3357,8 +3489,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 181,
-              "start": 178
+              "end": 208,
+              "start": 205
             },
             "text": "key"
           }
@@ -3368,8 +3500,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 189,
-              "start": 183
+              "end": 216,
+              "start": 210
             },
             "text": "string"
           }
@@ -3379,8 +3511,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 201,
-              "start": 191
+              "end": 228,
+              "start": 218
             },
             "text": "descriptor"
           }
@@ -3390,8 +3522,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 221,
-              "start": 203
+              "end": 248,
+              "start": 230
             },
             "text": "PropertyDescriptor"
           }
@@ -3401,8 +3533,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 228,
-              "start": 224
+              "end": 255,
+              "start": 251
             },
             "text": "void"
           }
@@ -3428,17 +3560,17 @@
       "name": "original",
       "nameRange": {
         "encoding": "utf8",
-        "end": 247,
-        "start": 239
+        "end": 279,
+        "start": 271
       },
-      "nativeId": "sid:v1:4505693bfd2320d470ff1e9f0ca3c999",
-      "parentRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "sid:v1:e6a64dc6639bf98e06a6419ee98fa4aa",
+      "parentRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 301,
-        "start": 239
+        "end": 333,
+        "start": 271
       },
-      "ref": "2:r1:sid:v1:4505693bfd2320d470ff1e9f0ca3c999",
+      "ref": "2:r1:sid:v1:e6a64dc6639bf98e06a6419ee98fa4aa",
       "revisionId": "r1",
       "role": "production",
       "signature": null,
@@ -3448,8 +3580,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 247,
-              "start": 239
+              "end": 279,
+              "start": 271
             },
             "text": "original"
           }
@@ -3459,8 +3591,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 247,
-              "start": 239
+              "end": 279,
+              "start": 271
             },
             "text": "original"
           }
@@ -3502,15 +3634,15 @@
       "name": "tagged",
       "nameRange": {
         "encoding": "utf8",
-        "end": 448,
-        "start": 442
+        "end": 507,
+        "start": 501
       },
       "nativeId": "sid:v1:10f173e969ea24448731b5520a45b269",
       "parentRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 513,
-        "start": 433
+        "end": 572,
+        "start": 492
       },
       "ref": "2:r1:sid:v1:10f173e969ea24448731b5520a45b269",
       "revisionId": "r1",
@@ -3522,8 +3654,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 448,
-              "start": 442
+              "end": 507,
+              "start": 501
             },
             "text": "tagged"
           }
@@ -3533,8 +3665,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 448,
-              "start": 442
+              "end": 507,
+              "start": 501
             },
             "text": "tagged"
           }
@@ -3544,8 +3676,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 456,
-              "start": 449
+              "end": 515,
+              "start": 508
             },
             "text": "_target"
           }
@@ -3555,8 +3687,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 464,
-              "start": 458
+              "end": 523,
+              "start": 517
             },
             "text": "object"
           }
@@ -3566,8 +3698,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 470,
-              "start": 466
+              "end": 529,
+              "start": 525
             },
             "text": "_key"
           }
@@ -3577,8 +3709,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 487,
-              "start": 472
+              "end": 546,
+              "start": 531
             },
             "text": "string | symbol"
           }
@@ -3588,8 +3720,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 495,
-              "start": 489
+              "end": 554,
+              "start": 548
             },
             "text": "_index"
           }
@@ -3599,8 +3731,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 503,
-              "start": 497
+              "end": 562,
+              "start": 556
             },
             "text": "number"
           }
@@ -3610,8 +3742,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 510,
-              "start": 506
+              "end": 569,
+              "start": 565
             },
             "text": "void"
           }
@@ -3637,15 +3769,15 @@
       "name": "Measurable",
       "nameRange": {
         "encoding": "utf8",
-        "end": 542,
-        "start": 532
+        "end": 601,
+        "start": 591
       },
       "nativeId": "sid:v1:61af38151d19ba34dc91d217ed898d9d",
       "parentRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 587,
-        "start": 522
+        "end": 646,
+        "start": 581
       },
       "ref": "2:r1:sid:v1:61af38151d19ba34dc91d217ed898d9d",
       "revisionId": "r1",
@@ -3657,8 +3789,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 542,
-              "start": 532
+              "end": 601,
+              "start": 591
             },
             "text": "Measurable"
           }
@@ -3668,8 +3800,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 542,
-              "start": 532
+              "end": 601,
+              "start": 591
             },
             "text": "Measurable"
           }
@@ -3695,15 +3827,15 @@
       "name": "area",
       "nameRange": {
         "encoding": "utf8",
-        "end": 551,
-        "start": 547
+        "end": 610,
+        "start": 606
       },
       "nativeId": "sid:v1:df2dc493886852bbc7fe817e6c0a2523",
       "parentRef": "2:r1:sid:v1:61af38151d19ba34dc91d217ed898d9d",
       "range": {
         "encoding": "utf8",
-        "end": 561,
-        "start": 547
+        "end": 620,
+        "start": 606
       },
       "ref": "2:r1:sid:v1:df2dc493886852bbc7fe817e6c0a2523",
       "revisionId": "r1",
@@ -3715,8 +3847,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 551,
-              "start": 547
+              "end": 610,
+              "start": 606
             },
             "text": "area"
           }
@@ -3726,8 +3858,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 551,
-              "start": 547
+              "end": 610,
+              "start": 606
             },
             "text": "area"
           }
@@ -3737,8 +3869,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 561,
-              "start": 555
+              "end": 620,
+              "start": 614
             },
             "text": "number"
           }
@@ -3764,15 +3896,15 @@
       "name": "perimeter",
       "nameRange": {
         "encoding": "utf8",
-        "end": 574,
-        "start": 565
+        "end": 633,
+        "start": 624
       },
       "nativeId": "sid:v1:58b705ef6a80740fdcd1a25ef6a012ce",
       "parentRef": "2:r1:sid:v1:61af38151d19ba34dc91d217ed898d9d",
       "range": {
         "encoding": "utf8",
-        "end": 584,
-        "start": 565
+        "end": 643,
+        "start": 624
       },
       "ref": "2:r1:sid:v1:58b705ef6a80740fdcd1a25ef6a012ce",
       "revisionId": "r1",
@@ -3784,8 +3916,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 574,
-              "start": 565
+              "end": 633,
+              "start": 624
             },
             "text": "perimeter"
           }
@@ -3795,8 +3927,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 574,
-              "start": 565
+              "end": 633,
+              "start": 624
             },
             "text": "perimeter"
           }
@@ -3806,8 +3938,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 584,
-              "start": 578
+              "end": 643,
+              "start": 637
             },
             "text": "number"
           }
@@ -3835,15 +3967,15 @@
       "name": "Shape",
       "nameRange": {
         "encoding": "utf8",
-        "end": 616,
-        "start": 611
+        "end": 675,
+        "start": 670
       },
       "nativeId": "sid:v1:2269896ca380b25af31e4033a1a79716",
       "parentRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 794,
-        "start": 596
+        "end": 853,
+        "start": 655
       },
       "ref": "2:r1:sid:v1:2269896ca380b25af31e4033a1a79716",
       "revisionId": "r1",
@@ -3855,8 +3987,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 616,
-              "start": 611
+              "end": 675,
+              "start": 670
             },
             "text": "Shape"
           }
@@ -3866,8 +3998,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 616,
-              "start": 611
+              "end": 675,
+              "start": 670
             },
             "text": "Shape"
           }
@@ -3877,8 +4009,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 604,
-              "start": 596
+              "end": 663,
+              "start": 655
             },
             "text": "abstract"
           }
@@ -3906,15 +4038,15 @@
       "name": "area",
       "nameRange": {
         "encoding": "utf8",
-        "end": 656,
-        "start": 652
+        "end": 715,
+        "start": 711
       },
       "nativeId": "sid:v1:41af0be0ab8632e26fd249868b5f7f3f",
       "parentRef": "2:r1:sid:v1:2269896ca380b25af31e4033a1a79716",
       "range": {
         "encoding": "utf8",
-        "end": 666,
-        "start": 643
+        "end": 725,
+        "start": 702
       },
       "ref": "2:r1:sid:v1:41af0be0ab8632e26fd249868b5f7f3f",
       "revisionId": "r1",
@@ -3926,8 +4058,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 656,
-              "start": 652
+              "end": 715,
+              "start": 711
             },
             "text": "area"
           }
@@ -3937,8 +4069,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 656,
-              "start": 652
+              "end": 715,
+              "start": 711
             },
             "text": "area"
           }
@@ -3948,8 +4080,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 651,
-              "start": 643
+              "end": 710,
+              "start": 702
             },
             "text": "abstract"
           }
@@ -3959,8 +4091,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 666,
-              "start": 660
+              "end": 725,
+              "start": 719
             },
             "text": "number"
           }
@@ -3988,15 +4120,15 @@
       "name": "perimeter",
       "nameRange": {
         "encoding": "utf8",
-        "end": 688,
-        "start": 679
+        "end": 747,
+        "start": 738
       },
       "nativeId": "sid:v1:8d32551ffee61ec2c08cd9c2b5c838ab",
       "parentRef": "2:r1:sid:v1:2269896ca380b25af31e4033a1a79716",
       "range": {
         "encoding": "utf8",
-        "end": 698,
-        "start": 670
+        "end": 757,
+        "start": 729
       },
       "ref": "2:r1:sid:v1:8d32551ffee61ec2c08cd9c2b5c838ab",
       "revisionId": "r1",
@@ -4008,8 +4140,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 688,
-              "start": 679
+              "end": 747,
+              "start": 738
             },
             "text": "perimeter"
           }
@@ -4019,8 +4151,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 688,
-              "start": 679
+              "end": 747,
+              "start": 738
             },
             "text": "perimeter"
           }
@@ -4030,8 +4162,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 678,
-              "start": 670
+              "end": 737,
+              "start": 729
             },
             "text": "abstract"
           }
@@ -4041,8 +4173,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 698,
-              "start": 692
+              "end": 757,
+              "start": 751
             },
             "text": "number"
           }
@@ -4068,15 +4200,15 @@
       "name": "describe",
       "nameRange": {
         "encoding": "utf8",
-        "end": 711,
-        "start": 703
+        "end": 770,
+        "start": 762
       },
       "nativeId": "sid:v1:92a2f7f18241894224faceeb4c6b338d",
       "parentRef": "2:r1:sid:v1:2269896ca380b25af31e4033a1a79716",
       "range": {
         "encoding": "utf8",
-        "end": 792,
-        "start": 703
+        "end": 851,
+        "start": 762
       },
       "ref": "2:r1:sid:v1:92a2f7f18241894224faceeb4c6b338d",
       "revisionId": "r1",
@@ -4088,8 +4220,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 711,
-              "start": 703
+              "end": 770,
+              "start": 762
             },
             "text": "describe"
           }
@@ -4099,8 +4231,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 711,
-              "start": 703
+              "end": 770,
+              "start": 762
             },
             "text": "describe"
           }
@@ -4110,8 +4242,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 721,
-              "start": 715
+              "end": 780,
+              "start": 774
             },
             "text": "string"
           }
@@ -4137,15 +4269,15 @@
       "name": "Rectangle",
       "nameRange": {
         "encoding": "utf8",
-        "end": 826,
-        "start": 817
+        "end": 885,
+        "start": 876
       },
       "nativeId": "sid:v1:93a0261b512ebc219c21c81e9941e893",
       "parentRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 1249,
-        "start": 811
+        "end": 1317,
+        "start": 870
       },
       "ref": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
       "revisionId": "r1",
@@ -4157,8 +4289,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 826,
-              "start": 817
+              "end": 885,
+              "start": 876
             },
             "text": "Rectangle"
           }
@@ -4168,8 +4300,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 826,
-              "start": 817
+              "end": 885,
+              "start": 876
             },
             "text": "Rectangle"
           }
@@ -4211,15 +4343,15 @@
       "name": "constructor",
       "nameRange": {
         "encoding": "utf8",
-        "end": 856,
-        "start": 845
+        "end": 915,
+        "start": 904
       },
       "nativeId": "sid:v1:dbe9c81d2e79469c0228b5495ee5eaa3",
       "parentRef": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
       "range": {
         "encoding": "utf8",
-        "end": 973,
-        "start": 845
+        "end": 1032,
+        "start": 904
       },
       "ref": "2:r1:sid:v1:dbe9c81d2e79469c0228b5495ee5eaa3",
       "revisionId": "r1",
@@ -4231,8 +4363,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 856,
-              "start": 845
+              "end": 915,
+              "start": 904
             },
             "text": "constructor"
           }
@@ -4242,8 +4374,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 856,
-              "start": 845
+              "end": 915,
+              "start": 904
             },
             "text": "constructor"
           }
@@ -4253,8 +4385,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 883,
-              "start": 878
+              "end": 942,
+              "start": 937
             },
             "text": "width"
           }
@@ -4264,8 +4396,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 891,
-              "start": 885
+              "end": 950,
+              "start": 944
             },
             "text": "number"
           }
@@ -4275,8 +4407,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 913,
-              "start": 907
+              "end": 972,
+              "start": 966
             },
             "text": "height"
           }
@@ -4286,8 +4418,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 921,
-              "start": 915
+              "end": 980,
+              "start": 974
             },
             "text": "number"
           }
@@ -4297,8 +4429,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 940,
-              "start": 935
+              "end": 999,
+              "start": 994
             },
             "text": "label"
           }
@@ -4308,8 +4440,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 949,
-              "start": 943
+              "end": 1008,
+              "start": 1002
             },
             "text": "string"
           }
@@ -4338,15 +4470,15 @@
       "name": "width",
       "nameRange": {
         "encoding": "utf8",
-        "end": 883,
-        "start": 878
+        "end": 942,
+        "start": 937
       },
       "nativeId": "sid:v1:5840aeb8c8bb52e7a5d015bea5fc9407",
       "parentRef": "2:r1:sid:v1:dbe9c81d2e79469c0228b5495ee5eaa3",
       "range": {
         "encoding": "utf8",
-        "end": 891,
-        "start": 862
+        "end": 950,
+        "start": 921
       },
       "ref": "2:r1:sid:v1:5840aeb8c8bb52e7a5d015bea5fc9407",
       "revisionId": "r1",
@@ -4358,8 +4490,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 883,
-              "start": 878
+              "end": 942,
+              "start": 937
             },
             "text": "width"
           }
@@ -4369,8 +4501,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 883,
-              "start": 878
+              "end": 942,
+              "start": 937
             },
             "text": "width"
           }
@@ -4380,8 +4512,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 868,
-              "start": 862
+              "end": 927,
+              "start": 921
             },
             "text": "public"
           }
@@ -4391,8 +4523,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 877,
-              "start": 869
+              "end": 936,
+              "start": 928
             },
             "text": "readonly"
           }
@@ -4420,15 +4552,15 @@
       "name": "height",
       "nameRange": {
         "encoding": "utf8",
-        "end": 913,
-        "start": 907
+        "end": 972,
+        "start": 966
       },
       "nativeId": "sid:v1:a5527fe869ba3476431e3fc5b3c0b5be",
       "parentRef": "2:r1:sid:v1:dbe9c81d2e79469c0228b5495ee5eaa3",
       "range": {
         "encoding": "utf8",
-        "end": 921,
-        "start": 897
+        "end": 980,
+        "start": 956
       },
       "ref": "2:r1:sid:v1:a5527fe869ba3476431e3fc5b3c0b5be",
       "revisionId": "r1",
@@ -4440,8 +4572,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 913,
-              "start": 907
+              "end": 972,
+              "start": 966
             },
             "text": "height"
           }
@@ -4451,8 +4583,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 913,
-              "start": 907
+              "end": 972,
+              "start": 966
             },
             "text": "height"
           }
@@ -4462,8 +4594,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 906,
-              "start": 897
+              "end": 965,
+              "start": 956
             },
             "text": "protected"
           }
@@ -4491,15 +4623,15 @@
       "name": "label",
       "nameRange": {
         "encoding": "utf8",
-        "end": 940,
-        "start": 935
+        "end": 999,
+        "start": 994
       },
       "nativeId": "sid:v1:793470ca398b9f80fb048d9bad59e317",
       "parentRef": "2:r1:sid:v1:dbe9c81d2e79469c0228b5495ee5eaa3",
       "range": {
         "encoding": "utf8",
-        "end": 949,
-        "start": 927
+        "end": 1008,
+        "start": 986
       },
       "ref": "2:r1:sid:v1:793470ca398b9f80fb048d9bad59e317",
       "revisionId": "r1",
@@ -4511,8 +4643,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 940,
-              "start": 935
+              "end": 999,
+              "start": 994
             },
             "text": "label"
           }
@@ -4522,8 +4654,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 940,
-              "start": 935
+              "end": 999,
+              "start": 994
             },
             "text": "label"
           }
@@ -4533,8 +4665,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 934,
-              "start": 927
+              "end": 993,
+              "start": 986
             },
             "text": "private"
           }
@@ -4560,15 +4692,15 @@
       "name": "area",
       "nameRange": {
         "encoding": "utf8",
-        "end": 981,
-        "start": 977
+        "end": 1040,
+        "start": 1036
       },
       "nativeId": "sid:v1:7714fac51f5c657737dfed033dbdee60",
       "parentRef": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
       "range": {
         "encoding": "utf8",
-        "end": 1034,
-        "start": 977
+        "end": 1093,
+        "start": 1036
       },
       "ref": "2:r1:sid:v1:7714fac51f5c657737dfed033dbdee60",
       "revisionId": "r1",
@@ -4580,8 +4712,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 981,
-              "start": 977
+              "end": 1040,
+              "start": 1036
             },
             "text": "area"
           }
@@ -4591,8 +4723,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 981,
-              "start": 977
+              "end": 1040,
+              "start": 1036
             },
             "text": "area"
           }
@@ -4602,8 +4734,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 991,
-              "start": 985
+              "end": 1050,
+              "start": 1044
             },
             "text": "number"
           }
@@ -4629,15 +4761,15 @@
       "name": "perimeter",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1047,
-        "start": 1038
+        "end": 1106,
+        "start": 1097
       },
       "nativeId": "sid:v1:b0b3550b65759ee573814fe7c491c4ff",
       "parentRef": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
       "range": {
         "encoding": "utf8",
-        "end": 1106,
-        "start": 1038
+        "end": 1165,
+        "start": 1097
       },
       "ref": "2:r1:sid:v1:b0b3550b65759ee573814fe7c491c4ff",
       "revisionId": "r1",
@@ -4649,8 +4781,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1047,
-              "start": 1038
+              "end": 1106,
+              "start": 1097
             },
             "text": "perimeter"
           }
@@ -4660,8 +4792,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1047,
-              "start": 1038
+              "end": 1106,
+              "start": 1097
             },
             "text": "perimeter"
           }
@@ -4671,8 +4803,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1057,
-              "start": 1051
+              "end": 1116,
+              "start": 1110
             },
             "text": "number"
           }
@@ -4704,15 +4836,15 @@
       "name": "scale",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1125,
-        "start": 1120
+        "end": 1193,
+        "start": 1188
       },
       "nativeId": "sid:v1:5225a16160e4172ca327892521c5fb60",
       "parentRef": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
       "range": {
         "encoding": "utf8",
-        "end": 1247,
-        "start": 1120
+        "end": 1315,
+        "start": 1188
       },
       "ref": "2:r1:sid:v1:5225a16160e4172ca327892521c5fb60",
       "revisionId": "r1",
@@ -4724,8 +4856,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1125,
-              "start": 1120
+              "end": 1193,
+              "start": 1188
             },
             "text": "scale"
           }
@@ -4735,8 +4867,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1125,
-              "start": 1120
+              "end": 1193,
+              "start": 1188
             },
             "text": "scale"
           }
@@ -4746,8 +4878,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1140,
-              "start": 1134
+              "end": 1208,
+              "start": 1202
             },
             "text": "factor"
           }
@@ -4757,8 +4889,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1148,
-              "start": 1142
+              "end": 1216,
+              "start": 1210
             },
             "text": "number"
           }
@@ -4768,8 +4900,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1160,
-              "start": 1151
+              "end": 1228,
+              "start": 1219
             },
             "text": "Rectangle"
           }
@@ -4795,15 +4927,15 @@
       "name": "Square",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1270,
-        "start": 1264
+        "end": 1338,
+        "start": 1332
       },
       "nativeId": "sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "parentRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 1618,
-        "start": 1258
+        "end": 1697,
+        "start": 1326
       },
       "ref": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "revisionId": "r1",
@@ -4815,8 +4947,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1270,
-              "start": 1264
+              "end": 1338,
+              "start": 1332
             },
             "text": "Square"
           }
@@ -4826,8 +4958,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1270,
-              "start": 1264
+              "end": 1338,
+              "start": 1332
             },
             "text": "Square"
           }
@@ -4848,26 +4980,26 @@
           "static",
           "readonly"
         ],
-        "name": "sides",
+        "name": "unit",
         "parameters": [],
         "resultType": null,
         "typeParameters": []
       },
       "kind": "field",
-      "name": "sides",
+      "name": "unit",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1343,
-        "start": 1338
+        "end": 1410,
+        "start": 1406
       },
-      "nativeId": "sid:v1:643e5f6e1fcafe8ab200533440b08a1f",
+      "nativeId": "sid:v1:515c93c54641c9820466ba3e0107f741",
       "parentRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1347,
-        "start": 1315
+        "end": 1426,
+        "start": 1383
       },
-      "ref": "2:r1:sid:v1:643e5f6e1fcafe8ab200533440b08a1f",
+      "ref": "2:r1:sid:v1:515c93c54641c9820466ba3e0107f741",
       "revisionId": "r1",
       "role": "production",
       "signature": null,
@@ -4877,10 +5009,10 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1343,
-              "start": 1338
+              "end": 1410,
+              "start": 1406
             },
-            "text": "sides"
+            "text": "unit"
           }
         },
         {
@@ -4888,10 +5020,10 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1343,
-              "start": 1338
+              "end": 1410,
+              "start": 1406
             },
-            "text": "sides"
+            "text": "unit"
           }
         },
         {
@@ -4899,8 +5031,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1321,
-              "start": 1315
+              "end": 1389,
+              "start": 1383
             },
             "text": "public"
           }
@@ -4910,8 +5042,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1328,
-              "start": 1322
+              "end": 1396,
+              "start": 1390
             },
             "text": "static"
           }
@@ -4921,8 +5053,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1337,
-              "start": 1329
+              "end": 1405,
+              "start": 1397
             },
             "text": "readonly"
           }
@@ -4954,15 +5086,15 @@
       "name": "constructor",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1363,
-        "start": 1352
+        "end": 1442,
+        "start": 1431
       },
       "nativeId": "sid:v1:20260f49d1c81783f14905a5d9975d41",
       "parentRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1416,
-        "start": 1352
+        "end": 1495,
+        "start": 1431
       },
       "ref": "2:r1:sid:v1:20260f49d1c81783f14905a5d9975d41",
       "revisionId": "r1",
@@ -4974,8 +5106,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1363,
-              "start": 1352
+              "end": 1442,
+              "start": 1431
             },
             "text": "constructor"
           }
@@ -4985,8 +5117,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1363,
-              "start": 1352
+              "end": 1442,
+              "start": 1431
             },
             "text": "constructor"
           }
@@ -4996,8 +5128,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1368,
-              "start": 1364
+              "end": 1447,
+              "start": 1443
             },
             "text": "side"
           }
@@ -5007,8 +5139,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1376,
-              "start": 1370
+              "end": 1455,
+              "start": 1449
             },
             "text": "number"
           }
@@ -5036,15 +5168,15 @@
       "name": "area",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1433,
-        "start": 1429
+        "end": 1512,
+        "start": 1508
       },
       "nativeId": "sid:v1:4a84e0f6e56c232002106f902bf12e6c",
       "parentRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1474,
-        "start": 1420
+        "end": 1553,
+        "start": 1499
       },
       "ref": "2:r1:sid:v1:4a84e0f6e56c232002106f902bf12e6c",
       "revisionId": "r1",
@@ -5056,8 +5188,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1433,
-              "start": 1429
+              "end": 1512,
+              "start": 1508
             },
             "text": "area"
           }
@@ -5067,8 +5199,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1433,
-              "start": 1429
+              "end": 1512,
+              "start": 1508
             },
             "text": "area"
           }
@@ -5078,8 +5210,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1428,
-              "start": 1420
+              "end": 1507,
+              "start": 1499
             },
             "text": "override"
           }
@@ -5089,8 +5221,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1443,
-              "start": 1437
+              "end": 1522,
+              "start": 1516
             },
             "text": "number"
           }
@@ -5118,15 +5250,15 @@
       "name": "side",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1486,
-        "start": 1482
+        "end": 1565,
+        "start": 1561
       },
       "nativeId": "sid:v1:4309a95a45e15d65d7593601bdb018d4",
       "parentRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1525,
-        "start": 1478
+        "end": 1604,
+        "start": 1557
       },
       "ref": "2:r1:sid:v1:4309a95a45e15d65d7593601bdb018d4",
       "revisionId": "r1",
@@ -5138,8 +5270,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1486,
-              "start": 1482
+              "end": 1565,
+              "start": 1561
             },
             "text": "side"
           }
@@ -5149,8 +5281,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1486,
-              "start": 1482
+              "end": 1565,
+              "start": 1561
             },
             "text": "side"
           }
@@ -5160,8 +5292,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1481,
-              "start": 1478
+              "end": 1560,
+              "start": 1557
             },
             "text": "get"
           }
@@ -5171,8 +5303,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1496,
-              "start": 1490
+              "end": 1575,
+              "start": 1569
             },
             "text": "number"
           }
@@ -5206,15 +5338,15 @@
       "name": "side",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1537,
-        "start": 1533
+        "end": 1616,
+        "start": 1612
       },
       "nativeId": "sid:v1:94a78571832efedf745c8133216e539e",
       "parentRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1616,
-        "start": 1529
+        "end": 1695,
+        "start": 1608
       },
       "ref": "2:r1:sid:v1:94a78571832efedf745c8133216e539e",
       "revisionId": "r1",
@@ -5226,8 +5358,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1537,
-              "start": 1533
+              "end": 1616,
+              "start": 1612
             },
             "text": "side"
           }
@@ -5237,8 +5369,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1537,
-              "start": 1533
+              "end": 1616,
+              "start": 1612
             },
             "text": "side"
           }
@@ -5248,8 +5380,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1532,
-              "start": 1529
+              "end": 1611,
+              "start": 1608
             },
             "text": "set"
           }
@@ -5259,8 +5391,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1543,
-              "start": 1538
+              "end": 1622,
+              "start": 1617
             },
             "text": "value"
           }
@@ -5270,8 +5402,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1551,
-              "start": 1545
+              "end": 1630,
+              "start": 1624
             },
             "text": "number"
           }
@@ -5297,15 +5429,15 @@
       "name": "Circle",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1649,
-        "start": 1643
+        "end": 1728,
+        "start": 1722
       },
       "nativeId": "sid:v1:01053e7a7a0a9afafeb2b53fc95f651e",
       "parentRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 1863,
-        "start": 1637
+        "end": 1942,
+        "start": 1716
       },
       "ref": "2:r1:sid:v1:01053e7a7a0a9afafeb2b53fc95f651e",
       "revisionId": "r1",
@@ -5317,8 +5449,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1649,
-              "start": 1643
+              "end": 1728,
+              "start": 1722
             },
             "text": "Circle"
           }
@@ -5328,8 +5460,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1649,
-              "start": 1643
+              "end": 1728,
+              "start": 1722
             },
             "text": "Circle"
           }
@@ -5361,15 +5493,15 @@
       "name": "constructor",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1679,
-        "start": 1668
+        "end": 1758,
+        "start": 1747
       },
       "nativeId": "sid:v1:b88d006c86386194b7940d180ef9486d",
       "parentRef": "2:r1:sid:v1:01053e7a7a0a9afafeb2b53fc95f651e",
       "range": {
         "encoding": "utf8",
-        "end": 1731,
-        "start": 1668
+        "end": 1810,
+        "start": 1747
       },
       "ref": "2:r1:sid:v1:b88d006c86386194b7940d180ef9486d",
       "revisionId": "r1",
@@ -5381,8 +5513,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1679,
-              "start": 1668
+              "end": 1758,
+              "start": 1747
             },
             "text": "constructor"
           }
@@ -5392,8 +5524,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1679,
-              "start": 1668
+              "end": 1758,
+              "start": 1747
             },
             "text": "constructor"
           }
@@ -5403,8 +5535,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1703,
-              "start": 1697
+              "end": 1782,
+              "start": 1776
             },
             "text": "radius"
           }
@@ -5414,8 +5546,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1711,
-              "start": 1705
+              "end": 1790,
+              "start": 1784
             },
             "text": "number"
           }
@@ -5444,15 +5576,15 @@
       "name": "radius",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1703,
-        "start": 1697
+        "end": 1782,
+        "start": 1776
       },
       "nativeId": "sid:v1:4cf1fc5e1be8f74a82d37803d9635ec5",
       "parentRef": "2:r1:sid:v1:b88d006c86386194b7940d180ef9486d",
       "range": {
         "encoding": "utf8",
-        "end": 1711,
-        "start": 1680
+        "end": 1790,
+        "start": 1759
       },
       "ref": "2:r1:sid:v1:4cf1fc5e1be8f74a82d37803d9635ec5",
       "revisionId": "r1",
@@ -5464,8 +5596,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1703,
-              "start": 1697
+              "end": 1782,
+              "start": 1776
             },
             "text": "radius"
           }
@@ -5475,8 +5607,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1703,
-              "start": 1697
+              "end": 1782,
+              "start": 1776
             },
             "text": "radius"
           }
@@ -5486,8 +5618,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1687,
-              "start": 1680
+              "end": 1766,
+              "start": 1759
             },
             "text": "private"
           }
@@ -5497,8 +5629,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1696,
-              "start": 1688
+              "end": 1775,
+              "start": 1767
             },
             "text": "readonly"
           }
@@ -5524,15 +5656,15 @@
       "name": "area",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1739,
-        "start": 1735
+        "end": 1818,
+        "start": 1814
       },
       "nativeId": "sid:v1:3a0d5f0019a6e35b213e0835463110bb",
       "parentRef": "2:r1:sid:v1:01053e7a7a0a9afafeb2b53fc95f651e",
       "range": {
         "encoding": "utf8",
-        "end": 1794,
-        "start": 1735
+        "end": 1873,
+        "start": 1814
       },
       "ref": "2:r1:sid:v1:3a0d5f0019a6e35b213e0835463110bb",
       "revisionId": "r1",
@@ -5544,8 +5676,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1739,
-              "start": 1735
+              "end": 1818,
+              "start": 1814
             },
             "text": "area"
           }
@@ -5555,8 +5687,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1739,
-              "start": 1735
+              "end": 1818,
+              "start": 1814
             },
             "text": "area"
           }
@@ -5566,8 +5698,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1749,
-              "start": 1743
+              "end": 1828,
+              "start": 1822
             },
             "text": "number"
           }
@@ -5593,15 +5725,15 @@
       "name": "perimeter",
       "nameRange": {
         "encoding": "utf8",
-        "end": 1807,
-        "start": 1798
+        "end": 1886,
+        "start": 1877
       },
       "nativeId": "sid:v1:ce8e4bb41f360a33e69bfe355a558574",
       "parentRef": "2:r1:sid:v1:01053e7a7a0a9afafeb2b53fc95f651e",
       "range": {
         "encoding": "utf8",
-        "end": 1861,
-        "start": 1798
+        "end": 1940,
+        "start": 1877
       },
       "ref": "2:r1:sid:v1:ce8e4bb41f360a33e69bfe355a558574",
       "revisionId": "r1",
@@ -5613,8 +5745,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1807,
-              "start": 1798
+              "end": 1886,
+              "start": 1877
             },
             "text": "perimeter"
           }
@@ -5624,8 +5756,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1807,
-              "start": 1798
+              "end": 1886,
+              "start": 1877
             },
             "text": "perimeter"
           }
@@ -5635,8 +5767,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1817,
-              "start": 1811
+              "end": 1896,
+              "start": 1890
             },
             "text": "number"
           }
@@ -12662,14 +12794,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:dfff6537e5b0bd6686b9a0c71aabc171",
+      "nativeId": "occ:v2:c4bda1af940f3ac9a341d5ce7a146eaf",
       "ownerRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
         "end": 15,
         "start": 9
       },
-      "ref": "2:r1:occ:v2:dfff6537e5b0bd6686b9a0c71aabc171",
+      "ref": "2:r1:occ:v2:c4bda1af940f3ac9a341d5ce7a146eaf",
       "revisionId": "r1",
       "spelling": "sealed",
       "witnesses": [
@@ -12692,14 +12824,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:ab5f2f155e6e908d06aff83db0b40153",
+      "nativeId": "occ:v2:c0f107b92037f61cb504859792cd1022",
       "ownerRef": "2:r1:sid:v1:41fb0d71c1b577fe3aa9d3e2a59e34c1",
       "range": {
         "encoding": "utf8",
         "end": 17,
         "start": 16
       },
-      "ref": "2:r1:occ:v2:ab5f2f155e6e908d06aff83db0b40153",
+      "ref": "2:r1:occ:v2:c0f107b92037f61cb504859792cd1022",
       "revisionId": "r1",
       "spelling": "T",
       "witnesses": [
@@ -12722,14 +12854,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:b7c03e34105f35d8c5ca736700b69eb2",
+      "nativeId": "occ:v2:0d460a2ff7d8aecbf94397c04756266b",
       "ownerRef": "2:r1:sid:v1:41fb0d71c1b577fe3aa9d3e2a59e34c1",
       "range": {
         "encoding": "utf8",
         "end": 47,
         "start": 43
       },
-      "ref": "2:r1:occ:v2:b7c03e34105f35d8c5ca736700b69eb2",
+      "ref": "2:r1:occ:v2:0d460a2ff7d8aecbf94397c04756266b",
       "revisionId": "r1",
       "spelling": "args",
       "witnesses": [
@@ -12752,14 +12884,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:06876785b5ca784340ee671a557040f0",
+      "nativeId": "occ:v2:a42f52751cdd48ffb9ed4de50de58285",
       "ownerRef": "2:r1:sid:v1:41fb0d71c1b577fe3aa9d3e2a59e34c1",
       "range": {
         "encoding": "utf8",
         "end": 80,
         "start": 69
       },
-      "ref": "2:r1:occ:v2:06876785b5ca784340ee671a557040f0",
+      "ref": "2:r1:occ:v2:a42f52751cdd48ffb9ed4de50de58285",
       "revisionId": "r1",
       "spelling": "constructor",
       "witnesses": [
@@ -12782,14 +12914,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:47673e7f60e235fe875502d50339a78c",
+      "nativeId": "occ:v2:702a47a2bc7b51f87887f5c79d01d23d",
       "ownerRef": "2:r1:sid:v1:41fb0d71c1b577fe3aa9d3e2a59e34c1",
       "range": {
         "encoding": "utf8",
         "end": 83,
         "start": 82
       },
-      "ref": "2:r1:occ:v2:47673e7f60e235fe875502d50339a78c",
+      "ref": "2:r1:occ:v2:702a47a2bc7b51f87887f5c79d01d23d",
       "revisionId": "r1",
       "spelling": "T",
       "witnesses": [
@@ -12812,14 +12944,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:f9d48074df21ddc0b3763889f36f88c8",
+      "nativeId": "occ:v2:2fdc181035f6e428f63916b0c9d6d1ef",
       "ownerRef": "2:r1:sid:v1:41fb0d71c1b577fe3aa9d3e2a59e34c1",
       "range": {
         "encoding": "utf8",
         "end": 87,
         "start": 86
       },
-      "ref": "2:r1:occ:v2:f9d48074df21ddc0b3763889f36f88c8",
+      "ref": "2:r1:occ:v2:2fdc181035f6e428f63916b0c9d6d1ef",
       "revisionId": "r1",
       "spelling": "T",
       "witnesses": [
@@ -12842,14 +12974,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:2d8ed7b3bd8b0a19a5e10c1b405fbe93",
+      "nativeId": "occ:v2:4c0a5e1ec9c859f7b572b8537f411ab7",
       "ownerRef": "2:r1:sid:v1:41fb0d71c1b577fe3aa9d3e2a59e34c1",
       "range": {
         "encoding": "utf8",
         "end": 98,
         "start": 92
       },
-      "ref": "2:r1:occ:v2:2d8ed7b3bd8b0a19a5e10c1b405fbe93",
+      "ref": "2:r1:occ:v2:4c0a5e1ec9c859f7b572b8537f411ab7",
       "revisionId": "r1",
       "spelling": "Object",
       "witnesses": [
@@ -12872,14 +13004,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:4cb5899bebab9763a6a0d4aa7d2ead16",
+      "nativeId": "occ:v2:17e8a6de8b1aea07605410685badd9da",
       "ownerRef": "2:r1:sid:v1:41fb0d71c1b577fe3aa9d3e2a59e34c1",
       "range": {
         "encoding": "utf8",
         "end": 105,
         "start": 99
       },
-      "ref": "2:r1:occ:v2:4cb5899bebab9763a6a0d4aa7d2ead16",
+      "ref": "2:r1:occ:v2:17e8a6de8b1aea07605410685badd9da",
       "revisionId": "r1",
       "spelling": "freeze",
       "witnesses": [
@@ -12902,14 +13034,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:134b3a0fd1be6e2d4c55ce63213b9d0f",
+      "nativeId": "occ:v2:2921cefdf540a783abc6ae2b83e2cbfa",
       "ownerRef": "2:r1:sid:v1:41fb0d71c1b577fe3aa9d3e2a59e34c1",
       "range": {
         "encoding": "utf8",
         "end": 117,
         "start": 106
       },
-      "ref": "2:r1:occ:v2:134b3a0fd1be6e2d4c55ce63213b9d0f",
+      "ref": "2:r1:occ:v2:2921cefdf540a783abc6ae2b83e2cbfa",
       "revisionId": "r1",
       "spelling": "constructor",
       "witnesses": [
@@ -12932,14 +13064,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:b9a06f44df9c0c5aaf5fb85afbff1869",
+      "nativeId": "occ:v2:4afc1df62e9d7896009e239114c8094c",
       "ownerRef": "2:r1:sid:v1:41fb0d71c1b577fe3aa9d3e2a59e34c1",
       "range": {
         "encoding": "utf8",
         "end": 140,
         "start": 129
       },
-      "ref": "2:r1:occ:v2:b9a06f44df9c0c5aaf5fb85afbff1869",
+      "ref": "2:r1:occ:v2:4afc1df62e9d7896009e239114c8094c",
       "revisionId": "r1",
       "spelling": "constructor",
       "witnesses": [
@@ -12962,14 +13094,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:b9d66b8b798d6355298c8b0d40a35c36",
+      "nativeId": "occ:v2:08764ed5a021145365fa2363b34eea3b",
       "ownerRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
         "end": 160,
         "start": 154
       },
-      "ref": "2:r1:occ:v2:b9d66b8b798d6355298c8b0d40a35c36",
+      "ref": "2:r1:occ:v2:08764ed5a021145365fa2363b34eea3b",
       "revisionId": "r1",
       "spelling": "logged",
       "witnesses": [
@@ -12992,14 +13124,44 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:395fe9bcc93bbc573f30e96f8c062280",
+      "nativeId": "occ:v2:6628425cef85e87389e8fb1d0b437c0f",
       "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
       "range": {
         "encoding": "utf8",
-        "end": 168,
+        "end": 166,
         "start": 161
       },
-      "ref": "2:r1:occ:v2:395fe9bcc93bbc573f30e96f8c062280",
+      "ref": "2:r1:occ:v2:6628425cef85e87389e8fb1d0b437c0f",
+      "revisionId": "r1",
+      "spelling": "label",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "end": 166,
+              "start": 161
+            },
+            "text": "label"
+          }
+        }
+      ]
+    },
+    {
+      "document": {
+        "language": "typescript",
+        "path": "src/geometry.ts",
+        "sourceSetId": "main"
+      },
+      "nativeId": "occ:v2:e544693b554eb196be9ff83a3ed23726",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
+      "range": {
+        "encoding": "utf8",
+        "end": 195,
+        "start": 188
+      },
+      "ref": "2:r1:occ:v2:e544693b554eb196be9ff83a3ed23726",
       "revisionId": "r1",
       "spelling": "_target",
       "witnesses": [
@@ -13008,8 +13170,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 168,
-              "start": 161
+              "end": 195,
+              "start": 188
             },
             "text": "_target"
           }
@@ -13022,14 +13184,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:63b4b303225480771ea5dad2d6d5dc74",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:4f645770b8715eb1a2526889137e6816",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 181,
-        "start": 178
+        "end": 208,
+        "start": 205
       },
-      "ref": "2:r1:occ:v2:63b4b303225480771ea5dad2d6d5dc74",
+      "ref": "2:r1:occ:v2:4f645770b8715eb1a2526889137e6816",
       "revisionId": "r1",
       "spelling": "key",
       "witnesses": [
@@ -13038,8 +13200,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 181,
-              "start": 178
+              "end": 208,
+              "start": 205
             },
             "text": "key"
           }
@@ -13052,14 +13214,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:26e9d260da279f2c725f16a077eb6a88",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:bef929374bf74799b153b3e7554ebbd7",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 201,
-        "start": 191
+        "end": 228,
+        "start": 218
       },
-      "ref": "2:r1:occ:v2:26e9d260da279f2c725f16a077eb6a88",
+      "ref": "2:r1:occ:v2:bef929374bf74799b153b3e7554ebbd7",
       "revisionId": "r1",
       "spelling": "descriptor",
       "witnesses": [
@@ -13068,8 +13230,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 201,
-              "start": 191
+              "end": 228,
+              "start": 218
             },
             "text": "descriptor"
           }
@@ -13082,14 +13244,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:9aed900a5a04fce1a12ee5d7f11046ab",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:57b524e4f0603ea9b9f350faf086a89e",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 221,
-        "start": 203
+        "end": 248,
+        "start": 230
       },
-      "ref": "2:r1:occ:v2:9aed900a5a04fce1a12ee5d7f11046ab",
+      "ref": "2:r1:occ:v2:57b524e4f0603ea9b9f350faf086a89e",
       "revisionId": "r1",
       "spelling": "PropertyDescriptor",
       "witnesses": [
@@ -13098,8 +13260,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 221,
-              "start": 203
+              "end": 248,
+              "start": 230
             },
             "text": "PropertyDescriptor"
           }
@@ -13112,14 +13274,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:768d569e53dd9f278c62148924484920",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:e16c559f37aedd899b1b32bb7f387791",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 247,
-        "start": 239
+        "end": 279,
+        "start": 271
       },
-      "ref": "2:r1:occ:v2:768d569e53dd9f278c62148924484920",
+      "ref": "2:r1:occ:v2:e16c559f37aedd899b1b32bb7f387791",
       "revisionId": "r1",
       "spelling": "original",
       "witnesses": [
@@ -13128,8 +13290,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 247,
-              "start": 239
+              "end": 279,
+              "start": 271
             },
             "text": "original"
           }
@@ -13142,14 +13304,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:4d55f6eef6ae86aa36d790cafebdb739",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:bf63e31c3e368bf6cfdec855d1b98277",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 260,
-        "start": 250
+        "end": 292,
+        "start": 282
       },
-      "ref": "2:r1:occ:v2:4d55f6eef6ae86aa36d790cafebdb739",
+      "ref": "2:r1:occ:v2:bf63e31c3e368bf6cfdec855d1b98277",
       "revisionId": "r1",
       "spelling": "descriptor",
       "witnesses": [
@@ -13158,8 +13320,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 260,
-              "start": 250
+              "end": 292,
+              "start": 282
             },
             "text": "descriptor"
           }
@@ -13172,14 +13334,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:63e4219e6f058dc2b03d079aeb4f53bd",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:41890b89fb50748a13042c3a5b1fe18b",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 266,
-        "start": 261
+        "end": 298,
+        "start": 293
       },
-      "ref": "2:r1:occ:v2:63e4219e6f058dc2b03d079aeb4f53bd",
+      "ref": "2:r1:occ:v2:41890b89fb50748a13042c3a5b1fe18b",
       "revisionId": "r1",
       "spelling": "value",
       "witnesses": [
@@ -13188,8 +13350,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 266,
-              "start": 261
+              "end": 298,
+              "start": 293
             },
             "text": "value"
           }
@@ -13202,14 +13364,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:0deb86b9e10398333e619059a099dee9",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:a90adc2b37287bc0c6cde92ec35142e2",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 278,
-        "start": 274
+        "end": 310,
+        "start": 306
       },
-      "ref": "2:r1:occ:v2:0deb86b9e10398333e619059a099dee9",
+      "ref": "2:r1:occ:v2:a90adc2b37287bc0c6cde92ec35142e2",
       "revisionId": "r1",
       "spelling": "args",
       "witnesses": [
@@ -13218,8 +13380,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 278,
-              "start": 274
+              "end": 310,
+              "start": 306
             },
             "text": "args"
           }
@@ -13232,14 +13394,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:ccce52917b42427753b88a420d711523",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:424efd6c8142612d4b3b7a5e7a87b58b",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 315,
-        "start": 305
+        "end": 349,
+        "start": 339
       },
-      "ref": "2:r1:occ:v2:ccce52917b42427753b88a420d711523",
+      "ref": "2:r1:occ:v2:424efd6c8142612d4b3b7a5e7a87b58b",
       "revisionId": "r1",
       "spelling": "descriptor",
       "witnesses": [
@@ -13248,8 +13410,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 315,
-              "start": 305
+              "end": 349,
+              "start": 339
             },
             "text": "descriptor"
           }
@@ -13262,14 +13424,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:6edb9b9f85a17d092ecee6bf05018435",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:1b61c0d4ef1e8b58d469490e8b258d0d",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 321,
-        "start": 316
+        "end": 355,
+        "start": 350
       },
-      "ref": "2:r1:occ:v2:6edb9b9f85a17d092ecee6bf05018435",
+      "ref": "2:r1:occ:v2:1b61c0d4ef1e8b58d469490e8b258d0d",
       "revisionId": "r1",
       "spelling": "value",
       "witnesses": [
@@ -13278,8 +13440,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 321,
-              "start": 316
+              "end": 355,
+              "start": 350
             },
             "text": "value"
           }
@@ -13292,14 +13454,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:e410f737eaab169ae07d986c87d33977",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:71224a6245d787ccf7bf41df15825a0b",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 341,
-        "start": 337
+        "end": 390,
+        "start": 386
       },
-      "ref": "2:r1:occ:v2:e410f737eaab169ae07d986c87d33977",
+      "ref": "2:r1:occ:v2:71224a6245d787ccf7bf41df15825a0b",
       "revisionId": "r1",
       "spelling": "args",
       "witnesses": [
@@ -13308,8 +13470,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 341,
-              "start": 337
+              "end": 390,
+              "start": 386
             },
             "text": "args"
           }
@@ -13322,14 +13484,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:db4f43944fa9a51af27406cd4702457c",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:fada4abd36c8e363b943ef9af3e8ba1e",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 367,
-        "start": 360
+        "end": 418,
+        "start": 411
       },
-      "ref": "2:r1:occ:v2:db4f43944fa9a51af27406cd4702457c",
+      "ref": "2:r1:occ:v2:fada4abd36c8e363b943ef9af3e8ba1e",
       "revisionId": "r1",
       "spelling": "console",
       "witnesses": [
@@ -13338,8 +13500,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 367,
-              "start": 360
+              "end": 418,
+              "start": 411
             },
             "text": "console"
           }
@@ -13352,14 +13514,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:c780b18deeb449da494524b007d398f0",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:91da7ff6c63e5dbc6c9ab2e619e029e5",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 371,
-        "start": 368
+        "end": 422,
+        "start": 419
       },
-      "ref": "2:r1:occ:v2:c780b18deeb449da494524b007d398f0",
+      "ref": "2:r1:occ:v2:91da7ff6c63e5dbc6c9ab2e619e029e5",
       "revisionId": "r1",
       "spelling": "log",
       "witnesses": [
@@ -13368,8 +13530,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 371,
-              "start": 368
+              "end": 422,
+              "start": 419
             },
             "text": "log"
           }
@@ -13382,14 +13544,44 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:ea6e80fde77d18a46ce780c7368d04eb",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:d3553b819a3dfae4935273aa58786ebb",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 383,
-        "start": 380
+        "end": 428,
+        "start": 423
       },
-      "ref": "2:r1:occ:v2:ea6e80fde77d18a46ce780c7368d04eb",
+      "ref": "2:r1:occ:v2:d3553b819a3dfae4935273aa58786ebb",
+      "revisionId": "r1",
+      "spelling": "label",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "end": 428,
+              "start": 423
+            },
+            "text": "label"
+          }
+        }
+      ]
+    },
+    {
+      "document": {
+        "language": "typescript",
+        "path": "src/geometry.ts",
+        "sourceSetId": "main"
+      },
+      "nativeId": "occ:v2:565e78a048fa33417d24b5367e839218",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
+      "range": {
+        "encoding": "utf8",
+        "end": 433,
+        "start": 430
+      },
+      "ref": "2:r1:occ:v2:565e78a048fa33417d24b5367e839218",
       "revisionId": "r1",
       "spelling": "key",
       "witnesses": [
@@ -13398,8 +13590,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 383,
-              "start": 380
+              "end": 433,
+              "start": 430
             },
             "text": "key"
           }
@@ -13412,14 +13604,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:7a5b23cc38a8a8f2a9c89a6414b9080a",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:f5dc05c971ef134aee06d429cc4d37c4",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 405,
-        "start": 397
+        "end": 457,
+        "start": 449
       },
-      "ref": "2:r1:occ:v2:7a5b23cc38a8a8f2a9c89a6414b9080a",
+      "ref": "2:r1:occ:v2:f5dc05c971ef134aee06d429cc4d37c4",
       "revisionId": "r1",
       "spelling": "original",
       "witnesses": [
@@ -13428,8 +13620,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 405,
-              "start": 397
+              "end": 457,
+              "start": 449
             },
             "text": "original"
           }
@@ -13442,14 +13634,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:e28229b0377901ccf9301751208322fe",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:43dda4fff6cae4bbd353f3ce5430ade5",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 411,
-        "start": 406
+        "end": 463,
+        "start": 458
       },
-      "ref": "2:r1:occ:v2:e28229b0377901ccf9301751208322fe",
+      "ref": "2:r1:occ:v2:43dda4fff6cae4bbd353f3ce5430ade5",
       "revisionId": "r1",
       "spelling": "apply",
       "witnesses": [
@@ -13458,8 +13650,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 411,
-              "start": 406
+              "end": 463,
+              "start": 458
             },
             "text": "apply"
           }
@@ -13472,14 +13664,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:3a87170c49985a3e2a12be56dc611b77",
-      "ownerRef": "2:r1:sid:v1:d3aeee3466733aa1af9a9dcfed654090",
+      "nativeId": "occ:v2:0c8f921a8481af7a9e758cde208550f1",
+      "ownerRef": "2:r1:sid:v1:7d8fbe127066df3e3d3450bdb5982bcc",
       "range": {
         "encoding": "utf8",
-        "end": 422,
-        "start": 418
+        "end": 474,
+        "start": 470
       },
-      "ref": "2:r1:occ:v2:3a87170c49985a3e2a12be56dc611b77",
+      "ref": "2:r1:occ:v2:0c8f921a8481af7a9e758cde208550f1",
       "revisionId": "r1",
       "spelling": "args",
       "witnesses": [
@@ -13488,8 +13680,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 422,
-              "start": 418
+              "end": 474,
+              "start": 470
             },
             "text": "args"
           }
@@ -13502,14 +13694,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:0aaa0b9784405c511d01c3c6410e4c06",
+      "nativeId": "occ:v2:0a2de280baa3d2f16302abf5a7b350fc",
       "ownerRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 448,
-        "start": 442
+        "end": 507,
+        "start": 501
       },
-      "ref": "2:r1:occ:v2:0aaa0b9784405c511d01c3c6410e4c06",
+      "ref": "2:r1:occ:v2:0a2de280baa3d2f16302abf5a7b350fc",
       "revisionId": "r1",
       "spelling": "tagged",
       "witnesses": [
@@ -13518,8 +13710,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 448,
-              "start": 442
+              "end": 507,
+              "start": 501
             },
             "text": "tagged"
           }
@@ -13532,14 +13724,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:2ed4f5b3a09e6ab0131790d224d5016b",
+      "nativeId": "occ:v2:135de862f3ef0e694379db775de4252a",
       "ownerRef": "2:r1:sid:v1:10f173e969ea24448731b5520a45b269",
       "range": {
         "encoding": "utf8",
-        "end": 456,
-        "start": 449
+        "end": 515,
+        "start": 508
       },
-      "ref": "2:r1:occ:v2:2ed4f5b3a09e6ab0131790d224d5016b",
+      "ref": "2:r1:occ:v2:135de862f3ef0e694379db775de4252a",
       "revisionId": "r1",
       "spelling": "_target",
       "witnesses": [
@@ -13548,8 +13740,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 456,
-              "start": 449
+              "end": 515,
+              "start": 508
             },
             "text": "_target"
           }
@@ -13562,14 +13754,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:c648079dc069d0e84968a58b886ef0a0",
+      "nativeId": "occ:v2:b626e8f6512c909976f5336ed9672e67",
       "ownerRef": "2:r1:sid:v1:10f173e969ea24448731b5520a45b269",
       "range": {
         "encoding": "utf8",
-        "end": 470,
-        "start": 466
+        "end": 529,
+        "start": 525
       },
-      "ref": "2:r1:occ:v2:c648079dc069d0e84968a58b886ef0a0",
+      "ref": "2:r1:occ:v2:b626e8f6512c909976f5336ed9672e67",
       "revisionId": "r1",
       "spelling": "_key",
       "witnesses": [
@@ -13578,8 +13770,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 470,
-              "start": 466
+              "end": 529,
+              "start": 525
             },
             "text": "_key"
           }
@@ -13592,14 +13784,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:12aa9d820ecaf04e5425cefb017e36e3",
+      "nativeId": "occ:v2:421f612604069cecaebfa23a670ee42d",
       "ownerRef": "2:r1:sid:v1:10f173e969ea24448731b5520a45b269",
       "range": {
         "encoding": "utf8",
-        "end": 495,
-        "start": 489
+        "end": 554,
+        "start": 548
       },
-      "ref": "2:r1:occ:v2:12aa9d820ecaf04e5425cefb017e36e3",
+      "ref": "2:r1:occ:v2:421f612604069cecaebfa23a670ee42d",
       "revisionId": "r1",
       "spelling": "_index",
       "witnesses": [
@@ -13608,8 +13800,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 495,
-              "start": 489
+              "end": 554,
+              "start": 548
             },
             "text": "_index"
           }
@@ -13622,14 +13814,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:70cfbf5aff8d2abe5ef8c860a5f86156",
+      "nativeId": "occ:v2:c902c9ba555a9ff40937eca691f28a06",
       "ownerRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 542,
-        "start": 532
+        "end": 601,
+        "start": 591
       },
-      "ref": "2:r1:occ:v2:70cfbf5aff8d2abe5ef8c860a5f86156",
+      "ref": "2:r1:occ:v2:c902c9ba555a9ff40937eca691f28a06",
       "revisionId": "r1",
       "spelling": "Measurable",
       "witnesses": [
@@ -13638,8 +13830,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 542,
-              "start": 532
+              "end": 601,
+              "start": 591
             },
             "text": "Measurable"
           }
@@ -13652,14 +13844,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:68e821afa394ccf7556977a14bca968e",
+      "nativeId": "occ:v2:919474bfa5fe39a3f98d43d0ecb48932",
       "ownerRef": "2:r1:sid:v1:61af38151d19ba34dc91d217ed898d9d",
       "range": {
         "encoding": "utf8",
-        "end": 551,
-        "start": 547
+        "end": 610,
+        "start": 606
       },
-      "ref": "2:r1:occ:v2:68e821afa394ccf7556977a14bca968e",
+      "ref": "2:r1:occ:v2:919474bfa5fe39a3f98d43d0ecb48932",
       "revisionId": "r1",
       "spelling": "area",
       "witnesses": [
@@ -13668,8 +13860,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 551,
-              "start": 547
+              "end": 610,
+              "start": 606
             },
             "text": "area"
           }
@@ -13682,14 +13874,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:45b38adf55adcd70687c869b1e09f1bb",
+      "nativeId": "occ:v2:01ccf10b303b13d4388fe1dcc4009f84",
       "ownerRef": "2:r1:sid:v1:61af38151d19ba34dc91d217ed898d9d",
       "range": {
         "encoding": "utf8",
-        "end": 574,
-        "start": 565
+        "end": 633,
+        "start": 624
       },
-      "ref": "2:r1:occ:v2:45b38adf55adcd70687c869b1e09f1bb",
+      "ref": "2:r1:occ:v2:01ccf10b303b13d4388fe1dcc4009f84",
       "revisionId": "r1",
       "spelling": "perimeter",
       "witnesses": [
@@ -13698,8 +13890,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 574,
-              "start": 565
+              "end": 633,
+              "start": 624
             },
             "text": "perimeter"
           }
@@ -13712,14 +13904,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:e3da63afa1d6d1c6730b1d7bda742b03",
+      "nativeId": "occ:v2:3dcbb0638fabbc6bd63efc06907cb886",
       "ownerRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 616,
-        "start": 611
+        "end": 675,
+        "start": 670
       },
-      "ref": "2:r1:occ:v2:e3da63afa1d6d1c6730b1d7bda742b03",
+      "ref": "2:r1:occ:v2:3dcbb0638fabbc6bd63efc06907cb886",
       "revisionId": "r1",
       "spelling": "Shape",
       "witnesses": [
@@ -13728,8 +13920,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 616,
-              "start": 611
+              "end": 675,
+              "start": 670
             },
             "text": "Shape"
           }
@@ -13742,14 +13934,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:eda33c94f4506cc540e87071ef120c4c",
+      "nativeId": "occ:v2:64fbe412788fd5c309349b4f6e9b6d39",
       "ownerRef": "2:r1:sid:v1:2269896ca380b25af31e4033a1a79716",
       "range": {
         "encoding": "utf8",
-        "end": 638,
-        "start": 628
+        "end": 697,
+        "start": 687
       },
-      "ref": "2:r1:occ:v2:eda33c94f4506cc540e87071ef120c4c",
+      "ref": "2:r1:occ:v2:64fbe412788fd5c309349b4f6e9b6d39",
       "revisionId": "r1",
       "spelling": "Measurable",
       "witnesses": [
@@ -13758,8 +13950,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 638,
-              "start": 628
+              "end": 697,
+              "start": 687
             },
             "text": "Measurable"
           }
@@ -13772,14 +13964,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:de85d224a270f6fee9a4aaa844952156",
+      "nativeId": "occ:v2:78943bb1aff7b1addd57b719f3881134",
       "ownerRef": "2:r1:sid:v1:2269896ca380b25af31e4033a1a79716",
       "range": {
         "encoding": "utf8",
-        "end": 656,
-        "start": 652
+        "end": 715,
+        "start": 711
       },
-      "ref": "2:r1:occ:v2:de85d224a270f6fee9a4aaa844952156",
+      "ref": "2:r1:occ:v2:78943bb1aff7b1addd57b719f3881134",
       "revisionId": "r1",
       "spelling": "area",
       "witnesses": [
@@ -13788,8 +13980,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 656,
-              "start": 652
+              "end": 715,
+              "start": 711
             },
             "text": "area"
           }
@@ -13802,14 +13994,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:8dbc85c7d1499351f471bd27c01cd943",
+      "nativeId": "occ:v2:a4cf6f35cf47e6874213835f6c5f6262",
       "ownerRef": "2:r1:sid:v1:2269896ca380b25af31e4033a1a79716",
       "range": {
         "encoding": "utf8",
-        "end": 688,
-        "start": 679
+        "end": 747,
+        "start": 738
       },
-      "ref": "2:r1:occ:v2:8dbc85c7d1499351f471bd27c01cd943",
+      "ref": "2:r1:occ:v2:a4cf6f35cf47e6874213835f6c5f6262",
       "revisionId": "r1",
       "spelling": "perimeter",
       "witnesses": [
@@ -13818,8 +14010,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 688,
-              "start": 679
+              "end": 747,
+              "start": 738
             },
             "text": "perimeter"
           }
@@ -13832,14 +14024,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:fda5eee5f112094976b473c6cbfc6512",
+      "nativeId": "occ:v2:91772e8557deb62769cd2e512586b786",
       "ownerRef": "2:r1:sid:v1:2269896ca380b25af31e4033a1a79716",
       "range": {
         "encoding": "utf8",
-        "end": 711,
-        "start": 703
+        "end": 770,
+        "start": 762
       },
-      "ref": "2:r1:occ:v2:fda5eee5f112094976b473c6cbfc6512",
+      "ref": "2:r1:occ:v2:91772e8557deb62769cd2e512586b786",
       "revisionId": "r1",
       "spelling": "describe",
       "witnesses": [
@@ -13848,8 +14040,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 711,
-              "start": 703
+              "end": 770,
+              "start": 762
             },
             "text": "describe"
           }
@@ -13862,14 +14054,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:ad539864dd23a03109ccc24811b936f8",
+      "nativeId": "occ:v2:b053ea4dafe47f34e8ae81e500f8569c",
       "ownerRef": "2:r1:sid:v1:92a2f7f18241894224faceeb4c6b338d",
       "range": {
         "encoding": "utf8",
-        "end": 754,
-        "start": 743
+        "end": 813,
+        "start": 802
       },
-      "ref": "2:r1:occ:v2:ad539864dd23a03109ccc24811b936f8",
+      "ref": "2:r1:occ:v2:b053ea4dafe47f34e8ae81e500f8569c",
       "revisionId": "r1",
       "spelling": "constructor",
       "witnesses": [
@@ -13878,8 +14070,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 754,
-              "start": 743
+              "end": 813,
+              "start": 802
             },
             "text": "constructor"
           }
@@ -13892,14 +14084,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:d57729b0c4988617e23530f85fe651ce",
+      "nativeId": "occ:v2:245307399fb33ed9ae3203b4ee009eac",
       "ownerRef": "2:r1:sid:v1:92a2f7f18241894224faceeb4c6b338d",
       "range": {
         "encoding": "utf8",
-        "end": 759,
-        "start": 755
+        "end": 818,
+        "start": 814
       },
-      "ref": "2:r1:occ:v2:d57729b0c4988617e23530f85fe651ce",
+      "ref": "2:r1:occ:v2:245307399fb33ed9ae3203b4ee009eac",
       "revisionId": "r1",
       "spelling": "name",
       "witnesses": [
@@ -13908,8 +14100,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 759,
-              "start": 755
+              "end": 818,
+              "start": 814
             },
             "text": "name"
           }
@@ -13922,14 +14114,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:b371610b7fd1c9cdd0d5aabde1683c29",
+      "nativeId": "occ:v2:de57964be68d0a3a9096d060f8d7b66c",
       "ownerRef": "2:r1:sid:v1:92a2f7f18241894224faceeb4c6b338d",
       "range": {
         "encoding": "utf8",
-        "end": 772,
-        "start": 768
+        "end": 831,
+        "start": 827
       },
-      "ref": "2:r1:occ:v2:b371610b7fd1c9cdd0d5aabde1683c29",
+      "ref": "2:r1:occ:v2:de57964be68d0a3a9096d060f8d7b66c",
       "revisionId": "r1",
       "spelling": "area",
       "witnesses": [
@@ -13938,8 +14130,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 772,
-              "start": 768
+              "end": 831,
+              "start": 827
             },
             "text": "area"
           }
@@ -13952,14 +14144,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:c6036883dd57ab3d766d09dcfb255703",
+      "nativeId": "occ:v2:a3498fb397cb924dd55a270599971917",
       "ownerRef": "2:r1:sid:v1:92a2f7f18241894224faceeb4c6b338d",
       "range": {
         "encoding": "utf8",
-        "end": 782,
-        "start": 775
+        "end": 841,
+        "start": 834
       },
-      "ref": "2:r1:occ:v2:c6036883dd57ab3d766d09dcfb255703",
+      "ref": "2:r1:occ:v2:a3498fb397cb924dd55a270599971917",
       "revisionId": "r1",
       "spelling": "toFixed",
       "witnesses": [
@@ -13968,8 +14160,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 782,
-              "start": 775
+              "end": 841,
+              "start": 834
             },
             "text": "toFixed"
           }
@@ -13982,14 +14174,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:23c87624f19573c749cd61ab6bd32939",
+      "nativeId": "occ:v2:a975b00dd7aed7d7cb5b3489542aac7d",
       "ownerRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 803,
-        "start": 797
+        "end": 862,
+        "start": 856
       },
-      "ref": "2:r1:occ:v2:23c87624f19573c749cd61ab6bd32939",
+      "ref": "2:r1:occ:v2:a975b00dd7aed7d7cb5b3489542aac7d",
       "revisionId": "r1",
       "spelling": "sealed",
       "witnesses": [
@@ -13998,8 +14190,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 803,
-              "start": 797
+              "end": 862,
+              "start": 856
             },
             "text": "sealed"
           }
@@ -14012,14 +14204,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:91a722c51beb83afa00569462a2323b4",
+      "nativeId": "occ:v2:2a695d8d24d38e838197390874b17883",
       "ownerRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 826,
-        "start": 817
+        "end": 885,
+        "start": 876
       },
-      "ref": "2:r1:occ:v2:91a722c51beb83afa00569462a2323b4",
+      "ref": "2:r1:occ:v2:2a695d8d24d38e838197390874b17883",
       "revisionId": "r1",
       "spelling": "Rectangle",
       "witnesses": [
@@ -14028,8 +14220,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 826,
-              "start": 817
+              "end": 885,
+              "start": 876
             },
             "text": "Rectangle"
           }
@@ -14042,14 +14234,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:bac1a86628cbe3c6587772935542c440",
+      "nativeId": "occ:v2:3fb448f7ca5d566ec94f9b806f4a9b9a",
       "ownerRef": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
       "range": {
         "encoding": "utf8",
-        "end": 840,
-        "start": 835
+        "end": 899,
+        "start": 894
       },
-      "ref": "2:r1:occ:v2:bac1a86628cbe3c6587772935542c440",
+      "ref": "2:r1:occ:v2:3fb448f7ca5d566ec94f9b806f4a9b9a",
       "revisionId": "r1",
       "spelling": "Shape",
       "witnesses": [
@@ -14058,8 +14250,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 840,
-              "start": 835
+              "end": 899,
+              "start": 894
             },
             "text": "Shape"
           }
@@ -14072,14 +14264,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:74b0eca6d7a4b5daf367863d425f7124",
+      "nativeId": "occ:v2:89f1be5a1b36ad4574fc55b54ced88af",
       "ownerRef": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
       "range": {
         "encoding": "utf8",
-        "end": 856,
-        "start": 845
+        "end": 915,
+        "start": 904
       },
-      "ref": "2:r1:occ:v2:74b0eca6d7a4b5daf367863d425f7124",
+      "ref": "2:r1:occ:v2:89f1be5a1b36ad4574fc55b54ced88af",
       "revisionId": "r1",
       "spelling": "constructor",
       "witnesses": [
@@ -14088,8 +14280,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 856,
-              "start": 845
+              "end": 915,
+              "start": 904
             },
             "text": "constructor"
           }
@@ -14102,14 +14294,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:88c70571b81194521b2b0d5b1498456d",
+      "nativeId": "occ:v2:6818c4f76c52e7ba03d96864f83fc119",
       "ownerRef": "2:r1:sid:v1:dbe9c81d2e79469c0228b5495ee5eaa3",
       "range": {
         "encoding": "utf8",
-        "end": 883,
-        "start": 878
+        "end": 942,
+        "start": 937
       },
-      "ref": "2:r1:occ:v2:88c70571b81194521b2b0d5b1498456d",
+      "ref": "2:r1:occ:v2:6818c4f76c52e7ba03d96864f83fc119",
       "revisionId": "r1",
       "spelling": "width",
       "witnesses": [
@@ -14118,8 +14310,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 883,
-              "start": 878
+              "end": 942,
+              "start": 937
             },
             "text": "width"
           }
@@ -14132,14 +14324,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:62aa513c85371709f0290a866ad962d7",
+      "nativeId": "occ:v2:ac1895e3698b1a6d27d15b254cf179ff",
       "ownerRef": "2:r1:sid:v1:dbe9c81d2e79469c0228b5495ee5eaa3",
       "range": {
         "encoding": "utf8",
-        "end": 913,
-        "start": 907
+        "end": 972,
+        "start": 966
       },
-      "ref": "2:r1:occ:v2:62aa513c85371709f0290a866ad962d7",
+      "ref": "2:r1:occ:v2:ac1895e3698b1a6d27d15b254cf179ff",
       "revisionId": "r1",
       "spelling": "height",
       "witnesses": [
@@ -14148,8 +14340,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 913,
-              "start": 907
+              "end": 972,
+              "start": 966
             },
             "text": "height"
           }
@@ -14162,14 +14354,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:a4bb803f9f65f6876bd2418193346490",
+      "nativeId": "occ:v2:1a0cba68ff7c686a37f3d2112623466c",
       "ownerRef": "2:r1:sid:v1:dbe9c81d2e79469c0228b5495ee5eaa3",
       "range": {
         "encoding": "utf8",
-        "end": 940,
-        "start": 935
+        "end": 999,
+        "start": 994
       },
-      "ref": "2:r1:occ:v2:a4bb803f9f65f6876bd2418193346490",
+      "ref": "2:r1:occ:v2:1a0cba68ff7c686a37f3d2112623466c",
       "revisionId": "r1",
       "spelling": "label",
       "witnesses": [
@@ -14178,8 +14370,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 940,
-              "start": 935
+              "end": 999,
+              "start": 994
             },
             "text": "label"
           }
@@ -14192,14 +14384,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:0bc5c722b282ffcc4f18dd0f9c556ed9",
+      "nativeId": "occ:v2:87cc7592977680e07636d676c61a9099",
       "ownerRef": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
       "range": {
         "encoding": "utf8",
-        "end": 981,
-        "start": 977
+        "end": 1040,
+        "start": 1036
       },
-      "ref": "2:r1:occ:v2:0bc5c722b282ffcc4f18dd0f9c556ed9",
+      "ref": "2:r1:occ:v2:87cc7592977680e07636d676c61a9099",
       "revisionId": "r1",
       "spelling": "area",
       "witnesses": [
@@ -14208,8 +14400,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 981,
-              "start": 977
+              "end": 1040,
+              "start": 1036
             },
             "text": "area"
           }
@@ -14222,14 +14414,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:ef64887ba6ccbc5745e6f4dcdfc0593a",
+      "nativeId": "occ:v2:957bc4413682f5c6c0d1ad6a03e892cc",
       "ownerRef": "2:r1:sid:v1:7714fac51f5c657737dfed033dbdee60",
       "range": {
         "encoding": "utf8",
-        "end": 1015,
-        "start": 1010
+        "end": 1074,
+        "start": 1069
       },
-      "ref": "2:r1:occ:v2:ef64887ba6ccbc5745e6f4dcdfc0593a",
+      "ref": "2:r1:occ:v2:957bc4413682f5c6c0d1ad6a03e892cc",
       "revisionId": "r1",
       "spelling": "width",
       "witnesses": [
@@ -14238,8 +14430,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1015,
-              "start": 1010
+              "end": 1074,
+              "start": 1069
             },
             "text": "width"
           }
@@ -14252,14 +14444,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:a9dcc779fffd6e4da35244441bf85699",
+      "nativeId": "occ:v2:f3083dc165d839cfc7ac53a728b9dbca",
       "ownerRef": "2:r1:sid:v1:7714fac51f5c657737dfed033dbdee60",
       "range": {
         "encoding": "utf8",
-        "end": 1029,
-        "start": 1023
+        "end": 1088,
+        "start": 1082
       },
-      "ref": "2:r1:occ:v2:a9dcc779fffd6e4da35244441bf85699",
+      "ref": "2:r1:occ:v2:f3083dc165d839cfc7ac53a728b9dbca",
       "revisionId": "r1",
       "spelling": "height",
       "witnesses": [
@@ -14268,8 +14460,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1029,
-              "start": 1023
+              "end": 1088,
+              "start": 1082
             },
             "text": "height"
           }
@@ -14282,14 +14474,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:a3322c2b283afda08c2d9d2680c508c2",
+      "nativeId": "occ:v2:5fe5ea9725d3cd35686fd51e1a6476e9",
       "ownerRef": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
       "range": {
         "encoding": "utf8",
-        "end": 1047,
-        "start": 1038
+        "end": 1106,
+        "start": 1097
       },
-      "ref": "2:r1:occ:v2:a3322c2b283afda08c2d9d2680c508c2",
+      "ref": "2:r1:occ:v2:5fe5ea9725d3cd35686fd51e1a6476e9",
       "revisionId": "r1",
       "spelling": "perimeter",
       "witnesses": [
@@ -14298,8 +14490,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1047,
-              "start": 1038
+              "end": 1106,
+              "start": 1097
             },
             "text": "perimeter"
           }
@@ -14312,14 +14504,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:3e85dadffbea4eb9de75834989a2784e",
+      "nativeId": "occ:v2:df94e71ac242451305e69ce5cb528bac",
       "ownerRef": "2:r1:sid:v1:b0b3550b65759ee573814fe7c491c4ff",
       "range": {
         "encoding": "utf8",
-        "end": 1086,
-        "start": 1081
+        "end": 1145,
+        "start": 1140
       },
-      "ref": "2:r1:occ:v2:3e85dadffbea4eb9de75834989a2784e",
+      "ref": "2:r1:occ:v2:df94e71ac242451305e69ce5cb528bac",
       "revisionId": "r1",
       "spelling": "width",
       "witnesses": [
@@ -14328,8 +14520,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1086,
-              "start": 1081
+              "end": 1145,
+              "start": 1140
             },
             "text": "width"
           }
@@ -14342,14 +14534,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:4e85637050a5b7f533de38a801041226",
+      "nativeId": "occ:v2:3def521e4510ca5ddabffed644785e43",
       "ownerRef": "2:r1:sid:v1:b0b3550b65759ee573814fe7c491c4ff",
       "range": {
         "encoding": "utf8",
-        "end": 1100,
-        "start": 1094
+        "end": 1159,
+        "start": 1153
       },
-      "ref": "2:r1:occ:v2:4e85637050a5b7f533de38a801041226",
+      "ref": "2:r1:occ:v2:3def521e4510ca5ddabffed644785e43",
       "revisionId": "r1",
       "spelling": "height",
       "witnesses": [
@@ -14358,8 +14550,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1100,
-              "start": 1094
+              "end": 1159,
+              "start": 1153
             },
             "text": "height"
           }
@@ -14372,14 +14564,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:b04725d5784ed1689f02018fa2bc614e",
+      "nativeId": "occ:v2:371d753fcd307d74fb7394dbcaa09435",
       "ownerRef": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
       "range": {
         "encoding": "utf8",
-        "end": 1117,
-        "start": 1111
+        "end": 1176,
+        "start": 1170
       },
-      "ref": "2:r1:occ:v2:b04725d5784ed1689f02018fa2bc614e",
+      "ref": "2:r1:occ:v2:371d753fcd307d74fb7394dbcaa09435",
       "revisionId": "r1",
       "spelling": "logged",
       "witnesses": [
@@ -14388,8 +14580,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1117,
-              "start": 1111
+              "end": 1176,
+              "start": 1170
             },
             "text": "logged"
           }
@@ -14402,14 +14594,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:2b4724b8a1a0638a29c7d8ebcdbe02c9",
+      "nativeId": "occ:v2:f6a6c00d32075a70ec647729da5dd3ff",
       "ownerRef": "2:r1:sid:v1:93a0261b512ebc219c21c81e9941e893",
       "range": {
         "encoding": "utf8",
-        "end": 1125,
-        "start": 1120
+        "end": 1193,
+        "start": 1188
       },
-      "ref": "2:r1:occ:v2:2b4724b8a1a0638a29c7d8ebcdbe02c9",
+      "ref": "2:r1:occ:v2:f6a6c00d32075a70ec647729da5dd3ff",
       "revisionId": "r1",
       "spelling": "scale",
       "witnesses": [
@@ -14418,8 +14610,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1125,
-              "start": 1120
+              "end": 1193,
+              "start": 1188
             },
             "text": "scale"
           }
@@ -14432,14 +14624,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:a1c7676ca266aa33e06edc3628f8482e",
+      "nativeId": "occ:v2:999c4a8cd20f45606ff8c6f99b72877d",
       "ownerRef": "2:r1:sid:v1:5225a16160e4172ca327892521c5fb60",
       "range": {
         "encoding": "utf8",
-        "end": 1133,
-        "start": 1127
+        "end": 1201,
+        "start": 1195
       },
-      "ref": "2:r1:occ:v2:a1c7676ca266aa33e06edc3628f8482e",
+      "ref": "2:r1:occ:v2:999c4a8cd20f45606ff8c6f99b72877d",
       "revisionId": "r1",
       "spelling": "tagged",
       "witnesses": [
@@ -14448,8 +14640,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1133,
-              "start": 1127
+              "end": 1201,
+              "start": 1195
             },
             "text": "tagged"
           }
@@ -14462,14 +14654,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:7e46e6f1535afcc5a560d57057678aae",
+      "nativeId": "occ:v2:4c7af12cb9fc3579e3733f62c4f8db40",
       "ownerRef": "2:r1:sid:v1:5225a16160e4172ca327892521c5fb60",
       "range": {
         "encoding": "utf8",
-        "end": 1140,
-        "start": 1134
+        "end": 1208,
+        "start": 1202
       },
-      "ref": "2:r1:occ:v2:7e46e6f1535afcc5a560d57057678aae",
+      "ref": "2:r1:occ:v2:4c7af12cb9fc3579e3733f62c4f8db40",
       "revisionId": "r1",
       "spelling": "factor",
       "witnesses": [
@@ -14478,8 +14670,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1140,
-              "start": 1134
+              "end": 1208,
+              "start": 1202
             },
             "text": "factor"
           }
@@ -14492,14 +14684,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:c5f26b2c72271c2479f6b2973721c9be",
+      "nativeId": "occ:v2:3a9767b27d75f25ba3d07a1961324e97",
       "ownerRef": "2:r1:sid:v1:5225a16160e4172ca327892521c5fb60",
       "range": {
         "encoding": "utf8",
-        "end": 1160,
-        "start": 1151
+        "end": 1228,
+        "start": 1219
       },
-      "ref": "2:r1:occ:v2:c5f26b2c72271c2479f6b2973721c9be",
+      "ref": "2:r1:occ:v2:3a9767b27d75f25ba3d07a1961324e97",
       "revisionId": "r1",
       "spelling": "Rectangle",
       "witnesses": [
@@ -14508,8 +14700,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1160,
-              "start": 1151
+              "end": 1228,
+              "start": 1219
             },
             "text": "Rectangle"
           }
@@ -14522,14 +14714,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:92c7d0c66df8782a5f25ffa9619e24de",
+      "nativeId": "occ:v2:d8a81394b784779c4f93fa80c13b00a4",
       "ownerRef": "2:r1:sid:v1:5225a16160e4172ca327892521c5fb60",
       "range": {
         "encoding": "utf8",
-        "end": 1187,
-        "start": 1178
+        "end": 1255,
+        "start": 1246
       },
-      "ref": "2:r1:occ:v2:92c7d0c66df8782a5f25ffa9619e24de",
+      "ref": "2:r1:occ:v2:d8a81394b784779c4f93fa80c13b00a4",
       "revisionId": "r1",
       "spelling": "Rectangle",
       "witnesses": [
@@ -14538,8 +14730,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1187,
-              "start": 1178
+              "end": 1255,
+              "start": 1246
             },
             "text": "Rectangle"
           }
@@ -14552,14 +14744,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:6df5b4f63dc5c4804b3fb8a6b216ed07",
+      "nativeId": "occ:v2:7d6fd339a021a48308e33e1e0e67d79d",
       "ownerRef": "2:r1:sid:v1:5225a16160e4172ca327892521c5fb60",
       "range": {
         "encoding": "utf8",
-        "end": 1198,
-        "start": 1193
+        "end": 1266,
+        "start": 1261
       },
-      "ref": "2:r1:occ:v2:6df5b4f63dc5c4804b3fb8a6b216ed07",
+      "ref": "2:r1:occ:v2:7d6fd339a021a48308e33e1e0e67d79d",
       "revisionId": "r1",
       "spelling": "width",
       "witnesses": [
@@ -14568,8 +14760,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1198,
-              "start": 1193
+              "end": 1266,
+              "start": 1261
             },
             "text": "width"
           }
@@ -14582,14 +14774,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:fd4f08b0bf51cad2c51799bcccb096bd",
+      "nativeId": "occ:v2:f0e080887477c8fe1bb3d397b1eabe27",
       "ownerRef": "2:r1:sid:v1:5225a16160e4172ca327892521c5fb60",
       "range": {
         "encoding": "utf8",
-        "end": 1207,
-        "start": 1201
+        "end": 1275,
+        "start": 1269
       },
-      "ref": "2:r1:occ:v2:fd4f08b0bf51cad2c51799bcccb096bd",
+      "ref": "2:r1:occ:v2:f0e080887477c8fe1bb3d397b1eabe27",
       "revisionId": "r1",
       "spelling": "factor",
       "witnesses": [
@@ -14598,8 +14790,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1207,
-              "start": 1201
+              "end": 1275,
+              "start": 1269
             },
             "text": "factor"
           }
@@ -14612,14 +14804,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:2f5f5fbab033b86da8ccf9cc455c1657",
+      "nativeId": "occ:v2:f8e1bd591728c4177233b033c956dce5",
       "ownerRef": "2:r1:sid:v1:5225a16160e4172ca327892521c5fb60",
       "range": {
         "encoding": "utf8",
-        "end": 1220,
-        "start": 1214
+        "end": 1288,
+        "start": 1282
       },
-      "ref": "2:r1:occ:v2:2f5f5fbab033b86da8ccf9cc455c1657",
+      "ref": "2:r1:occ:v2:f8e1bd591728c4177233b033c956dce5",
       "revisionId": "r1",
       "spelling": "height",
       "witnesses": [
@@ -14628,8 +14820,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1220,
-              "start": 1214
+              "end": 1288,
+              "start": 1282
             },
             "text": "height"
           }
@@ -14642,14 +14834,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:9eca60e2811b06839b737a74a11e67bf",
+      "nativeId": "occ:v2:442a7919f8ac540792b857c79b131f17",
       "ownerRef": "2:r1:sid:v1:5225a16160e4172ca327892521c5fb60",
       "range": {
         "encoding": "utf8",
-        "end": 1229,
-        "start": 1223
+        "end": 1297,
+        "start": 1291
       },
-      "ref": "2:r1:occ:v2:9eca60e2811b06839b737a74a11e67bf",
+      "ref": "2:r1:occ:v2:442a7919f8ac540792b857c79b131f17",
       "revisionId": "r1",
       "spelling": "factor",
       "witnesses": [
@@ -14658,8 +14850,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1229,
-              "start": 1223
+              "end": 1297,
+              "start": 1291
             },
             "text": "factor"
           }
@@ -14672,14 +14864,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:9b5d22f98112715ca3c2642fbb760622",
+      "nativeId": "occ:v2:5c0d7d680f2d306a262b0ae221ebd672",
       "ownerRef": "2:r1:sid:v1:5225a16160e4172ca327892521c5fb60",
       "range": {
         "encoding": "utf8",
-        "end": 1241,
-        "start": 1236
+        "end": 1309,
+        "start": 1304
       },
-      "ref": "2:r1:occ:v2:9b5d22f98112715ca3c2642fbb760622",
+      "ref": "2:r1:occ:v2:5c0d7d680f2d306a262b0ae221ebd672",
       "revisionId": "r1",
       "spelling": "label",
       "witnesses": [
@@ -14688,8 +14880,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1241,
-              "start": 1236
+              "end": 1309,
+              "start": 1304
             },
             "text": "label"
           }
@@ -14702,14 +14894,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:fae8273075c6df12ef3b64956ecd9978",
+      "nativeId": "occ:v2:8f0c6da182fe25510e8d4671597866fd",
       "ownerRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 1270,
-        "start": 1264
+        "end": 1338,
+        "start": 1332
       },
-      "ref": "2:r1:occ:v2:fae8273075c6df12ef3b64956ecd9978",
+      "ref": "2:r1:occ:v2:8f0c6da182fe25510e8d4671597866fd",
       "revisionId": "r1",
       "spelling": "Square",
       "witnesses": [
@@ -14718,8 +14910,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1270,
-              "start": 1264
+              "end": 1338,
+              "start": 1332
             },
             "text": "Square"
           }
@@ -14732,14 +14924,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:906195134a907feb2c7c17b62393de06",
+      "nativeId": "occ:v2:b70aa558e9c97dfb00e1f6fa16598e54",
       "ownerRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1288,
-        "start": 1279
+        "end": 1356,
+        "start": 1347
       },
-      "ref": "2:r1:occ:v2:906195134a907feb2c7c17b62393de06",
+      "ref": "2:r1:occ:v2:b70aa558e9c97dfb00e1f6fa16598e54",
       "revisionId": "r1",
       "spelling": "Rectangle",
       "witnesses": [
@@ -14748,8 +14940,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1288,
-              "start": 1279
+              "end": 1356,
+              "start": 1347
             },
             "text": "Rectangle"
           }
@@ -14762,14 +14954,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:b4926ae68a0e33686bd4f2348ddab105",
+      "nativeId": "occ:v2:35e7eea64e2e181ba779f97414900e5a",
       "ownerRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1310,
-        "start": 1300
+        "end": 1378,
+        "start": 1368
       },
-      "ref": "2:r1:occ:v2:b4926ae68a0e33686bd4f2348ddab105",
+      "ref": "2:r1:occ:v2:35e7eea64e2e181ba779f97414900e5a",
       "revisionId": "r1",
       "spelling": "Measurable",
       "witnesses": [
@@ -14778,8 +14970,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1310,
-              "start": 1300
+              "end": 1378,
+              "start": 1368
             },
             "text": "Measurable"
           }
@@ -14792,26 +14984,26 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:6c446722fe5ae7b51660e228a9ece262",
+      "nativeId": "occ:v2:8a2386df78224db13babfc873d59e41b",
       "ownerRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1343,
-        "start": 1338
+        "end": 1410,
+        "start": 1406
       },
-      "ref": "2:r1:occ:v2:6c446722fe5ae7b51660e228a9ece262",
+      "ref": "2:r1:occ:v2:8a2386df78224db13babfc873d59e41b",
       "revisionId": "r1",
-      "spelling": "sides",
+      "spelling": "unit",
       "witnesses": [
         {
           "field": "spelling",
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1343,
-              "start": 1338
+              "end": 1410,
+              "start": 1406
             },
-            "text": "sides"
+            "text": "unit"
           }
         }
       ]
@@ -14822,14 +15014,44 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:9ca528b548ba127124fed2741d78f01c",
+      "nativeId": "occ:v2:3e0f781a90df18b359b82d4607343ba4",
       "ownerRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1363,
-        "start": 1352
+        "end": 1423,
+        "start": 1417
       },
-      "ref": "2:r1:occ:v2:9ca528b548ba127124fed2741d78f01c",
+      "ref": "2:r1:occ:v2:3e0f781a90df18b359b82d4607343ba4",
+      "revisionId": "r1",
+      "spelling": "Square",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "end": 1423,
+              "start": 1417
+            },
+            "text": "Square"
+          }
+        }
+      ]
+    },
+    {
+      "document": {
+        "language": "typescript",
+        "path": "src/geometry.ts",
+        "sourceSetId": "main"
+      },
+      "nativeId": "occ:v2:5af416c747f33e504ab99bded018ad60",
+      "ownerRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
+      "range": {
+        "encoding": "utf8",
+        "end": 1442,
+        "start": 1431
+      },
+      "ref": "2:r1:occ:v2:5af416c747f33e504ab99bded018ad60",
       "revisionId": "r1",
       "spelling": "constructor",
       "witnesses": [
@@ -14838,8 +15060,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1363,
-              "start": 1352
+              "end": 1442,
+              "start": 1431
             },
             "text": "constructor"
           }
@@ -14852,14 +15074,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:79294f225226a4f06ab1a32367e953b1",
+      "nativeId": "occ:v2:d4e182e643a6c5b209038f1240e5840b",
       "ownerRef": "2:r1:sid:v1:20260f49d1c81783f14905a5d9975d41",
       "range": {
         "encoding": "utf8",
-        "end": 1368,
-        "start": 1364
+        "end": 1447,
+        "start": 1443
       },
-      "ref": "2:r1:occ:v2:79294f225226a4f06ab1a32367e953b1",
+      "ref": "2:r1:occ:v2:d4e182e643a6c5b209038f1240e5840b",
       "revisionId": "r1",
       "spelling": "side",
       "witnesses": [
@@ -14868,8 +15090,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1368,
-              "start": 1364
+              "end": 1447,
+              "start": 1443
             },
             "text": "side"
           }
@@ -14882,14 +15104,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:a8c75dbb25a04e3a662087d8ef89a514",
+      "nativeId": "occ:v2:137c7ee17650f48e29a45ca7ff460f28",
       "ownerRef": "2:r1:sid:v1:20260f49d1c81783f14905a5d9975d41",
       "range": {
         "encoding": "utf8",
-        "end": 1394,
-        "start": 1390
+        "end": 1473,
+        "start": 1469
       },
-      "ref": "2:r1:occ:v2:a8c75dbb25a04e3a662087d8ef89a514",
+      "ref": "2:r1:occ:v2:137c7ee17650f48e29a45ca7ff460f28",
       "revisionId": "r1",
       "spelling": "side",
       "witnesses": [
@@ -14898,8 +15120,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1394,
-              "start": 1390
+              "end": 1473,
+              "start": 1469
             },
             "text": "side"
           }
@@ -14912,14 +15134,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:51f5c7748ac5a604365f40f0e63f92ac",
+      "nativeId": "occ:v2:673e177d42f0a704cafa545dc4ca4035",
       "ownerRef": "2:r1:sid:v1:20260f49d1c81783f14905a5d9975d41",
       "range": {
         "encoding": "utf8",
-        "end": 1400,
-        "start": 1396
+        "end": 1479,
+        "start": 1475
       },
-      "ref": "2:r1:occ:v2:51f5c7748ac5a604365f40f0e63f92ac",
+      "ref": "2:r1:occ:v2:673e177d42f0a704cafa545dc4ca4035",
       "revisionId": "r1",
       "spelling": "side",
       "witnesses": [
@@ -14928,8 +15150,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1400,
-              "start": 1396
+              "end": 1479,
+              "start": 1475
             },
             "text": "side"
           }
@@ -14942,14 +15164,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:6892c2d8109d85736155e6bb60849ead",
+      "nativeId": "occ:v2:1414d457c1ec4fe75d76af3e68809db7",
       "ownerRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1433,
-        "start": 1429
+        "end": 1512,
+        "start": 1508
       },
-      "ref": "2:r1:occ:v2:6892c2d8109d85736155e6bb60849ead",
+      "ref": "2:r1:occ:v2:1414d457c1ec4fe75d76af3e68809db7",
       "revisionId": "r1",
       "spelling": "area",
       "witnesses": [
@@ -14958,8 +15180,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1433,
-              "start": 1429
+              "end": 1512,
+              "start": 1508
             },
             "text": "area"
           }
@@ -14972,14 +15194,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:5a0357c3e0e8a4095de6fb7ad29f663f",
+      "nativeId": "occ:v2:4c47ea7d4f423da66a4833717ff67e69",
       "ownerRef": "2:r1:sid:v1:4a84e0f6e56c232002106f902bf12e6c",
       "range": {
         "encoding": "utf8",
-        "end": 1467,
-        "start": 1463
+        "end": 1546,
+        "start": 1542
       },
-      "ref": "2:r1:occ:v2:5a0357c3e0e8a4095de6fb7ad29f663f",
+      "ref": "2:r1:occ:v2:4c47ea7d4f423da66a4833717ff67e69",
       "revisionId": "r1",
       "spelling": "area",
       "witnesses": [
@@ -14988,8 +15210,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1467,
-              "start": 1463
+              "end": 1546,
+              "start": 1542
             },
             "text": "area"
           }
@@ -15002,14 +15224,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:f29bd2cbd37f84b7922fe3b629cefaae",
+      "nativeId": "occ:v2:5f525d17b5e06d0e4944885fc66619ef",
       "ownerRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1486,
-        "start": 1482
+        "end": 1565,
+        "start": 1561
       },
-      "ref": "2:r1:occ:v2:f29bd2cbd37f84b7922fe3b629cefaae",
+      "ref": "2:r1:occ:v2:5f525d17b5e06d0e4944885fc66619ef",
       "revisionId": "r1",
       "spelling": "side",
       "witnesses": [
@@ -15018,8 +15240,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1486,
-              "start": 1482
+              "end": 1565,
+              "start": 1561
             },
             "text": "side"
           }
@@ -15032,14 +15254,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:63be061265bde25b195f52a161d1923d",
+      "nativeId": "occ:v2:e29bccce85a6939b0137326ea83ab39a",
       "ownerRef": "2:r1:sid:v1:4309a95a45e15d65d7593601bdb018d4",
       "range": {
         "encoding": "utf8",
-        "end": 1520,
-        "start": 1515
+        "end": 1599,
+        "start": 1594
       },
-      "ref": "2:r1:occ:v2:63be061265bde25b195f52a161d1923d",
+      "ref": "2:r1:occ:v2:e29bccce85a6939b0137326ea83ab39a",
       "revisionId": "r1",
       "spelling": "width",
       "witnesses": [
@@ -15048,8 +15270,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1520,
-              "start": 1515
+              "end": 1599,
+              "start": 1594
             },
             "text": "width"
           }
@@ -15062,14 +15284,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:ca16e5dfbb5cb89d1052a4b1c547f5e7",
+      "nativeId": "occ:v2:f1bebffaa9ab921061d3142d709c3489",
       "ownerRef": "2:r1:sid:v1:ebcd73b619dc3f4298e0502eaf76bc6a",
       "range": {
         "encoding": "utf8",
-        "end": 1537,
-        "start": 1533
+        "end": 1616,
+        "start": 1612
       },
-      "ref": "2:r1:occ:v2:ca16e5dfbb5cb89d1052a4b1c547f5e7",
+      "ref": "2:r1:occ:v2:f1bebffaa9ab921061d3142d709c3489",
       "revisionId": "r1",
       "spelling": "side",
       "witnesses": [
@@ -15078,8 +15300,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1537,
-              "start": 1533
+              "end": 1616,
+              "start": 1612
             },
             "text": "side"
           }
@@ -15092,14 +15314,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:8808ff6e06e31164c153a65d805aa9dd",
+      "nativeId": "occ:v2:cc2a4507a48388c4cec20775418388a4",
       "ownerRef": "2:r1:sid:v1:94a78571832efedf745c8133216e539e",
       "range": {
         "encoding": "utf8",
-        "end": 1543,
-        "start": 1538
+        "end": 1622,
+        "start": 1617
       },
-      "ref": "2:r1:occ:v2:8808ff6e06e31164c153a65d805aa9dd",
+      "ref": "2:r1:occ:v2:cc2a4507a48388c4cec20775418388a4",
       "revisionId": "r1",
       "spelling": "value",
       "witnesses": [
@@ -15108,8 +15330,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1543,
-              "start": 1538
+              "end": 1622,
+              "start": 1617
             },
             "text": "value"
           }
@@ -15122,14 +15344,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:fed27e87132c5ac79147345b693e786d",
+      "nativeId": "occ:v2:9ede6c0477f09078eb105e733d406239",
       "ownerRef": "2:r1:sid:v1:94a78571832efedf745c8133216e539e",
       "range": {
         "encoding": "utf8",
-        "end": 1565,
-        "start": 1559
+        "end": 1644,
+        "start": 1638
       },
-      "ref": "2:r1:occ:v2:fed27e87132c5ac79147345b693e786d",
+      "ref": "2:r1:occ:v2:9ede6c0477f09078eb105e733d406239",
       "revisionId": "r1",
       "spelling": "Object",
       "witnesses": [
@@ -15138,8 +15360,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1565,
-              "start": 1559
+              "end": 1644,
+              "start": 1638
             },
             "text": "Object"
           }
@@ -15152,14 +15374,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:50e62a03cc1854b17ac0a0dc4cb39301",
+      "nativeId": "occ:v2:96f02841cdb83c74ae8bbf77b0c712d2",
       "ownerRef": "2:r1:sid:v1:94a78571832efedf745c8133216e539e",
       "range": {
         "encoding": "utf8",
-        "end": 1572,
-        "start": 1566
+        "end": 1651,
+        "start": 1645
       },
-      "ref": "2:r1:occ:v2:50e62a03cc1854b17ac0a0dc4cb39301",
+      "ref": "2:r1:occ:v2:96f02841cdb83c74ae8bbf77b0c712d2",
       "revisionId": "r1",
       "spelling": "assign",
       "witnesses": [
@@ -15168,8 +15390,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1572,
-              "start": 1566
+              "end": 1651,
+              "start": 1645
             },
             "text": "assign"
           }
@@ -15182,14 +15404,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:ba32849f3b7a75be35f0462734d6b5d4",
+      "nativeId": "occ:v2:9ab77a67d01c074b4d92c7abc7655e47",
       "ownerRef": "2:r1:sid:v1:94a78571832efedf745c8133216e539e",
       "range": {
         "encoding": "utf8",
-        "end": 1586,
-        "start": 1581
+        "end": 1665,
+        "start": 1660
       },
-      "ref": "2:r1:occ:v2:ba32849f3b7a75be35f0462734d6b5d4",
+      "ref": "2:r1:occ:v2:9ab77a67d01c074b4d92c7abc7655e47",
       "revisionId": "r1",
       "spelling": "width",
       "witnesses": [
@@ -15198,8 +15420,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1586,
-              "start": 1581
+              "end": 1665,
+              "start": 1660
             },
             "text": "width"
           }
@@ -15212,14 +15434,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:631723d5431e156e5a257c50f19a24ca",
+      "nativeId": "occ:v2:de6d92f545a133177fbb5ff8ec7faec5",
       "ownerRef": "2:r1:sid:v1:94a78571832efedf745c8133216e539e",
       "range": {
         "encoding": "utf8",
-        "end": 1593,
-        "start": 1588
+        "end": 1672,
+        "start": 1667
       },
-      "ref": "2:r1:occ:v2:631723d5431e156e5a257c50f19a24ca",
+      "ref": "2:r1:occ:v2:de6d92f545a133177fbb5ff8ec7faec5",
       "revisionId": "r1",
       "spelling": "value",
       "witnesses": [
@@ -15228,8 +15450,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1593,
-              "start": 1588
+              "end": 1672,
+              "start": 1667
             },
             "text": "value"
           }
@@ -15242,14 +15464,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:136524b36436f24268e2e261d21a4c16",
+      "nativeId": "occ:v2:d9b651c072225f5215aa411029a5a821",
       "ownerRef": "2:r1:sid:v1:94a78571832efedf745c8133216e539e",
       "range": {
         "encoding": "utf8",
-        "end": 1601,
-        "start": 1595
+        "end": 1680,
+        "start": 1674
       },
-      "ref": "2:r1:occ:v2:136524b36436f24268e2e261d21a4c16",
+      "ref": "2:r1:occ:v2:d9b651c072225f5215aa411029a5a821",
       "revisionId": "r1",
       "spelling": "height",
       "witnesses": [
@@ -15258,8 +15480,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1601,
-              "start": 1595
+              "end": 1680,
+              "start": 1674
             },
             "text": "height"
           }
@@ -15272,14 +15494,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:397aab3a4b8f97f24a3373201b3dd289",
+      "nativeId": "occ:v2:bd28d29ee34896868af221f4d7154c37",
       "ownerRef": "2:r1:sid:v1:94a78571832efedf745c8133216e539e",
       "range": {
         "encoding": "utf8",
-        "end": 1608,
-        "start": 1603
+        "end": 1687,
+        "start": 1682
       },
-      "ref": "2:r1:occ:v2:397aab3a4b8f97f24a3373201b3dd289",
+      "ref": "2:r1:occ:v2:bd28d29ee34896868af221f4d7154c37",
       "revisionId": "r1",
       "spelling": "value",
       "witnesses": [
@@ -15288,8 +15510,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1608,
-              "start": 1603
+              "end": 1687,
+              "start": 1682
             },
             "text": "value"
           }
@@ -15302,14 +15524,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:dccfccfbb4ba6586ff7bb2c34ad4cb5b",
+      "nativeId": "occ:v2:2aeff344d666add111519b0e77072912",
       "ownerRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 1627,
-        "start": 1621
+        "end": 1706,
+        "start": 1700
       },
-      "ref": "2:r1:occ:v2:dccfccfbb4ba6586ff7bb2c34ad4cb5b",
+      "ref": "2:r1:occ:v2:2aeff344d666add111519b0e77072912",
       "revisionId": "r1",
       "spelling": "sealed",
       "witnesses": [
@@ -15318,8 +15540,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1627,
-              "start": 1621
+              "end": 1706,
+              "start": 1700
             },
             "text": "sealed"
           }
@@ -15332,14 +15554,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:ea276f7445f2e131c738044028dca648",
+      "nativeId": "occ:v2:6e5d902c3ebc8d82629ca730684338d7",
       "ownerRef": "2:r1:sid:v1:3f34aa64c7d74986d6522bbdf9c6a3e6",
       "range": {
         "encoding": "utf8",
-        "end": 1649,
-        "start": 1643
+        "end": 1728,
+        "start": 1722
       },
-      "ref": "2:r1:occ:v2:ea276f7445f2e131c738044028dca648",
+      "ref": "2:r1:occ:v2:6e5d902c3ebc8d82629ca730684338d7",
       "revisionId": "r1",
       "spelling": "Circle",
       "witnesses": [
@@ -15348,8 +15570,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1649,
-              "start": 1643
+              "end": 1728,
+              "start": 1722
             },
             "text": "Circle"
           }
@@ -15362,14 +15584,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:d6622efff759fee124d7eb911a2069ca",
+      "nativeId": "occ:v2:7cac30097a4a17621930b33a56432f2b",
       "ownerRef": "2:r1:sid:v1:01053e7a7a0a9afafeb2b53fc95f651e",
       "range": {
         "encoding": "utf8",
-        "end": 1663,
-        "start": 1658
+        "end": 1742,
+        "start": 1737
       },
-      "ref": "2:r1:occ:v2:d6622efff759fee124d7eb911a2069ca",
+      "ref": "2:r1:occ:v2:7cac30097a4a17621930b33a56432f2b",
       "revisionId": "r1",
       "spelling": "Shape",
       "witnesses": [
@@ -15378,8 +15600,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1663,
-              "start": 1658
+              "end": 1742,
+              "start": 1737
             },
             "text": "Shape"
           }
@@ -15392,14 +15614,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:27ed0f7782b7f3754231512564256181",
+      "nativeId": "occ:v2:3df26721091dac42678f78201f37ab89",
       "ownerRef": "2:r1:sid:v1:01053e7a7a0a9afafeb2b53fc95f651e",
       "range": {
         "encoding": "utf8",
-        "end": 1679,
-        "start": 1668
+        "end": 1758,
+        "start": 1747
       },
-      "ref": "2:r1:occ:v2:27ed0f7782b7f3754231512564256181",
+      "ref": "2:r1:occ:v2:3df26721091dac42678f78201f37ab89",
       "revisionId": "r1",
       "spelling": "constructor",
       "witnesses": [
@@ -15408,8 +15630,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1679,
-              "start": 1668
+              "end": 1758,
+              "start": 1747
             },
             "text": "constructor"
           }
@@ -15422,14 +15644,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:497431e7fac949ee02d5731d4ec01109",
+      "nativeId": "occ:v2:5f0b8dcdd8706682336133f1c8b56240",
       "ownerRef": "2:r1:sid:v1:b88d006c86386194b7940d180ef9486d",
       "range": {
         "encoding": "utf8",
-        "end": 1703,
-        "start": 1697
+        "end": 1782,
+        "start": 1776
       },
-      "ref": "2:r1:occ:v2:497431e7fac949ee02d5731d4ec01109",
+      "ref": "2:r1:occ:v2:5f0b8dcdd8706682336133f1c8b56240",
       "revisionId": "r1",
       "spelling": "radius",
       "witnesses": [
@@ -15438,8 +15660,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1703,
-              "start": 1697
+              "end": 1782,
+              "start": 1776
             },
             "text": "radius"
           }
@@ -15452,14 +15674,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:b36ec188b6dd3af0d31f8ff3b8e24084",
+      "nativeId": "occ:v2:013524daeda85667e7c69f25eb796432",
       "ownerRef": "2:r1:sid:v1:01053e7a7a0a9afafeb2b53fc95f651e",
       "range": {
         "encoding": "utf8",
-        "end": 1739,
-        "start": 1735
+        "end": 1818,
+        "start": 1814
       },
-      "ref": "2:r1:occ:v2:b36ec188b6dd3af0d31f8ff3b8e24084",
+      "ref": "2:r1:occ:v2:013524daeda85667e7c69f25eb796432",
       "revisionId": "r1",
       "spelling": "area",
       "witnesses": [
@@ -15468,8 +15690,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1739,
-              "start": 1735
+              "end": 1818,
+              "start": 1814
             },
             "text": "area"
           }
@@ -15482,14 +15704,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:b7b3d94b90932a17e300ccd07d2ad77c",
+      "nativeId": "occ:v2:2b45021ece90b975ee3d1db1e865f1e6",
       "ownerRef": "2:r1:sid:v1:3a0d5f0019a6e35b213e0835463110bb",
       "range": {
         "encoding": "utf8",
-        "end": 1767,
-        "start": 1763
+        "end": 1846,
+        "start": 1842
       },
-      "ref": "2:r1:occ:v2:b7b3d94b90932a17e300ccd07d2ad77c",
+      "ref": "2:r1:occ:v2:2b45021ece90b975ee3d1db1e865f1e6",
       "revisionId": "r1",
       "spelling": "Math",
       "witnesses": [
@@ -15498,8 +15720,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1767,
-              "start": 1763
+              "end": 1846,
+              "start": 1842
             },
             "text": "Math"
           }
@@ -15512,14 +15734,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:7575d0147f408df6d3378a0edda55138",
+      "nativeId": "occ:v2:afc34ec889d9d9a03f743beddf7c5f56",
       "ownerRef": "2:r1:sid:v1:3a0d5f0019a6e35b213e0835463110bb",
       "range": {
         "encoding": "utf8",
-        "end": 1770,
-        "start": 1768
+        "end": 1849,
+        "start": 1847
       },
-      "ref": "2:r1:occ:v2:7575d0147f408df6d3378a0edda55138",
+      "ref": "2:r1:occ:v2:afc34ec889d9d9a03f743beddf7c5f56",
       "revisionId": "r1",
       "spelling": "PI",
       "witnesses": [
@@ -15528,8 +15750,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1770,
-              "start": 1768
+              "end": 1849,
+              "start": 1847
             },
             "text": "PI"
           }
@@ -15542,14 +15764,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:647538f63d4009c000d62924df92f03d",
+      "nativeId": "occ:v2:be2d9ff3f5a231fd2a48f8c2858eb44f",
       "ownerRef": "2:r1:sid:v1:3a0d5f0019a6e35b213e0835463110bb",
       "range": {
         "encoding": "utf8",
-        "end": 1784,
-        "start": 1778
+        "end": 1863,
+        "start": 1857
       },
-      "ref": "2:r1:occ:v2:647538f63d4009c000d62924df92f03d",
+      "ref": "2:r1:occ:v2:be2d9ff3f5a231fd2a48f8c2858eb44f",
       "revisionId": "r1",
       "spelling": "radius",
       "witnesses": [
@@ -15558,8 +15780,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1784,
-              "start": 1778
+              "end": 1863,
+              "start": 1857
             },
             "text": "radius"
           }
@@ -15572,14 +15794,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:beef1132b9ee677d2a3689e43e45c379",
+      "nativeId": "occ:v2:9a4b899833936a664562fc2c55429fca",
       "ownerRef": "2:r1:sid:v1:01053e7a7a0a9afafeb2b53fc95f651e",
       "range": {
         "encoding": "utf8",
-        "end": 1807,
-        "start": 1798
+        "end": 1886,
+        "start": 1877
       },
-      "ref": "2:r1:occ:v2:beef1132b9ee677d2a3689e43e45c379",
+      "ref": "2:r1:occ:v2:9a4b899833936a664562fc2c55429fca",
       "revisionId": "r1",
       "spelling": "perimeter",
       "witnesses": [
@@ -15588,8 +15810,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1807,
-              "start": 1798
+              "end": 1886,
+              "start": 1877
             },
             "text": "perimeter"
           }
@@ -15602,14 +15824,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:a1deaffb172280bdd5b97275ea35ab32",
+      "nativeId": "occ:v2:4e005f9719cb7f054fd935bb852dd139",
       "ownerRef": "2:r1:sid:v1:ce8e4bb41f360a33e69bfe355a558574",
       "range": {
         "encoding": "utf8",
-        "end": 1839,
-        "start": 1835
+        "end": 1918,
+        "start": 1914
       },
-      "ref": "2:r1:occ:v2:a1deaffb172280bdd5b97275ea35ab32",
+      "ref": "2:r1:occ:v2:4e005f9719cb7f054fd935bb852dd139",
       "revisionId": "r1",
       "spelling": "Math",
       "witnesses": [
@@ -15618,8 +15840,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1839,
-              "start": 1835
+              "end": 1918,
+              "start": 1914
             },
             "text": "Math"
           }
@@ -15632,14 +15854,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:96c8c796cb92719aef60e4adf96a1b70",
+      "nativeId": "occ:v2:c615052194c36cfd9051752bb5213663",
       "ownerRef": "2:r1:sid:v1:ce8e4bb41f360a33e69bfe355a558574",
       "range": {
         "encoding": "utf8",
-        "end": 1842,
-        "start": 1840
+        "end": 1921,
+        "start": 1919
       },
-      "ref": "2:r1:occ:v2:96c8c796cb92719aef60e4adf96a1b70",
+      "ref": "2:r1:occ:v2:c615052194c36cfd9051752bb5213663",
       "revisionId": "r1",
       "spelling": "PI",
       "witnesses": [
@@ -15648,8 +15870,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1842,
-              "start": 1840
+              "end": 1921,
+              "start": 1919
             },
             "text": "PI"
           }
@@ -15662,14 +15884,14 @@
         "path": "src/geometry.ts",
         "sourceSetId": "main"
       },
-      "nativeId": "occ:v2:1cc66101decc9a34c5750d554dd36f00",
+      "nativeId": "occ:v2:f7643dcc98babaf8473d448a9c9436ea",
       "ownerRef": "2:r1:sid:v1:ce8e4bb41f360a33e69bfe355a558574",
       "range": {
         "encoding": "utf8",
-        "end": 1856,
-        "start": 1850
+        "end": 1935,
+        "start": 1929
       },
-      "ref": "2:r1:occ:v2:1cc66101decc9a34c5750d554dd36f00",
+      "ref": "2:r1:occ:v2:f7643dcc98babaf8473d448a9c9436ea",
       "revisionId": "r1",
       "spelling": "radius",
       "witnesses": [
@@ -15678,8 +15900,8 @@
           "witness": {
             "range": {
               "encoding": "utf8",
-              "end": 1856,
-              "start": 1850
+              "end": 1935,
+              "start": 1929
             },
             "text": "radius"
           }

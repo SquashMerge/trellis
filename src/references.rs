@@ -142,8 +142,7 @@ pub struct ReferenceBase {
 /// One source document's resolved sites.
 struct SourceReferences {
     projection: Option<crate::model::SemanticProjection>,
-    /// (target, test) -> (sites, semantic sites, samples)
-    edges: BTreeMap<(Target, bool), (usize, usize, Vec<Site>)>,
+    edges: BTreeMap<(Target, bool), EdgeSites>,
     unresolved: Vec<(Site, &'static str)>,
     /// Modules that prove this source's mapped sites.
     proof: BTreeSet<usize>,
@@ -152,6 +151,69 @@ struct SourceReferences {
     coverage: BTreeMap<bool, SiteCoverage>,
     mapped: usize,
     semantic: usize,
+}
+/// The sites of one (target, role) edge: exact counts, and call-first samples (R5).
+#[derive(Default)]
+struct EdgeSites {
+    count: usize,
+    semantic: usize,
+    kinds: KindCounts,
+    calls: Vec<Site>,
+    others: Vec<Site>,
+}
+/// What a site is: the closed `relationKind` vocabulary.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RelationKind {
+    Reference,
+    Import,
+    Call,
+    Type,
+}
+impl RelationKind {
+    fn from_raw(kind: &'static str) -> Self {
+        match kind {
+            "import" => Self::Import,
+            "call" => Self::Call,
+            "type" => Self::Type,
+            _ => Self::Reference,
+        }
+    }
+}
+/// Exact site counts per relation kind of one edge or aggregated row.
+#[derive(Clone, Copy, Default, Serialize)]
+struct KindCounts {
+    call: usize,
+    r#type: usize,
+    import: usize,
+    reference: usize,
+}
+impl KindCounts {
+    fn add(&mut self, kind: RelationKind) {
+        match kind {
+            RelationKind::Call => self.call += 1,
+            RelationKind::Type => self.r#type += 1,
+            RelationKind::Import => self.import += 1,
+            RelationKind::Reference => self.reference += 1,
+        }
+    }
+}
+/// The declaration that encloses a site.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SiteOwner {
+    syntax_id: String,
+    name: Option<String>,
+    stable_lookup_key: Option<String>,
+}
+/// The declaration a semantic binding resolves a site to.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReferenceTarget {
+    syntax_id: String,
+    display_key: String,
+    document: DocumentKey,
+    lines: Lines,
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,11 +230,16 @@ struct Site {
     role: Option<&'static str>,
     range: crate::native_evidence::Range,
     lines: Option<Lines>,
-    relation_kind: &'static str,
+    relation_kind: RelationKind,
     spelling: String,
     call_id: Option<String>,
     caller: Option<callers::Caller>,
     caller_reason: Option<&'static str>,
+    owner: Option<SiteOwner>,
+    /// Set only when a fresh semantic binding resolves the site to an indexed declaration.
+    target: Option<ReferenceTarget>,
+    /// Why `target` is null: `structural_only`, `unresolved`, `external` or `ambiguous`.
+    target_reason: Option<&'static str>,
     /// `structural` (captured syntax conventions) or `semantic` (a fresh producer binding).
     mapping: &'static str,
     /// The semantic binding's provenance; null for structural sites.
@@ -180,7 +247,7 @@ struct Site {
     #[serde(flatten)]
     semantic_metadata: BTreeMap<String, Value>,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Copy, Serialize)]
 struct Lines {
     start: usize,
     end: usize,
@@ -538,6 +605,7 @@ fn resolve(
     let mut sources: Vec<Option<SourceReferences>> = Vec::new();
     sources.resize_with(docs.len(), || None);
     let mut site_count = 0usize;
+    let mut target_documents: BTreeMap<usize, TargetDocument<'_>> = BTreeMap::new();
     for batch in selected.chunks(workers) {
         let remaining = rust.work.remaining();
         let prepared = map_batch(batch, workers, request, |&source| {
@@ -633,6 +701,13 @@ fn resolve(
                             site.caller = None;
                             site.caller_reason = Some("semantic_boundary");
                         }
+                        if site.relation_kind == RelationKind::Reference {
+                            if anchor.call_id.is_some() {
+                                site.relation_kind = RelationKind::Call;
+                            } else if anchor.type_role {
+                                site.relation_kind = RelationKind::Type;
+                            }
+                        }
                         resolution
                     }
                     (None, Some(resolution)) => resolution,
@@ -644,6 +719,29 @@ fn resolve(
                     site_count <= site_limit(),
                     "bounded_work: reference site count"
                 );
+                if let (true, Some(SemanticOutcome::Internal(document, sid))) =
+                    (site.mapping == "semantic", anchor.map(|a| &a.outcome))
+                    && let Some(target) = locate(*document, sid)
+                    && resolution.targets.contains(&Target::Native(target))
+                {
+                    owner_step(&mut rust.work, check)?;
+                    let entry = target_documents
+                        .entry(target)
+                        .or_insert_with(|| TargetDocument::new(docs[target]));
+                    site.target = entry.by_sid.get(sid.as_str()).map(|d| ReferenceTarget {
+                        syntax_id: sid.clone(),
+                        display_key: display_key(d),
+                        document: d.document.clone(),
+                        lines: lines_of(&entry.newlines, d.range.start, d.range.end),
+                    });
+                }
+                if site.target.is_none() {
+                    site.target_reason = Some(target_reason(
+                        site.mapping == "structural",
+                        doc.semantic.producer_id.is_some(),
+                        anchor.map(|a| &a.outcome),
+                    ));
+                }
                 let role = site.role;
                 let test = role == Some("test");
                 let bound = site.mapping == "semantic";
@@ -660,10 +758,16 @@ fn resolve(
                 for target in resolution.targets {
                     owner_step(&mut rust.work, check)?;
                     let edge = found.edges.entry((target, test)).or_default();
-                    edge.0 += 1;
-                    edge.1 += usize::from(bound);
-                    if edge.2.len() < sample_limit {
-                        edge.2.push(site.clone());
+                    edge.count += 1;
+                    edge.semantic += usize::from(bound);
+                    edge.kinds.add(site.relation_kind);
+                    let sample = if site.relation_kind == RelationKind::Call {
+                        &mut edge.calls
+                    } else {
+                        &mut edge.others
+                    };
+                    if sample.len() < sample_limit {
+                        sample.push(site.clone());
                     }
                 }
                 if let Some(reason) = resolution.residual {
@@ -771,7 +875,8 @@ impl ReferenceBase {
                     }
                 }
             }
-            for ((target, test), (count, semantic, sites)) in &found.edges {
+            for ((target, test), edge) in &found.edges {
+                let (count, semantic) = (&edge.count, &edge.semantic);
                 check()?;
                 let target = match target {
                     Target::Native(target) => {
@@ -780,7 +885,12 @@ impl ReferenceBase {
                     }
                     Target::External(identity) => json!(identity),
                 };
-                let sampled = &sites[..sites.len().min(sample_limit)];
+                let sampled: Vec<_> = edge
+                    .calls
+                    .iter()
+                    .chain(&edge.others)
+                    .take(sample_limit)
+                    .collect();
                 let omitted = count - sampled.len();
                 let tier = match semantic {
                     0 => "syntax",
@@ -788,7 +898,7 @@ impl ReferenceBase {
                     _ => "mixed",
                 };
                 let mut edge = json!({"source":identities[source],"target":target,"count":count,
-                    "sites":sampled,"omittedSites":omitted,"evidenceTier":tier,"semanticSites":semantic});
+                    "kindCounts":edge.kinds,"sites":sampled,"omittedSites":omitted,"evidenceTier":tier,"semanticSites":semantic});
                 // The edge itself is detachable even when sampling omits other sites.
                 if *semantic > 0
                     && let Some(projection) = &found.projection
@@ -848,6 +958,73 @@ impl ReferenceBase {
             coverage,
         })
     }
+}
+
+/// A semantic target's document: its line starts and declarations by syntax ID, filled on
+/// first use.
+struct TargetDocument<'a> {
+    newlines: Vec<usize>,
+    by_sid: BTreeMap<&'a str, &'a Declaration>,
+}
+impl<'a> TargetDocument<'a> {
+    fn new(doc: &'a DocumentInput) -> Self {
+        Self {
+            newlines: newlines(&doc.file.text),
+            by_sid: doc
+                .declarations
+                .iter()
+                .map(|d| (d.syntax_id.as_str(), d))
+                .collect(),
+        }
+    }
+}
+
+fn newlines(text: &str) -> Vec<usize> {
+    text.bytes()
+        .enumerate()
+        .filter_map(|(i, b)| (b == b'\n').then_some(i))
+        .collect()
+}
+
+/// The 1-based inclusive lines of a byte range, given the document's newline offsets.
+fn lines_of(newlines: &[usize], start: usize, end: usize) -> Lines {
+    Lines {
+        start: newlines.partition_point(|&p| p < start) + 1,
+        end: newlines.partition_point(|&p| p < end.saturating_sub(1)) + 1,
+    }
+}
+
+/// Why a site has no `target`, by first match. `outcome` is the site's binding outcome.
+fn target_reason(
+    structural: bool,
+    has_producer: bool,
+    outcome: Option<&SemanticOutcome>,
+) -> &'static str {
+    match outcome {
+        _ if structural && !has_producer => "structural_only",
+        Some(SemanticOutcome::External) => "external",
+        Some(SemanticOutcome::Ambiguous) => "ambiguous",
+        _ => "unresolved",
+    }
+}
+
+/// The written path of a declaration: its document and dotted ancestors.
+pub(crate) fn display_key(d: &Declaration) -> String {
+    let mut segments: Vec<String> = d
+        .ancestors
+        .iter()
+        .map(|key| {
+            key.name
+                .clone()
+                .unwrap_or_else(|| format!("{}@{}", key.kind, key.ordinal))
+        })
+        .collect();
+    segments.push(
+        d.name
+            .clone()
+            .unwrap_or_else(|| format!("{}@{}", d.kind, d.range.start)),
+    );
+    format!("{}#{}", d.document.path, segments.join("."))
 }
 
 /// How a fresh semantic binding resolves a site, or `None` to keep its structural result
@@ -912,6 +1089,7 @@ struct SiteContext<'a> {
     calls: RangeIndex<'a>,
     newlines: Vec<usize>,
     callers: callers::Callers<'a>,
+    keys: BTreeMap<String, String>,
 }
 impl SiteContext<'_> {
     #[allow(clippy::too_many_arguments)]
@@ -927,6 +1105,22 @@ impl SiteContext<'_> {
     ) -> Result<Site> {
         let doc = self.doc;
         let owner = owner(doc, self.declarations.enclosing(start, end, work, check)?);
+        let site_owner = owner.map(|d| {
+            let file_module = d.kind == "module" && d.ancestors.is_empty();
+            SiteOwner {
+                syntax_id: d.syntax_id.clone(),
+                name: if d.kind == "module" {
+                    None
+                } else {
+                    d.name.clone()
+                },
+                stable_lookup_key: if file_module {
+                    None
+                } else {
+                    self.keys.get(&d.syntax_id).cloned()
+                },
+            }
+        });
         let role = owner.map(|d| match d.role {
             DeclarationRole::Test => "test",
             DeclarationRole::Production => "production",
@@ -950,21 +1144,30 @@ impl SiteContext<'_> {
                     .map(|index| doc.calls[index].id.clone())
             }
         };
-        let (caller, caller_reason) = self.callers.get(call_id.as_deref(), &range);
+        let (mut caller, mut caller_reason) = self.callers.get(call_id.as_deref(), &range);
+        // R1: an import stays an import and a structural callee path is a call.
+        let relation_kind = match RelationKind::from_raw(kind) {
+            RelationKind::Reference if self.callers.measured(call_id.as_deref(), &range) => {
+                RelationKind::Call
+            }
+            RelationKind::Type => {
+                // A caller belongs to a call or an import, never a type site.
+                (caller, caller_reason) = (None, Some("syntax_only"));
+                RelationKind::Type
+            }
+            kind => kind,
+        };
         Ok(Site {
+            owner: site_owner,
+            target: None,
+            target_reason: None,
             caller,
             caller_reason,
             owner_syntax_id: owner.map(|d| d.syntax_id.clone()),
             role,
             range: crate::native_evidence::Range { start, end },
-            lines: (!doc.file.text.is_empty()).then(|| Lines {
-                start: self.newlines.partition_point(|&p| p < start) + 1,
-                end: self
-                    .newlines
-                    .partition_point(|&p| p < end.saturating_sub(1))
-                    + 1,
-            }),
-            relation_kind: kind,
+            lines: (!doc.file.text.is_empty()).then(|| lines_of(&self.newlines, start, end)),
+            relation_kind,
             spelling,
             call_id,
             mapping: "structural",
@@ -989,18 +1192,18 @@ fn prepare_file(
 ) -> Result<PreparedFile> {
     let mut work = Work::new(limit);
     let raw = extract(doc, tree, &mut work, check)?;
+    let keys = if raw.is_empty() && doc.semantic.anchors.is_empty() {
+        BTreeMap::new()
+    } else {
+        callers::lookup_keys(doc)
+    };
     let context = SiteContext {
         doc,
-        callers: callers::Callers::new(doc),
+        callers: callers::Callers::with_keys(doc, &keys),
+        keys,
         declarations: RangeIndex::new(doc.declarations.iter().map(|d| &d.range), &mut work, check)?,
         calls: RangeIndex::new(doc.calls.iter().map(|c| &c.range), &mut work, check)?,
-        newlines: doc
-            .file
-            .text
-            .bytes()
-            .enumerate()
-            .filter_map(|(i, b)| (b == b'\n').then_some(i))
-            .collect(),
+        newlines: newlines(&doc.file.text),
     };
     // Semantic anchors by start offset (#523). A structural site consumes every anchor
     // inside it, and a call joined on its whole invocation that starts with it; it is
@@ -1552,8 +1755,7 @@ mod parallel_tests {
     };
 
     fn snapshot() -> Snapshot {
-        let root = tempfile::tempdir().unwrap();
-        for (path, text) in [
+        snapshot_of(&[
             (
                 "src/lib.rs",
                 "mod provider; pub use provider::value; pub fn run() { value(); }",
@@ -1568,7 +1770,12 @@ mod parallel_tests {
             ("provider.py", "def value():\n    return 1\n"),
             ("use.js", "import { value } from './provider.js'; value();"),
             ("provider.js", "export function value() {}"),
-        ] {
+        ])
+    }
+
+    pub(super) fn snapshot_of(files: &[(&str, &str)]) -> Snapshot {
+        let root = tempfile::tempdir().unwrap();
+        for (path, text) in files.iter().copied() {
             let file = root.path().join(path);
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(file, text).unwrap();
@@ -1860,5 +2067,87 @@ mod parallel_tests {
         merge_work(&mut total, 2, &mut || Ok(())).unwrap();
         assert!(merge_work(&mut total, 2, &mut || Ok(())).is_err());
         assert_eq!(total.used, 4);
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::parallel_tests::snapshot_of;
+    use super::*;
+
+    fn edge<'a>(data: &'a Value, source: &str, target: &str) -> &'a Value {
+        data["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["source"]["path"] == source && e["target"]["path"] == target)
+            .unwrap()
+    }
+
+    /// R1 and R2: a structural callee path is a call, and a site names its owner.
+    #[test]
+    fn structural_callee_paths_are_calls() {
+        let snapshot = snapshot_of(&[
+            (
+                "src/lib.rs",
+                "mod high;\nuse crate::high::T;\nfn run(_: crate::high::T) { crate::high::f(); }\n",
+            ),
+            ("src/high.rs", "pub struct T;\npub fn f() -> u8 { 0 }\n"),
+        ]);
+        let data = project(&snapshot, &[], 20, &mut || Ok(())).unwrap().data;
+        let pair = edge(&data, "src/lib.rs", "src/high.rs");
+        let sites = pair["sites"].as_array().unwrap();
+        let kind = |spelling: &str, line: u64| {
+            sites
+                .iter()
+                .find(|s| s["spelling"] == spelling && s["lines"]["start"] == line)
+                .unwrap_or_else(|| panic!("{spelling} on line {line}"))
+        };
+        assert_eq!(kind("crate::high::T", 2)["relationKind"], "import");
+        assert_eq!(kind("crate::high::T", 3)["relationKind"], "reference");
+        let call = kind("crate::high::f", 3);
+        assert_eq!(call["relationKind"], "call");
+        assert_eq!(call["caller"]["name"], "run");
+        assert_eq!(call["owner"]["name"], "run");
+        assert_eq!(call["owner"]["syntaxId"], call["ownerSyntaxId"]);
+        assert_eq!(call["owner"]["stableLookupKey"], "src/lib.rs::run");
+        assert_eq!(call["target"], Value::Null);
+        assert_eq!(call["targetReason"], "structural_only");
+        // Calls come first, and the counts add up to the edge.
+        assert_eq!(sites[0]["relationKind"], "call");
+        let counts = &pair["kindCounts"];
+        assert_eq!(counts["call"], 1);
+        assert_eq!(counts["import"], 1);
+        assert_eq!(counts["reference"], 1);
+        assert_eq!(counts["type"], 0);
+        // A site outside any declaration is owned by the file module.
+        let module = pair["source"]["sid"].clone();
+        let import = kind("crate::high::T", 2);
+        assert_eq!(import["owner"]["name"], Value::Null);
+        assert_eq!(import["owner"]["stableLookupKey"], Value::Null);
+        assert_eq!(import["owner"]["syntaxId"], module);
+    }
+
+    /// R3: the four reasons, and the order in which they apply.
+    #[test]
+    fn target_reason_vocabulary() {
+        use SemanticOutcome::*;
+        assert_eq!(target_reason(true, false, None), "structural_only");
+        // No producer wins over any outcome.
+        assert_eq!(
+            target_reason(true, false, Some(&External)),
+            "structural_only"
+        );
+        assert_eq!(target_reason(true, true, Some(&External)), "external");
+        assert_eq!(target_reason(false, true, Some(&External)), "external");
+        assert_eq!(target_reason(true, true, Some(&Ambiguous)), "ambiguous");
+        assert_eq!(target_reason(true, true, None), "unresolved");
+        assert_eq!(target_reason(true, true, Some(&Unresolved)), "unresolved");
+        assert_eq!(target_reason(false, true, Some(&Boundary)), "unresolved");
+        assert_eq!(
+            target_reason(false, true, Some(&Internal(0, "sid".into()))),
+            "unresolved"
+        );
+        assert_eq!(target_reason(false, true, None), "unresolved");
     }
 }

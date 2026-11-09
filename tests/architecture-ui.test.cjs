@@ -58,7 +58,7 @@ function harness() {
   let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null, detailError = null;
   // Created nodes with an id (the inspector's review chips, #449) resolve by that id; the newest wins.
   const created = [];
-  const document = {getElementById:id => {
+  const document = {querySelector:() => null,getElementById:id => {
     const made = created.findLast(item => item.id === id);
     if (made) return made;
     if (!elements.has(id)) elements.set(id, node(id)); return elements.get(id);
@@ -66,7 +66,7 @@ function harness() {
   function node(tagName) {
     return {tagName,textContent:"",children:[],dataset:{},attrs:{},listeners:{},hidden:false,value:"",checked:false,
       append(...items) {this.children.push(...items);},replaceChildren(...items) {this.children = [...items];this.textContent="";},
-      setAttribute(key,value) {this.attrs[key]=String(value);},
+      setAttribute(key,value) {this.attrs[key]=String(value);},focus() {},
       addEventListener(name,fn) {(this.listeners[name] ||= []).push(fn);},
       async fire(name) {for (const fn of this.listeners[name] || []) await fn({target:this});}};
   }
@@ -76,7 +76,7 @@ function harness() {
     clearArchitectureInspector:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
     showArchitectureInspector:() => {get("architecture-inspector").hidden=false;},
   }};
-  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
   const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
     if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; return emulateDetails(full, url); }
     calls.push({url,current,options}); const data = await response(url,options);
@@ -347,7 +347,7 @@ function authoringFixture(hash = "rules-one") {
 const ruleRows = h => descendants(h.get("architecture-review-list")).filter(item => item.className === "architecture-rule-row").length;
 const byLabel = (node,label) => descendants(node).find(item => item.attrs["aria-label"] === label);
 async function selectTwo(h) {
-  await h.get("architecture-review").fire("click");await flush();
+  await h.get("architecture-review").fire("click");await h.get("architecture-deviations-review").fire("click");await flush();
   for (const label of ["Select src/a.rs → src/b.rs","Select src/b.rs → src/a.rs"]) {
     const input = byLabel(h.get("architecture-review-list"),label);assert.ok(input);input.checked=true;await input.fire("change");
   }
@@ -359,7 +359,7 @@ function editorResponse(hash = "rules-one") {
 
 test("review filters independent role/state, edge instances and no-edge unassigned assignments", async () => {
   const h=harness(),payload=authoringFixture();h.setResponse(async () => ({payload}));await h.controller.refresh();
-  await h.get("architecture-review").fire("click");await flush();
+  await h.get("architecture-review").fire("click");await h.get("architecture-deviations-review").fire("click");await flush();
   assert.equal(ruleRows(h),2,"the deviations chip lists the production deviations it counts");
   h.get("architecture-review-role").value="all";await h.get("architecture-review-role").fire("change");await flush();
   assert.equal(ruleRows(h),3,"two production deviations plus test-only row");
@@ -389,6 +389,24 @@ test("multi-pair one-reason edit uses one preview and exact same operations/hash
   await h.get("architecture-confirm").fire("click");
   const writes=h.calls.filter(c=>c.options?.method==="POST");assert.equal(writes.length,2);
   assert.equal(JSON.stringify(writes[1].options.body),JSON.stringify({...sent.options.body,proposedHash:"rules-proposed"}));assert.match(h.get("architecture-state").textContent,/Rules committed.*same code/);
+});
+
+test("a refresh that fails after an apply drops the reopen request, so a later refresh keeps the tree closed", async () => {
+  const h=harness();let hash="rules-one",failRead=false;
+  h.setResponse(async url => {
+    if(url.endsWith("/preview")) return editorResponse();
+    if(url.endsWith("/apply")) {hash="rules-proposed";failRead=true;return {payload:{...pin,rulesFile:{contentHash:hash},mutationOutcome:"committed"}};}
+    if(failRead) throw Object.assign(new Error("Architecture is still building"),{status:503});
+    return {payload:authoringFixture(hash)};
+  });
+  await h.controller.refresh();await selectTwo(h);
+  h.get("architecture-reason").value="Reviewed";await h.get("architecture-reason").fire("input");await h.get("architecture-preview").fire("click");
+  await h.get("architecture-review").fire("click");await flush();
+  assert.equal(h.get("architecture-deviations").hidden,false,"the tree is open when the rules are applied");
+  await h.get("architecture-confirm").fire("click");await flush();
+  assert.equal(h.get("architecture-deviations").hidden,true);
+  failRead=false;await h.controller.refresh();await flush();
+  assert.equal(h.get("architecture-deviations").hidden,true,"a later successful refresh does not reopen the tree");
 });
 
 test("conflict preserves draft and reload requires a new preview on the new rules base", async () => {
@@ -424,7 +442,7 @@ test("authored orphan edit/remove use hash-qualified entry index; reason input i
 
 test("literal file-to-layer/glob selection emits only finite witnessed native production pairs", async () => {
   const h=harness();h.setResponse(async (url) => url.endsWith("/preview") ? editorResponse() : {payload:authoringFixture()});
-  await h.controller.refresh();await h.get("architecture-review").fire("click");h.get("architecture-source-glob").value="src/**/a.*";h.get("architecture-destination-layer").value="Storage";
+  await h.controller.refresh();await h.get("architecture-review").fire("click");await h.get("architecture-deviations-review").fire("click");h.get("architecture-source-glob").value="src/**/a.*";h.get("architecture-destination-layer").value="Storage";
   await h.get("architecture-select-scope").fire("click");await h.get("architecture-add-selected").fire("click");h.get("architecture-reason").value="Selected finite pairs";await h.get("architecture-preview").fire("click");
   assert.equal(h.calls.at(-1).options.body.operations[0].pairs.length,1);assert.equal(h.calls.at(-1).options.body.operations[0].pairs[0].source.path,"src/a.rs");
 });
@@ -750,7 +768,7 @@ test("the full stack stays drawn with deviations, and counted review chips open 
   assert.equal(chips()[0].dataset.tone, "error");
   assert.doesNotMatch(text(h.get("architecture-inspector-content")), /reference sites mapped/, "#525: the coverage sentence is said once, under the arrow key");
   assert.match(text(h.get("architecture-notice-content")), /563 of 897 production rule instances unknown/, "rule counts sit behind the ⓘ");
-  await h.get("architecture-review").fire("click"); await flush();
+  await h.get("architecture-review").fire("click");await h.get("architecture-deviations-review").fire("click"); await flush();
   assert.equal(h.get("architecture-review-panel").hidden, false);
   assert.equal(h.get("architecture-review-role").value, "production"); assert.equal(h.get("architecture-review-state").value, "deviates");
   const query = new URL(h.detailCalls.at(-1).url, "http://local").searchParams;
@@ -843,4 +861,596 @@ test("#523: inspectors describe semantic evidence for mixed edges and bound rule
   plain.setResponse(async () => ({payload:syntax})); await plain.controller.refresh();
   plain.renders[0].options.onSelectEdge(syntax.edges[0]); await flush();
   assert.match(text(plain.get("architecture-inspector-content")), /Syntax evidence · not compiler-resolved calls.*structural reference sites/s);
+});
+
+// Deviations tree (#786): the module loads into node:vm with a small DOM stub and stub deps.
+const deviationsSource = fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8");
+const plain = value => JSON.parse(JSON.stringify(value));
+const deq = (actual, expected, message) => assert.deepEqual(plain(actual), plain(expected), message);
+const callId = letter => `occ:v2:${letter.repeat(32)}`;
+const docId = (file, language = "rust") => ({sourceSetId:"workspace",language,path:file,sid:`sid:${file}`});
+const evidenceItem = props => ({document:docId("src/store.rs"),kind:"structuralReference",callId:null,caller:null,callerReason:null,spelling:"x",owner:null,
+  target:null,targetReason:"structural_only",lines:null,range:{start:0,end:1},...props});
+function deviationRows(hostile = "(anonymous)") {
+  const store = docId("src/store.rs"), rules = docId("src/rules.rs"), peer = docId("src/peer.rs"), other = docId("src/other.rs");
+  const o1 = {syntaxId:"o1",name:"enqueue",stableLookupKey:"S::enqueue"};
+  const caller = {stableLookupKey:"S::enqueue",syntaxId:"o1",name:"enqueue",document:store};
+  const definition = {syntaxId:"d1",displayKey:"rules::load",document:rules,lines:{start:5,end:9}};
+  const row = (target, destination, sourceLayer, destinationLayer, referenceCount, kindCounts, evidence) => ({role:"production",
+    instance:{rule:"$layers",status:"deviates",excepted:false,sourceLayer,destinationLayer,target,destination,referenceCount,kindCounts,evidence}});
+  return [
+    row(store, rules, "Storage", "UI", 10, {call:3,type:4,import:1,reference:2}, [
+      evidenceItem({relationKind:"call",callId:callId("a"),caller,owner:o1,lines:{start:20,end:20},range:{start:200,end:210},target:definition,targetReason:null,spelling:"load"}),
+      evidenceItem({relationKind:"call",callId:callId("b"),owner:{syntaxId:store.sid,name:null,stableLookupKey:null},lines:{start:10,end:10},range:{start:100,end:110}}),
+      evidenceItem({relationKind:"type",owner:o1,lines:{start:12,end:12},range:{start:120,end:125},target:definition,targetReason:null,spelling:"Rules"}),
+      evidenceItem({relationKind:"reference",owner:{syntaxId:"o2",name:hostile === "(anonymous)" ? null : hostile,stableLookupKey:null},lines:{start:30,end:31},range:{start:300,end:310},targetReason:"unresolved",spelling:hostile === "(anonymous)" ? "x" : hostile}),
+      evidenceItem({relationKind:"import",callId:callId("c"),caller:{...caller,syntaxId:"o3",stableLookupKey:"S::boot",name:"boot"},owner:{syntaxId:"o3",name:"boot",stableLookupKey:"S::boot"},lines:{start:2,end:2},range:{start:20,end:30},targetReason:"external"}),
+    ]),
+    row(store, peer, "Storage", "Peer", 2, {call:0,type:0,import:0,reference:2}, [
+      evidenceItem({relationKind:"reference",owner:o1,lines:{start:40,end:40},range:{start:400,end:410}}),
+      evidenceItem({relationKind:"reference",owner:o1,lines:{start:41,end:41},range:{start:410,end:420}}),
+    ]),
+    row(other, rules, "Storage", "UI", 1, {call:1,type:0,import:0,reference:0}, [
+      evidenceItem({document:other,relationKind:"call",callId:callId("d"),owner:null,lines:{start:3,end:3},range:{start:30,end:40}}),
+    ]),
+  ];
+}
+const deviationView = () => ({...pin,state:"ready",
+  layers:[{name:"UI",order:1,shared:false},{name:"Storage",order:2,shared:false},{name:"Peer",order:2,shared:false}],
+  edges:[
+    {sourceLayer:"Storage",destinationLayer:"UI",role:"production",status:"deviates",excepted:false,count:11},
+    {sourceLayer:"Storage",destinationLayer:"Peer",role:"production",status:"deviates",excepted:false,count:2},
+    {sourceLayer:"Storage",destinationLayer:"UI",role:"production",status:"deviates",excepted:true,count:99},
+    {sourceLayer:"Storage",destinationLayer:"UI",role:"test",status:"deviates",excepted:false,count:50},
+    {sourceLayer:"UI",destinationLayer:"Storage",role:"production",status:"conforms",excepted:false,count:5}],
+  rules:{counts:{unknown:2}}});
+const deviationEdgeText = edge => ({bound:edge.destinationLayer === "Peer"});
+
+function dnode(tagName) {
+  return {tagName,id:"",className:"",textContent:"",children:[],parent:null,dataset:{},attrs:{},listeners:{},hidden:false,checked:false,type:"",
+    append(...items) {for (const item of items) {item.parent = this;this.children.push(item);}},
+    replaceChildren(...items) {this.children = [];this.textContent = "";this.append(...items);},
+    setAttribute(key, value) {this.attrs[key] = String(value);},
+    addEventListener(name, fn) {(this.listeners[name] ||= []).push(fn);},
+    closest(selector) {for (let n = this; n; n = n.parent) if (n.className.split(" ").includes(selector.slice(1))) return n; return null;},
+    focus() {this.focusedBy.active = this;}, scrollIntoView() {this.scrolled = true;},
+    async dispatch(name, props = {}) {
+      const event = {type:name,target:this,preventDefault() {this.prevented = true;},stopPropagation() {this.stopped = true;},...props};
+      for (let n = this; n && !event.stopped; n = n.parent) {event.currentTarget = n;for (const fn of n.listeners[name] || []) await fn(event);}
+      return event;
+    }};
+}
+function deviationsHarness(options = {}) {
+  const created = [], statics = new Map(), focus = {active:null}, menus = [], inspections = [], calls = {reads:[],sequences:[],drafts:[],opened:[],details:[],overview:0,conflicts:0,refreshes:0};
+  const track = node => {node.focusedBy = focus;return node;};
+  const document = {createElement:tag => {const node = track(dnode(tag));created.push(node);return node;},
+    getElementById:id => created.findLast(item => item.id === id) || (statics.has(`#${id}`) ? statics.get(`#${id}`) : statics.set(`#${id}`, track(dnode("static"))).get(`#${id}`)),
+    querySelector:selector => statics.has(selector) ? statics.get(selector) : statics.set(selector, track(dnode("static"))).get(selector)};
+  const rows = options.rows || deviationRows(), state = {stale:false,usable:true,pages:options.pages || [[0, 2], [2, 3]],failAt:options.failAt ?? null,error:options.error ?? null,
+    readError:null,eligible:true,view:options.view || deviationView()};
+  const sandbox = {document,console,navigator:{clipboard:{writeText:async value => {sandbox.copied = value;}}},window:{TrellisClasses:{showContextMenu(event, actions, opts) {
+    menus.push({target:event.currentTarget,actions,options:opts});event.stopPropagation();}}}};
+  vm.createContext(sandbox);
+  vm.runInContext(pinSource, sandbox);
+  vm.runInContext(deviationsSource, sandbox);
+  const deps = {
+    details:async (params, active, offset) => {
+      calls.details.push({params:plain(params),offset});
+      if (state.error && calls.details.length > (state.failAt ?? 0)) throw state.error;
+      const index = state.pages.findIndex(([from]) => from === offset), [from, to] = state.pages[index];
+      return {items:rows.slice(from, to),nextOffset:index + 1 < state.pages.length ? state.pages[index + 1][0] : null,total:rows.length};
+    },
+    current:() => state.usable,basis:() => ({pin,rulesHash:"rules-one"}),view:() => state.view,targetLabel:identity => identity.path,
+    eligible:() => state.eligible,portable:identity => ({path:identity.path}),beginDraft:async (...args) => {calls.drafts.push(plain(args));},
+    edgeText:deviationEdgeText,
+    inspectLine:(record, render) => {
+      const target = track(dnode("div")), title = track(dnode("h3")), active = () => !state.stale && !target.dead;
+      inspections.push({record,target,title});render(target, title, active);return active;
+    },
+    overview:() => {calls.overview++;},openReview:(...args) => {calls.opened.push(args);},onConflict:() => {calls.conflicts++;},
+    refresh:async () => {calls.refreshes++;},
+    readSource:async (...args) => {if (state.readError) throw state.readError;calls.reads.push(args);},
+    openSequence:async (...args) => {calls.sequences.push(args);},snapshot:() => ({snap:true}),
+  };
+  const dev = sandbox.window.TrellisDeviations.create(deps);
+  const get = id => document.getElementById(id);
+  const treeRows = () => descendants(get("architecture-deviations-tree")).filter(item => item.className.split(" ").includes("deviation-row"));
+  const byLabel = start => treeRows().find(item => item.attrs["aria-label"].startsWith(start));
+  const expandAll = async () => {for (let open = treeRows().find(item => item.attrs["aria-expanded"] === "false"); open; open = treeRows().find(item => item.attrs["aria-expanded"] === "false")) await open.dispatch("click");};
+  const menuOf = row => descendants(row).find(item => item.className === "deviation-actions");
+  return {dev,deps,get,sandbox,state,calls,menus,inspections,focus,rows,treeRows,byLabel,expandAll,menuOf,statics,
+    notices:() => text(get("architecture-deviations-notices")),feedback:() => text(get("architecture-deviations-notices").children[3]).trim(),trigger:track(dnode("button"))};
+}
+
+test("deviation model: valid is a shape check and one bad row invalidates the read", () => {
+  const {model} = deviationsHarness().sandbox.window.TrellisDeviations, rows = deviationRows();
+  assert.equal(rows.every(model.valid), true);
+  const bad = mutate => {const copy = deviationRows();mutate(copy[0].instance);return model.valid(copy[0]);};
+  assert.equal(bad(i => {i.kindCounts.call = -1;}), false);
+  assert.equal(bad(i => {i.kindCounts.type = 1.5;}), false);
+  assert.equal(bad(i => {delete i.kindCounts.import;}), false);
+  assert.equal(bad(i => {i.evidence[0].relationKind = "rust_path";}), false);
+  assert.equal(bad(i => {i.evidence[0].range = null;}), false);
+  assert.equal(bad(i => {i.evidence = null;}), false);
+  assert.equal(bad(i => {i.kindCounts.call = 99;}), true, "no sum re-check");
+});
+
+test("deviation model: build groups files, functions and lines, with per-file exactness", () => {
+  const {model} = deviationsHarness().sandbox.window.TrellisDeviations;
+  const layers = deviationView().layers, tree = model.build(deviationRows(), layers);
+  deq(plain(tree.totals), {files:2,references:13,calls:4});
+  deq(tree.files.map(file => file.path), ["src/store.rs", "src/other.rs"]);
+  const store = tree.files[0];
+  deq(plain(store.edges.map(({key, direction, count}) => [key, direction, count])), [["Storage→UI", "up", 10], ["Storage→Peer", "cross", 2]]);
+  deq([store.references, store.calls], [12, 3]);
+  deq(plain(store.kinds), {call:3,type:4,import:1,reference:4});
+  deq(plain(store.unlisted), {call:1,type:3,import:0,reference:1});
+  deq(store.functions.map(fn => fn.label), ["S::enqueue", "(module level)", "(anonymous)", "S::boot"], "a call-tagged import is not a call, so S::boot has no call lines");
+  deq(store.functions[0].lines.map(line => line.evidence.lines.start), [12, 20, 40, 41], "lines follow the site line");
+  assert.equal(store.functions[0].callsExact, false, "2 of 3 calls are listed, so every function of the file is a bound");
+  assert.equal(store.functions[2].refsExact, false);
+  assert.equal(tree.files[1].functions[0].callsExact, true);
+  assert.equal(tree.files[1].functions[0].label, "(module level)", "a null owner is the module");
+  deq(plain(tree.files[1].unlisted), {call:0,type:0,import:0,reference:0});
+});
+
+test("deviation model: module level only for the file module, otherwise a name or anonymous", () => {
+  const {model} = deviationsHarness().sandbox.window.TrellisDeviations, rows = deviationRows();
+  rows[2].instance.evidence[0].owner = {syntaxId:"sid:src/elsewhere.rs",name:null,stableLookupKey:null};
+  assert.equal(model.build(rows, deviationView().layers).files[1].functions[0].label, "(anonymous)");
+  rows[2].instance.evidence[0].owner = {syntaxId:"x",name:"helper",stableLookupKey:null};
+  assert.equal(model.build(rows, deviationView().layers).files[1].functions[0].label, "helper");
+});
+
+test("deviation model: filter by edge and calls only", () => {
+  const {model} = deviationsHarness().sandbox.window.TrellisDeviations, layers = deviationView().layers, tree = model.build(deviationRows(), layers);
+  const peer = model.filter(tree, {edge:"Storage→Peer", callsOnly:false});
+  deq(plain(peer.totals), {files:1,references:2,calls:0});
+  assert.equal(peer.files[0].functions[0].callsExact, true, "exactness follows the instances that remain");
+  deq(plain(peer.files[0].unlisted), {call:0,type:0,import:0,reference:0});
+  const calls = model.filter(tree, {edge:null, callsOnly:true});
+  deq(plain(calls.totals).files, 2);
+  deq(calls.files[0].functions.map(fn => fn.label), ["(module level)", "S::enqueue"], "S::boot holds only a call-tagged import");
+  assert.equal(calls.files[0].functions.some(fn => fn.label === "(anonymous)"), false, "functions with no call are hidden");
+  assert.equal(calls.files[0].functions.find(fn => fn.label === "S::enqueue").lines.length, 1);
+  assert.equal(calls.files[0].edges.some(edge => edge.key === "Storage→Peer"), false);
+  assert.equal(model.filter(tree, {edge:"Storage→Peer", callsOnly:true}).files.length, 0, "no calls on the peer edge");
+});
+
+test("deviation model: a require with a caller is tagged a call but counted as an import", () => {
+  const {model} = deviationsHarness().sandbox.window.TrellisDeviations, layers = deviationView().layers;
+  const store = docId("src/req.js", "javascript"), rules = docId("src/rules.js", "javascript");
+  const boot = {syntaxId:"o3",name:"boot",stableLookupKey:"S::boot"}, caller = {stableLookupKey:"S::boot",syntaxId:"o3",name:"boot",document:store};
+  const require = evidenceItem({document:store,relationKind:"import",callId:callId("c"),caller,owner:boot,lines:{start:2,end:2},range:{start:20,end:30}});
+  const rows = [{role:"production",instance:{rule:"$layers",status:"deviates",excepted:false,sourceLayer:"Storage",destinationLayer:"UI",target:store,destination:rules,
+    referenceCount:1,kindCounts:{call:0,type:0,import:1,reference:0},evidence:[require]}}];
+  const tree = model.build(rows, layers), file = tree.files[0];
+  assert.equal(file.functions[0].lines[0].kind, "call", "the tag keeps the caller rule");
+  deq([file.calls, file.functions[0].calls], [0, 0], "file and function call totals agree");
+  const calls = model.filter(tree, {edge:null, callsOnly:true});
+  deq(plain(calls.totals), {files:0,references:0,calls:0}, "a file whose only call-tagged line is a require is hidden under Calls only");
+  const mixed = deviationRows();
+  mixed[0].instance.evidence = mixed[0].instance.evidence.filter(item => item.relationKind === "import");
+  mixed[0].instance.kindCounts = {call:0,type:0,import:1,reference:0};
+  mixed[0].instance.referenceCount = 1;
+  const none = model.filter(model.build(mixed, layers), {edge:null, callsOnly:true});
+  deq(none.files.map(item => item.path), ["src/other.rs"], "the require-only file leaves the Calls only list");
+});
+
+test("deviation model: kind tag, chips with bound, exception note, sequence test, line key", () => {
+  const {model} = deviationsHarness().sandbox.window.TrellisDeviations;
+  assert.equal(model.kindOf({caller:{},relationKind:"import"}), "call", "a caller makes it a call");
+  assert.equal(model.kindOf({caller:null,relationKind:"type",callId:callId("a")}), "type", "never by callId");
+  assert.equal(model.kindOf({relationKind:"call"}), "call");
+  const chips = model.chips(deviationView(), deviationEdgeText);
+  deq(plain(chips.all), {count:13,bound:true});
+  deq(plain(chips.edges.map(({key, direction, count, bound}) => [key, direction, count, bound])),
+    [["Storage→UI", "up", 11, false], ["Storage→Peer", "cross", 2, true]]);
+  assert.equal(model.exceptionNote(1, "a.rs", "b.rs"), "Approves all 1 reference from a.rs to b.rs, including future ones on this pair.");
+  assert.equal(model.exceptionNote(537, "a.rs", "b.rs"), "Approves all 537 references from a.rs to b.rs, including future ones on this pair.");
+  assert.equal(model.canOpenSequence({caller:{syntaxId:"s",stableLookupKey:"k"},callId:callId("a"),relationKind:"import"}), true);
+  assert.equal(model.canOpenSequence({caller:{syntaxId:"s",stableLookupKey:"k"},callId:null}), false);
+  assert.equal(model.canOpenSequence({caller:null,callId:callId("a")}), false);
+  const [first] = deviationRows();
+  assert.equal(model.lineKey(first.instance, first.instance.evidence[0]),
+    JSON.stringify(["workspace", "src/store.rs", JSON.stringify(["workspace", "rust", "src/rules.rs"]), 200, 210, "call", callId("a")]));
+});
+
+test("deviations keyboard actions", () => {
+  const {model} = deviationsHarness().sandbox.window.TrellisDeviations;
+  const rows = [{key:"f1",level:1,expandable:true,expanded:true,parent:null},{key:"fn",level:2,expandable:true,expanded:false,parent:"f1"},
+    {key:"l",level:3,expandable:false,expanded:false,parent:"fn"},{key:"f2",level:1,expandable:true,expanded:false,parent:null},
+    {key:"more",level:2,expandable:false,expanded:false,parent:"f2"}];
+  const act = (index, key) => plain(model.keyAction(rows, index, key));
+  deq(act(0, "ArrowDown"), {focus:1});
+  deq(act(4, "ArrowDown"), {focus:4}, "clamped at the end");
+  deq(act(0, "ArrowUp"), {focus:0}, "clamped at the start");
+  deq(act(2, "Home"), {focus:0});
+  deq(act(1, "End"), {focus:4});
+  deq(act(1, "ArrowRight"), {focus:1,expand:"fn"});
+  deq(act(0, "ArrowRight"), {focus:1}, "an expanded row moves to its first child");
+  deq(act(2, "ArrowRight"), {focus:2}, "a line does nothing");
+  deq(act(0, "ArrowLeft"), {focus:0,collapse:"f1"});
+  deq(act(1, "ArrowLeft"), {focus:0}, "a collapsed row moves to its parent");
+  deq(act(2, "ArrowLeft"), {focus:1});
+  deq(act(3, "ArrowLeft"), {focus:3}, "a level-1 row does nothing");
+  deq(act(0, "Enter"), {focus:0,toggle:"f1"});
+  deq(act(1, " "), {focus:1,toggle:"fn"});
+  deq(act(2, "Enter"), {focus:2,select:"l"});
+  deq(act(4, "Enter"), {focus:4}, "the unlisted row has no action");
+  assert.equal(model.keyAction(rows, 0, "a"), null);
+  assert.equal(model.keyAction(rows, 0, "Tab"), null);
+});
+
+test("one unknown rule instance reads in the singular", async () => {
+  const h = deviationsHarness({view:{...deviationView(), rules:{counts:{unknown:1}}}});
+  await h.dev.open(h.trigger);
+  assert.match(h.notices(), /1 unknown rule instance is not a deviation\./);
+});
+
+test("deviations read sends the five filters and pages until nextOffset is null", async () => {
+  const h = deviationsHarness();
+  await h.dev.open(h.trigger);
+  deq(h.calls.details.map(call => call.offset), [0, 2]);
+  deq(h.calls.details[0].params, {kind:"instances",rule:"$layers",status:"deviates",role:"production",excepted:"false",limit:"500"});
+  assert.equal(h.dev.isOpen(), true);
+  assert.equal(h.get("architecture-deviations").hidden, false);
+  assert.equal(h.statics.get("#architecture-diagram").hidden, true);
+  assert.equal(h.get("architecture-deviations-summary").textContent, "2 files · 13 deviating references · 4 calls");
+  assert.equal(h.get("architecture-deviations-tree").attrs["aria-busy"], "false");
+  assert.equal(h.get("architecture-deviations-notices").attrs.role, "status");
+  assert.match(h.notices(), /2 unknown rule instances are not deviations\./);
+  await h.get("architecture-deviations-inspect").dispatch("click");
+  deq(h.calls.opened, [["rules", "unknown"]]);
+  h.dev.close();
+  assert.equal(h.statics.get("#architecture-diagram").hidden, false);
+  assert.equal(h.calls.overview, 1);
+  assert.equal(h.focus.active, h.statics.get("#architecture-review"));
+});
+
+test("deviation rows: names, badges, kind tags, tabindex and unlisted footer", async () => {
+  const h = deviationsHarness();
+  await h.dev.open(h.trigger);
+  const file = h.byLabel("src/store.rs");
+  assert.equal(file.attrs["aria-label"], "src/store.rs, 3 calls, 12 references, upward deviations: UI 10, deviations: Peer 2");
+  assert.match(text(file), /↑ UI · 10 deviations/);
+  assert.match(text(file), /⇄ Peer · 2 deviations/);
+  assert.equal(file.attrs["aria-expanded"], "false");
+  await h.expandAll();
+  const enqueue = h.byLabel("S::enqueue");
+  assert.equal(enqueue.attrs["aria-label"], "S::enqueue, calls: at least 1, sampled, references: at least 4, sampled");
+  assert.equal(h.byLabel("src/other.rs").attrs["aria-label"], "src/other.rs, 1 call, 1 reference, upward deviations: UI 1");
+  const more = h.treeRows().find(row => row.attrs["aria-label"].startsWith("+ 5 more not listed"));
+  assert.equal(more.attrs["aria-label"], "+ 5 more not listed: 1 call · 3 type uses · 1 reference");
+  assert.equal(more.attrs["aria-expanded"], undefined);
+  const kinds = h.treeRows().filter(row => row.dataset.level === "3").map(row => descendants(row).find(item => item.className.includes("deviation-kind")));
+  deq(kinds.map(tag => [tag.dataset.kind, tag.textContent]).sort(), [["call", "call"], ["call", "call"], ["call", "call"], ["call", "call"], ["reference", "reference"], ["reference", "reference"], ["reference", "reference"], ["type", "type use"]].sort());
+  const unresolved = h.treeRows().find(row => /no semantic binding for this site/.test(text(row)));
+  assert.match(text(unresolved), /→ src\/rules\.rs · file only/);
+  assert.match(unresolved.attrs["aria-label"], /file only: no semantic binding for this site$/);
+  const bound = h.treeRows().find(row => /^Line 20,/.test(row.attrs["aria-label"]));
+  assert.equal(bound.attrs["aria-label"], "Line 20, rules::load, call, defined at src/rules.rs:5");
+  assert.match(text(bound), /→ src\/rules\.rs:5/);
+  const stops = h.treeRows().filter(row => row.attrs.tabindex === "0");
+  assert.equal(stops.length, 1, "one tab stop in the tree");
+  assert.equal(descendants(h.get("architecture-deviations-tree")).filter(item => item.className === "deviation-actions" && item.attrs.tabindex === "0").length, 0);
+  await bound.dispatch("click");
+  assert.equal(h.treeRows().filter(row => row.attrs.tabindex === "0").length, 1);
+  assert.equal(h.menuOf(bound).attrs.tabindex, "0");
+  assert.equal(descendants(h.get("architecture-deviations-tree")).filter(item => item.className === "deviation-actions" && item.attrs.tabindex === "0").length, 1);
+  assert.equal(h.menuOf(bound).attrs["aria-label"], "Actions for line 20 in src/store.rs");
+  assert.equal(h.menuOf(bound).attrs["aria-haspopup"], "menu");
+});
+
+test("deviations hostile repository text stays literal", async () => {
+  const hostile = "<img src=x onerror=alert(1)>";
+  const h = deviationsHarness({rows:deviationRows(hostile)});
+  await h.dev.open(h.trigger);
+  await h.expandAll();
+  assert.equal(descendants(h.get("architecture-deviations")).some(item => item.tagName === "img"), false);
+  assert.ok(h.treeRows().some(row => text(row).includes(hostile)));
+  const line = h.treeRows().find(row => row.dataset.level === "3" && row.attrs["aria-label"].includes(hostile));
+  await line.dispatch("click");
+  assert.ok(text(h.inspections.at(-1).target).includes(hostile));
+});
+
+test("deviations errors: conflict, rules_conflict, 503 and invalid copy; no partial tree", async () => {
+  const cases = [
+    [Object.assign(new Error("x"), {status:409,code:"revision_conflict"}), "The index moved to a newer revision. Reload deviations.", 1],
+    [Object.assign(new Error("x"), {status:409,code:"pin_expired"}), "The index moved to a newer revision. Reload deviations.", 1],
+    [Object.assign(new Error("x"), {status:409,code:"rules_conflict"}), "Rules changed since these deviations were loaded. Reload deviations.", 0],
+    [Object.assign(new Error("x"), {status:503,code:"architecture_building"}), "Architecture is still building for this revision.", 0],
+  ];
+  for (const [error, copy, conflicts] of cases) {
+    const h = deviationsHarness({error,failAt:1});
+    await h.dev.open(h.trigger);
+    assert.equal(h.calls.details.length, 2, "page 2 is the failing read");
+    assert.match(h.notices(), new RegExp(copy.replace(/[.]/g, "\\.")));
+    assert.equal(h.treeRows().length, 0, "page 1 is discarded");
+    assert.equal(h.get("architecture-deviations-summary").textContent, "");
+    assert.equal(h.calls.conflicts, conflicts);
+    assert.ok(h.get("architecture-deviations-reload"));
+  }
+  const rows = deviationRows();
+  rows[2].instance.kindCounts = {call:1};
+  const invalid = deviationsHarness({rows});
+  await invalid.dev.open(invalid.trigger);
+  assert.match(invalid.notices(), /Invalid Architecture detail response\. Nothing displayed\./);
+  assert.equal(invalid.treeRows().length, 0);
+});
+
+test("deviations reload reopens with the same filters and no selection", async () => {
+  const h = deviationsHarness({error:Object.assign(new Error("x"), {status:409,code:"rules_conflict"}),failAt:1});
+  await h.dev.open(h.trigger);
+  await h.get("architecture-deviations-reload").dispatch("click");
+  assert.equal(h.calls.refreshes, 1);
+  h.dev.reset(true);
+  assert.equal(h.dev.isOpen(), false);
+  assert.equal(h.statics.get("#architecture-diagram").hidden, false);
+  h.state.error = null;
+  await h.dev.afterRefresh();
+  assert.equal(h.dev.isOpen(), true);
+  assert.equal(h.treeRows().length, 2);
+  const chip = name => descendants(h.get("architecture-deviations-edges")).find(item => item.dataset.key === name);
+  await chip("Storage→UI").dispatch("click");
+  await h.get("architecture-deviations-calls").dispatch("change", {});
+  h.get("architecture-deviations-calls").checked = true;
+  await h.get("architecture-deviations-calls").dispatch("change");
+  await h.expandAll();
+  await h.treeRows().find(row => row.dataset.level === "3").dispatch("click");
+  h.dev.reopenAfterRefresh();
+  h.dev.reset(true);
+  await h.dev.afterRefresh();
+  assert.equal(chip("Storage→UI").attrs["aria-pressed"], "true");
+  assert.equal(h.get("architecture-deviations-calls").checked, true);
+  assert.equal(h.dev.snapshot().selected, null);
+  assert.equal(h.treeRows().filter(row => row.attrs["aria-selected"] === "true").length, 0);
+  await h.dev.afterRefresh();
+});
+
+test("a reset that is not a refresh drops the pending reopen request", async () => {
+  const h = deviationsHarness();
+  await h.dev.open(h.trigger);
+  h.dev.reopenAfterRefresh();
+  h.dev.reset();
+  await h.dev.afterRefresh();
+  assert.equal(h.dev.isOpen(), false, "a later successful refresh does not reopen the tree");
+  await h.dev.open(h.trigger);
+  h.dev.reopenAfterRefresh();
+  h.dev.reset(true);
+  await h.dev.afterRefresh();
+  assert.equal(h.dev.isOpen(), true, "the refresh's own reset keeps the request");
+});
+
+test("deviations line menu: three triggers pass the same actions and label", async () => {
+  const h = deviationsHarness();
+  await h.dev.open(h.trigger);
+  await h.expandAll();
+  const line = h.treeRows().find(row => row.dataset.level === "3" && /Line 20,/.test(row.attrs["aria-label"]));
+  await line.dispatch("contextmenu");
+  await line.dispatch("keydown", {key:"ContextMenu"});
+  await line.dispatch("keydown", {key:"F10",shiftKey:true});
+  await h.menuOf(line).dispatch("click");
+  assert.equal(h.menus.length, 4);
+  assert.deepEqual(h.menus.map(menu => menu.target === line ? "row" : menu.target === h.menuOf(line) ? "button" : "other"), ["row", "row", "row", "button"]);
+  for (const menu of h.menus) {
+    deq(plain(menu.options), {label:"Line actions"});
+    deq(menu.actions.map(action => action.label), ["Open in Sequence", "Go to call site", "Go to definition · src/rules.rs:5", "Copy location", "Add exception for this file pair…"]);
+  }
+  assert.equal(h.inspections.at(-1).record.evidence.range.start, 200, "opening the menu selects the line");
+  assert.equal(line.attrs["aria-selected"], "true");
+  const plainKey = await line.dispatch("keydown", {key:"a"});
+  assert.equal(h.menus.length, 4);
+  assert.equal(plainKey.prevented, undefined);
+  const noTarget = h.treeRows().find(row => row.dataset.level === "3" && /Line 10,/.test(row.attrs["aria-label"]));
+  await noTarget.dispatch("contextmenu");
+  deq(h.menus.at(-1).actions.map(action => action.label), ["Go to call site", "Copy location", "Add exception for this file pair…"],
+    "unavailable items are omitted: no caller key and no target");
+  h.state.eligible = false;
+  await noTarget.dispatch("contextmenu");
+  deq(h.menus.at(-1).actions.map(action => action.label), ["Go to call site", "Copy location"]);
+});
+
+test("deviations line actions call the open hooks with the captured evidence", async () => {
+  const h = deviationsHarness();
+  await h.dev.open(h.trigger);
+  await h.expandAll();
+  const line = h.treeRows().find(row => row.dataset.level === "3" && /Line 20,/.test(row.attrs["aria-label"]));
+  await line.dispatch("contextmenu");
+  const run = label => h.menus.at(-1).actions.find(action => action.label.startsWith(label)).run();
+  await run("Open in Sequence");
+  const [caller, sites, revision, snap] = h.calls.sequences[0];
+  assert.equal(caller.syntaxId, "o1");
+  assert.equal(sites.length, 1);
+  assert.equal(sites[0].callId, callId("a"));
+  assert.equal(revision.indexRevision, 1);
+  deq(plain(snap), {snap:true});
+  await run("Go to call site");
+  deq(plain(h.calls.reads[0][0]), {path:"src/store.rs",range:{startLine:20,endLine:20,startByte:200,endByte:210}});
+  await run("Go to definition");
+  deq(plain(h.calls.reads[1][0]), {path:"src/rules.rs",range:{startLine:5,endLine:9}});
+  await run("Add exception");
+  deq(h.calls.drafts[0], [{type:"addExceptions",pairs:[{source:{path:"src/store.rs"},destination:{path:"src/rules.rs"}}],reason:""},
+    "Approves all 10 references from src/store.rs to src/rules.rs, including future ones on this pair."]);
+  assert.equal(h.focus.active, h.get("architecture-reason"));
+});
+
+test("deviations inspector actions use the current guard after a second selection", async () => {
+  const h = deviationsHarness(), inspect = h.deps.inspectLine, seen = [];
+  h.deps.inspectLine = (record, render) => {
+    const prior = h.inspections.at(-1);
+    if (prior) prior.target.dead = true;
+    return inspect(record, render);
+  };
+  h.deps.readSource = async (site, pin, active) => { seen.push({action:"read", path:site.path, active:active()}); };
+  h.deps.openSequence = async (caller, sites, pin, snap, active) => { seen.push({action:"sequence", active:active()}); };
+  await h.dev.open(h.trigger);
+  await h.expandAll();
+  const line = n => h.treeRows().find(row => row.dataset.level === "3" && new RegExp(`Line ${n},`).test(row.attrs["aria-label"]));
+  const click = label => descendants(h.inspections.at(-1).target).find(item => item.tagName === "button" && item.textContent.startsWith(label)).dispatch("click");
+  await line(10).dispatch("click");
+  await line(20).dispatch("click");
+  assert.equal(h.inspections.length, 2);
+  assert.equal(h.inspections[0].target.dead, true, "the first inspector's guard is invalidated");
+  await click("Go to call site");
+  await click("Go to definition");
+  await click("Open in Sequence");
+  deq(seen, [{action:"read",path:"src/store.rs",active:true},{action:"read",path:"src/rules.rs",active:true},{action:"sequence",active:true}]);
+});
+
+test("deviations copy location writes, announces and falls back", async () => {
+  const h = deviationsHarness();
+  await h.dev.open(h.trigger);
+  await h.expandAll();
+  const line = h.treeRows().find(row => row.dataset.level === "3" && /Line 20,/.test(row.attrs["aria-label"]));
+  await line.dispatch("contextmenu");
+  const copy = () => h.menus.at(-1).actions.find(action => action.label === "Copy location").run();
+  await copy();
+  assert.equal(h.sandbox.copied, "src/store.rs:20");
+  assert.equal(h.feedback(), "Copied src/store.rs:20");
+  h.sandbox.navigator = {clipboard:{writeText:async () => { throw new Error("denied"); }}};
+  await copy();
+  assert.equal(h.feedback(), "Copy failed. Location: src/store.rs:20");
+  const span = descendants(h.get("architecture-deviations-notices")).find(item => item.tagName === "span");
+  assert.equal(span.attrs.style, undefined, "selectable fallback text is a plain span");
+  h.sandbox.navigator = {};
+  h.sandbox.copied = null;
+  await copy();
+  assert.equal(h.feedback(), "Copy failed. Location: src/store.rs:20");
+  assert.equal(h.sandbox.copied, null);
+});
+
+test("deviations line action errors stay in the Deviations notices", async () => {
+  const h = deviationsHarness();
+  await h.dev.open(h.trigger);
+  await h.expandAll();
+  const line = h.treeRows().find(row => row.dataset.level === "3" && /Line 20,/.test(row.attrs["aria-label"]));
+  await line.dispatch("click");
+  const panel = h.inspections.at(-1).target;
+  const button = label => descendants(panel).find(item => item.tagName === "button" && item.textContent.startsWith(label));
+  assert.ok(button("Open in Sequence").className.includes("deviation-primary"), "a call with a caller leads with Sequence");
+  assert.match(text(panel), /Call · runs code in a higher layer/);
+  assert.match(text(panel), /Semantic binding · run by enqueue/);
+  assert.equal(h.inspections.at(-1).title.textContent, "src/store.rs:20");
+  h.state.readError = new Error("source gone");
+  await button("Go to call site").dispatch("click");
+  assert.equal(h.feedback(), "source gone");
+  h.state.readError = Object.assign(new Error("cancelled"), {name:"AbortError"});
+  await button("Go to definition").dispatch("click");
+  assert.equal(h.feedback(), "source gone", "an abort is not reported");
+  h.state.readError = new Error("stale");
+  h.state.stale = true;
+  await button("Go to call site").dispatch("click");
+  assert.equal(h.feedback(), "source gone", "an inactive guard reports nothing");
+  const no = h.treeRows().find(row => row.dataset.level === "3" && /Line 10,/.test(row.attrs["aria-label"]));
+  h.state.stale = false;
+  await no.dispatch("click");
+  const second = descendants(h.inspections.at(-1).target);
+  assert.match(text(h.inspections.at(-1).target), /no measured caller: /);
+  assert.ok(second.find(item => item.tagName === "button" && item.textContent === "Go to call site").className.includes("deviation-primary"));
+  assert.match(text(h.inspections.at(-1).target), /Approves all 10 references/);
+});
+
+test("deviations hidden selection: notice, Clear filter, never auto-selected", async () => {
+  const h = deviationsHarness();
+  await h.dev.open(h.trigger);
+  await h.expandAll();
+  const type = h.treeRows().find(row => row.dataset.level === "3" && /Line 12,/.test(row.attrs["aria-label"]));
+  await type.dispatch("click");
+  assert.match(text(h.inspections.at(-1).target), /Type use · names a type from a higher layer/);
+  const selections = h.inspections.length, overview = h.calls.overview, calls = h.get("architecture-deviations-calls");
+  calls.checked = true;
+  await calls.dispatch("change");
+  assert.match(h.notices(), /Selected line is hidden by this filter\./);
+  assert.equal(h.calls.overview, overview + 1);
+  assert.equal(h.inspections.length, selections);
+  assert.equal(h.dev.snapshot().selected, null);
+  assert.equal(h.focus.active, calls, "focus stays on the changed control");
+  assert.equal(h.get("architecture-deviations-summary").textContent, "2 files · 4 deviating calls");
+  await h.get("architecture-deviations-clear").dispatch("click");
+  assert.equal(h.notices().includes("hidden by this filter"), false);
+  assert.equal(calls.checked, false);
+  assert.equal(h.inspections.length, selections, "nothing is selected");
+  assert.equal(h.treeRows().filter(row => row.attrs["aria-selected"] === "true").length, 0);
+  const chip = descendants(h.get("architecture-deviations-edges")).find(item => item.dataset.key === "Storage→Peer");
+  assert.match(chip.attrs["aria-label"], /at least 2 deviations \(lower bound\)/);
+  assert.match(chip.textContent, /≥2 deviations/);
+  await chip.dispatch("click");
+  const pressed = descendants(h.get("architecture-deviations-edges")).find(item => item.dataset.key === "Storage→Peer");
+  assert.equal(pressed.attrs["aria-pressed"], "true");
+  assert.equal(chip.attrs["aria-pressed"], "false", "the stale node is replaced");
+  assert.equal(h.treeRows().filter(row => row.dataset.level === "1").length, 1);
+  calls.checked = true;
+  await calls.dispatch("change");
+  assert.match(h.get("architecture-deviations-state").textContent, /^No calls on this edge at .*Turn off Calls only to see type uses, imports and references\.$/);
+});
+
+test("deviations keyboard drives the tree with a roving tabindex", async () => {
+  const h = deviationsHarness();
+  await h.dev.open(h.trigger);
+  const tree = h.get("architecture-deviations-tree"), press = (key, target) => tree.dispatch("keydown", {key,target:target || h.treeRows().find(row => row.attrs.tabindex === "0")});
+  const active = () => h.treeRows().find(row => row.attrs.tabindex === "0");
+  assert.match(active().attrs["aria-label"], /^src\/store\.rs/);
+  await press("ArrowRight");
+  assert.equal(h.byLabel("src/store.rs").attrs["aria-expanded"], "true");
+  assert.match(active().attrs["aria-label"], /^src\/store\.rs/);
+  await press("ArrowRight");
+  assert.match(active().attrs["aria-label"], /^S::enqueue/);
+  await press("Enter");
+  assert.equal(active().attrs["aria-expanded"], "true");
+  await press("ArrowDown");
+  assert.equal(active().dataset.level, "3");
+  const event = await press("Enter");
+  assert.equal(event.prevented, true);
+  assert.equal(active().attrs["aria-selected"], "true");
+  assert.equal(h.inspections.length, 1);
+  await press("ArrowLeft");
+  assert.match(active().attrs["aria-label"], /^S::enqueue/);
+  await press("ArrowLeft");
+  assert.equal(active().attrs["aria-expanded"], "false");
+  assert.equal(h.dev.snapshot().selected !== null, true, "collapsing a parent keeps the selection");
+  await press("End");
+  await press("Home");
+  assert.match(active().attrs["aria-label"], /^src\/store\.rs/);
+  const other = await press("x");
+  assert.equal(other.prevented, undefined);
+  const menu = h.treeRows().find(row => row.dataset.level === "3");
+  assert.equal(menu, undefined, "collapsed lines are not rendered");
+});
+
+test("deviations snapshot and restore round trip; a missing line selects nothing", async () => {
+  const first = deviationsHarness();
+  assert.equal(first.dev.snapshot(), null);
+  await first.dev.open(first.trigger);
+  await first.expandAll();
+  const line = first.treeRows().find(row => row.dataset.level === "3" && /Line 20,/.test(row.attrs["aria-label"]));
+  await line.dispatch("click");
+  const saved = plain(first.dev.snapshot());
+  assert.equal(saved.chip, null);
+  assert.equal(saved.callsOnly, false);
+  assert.equal(saved.expanded.length, 7, "every file and function was opened");
+  assert.equal(typeof saved.selected, "string");
+
+  const second = deviationsHarness();
+  await second.dev.restore(saved, () => true);
+  assert.equal(second.dev.isOpen(), true);
+  const restored = second.treeRows().find(row => row.attrs["aria-selected"] === "true");
+  assert.match(restored.attrs["aria-label"], /^Line 20,/);
+  assert.equal(restored.scrolled, true);
+  assert.equal(second.focus.active, restored);
+  assert.equal(second.inspections.length, 1);
+  assert.equal(second.inspections[0].record.evidence.range.start, 200);
+  deq(plain(second.dev.snapshot()), saved);
+
+  const third = deviationsHarness();
+  await third.dev.restore({...saved,selected:JSON.stringify(["gone"])}, () => true);
+  assert.match(third.notices(), /The selected line is no longer listed\./);
+  assert.equal(third.inspections.length, 0);
+  assert.equal(third.treeRows().filter(row => row.attrs["aria-selected"] === "true").length, 0);
+  assert.equal(third.calls.overview, 1);
+
+  const stale = deviationsHarness();
+  await stale.dev.restore(saved, () => false);
+  assert.equal(stale.dev.isOpen(), false);
+  assert.equal(stale.calls.details.length, 0);
 });

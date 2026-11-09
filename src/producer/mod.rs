@@ -16,6 +16,7 @@ pub mod profiles;
 pub(crate) mod retention;
 pub mod run;
 pub mod state;
+pub mod tsconfig;
 pub mod worktree;
 
 #[cfg(test)]
@@ -38,6 +39,8 @@ mod profiles_tests;
 mod run_tests;
 #[cfg(test)]
 mod state_tests;
+#[cfg(test)]
+mod tsconfig_tests;
 #[cfg(test)]
 mod worktree_tests;
 

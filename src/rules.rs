@@ -1027,6 +1027,8 @@ fn counts(rows: &[Value]) -> Value {
     json!({"comparable":rows.len(),"conforms":conforms,"deviates":deviates,"unknown":unknown,"excepted":excepted})
 }
 /// A reference site as rule evidence: a semantic site carries its binding's proof (#523).
+/// Every reference site also carries its call-site `lines`, `relationKind`, `spelling`,
+/// `owner`, reference `target` and `targetReason`, copied as the site has them (#785).
 fn reference_evidence(module: &Value, site: &Value) -> Value {
     let (kind, provenance) = if site["mapping"] == "semantic" {
         ("semanticBinding", &site["provenanceId"])
@@ -1037,6 +1039,16 @@ fn reference_evidence(module: &Value, site: &Value) -> Value {
         "revisionId":module["revisionId"],"range":site["range"],"kind":kind,"syntaxId":site["ownerSyntaxId"],"callId":site["callId"],"provenanceId":provenance});
     evidence["caller"] = site["caller"].clone();
     evidence["callerReason"] = site["callerReason"].clone();
+    for key in [
+        "lines",
+        "relationKind",
+        "spelling",
+        "owner",
+        "target",
+        "targetReason",
+    ] {
+        evidence[key] = site[key].clone();
+    }
     if site["mapping"] == "semantic" {
         for key in [
             "projection",
@@ -1062,6 +1074,15 @@ fn reference_evidence(module: &Value, site: &Value) -> Value {
         }
     }
     evidence
+}
+
+/// `kindCounts` of an unknown row that holds one site.
+fn unknown_kind_counts(site: &Value) -> Value {
+    let mut counts = json!({"call":0,"type":0,"import":0,"reference":0});
+    if let Some(kind) = site["relationKind"].as_str() {
+        counts[kind] = json!(1);
+    }
+    counts
 }
 
 fn semantic_evidence(mut evidence: Value, metadata: &BTreeMap<String, Value>) -> Value {
@@ -1949,7 +1970,7 @@ pub(crate) fn evaluate_prepared<'a>(
                     unresolved.push("test_only".into());
                 }
                 let mut row = json!({"rule":"$layers","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":status,
-                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"],"projection":edge["projection"]});
+                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"],"kindCounts":edge["kindCounts"],"projection":edge["projection"]});
                 ensure!(
                     work.charge(config.exceptions.len()),
                     "bounded_work: exception match budget"
@@ -1960,7 +1981,7 @@ pub(crate) fn evaluate_prepared<'a>(
             if denied {
                 let unresolved = if test { vec!["test_only"] } else { vec![] };
                 rows.push(json!({"rule":"$external","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":"deviates",
-                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"],"projection":edge["projection"]}));
+                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"],"kindCounts":edge["kindCounts"],"projection":edge["projection"]}));
             }
         }
     }
@@ -1992,7 +2013,7 @@ pub(crate) fn evaluate_prepared<'a>(
                 reasons.push("test_only".into());
             }
             let row = json!({"rule":"$layers","target":source,"destination":null,"sourceLayer":assignments.get(path).copied().flatten(),"destinationLayer":null,"status":"unknown",
-            "excepted":false,"exceptionReason":null,"constraints":[],"evidence":[reference_evidence(module,site)],"unresolved":reasons,"referenceCount":1});
+            "excepted":false,"exceptionReason":null,"constraints":[],"evidence":[reference_evidence(module,site)],"unresolved":reasons,"referenceCount":1,"kindCounts":unknown_kind_counts(site)});
             // One unresolved source instance keeps every unresolved observed site.
             let rows = if test { &mut test_only } else { &mut instances };
             let key = (test, source.to_string());
@@ -2000,6 +2021,10 @@ pub(crate) fn evaluate_prepared<'a>(
                 let existing: &mut Value = &mut rows[index];
                 existing["referenceCount"] =
                     json!(existing["referenceCount"].as_u64().unwrap_or(0) + 1);
+                if let Some(kind) = site["relationKind"].as_str() {
+                    existing["kindCounts"][kind] =
+                        json!(existing["kindCounts"][kind].as_u64().unwrap_or(0) + 1);
+                }
                 existing["evidence"]
                     .as_array_mut()
                     .expect("constructed evidence array")

@@ -523,6 +523,19 @@ what this section adds.
 
 The added schema bytes are paid for without changing what any schema accepts: each tool's output `$defs` drops the `FailureCode` definition, which no response shape references (`ResolvedFailureCode` is the one `Failure.error.code` names, and still omits `workspace_selection_failed`). The catalog headroom of Decision 0011 item 6 is unchanged.
 
+## Amendment (#785): classified rule evidence
+
+**Status: proposed (owner-delegated, run 802).** `toolVersion` is **15** (previously 14, #777). The change is additive on the wire apart from the two documented behaviours below; paging, `omittedEvidence`, `nextCall` and every bound are unchanged.
+
+- **`Site`** gains the required `owner`, `target` and `targetReason`.
+  - `owner` is `{syntaxId,name,stableLookupKey}|null`: the declaration that encloses the site. It is null only when `ownerSyntaxId` is null. `name` is null for an anonymous declaration or a module, and `stableLookupKey` is null when no key is recoverable and always for a file module.
+  - `target` is `{syntaxId,displayKey,document,lines}|null`: the indexed declaration a fresh semantic binding resolves the site to. `targetReason` says why it is null: `structural_only` (no selected semantic evidence for the document), `external`, `ambiguous`, or `unresolved` (anything else, including a target outside this snapshot). `targetReason` is null if and only if `target` is non-null.
+- **`relationKind`** is `call` for a structural callee path: a site whose range is the invocation or callee spelling of a measured call, or that a semantic call binding maps. An `import` is never promoted, so a JS or TS `require(...)` or dynamic `import(...)` stays `import` and may carry a `caller` naming the function that runs it. A structural path that a type-role binding maps is `type`. Without semantic evidence a Rust or Java type path stays `reference`. A `caller` is present only on `call` and `import` sites.
+- **`Edge`** gains the required `kindCounts` `{call,type,import,reference}`, exact for every counted site, so the four add up to `count`. The sample takes an edge's `call` sites first, then the others, each group in its existing order, up to `limit`; `omittedSites` is still `count` minus the sites returned.
+- **`RuleEvidence`** gains the optional `lines`, `relationKind`, `spelling`, `owner`, `target` and `targetReason`, and **`RuleInstance`** gains the optional `kindCounts`.
+- **Catalog.** Each architecture tool's output `$defs` drops every definition its output root does not reach. Tool 8 drops `ConfigDescriptor`, `ConstraintResult`, `RuleCounts`, `RuleDiagnostic`, `RuleEvidence` and `RuleInstance`; tools 9 and 10 drop `Edge`, `Module`, `SemanticBasis`, `Site` and `UnresolvedReference`. No response shape used them, so what any schema accepts is unchanged. The complete catalog is 241,831 compact bytes before and 230,217 after; the `tools/list` frame is 230,574 bytes against the 245,760-byte named headroom limit. A test now checks that every output definition is reachable and every `$ref` resolves.
+- **Frame.** An answer that does not fit one frame fails with `response_too_large`; ask for a smaller `limit`.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)

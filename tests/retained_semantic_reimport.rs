@@ -2151,3 +2151,131 @@ fn multi_language_scip_typescript_run_is_readmitted_after_upgrade() {
     let after = Connection::open_with_flags(&index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     assert_eq!(languages(&after), r#"["javascript","typescript"]"#);
 }
+
+/// The retention catalog's bound identity, and the checkout's reboot-stable `{record}:{inode}`.
+fn catalog_identity(world: &World) -> (String, String, WorkspaceIdentity) {
+    let identity =
+        WorkspaceIdentity::discover(Some(&world.checkout.root), &world.checkout.root).unwrap();
+    let db = Connection::open_with_flags(
+        state_dir(&world.checkout).join("retention.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let stored: String = db
+        .query_row("SELECT root_key FROM identity", [], |row| row.get(0))
+        .unwrap();
+    let key = format!("{}:{}", identity.record_id, identity.inode);
+    (stored, key, identity)
+}
+
+/// #811: a catalog written on an earlier boot, when APFS gave the root another `st_dev`, is
+/// the same root. It is adopted and the retained run is readmitted, not refused forever.
+#[test]
+fn retention_catalog_from_another_boot_device_is_adopted_and_readmits() {
+    let world = World::new();
+    let (_, _, options) = world.run_once();
+    let (stored, key, identity) = catalog_identity(&world);
+    assert_eq!(stored, key, "new catalogs never bind st_dev");
+    let state = state_dir(&world.checkout);
+    world.upgrade(|_| {
+        // The pre-#811 spelling, under the device number of a previous boot.
+        let earlier = format!(
+            "{}:{}:{}",
+            identity.record_id,
+            identity.device.wrapping_add(3),
+            identity.inode
+        );
+        let db = Connection::open(state.join("retention.sqlite")).unwrap();
+        db.execute("UPDATE identity SET root_key=?1", [earlier])
+            .unwrap();
+    });
+    trellis::testing::wait_until("retained run readmitted under the adopted catalog", || {
+        let rows = world.generated_rows();
+        rows.len() == 2 && matches!(rows[1].0.as_str(), "done" | "failed")
+    });
+    let rows = world.generated_rows();
+    assert_eq!(rows[1].0, "done", "adopted catalog refused: {rows:?}");
+    assert_eq!(rows[1].2, options);
+    assert_eq!(catalog_identity(&world).0, key, "identity rewritten");
+    assert_eq!(world.invocation_count(), 1);
+}
+
+/// #811: a structurally corrupt catalog fails the import with its own typed code and area,
+/// not `index_failed: internal error`.
+#[test]
+fn corrupt_retention_catalog_fails_import_as_producer_state_corrupt() {
+    let world = World::new();
+    world.run_once();
+    // The daemon keeps the stub producer's environment, so it stays up; SQLite fences
+    // this schema change against its next attach.
+    let db = Connection::open(state_dir(&world.checkout).join("retention.sqlite")).unwrap();
+    db.execute_batch("DROP TABLE legacy_languages").unwrap();
+    drop(db);
+    let _ = world.spawn_run_variant(1).wait_with_output().unwrap();
+    let rows = world.generated_rows();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        (rows[1].0.as_str(), rows[1].1.as_str()),
+        ("failed", "producer_state_corrupt: retention catalog"),
+        "{rows:?}"
+    );
+}
+
+/// #811: a retained descriptor written before #800 renamed `language` to `languages` can
+/// never be admitted again. It counts as a missing input: the slot is cleared and the run
+/// is not queued, while the language keeps reporting needs-re-import.
+#[test]
+fn pre_800_retained_descriptor_is_cleared_not_requeued() {
+    let world = World::new();
+    let (_, original, options) = world.run_once();
+    let state = state_dir(&world.checkout);
+    let descriptor = PathBuf::from(options["descriptor"].as_str().unwrap());
+    world.upgrade(|_| {
+        let mut json: Value = serde_json::from_slice(&original).unwrap();
+        for artifact in json["artifacts"].as_array_mut().unwrap() {
+            let languages = artifact
+                .as_object_mut()
+                .unwrap()
+                .remove("languages")
+                .unwrap();
+            artifact["language"] = languages[0].clone();
+        }
+        let bytes = serde_json::to_vec(&json).unwrap();
+        fs::write(&descriptor, &bytes).unwrap();
+        // The slot binds the old descriptor's own digest, as a pre-#800 run recorded it.
+        let digest = semantic_batch_support::sha256(&bytes);
+        let mut retained = options.clone();
+        retained["descriptorSha256"] = json!(digest);
+        let db = Connection::open(state.join("retention.sqlite")).unwrap();
+        db.execute(
+            "UPDATE retained_runs SET descriptor_sha256=?1,options=?2",
+            [digest, retained.to_string()],
+        )
+        .unwrap();
+    });
+    let slots = || {
+        Connection::open_with_flags(
+            state.join("retention.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row("SELECT count(*) FROM retained_runs", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    trellis::testing::wait_until("inadmissible retained slot cleared", || slots() == 0);
+    assert_eq!(world.generated_rows().len(), 1, "nothing was queued");
+    let status = world.status();
+    let js = status["semanticLanguages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["language"] == "javascript")
+        .unwrap();
+    assert_eq!(js["reimport"]["state"], "needsReimport", "{status}");
+    // A later generation finds no slot and queues nothing.
+    world.upgrade(|_| {});
+    assert_eq!(world.generated_rows().len(), 1, "never re-queued");
+    assert_eq!(slots(), 0);
+}

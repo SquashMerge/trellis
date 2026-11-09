@@ -2358,6 +2358,15 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
+            "/architecture-deviations.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/architecture-deviations.js"),
+                )
+            }),
+        )
+        .route(
             "/architecture.js",
             get(|| async {
                 (
@@ -3753,6 +3762,15 @@ impl ProvisionedBrowser {
                     (
                         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
                         include_str!("../web/treemap.css"),
+                    )
+                }),
+            )
+            .route(
+                "/architecture-deviations.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/architecture-deviations.js"),
                     )
                 }),
             )
