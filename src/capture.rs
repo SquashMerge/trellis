@@ -456,6 +456,14 @@ pub(crate) fn nested_cargo_manifest(root: &Path, path: &Path) -> bool {
         && path.starts_with(root)
         && path.parent() != Some(root)
 }
+/// A nested Python project manifest admitted for app detection (owner ruling 2026-11-08,
+/// #807).
+pub(crate) fn nested_pyproject_manifest(root: &Path, path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == "pyproject.toml")
+        && path.starts_with(root)
+        && path.parent() != Some(root)
+}
 /// The workspace inventory and its sources, and the ignore files the walk left unread
 /// because they are over their cap.
 type Walked = (BTreeMap<PathBuf, Stamp>, Vec<PathBuf>, BTreeSet<PathBuf>);
@@ -907,7 +915,9 @@ impl Capture {
         // nested package roots of JavaScript sources are admitted beside the root inputs
         // (owner ruling 2026-10-29, #443). Like the producer, only a regular file counts.
         // Rust symbol keys are scoped by Cargo target, so nested Cargo manifests of Rust
-        // sources are admitted the same way (owner ruling 2026-10-30, #394).
+        // sources are admitted the same way (owner ruling 2026-10-30, #394), and so are
+        // nested Python project manifests of Python sources, for app detection (owner
+        // ruling 2026-11-08, #807).
         let nested = nested_package_dirs(&root, &sources, SCRIPT_EXTENSIONS)
             .into_iter()
             .map(|dir| dir.join("package.json"))
@@ -915,6 +925,11 @@ impl Capture {
                 nested_package_dirs(&root, &sources, &["rs"])
                     .into_iter()
                     .map(|dir| dir.join("Cargo.toml")),
+            )
+            .chain(
+                nested_package_dirs(&root, &sources, &["py"])
+                    .into_iter()
+                    .map(|dir| dir.join("pyproject.toml")),
             );
         for path in nested {
             if metadata(&path)?.is_some_and(|item| item.kind != 2) {
@@ -1184,6 +1199,7 @@ impl Capture {
                 } else if ROOT_INPUTS.contains(&relative.as_str())
                     || nested_package_manifest(&self.root, path)
                     || nested_cargo_manifest(&self.root, path)
+                    || nested_pyproject_manifest(&self.root, path)
                 {
                     roles.push(format!("config:{relative}"));
                 }
@@ -1308,6 +1324,7 @@ impl Capture {
                 } else if ROOT_INPUTS.contains(&rel.as_str())
                     || nested_package_manifest(&self.root, path)
                     || nested_cargo_manifest(&self.root, path)
+                    || nested_pyproject_manifest(&self.root, path)
                 {
                     roles.push(format!("config:{rel}"));
                 }

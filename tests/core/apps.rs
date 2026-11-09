@@ -1,6 +1,6 @@
 #![cfg(feature = "test-support")]
 //! App detection and per-app layer rules (#784), through the published store.
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     fs,
     path::Path,
@@ -10,7 +10,7 @@ use trellis::{
     indexer::{IndexOptions, index_workspace_bundle},
     model::{CancelFlag, IndexPin},
     rules,
-    store::Store,
+    store::{MetricsOptions, Store},
 };
 
 fn publish(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
@@ -108,7 +108,7 @@ fn real_manifests(root: &Path) -> Vec<(String, String)> {
         let entry = entry.unwrap();
         let name = entry.file_name().to_str().unwrap_or_default();
         if entry.file_type().is_some_and(|kind| kind.is_file())
-            && matches!(name, "Cargo.toml" | "package.json")
+            && matches!(name, "Cargo.toml" | "package.json" | "pyproject.toml")
         {
             let relative = entry.path().strip_prefix(root).unwrap();
             found.push((
@@ -134,6 +134,11 @@ fn trellis_layout_detects_daemon_and_web_apps() {
         .iter()
         .map(|(path, text)| match path.strip_suffix("package.json") {
             Some(dir) => (format!("{dir}index.js"), "export const a = 1;\n".to_owned()),
+            // A Python source below a `pyproject.toml` makes capture retain it (#807).
+            None if path.ends_with("pyproject.toml") => (
+                format!("{}stub.py", path.trim_end_matches("pyproject.toml")),
+                "A = 1\n".to_owned(),
+            ),
             None if text.contains("[package]") => (
                 format!("{}src/main.rs", path.trim_end_matches("Cargo.toml")),
                 "fn main() {}\n".to_owned(),
@@ -153,6 +158,13 @@ fn trellis_layout_detects_daemon_and_web_apps() {
         owned
             .iter()
             .map(|(path, text)| (path.as_str(), text.as_str())),
+    );
+    // The Python producer fixture declares `[project]`; the hidden `fixtures` layer drops it.
+    assert!(
+        owned
+            .iter()
+            .any(|(path, _)| path == "tests/fixtures/producers/python/pyproject.toml"),
+        "the walk finds the checkout's pyproject.toml"
     );
     let data = check(&files).expect("the Trellis layout validates");
     assert_eq!(limitation_count(&data), 0);
@@ -608,4 +620,112 @@ external = [{ language = "javascript", package = "widget", stdlib = false }]
             .sum();
         assert_eq!(sum, data["counts"][field].as_u64().unwrap(), "{field}");
     }
+}
+
+const PY_PROJECT: (&str, &str) = (
+    "svc/pyproject.toml",
+    "[project]\nname = \"svc\"\n[project.scripts]\nsvc = \"svc.main:run\"\n",
+);
+const PY_SOURCE: (&str, &str) = (
+    "svc/svc/main.py",
+    "from ui import helper\n\ndef run():\n    return helper()\n",
+);
+const PY_UI_PROJECT: (&str, &str) = ("ui/pyproject.toml", "[project]\nname = \"ui\"\n");
+const PY_UI_SOURCE: (&str, &str) = ("ui/ui/__init__.py", "def helper():\n    return 1\n");
+
+#[test]
+fn python_projects_are_apps_that_layers_can_name() {
+    let rules_file = "version = 1\n[layers.service]\napp = \"svc\"\norder = 1\npaths = [\"svc/**\"]\n[layers.screen]\napp = \"ui\"\norder = 1\npaths = [\"ui/**\"]\n";
+    let data = check(&with(
+        rules_file,
+        &[PY_PROJECT, PY_SOURCE, PY_UI_PROJECT, PY_UI_SOURCE],
+    ))
+    .unwrap();
+    let apps: Vec<(&str, &str)> = data["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|app| {
+            (
+                app["name"].as_str().unwrap(),
+                app["manifest"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        apps,
+        [("svc", "svc/pyproject.toml"), ("ui", "ui/pyproject.toml")]
+    );
+    assert_eq!(limitation_count(&data), 0);
+    // A layer naming an undetected Python app is still a reference error.
+    let diagnostic = invalid(&with(
+        "version = 1\n[layers.service]\napp = \"nope\"\norder = 1\npaths = [\"svc/**\"]\n",
+        &[PY_PROJECT, PY_SOURCE],
+    ));
+    assert!(diagnostic.to_string().contains("nope"), "{diagnostic}");
+}
+
+#[test]
+fn a_malformed_pyproject_adds_one_limitation_unless_hidden() {
+    let bad = ("bad/pyproject.toml", "[project\nname = \"bad\"\n");
+    let bad_source = ("bad/bad.py", "X = 1\n");
+    let data = check(&with(
+        "version = 1\n",
+        &[PY_PROJECT, PY_SOURCE, bad, bad_source],
+    ))
+    .unwrap();
+    assert_eq!(limitation_count(&data), 1);
+    assert_eq!(data["apps"].as_array().unwrap().len(), 1);
+    let hidden =
+        "version = 1\n[layers.fixtures]\ndisplay = \"hidden\"\norder = 1\npaths = [\"bad/**\"]\n";
+    let data = check(&with(hidden, &[PY_PROJECT, PY_SOURCE, bad, bad_source])).unwrap();
+    assert_eq!(limitation_count(&data), 0);
+    assert_eq!(data["apps"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_tool_only_pyproject_is_not_an_app() {
+    let data = check(&with(
+        "version = 1\n",
+        &[
+            ("tools/pyproject.toml", "[tool.ruff]\nline-length = 100\n"),
+            ("tools/lint.py", "X = 1\n"),
+        ],
+    ))
+    .unwrap();
+    assert_eq!(data["apps"], json!([]));
+    assert_eq!(limitation_count(&data), 0);
+}
+
+#[test]
+fn the_architecture_summary_lists_a_python_app_with_its_kind_and_entries() {
+    // The summary is computed only when the rules file has layers.
+    let rules_file = "version = 1\n[layers.service]\napp = \"svc\"\norder = 1\npaths = [\"svc/**\"]\n[layers.screen]\napp = \"ui\"\norder = 1\npaths = [\"ui/**\"]\n";
+    let (_state, _root, store, pin) = publish(&with(
+        rules_file,
+        &[PY_PROJECT, PY_SOURCE, PY_UI_PROJECT, PY_UI_SOURCE],
+    ));
+    let response = store.evidence_response().unwrap();
+    let summary = response
+        .architecture_view(
+            &MetricsOptions {
+                pin: Some(pin),
+                aggregate: "max".into(),
+                ..Default::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    let summary = response.finish(summary).unwrap();
+    let svc = summary["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|app| app["name"] == "svc")
+        .expect("the svc app");
+    assert_eq!(svc["kind"], "python");
+    assert_eq!(svc["manifest"], "svc/pyproject.toml");
+    assert_eq!(svc["roots"], json!(["svc"]));
+    assert_eq!(svc["entries"], json!(["svc.main"]));
+    assert_eq!(svc["languages"], json!(["python"]));
 }

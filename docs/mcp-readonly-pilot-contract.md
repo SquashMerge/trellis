@@ -626,7 +626,7 @@ changes, only the order of rows within two arrays. This section wins over the #7
 **Status: proposed (owner-delegated, run 803).** `toolVersion` is **20** (previously 19, #839). Detection and the counting rule are in [rules.md implementation notes (#784)](rules.md#implementation-notes-784). This section wins over the #129 description of the check payload where they differ.
 
 - **`trellis_rules_check`** data gains two required fields, whole on every page like `counts`:
-  - `apps`: `[{name:Text,manifest:Path,counts:RuleCounts}]`, one entry per detected manifest in manifest-path order. Apps that share a name each keep their own entry. An entry carries no `kind`, roots or entries; those are in the proposal prompt's `payload.apps` and the browser summary. App kinds are `cargo`, `npm` and `python`; Python detection arrives separately in [#807](https://github.com/SquashMerge/trellis/issues/807).
+  - `apps`: `[{name:Text,manifest:Path,counts:RuleCounts}]`, one entry per detected manifest in manifest-path order. Apps that share a name each keep their own entry. An entry carries no `kind`, roots or entries; those are in the proposal prompt's `payload.apps` and the browser summary. App kinds are `cargo`, `npm` and `python`; `python` apps are detected from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)).
   - `noApp`: `{counts:RuleCounts}`.
 - **Counts** cover production instances, field by field, so `Σ apps[].counts + noApp.counts = counts`. A `cross_app` instance is `unknown` and counts under `noApp`. With no detected app, `apps` is `[]` and `noApp` holds every count.
 - **`trellis_rules_explain`** does not carry `apps` or `noApp`; its schema and output are unchanged.

@@ -166,6 +166,19 @@ app is one of:
 - **A `package.json`,** anywhere in the snapshot outside `node_modules/`. Its name is
   `name`, or the manifest's checkout-relative directory (`.` at the checkout root) when
   `name` is absent or not a nonblank string. Its root is the manifest's directory.
+- **A Python project** (status: owner-ratified 2026-11-08 (#807)). That is a `pyproject.toml`,
+  anywhere in the snapshot outside `node_modules/`, with a `[project]` table whose `name`
+  is a nonblank string, or, without `[project]`, a Poetry `[tool.poetry]` table with one.
+  Its name is that `name`. Its root is the manifest's directory. Its entries are the
+  modules (the part before `:`) of its `[project.scripts]`, `[project.gui-scripts]` and
+  `[tool.poetry.scripts]` targets, and may be empty. A `pyproject.toml` with neither table,
+  such as a tool-only file, is not an app. Each file is judged alone: a uv
+  `[tool.uv.workspace]` changes nothing, so a virtual workspace root is not an app, and a
+  member, an excluded project and a project outside the workspace are each an app. Capture
+  retains a nested `pyproject.toml` that sits above Python sources, as it does a nested
+  `Cargo.toml` above Rust sources.
+
+The app kinds are `cargo`, `npm` and `python` (`python` owner-ratified 2026-11-08 (#807)).
 
 There is no authored `[[apps]]` table, so the closed top-level keys are unchanged. An
 authored override is a planned follow-up in a separate issue, for checkouts that manifests
@@ -375,13 +388,14 @@ What the example shows:
 amendment. Where the two differ in detail, this section is the exact behaviour.
 
 **App kinds.** An app's `kind` is `cargo`, `npm` or `python`. `python` is a ratified app kind
-(owner ruling 2026-11-08). Python detection from `pyproject.toml` arrives separately in
-[#807](https://github.com/SquashMerge/trellis/issues/807); until it lands, detection yields
-only `cargo` and `npm` apps.
+(owner ruling 2026-11-08), detected from `pyproject.toml` since
+[#807](https://github.com/SquashMerge/trellis/issues/807).
 
 **Captured manifests.** Detection reads only manifest bytes the indexer captured with the
 code snapshot, and never the live files. The snapshot retains every present `package.json`
-and `Cargo.toml` at any depth, outside `node_modules/`, under the existing byte bounds. The
+and `Cargo.toml` at any depth, outside `node_modules/`, under the existing byte bounds. It
+retains the root `pyproject.toml` and each nested `pyproject.toml` that sits above a captured
+Python source (#807), under the same bounds. The
 per-manifest size bound applies to the root manifests only; a nested manifest counts toward
 the total bound. A manifest that is absent from the snapshot is not an app and is not unread.
 
@@ -401,6 +415,10 @@ the total bound. A manifest that is absent from the snapshot is not an app and i
 | Nested `Cargo.toml` that is not a workspace member | no app; never parsed for identity |
 | `package.json` that is not a JSON object, or is over the size bound | unread |
 | `package.json` that is a JSON object | app (`npm`) |
+| `pyproject.toml`: invalid TOML, over the size bound, `project` or `tool` or `tool.poetry` not a table, a scripts table or target of the wrong type, or a `[project.scripts]` or `[project.gui-scripts]` target that is not a `module:attr` string | unread |
+| `pyproject.toml` with neither `[project]` nor a `[tool.poetry]` that has `name` | no app |
+| `pyproject.toml` whose `[project].name` (or, without `[project]`, `[tool.poetry].name`) is not a nonblank string | unread |
+| `pyproject.toml` with `[project]` or a named `[tool.poetry]` | app (`python`) |
 
 An unread manifest detects no app. A manifest that a hidden layer selects (see
 [Amendment (#783)](#amendment-783-apps-and-per-app-layers)) is neither an app nor unread.
@@ -416,6 +434,14 @@ An unread manifest detects no app. A manifest that a hidden layer selects (see
   Entries are sorted and deduplicated.
 - **npm** name is `name` when it is a nonblank string, otherwise the manifest's directory
   (`.` at the checkout root). Its entries are empty.
+- **Python** name is `[project].name`, or `[tool.poetry].name` without `[project]`. Its
+  entries are the modules (the text before `:`, trimmed) of the `[project.scripts]`,
+  `[project.gui-scripts]` and `[tool.poetry.scripts]` targets. A `[project]` script target
+  must be a `module:attr` string with both sides nonblank; anything else, including a table,
+  makes the manifest unread. Only `[tool.poetry.scripts]` accepts a table target: it uses
+  its `callable`, and one without `callable` (a file script) adds nothing. Entries are sorted
+  and deduplicated, and may be empty. A uv `[tool.uv.workspace]` changes nothing: each
+  `pyproject.toml` is judged alone.
 - **Roots** are the manifest's directory. `.` contains every path, and a path belongs to
   the app with the most specific containing root.
 
