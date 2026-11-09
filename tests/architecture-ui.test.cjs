@@ -1741,7 +1741,9 @@ test("AC15 the app inspector names the files, layers and interfaces of an app, a
   const paragraphs = inspectorParagraphs(h);
   assert.ok(paragraphs.includes("javascript · web")); assert.ok(paragraphs.includes("Detected from web/package.json (npm)"));
   const grid = descendants(h.get("architecture-inspector-content")).find(item => item.className === "metric-inspector-values");
-  assert.deepEqual(grid.children.map(item => item.textContent), ["Files", "2", "Layers", "1 + 1 shared", "Unassigned files", "1"]);
+  assert.deepEqual(grid.children.map(item => item.textContent), ["Files", "2", "Layers", "1 + 1 shared", "Calls to daemon", "6",
+    "Deviations", "↑ 3 deviations", "Unassigned", "◇ 1 unassigned"]);
+  assert.deepEqual(grid.children.filter(item => item.tagName === "dd").map(item => item.dataset.tone ?? null), [null, null, null, "error", "warning"], "the word and the tone say it");
   await h.button("HTTP: web → daemon").fire("click"); await flush();
   assert.equal(h.get("architecture-inspector-title").textContent, "web → daemon");
   await h.controller.restore(saved("scripts"), () => true);
@@ -1839,4 +1841,38 @@ test("a scope needs a ready snapshot: apps sent with no_layers never keep a scop
   h.setResponse(async () => ({payload:waiting})); await h.controller.refresh();
   h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
   assert.deepEqual(pressedApps(h), ["All apps"], "the old scope did not survive a snapshot that could not show it");
+});
+
+// A diagram that answers the selectors the controller uses, so drawn aria-pressed can be observed.
+function drawnDiagram(h, names) {
+  const nodes = names.map(id => ({attrs:{"aria-pressed":"false", "data-trellis-action-id":id},
+    getAttribute(key) { return this.attrs[key] ?? null; }, hasAttribute(key) { return key in this.attrs; }, setAttribute(key, value) { this.attrs[key] = String(value); }, focus() {}}));
+  h.get("architecture-diagram").querySelectorAll = selector => {
+    const [, key, value] = selector.match(/^\[([\w-]+)(?:="([^"]*)")?\]$/);
+    return nodes.filter(node => key in node.attrs && (value === undefined || node.attrs[key] === value));
+  };
+  return nodes;
+}
+
+test("AC25 a selected stub marks its end band with a word, and leaving the selection clears the stub and the word", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:interfacesFixture()})); await h.controller.refresh();
+  await chooseApp(h, "web · javascript");
+  const [stub] = statsOf(h, "UI"), nodes = drawnDiagram(h, [stub.action.id]);
+  const layer = () => h.renders.at(-1).view.layers.find(item => item.name === "UI"), label = () => h.renders.at(-1).options.layerLabel(layer());
+  assert.doesNotMatch(label(), /end/);
+  const drawn = h.renders.length;
+  h.renders.at(-1).options.onSelectInterface(stub.action); await flush();
+  assert.equal(nodes[0].attrs["aria-pressed"], "true"); assert.equal(h.renders.length, drawn + 1, "the drawing is swapped in place");
+  assert.match(label(), /^1 · UI · 1 file · max 3 · client end$/);
+  h.get("architecture-review").fire("click"); await flush();
+  await h.get("architecture-deviations-back").fire("click"); await flush();
+  assert.equal(h.get("architecture-inspector-title").textContent, "Architecture review");
+  assert.equal(nodes[0].attrs["aria-pressed"], "false", "returning from the tree leaves no stub marked Selected");
+  assert.doesNotMatch(label(), /end/);
+  assert.equal(h.renders.length, drawn + 2, "the word left with the selection");
+  await chooseApp(h, "daemon · rust");
+  const server = statsOf(h, "Storage")[0];
+  drawnDiagram(h, [server.action.id]);
+  h.renders.at(-1).options.onSelectInterface(server.action); await flush();
+  assert.match(h.renders.at(-1).options.layerLabel(h.renders.at(-1).view.layers.find(item => item.name === "Storage")), /server end$/);
 });

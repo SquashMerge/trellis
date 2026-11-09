@@ -387,8 +387,8 @@
           // Pressed chips show the word through CSS; the chip's name and aria-pressed carry the state for assistive technology.
           const tagLeft = origin + Math.ceil(measure(stat.text)) + STAT_PAD, tagWidth = widths[i] - (tagLeft - origin) - 2;
           const back = document.createElementNS(NS,"rect"), tag = document.createElementNS(NS,"text");
-          for (const [name,value] of Object.entries({x:tagLeft,y:y-12,width:tagWidth,height:14,rx:3,"class":"trellis-architecture-stat-tag-back","aria-hidden":"true"})) back.setAttribute(name,String(value));
-          for (const [name,value] of Object.entries({x:tagLeft + tagWidth / 2,y,"text-anchor":"middle","font-size":"14","aria-hidden":"true","class":"trellis-architecture-stat-tag"})) tag.setAttribute(name,String(value));
+          for (const [name,value] of Object.entries({x:tagLeft,y:y-12,width:tagWidth,height:14,rx:3,"class":"architecture-selected-tag-back","aria-hidden":"true"})) back.setAttribute(name,String(value));
+          for (const [name,value] of Object.entries({x:tagLeft + tagWidth / 2,y,"text-anchor":"middle","font-size":"14","aria-hidden":"true","class":"architecture-selected-tag"})) tag.setAttribute(name,String(value));
           tag.textContent = stat.tag;
           button.setAttribute("aria-pressed","false"); button.append(back,tag);
         }

@@ -60,6 +60,8 @@
     // The app whose stack is drawn: null for all apps, else an app name (never compared with a literal). Memory only; a new checkout starts at "all".
     // `drawn` is the view the last render laid out (the scoped slice, or `view` itself).
     let scope = null, scopeRoot = null, drawn = null;
+    // The band that holds the selected stub's end, so its label can say `client end` / `server end` (AC25).
+    let endMark = null;
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
     const callables = () => role === "all" ? "indexed callables" : "production callables";
     const population = () => role === "all" ? "all indexed callables" : callables();
@@ -103,6 +105,8 @@
     function clearInspection() {
       selectionSerial++; pressed = null; inspection = null;
       window.TrellisShell?.clearArchitectureInspector();
+      // Leaving a stub drops its band's word; the drawing is swapped in place, keeping what else is selected.
+      if (endMark) { endMark = null; if (usable() && view.state === "ready") void render({keepSelection:true}); }
     }
     function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false, keepReopen = false) {
       drawn = null; get("architecture-apps").hidden = true; get("architecture-source-line").hidden = true;
@@ -216,6 +220,7 @@
       // The narrow shared box stacks its header; ordered bands keep one line.
       const parts = [`${layer.shared ? "Shared" : layer.order} · ${layer.name}`, `${plural(modules.length, "file")}${packages.length ? ` · ${packages.length} external packages` : ""}`];
       if (metric !== "layer") parts.push(`max ${max}`);
+      if (endMark?.layer === layer.name) parts.push(`${endMark.side} end`);
       return parts.join(layer.shared ? "\n" : " · ");
     }
     // Outgoing production reference sites by verdict: the same summary edges the arrows draw.
@@ -525,6 +530,7 @@
       if (!usable() || view.state !== "ready") return false;
       // `full` is the snapshot; `payload` is what this drawing shows: the whole stack, or one app's slice of it.
       const c = basis, full = view, ticket = ++renderSerial;
+      if (!keepSelection) endMark = null;
       if (scope !== null && !scopeGroup(full)) scope = null;
       const payload = scope === null ? full : apps.scoped(full, scope);
       const active = () => current(c) && view === full && ticket === renderSerial && full.rulesFile.contentHash === c.rulesHash;
@@ -571,6 +577,7 @@
             const stub = typeof action.id === "string" ? findNode(["data-trellis-action-id", action.id]) : null;
             for (const node of get("architecture-diagram").querySelectorAll?.("[aria-pressed]") || []) node.setAttribute("aria-pressed", String(node === stub));
             pressed = nodeKey(stub);
+            endMark = {layer:action.layer, side:action.side}; void render({keepSelection:true});
           },
           onSelectModule:module => { if (active() && payload.modules.includes(module)) { inspect("module", module); pressed = nodeKey(pressedNode()); } },
           onSelectEdge:edge => { if (active() && payload.edges.includes(edge)) { inspect("edge", edge); pressed = nodeKey(pressedNode()); } },
@@ -780,6 +787,8 @@
     function overview() {
       if (!usable() || !["ready", "no_layers"].includes(view.state)) return;
       clearInspection(); window.TrellisShell?.showArchitectureInspector({drawer:false});
+      // Nothing is selected any more, so no drawn node may say it is (a stub shows the word Selected).
+      for (const node of get("architecture-diagram").querySelectorAll?.('[aria-pressed="true"]') || []) node.setAttribute("aria-pressed", "false");
       get("architecture-inspector-title").textContent = "Architecture review";
       const target = get("architecture-inspector-content"); target.replaceChildren();
       reviewChips(target);
@@ -861,7 +870,12 @@
       const ordered = payload.layers.filter(layer => !layer.shared && layer.app === group.name).length;
       const shared = payload.layers.filter(layer => layer.shared && (layer.apps == null || layer.apps.includes(group.name))).length;
       const grid = make("dl", undefined, "metric-inspector-values");
-      for (const [name, value] of [["Files", group.fileCount], ["Layers", `${ordered} + ${shared} shared`], ["Unassigned files", unassignedOf(payload, group).length]]) grid.append(make("dt", name), make("dd", String(value)));
+      const row = (name, value, tone) => { const item = make("dd", value); if (tone) item.dataset.tone = tone; grid.append(make("dt", name), item); };
+      const unassigned = unassignedOf(payload, group).length, deviates = Number.isSafeInteger(group.counts?.deviates) ? group.counts.deviates : 0;
+      row("Files", String(group.fileCount)); row("Layers", `${ordered} + ${shared} shared`);
+      for (const entry of payload.interfaces) if (entry?.client === group.name) row(`Calls to ${entry.server}`, display(entry.counts?.callSites));
+      row("Deviations", deviates ? `↑ ${deviates} ${deviates === 1 ? "deviation" : "deviations"}` : "0", deviates ? "error" : null);
+      row("Unassigned", unassigned ? `◇ ${unassigned} unassigned` : "0", unassigned ? "warning" : null);
       target.append(grid);
       paragraph(target, `Detected from ${group.manifests.join(", ")}${group.kinds.length ? ` (${group.kinds.join(", ")})` : ""}`, "detail");
       if (group.duplicate) paragraph(target, apps.duplicateNotice(group), "architecture-app-notice");

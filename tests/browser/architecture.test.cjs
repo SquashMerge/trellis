@@ -2005,13 +2005,16 @@ test("a stub selects its interface with a visible Selected word, opens the inspe
   const stub = page.getByRole("button", {name:"HTTP interface to srv: 1 route, 1 call site", exact:true});
   assert.equal(await stub.locator("text.trellis-architecture-stat").textContent(), "→ srv · 1 route · 1 call site");
   assert.equal(await stub.getAttribute("aria-pressed"), "false");
-  const tag = stub.locator("text.trellis-architecture-stat-tag");
+  const tag = stub.locator("text.architecture-selected-tag");
   assert.equal(await tag.evaluate(node => getComputedStyle(node).visibility), "hidden", "no word before a selection");
   await stub.focus(); await page.keyboard.press("Enter"); await settled(page);
   assert.equal(await stub.getAttribute("aria-pressed"), "true");
   assert.equal(await tag.textContent(), "Selected");
   assert.equal(await tag.evaluate(node => getComputedStyle(node).visibility), "visible", "the word marks the selection, not only the colour");
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), "web-app → srv");
+  const band = page.locator('#architecture-diagram [data-trellis-layer-id="client"]');
+  await page.waitForFunction(() => document.querySelector('#architecture-diagram [data-trellis-layer-id="client"]')?.getAttribute("aria-label")?.includes("client end"));
+  assert.match(await band.getAttribute("aria-label"), /client end/, "the selected stub's band says which end it is");
   const content = page.locator("#architecture-inspector-content");
   assert.match(await content.textContent(), /Client end: web-app · client/); assert.match(await content.textContent(), /Server end: srv · server/);
   await content.getByRole("button", {name:"Open endpoints"}).click(); await settled(page);
@@ -2024,6 +2027,7 @@ test("a stub selects its interface with a visible Selected word, opens the inspe
   assert.equal(kept.pressed.length, 1); assert.match(kept.pressed[0], /^\["interface","web-app","srv","client","client"\]$/);
   await page.locator('#architecture-diagram [data-trellis-layer-id="client"]').click();
   assert.equal(await stub.getAttribute("aria-pressed"), "false", "selecting another node clears the stub");
+  await page.waitForFunction(() => !document.querySelector('#architecture-diagram [data-trellis-layer-id="client"]')?.getAttribute("aria-label")?.includes("client end"));
   await page.locator("#architecture-apps").getByRole("button", {name:/^srv/}).click();
   await page.locator('#architecture-diagram [data-trellis-layer-action="server"]').waitFor({state:"attached"});
   assert.equal(await page.getByRole("button", {name:"HTTP interface from web-app: 1 route", exact:true}).locator("text.trellis-architecture-stat").textContent(), "← web-app · 1 route");
@@ -2041,3 +2045,18 @@ test("a ↑ badge opens the Deviations tree on its edge with the chip pressed an
   assert.equal(await page.locator("#architecture-deviations-calls").isChecked(), false);
   assert.equal(await page.locator("#architecture-deviations-tree .deviation-row[aria-selected=true]").count(), 0, "no line is selected");
 }));
+
+test("returning from the Deviations tree leaves no stub marked Selected", {timeout:240000}, async () => published(httpRules, async ({page}) => {
+  await ready(page);
+  await page.locator("#architecture-apps").getByRole("button", {name:/^web-app/}).click();
+  const stub = page.getByRole("button", {name:"HTTP interface to srv: 1 route, 1 call site", exact:true});
+  await stub.waitFor({state:"attached"});
+  await stub.focus(); await page.keyboard.press("Enter"); await settled(page);
+  await page.waitForFunction(() => document.querySelector('#architecture-diagram [aria-pressed=true] .architecture-selected-tag'));
+  await page.locator("#architecture-review").click();
+  await page.locator("#architecture-deviations-back").click();
+  assert.equal(await page.locator("#architecture-inspector-title").textContent(), "Architecture review");
+  await page.waitForFunction(() => !document.querySelector('#architecture-diagram [aria-pressed=true]'));
+  assert.equal(await stub.getAttribute("aria-pressed"), "false");
+  assert.equal(await stub.locator("text.architecture-selected-tag").evaluate(node => getComputedStyle(node).visibility), "hidden");
+}, new Map(), httpApps));

@@ -59,7 +59,8 @@ switcher and the drawing are [#789](https://github.com/SquashMerge/trellis/issue
   layers stay whole files.
 - **One stack per app.** An app's view draws that app's ordered layers, including its hidden
   ones, by their own `order`. It also draws the shared layers that serve the app. With zero
-  or one app, the view is the single stack above, unchanged.
+  or one app, the view is the single stack above, with the same per-destination `↑` badges
+  (see the #789 badge amendment under the band headers).
 - **An app with no layers yet** lists its files as unassigned, under that app, and shows
   the `trellis_propose_layers` setup help.
 - **Tooling, test harnesses and fixtures are hidden layers of their app, not apps** (#524).
@@ -329,9 +330,10 @@ read from `interfaces[].ends`: `→ <server> · N routes · M call sites` on the
 one server band can share a route, so that stub reads `≥N routes`. A stub is a button with
 `aria-pressed`; selecting it opens the interface inspector (the ends, the counts, the wrappers,
 the server-only and client-only lists, and **Open endpoints** for the matched routes, each
-with **Read handler source** and **Read call-site source**) and shows the word `Selected` on the stub. The app
-inspector (name, languages and roots, files, layers, unassigned files and the interfaces
-the app takes part in) is selected from an app column header in All apps (#790).
+with **Read handler source** and **Read call-site source**) and shows the word `Selected` on the stub; while it is selected, its band's label also says
+`client end` or `server end`. The app
+inspector (name, languages and roots, a grid of files, layers, calls to each server app, deviations
+and unassigned files, and the interfaces the app takes part in) is selected from an app column header in All apps (#790).
 
 **Opening the tab again (#789, proposed (owner-delegated, run 803)).** This supersedes
 "re-reads when the tab is opened again". Leaving the Architecture tab keeps the loaded
