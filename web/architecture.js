@@ -224,10 +224,10 @@
       return parts.join(layer.shared ? "\n" : " · ");
     }
     // Outgoing production reference sites by verdict: the same summary edges the arrows draw.
-    function layerCounts(layer) {
-      const byName = new Map(model().layers.map(item => [item.name, item]));
+    function layerCounts(layer, source = model()) {
+      const byName = new Map(source.layers.map(item => [item.name, item]));
       const counts = {up:0, cross:0, down:0, shared:0, allowed:0, excepted:0, unknown:0}, upTo = new Map();
-      for (const edge of model().edges) {
+      for (const edge of source.edges) {
         if (edge.sourceLayer !== layer.name || edge.role !== "production") continue;
         const destination = byName.get(edge.destinationLayer), ordered = !layer.shared && destination && !destination.shared;
         if (edge.excepted) counts.excepted += edge.count;
@@ -245,8 +245,9 @@
     // Only non-zero counts become chips; deviations carry the error tone and a glyph. Upward deviations
     // get one chip per destination layer, each a control that opens the Deviations tree on that edge
     // (AC10), in every stack.
-    function layerStats(layer, appName = scopeGroup()?.name) {
-      const counts = layerCounts(layer), bound = lowerBound(layer.name, "production") ? "≥" : "";
+    // `source` is the slice the band is drawn from: a column's chips sum that app's own edges.
+    function layerStats(layer, appName = scopeGroup()?.name, source = model()) {
+      const counts = layerCounts(layer, source), bound = lowerBound(layer.name, "production") ? "≥" : "";
       const stats = STATS.filter(([key]) => key !== "up" && counts[key] > 0).map(([key, glyph, words, error]) =>
         ({key, count:counts[key], text:`${glyph}${bound}${counts[key]}`, label:`${bound ? "at least " : ""}${counts[key]} outgoing production reference sites · ${words}`, tone:error ? "error" : "neutral"}));
       const up = [...counts.upTo].map(([destination, count]) => ({key:"up", count, text:`↑${bound}${count} deviation · ${destination}`, tone:"error",
@@ -455,7 +456,7 @@
       const refocus = show && !target.hidden && !!target.contains?.(document.activeElement);
       target.hidden = line.hidden = !show; target.replaceChildren(); line.replaceChildren();
       const footnote = get("architecture-footnote"); footnote.hidden = !show;
-      if (show) footnote.textContent = `Apps are detected from build manifests (Cargo binary packages and package.json). Layer order is compared within an app. Band and arrow counts are reference sites at ${window.TrellisIndexPin.label(payload)}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
+      if (show) footnote.textContent = `Apps are detected from build manifests (Cargo binary packages, package.json and Python project manifests). Layer order is compared within an app. Band and arrow counts are reference sites at ${window.TrellisIndexPin.label(payload)}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
       if (!show) return;
       const choose = (name, text) => {
         const button = make("button", text); button.type = "button"; button.setAttribute("aria-pressed", String(scope === name));
@@ -568,7 +569,7 @@
           showTests, metric, aggregate, isCurrent:active, ...extra,
           moduleValue:module => metric === "layer" ? undefined : metricValue(module.metrics, metric),
           moduleBand:module => metric === "layer" ? null : scale.band(metricValue(module.metrics, metric)),
-          layerLabel, layerStats:name === undefined ? layerStats : layer => layerStats(layer, name), edgeText, edgeTone,
+          layerLabel, layerStats:name === undefined ? layerStats : layer => layerStats(layer, name, slice), edgeText, edgeTone,
           display:{layers:part.layout.layers, expanded:name => budget.left > 0 && expanded(slice.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, scale, budget), reset:() => { budget.left = cap; budget.truncated = 0; },
             summary:(key, modules, columns) => summaryChips(key, modules, columns, scale, budget),
             edge:() => true,
@@ -1300,7 +1301,7 @@
       else if (kind === "rule") inspectRule(record);
       else inspect(kind, record);
       pressed = saved.pressed;
-      const node = findNode(pressed); if (node) { node.setAttribute("aria-pressed", "true"); node.focus({preventScroll:true}); }
+      const node = findNode(pressed); if (node) { node.setAttribute("aria-pressed", "true"); node.focus({preventScroll:true}); syncCards(); }
     }
     function beginDraft(operation, scope = null) {
       if (!usable() || editBusy) return;

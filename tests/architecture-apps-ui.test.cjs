@@ -310,3 +310,23 @@ test("stale async: a scope change or a suspend during the column drawings paints
   await Promise.all([drawing, switched]); await flush();
   assert.equal(descendants(later.get("architecture-diagram")).some(item => item.className === "architecture-apps-grid"), false, "the superseded All apps drawing never lands");
 });
+
+test("a column's shared-layer chips sum that app's own edges, as the one-app view does", async () => {
+  const dto = threeApps();
+  dto.layers.push({name:"Common", shared:true, app:null, apps:null});
+  dto.modules.push({identity:identity("common/a.js"), layer:"Common", app:null, physicalLines:1, declarationCount:1, metrics:{cognitive:1}});
+  const edge = (destinationLayer, count) => ({sourceLayer:"Common", destinationLayer, role:"production", count, status:"deviates", excepted:false, exceptionReason:null, pairs:[]});
+  dto.edges = [edge("UI", 2), edge("Api", 3)];
+  const h = controller(dto); await h.architecture.refresh();
+  const chips = render => JSON.parse(JSON.stringify(render.options.layerStats(render.view.layers.find(layer => layer.name === "Common")).map(stat => stat.text)));
+  const columns = new Map(h.renders.map(render => [render.options.title.split(" ")[0], chips(render)]));
+  for (const name of ["web", "api"]) {
+    const before = h.renders.length;
+    await h.get("architecture-apps").children.find(item => item.textContent.startsWith(name)).fire("click"); await flush();
+    assert.deepEqual(chips(h.renders.at(-1)), columns.get(name), `${name}: the column and the one-app view agree`);
+    assert.equal(h.renders.length, before + 1);
+    await h.get("architecture-apps").children[0].fire("click"); await flush();
+  }
+  assert.notDeepEqual(columns.get("web"), columns.get("api"), "each column counts only its own edges");
+  assert.ok(columns.get("web").some(text => /2/.test(text)) && !columns.get("web").some(text => /5/.test(text)));
+});
