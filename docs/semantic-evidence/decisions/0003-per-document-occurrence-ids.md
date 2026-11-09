@@ -44,6 +44,7 @@ The v1 rule "occurrence-keyed evidence never crosses revisions" protects **seman
    - A shared occurrence ID never carries a binding, resolution, target, join or provenance from one revision to another.
    - After a failed or omitted r2 refresh, r2 occurrences have no selected-producer binding even when their IDs equal r1's.
    - Freshness rule 2 (`possiblyStale`), `staleTarget=false` and the no-expansion rules are unchanged.
+   - *(Amended by [Decision 0021](0021-shared-semantic-payloads.md), #680; accepted design (owner, 2026-11-08); ratified on merge: this item binds **validity**, not storage. Storage may share one validated semantic payload among revisions when its input key matches; each revision's own manifest row selects it, and a read at r2 projects it as r2 evidence, as item 6 does for native records.)*
 6. **Pinned projection (acceptance condition).** A pinned read of revision r2 projects every native record of a reused (unchanged) document version **as r2 evidence**:
    - its `.revisionId` is r2;
    - its native measured-syntax provenance and coverage are r2's;
