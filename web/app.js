@@ -157,13 +157,19 @@ function sequenceHash(id, revision, boundary = null) {
 }
 // Replaces the current history entry with what is on screen, so Back returns to it.
 function rememberCurrent(revision, architectureEntry = null) {
-  const source = captureSourceEntry();
-  if (architectureEntry) rememberNavigation({kind:"architecture", architecture:architectureEntry}, true, "#architecture");
-  else if (source) rememberNavigation(source, true, "#source");
-  else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id && IndexPin.equal(diagramSequence.revision, revision)) {
-    rememberNavigation({kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked, boundary:sequenceBoundary}, true, sequenceHash(selectedMethod.id, revision, sequenceBoundary));
-  } else if (!window.location?.hash) rememberNavigation({kind:"unavailable"}, true, "");
+  writeEntry(currentEntry(revision, architectureEntry));
 }
+// What is on screen as a history entry, or null when the current entry already describes it.
+function currentEntry(revision, architectureEntry = null) {
+  const source = captureSourceEntry();
+  if (architectureEntry) return {entry:{kind:"architecture", architecture:architectureEntry}, hash:"#architecture"};
+  if (source) return {entry:source, hash:"#source"};
+  if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id && IndexPin.equal(diagramSequence.revision, revision))
+    return {entry:{kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked, boundary:sequenceBoundary}, hash:sequenceHash(selectedMethod.id, revision, sequenceBoundary)};
+  if (!window.location?.hash) return {entry:{kind:"unavailable"}, hash:""};
+  return null;
+}
+function writeEntry(saved) { if (saved) rememberNavigation(saved.entry, true, saved.hash); }
 async function navigateDiagram(symbol, revision, kind = "sequence", admitted = null, showAll = false, boundary = null, architectureEntry = null, remembered = false) {
   IndexPin.copy(revision);
   if (!IndexPin.equal(revision, status?.revision) || !token || !selectedRootKey) throw new Error("Source navigation is stale. Refresh the indexed view.");
@@ -371,30 +377,34 @@ async function showAgentView(request) {
     rememberVisible(pin);
     await navigateDiagram({id:request.symbolId}, pin, "class", null, false, null, null, true);
   } else {
-    rememberVisible(pin);
-    // The source read takes its own serials; from here the show is this ticket's alone.
+    // The source read takes its own serials, which a user's source or Files choice advances;
+    // the read paints only while this show is still the latest and unpinned. Nothing else is
+    // published unless it painted and still owns the view.
+    const before = visibleEntry(pin);
     const mine = () => ticket === showSerial && !followPinned && navigationCurrent(context);
     const range = {startLine:request.line, endLine:request.line};
-    if (section === "files") await openFilesLocation({path:request.path, range}, pin);
-    else await showCachedSource(request.path, range, pin, mine);
-    if (!mine()) return;
+    const painted = section === "files" ? await openFilesLocation({path:request.path, range}, pin, mine)
+      : await showCachedSource(request.path, range, pin, mine);
+    if (painted !== true || !mine()) return;
+    writeEntry(before);
     const entry = captureSourceEntry();
     pushed = !!entry && !!window.history?.pushState;
     if (entry) rememberNavigation(entry, false, "#source");
   }
   if (ticket === showSerial && navigationCurrent(context)) showAgentNote(`Shown by agent · ${title}`, null, pushed && !!window.history?.pushState);
 }
-// Replaces the current history entry with the view visible now, so agent Back returns to it
-// rather than to a sequence still held from an earlier visit (#824).
+// The view visible now as a history entry, so agent Back returns to it rather than to a
+// sequence still held from an earlier visit (#824). Written only when the show publishes.
 let classesSeed = null;
-function rememberVisible(revision) {
+function visibleEntry(revision) {
   const visible = currentDiagramView();
-  if (section !== "diagrams" || visible === "sequence") return rememberCurrent(revision);
+  if (section !== "diagrams" || visible === "sequence") return currentEntry(revision);
   const source = captureSourceEntry();
-  if (source) return rememberNavigation(source, true, "#source");
-  if (visible === "classes" && classesSeed) return rememberNavigation({kind:"class", symbol:{id:classesSeed}}, true, "#classes");
-  rememberNavigation({kind:"view", view:visible}, true, "");
+  if (source) return {entry:source, hash:"#source"};
+  if (visible === "classes" && classesSeed) return {entry:{kind:"class", symbol:{id:classesSeed}}, hash:"#classes"};
+  return {entry:{kind:"view", view:visible}, hash:""};
 }
+function rememberVisible(revision) { writeEntry(visibleEntry(revision)); }
 function currentDiagramView() {
   return ["sequence", "classes", "architecture", "treemap"].find(name => $("view-" + name)?.getAttribute?.("aria-selected") === "true") || "sequence";
 }
@@ -1066,6 +1076,7 @@ async function showCachedSource(path, range, revision, callerCurrent = () => tru
     $("source").scrollTop = highlight.offsetTop - $("source").offsetTop - 80;
     highlight.scrollIntoView?.({block:"start", inline:"nearest"});
   }
+  return true;
 }
 async function refreshView() {
   resetHeadObservation(); clearRevisionReads();
@@ -1357,14 +1368,16 @@ function renderFilesMatches() {
   $("files-matches-state").textContent = `${data.items.length} shown · ${data.scope?.language || "language unavailable"} · source set ${data.scope?.sourceSetId || "unavailable"}${data.scope?.spelling ? " · " + data.scope.spelling : " · spelling unavailable"}${data.partial ? " · Incomplete coverage (skipped files or work budget)" : ""}${data.truncated ? " · more available" : ""}${!data.items.length ? " · No matches returned in the scanned scope; not proof of no references." : ""}${data.warnings?.length ? " · " + data.warnings.join(" · ") : ""}`;
   $("files-matches-more").hidden = data.continuation == null;
 }
-async function openFilesLocation(item, pin) {
-  if (!IndexPin.equal(pin, status?.revision) || section !== "files") return;
+// Paints a pinned source location in Files; true only when it painted.
+async function openFilesLocation(item, pin, callerCurrent = () => true) {
+  if (!IndexPin.equal(pin, status?.revision) || section !== "files" || !callerCurrent()) return false;
   filesSerial++; filesDiffSerial++; clearFilesInspector(); filesFile = files.find(file => file.path === item.path) || {path:item.path}; filesBasis = "indexed"; filesDiff = null;
   $("files-empty").hidden = true; $("files-symbol-title").textContent = "Pinned source location";
   $("files-symbol-location").textContent = `${item.path}:${item.range.startLine} · indexed revision ${IndexPin.label(pin)}`;
   updateFilesBasis(); renderFiles();
-  const current = filesGuard({symbol:true, basis:true});
-  await showCachedSource(item.path, item.range, pin, current).catch(error => filesFailure(error, "source-path", current));
+  const guard = filesGuard({symbol:true, basis:true}), current = () => guard() && callerCurrent();
+  try { return await showCachedSource(item.path, item.range, pin, current) === true; }
+  catch (error) { filesFailure(error, "source-path", current); return false; }
 }
 async function loadFilesMini(current) {
   const symbol = filesSymbol.symbol, pin = IndexPin.copy(status.revision);

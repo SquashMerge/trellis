@@ -2118,3 +2118,44 @@ test("agent Back returns to the class diagram that was open", async () => {
   assert.deepEqual(opened, ["Type", "Type"]);
   assert.equal(h.run("currentDiagramView()"), "classes");
 });
+
+// #824: an agent source show publishes nothing (bytes, history, note) unless it still owns
+// the view when its read lands.
+const sourceFile = path => response({revision:SHOW_PIN, file:{path, language:"rust", text:`${path} bytes`}});
+for (const files of [true, false]) test(`pinning during an agent source read in ${files ? "Files" : "Diagrams"} paints nothing; control: unpinned paints`, async () => {
+  for (const pin of [true, false]) {
+    const {h, browser} = await showHarness(), hold = deferred();
+    if (files) h.run("section='files'");
+    h.context.fetch = () => hold.promise;
+    const entries = browser.history.length;
+    const pending = h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"source", path:"agent.rs", line:1}))})`);
+    if (pin) h.get("follow-agent").listeners.click();
+    hold.resolve(sourceFile("agent.rs")); await pending;
+    assert.equal(h.run("workspaceSource?.data.file.path") || null, pin ? null : "agent.rs", `pinned: ${pin}`);
+    assert.equal(browser.history.length, pin ? entries : entries + 1);
+    assert.equal(h.get("agent-shown").hidden, pin);
+  }
+});
+test("a manual Files choice during an agent source read: no agent bytes, history entry or note", async () => {
+  const {h, browser} = await showHarness(), hold = deferred();
+  h.run("section='files'");
+  h.context.fetch = () => hold.promise;
+  const pending = h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"source", path:"agent.rs", line:1}))})`);
+  h.context.fetch = async () => sourceFile("manual.rs");
+  assert.equal(await h.run("openFilesLocation({path:'manual.rs',range:{startLine:1,endLine:1}},status.revision)"), true);
+  const entries = browser.history.length, state = JSON.stringify(browser.history.state);
+  hold.resolve(sourceFile("agent.rs")); await pending;
+  assert.equal(h.run("workspaceSource.data.file.path"), "manual.rs");
+  assert.equal(browser.history.length, entries, "no extra history entry");
+  assert.equal(JSON.stringify(browser.history.state), state, "the current entry is not rewritten");
+  assert.equal(h.get("agent-shown").hidden, true, "no false note");
+});
+test("openFilesLocation reports an aborted read as not painted", async () => {
+  const {h} = await showHarness(), hold = deferred();
+  h.run("section='files'");
+  h.context.fetch = () => hold.promise;
+  const read = h.run("openFilesLocation({path:'a.rs',range:{startLine:1,endLine:1}},status.revision)");
+  h.run("epoch++");
+  hold.resolve(sourceFile("a.rs"));
+  assert.equal(await read, false);
+});
