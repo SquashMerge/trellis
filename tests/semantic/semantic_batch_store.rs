@@ -9327,6 +9327,88 @@ fn unavailable_basis_is_rejoined_not_copied() {
     assert_head_matches_full(&world, &descriptor);
 }
 
+/// #826 accounting: in one S with two producers on disjoint languages, rust-analyzer (first
+/// in selection order) copies A and B while scip-typescript's witness exceeds the limit and
+/// falls back to FULL. Only the falling-back producer's abandoned copies leave the report:
+/// rust-analyzer's copies stay counted, and the report equals what the publisher copied.
+#[test]
+fn a_later_producer_fallback_keeps_earlier_producer_copies() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+                ("src/c.rs", "fn other() { }\n"),
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+            ],
+        )
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g) = (symbol("r()."), symbol("impl#[S]f()."), symbol("g()."));
+    let mut rust = world.fixture().reference("rust-analyzer");
+    rust.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 15, 16], &[], &f, 0)
+                .occurrence(&[0, 20, 21], &[], &g, 0)
+                .symbol(&r, 17, &[]),
+            DocSpec::new("src/b.rs")
+                .occurrence(&[1, 12, 13], &[], &f, 1)
+                .occurrence(&[2, 3, 4], &[], &g, 1)
+                .symbol(&f, 26, &[])
+                .symbol(&g, 17, &[]),
+            DocSpec::new("src/c.rs"),
+        ],
+    );
+    let rust = world.write(&rust);
+    drop(world.publish(&rust).unwrap());
+    let (a, b) = definitions_docs();
+    let mut js = world.fixture().reference("scip-typescript");
+    js.artifact("javascript", vec![a, b]);
+    let js = world.write(&js);
+    drop(world.publish(&js).unwrap());
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&counts, Some(ISSUE_826_LIMITS));
+    // One native publication: C changes (Rust A and B are copied); JavaScript B changes, so
+    // JavaScript A is a pending dependent the witness settles, over the limit.
+    write_files(&world.root, &[("src/c.rs", "fn other() { let _ = 1; }\n")]);
+    let work = local_edit(
+        &world,
+        "src/B.js",
+        "function target(){ }\n// edited\n",
+        &counts,
+    );
+    assert_eq!(
+        work["producerIds"],
+        json!(["rust-analyzer", "scip-typescript"]),
+        "{work}"
+    );
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(
+        work["fallbackReasons"],
+        json!(["witness_limit_exceeded"]),
+        "{work}"
+    );
+    let paths = |field: &str| -> Vec<String> {
+        work[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|doc| doc["path"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(paths("copiedDocuments"), ["src/a.rs", "src/b.rs"], "{work}");
+    assert_eq!(paths("publishedCopies"), paths("copiedDocuments"), "{work}");
+    assert_eq!(world.rejoin_failures(), 0);
+}
+
 /// #826: with the oracle on, an S that ends unavailable where the independent FULL rejoin
 /// succeeds is the typed oracle mismatch, and publishes nothing.
 #[test]

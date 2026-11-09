@@ -623,6 +623,10 @@ impl Store {
                     }
                     let mut copied: std::collections::VecDeque<_> =
                         copy::copied_documents(parts.conn, &parts.descriptor.source_set.id)?.into();
+                    #[cfg(feature = "test-support")]
+                    copied
+                        .iter()
+                        .for_each(crate::semantic_import::note_published_copy);
                     if !copied.is_empty() && destination.is_none() {
                         destination = Some(copy::CopyDestination::read(self, &tx, target)?);
                     }

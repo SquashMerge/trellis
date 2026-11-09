@@ -557,7 +557,11 @@ fn clear_work_counts() {
 }
 
 fn copied_paths(work: &serde_json::Value) -> BTreeSet<String> {
-    work["copiedDocuments"]
+    paths_of(work, "copiedDocuments")
+}
+
+fn paths_of(work: &serde_json::Value, field: &str) -> BTreeSet<String> {
+    work[field]
         .as_array()
         .map(|docs| {
             docs.iter()
@@ -1551,6 +1555,14 @@ impl<'w> Harness<'w> {
                     .count()
             });
             let copied = copied_paths(&work);
+            // #826: the report names exactly the documents the publisher wrote as copies, in
+            // both directions, so a later check cannot pass on a report missing real copies.
+            let published_copies = paths_of(&work, "publishedCopies");
+            if copied != published_copies {
+                return Err(format!(
+                    "{label}: S reported copies {copied:?} but published copies {published_copies:?}"
+                ));
+            }
             if std::env::var_os("TRELLIS_PROPTEST_TRACE").is_some() {
                 eprintln!(
                     "{label}: S {s:?} eligible {eligible:?} copied {copied:?} P omitted {:?} reused {}",

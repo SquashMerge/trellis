@@ -411,6 +411,8 @@ impl Store {
                     };
                     if state.current.is_none() {
                         let producer = pending_producer(db, &target, &selection.producer_id)?;
+                        #[cfg(feature = "test-support")]
+                        crate::semantic_import::note_producer_attempt();
                         state.current = Some(ProducerContinuation {
                             producer,
                             admission: None,

@@ -918,6 +918,12 @@ pub(crate) struct PublicationWork {
     reused_documents: BTreeSet<native::DocumentKey>,
     /// Unchanged documents S copies from their published basis (#669 H1).
     copied_documents: BTreeSet<native::DocumentKey>,
+    /// `copied_documents` as the current producer's attempt found it: what earlier producers
+    /// copied. A FULL fallback restores it, dropping only the abandoned attempt's copies.
+    #[serde(skip)]
+    copied_before_attempt: BTreeSet<native::DocumentKey>,
+    /// Documents the S publisher actually wrote as copies, from each joined stage (#826).
+    published_copies: BTreeSet<native::DocumentKey>,
 }
 #[cfg(feature = "test-support")]
 thread_local! { static PUBLICATION_WORK: std::cell::RefCell<PublicationWork> =
@@ -957,6 +963,18 @@ pub(crate) fn note_copied_document(document: &native::DocumentKey) {
         work.copied_documents.insert(document.clone());
     });
 }
+/// A producer's S attempt starts: copies noted so far belong to earlier producers.
+#[cfg(feature = "test-support")]
+pub(crate) fn note_producer_attempt() {
+    count_publication_work(|work| work.copied_before_attempt = work.copied_documents.clone());
+}
+/// The S publisher wrote `document` as a copy of its basis tuple.
+#[cfg(feature = "test-support")]
+pub(crate) fn note_published_copy(document: &native::DocumentKey) {
+    count_publication_work(|work| {
+        work.published_copies.insert(document.clone());
+    });
+}
 #[cfg(feature = "test-support")]
 pub(crate) fn note_reused_document(document: &native::DocumentKey) {
     count_publication_work(|work| {
@@ -969,8 +987,9 @@ pub(crate) fn note_local_witness_outcome(fallback: Option<&str>) {
         Some(reason) => {
             work.full_fallbacks += 1;
             work.fallback_reasons.push(reason.to_owned());
-            // FULL copies nothing: an abandoned witnessed attempt's copies are not published.
-            work.copied_documents.clear();
+            // FULL copies nothing: this producer's abandoned witnessed attempt's copies are
+            // not published; earlier producers' copies are (#826).
+            work.copied_documents = work.copied_before_attempt.clone();
         }
         None => work.witnessed_rejoins += 1,
     });
