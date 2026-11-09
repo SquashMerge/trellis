@@ -4049,3 +4049,177 @@ fn invalid_search_backend_refuses_direct_daemon_without_checkout_state() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid embedding input"));
     assert!(!fixture_roots(&home).cache.exists());
 }
+
+/// `trellis api` (#817): one allowlisted browser route through the daemon socket.
+fn api(home: &Path, args: &[&str], body: Option<&str>) -> (i32, Value) {
+    use std::io::Write;
+    let mut command = cli(home);
+    command.arg("api").args(args).stdout(Stdio::piped());
+    if body.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command.spawn().unwrap();
+    if let Some(body) = body {
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "api {args:?} printed no JSON ({error}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    (output.status.code().unwrap(), value)
+}
+
+#[test]
+fn api_cli_answers_allowed_routes_through_the_daemon() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "apicli");
+    run(&home, "index", &root);
+    let (code, list) = api(&home, &["GET", "/api/checkouts"], None);
+    assert_eq!(code, 0, "{list}");
+    let row = list["checkouts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["workspaceRoot"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with("/apicli")
+        })
+        .unwrap_or_else(|| panic!("indexed checkout not listed: {list}"))
+        .clone();
+    let key = row["rootKey"].as_str().unwrap();
+    let (code, status) = api(
+        &home,
+        &["GET", &format!("/api/checkouts/{key}/status")],
+        None,
+    );
+    assert_eq!(code, 0, "{status}");
+    let pin = status["revision"].clone();
+    assert!(pin["indexRevision"].as_u64().unwrap() >= 1, "{status}");
+    let query = format!(
+        "indexGeneration={}&indexRevision={}&path=sample.js",
+        pin["indexGeneration"].as_str().unwrap(),
+        pin["indexRevision"]
+    );
+    let (code, methods) = api(
+        &home,
+        &["GET", &format!("/api/checkouts/{key}/methods?{query}")],
+        None,
+    );
+    assert_eq!(code, 0, "{methods}");
+    let seed = methods["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|item| item["symbol"]["id"].as_str())
+        .unwrap_or_else(|| panic!("no method in sample.js: {methods}"));
+    // POST takes its JSON body inline, as the mod sends it, or from stdin with `-`.
+    let body = serde_json::json!({"seed": seed, "expectedRevision": pin, "showAll": false, "interactions": true})
+        .to_string();
+    let target = format!("/api/checkouts/{key}/sequence");
+    for (args, stdin) in [
+        (["POST", &target, "--body", &body], None),
+        (["POST", &target, "--body", "-"], Some(body.as_str())),
+    ] {
+        let (code, sequence) = api(&home, &args, stdin);
+        assert_eq!(code, 0, "{sequence}");
+        assert_eq!(sequence["seed"]["id"], seed, "{sequence}");
+    }
+}
+
+#[test]
+fn api_cli_refuses_other_routes_before_reaching_a_daemon() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let key = "0".repeat(64);
+    for target in [
+        format!("/api/checkouts/{key}/source?path=sample.js"),
+        format!("/api/checkouts/{key}/architecture/rules"),
+        "/api/daemon/status".to_owned(),
+    ] {
+        let (code, refused) = api(&home, &["GET", &target], None);
+        assert_eq!(code, 2, "{target}: {refused}");
+        assert_eq!(refused["error"]["code"], "route_not_allowed", "{refused}");
+    }
+    let (code, refused) = api(
+        &home,
+        &[
+            "POST",
+            &format!("/api/checkouts/{key}/index"),
+            "--body",
+            "-",
+        ],
+        Some("{}"),
+    );
+    assert_eq!(code, 2);
+    assert_eq!(refused["error"]["code"], "route_not_allowed", "{refused}");
+    assert!(
+        !home.join("auto-daemon.pid").exists(),
+        "a refused route started the daemon"
+    );
+}
+
+#[test]
+fn api_cli_passes_a_daemon_error_through_with_its_code() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "apierror");
+    run(&home, "index", &root);
+    let unknown = "0".repeat(64);
+    let (code, answer) = api(
+        &home,
+        &["GET", &format!("/api/checkouts/{unknown}/status")],
+        None,
+    );
+    assert_eq!(code, 1, "a daemon error answer exits 1: {answer}");
+    assert_eq!(
+        answer["error"]["code"], "workspace_selection_failed",
+        "{answer}"
+    );
+    // A query the route rejects is the daemon's own typed answer too.
+    let (_, list) = api(&home, &["GET", "/api/checkouts"], None);
+    let key = list["checkouts"][0]["rootKey"].as_str().unwrap();
+    let (code, answer) = api(
+        &home,
+        &["GET", &format!("/api/checkouts/{key}/methods?unknown=1")],
+        None,
+    );
+    assert_eq!(code, 1, "{answer}");
+    assert!(answer["error"]["code"].is_string(), "{answer}");
+}
+
+#[test]
+fn api_cli_types_an_unreachable_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let paths = fixture_socket_paths(&home);
+    fs::create_dir_all(&paths.run).unwrap();
+    for dir in [&paths.run, paths.run.parent().unwrap()] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    // An ordinary file where the socket belongs: no daemon can answer or be elected.
+    fs::write(&paths.socket, b"not a socket").unwrap();
+    let started = Instant::now();
+    let (code, answer) = api(&home, &["GET", "/api/checkouts"], None);
+    assert!(started.elapsed() < trellis::testing::HANG_BACKSTOP);
+    assert_eq!(code, 2, "{answer}");
+    assert_eq!(answer["error"]["code"], "daemon_unavailable", "{answer}");
+}

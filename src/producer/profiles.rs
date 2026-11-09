@@ -176,13 +176,15 @@ fn lang() -> &'static str {
 }
 
 /// The command of `row`. `resolution` must come from the same row (the
-/// launcher, `node`, `java`, `rustup` and `python3` each row consumes).
+/// launcher, `node`, `java`, `rustup` and `python3` each row consumes), and `rules` from the
+/// same plan.
 pub fn command(
     row: &Row,
     resolution: &Resolution,
     declared: &Declared,
     stub: Option<&Stub>,
     pin: &PinnedProducer,
+    rules: &Rules,
     run: &str,
 ) -> CommandSpec {
     let out = format!("{run}/out/index.scip");
@@ -276,7 +278,7 @@ pub fn command(
             }
         }
         (Target::Real(ProducerName::RustAnalyzer), _) => {
-            argv = vec![
+            let mut v = vec![
                 launcher,
                 "run".into(),
                 rustup_toolchain(pin).to_owned(),
@@ -286,6 +288,12 @@ pub fn command(
                 "--output".into(),
                 out,
             ];
+            // The project's settings (#717), when any is not rust-analyzer's default.
+            let config = super::settings::RUST_ANALYZER_CONFIG;
+            if rules.generated.iter().any(|file| file.path == config) {
+                v.extend(["--config-path".into(), format!("{run}/{config}")]);
+            }
+            argv = v;
             let rustup_dir = resolution
                 .rustup
                 .as_ref()

@@ -10,9 +10,15 @@
 //!    the repo's, and the plan records the replacement under `omitted`.
 //! 3. Any other failure of an `extends` is the typed `producer_config_unresolved` refusal,
 //!    naming the `extends`.
+//!
+//! The root config is chosen as the project's settings say (#717): the `--ts-project`
+//! override, else `tsconfig.json`, else `jsconfig.json` (through a generated `tsconfig.json`
+//! that extends it, since scip-typescript reads only `tsconfig.json`), else the generated
+//! tsconfig. A root config Trellis cannot parse is the same typed refusal.
 
 use super::profiles::{Generated, Omission, Rules};
-use super::worktree::RetainedInputs;
+use super::settings::{Origin, Setting, Source, TsProject};
+use super::worktree::{RetainedInputs, RootInput};
 use crate::references::tsconfig::parse_jsonc;
 use anyhow::Result;
 use serde_json::Value;
@@ -30,7 +36,13 @@ pub const MAX_FILE_BYTES: u64 = 256 * 1024;
 pub const MAX_CHAIN_FILES: usize = 16;
 /// The most paths one resolution inspects while looking files up.
 pub const MAX_PROBES: usize = 256;
-const ROOT: &str = "tsconfig.json";
+const TSCONFIG: &str = "tsconfig.json";
+const JSCONFIG: &str = "jsconfig.json";
+/// The project config scip-typescript reads when the checkout's root config is a
+/// `jsconfig.json`: TypeScript gives a `jsconfig.json` `allowJs` by default, and a config
+/// reached through `extends` keeps none of its file-name defaults, so this sets it.
+pub const JSCONFIG_PROJECT: &[u8] =
+    br#"{"extends":"./jsconfig.json","compilerOptions":{"allowJs":true}}"#;
 const NODE_MODULES: &str = "node_modules";
 /// The export conditions TypeScript 5.9 matches when it resolves a config's `extends`
 /// (`nodeNextJsonConfigResolver`: CommonJS mode, so `require`, `types` and `node`, plus
@@ -225,12 +237,12 @@ struct Chain<'a> {
 }
 
 impl<'a> Chain<'a> {
-    fn new(workspace: &'a Path) -> Self {
+    fn new(workspace: &'a Path, root: &str) -> Self {
         Self {
             workspace,
             node_modules: fs::canonicalize(workspace.join(NODE_MODULES)).ok(),
             files: BTreeMap::new(),
-            reading: vec![ROOT.to_owned()],
+            reading: vec![root.to_owned()],
             reads: 0,
             probes: 0,
         }
@@ -553,34 +565,63 @@ fn conditional(value: &Exports, depth: usize, targets: &mut Vec<String>) -> Resu
     Ok(())
 }
 
+/// Whether the config `bytes` (already accepted by `resolve_root`) extends the root file `path`
+/// by a relative path, with or without its `.json`.
+fn extends_root(bytes: &[u8], path: &str) -> bool {
+    let Some(config) = parse_jsonc(bytes) else {
+        return false;
+    };
+    extends_of(&config).is_ok_and(|extends| {
+        extends
+            .iter()
+            .filter(|specifier| is_path(specifier))
+            .any(|specifier| {
+                join("", specifier)
+                    .is_some_and(|target| target == path || format!("{target}.json") == path)
+            })
+    })
+}
+
 /// The typed refusal. `extends` is the JSON text of the root's `extends` entry.
-fn unresolved(extends: &str, reason: &str) -> anyhow::Error {
+fn unresolved(root: &str, extends: &str, reason: &str) -> anyhow::Error {
     let extends: String = extends.chars().take(200).collect();
     anyhow::anyhow!(
-        "{CONFIG_UNRESOLVED}: {ROOT} extends {extends}, which cannot be supplied to the run's worktree: {reason}"
+        "{CONFIG_UNRESOLVED}: {root} extends {extends}, which cannot be supplied to the run's worktree: {reason}"
     )
 }
 
-/// Adjust scip-typescript's `rules` for a root `tsconfig.json` whose `extends` names a
-/// package. Any other root config is left to the run as it is.
-pub fn apply(rules: &mut Rules, inputs: &RetainedInputs, workspace: &Path) -> Result<()> {
-    let Some(root) = inputs.config.iter().find(|file| file.path == ROOT) else {
-        return Ok(());
-    };
-    // A config this cannot read is left to TypeScript, which reports it.
+/// Adjust scip-typescript's `rules` for the root config `root` (`tsconfig.json` or
+/// `jsconfig.json`) whose `extends` names a package. A config Trellis cannot parse is the
+/// typed refusal (#717). Returns why the generated tsconfig replaces it, when its package is
+/// not in the checkout.
+fn resolve_root(
+    rules: &mut Rules,
+    root: &RootInput,
+    root_path: &'static str,
+    workspace: &Path,
+) -> Result<Option<String>> {
+    if root.bytes == crate::skipped_config::PLACEHOLDER {
+        anyhow::bail!(
+            "{CONFIG_UNRESOLVED}: {root_path} is over the config input cap and was not read"
+        );
+    }
     let Some(mut config) = parse_jsonc(&root.bytes).filter(Value::is_object) else {
-        return Ok(());
+        anyhow::bail!("{CONFIG_UNRESOLVED}: {root_path} is not a JSON object");
     };
     let extends = match extends_of(&config) {
         Ok(extends) => extends,
         Err(Failure::Invalid(reason) | Failure::Missing(reason)) => {
-            return Err(unresolved(&config["extends"].to_string(), &reason));
+            return Err(unresolved(
+                root_path,
+                &config["extends"].to_string(),
+                &reason,
+            ));
         }
     };
     if extends.iter().all(|specifier| is_path(specifier)) {
-        return Ok(());
+        return Ok(None);
     }
-    let mut chain = Chain::new(workspace);
+    let mut chain = Chain::new(workspace, root_path);
     let mut rewritten = Vec::with_capacity(extends.len());
     for specifier in &extends {
         if is_path(specifier) {
@@ -593,16 +634,18 @@ pub fn apply(rules: &mut Rules, inputs: &RetainedInputs, workspace: &Path) -> Re
         match supplied {
             Ok(target) => rewritten.push(relative("", &target)),
             Err(Failure::Missing(reason)) => {
+                let reason = format!(
+                    "extends \"{specifier}\", which the checkout's node_modules does not hold ({reason}); the generated tsconfig.json replaces it"
+                );
                 rules.omit.push(Omission {
-                    path: ROOT,
-                    reason: format!(
-                        "extends \"{specifier}\", which the checkout's node_modules does not hold ({reason}); the generated tsconfig.json replaces it"
-                    ),
+                    path: root_path,
+                    reason: reason.clone(),
                 });
-                return Ok(());
+                return Ok(Some(reason));
             }
             Err(Failure::Invalid(reason)) => {
                 return Err(unresolved(
+                    root_path,
                     &Value::from(specifier.as_str()).to_string(),
                     &reason,
                 ));
@@ -616,7 +659,7 @@ pub fn apply(rules: &mut Rules, inputs: &RetainedInputs, workspace: &Path) -> Re
         .map(String::as_str)
         .collect();
     rules.omit.push(Omission {
-        path: ROOT,
+        path: root_path,
         reason: format!(
             "extends {}, supplied from the checkout's node_modules; a copy with extends rewritten to the supplied files is generated",
             packages
@@ -629,9 +672,9 @@ pub fn apply(rules: &mut Rules, inputs: &RetainedInputs, workspace: &Path) -> Re
     // The rewritten root takes the place of the default-only generated one.
     rules
         .generated
-        .retain(|file| file.path != format!("worktree/{ROOT}"));
+        .retain(|file| file.path != format!("worktree/{root_path}"));
     rules.generated.push(Generated {
-        path: format!("worktree/{ROOT}"),
+        path: format!("worktree/{root_path}"),
         bytes: serde_json::to_vec(&config)?,
         default_only: false,
     });
@@ -642,5 +685,119 @@ pub fn apply(rules: &mut Rules, inputs: &RetainedInputs, workspace: &Path) -> Re
             bytes,
             default_only: false,
         }));
-    Ok(())
+    Ok(None)
+}
+
+/// Choose scip-typescript's project config and adjust its `rules` (#717): the override, else
+/// the root `tsconfig.json`, else the root `jsconfig.json`, else the generated tsconfig
+/// (#652). A root config's package `extends` is supplied from the checkout's `node_modules`
+/// (#799). Returns the `typescript.project` setting.
+pub fn apply(
+    rules: &mut Rules,
+    inputs: &RetainedInputs,
+    workspace: &Path,
+    overridden: Option<TsProject>,
+) -> Result<Setting> {
+    let find = |path: &str| inputs.config.iter().find(|file| file.path == path);
+    let (project, source) = match overridden {
+        Some(project) => (project, Source::Override),
+        None if find(TSCONFIG).is_some() => (TsProject::Tsconfig, Source::Project),
+        None if find(JSCONFIG).is_some() => (TsProject::Jsconfig, Source::Project),
+        None => (TsProject::Generated, Source::Default),
+    };
+    let given = if source == Source::Override {
+        format!("given with --ts-project {}; ", project.as_str())
+    } else {
+        String::new()
+    };
+    let missing = |path: &str| {
+        anyhow::anyhow!(
+            "{CONFIG_UNRESOLVED}: --ts-project {path}, but the checkout has no root {path}"
+        )
+    };
+    let setting = |value: TsProject, from: Option<&RootInput>, detail: String| Setting {
+        name: "typescript.project",
+        value: Value::from(value.as_str()),
+        source,
+        from: from.map(Origin::of).into_iter().collect(),
+        detail: format!("{given}{detail}"),
+    };
+    match project {
+        TsProject::Generated => {
+            // The generated tsconfig extends nothing, so a root config it replaces is left out
+            // of the worktree: it is never read, and one over the config input cap cannot
+            // refuse the run (#822 review).
+            for path in [TSCONFIG, JSCONFIG] {
+                if find(path).is_some() {
+                    rules.omit.push(Omission {
+                        path,
+                        reason: format!(
+                            "--ts-project generated: the generated tsconfig.json is used instead of the root {path}"
+                        ),
+                    });
+                }
+            }
+            Ok(setting(
+                project,
+                None,
+                if source == Source::Default {
+                    "no root tsconfig.json or jsconfig.json: the generated tsconfig.json".into()
+                } else {
+                    "the generated tsconfig.json".into()
+                },
+            ))
+        }
+        TsProject::Tsconfig => {
+            let root = find(TSCONFIG).ok_or_else(|| missing(TSCONFIG))?;
+            let resolved = resolve_root(rules, root, TSCONFIG, workspace)?;
+            // An explicit choice leaves out the root jsconfig.json it does not use, unless the
+            // tsconfig.json extends it (#822 review).
+            if source == Source::Override
+                && find(JSCONFIG).is_some()
+                && !extends_root(&root.bytes, JSCONFIG)
+            {
+                rules.omit.push(Omission {
+                    path: JSCONFIG,
+                    reason: "--ts-project tsconfig.json: the root jsconfig.json is not used".into(),
+                });
+            }
+            Ok(match resolved {
+                Some(reason) => setting(
+                    TsProject::Generated,
+                    Some(root),
+                    format!("root tsconfig.json {reason}"),
+                ),
+                None => setting(project, Some(root), "the root tsconfig.json".into()),
+            })
+        }
+        TsProject::Jsconfig => {
+            let root = find(JSCONFIG).ok_or_else(|| missing(JSCONFIG))?;
+            if find(TSCONFIG).is_some() {
+                rules.omit.push(Omission {
+                    path: TSCONFIG,
+                    reason: "--ts-project jsconfig.json: a generated tsconfig.json extending the root jsconfig.json replaces it".into(),
+                });
+            }
+            if let Some(reason) = resolve_root(rules, root, JSCONFIG, workspace)? {
+                return Ok(setting(
+                    TsProject::Generated,
+                    Some(root),
+                    format!("root jsconfig.json {reason}"),
+                ));
+            }
+            rules
+                .generated
+                .retain(|file| file.path != format!("worktree/{TSCONFIG}"));
+            rules.generated.push(Generated {
+                path: format!("worktree/{TSCONFIG}"),
+                bytes: JSCONFIG_PROJECT.to_vec(),
+                default_only: false,
+            });
+            Ok(setting(
+                project,
+                Some(root),
+                "the root jsconfig.json, through a generated tsconfig.json that extends it with allowJs, since scip-typescript reads only tsconfig.json".into(),
+            ))
+        }
+    }
 }

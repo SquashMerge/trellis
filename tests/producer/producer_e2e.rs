@@ -452,6 +452,7 @@ mod omitted_python_context {
             },
             executable: None,
             environment: serde_json::from_value(Value::Object(environment)).unwrap(),
+            settings: Default::default(),
         };
         let prepared = match plan::prepare(&store, &request, None) {
             Ok(prepared) => prepared,
@@ -505,6 +506,7 @@ mod omitted_python_context {
             &prepared.declared,
             None,
             &prepared.pin,
+            &prepared.rules,
             run_path,
         );
         worktree::write_bin_links(&dir, &command.bin_links).unwrap();

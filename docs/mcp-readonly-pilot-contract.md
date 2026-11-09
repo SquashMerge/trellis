@@ -536,6 +536,31 @@ The added schema bytes are paid for without changing what any schema accepts: ea
 - **Catalog.** Each architecture tool's output `$defs` drops every definition its output root does not reach. Tool 8 drops `ConfigDescriptor`, `ConstraintResult`, `RuleCounts`, `RuleDiagnostic`, `RuleEvidence` and `RuleInstance`; tools 9 and 10 drop `Edge`, `Module`, `SemanticBasis`, `Site` and `UnresolvedReference`. No response shape used them, so what any schema accepts is unchanged. The complete catalog is 241,831 compact bytes before and 230,217 after; the `tools/list` frame is 230,574 bytes against the 245,760-byte named headroom limit. A test now checks that every output definition is reachable and every `$ref` resolves.
 - **Frame.** An answer that does not fit one frame fails with `response_too_large`; ask for a smaller `limit`.
 
+## Amendment (#714): rules check pages deviations first
+
+**Status: proposed, awaiting owner ratification.** From the 2026-11-05 dogfood: with
+76 production deviations among 615 unknowns, page 1 of `trellis_rules_check` held only
+unknown `$layers` instances, because instances page in evaluation order (rule, target,
+destination). `toolVersion` is unchanged at **15**: no field, type, bound or count
+changes, only the order of rows within two arrays. This section wins over the #725
+"order of the kept items is unchanged" sentence, for check only.
+
+- **Status order.** Over MCP, `trellis_rules_check` orders `instances` by status,
+  `deviates`, then `unknown`, then `conforms`, and orders `testOnly` the same way.
+  Within one status, rows keep evaluation order. An excepted instance keeps its status
+  and therefore its place. The arrays still form the #448 sequence `instances`,
+  `testOnly`, `unassigned`, `externalPackages`.
+- **Stable paging.** The order is applied before the `status` filter and before
+  offsets are counted, so it is the same on every page: the pages concatenate to each
+  row exactly once, `page.total` and the whole-result `counts` and `testCounts` are
+  identical on every page, and the same arguments at the same pin give the same page.
+- **`limit`** is unchanged from #725: the most rule instances on one page, `instances`
+  and `testOnly` together.
+- **Unchanged:** evaluation, verdicts, counts, `omittedEvidence`, `nextCall`, bounds,
+  `trellis_rules_explain` (which pages its instances in evaluation order), the CLI and
+  the browser.
+- **Not in this amendment:** grouping or skipping `layer_unassigned` unknowns.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)

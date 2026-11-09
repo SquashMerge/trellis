@@ -262,14 +262,22 @@
     if (!current()) return {status:"stale"};
     const renderCurrent = window.TrellisSequence.beginRender(container);
     const active = () => current() && renderCurrent();
+    // An optional async yield between heavy phases, for hosts that cap one synchronous run
+    // (the Herdr mod, #707). Without it nothing here awaits.
+    const pause = typeof options.pause === "function" ? options.pause : null;
+    const breathe = async () => { await pause(); return active(); };
     try {
+      if (pause && !(await breathe())) return {status:"stale"};
       const projection = project(view, expandedGroups, options);
       if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
+      if (pause && !(await breathe())) return {status:"stale"};
       // Pele renders synchronously. Input caps bound the work; a timer cannot
       // interrupt it. Output byte/node caps are checked before installation.
       const result = window.pele.render(projection.source, {}).svg;
       if (!current()) return {status:"stale"};
+      if (pause && !(await breathe())) return {status:"stale"};
       const {root, notes, messages, messageLabels, actors} = validatedSvg(result, projection);
+      if (pause && !(await breathe())) return {status:"stale"};
       const rowNodes = [...notes, ...messageLabels];
       for (const lane of projection.lanes) {
         // A column of several methods names no one target: its arrows do, in the inspector.
