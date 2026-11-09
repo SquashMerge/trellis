@@ -283,6 +283,39 @@ async fn inventory_requires_complete_pin_and_lists_editable_configuration() {
     assert_eq!(layers.len(), 2);
     assert!(layers.iter().any(|layer| layer["name"] == "source"));
     assert!(layers.iter().any(|layer| layer["name"] == "target"));
+    for layer in layers {
+        assert_eq!(layer["app"], Value::Null, "{layer}");
+        assert_eq!(layer["apps"], Value::Null, "{layer}");
+    }
+}
+
+#[tokio::test]
+async fn proposal_naming_unknown_app_is_rejected() {
+    let f = fixture(true).await;
+    let app = f.browser.clone().router();
+    let text = RULES.replace("[layers.source]\n", "[layers.source]\napp='ghost'\n");
+    fs::write(f.rules_path(), format!("{text}{EXCEPTION}")).unwrap();
+    let inventory = f.inventory(&app).await;
+    let layers = inventory["layers"].as_array().unwrap();
+    assert!(
+        layers
+            .iter()
+            .any(|l| l["name"] == "source" && l["app"] == "ghost")
+    );
+    let hash = &inventory["rulesFile"]["contentHash"];
+    let original = fs::read(f.rules_path()).unwrap();
+    let body = f.body(hash, edit("Still reviewed"));
+    let (status, _, error) = call(&app, "POST", &f.route("/preview"), Some(&body)).await;
+    assert_rejected(status, &error);
+    assert_eq!(error["error"]["code"], "invalid_rules", "{error}");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ghost"),
+        "{error}"
+    );
+    assert_eq!(fs::read(f.rules_path()).unwrap(), original);
 }
 
 #[tokio::test]

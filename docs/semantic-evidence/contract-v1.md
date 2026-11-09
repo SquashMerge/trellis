@@ -418,6 +418,42 @@ Other binding sites without a measured declaration remain candidates, but cannot
 
 **Status: owner-ratified 2026-11-08 ([#801](https://github.com/SquashMerge/trellis/issues/801), option A).** A measured call or control region is owned by its innermost **executable container**: the nearest enclosing declaration of kind `module`, `namespace`, `type`, `implementation`, `function`, `method`, `constructor` or `anonymousFunction`. Other declarations (`field`, `variable`, `parameter`, `typeParameter`, `alias`) never own calls or control regions; an initializer runs in the enclosing executable container. A class therefore owns a call in its body outside any method: a field initializer, a member decorator call, a Python class-body statement or a Java static initializer. This is the rule production native measurement has always applied, in every language, so it changes no native identity, occurrence ID or extractor hash. The `Call.ownerSyntaxId` and `ControlRegion.ownerSyntaxId` rows, the reference ownership rule and the graph's per-owner call inspection read "owner" this way. A checker accepts any executable-container owner whose range contains the occurrence, and rejects a non-container owner and an owner with a nested executable container strictly between it and the occurrence. The rejected option B, re-attributing class-body calls to the module or function, would have changed call ordinals under their owners in every language.
 
+## Interface evidence amendment (#788)
+
+**Status: owner-ratified 2026-11-08 (#788). The owner pre-approved these four points; the supervising session verified the text stays within them.**
+
+### The evidence kind
+
+An `interfaces[]` item with `kind: "http"` is an interface: it records the HTTP evidence between one client app and one server app. Its fields are:
+
+- the client and server apps;
+- `method`;
+- `pathTemplate`;
+- the handler: its `syntaxId`, its location, and `handler.kind`, which is `declaration`, `closure` or `dispatchArm`;
+- the call sites, each with a `callId` and a `caller`; each pairing of a client path with a server route is a match;
+- `serverOnly` and `clientOnly`, which mark a route with no matched call site and a call site with no matched route.
+
+Extraction details (route recognition, handler identity, segment matching rules, exclusions and the wrapper list) are specified in architecture-view.md, not here.
+
+### Matching
+
+A client path is matched against server route templates. Server templates come from axum route literals plus dispatch tables. Client paths come from configured wrappers plus a prefix rule.
+
+### Confidence
+
+Each match carries a `confidence`, and so does each `clientOnly` item, which is always `unresolved`. Every match gets exactly one of four values, each with exactly one meaning. The values are decided in the order below, and that order is the precedence:
+
+| Order | Value | Meaning |
+|---|---|---|
+| 1 | `wrapperInferred` | the match needed a known client wrapper's prefix to build the path |
+| 2 | `template` | otherwise, the match used a client path substitution, a server path parameter or tail, or a dispatch-table route |
+| 3 | `exact` | otherwise, a literal client path equals a literal server route |
+| 4 | `unresolved` | a client call whose path matched no server route |
+
+### Evidence, never proof
+
+Interface evidence is never worded "A calls B", and it is never an input to `$layers` verdicts.
+
 ## Owner-ratified native-v9 correction: Java varargs
 
 **Status: owner-ratified 2026-10-24 (#279).** This narrow Java measurement ruling is approved independently; the #279 capability and reference amendments above are also ratified by the owner, 2026-10-24.

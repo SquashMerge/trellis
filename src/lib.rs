@@ -1,3 +1,4 @@
+pub(crate) mod apps;
 pub mod architecture_details;
 pub mod auth;
 pub mod behavior;
@@ -34,6 +35,7 @@ mod indexer_projection_vectors_tests;
 mod indexer_python;
 mod indexer_rust;
 mod indexer_ts;
+pub(crate) mod interfaces;
 #[cfg(test)]
 mod language_set_tests;
 pub mod mcp;

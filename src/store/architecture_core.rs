@@ -131,6 +131,11 @@ pub(crate) struct ArchitectureCore {
     rules: Option<RulesPart>,
     /// `None` when this core was computed for one read that has no use for metrics.
     metrics: Option<Result<ArchitectureMetrics, CoreFailure>>,
+    /// Every build manifest's app-detection outcome, before any rules file hides some.
+    app_candidates: Result<crate::apps::Candidates, CoreFailure>,
+    /// Server routes and client calls, computed only for a checkout with two or more apps.
+    /// `None` when this core was computed without a rules file.
+    interfaces: Option<Result<crate::interfaces::Extraction, CoreFailure>>,
     /// Finished summaries; one per valid role, aggregate and workbench choice.
     summaries: Mutex<BTreeMap<SummaryKey, Arc<serde_json::Value>>>,
 }
@@ -157,6 +162,15 @@ impl ArchitectureCore {
         match &self.metrics {
             Some(metrics) => metrics.as_ref().map_err(CoreFailure::error),
             None => anyhow::bail!("store_unavailable: architecture metrics part"),
+        }
+    }
+    pub(crate) fn app_candidates(&self) -> Result<&crate::apps::Candidates> {
+        self.app_candidates.as_ref().map_err(CoreFailure::error)
+    }
+    pub(crate) fn interfaces(&self) -> Result<&crate::interfaces::Extraction> {
+        match &self.interfaces {
+            Some(interfaces) => interfaces.as_ref().map_err(CoreFailure::error),
+            None => anyhow::bail!("store_unavailable: architecture interfaces part"),
         }
     }
     /// Metrics rows for a read that can compute its own if this core failed them.
@@ -282,15 +296,52 @@ impl ArchitectureCore {
         } else {
             None
         };
+        let app_candidates = kept(crate::rules::app_candidates(&snapshot, check))?;
+        let interfaces = match (config, &app_candidates) {
+            (None, _) => None,
+            (Some(_), Ok(candidates)) if detected_apps(candidates) >= 2 => {
+                let mut work =
+                    crate::references::work::Work::new(crate::references::work::rules_limit(
+                        snapshot.documents.len(),
+                        crate::references::work::snapshot_bytes(&snapshot, check)?,
+                    ));
+                Some(kept(crate::interfaces::extract(
+                    &snapshot, &mut work, check,
+                ))?)
+            }
+            (Some(_), Ok(_)) => Some(Ok(crate::interfaces::Extraction::default())),
+            // Failed app detection is the part's failure too, never an empty extraction.
+            (Some(_), Err(failure)) => Some(Err(failure.clone())),
+        };
         check()?;
         Ok(Self {
             pin: snapshot.pin,
             references,
             rules,
             metrics,
+            app_candidates,
+            interfaces,
             summaries: Mutex::default(),
         })
     }
+}
+
+/// A part's outcome: a repeating failure is kept as the part's result, any other is returned.
+fn kept<T>(outcome: Result<T>) -> Result<std::result::Result<T, CoreFailure>> {
+    match outcome {
+        Ok(value) => Ok(Ok(value)),
+        Err(error) if CoreFailure::repeats(&error) => Ok(Err(CoreFailure::of(&error))),
+        Err(error) => Err(error),
+    }
+}
+
+/// How many manifests detect an app.
+fn detected_apps(candidates: &crate::apps::Candidates) -> usize {
+    candidates
+        .manifests
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, crate::apps::Outcome::App(_)))
+        .count()
 }
 
 /// Metrics of the documents already read, in parallel. Each measured document advances
@@ -371,4 +422,25 @@ fn measure_documents(
     }
     progress.check()?;
     Ok(documents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repeating_part_error_is_kept_and_answered_again_and_any_other_is_returned() {
+        let repeats = anyhow::anyhow!("bounded_work: interface extraction budget");
+        let failure = kept::<u8>(Err(repeats)).unwrap().unwrap_err();
+        assert_eq!(
+            failure.error().to_string(),
+            "bounded_work: interface extraction budget"
+        );
+        assert_eq!(failure.error().to_string(), failure.error().to_string());
+        assert_eq!(kept(Ok(7)).unwrap().unwrap(), 7);
+        for other in ["cancelled", "storage_busy: waiting"] {
+            let error = kept::<u8>(Err(anyhow::anyhow!(other))).unwrap_err();
+            assert_eq!(error.to_string(), other);
+        }
+    }
 }

@@ -1,0 +1,285 @@
+use super::*;
+use crate::apps::Outcome;
+use crate::indexer::{IndexOptions, index_workspace_bundle};
+use std::{fs, sync::atomic::AtomicBool};
+
+fn write(root: &std::path::Path, path: &str, text: &str) {
+    let path = root.join(path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, text).unwrap();
+}
+
+/// A checkout with a root workspace, a member, and nested and non-member manifests.
+fn published(root_package_json: bool) -> (tempfile::TempDir, tempfile::TempDir, Store) {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    write(dir, "Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+    write(
+        dir,
+        "crates/alpha/Cargo.toml",
+        "[package]\nname = \"alpha\"\n",
+    );
+    write(dir, "crates/alpha/src/main.rs", SERVER);
+    write(dir, "tools/loose/Cargo.toml", "this is not toml [\n");
+    write(dir, "tools/loose/src/lib.rs", "pub fn f() {}\n");
+    write(dir, "web/package.json", "{\"name\":\"web-app\"}\n");
+    write(dir, "web/app.js", CLIENT);
+    if root_package_json {
+        write(dir, "package.json", "{\"name\":\"root\"}\n");
+    }
+    write(dir, "a.js", "function a() {}\n");
+    let store = publish(&state, dir);
+    (state, root, store)
+}
+
+fn publish(state: &tempfile::TempDir, dir: &std::path::Path) -> Store {
+    let store = crate::testing::retry_admission(|| Store::open_for_tests(state.path(), dir));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(dir.into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.writer().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    store
+}
+
+const SERVER: &str = "async fn h() {}\nfn router() -> Router {\n    Router::new().route(\"/health\", get(h))\n}\nfn main() {}\n";
+const CLIENT: &str =
+    "async function app(api) {\n  await api(\"/health\");\n  await api(\"/missing\");\n}\n";
+
+/// A checkout with one app only, so that interfaces have nothing to relate.
+fn published_single_app() -> (tempfile::TempDir, tempfile::TempDir, Store) {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "web/package.json", "{\"name\":\"web-app\"}\n");
+    write(root.path(), "web/app.js", CLIENT);
+    write(root.path(), "src/lib.rs", SERVER);
+    let store = publish(&state, root.path());
+    (state, root, store)
+}
+
+fn core_with_rules(store: &Store) -> Result<ArchitectureCore> {
+    let config = crate::rules::parse("version = 1\n").unwrap();
+    let response = store.evidence_response()?;
+    let pin = response.selected_pin(None)?;
+    response.architecture_core_at(
+        pin,
+        Some(&config),
+        false,
+        &mut || Ok(()),
+        &|_: ArchitectureProgress| {},
+    )
+}
+
+fn core(store: &Store) -> Result<ArchitectureCore> {
+    let response = store.evidence_response()?;
+    let pin = response.selected_pin(None)?;
+    response.architecture_core_at(
+        pin,
+        None,
+        false,
+        &mut || Ok(()),
+        &|_: ArchitectureProgress| {},
+    )
+}
+
+#[test]
+fn nested_manifests_reach_core_app_candidates_with_their_outcomes() {
+    let (_state, _root, store) = published(true);
+    let core = core(&store).unwrap();
+    let found = core.app_candidates().unwrap();
+    let outcomes: BTreeMap<&str, &Outcome> = found
+        .manifests
+        .iter()
+        .map(|(path, outcome)| (path.as_str(), outcome))
+        .collect();
+    let Outcome::App(member) = outcomes["crates/alpha/Cargo.toml"] else {
+        panic!("{outcomes:?}");
+    };
+    assert_eq!(
+        (member.name.as_str(), member.root.as_str()),
+        ("alpha", "crates/alpha")
+    );
+    let Outcome::App(web) = outcomes["web/package.json"] else {
+        panic!("{outcomes:?}");
+    };
+    assert_eq!(web.name, "web-app");
+    assert!(matches!(outcomes["package.json"], Outcome::App(_)));
+    assert_eq!(outcomes["Cargo.toml"], &Outcome::NotApp);
+    // Not a workspace member: never parsed, so its malformed bytes are not `Unread`.
+    assert_eq!(outcomes["tools/loose/Cargo.toml"], &Outcome::NotApp);
+}
+
+#[test]
+fn an_absent_root_package_json_is_not_an_app() {
+    let (_state, _root, store) = published(false);
+    let core = core(&store).unwrap();
+    let found = core.app_candidates().unwrap();
+    let root = found
+        .manifests
+        .iter()
+        .find(|(path, _)| path == "package.json")
+        .unwrap();
+    assert_eq!(root.1, Outcome::NotApp);
+}
+
+#[test]
+fn a_corrupt_retained_nested_entry_is_a_typed_selected_integrity_failure() {
+    let (_state, _root, store) = published(true);
+    let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+    let retained: String = db
+        .query_row("SELECT retained_config FROM native_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut entries: Vec<serde_json::Value> = serde_json::from_str(&retained).unwrap();
+    let entry = entries
+        .iter_mut()
+        .find(|entry| entry["path"] == "web/package.json")
+        .expect("nested manifest is retained");
+    entry["byteLength"] = serde_json::json!(1);
+    db.execute(
+        "UPDATE native_revisions SET retained_config=?1",
+        [serde_json::to_string(&entries).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let error = core(&store).err().expect("corrupt entry fails the read");
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<SelectedIntegrity>().is_some()),
+        "{error:#}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("corrupt retained web/package.json length"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn a_duplicated_retained_nested_manifest_is_a_typed_selected_integrity_failure() {
+    let (_state, _root, store) = published(true);
+    let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+    let retained: String = db
+        .query_row("SELECT retained_config FROM native_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut entries: Vec<serde_json::Value> = serde_json::from_str(&retained).unwrap();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["path"] == "web/package.json")
+        .expect("nested manifest is retained")
+        .clone();
+    entries.push(entry);
+    db.execute(
+        "UPDATE native_revisions SET retained_config=?1",
+        [serde_json::to_string(&entries).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let error = core(&store).err().expect("duplicate entry fails the read");
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<SelectedIntegrity>().is_some()),
+        "{error:#}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("incompatible_index: duplicate retained nested manifest"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn two_apps_extract_routes_and_match_their_client_calls() {
+    let (_state, _root, store) = published(false);
+    let core = core_with_rules(&store).unwrap();
+    let found = core.interfaces().unwrap();
+    let routes: Vec<&str> = found
+        .routes
+        .iter()
+        .map(|route| route.path_template.as_str())
+        .collect();
+    assert_eq!(routes, ["/health"]);
+    let paths: Vec<_> = found
+        .calls
+        .iter()
+        .map(|call| call.path_template.as_deref())
+        .collect();
+    assert_eq!(paths, [Some("/health"), Some("/missing")]);
+    assert_eq!(
+        found.matched[0].map(|m| m.confidence),
+        Some(crate::interfaces::Confidence::Exact)
+    );
+    assert!(found.matched[1].is_none());
+}
+
+#[test]
+fn one_app_has_empty_interfaces_without_extracting() {
+    let (_state, _root, store) = published_single_app();
+    let core = core_with_rules(&store).unwrap();
+    let found = core.interfaces().unwrap();
+    assert!(found.routes.is_empty() && found.calls.is_empty() && found.matched.is_empty());
+}
+
+#[test]
+fn a_core_without_rules_has_no_interfaces_part() {
+    let (_state, _root, store) = published(false);
+    let error = core(&store).unwrap().interfaces().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("store_unavailable: architecture interfaces part"),
+        "{error:#}"
+    );
+}
+
+/// App detection that exhausts its work budget fails the interfaces part with the same
+/// typed failure; it is never a successful, empty extraction (#843 review).
+#[test]
+fn failed_app_detection_fails_the_interfaces_part() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    write(dir, "Cargo.toml", "[package]\nname = \"srv\"\n");
+    write(dir, "src/main.rs", SERVER);
+    let manifest = format!(
+        "{{\"name\":\"web-app\",\"padding\":\"{}\"}}",
+        "x".repeat(8_000_000)
+    );
+    write(dir, "web/package.json", &manifest);
+    write(dir, "web/app.js", CLIENT);
+    let store = publish(&state, dir);
+    let core = core_with_rules(&store).unwrap();
+    let candidates = core.app_candidates().expect_err("detection fails");
+    assert_eq!(
+        candidates.to_string(),
+        "bounded_work: app manifest parsing",
+        "{candidates:#}"
+    );
+    let interfaces = core.interfaces().err().expect("interfaces part fails");
+    assert_eq!(
+        interfaces.to_string(),
+        "bounded_work: app manifest parsing",
+        "{interfaces:#}"
+    );
+}

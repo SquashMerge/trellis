@@ -277,6 +277,14 @@
       chrome.back.focus();
       return reading;
     }
+    // Opens on one layer pair's chip with nothing selected and Calls only off. An already open tree
+    // just switches filter. A new tree reads under the state set here, so the chip applies once loaded.
+    function openEdge(sourceLayer, destinationLayer, next) {
+      if (!deps.current()) return;
+      Object.assign(state(), {chip:edgeKey(sourceLayer, destinationLayer), callsOnly:false, selected:null});
+      if (!opened || !base) return open(next);
+      hiddenNotice = false; refilter(); deps.overview(); render();
+    }
     function reset(keepReopen = false) {
       if (!keepReopen) pending = null;
       ticket++; opened = false; showHidden(); lineActive = null;
@@ -589,7 +597,7 @@
       if (exception) target.append(button(exception), make("p", model.exceptionNote(i.referenceCount, i.target.path, i.destination.path), "detail"));
     }
 
-    return {open, close, reset, reopenAfterRefresh, afterRefresh, snapshot, restore, isOpen:() => opened};
+    return {open, openEdge, close, reset, reopenAfterRefresh, afterRefresh, snapshot, restore, isOpen:() => opened};
   }
 
   window.TrellisDeviations = Object.freeze({create, model});

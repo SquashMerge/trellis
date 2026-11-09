@@ -493,7 +493,7 @@ unchanged, as are the CLI and the browser.
 [Amendment (#770)](#amendment-770-a-bounded-prompt-reference-view) is unchanged except
 what this section adds.
 
-- **`payload.apps`** lists the detected apps: `{name, kind:"cargo"|"npm", manifest, roots,
+- **`payload.apps`** lists the detected apps: `{name, kind:"cargo"|"npm"|"python" (python added by owner ruling 2026-11-08), manifest, roots,
   entries}`, ordered by manifest path. It is untrusted repository data, like the rest of
   the payload.
   - The prompt detects apps against the current rules bytes, so a manifest that a hidden
@@ -620,6 +620,19 @@ changes, only the order of rows within two arrays. This section wins over the #7
 - **Unchanged.** Root identity checks at admission and at the send decision (each root's captured Git common directory must still be the one it had at selection), one checkout per result, attachment for the session's lifetime, the `not_absolute`, `not_checkout`, `identity_changed` and `unavailable` reasons, and Decision 0009 checkout capacity (`checkout_capacity`).
 - **Removed.** `different_repository` leaves the `workspace_selection_failed` reason enum of every tool's output schema. There is no compatibility shim.
 - **Catalog.** Removing the enum value from the twelve output schemas shrinks the compact catalog by 276 bytes; the modern `tools/list` frame is 243,382 bytes (243,658 at `toolVersion` 18) against the 245,760-byte named headroom limit.
+
+## Amendment (#784): per-app counts in rules check
+
+**Status: proposed (owner-delegated, run 803).** `toolVersion` is **20** (previously 19, #839). Detection and the counting rule are in [rules.md implementation notes (#784)](rules.md#implementation-notes-784). This section wins over the #129 description of the check payload where they differ.
+
+- **`trellis_rules_check`** data gains two required fields, whole on every page like `counts`:
+  - `apps`: `[{name:Text,manifest:Path,counts:RuleCounts}]`, one entry per detected manifest in manifest-path order. Apps that share a name each keep their own entry. An entry carries no `kind`, roots or entries; those are in the proposal prompt's `payload.apps` and the browser summary. App kinds are `cargo`, `npm` and `python`; Python detection arrives separately in [#807](https://github.com/SquashMerge/trellis/issues/807).
+  - `noApp`: `{counts:RuleCounts}`.
+- **Counts** cover production instances, field by field, so `Σ apps[].counts + noApp.counts = counts`. A `cross_app` instance is `unknown` and counts under `noApp`. With no detected app, `apps` is `[]` and `noApp` holds every count.
+- **`trellis_rules_explain`** does not carry `apps` or `noApp`; its schema and output are unchanged.
+- **Single-app output.** With exactly one detected app, `apps[0].counts` equals `rules.counts` only when no row's own file is unassigned and outside the app's root. Such rows count under `noApp`. So a single-app checkout whose app root is a subdirectory, and which has unassigned files outside that root, reports part of its CLI and MCP per-app output under `noApp`.
+- **Limitation.** When manifests are unread, `limitations` gains the one-line unread-manifest entry described in rules.md.
+- **Unchanged:** paging, `omittedEvidence`, `nextCall`, every bound, the check input, and the `trellis_propose_layers` payload of [Amendment (#783)](#amendment-783-per-app-layers-in-the-proposal-prompt). `trellis rules check --format json` prints the same two fields and its exit rule is unchanged.
 
 ## Tool catalog
 
@@ -956,7 +969,8 @@ UInt) that fit in the 24,576-byte page target (#528; a lone larger item still fi
 `page:{offset,nextOffset,total}` continues it: call again with the same arguments,
 `expectedBasis` and `offset:nextOffset`, until `nextOffset` is null. `total` counts
 every item. Every page carries the whole result's `counts`, `testCounts`,
-`unassignedFileCount`, `limitations`, `rulesFile` and pin. The pages concatenate, in order, to the complete
+`unassignedFileCount`, `limitations`, `rulesFile` and pin. Check also carries the whole
+result's `apps` and `noApp` ([Amendment (#784)](#amendment-784-per-app-counts-in-rules-check)). The pages concatenate, in order, to the complete
 selected result, and closures such as module and external-package descriptors hold
 across the sequence, not within each page. An `offset` past `total` fails
 `range_too_large`. Only an item that cannot fit even alone still fails atomically

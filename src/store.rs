@@ -1911,6 +1911,15 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<serde_json::Value> {
         let references = core.references(&parsed.paths, parsed.sample_limit, check)?;
+        let apps = if kind == "prompt" {
+            Some(crate::rules::prompt_apps(
+                config,
+                core.app_candidates()?,
+                check,
+            )?)
+        } else {
+            None
+        };
         let mut evaluate =
             |config: &crate::rules::Config,
              references: &crate::references::Projection,
@@ -1925,7 +1934,7 @@ impl EvidenceResponse {
                 )?
                 .data)
             };
-        Self::architecture_payload(
+        let mut payload = Self::architecture_payload(
             kind,
             arguments,
             config,
@@ -1933,7 +1942,11 @@ impl EvidenceResponse {
             core.pin,
             &mut evaluate,
             check,
-        )
+        )?;
+        if let Some(apps) = apps {
+            payload["apps"] = serde_json::Value::Array(apps);
+        }
+        Ok(payload)
     }
 
     /// One path-scoped operation computed from its own scope, under the budgets of that
@@ -1951,6 +1964,12 @@ impl EvidenceResponse {
             .map_err(|error| self.store.report_index_failure(error))?;
         let references =
             crate::references::project(&snapshot, &parsed.paths, parsed.sample_limit, check)?;
+        let apps = if kind == "prompt" {
+            let candidates = crate::rules::app_candidates(&snapshot, check)?;
+            Some(crate::rules::prompt_apps(config, &candidates, check)?)
+        } else {
+            None
+        };
         let mut evaluate =
             |config: &crate::rules::Config,
              references: &crate::references::Projection,
@@ -1958,7 +1977,7 @@ impl EvidenceResponse {
                 let mut check = || check();
                 crate::rules::evaluate(config, &snapshot, references, &parsed.paths, &mut check)
             };
-        Self::architecture_payload(
+        let mut payload = Self::architecture_payload(
             kind,
             arguments,
             config,
@@ -1966,7 +1985,11 @@ impl EvidenceResponse {
             snapshot.pin,
             &mut evaluate,
             check,
-        )
+        )?;
+        if let Some(apps) = apps {
+            payload["apps"] = serde_json::Value::Array(apps);
+        }
+        Ok(payload)
     }
 
     /// One operation's answer from its references and its way of evaluating the rules.
@@ -2061,7 +2084,8 @@ impl EvidenceResponse {
             "exceptionCount": config.map(crate::rules::Config::exception_count),
             "aggregate": options.aggregate, "metricsVersion": "metrics:v1",
             "role": options.role, "workbench": options.workbench, "evidenceTier": "syntax", "semanticComplete": false,
-            "layers": layers, "modules": [], "edges": [], "references": null, "rules": null
+            "layers": layers, "modules": [], "edges": [], "references": null, "rules": null,
+            "apps": [], "noApp": null, "interfaces": []
         });
         Ok(if payload["state"] == "ready" {
             ArchitectureView::Ready {
@@ -2101,6 +2125,16 @@ impl EvidenceResponse {
         let references_coverage = &references.coverage;
         let rules = evaluated.data;
         let assignments = evaluated.layers;
+        let base = core.rules(config)?;
+        let scope = crate::rules::AppScope::new(config, base.apps());
+        let no_app_counts = rules["noApp"]["counts"].clone();
+        let app_rules = rules["apps"]
+            .as_array()
+            .context("store_unavailable: per-app counts")?;
+        ensure!(
+            app_rules.len() == base.apps().len(),
+            "store_unavailable: per-app counts"
+        );
         let metrics = self.metrics_at_with_config(
             &MetricsOptions {
                 pin: Some(core.pin),
@@ -2129,6 +2163,8 @@ impl EvidenceResponse {
             })
             .collect();
         let mut modules = Vec::new();
+        let mut app_files = vec![(0usize, 0usize, BTreeSet::new()); base.apps().len()];
+        let mut unassigned_files = 0usize;
         for module in &references.modules {
             check()?;
             let target = &module["identity"];
@@ -2152,6 +2188,18 @@ impl EvidenceResponse {
                     .get(key.2)
                     .context("store_unavailable: architecture layer assignment absent")?
             );
+            let layer = assignments.get(key.2).copied().flatten();
+            let app = scope.file(key.2, layer);
+            row["app"] = serde_json::json!(app.and_then(|index| scope.name(index)));
+            match app {
+                Some(index) => {
+                    let entry = &mut app_files[index];
+                    entry.0 += 1;
+                    entry.1 += usize::from(layer.is_none());
+                    entry.2.insert(key.1);
+                }
+                None => unassigned_files += usize::from(layer.is_none()),
+            }
             row["physicalLines"] = serde_json::json!(file.physical_lines);
             row["declarationCount"] = serde_json::json!(file.declaration_count);
             row["roleCounts"] = serde_json::json!(file.role_counts);
@@ -2195,6 +2243,12 @@ impl EvidenceResponse {
                     continue;
                 };
                 if source == destination {
+                    continue;
+                }
+                if verdict["unresolved"]
+                    .as_array()
+                    .is_some_and(|reasons| reasons.iter().any(|reason| reason == "cross_app"))
+                {
                     continue;
                 }
                 let status = verdict["status"]
@@ -2294,6 +2348,29 @@ impl EvidenceResponse {
                 })
                 .collect::<Vec<_>>()
         );
+        let apps: Vec<_> = base
+            .apps()
+            .iter()
+            .zip(app_rules)
+            .zip(&app_files)
+            .map(|((app, counted), (file_count, unassigned, languages))| {
+                serde_json::json!({
+                    "name": app.name, "kind": app.kind, "manifest": app.manifest,
+                    "roots": [app.root], "entries": app.entries,
+                    "languages": crate::semantic_evidence::LANGUAGE_ORDER
+                        .iter()
+                        .filter(|language| languages.contains(**language))
+                        .collect::<Vec<_>>(),
+                    "fileCount": file_count, "source": "manifest",
+                    "counts": counted["counts"], "unassignedFileCount": unassigned
+                })
+            })
+            .collect();
+        let no_app = serde_json::json!({
+            "counts": no_app_counts, "unassignedFileCount": unassigned_files
+        });
+        let interfaces =
+            crate::interfaces::project(core.interfaces()?, &scope, &assignments, check)?.summary();
         drop(assignments);
         for value in [&mut references, &mut rules] {
             value["indexGeneration"] = serde_json::json!(core.pin.index_generation.to_string());
@@ -2303,6 +2380,9 @@ impl EvidenceResponse {
         payload["edges"] = serde_json::json!(summaries.into_values().collect::<Vec<_>>());
         payload["references"] = references;
         payload["rules"] = rules;
+        payload["apps"] = serde_json::json!(apps);
+        payload["noApp"] = no_app;
+        payload["interfaces"] = serde_json::json!(interfaces);
         check()?;
         Ok(core.remember_summary(key, payload))
     }
@@ -2352,12 +2432,26 @@ impl EvidenceResponse {
         let references = core.references(&[], 5, check)?;
         let evaluated =
             crate::rules::evaluate_prepared(config, core.rules(config)?, &references, &[], check)?;
-        let layers = crate::architecture_details::Layers::new(&evaluated.layers, &evaluated.data);
+        let layers =
+            crate::architecture_details::Layers::new(&evaluated.layers, &evaluated.data).with_apps(
+                crate::rules::AppScope::new(config, core.rules(config)?.apps()),
+            );
+        let interfaces = if query.kind == crate::architecture_details::Kind::Interfaces {
+            Some(crate::interfaces::project(
+                core.interfaces()?,
+                &crate::rules::AppScope::new(config, core.rules(config)?.apps()),
+                &evaluated.layers,
+                check,
+            )?)
+        } else {
+            None
+        };
         let page = crate::architecture_details::page(
             query,
             &references.data,
             &evaluated.data,
             &layers,
+            interfaces.as_ref(),
             check,
         )?;
         check()?;
@@ -2707,7 +2801,10 @@ impl EvidenceResponse {
                 continue;
             };
             let path = path.as_ref();
-            if !matches!(path, "tsconfig.json" | "jsconfig.json") {
+            // Present nested manifests feed app detection (#784); other consumers ignore
+            // them, as they do every path that is not a root input.
+            let nested = path.ends_with("/package.json") || path.ends_with("/Cargo.toml");
+            if !nested && !matches!(path, "tsconfig.json" | "jsconfig.json") {
                 continue;
             }
             let (bytes, byte_length) = match (kind.as_deref(), bytes, byte_length) {
@@ -2738,6 +2835,27 @@ impl EvidenceResponse {
             let bytes = hex::decode(bytes.as_ref()).context(SelectedIntegrity(format!(
                 "incompatible_index: corrupt retained {path} bytes"
             )))?;
+            if nested {
+                use sha2::{Digest, Sha256};
+                let content_hash = hex::encode(Sha256::digest(&bytes));
+                selected_ensure!(
+                    manifests
+                        .insert(
+                            path.to_owned(),
+                            crate::references::external::ManifestInput {
+                                source_set_id: source_set_id.clone(),
+                                native_revision_id: native_revision_id.clone(),
+                                dependency_hash: dependency_hash.clone(),
+                                path: path.into(),
+                                bytes: Some(bytes),
+                                content_hash: Some(content_hash),
+                            },
+                        )
+                        .is_none(),
+                    "incompatible_index: duplicate retained nested manifest"
+                );
+                continue;
+            }
             root_tsconfig = Some(crate::references::tsconfig::RootTsconfigInput {
                 source_set_id: source_set_id.clone(),
                 path: path.to_owned(),
@@ -4953,6 +5071,8 @@ pub fn terminal_status_sqlite_contention(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod admit_once_tests;
+#[cfg(test)]
+mod architecture_apps_tests;
 #[cfg(test)]
 mod published_admission_tests;
 #[cfg(test)]

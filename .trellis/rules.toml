@@ -7,10 +7,18 @@ peers = "forbid"
 shared_outbound = "forbid"
 
 [layers.web]
+app = "trellis-web"
 order = 1
 paths = ["web/**"]
 
+[layers.web-tests]
+app = "trellis-web"
+display = "hidden"
+order = 0
+paths = ["tests/browser/**"]
+
 [layers.entry]
+app = "trellis"
 order = 2
 paths = [
   "src/main.rs", "src/auth.rs", "src/http.rs", "src/http/**",
@@ -18,6 +26,7 @@ paths = [
 ]
 
 [layers.query]
+app = "trellis"
 order = 3
 paths = [
   "src/navigation.rs", "src/classes.rs", "src/class_diagram.rs",
@@ -30,9 +39,11 @@ paths = [
   "src/search_model.rs", "src/search_rank.rs",
   "src/architecture_details.rs", "src/behavior_incidental.rs", "src/classes/**",
   "src/graph_query.rs", "src/rules/**", "src/rules_edit.rs", "src/behavior_columns.rs",
+  "src/apps.rs", "src/interfaces.rs", "src/interfaces/**",
 ]
 
 [layers.indexing]
+app = "trellis"
 order = 4
 paths = [
   "src/indexer.rs", "src/indexer_java.rs", "src/indexer_python.rs", "src/indexer_rust.rs",
@@ -46,10 +57,12 @@ paths = [
 ]
 
 [layers.storage]
+app = "trellis"
 order = 5
 paths = ["src/store.rs", "src/store/**", "src/search_vectors.rs"]
 
 [layers.shared]
+apps = ["trellis"]
 shared = true
 paths = [
   "src/model.rs", "src/testing.rs", "src/native_ids.rs", "src/scip_raw.rs", "src/files_view.rs", "src/parallel.rs", "src/build_info.rs", "src/search_lexical.rs",
@@ -58,6 +71,7 @@ paths = [
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.
 [layers.tooling]
+app = "trellis"
 display = "hidden"
 order = 1
 paths = [
@@ -66,10 +80,18 @@ paths = [
   "tools/metrics-oracle/**", "tools/metrics-bench/**", "tools/semantic-search/**",
   "tools/synthetic-cohorts/generate.mjs", "tools/synthetic-cohorts/test/**",
   "docs/semantic-evidence/check-policy.mjs", "docs/semantic-evidence/id-test-vectors/**",
-  "build.rs", "build/**", "examples/**",
+  "build.rs", "build/**", "examples/**", "herdr-mod/**",
 ]
 
 # Captured sample programs are inputs, not Trellis runtime implementations.
 [layers.fixture-inputs]
+app = "trellis"
+display = "hidden"
 order = 0
 paths = ["tests/fixtures/**", "tools/synthetic-cohorts/templates/**"]
+
+[layers.mcp-tests]
+app = "trellis"
+display = "hidden"
+order = 1
+paths = ["tests/mcp/**"]

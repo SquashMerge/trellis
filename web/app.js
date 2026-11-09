@@ -2079,7 +2079,10 @@ const compactDirectoryDepth = 32;
 const revisionReads = new Map();
 let revisionReadsKey = null;
 let architectureRulesHash = null;
-function clearRevisionReads() { revisionReads.clear(); revisionReadsKey = null; architectureRulesHash = null; }
+// Advances whenever the cached reads are dropped, so Architecture can tell a held snapshot from one
+// the rules have since moved past (#789).
+let rulesEpoch = 0;
+function clearRevisionReads() { revisionReads.clear(); revisionReadsKey = null; architectureRulesHash = null; rulesEpoch++; }
 async function revisionRead(path, current = () => true) {
   const route = path.split("?", 1)[0];
   if (!["/api/architecture", "/api/metrics"].includes(route) || !status?.revision) return api(path, "GET", undefined, current);
@@ -2132,7 +2135,7 @@ const architecture = window.TrellisArchitecture?.create({
       throw error;
     } finally { if (method === "POST" && route.startsWith("/api/architecture/rules/")) clearRevisionReads(); }
   },
-  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
+  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, rulesEpoch}),
   readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
   openSequence: (caller, sites, pin, saved, active) => perform(() => openArchitectureSequence(caller, sites, pin, saved, active)),
   onConflict: () => unexpectedPair("Architecture snapshot changed. Refresh status before reopening Architecture."),
@@ -2152,8 +2155,9 @@ window.TrellisShell?.setViewCallback?.(name => {
     if (navigationEntries.get(window.history?.state?.trellisNavigation)?.kind === "class") window.TrellisClasses?.reset();
   }
   architecture?.clearInspection(); treemap?.clearInspection();
-  if (name === "architecture" && section === "diagrams") void architecture?.refresh();
-  else architecture?.reset();
+  // Reopening the tab redraws the held snapshot unless its basis changed; leaving keeps it (#789).
+  if (name === "architecture" && section === "diagrams") void architecture?.reopen();
+  else architecture?.suspend();
   if (name === "treemap" && section === "diagrams") void treemap?.refresh();
   else treemap?.reset();
 });
