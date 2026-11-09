@@ -9,6 +9,8 @@
 // - Architecture: the layer stack, with the layer list and counts as native rows;
 // - Sequence: a method's static call sequence, with its steps as native rows.
 // Both follow the file the `trellis-files` panel selects (shared "trellis.selectedFile").
+// An agent's `trellis_show` (#818), carried by each status poll as `viewRequest`, takes an
+// unpinned pane to that Sequence, with a "Shown by agent" note and Back.
 //
 // Props (all optional): { url: "http://127.0.0.1:8877", tokenFile: "~/.config/trellis/serve.token",
 // checkout: "<root key>", machine: "<Herdr machine>", transport: "exec" }.
@@ -17,7 +19,7 @@ import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { appHome, focused, layout, machines, props, setShared, shared, spaces, theme } from "herdr";
 import * as fs from "fs/promises";
-import { TrellisError, architecturePayload, createClient, indexLabel, pinOf, samePin, validRootKey } from "./client.js";
+import { TrellisError, architecturePayload, createClient, indexLabel, pinLabel, pinOf, samePin, validRootKey } from "./client.js";
 import { draw, heat, hit, plural, display } from "./diagram.js";
 import { drawSequence, helpers as sequenceHelpers, targetOf } from "./sequence.js";
 import { ensureFilesPanel } from "./panels.js";
@@ -127,6 +129,8 @@ export default class Trellis extends View {
   select(rootKey, cx) {
     if (rootKey === this.rootKey) return;
     this.rootKey = rootKey; this.status = null; this.statusError = null; this.view = null; this.viewError = null; this.building = null;
+    // A new checkout starts a new baseline of agent shows (#818).
+    this.showSeen = null; this.shown = null;
     this.open = new Map(); this.tried = null; this.drawError = null; this.picked = null;
     this.seq = { history: [], expanded: new Set() };
     this.serial = (this.serial || 0) + 1;
@@ -185,6 +189,9 @@ export default class Trellis extends View {
   }
 
   setPinned(pinned, cx) {
+    // Pinning while an agent's Sequence is still being read stops that show: the pane goes
+    // back to what it showed before (#824).
+    if (pinned && this.shown?.back && this.seq?.agent && this.seq.loading) this.backFromShow(cx);
     this.pinned = pinned; this.pinnedSeq = this.events;
     try { localStorage.setItem("trellis.pinned", String(pinned)); } catch { /* a convenience only */ }
     // Unpinning follows the agent focused now, as if it had just been focused.
@@ -211,6 +218,7 @@ export default class Trellis extends View {
         this.statusError = null;
         if (changed || (!this.view && !this.viewError && !this.loading)) this.loadArchitecture(cx);
         if (changed) this.reloadSequence(cx);
+        this.observeShow(data?.viewRequest, cx);
       } catch (error) {
         if (!live()) return;
         // Never keep data from a checkout whose status can't be read.
@@ -220,6 +228,67 @@ export default class Trellis extends View {
         cx.notify();
       }
     });
+  }
+
+  // --- agent shows (#818) ---
+
+  // The first request seen for a checkout is a baseline; a newer generation is a show, which a
+  // pinned pane counts as seen and ignores. Only this pane's display changes, never focus.
+  observeShow(value, cx) {
+    const request = value == null ? null : viewRequestOf(value);
+    if (value != null && !request) return;
+    const generation = request?.generation ?? 0;
+    if (!this.showSeen || this.showSeen.rootKey !== this.rootKey) { this.showSeen = { rootKey: this.rootKey, generation }; return; }
+    if (generation <= this.showSeen.generation) return;
+    this.showSeen.generation = generation;
+    if (this.pinned) return;
+    this.showRequest(request, cx);
+  }
+
+  showRequest(request, cx) {
+    const back = this.shown?.back ?? null;
+    const label = request.view === "source" ? `${request.path}:${request.line}` : request.view === "class" ? "Class diagram" : "Sequence";
+    // The deep link's stale-pin rule: a target from another snapshot is not shown.
+    if (!samePin(request.revision, this.status?.pin)) {
+      this.shown = { text: `The agent showed a ${label} at index ${pinLabel(request.revision)}; this pane is at ${this.status?.pin ? pinLabel(this.status.pin) : "no index"}.`, back };
+      return;
+    }
+    if (request.view !== "sequence") {
+      this.shown = { text: `The agent showed ${label}. This pane has no ${request.view === "class" ? "Class" : "source"} view; open it in the browser.`, back };
+      return;
+    }
+    const before = back ?? { tab: this.tab, seq: this.seq };
+    const prev = this.seq;
+    this.tab = "sequence";
+    // The Files selection's method list stays; only the shown method changes.
+    this.seq = { file: prev.file, methods: prev.methods, methodsError: prev.methodsError, history: [], expanded: new Set(), agent: true };
+    this.loadSequence({ id: request.symbolId, name: null, path: null }, false, cx);
+    this.shown = { text: "Shown by agent · Sequence", back: before };
+  }
+
+  // Back returns to the tab and sequence shown before the agent's first show.
+  backFromShow(cx) {
+    const back = this.shown?.back;
+    this.shown = null;
+    if (back) {
+      this.tab = back.tab; this.seq = back.seq;
+      // The earlier drawing's file was replaced, so it is drawn again.
+      if (this.seq) this.seq.drawn = null;
+      this.seqTried = null;
+      // Never an older revision's payload under this header: read it again at this pin.
+      const data = this.seq?.data;
+      if (this.seq?.seed && !this.seq.loading && (!data || !samePin(data.revision, this.status?.pin))) this.reloadSequence(cx);
+    }
+    cx.notify();
+  }
+
+  shownBar(t) {
+    if (!this.shown) return [];
+    return [h_flex().id("agent-shown").flex_none().gap(8).items_center().px(8).py(4).rounded(6).bg(t.surface).border_1().border_color(t.border)
+      .child(div().flex_1().min_w(0).whitespace_normal().text_size(12).text_color(t.muted).child(this.shown.text))
+      .when(Boolean(this.shown.back), (el) => el.child(div().id("agent-shown-back").px(6).rounded(4).border_1().border_color(t.border).cursor_pointer()
+        .hover((st) => st.bg(t.hover)).on_click((_e, cx) => this.backFromShow(cx)).child("Back")))
+      .child(div().id("agent-shown-close").text_color(t.dim).cursor_pointer().child("×").on_click((_e, cx) => { this.shown = null; cx.notify(); }))];
   }
 
   loadArchitecture(cx) {
@@ -355,8 +424,15 @@ export default class Trellis extends View {
     this.loadMethods(cx);
   }
 
+  // A new revision reloads what the pane shows and, during an agent show, what Back returns to:
+  // a sequence is never shown under another revision's header (#824).
   reloadSequence(cx) {
-    if (!this.seq?.file) return;
+    const back = this.shown?.back?.seq;
+    if (back?.seed && back !== this.seq) this.loadSequence(back.seed, false, cx, back);
+    if (!this.seq?.file) {
+      if (this.seq?.seed) this.loadSequence(this.seq.seed, false, cx);
+      return;
+    }
     const keep = this.seq.seed;
     this.seq = { ...this.seq, methods: null, methodsError: null, data: null, error: null, drawn: null, drawError: null, keep };
     this.seqTried = null;
@@ -384,12 +460,13 @@ export default class Trellis extends View {
   }
 
   // Opens one method's sequence; `push` keeps the current one for Back (a re-center).
-  loadSequence(symbol, push, cx) {
-    const { rootKey, serial, client } = this, pin = this.status?.pin, seq = this.seq, run = {};
+  // `seq` is the shown sequence, or the one an agent show's Back returns to.
+  loadSequence(symbol, push, cx, seq = this.seq) {
+    const { rootKey, serial, client } = this, pin = this.status?.pin, run = {};
     if (push && seq.seed) seq.history = [...seq.history, seq.seed].slice(-MAX_HISTORY);
-    Object.assign(seq, { seed: { id: symbol.id, name: symbol.name, path: symbol.path }, data: null, error: null, selected: null, expanded: new Set(), loading: true, run });
+    Object.assign(seq, { seed: { id: symbol.id, name: symbol.name, path: symbol.path }, data: null, drawn: null, error: null, selected: null, expanded: new Set(), loading: true, run });
     // Only the newest sequence request of this view may set data, an error or loading.
-    const live = () => serial === this.serial && seq === this.seq && run === seq.run;
+    const live = () => serial === this.serial && (seq === this.seq || seq === this.shown?.back?.seq) && run === seq.run;
     cx.spawn(async (cx) => {
       try {
         const data = await client.sequence(rootKey, pin, symbol.id);
@@ -550,7 +627,7 @@ export default class Trellis extends View {
       .on_size_change((size, cx) => { if (Math.abs(size.width - this.width) >= 1) { this.width = size.width; cx.notify(); } })
       .child(this.header(t, cx))
       .child(v_flex().id("trellis-body").flex_1().min_h(0).overflow_y_scrollbar().p(PAD).gap(12)
-        .children(this.body(t, file, place, cx)));
+        .children([...this.shownBar(t), ...this.body(t, file, place, cx)]));
   }
 
   header(t, cx) {
@@ -708,6 +785,18 @@ export default class Trellis extends View {
       .child(div().pt(6).text_size(12).text_color(t.dim).child(
         `${mapped.toLocaleString("en-US")} of ${sites.toLocaleString("en-US")} reference sites mapped to a module${(view.references?.coverage || []).some((r) => r.unresolvedSites > 0) ? " · ≥ counts are lower bounds" : ""} · heat: cognitive, max per callable, fixed bands`));
   }
+}
+
+// A status poll's `viewRequest` (#818), or null when it isn't one this pane understands.
+function viewRequestOf(value) {
+  if (!value || typeof value !== "object" || !Number.isSafeInteger(value.generation) || value.generation < 1) return null;
+  let revision;
+  try { revision = pinOf(value.revision); } catch { return null; }
+  if ((value.view === "sequence" || value.view === "class") && typeof value.symbolId === "string" && value.symbolId)
+    return { generation: value.generation, view: value.view, symbolId: value.symbolId, revision };
+  if (value.view === "source" && typeof value.path === "string" && value.path && Number.isSafeInteger(value.line) && value.line >= 1)
+    return { generation: value.generation, view: "source", path: value.path, line: value.line, revision };
+  return null;
 }
 
 // The deepest listed checkout that holds `folder`.

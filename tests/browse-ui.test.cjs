@@ -1932,3 +1932,230 @@ test("Files zero-call preview keeps uncertainty and opens full admitted detail e
   assert.equal(opened[2],"sequence");
   assert.equal(opened[4],true,"Show all requests incidental calls as well as non-call detail");
 });
+
+// #818: an agent's trellis_show reaches this view through the status poll's viewRequest.
+const SHOW_PIN = {indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+const shown = (generation, extra = {view:"sequence", symbolId:"agent"}) => ({generation, revision:SHOW_PIN, ...extra});
+async function showHarness() {
+  const browser = historyWindow("#sequence?sid=old"), h = harness(browser), requests = [];
+  h.context.fetch = async (path, options) => { requests.push([path, options]); return response(view(JSON.parse(options.body).seed)); };
+  await h.run("readNavigationLocation()");
+  assert.equal(h.run("selectedMethod.id"), "old");
+  requests.length = 0;
+  await h.run("observeViewRequest(null)");
+  return {browser, h, requests};
+}
+
+test("a newer view request navigates an unpinned view, says so, and Back returns to the previous sequence", async () => {
+  const {browser, h, requests} = await showHarness();
+  await h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+  assert.deepEqual(requests.map(([path]) => path), ["/api/sequence"]);
+  assert.deepEqual(JSON.parse(requests[0][1].body).expectedRevision, SHOW_PIN, "the deep link's pinned read");
+  assert.equal(h.run("selectedMethod.id"), "agent");
+  assert.equal(h.get("agent-shown").hidden, false);
+  assert.match(h.get("agent-shown-label").textContent, /^Shown by agent · Sequence · agent$/);
+  assert.equal(h.get("agent-shown-back").hidden, false);
+  assert.match(browser.location.hash, /^#sequence\?sid=agent&/);
+  h.get("agent-shown-back").listeners.click();
+  assert.equal(h.get("agent-shown").hidden, true);
+  assert.match(browser.location.hash, /^#sequence\?sid=old&rootKey=/, "the entry before the show, as a full link");
+  await h.run("readNavigationLocation()");
+  assert.equal(h.run("selectedMethod.id"), "old", "Back restores what was shown before");
+  assert.equal(requests.length, 1, "the restored entry needs no new read");
+});
+
+test("negative control: the first request seen, an equal and an older generation never navigate", async () => {
+  const h = harness(historyWindow()), requests = [];
+  h.context.fetch = async (path, options) => { requests.push(path); return response(view("agent")); };
+  await h.run(`observeViewRequest(${JSON.stringify(shown(9))})`);
+  assert.equal(requests.length, 0, "a request older than this view is a baseline, not a show");
+  for (const generation of [9, 8]) await h.run(`observeViewRequest(${JSON.stringify(shown(generation))})`);
+  assert.equal(requests.length, 0);
+  assert.equal(h.run("selectedMethod"), null);
+  await h.run(`observeViewRequest(${JSON.stringify(shown(10))})`);
+  assert.equal(requests.length, 1, "the next generation does");
+  // A new checkout session starts a new baseline.
+  h.run("epoch++");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(11))})`);
+  assert.equal(requests.length, 1);
+});
+
+test("a pinned view ignores a newer request, and unpinning does not replay it", async () => {
+  const {h, requests} = await showHarness();
+  h.get("follow-agent").listeners.click();
+  assert.equal(h.get("follow-agent").textContent, "Pinned");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(5))})`);
+  assert.equal(requests.length, 0);
+  assert.equal(h.run("selectedMethod.id"), "old");
+  assert.equal(h.get("agent-shown").hidden, true);
+  h.get("follow-agent").listeners.click();
+  assert.equal(h.get("follow-agent").textContent, "Following agent");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(5))})`);
+  assert.equal(requests.length, 0, "the request seen while pinned stays seen");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(6))})`);
+  assert.equal(h.run("selectedMethod.id"), "agent", "control: unpinned, the next request is followed");
+});
+
+test("a request from another index snapshot is not shown; the note offers Reload and show", async () => {
+  const {h, requests} = await showHarness();
+  const newer = {...shown(5), revision:{...SHOW_PIN, indexRevision:2}};
+  await h.run(`observeViewRequest(${JSON.stringify(newer)})`);
+  assert.equal(requests.length, 0);
+  assert.equal(h.run("selectedMethod.id"), "old");
+  assert.match(h.get("agent-shown-label").textContent, /at index 12345678:2; this view is at 12345678:1/);
+  assert.equal(h.get("agent-shown-back").hidden, true);
+  assert.equal(h.get("agent-shown-reload").hidden, false);
+});
+
+test("a class request opens Classes at that seed through the class route", async () => {
+  const {browser, h} = await showHarness();
+  const opened = [];
+  h.run("window.TrellisClasses = {reset() {}, open(options) { globalThis.openedClass = options; }}");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"class", symbolId:"type"}))})`);
+  opened.push(h.run("globalThis.openedClass"));
+  assert.deepEqual(JSON.parse(JSON.stringify(opened[0])), {seed:"type"});
+  assert.equal(browser.location.hash, "#classes");
+  assert.match(h.get("agent-shown-label").textContent, /Shown by agent · Class diagram/);
+});
+
+test("malformed view requests are ignored", async () => {
+  const {h, requests} = await showHarness();
+  for (const bad of [{generation:5}, {...shown(5), view:"architecture"}, {...shown(5), revision:null}, {...shown(5, {view:"source", path:"a.rs", line:0})}, {...shown(0)}])
+    await h.run(`observeViewRequest(${JSON.stringify(bad)})`);
+  assert.equal(requests.length, 0);
+  assert.equal(h.run("followSeen.generation"), 0);
+});
+
+test("the follow poll reads status/head every 5 s and follows the viewRequest it carries", async () => {
+  const h = harness(historyWindow()), requests = [];
+  h.run("status.workspaceRoot='/synthetic'");
+  await h.run("observeViewRequest(null)");
+  h.context.fetch = async (path, options) => {
+    requests.push(path);
+    if (path === "/api/status/head") return response({workspaceRoot:"/synthetic", revision:SHOW_PIN, catchingUp:false, indexedAt:null, viewRequest:shown(3)});
+    return response(view(JSON.parse(options.body).seed));
+  };
+  h.run("scheduleFollow()");
+  const timers = [...h.timers.values()].filter(timer => timer.delay === 5000);
+  assert.equal(timers.length, 1);
+  timers[0].callback();
+  await settleHead(); await settleHead();
+  // The pinned sequence read observes head again, as every pinned read does; the same
+  // generation is not followed twice.
+  assert.deepEqual(requests.slice(0, 2), ["/api/status/head", "/api/sequence"]);
+  assert.ok(requests.slice(2).every(path => path === "/api/status/head"), requests.join());
+  assert.equal(requests.filter(path => path === "/api/sequence").length, 1);
+  assert.equal(h.run("selectedMethod.id"), "agent");
+  const next = h.run("followTimer");
+  assert.ok(next !== timers[0] && h.timers.get(next)?.delay === 5000, "the poll goes on");
+  h.run("resetCheckout()");
+  assert.equal(h.timers.has(next), false, "a checkout reset stops it");
+  assert.equal(h.run("followTimer"), null);
+});
+
+// #824: an agent show owns the view only until a newer show, a user navigation or a pin.
+test("a late older show does not override a newer one", async () => {
+  const {h} = await showHarness(), old = deferred();
+  h.context.fetch = (path, options) => JSON.parse(options.body).seed === "older" ? old.promise : Promise.resolve(response(view("newer")));
+  const pending = h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"sequence", symbolId:"older"}))})`);
+  await h.run(`observeViewRequest(${JSON.stringify(shown(5, {view:"sequence", symbolId:"newer"}))})`);
+  assert.equal(h.run("selectedMethod.id"), "newer");
+  old.resolve(response(view("older"))); await pending;
+  assert.equal(h.run("selectedMethod.id"), "newer");
+  assert.match(h.get("agent-shown-label").textContent, /newer/);
+});
+test("a pending show does not override a later manual selection", async () => {
+  const {h} = await showHarness(), old = deferred();
+  h.context.fetch = () => old.promise;
+  const pending = h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+  h.context.fetch = async () => response(view("manual"));
+  await h.run(`selectMethod(${JSON.stringify(symbol("manual"))})`);
+  old.resolve(response(view("agent"))); await pending;
+  assert.equal(h.run("selectedMethod.id"), "manual");
+  assert.equal(h.get("agent-shown").hidden, true);
+});
+test("pinning while a show's read is pending stops its navigation; control: an unpinned one navigates", async () => {
+  for (const pin of [true, false]) {
+    const {h} = await showHarness(), old = deferred();
+    h.context.fetch = () => old.promise;
+    const pending = h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+    if (pin) h.get("follow-agent").listeners.click();
+    old.resolve(response(view("agent"))); await pending;
+    assert.equal(h.run("selectedMethod.id"), pin ? "old" : "agent", `pinned: ${pin}`);
+  }
+});
+for (const before of ["architecture", "treemap", "classes"]) test(`agent Back returns to the visible ${before} view, not a sequence held from before`, async () => {
+  const {h} = await showHarness();
+  for (const name of ["architecture", "treemap", "sequence", "classes"]) h.get("view-" + name).getAttribute = function (key) { return this.attrs[key]; };
+  h.run(`window.TrellisShell.showView('${before}')`);
+  assert.equal(h.run("currentDiagramView()"), before);
+  await h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+  assert.equal(h.run("currentDiagramView()"), "sequence");
+  h.get("agent-shown-back").listeners.click();
+  await h.run("readNavigationLocation()");
+  assert.equal(h.run("currentDiagramView()"), before);
+});
+test("control: agent Back from a visible sequence returns to that sequence", async () => {
+  const {h} = await showHarness();
+  for (const name of ["architecture", "treemap", "sequence", "classes"]) h.get("view-" + name).getAttribute = function (key) { return this.attrs[key]; };
+  h.run("window.TrellisShell.showView('sequence')");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+  h.get("agent-shown-back").listeners.click();
+  await h.run("readNavigationLocation()");
+  assert.equal(h.run("currentDiagramView()"), "sequence");
+  assert.equal(h.run("selectedMethod.id"), "old");
+});
+test("agent Back returns to the class diagram that was open", async () => {
+  const {h} = await showHarness();
+  for (const name of ["architecture", "treemap", "sequence", "classes"]) h.get("view-" + name).getAttribute = function (key) { return this.attrs[key]; };
+  const opened = [];
+  h.context.recordClass = options => opened.push(options.seed);
+  h.run("window.TrellisClasses = {reset() {}, open(options) { recordClass(options); }}");
+  await h.run("openClasses({seed:'Type'})");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+  h.get("agent-shown-back").listeners.click();
+  await h.run("readNavigationLocation()");
+  assert.deepEqual(opened, ["Type", "Type"]);
+  assert.equal(h.run("currentDiagramView()"), "classes");
+});
+
+// #824: an agent source show publishes nothing (bytes, history, note) unless it still owns
+// the view when its read lands.
+const sourceFile = path => response({revision:SHOW_PIN, file:{path, language:"rust", text:`${path} bytes`}});
+for (const files of [true, false]) test(`pinning during an agent source read in ${files ? "Files" : "Diagrams"} paints nothing; control: unpinned paints`, async () => {
+  for (const pin of [true, false]) {
+    const {h, browser} = await showHarness(), hold = deferred();
+    if (files) h.run("section='files'");
+    h.context.fetch = () => hold.promise;
+    const entries = browser.history.length;
+    const pending = h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"source", path:"agent.rs", line:1}))})`);
+    if (pin) h.get("follow-agent").listeners.click();
+    hold.resolve(sourceFile("agent.rs")); await pending;
+    assert.equal(h.run("workspaceSource?.data.file.path") || null, pin ? null : "agent.rs", `pinned: ${pin}`);
+    assert.equal(browser.history.length, pin ? entries : entries + 1);
+    assert.equal(h.get("agent-shown").hidden, pin);
+  }
+});
+test("a manual Files choice during an agent source read: no agent bytes, history entry or note", async () => {
+  const {h, browser} = await showHarness(), hold = deferred();
+  h.run("section='files'");
+  h.context.fetch = () => hold.promise;
+  const pending = h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"source", path:"agent.rs", line:1}))})`);
+  h.context.fetch = async () => sourceFile("manual.rs");
+  assert.equal(await h.run("openFilesLocation({path:'manual.rs',range:{startLine:1,endLine:1}},status.revision)"), true);
+  const entries = browser.history.length, state = JSON.stringify(browser.history.state);
+  hold.resolve(sourceFile("agent.rs")); await pending;
+  assert.equal(h.run("workspaceSource.data.file.path"), "manual.rs");
+  assert.equal(browser.history.length, entries, "no extra history entry");
+  assert.equal(JSON.stringify(browser.history.state), state, "the current entry is not rewritten");
+  assert.equal(h.get("agent-shown").hidden, true, "no false note");
+});
+test("openFilesLocation reports an aborted read as not painted", async () => {
+  const {h} = await showHarness(), hold = deferred();
+  h.run("section='files'");
+  h.context.fetch = () => hold.promise;
+  const read = h.run("openFilesLocation({path:'a.rs',range:{startLine:1,endLine:1}},status.revision)");
+  h.run("epoch++");
+  hold.resolve(sourceFile("a.rs"));
+  assert.equal(await read, false);
+});

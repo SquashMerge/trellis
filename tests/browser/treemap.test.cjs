@@ -688,7 +688,7 @@ test("Startup load: one full status, head digests, no eager library catalog, and
   assert.ok(count("status/head") >= 1, "pinned reads compare the shown revision with the head digest");
   assert.equal(count("dependencies"), 0, "the library catalog is not read until an in-context entry needs it");
   const digest = await page.evaluate(async () => (await api("/api/status/head")));
-  assert.deepEqual(Object.keys(digest).sort(), ["catchingUp", "indexedAt", "revision", "workspaceRoot"]);
+  assert.deepEqual(Object.keys(digest).sort(), ["catchingUp", "indexedAt", "revision", "viewRequest", "workspaceRoot"]);
   const architectureReads = count("architecture"), metricsReads = treemapReads();
   assert.equal(architectureReads, 1); assert.equal(metricsReads, 1);
   for (let round = 0; round < 2; round++) {

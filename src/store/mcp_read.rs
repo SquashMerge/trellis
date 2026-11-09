@@ -268,12 +268,38 @@ fn mcp_lines_for_range(
     McpSelectedLines::new(bytes.to_vec()).range(range)
 }
 
+/// Why a selected source range cannot be read from its cached file: the typed kind behind
+/// the wire codes `range_too_large` and `unsupported_encoding` (#818). Its text keeps the
+/// code prefix the MCP failure mapping reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceRangeRejected {
+    /// More than 200 lines.
+    LineCap,
+    /// A line past the end of the cached file.
+    LineAbsent,
+    /// More than 16 KiB of selected bytes.
+    ByteCap,
+    /// The selected bytes are not UTF-8.
+    NotUtf8,
+}
+impl std::fmt::Display for SourceRangeRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::LineCap => "range_too_large: source line cap",
+            Self::LineAbsent => "range_too_large: source line absent",
+            Self::ByteCap => "range_too_large: source byte cap",
+            Self::NotUtf8 => "unsupported_encoding: selected source slice",
+        })
+    }
+}
+impl std::error::Error for SourceRangeRejected {}
+
 fn mcp_lf_range(bytes: &[u8], start: u64, end: u64) -> Result<(usize, usize)> {
     ensure!(
         start > 0 && end >= start,
         "invalid_request: reversed source range"
     );
-    ensure!(end - start < 200, "range_too_large: source line cap");
+    ensure!(end - start < 200, SourceRangeRejected::LineCap);
     let first = usize::try_from(start - 1)
         .ok()
         .and_then(|index| mcp_lf_lines(bytes).nth(index));
@@ -283,8 +309,8 @@ fn mcp_lf_range(bytes: &[u8], start: u64, end: u64) -> Result<(usize, usize)> {
     let (from, to) = first
         .map(|(from, _)| from)
         .zip(last.map(|(_, to)| to))
-        .context("range_too_large: source line absent")?;
-    ensure!(to - from <= 16384, "range_too_large: source byte cap");
+        .ok_or(SourceRangeRejected::LineAbsent)?;
+    ensure!(to - from <= 16384, SourceRangeRejected::ByteCap);
     Ok((from, to))
 }
 
@@ -322,7 +348,7 @@ impl EvidenceResponse {
         );
         let (byte_start, byte_end) = mcp_lf_range(&bytes, start_line, end_line)?;
         let text = std::str::from_utf8(&bytes[byte_start..byte_end])
-            .map_err(|_| anyhow::anyhow!("unsupported_encoding: selected source slice"))?
+            .map_err(|_| SourceRangeRejected::NotUtf8)?
             .to_owned();
         Ok(Some(McpSource {
             path: path.to_owned(),

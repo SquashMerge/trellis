@@ -421,3 +421,164 @@ test("an obsolete method list's rejection sets no error on the reloaded file", a
 });
 
 function TrellisErrorLike(code) { const e = new Error(code); e.code = code; return e; }
+
+// #818: an agent's trellis_show reaches the pane as each status poll's `viewRequest`.
+const flush = async (jobs) => { for (let n = 0; n < jobs.length; n++) await jobs[n]; };
+const request = (generation, extra = {}) => ({ generation, view: "sequence", symbolId: "helper", revision: pin, ...extra });
+function showPane({ pinned = false } = {}) {
+  const { view, cx, jobs } = bare();
+  let status = { revision: pin, workspaceRoot: ROOT, viewRequest: request(3) };
+  const sequences = [];
+  view.client = { status: async () => status, architecture: async (_key, p) => rulesless(p),
+    sequence: async (_key, _pin, id) => { sequences.push(id); return sequenceFor(id); } };
+  view.tab = "architecture"; view.pinned = pinned;
+  const poll = async (viewRequest) => { status = { ...status, viewRequest }; view.refreshStatus(cx); await flush(jobs); };
+  return { view, cx, jobs, sequences, poll, start: async () => { view.select(KEY_A, cx); await flush(jobs); } };
+}
+
+test("#818: a newer view request opens its Sequence with a note and Back; the first one seen is only a baseline", async () => {
+  const { view, cx, sequences, poll, start } = showPane();
+  await start();
+  assert.equal(view.tab, "architecture", "the request there before the pane is a baseline");
+  assert.equal(view.shown, null);
+  assert.deepEqual(sequences, []);
+  await poll(request(4));
+  assert.equal(view.tab, "sequence");
+  assert.deepEqual(sequences, ["helper"], "read at the pane's pin, as the browser's deep link reads it");
+  assert.equal(view.seq.seed.id, "helper");
+  const bar = view.shownBar(state.theme ? state.theme : { surface: "", border: "", muted: "", dim: "", hover: "" })[0];
+  assert.match(bar.text(), /Shown by agent · Sequence/);
+  assert.ok(bar.find("agent-shown-back"));
+  bar.find("agent-shown-back").props.click({}, cx);
+  assert.equal(view.tab, "architecture", "Back returns to the view before the show");
+  assert.equal(view.shown, null);
+});
+
+test("#818 negative controls: an equal or older generation, and a pinned pane, never navigate", async () => {
+  const { view, sequences, poll, start } = showPane({ pinned: true });
+  await start();
+  await poll(request(5));
+  assert.equal(view.tab, "architecture", "pinned: ignored");
+  assert.equal(view.shown, null);
+  view.pinned = false;
+  await poll(request(5));
+  assert.equal(view.tab, "architecture", "seen while pinned, so not replayed on unpinning");
+  await poll(request(4));
+  assert.equal(view.tab, "architecture", "an older generation");
+  assert.deepEqual(sequences, []);
+  await poll(request(6));
+  assert.equal(view.tab, "sequence", "control: the next generation is followed");
+  assert.deepEqual(sequences, ["helper"]);
+});
+
+test("#818: a request at another snapshot, or for a view this pane lacks, is a note only", async () => {
+  const { view, sequences, poll, start } = showPane();
+  await start();
+  await poll(request(4, { revision: { ...pin, indexRevision: 9 } }));
+  assert.match(view.shown.text, /at index 00000000:9; this pane is at 00000000:7/);
+  assert.equal(view.shown.back, null);
+  await poll(request(5, { view: "class", symbolId: "type" }));
+  assert.match(view.shown.text, /no Class view; open it in the browser/);
+  await poll(request(6, { view: "source", symbolId: undefined, path: "src/a.rs", line: 3 }));
+  assert.match(view.shown.text, /src\/a\.rs:3/);
+  assert.equal(view.tab, "architecture");
+  assert.deepEqual(sequences, []);
+});
+
+// #824: a shown Sequence is bound to its revision, and a show owns the pane only until a
+// newer show, a user choice or a pin.
+const seeded = (id, p) => { const v = sequenceFor(id); return { ...v, revision: p, seed: { ...v.seed, id, name: id } }; };
+function revisionPane() {
+  const { view, cx, jobs } = bare();
+  let current = pin;
+  const reads = [];
+  view.client = { status: async () => ({ revision: current, workspaceRoot: ROOT, viewRequest: request(3) }),
+    architecture: async (_key, p) => rulesless(p),
+    sequence: async (_key, p, id) => { reads.push([id, p.indexRevision]); return seeded(id, p); },
+    methods: async () => ({ items: [{ consequential: true, symbol: { id: "agent", name: "agent" } }] }) };
+  view.tab = "architecture";
+  return { view, cx, jobs, reads, advance: async (p) => { current = p; view.refreshStatus(cx); await flush(jobs); },
+    start: async () => { view.select(KEY_A, cx); await flush(jobs); } };
+}
+
+test("#824: an agent Sequence with no file reloads at a new revision; control: an unchanged revision reads nothing", async () => {
+  const { view, cx, jobs, reads, advance, start } = revisionPane();
+  await start();
+  view.observeShow(request(4, { symbolId: "agent" }), cx); await flush(jobs);
+  assert.equal(view.seq.data.revision.indexRevision, 7);
+  await advance(pin);
+  assert.deepEqual(reads, [["agent", 7]], "control: the same revision is not read again");
+  await advance(pin2);
+  assert.equal(view.status.pin.indexRevision, 8);
+  assert.equal(view.seq.data.revision.indexRevision, 8);
+  assert.deepEqual(reads.at(-1), ["agent", 8]);
+});
+
+test("#824: Back after a revision change shows the earlier Sequence at the new revision, never the old payload", async () => {
+  const { view, cx, jobs, advance, start } = revisionPane();
+  await start();
+  view.seq = { file: "file.rs", methods: [], history: [], expanded: new Set(), seed: { id: "old" }, data: seeded("old", pin) };
+  view.tab = "sequence";
+  view.observeShow(request(4, { symbolId: "agent" }), cx); await flush(jobs);
+  await advance(pin2);
+  assert.equal(view.seq.data.revision.indexRevision, 8);
+  view.backFromShow(cx);
+  assert.equal(view.seq.seed.id, "old");
+  assert.equal(view.seq.data.revision.indexRevision, 8);
+});
+
+test("#824: a Back state never reloaded is read again at the current pin, not shown stale", async () => {
+  const { view, cx, jobs, reads, start } = revisionPane();
+  await start();
+  view.seq = { file: null, methods: null, history: [], expanded: new Set(), seed: { id: "old" }, data: seeded("old", { ...pin, indexRevision: 6 }) };
+  view.tab = "sequence";
+  view.observeShow(request(4, { symbolId: "agent" }), cx); await flush(jobs);
+  view.backFromShow(cx);
+  assert.equal(view.seq.data, null, "the old payload is dropped");
+  await flush(jobs);
+  assert.equal(view.seq.data.revision.indexRevision, 7);
+  assert.deepEqual(reads.at(-1), ["old", 7]);
+});
+
+function heldPane() {
+  const { view, cx, jobs } = bare();
+  const pending = new Map();
+  view.client = { status: async () => ({ revision: pin, workspaceRoot: ROOT, viewRequest: request(3) }),
+    architecture: async (_key, p) => rulesless(p),
+    sequence: (_key, _p, id) => { const d = deferred(); pending.set(id, d); return d.promise; } };
+  view.tab = "architecture";
+  return { view, cx, jobs, pending, start: async () => { view.select(KEY_A, cx); await flush(jobs); } };
+}
+
+test("#824: a late older show's read does not replace a newer show", async () => {
+  const { view, cx, pending, start } = heldPane();
+  await start();
+  view.observeShow(request(4, { symbolId: "older" }), cx);
+  view.observeShow(request(5, { symbolId: "newer" }), cx);
+  pending.get("newer").resolve(sequenceFor("newer")); await Promise.resolve(); await new Promise(setImmediate);
+  pending.get("older").resolve(sequenceFor("helper")); await new Promise(setImmediate);
+  assert.equal(view.seq.seed.id, "newer");
+});
+
+test("#824: a user's method choice during an agent read wins", async () => {
+  const { view, cx, pending, start } = heldPane();
+  await start();
+  view.observeShow(request(4, { symbolId: "agent" }), cx);
+  view.loadSequence({ id: "manual", name: "manual" }, false, cx);
+  pending.get("manual").resolve({ ...sequenceFor("helper"), seed: { id: "manual", name: "manual" } }); await new Promise(setImmediate);
+  pending.get("agent").resolve(sequenceFor("helper")); await new Promise(setImmediate);
+  assert.equal(view.seq.seed.id, "manual");
+});
+
+test("#824: pinning during an agent read returns to the earlier view; control: unpinned, the show completes", async () => {
+  for (const pinNow of [true, false]) {
+    const { view, cx, pending, start } = heldPane();
+    await start();
+    view.observeShow(request(4, { symbolId: "helper" }), cx);
+    assert.equal(view.tab, "sequence");
+    if (pinNow) view.setPinned(true, cx);
+    pending.get("helper").resolve(sequenceFor("helper")); await new Promise(setImmediate);
+    assert.equal(view.tab, pinNow ? "architecture" : "sequence", `pinned: ${pinNow}`);
+    assert.equal(view.shown === null, pinNow);
+  }
+});

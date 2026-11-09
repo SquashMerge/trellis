@@ -2891,7 +2891,14 @@ async fn selected_status_head_is_the_bounded_digest_of_the_same_status() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["catchingUp", "indexedAt", "revision", "workspaceRoot"],
+        // `viewRequest` (#818) is null until an agent shows a target.
+        [
+            "catchingUp",
+            "indexedAt",
+            "revision",
+            "viewRequest",
+            "workspaceRoot"
+        ],
         "{head}"
     );
     for key in keys {

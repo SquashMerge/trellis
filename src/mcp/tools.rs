@@ -3,7 +3,7 @@ use super::{IdentityError, OpenedWorkspace, wire};
 use crate::daemon::registry::SelectionError;
 use serde_json::{Value, json};
 
-const TOOLS: [&str; 11] = super::catalog::NAMES;
+const TOOLS: [&str; 12] = super::catalog::NAMES;
 #[derive(Debug)]
 pub struct PreparedTool {
     pub name: String,
@@ -206,6 +206,19 @@ fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
             ],
             &["schemaVersion"],
         ),
+        "trellis_show" => (
+            &[
+                "schemaVersion",
+                "view",
+                "symbolId",
+                "lookupKey",
+                "path",
+                "line",
+                "expectedBasis",
+                "workspace",
+            ],
+            &["schemaVersion", "view"],
+        ),
         "trellis_call_graph" => (
             &[
                 "schemaVersion",
@@ -308,6 +321,15 @@ fn field_message(name: &str, field: &str) -> &'static str {
         (_, "maxNodes") => "`maxNodes` must be an integer from 1 to 150",
         (_, "maxCalls") => "`maxCalls` must be an integer from 0 to 500",
         (_, "path") => "`path` must be a checkout-relative file path",
+        (_, "view") => "`view` must be \"sequence\", \"class\" or \"source\"",
+        (_, "line") => "`line` must be a line number from 1",
+        (_, "view:symbol") => {
+            "`view` \"sequence\" and \"class\" take exactly one of `symbolId` or `lookupKey`, \
+             and no `path` or `line`"
+        }
+        (_, "view:source") => {
+            "`view` \"source\" takes `path` and `line`, and no `symbolId` or `lookupKey`"
+        }
         (_, "expectedContentHash") => {
             "`expectedContentHash` must be a 64-digit lowercase hex content hash"
         }
@@ -446,6 +468,34 @@ pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
             }
             limit(o).map_err(coded("limit"))?;
         }
+        "trellis_show" => match string(o.get("view")) {
+            Some("sequence" | "class") => {
+                if o.contains_key("path")
+                    || o.contains_key("line")
+                    || o.contains_key("symbolId") == o.contains_key("lookupKey")
+                {
+                    return Err(bad("view:symbol"));
+                }
+                selector(o).map_err(bad)?;
+            }
+            Some("source") => {
+                if o.contains_key("symbolId") || o.contains_key("lookupKey") {
+                    return Err(bad("view:source"));
+                }
+                let path = string(o.get("path")).ok_or_else(|| bad("path"))?;
+                if !valid_path(path) {
+                    return Err(bad("path"));
+                }
+                if !o
+                    .get("line")
+                    .and_then(wire::uint)
+                    .is_some_and(|line| line >= 1)
+                {
+                    return Err(bad("line"));
+                }
+            }
+            _ => return Err(bad("view")),
+        },
         "trellis_declaration"
         | "trellis_outgoing_calls"
         | "trellis_incoming_calls"
@@ -453,19 +503,7 @@ pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
             if o.contains_key("symbolId") == o.contains_key("lookupKey") {
                 return Err(bad("symbolId|lookupKey"));
             }
-            if let Some(value) = o.get("symbolId") {
-                let sid = value.as_str().ok_or_else(|| bad("symbolId"))?;
-                if sid.len() != 39
-                    || !sid.starts_with("sid:v1:")
-                    || !sid[7..]
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                {
-                    return Err(bad("symbolId"));
-                }
-            } else if !valid_lookup_key(o.get("lookupKey")) {
-                return Err(bad("lookupKey"));
-            }
+            selector(o).map_err(bad)?;
             if name == "trellis_call_graph" {
                 call_graph_arguments(o).map_err(bad)?;
             } else if name != "trellis_declaration" {
@@ -511,6 +549,23 @@ pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
     }
     if workspace_field(o).is_err() {
         return Err(bad("workspace"));
+    }
+    Ok(())
+}
+/// One present `symbolId` (a syntax ID) or `lookupKey` (nonempty); the failing field if not.
+fn selector(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
+    if let Some(value) = o.get("symbolId") {
+        let sid = value.as_str().ok_or("symbolId")?;
+        if sid.len() != 39
+            || !sid.starts_with("sid:v1:")
+            || !sid[7..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("symbolId");
+        }
+    } else if !valid_lookup_key(o.get("lookupKey")) {
+        return Err("lookupKey");
     }
     Ok(())
 }
@@ -789,6 +844,8 @@ pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
                         + 1) as usize,
                     "lines",
                 ),
+                // Its summary names the outcome instead (below).
+                "trellis_show" => (0, "targets"),
                 _ => unreachable!("known tool name"),
             }
         };
@@ -819,6 +876,11 @@ pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
             items
         };
         format!("{name}: {count} {items}{truncation}; full result in structuredContent.")
+    };
+    let text = if !error && name == super::show::NAME {
+        super::show::summary(&envelope)
+    } else {
+        text
     };
     assert!(text.len() <= 512, "tool summary exceeds 512 UTF-8 bytes");
     let mut value = json!({"isError":error,"structuredContent":envelope,
@@ -948,6 +1010,7 @@ mod tests {
             | "trellis_call_graph" => {
                 json!({"schemaVersion":1,"symbolId":sid()})
             }
+            "trellis_show" => json!({"schemaVersion":1,"view":"sequence","symbolId":sid()}),
             _ => json!({"schemaVersion":1,"path":"src/a.rs","startLine":1,"endLine":1}),
         }
     }
@@ -1355,7 +1418,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":16,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":17,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
@@ -1885,6 +1948,53 @@ mod tests {
                 Some(&json!({"schemaVersion":1}))
             ),
             Err("invalid_request")
+        );
+    }
+
+    /// #818: each view takes its own target fields and nothing else.
+    #[test]
+    fn show_arguments_are_closed_per_view() {
+        let n = "trellis_show";
+        let ok = |v: Value| assert_eq!(validate(n, Some(&v)), Ok(()), "{v}");
+        for view in ["sequence", "class"] {
+            ok(json!({"schemaVersion":1,"view":view,"symbolId":sid()}));
+            ok(
+                json!({"schemaVersion":1,"view":view,"lookupKey":"src/a.rs::A","expectedBasis":pin()}),
+            );
+            for v in [
+                json!({"schemaVersion":1,"view":view}),
+                json!({"schemaVersion":1,"view":view,"symbolId":sid(),"lookupKey":"k"}),
+                json!({"schemaVersion":1,"view":view,"symbolId":sid(),"line":1}),
+                json!({"schemaVersion":1,"view":view,"symbolId":sid(),"path":"a.rs"}),
+                json!({"schemaVersion":1,"view":view,"symbolId":"sid:v1:short"}),
+                json!({"schemaVersion":1,"view":view,"lookupKey":""}),
+            ] {
+                check(n, &v, "invalid_request");
+            }
+        }
+        ok(json!({"schemaVersion":1,"view":"source","path":"src/a.rs","line":1}));
+        ok(
+            json!({"schemaVersion":1,"view":"source","path":"src/a.rs","line":9007199254740991_u64}),
+        );
+        for v in [
+            json!({"schemaVersion":1,"view":"source","path":"src/a.rs"}),
+            json!({"schemaVersion":1,"view":"source","line":3}),
+            json!({"schemaVersion":1,"view":"source","path":"src/a.rs","line":0}),
+            json!({"schemaVersion":1,"view":"source","path":"src/a.rs","line":1.5}),
+            json!({"schemaVersion":1,"view":"source","path":"/abs.rs","line":1}),
+            json!({"schemaVersion":1,"view":"source","path":"../a.rs","line":1}),
+            json!({"schemaVersion":1,"view":"source","path":"a.rs","line":1,"symbolId":sid()}),
+            json!({"schemaVersion":1,"view":"source","path":"a.rs","line":1,"lookupKey":"k"}),
+            json!({"schemaVersion":1,"view":"architecture","symbolId":sid()}),
+            json!({"schemaVersion":1,"view":null,"symbolId":sid()}),
+        ] {
+            check(n, &v, "invalid_request");
+        }
+        let envelope = json!({"schemaVersion":1,"requestId":1,"truncated":false,
+            "data":{"outcome":"no_viewer","view":"class","generation":null,"message":"m"}});
+        assert_eq!(
+            result(n, envelope, false)["content"][0]["text"],
+            "trellis_show: no_viewer class; full result in structuredContent."
         );
     }
 }
