@@ -530,8 +530,8 @@
       const path = line.evidence.document?.path ?? line.instance.target.path, lines = line.evidence.lines;
       return lines ? `${path}:${lines.start}` : path;
     };
-    function actions(line) {
-      const e = line.evidence, i = line.instance, t = e.target, active = lineActive || fallbackActive, pin = deps.basis().pin, items = [];
+    function actions(line, active = lineActive || fallbackActive) {
+      const e = line.evidence, i = line.instance, t = e.target, pin = deps.basis().pin, items = [];
       const guarded = run => async () => {
         try { await run(); } catch (error) { if (isActive() && error?.name !== "AbortError") notice(error?.message || "Action unavailable."); }
       };
@@ -577,7 +577,7 @@
       else if (line.kind === "call" && e.relationKind === "call") evidence += ` · no measured caller: ${e.callerReason ?? "unavailable"}`;
       row("Evidence", evidence);
       target.append(list);
-      const items = actions(line), exception = items.find(item => item.id === "exception");
+      const items = actions(line, active), exception = items.find(item => item.id === "exception");
       const primary = items.find(item => item.id === "sequence") || items.find(item => item.id === "call-site");
       const button = item => {
         const node = make("button", item.label, item === primary ? "deviation-primary" : "deviation-secondary"); node.type = "button"; node.dataset.action = item.id;

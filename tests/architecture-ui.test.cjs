@@ -1275,6 +1275,29 @@ test("deviations line actions call the open hooks with the captured evidence", a
   assert.equal(h.focus.active, h.get("architecture-reason"));
 });
 
+test("deviations inspector actions use the current guard after a second selection", async () => {
+  const h = deviationsHarness(), inspect = h.deps.inspectLine, seen = [];
+  h.deps.inspectLine = (record, render) => {
+    const prior = h.inspections.at(-1);
+    if (prior) prior.target.dead = true;
+    return inspect(record, render);
+  };
+  h.deps.readSource = async (site, pin, active) => { seen.push({action:"read", path:site.path, active:active()}); };
+  h.deps.openSequence = async (caller, sites, pin, snap, active) => { seen.push({action:"sequence", active:active()}); };
+  await h.dev.open(h.trigger);
+  await h.expandAll();
+  const line = n => h.treeRows().find(row => row.dataset.level === "3" && new RegExp(`Line ${n},`).test(row.attrs["aria-label"]));
+  const click = label => descendants(h.inspections.at(-1).target).find(item => item.tagName === "button" && item.textContent.startsWith(label)).dispatch("click");
+  await line(10).dispatch("click");
+  await line(20).dispatch("click");
+  assert.equal(h.inspections.length, 2);
+  assert.equal(h.inspections[0].target.dead, true, "the first inspector's guard is invalidated");
+  await click("Go to call site");
+  await click("Go to definition");
+  await click("Open in Sequence");
+  deq(seen, [{action:"read",path:"src/store.rs",active:true},{action:"read",path:"src/rules.rs",active:true},{action:"sequence",active:true}]);
+});
+
 test("deviations copy location writes, announces and falls back", async () => {
   const h = deviationsHarness();
   await h.dev.open(h.trigger);
