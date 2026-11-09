@@ -804,6 +804,30 @@ mod tests {
         assert_eq!(state.architecture_builds_for_tests(), 1);
     }
 
+    /// #798: a retirement asked for while the head's eager build is reading it declines, as for
+    /// any admitted read, and is requested once that read has ended. Retirement is retried, so
+    /// the warm read delays it and never starves it.
+    #[test]
+    fn a_retirement_during_the_build_read_declines_then_is_requested() {
+        let (_tmp, _store, state, _roots, _identity) =
+            crate::http::exceptional_recovery_tests::fixture();
+        let (reached, release) = hold_at(&state, "reading", 0);
+        state.worker_step().unwrap();
+        reached.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        assert_eq!(state.leases(), 1);
+        assert!(matches!(
+            state.request_retire(|_| true),
+            RetireOutcome::Declined
+        ));
+        drop(release);
+        state.await_architecture_idle_for_tests();
+        assert_eq!(state.leases(), 0);
+        assert!(matches!(
+            state.request_retire(|_| true),
+            RetireOutcome::Requested
+        ));
+    }
+
     /// #798: a publication builds the new head with no rules file and no read asking, so the
     /// first read finds its core published.
     #[test]
