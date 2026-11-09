@@ -707,6 +707,71 @@ async fn h() {}
     }
 
     #[test]
+    fn a_comment_in_an_argument_list_is_not_an_argument() {
+        let client = r#"
+function go(api, request) {
+  api(/* the path */ "/health");
+  api(
+    // a note
+    "/health",
+    /* then the method */ "POST"
+  );
+  request("/health", /* body */ null, { method: "GET" /* verb */ });
+}
+"#;
+        assert_eq!(
+            outcomes(client),
+            [
+                "GET /health -> /health Exact",
+                "POST /health -> unresolved",
+                "GET /health -> /health Exact",
+            ]
+        );
+    }
+
+    #[test]
+    fn each_of_a_calls_own_charges_is_a_typed_bounded_work_error() {
+        let app = "function t(api) { api(\"/health\"); }";
+        let shot = snapshot(&[("src/http.rs", SERVER), ("web/app.js", app)]);
+        let budget = |limit: usize| {
+            let mut work = Work::new(limit);
+            let routes = crate::interfaces::routes::extract(&shot, &mut work, &mut || Ok(()));
+            (work, routes)
+        };
+        let (spent, routes) = budget(usize::MAX);
+        let routes = routes.unwrap();
+        let (routes_cost, parse_cost, match_cost) = (spent.used, app.len(), routes.len());
+        assert!(routes_cost > 0 && match_cost > 1);
+        let bounded = |error: anyhow::Error| error.to_string() == crate::interfaces::BUDGET;
+
+        let mut work = Work::new(parse_cost - 1);
+        assert!(bounded(
+            extract(&shot, &mut work, &mut || Ok(())).err().unwrap()
+        ));
+        let mut work = Work::new(parse_cost);
+        let calls = extract(&shot, &mut work, &mut || Ok(())).unwrap();
+        assert_eq!(calls.len(), 1);
+
+        let mut work = Work::new(calls.len() * match_cost - 1);
+        assert!(bounded(
+            resolve(&routes, &calls, &mut work, &mut || Ok(()))
+                .err()
+                .unwrap()
+        ));
+        let mut work = Work::new(calls.len() * match_cost);
+        resolve(&routes, &calls, &mut work, &mut || Ok(())).unwrap();
+
+        let whole = routes_cost + parse_cost + calls.len() * match_cost;
+        extract_all(&shot, &mut Work::new(whole), &mut || Ok(())).unwrap();
+        for short in [whole - 1, routes_cost + parse_cost - 1] {
+            let error = extract_all(&shot, &mut Work::new(short), &mut || Ok(()))
+                .err()
+                .unwrap();
+            assert!(bounded(error), "{short}");
+        }
+    }
+
+    #[test]
     fn trellis_own_client_reaches_the_dispatch_arm_and_its_test_only_route_is_excluded() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let read = |path: &str| std::fs::read_to_string(dir.join(path)).unwrap();

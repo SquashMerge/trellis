@@ -1,15 +1,16 @@
 //! HTTP interface evidence (#788): the server routes a checkout registers and the client calls
 //! it makes. Extraction reads parsed source and the stored declaration roles, knows nothing
 //! about apps, and runs at read time; nothing here is stored.
-#![cfg_attr(not(test), allow(dead_code))]
-
 mod calls;
 mod routes;
 
 use crate::native_evidence::{Declaration, DeclarationRole, DocumentKey, Range};
 use crate::references::{DocumentInput, Snapshot, callers::Caller, work::Work};
+use crate::rules::AppScope;
 use anyhow::{Context, Result};
 use serde::Serialize;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
 /// How firmly a client call is tied to a server route.
@@ -121,6 +122,310 @@ pub(crate) fn extract(
     })
 }
 
+/// The three lists of an interface that detail pages serve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum List {
+    Matched,
+    ServerOnly,
+    ClientOnly,
+}
+
+impl List {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "matched" => Some(Self::Matched),
+            "serverOnly" => Some(Self::ServerOnly),
+            "clientOnly" => Some(Self::ClientOnly),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Matched => "matched",
+            Self::ServerOnly => "serverOnly",
+            Self::ClientOnly => "clientOnly",
+        }
+    }
+}
+
+/// One item of one list: the interface, the list, and the position in that list.
+#[derive(Clone, Copy)]
+pub(crate) struct Row {
+    pair: usize,
+    list: List,
+    at: usize,
+}
+
+/// One ordered pair of apps with at least one matched call.
+struct Pair {
+    client: String,
+    server: String,
+    /// Each matched route with the call sites that reached it, in route order.
+    matched: Vec<(usize, Vec<usize>)>,
+    server_only: Vec<usize>,
+    client_only: Vec<usize>,
+}
+
+/// The extraction seen as interfaces between apps (#788). Each end belongs to the app and the
+/// layer that own its file. Built per read; nothing here is stored.
+pub(crate) struct Projection<'a> {
+    extraction: &'a Extraction,
+    route_layers: Vec<Option<String>>,
+    call_layers: Vec<Option<String>>,
+    pairs: Vec<Pair>,
+}
+
+const WRAPPER_CALLEES: [&str; 4] = ["api", "request", "api.request", "owner.request"];
+
+/// Projects the extraction onto the detected apps. `layers` maps each file to its layer.
+pub(crate) fn project<'a>(
+    extraction: &'a Extraction,
+    scope: &AppScope<'_>,
+    layers: &BTreeMap<&str, Option<&str>>,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Projection<'a>> {
+    let layer_of = |path: &str| layers.get(path).copied().flatten().map(str::to_owned);
+    let app_of = |path: &str, layer: &Option<String>| scope.file(path, layer.as_deref());
+    let mut route_layers = Vec::with_capacity(extraction.routes.len());
+    let mut route_apps = Vec::with_capacity(extraction.routes.len());
+    for route in &extraction.routes {
+        check()?;
+        let layer = layer_of(&route.handler.document.path);
+        route_apps.push(app_of(&route.handler.document.path, &layer));
+        route_layers.push(layer);
+    }
+    let mut call_layers = Vec::with_capacity(extraction.calls.len());
+    let mut call_apps = Vec::with_capacity(extraction.calls.len());
+    for call in &extraction.calls {
+        check()?;
+        let layer = layer_of(&call.document.path);
+        call_apps.push(app_of(&call.document.path, &layer));
+        call_layers.push(layer);
+    }
+    let mut reached = BTreeSet::new();
+    let mut grouped: BTreeMap<(usize, usize), BTreeMap<usize, Vec<usize>>> = BTreeMap::new();
+    for (call, found) in extraction.matched.iter().enumerate() {
+        check()?;
+        let Some(found) = found else { continue };
+        reached.insert(found.route);
+        if let (Some(client), Some(server)) = (call_apps[call], route_apps[found.route])
+            && client != server
+        {
+            grouped
+                .entry((client, server))
+                .or_default()
+                .entry(found.route)
+                .or_default()
+                .push(call);
+        }
+    }
+    let mut pairs = Vec::with_capacity(grouped.len());
+    for ((client, server), matched) in grouped {
+        check()?;
+        let unmatched = |apps: &[Option<usize>], app: usize, keep: &dyn Fn(usize) -> bool| {
+            (0..apps.len())
+                .filter(|&at| apps[at] == Some(app) && keep(at))
+                .collect::<Vec<_>>()
+        };
+        let name = |app: usize| scope.name(app).unwrap_or_default().to_owned();
+        pairs.push(Pair {
+            client: name(client),
+            server: name(server),
+            matched: matched.into_iter().collect(),
+            server_only: unmatched(&route_apps, server, &|route| !reached.contains(&route)),
+            client_only: unmatched(&call_apps, client, &|call| {
+                extraction.matched[call].is_none()
+            }),
+        });
+    }
+    Ok(Projection {
+        extraction,
+        route_layers,
+        call_layers,
+        pairs,
+    })
+}
+
+/// The position of a confidence in counts, best first.
+fn confidence_slot(confidence: Confidence) -> usize {
+    match confidence {
+        Confidence::Exact => 0,
+        Confidence::Template => 1,
+        Confidence::WrapperInferred => 2,
+        Confidence::Unresolved => 3,
+    }
+}
+
+impl Projection<'_> {
+    fn confidence(&self, call: usize) -> Confidence {
+        self.extraction.matched[call].map_or(Confidence::Unresolved, |found| found.confidence)
+    }
+
+    fn handler(&self, route: usize) -> Value {
+        let handler = &self.extraction.routes[route].handler;
+        json!({
+            "kind": handler.kind,
+            "syntaxId": handler.syntax_id,
+            "stableLookupKey": handler.stable_lookup_key,
+            "path": handler.document.path,
+            "lines": handler.lines,
+            "variant": handler.variant,
+            "layer": self.route_layers[route],
+        })
+    }
+
+    fn call_site(&self, call: usize) -> Value {
+        let site = &self.extraction.calls[call];
+        json!({
+            "document": site.document,
+            "range": site.range,
+            "lines": site.lines,
+            "callId": site.call_id,
+            "caller": site.caller,
+            "confidence": self.confidence(call),
+            "layer": self.call_layers[call],
+        })
+    }
+
+    /// The summary entries, one per interface, in client then server order.
+    pub(crate) fn summary(&self) -> Vec<Value> {
+        self.pairs
+            .iter()
+            .map(|pair| self.pair_summary(pair))
+            .collect()
+    }
+
+    fn pair_summary(&self, pair: &Pair) -> Value {
+        type End<'l> = (bool, Option<&'l str>);
+        fn end(layer: &Option<String>) -> End<'_> {
+            (layer.is_none(), layer.as_deref())
+        }
+        let mut ends: BTreeMap<(End<'_>, End<'_>), (BTreeSet<usize>, usize)> = BTreeMap::new();
+        let mut confidence = [0usize; 4];
+        let mut call_sites = 0;
+        for (route, calls) in &pair.matched {
+            for &call in calls {
+                let key = (
+                    end(&self.call_layers[call]),
+                    end(&self.route_layers[*route]),
+                );
+                let entry = ends.entry(key).or_default();
+                entry.0.insert(*route);
+                entry.1 += 1;
+                call_sites += 1;
+                confidence[confidence_slot(self.confidence(call))] += 1;
+            }
+        }
+        confidence[confidence_slot(Confidence::Unresolved)] += pair.client_only.len();
+        let ends: Vec<Value> = ends
+            .into_iter()
+            .map(|((client, server), (routes, sites))| {
+                json!({"clientLayer": client.1, "serverLayer": server.1,
+                    "routes": routes.len(), "callSites": sites})
+            })
+            .collect();
+        json!({
+            "client": pair.client,
+            "server": pair.server,
+            "kind": "http",
+            "ends": ends,
+            "wrappers": {
+                "callees": WRAPPER_CALLEES,
+                "prefix": {"client": "/api/", "server": "/api/checkouts/{root}/"},
+            },
+            "counts": {
+                "matchedRoutes": pair.matched.len(),
+                "callSites": call_sites,
+                "serverOnly": pair.server_only.len(),
+                "clientOnly": pair.client_only.len(),
+                "confidence": {
+                    "exact": confidence[0],
+                    "template": confidence[1],
+                    "wrapperInferred": confidence[2],
+                    "unresolved": confidence[3],
+                },
+            },
+        })
+    }
+
+    /// The items of the lists a page asks for, in interface order and then list order. An
+    /// absent filter selects everything.
+    pub(crate) fn rows<'s>(
+        &'s self,
+        client: Option<&'s str>,
+        server: Option<&'s str>,
+        list: Option<List>,
+    ) -> impl Iterator<Item = Row> + 's {
+        self.pairs
+            .iter()
+            .enumerate()
+            .filter(move |(_, pair)| {
+                client.is_none_or(|client| pair.client == client)
+                    && server.is_none_or(|server| pair.server == server)
+            })
+            .flat_map(move |(index, pair)| {
+                [
+                    (List::Matched, pair.matched.len()),
+                    (List::ServerOnly, pair.server_only.len()),
+                    (List::ClientOnly, pair.client_only.len()),
+                ]
+                .into_iter()
+                .filter(move |(wanted, _)| list.is_none_or(|list| list == *wanted))
+                .flat_map(move |(list, len)| {
+                    (0..len).map(move |at| Row {
+                        pair: index,
+                        list,
+                        at,
+                    })
+                })
+            })
+    }
+
+    pub(crate) fn item(&self, row: Row) -> Value {
+        let pair = &self.pairs[row.pair];
+        let entry = match row.list {
+            List::Matched => {
+                let (route, calls) = &pair.matched[row.at];
+                let best = calls
+                    .iter()
+                    .map(|&call| self.confidence(call))
+                    .min_by_key(|&confidence| confidence_slot(confidence))
+                    .unwrap_or(Confidence::Unresolved);
+                let found = &self.extraction.routes[*route];
+                json!({
+                    "method": found.method,
+                    "pathTemplate": found.path_template,
+                    "confidence": best,
+                    "handler": self.handler(*route),
+                    "callSites": calls.iter().map(|&call| self.call_site(call)).collect::<Vec<_>>(),
+                })
+            }
+            List::ServerOnly => {
+                let route = pair.server_only[row.at];
+                let found = &self.extraction.routes[route];
+                json!({
+                    "method": found.method,
+                    "pathTemplate": found.path_template,
+                    "handler": self.handler(route),
+                })
+            }
+            List::ClientOnly => {
+                let call = pair.client_only[row.at];
+                let site = &self.extraction.calls[call];
+                json!({
+                    "method": site.method,
+                    "pathTemplate": site.path_template,
+                    "confidence": Confidence::Unresolved,
+                    "callSite": self.call_site(call),
+                })
+            }
+        };
+        json!({"client": pair.client, "server": pair.server, "list": row.list.name(),
+            "entry": entry})
+    }
+}
+
 /// Splits a `/`-rooted template into segments. A trailing empty segment is dropped.
 pub(crate) fn segments(template: &str) -> Vec<Seg> {
     let mut parts: Vec<&str> = template.trim_start_matches('/').split('/').collect();
@@ -192,8 +497,9 @@ pub(crate) fn named_callable<'d>(doc: &'d DocumentInput, span: &Range) -> Option
 
 const TEST_SUPPORT_ATTRIBUTE: &str = "#[cfg(feature=\"test-support\")]";
 
+/// Whether the node is a Rust, JavaScript or TypeScript comment.
 pub(crate) fn comment(node: Node<'_>) -> bool {
-    matches!(node.kind(), "line_comment" | "block_comment")
+    matches!(node.kind(), "line_comment" | "block_comment" | "comment")
 }
 
 fn test_support_attribute(node: Node<'_>, source: &str) -> bool {

@@ -132,11 +132,9 @@ pub(crate) struct ArchitectureCore {
     /// `None` when this core was computed for one read that has no use for metrics.
     metrics: Option<Result<ArchitectureMetrics, CoreFailure>>,
     /// Every build manifest's app-detection outcome, before any rules file hides some.
-    #[cfg_attr(not(test), allow(dead_code))]
     app_candidates: Result<crate::apps::Candidates, CoreFailure>,
     /// Server routes and client calls, computed only for a checkout with two or more apps.
     /// `None` when this core was computed without a rules file.
-    #[cfg_attr(not(test), allow(dead_code))]
     interfaces: Option<Result<crate::interfaces::Extraction, CoreFailure>>,
     /// Finished summaries; one per valid role, aggregate and workbench choice.
     summaries: Mutex<BTreeMap<SummaryKey, Arc<serde_json::Value>>>,
@@ -170,7 +168,6 @@ impl ArchitectureCore {
     pub(crate) fn app_candidates(&self) -> Result<&crate::apps::Candidates> {
         self.app_candidates.as_ref().map_err(CoreFailure::error)
     }
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn interfaces(&self) -> Result<&crate::interfaces::Extraction> {
         match &self.interfaces {
             Some(interfaces) => interfaces.as_ref().map_err(CoreFailure::error),
@@ -323,13 +320,9 @@ impl ArchitectureCore {
                         snapshot.documents.len(),
                         crate::references::work::snapshot_bytes(&snapshot, check)?,
                     ));
-                Some(
-                    match crate::interfaces::extract(&snapshot, &mut work, check) {
-                        Ok(extraction) => Ok(extraction),
-                        Err(error) if CoreFailure::repeats(&error) => Err(CoreFailure::of(&error)),
-                        Err(error) => return Err(error),
-                    },
-                )
+                Some(kept(crate::interfaces::extract(
+                    &snapshot, &mut work, check,
+                ))?)
             }
             (Some(_), _) => Some(Ok(crate::interfaces::Extraction::default())),
         };
@@ -343,6 +336,15 @@ impl ArchitectureCore {
             interfaces,
             summaries: Mutex::default(),
         })
+    }
+}
+
+/// A part's outcome: a repeating failure is kept as the part's result, any other is returned.
+fn kept<T>(outcome: Result<T>) -> Result<std::result::Result<T, CoreFailure>> {
+    match outcome {
+        Ok(value) => Ok(Ok(value)),
+        Err(error) if CoreFailure::repeats(&error) => Ok(Err(CoreFailure::of(&error))),
+        Err(error) => Err(error),
     }
 }
 
@@ -433,4 +435,25 @@ fn measure_documents(
     }
     progress.check()?;
     Ok(documents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repeating_part_error_is_kept_and_answered_again_and_any_other_is_returned() {
+        let repeats = anyhow::anyhow!("bounded_work: interface extraction budget");
+        let failure = kept::<u8>(Err(repeats)).unwrap().unwrap_err();
+        assert_eq!(
+            failure.error().to_string(),
+            "bounded_work: interface extraction budget"
+        );
+        assert_eq!(failure.error().to_string(), failure.error().to_string());
+        assert_eq!(kept(Ok(7)).unwrap().unwrap(), 7);
+        for other in ["cancelled", "storage_busy: waiting"] {
+            let error = kept::<u8>(Err(anyhow::anyhow!(other))).unwrap_err();
+            assert_eq!(error.to_string(), other);
+        }
+    }
 }
