@@ -104,6 +104,10 @@ struct RawLayer {
     shared: Option<bool>,
     /// Browser presentation hint only (#391); never affects evaluation.
     display: Option<Spanned<String>>,
+    /// The app an ordered layer belongs to (#784).
+    app: Option<Spanned<String>>,
+    /// The apps a shared layer serves (#784).
+    apps: Option<Spanned<Vec<Spanned<String>>>>,
     #[serde(default)]
     paths: Vec<Spanned<String>>,
     #[serde(default)]
@@ -209,6 +213,8 @@ struct LayerPattern {
 struct Layer {
     order: Option<i64>,
     display: Option<String>,
+    app: Option<(String, std::ops::Range<usize>)>,
+    apps: Option<Vec<(String, std::ops::Range<usize>)>>,
     patterns: Vec<LayerPattern>,
     external: BTreeSet<ExternalSelector>,
     span: std::ops::Range<usize>,
@@ -320,6 +326,60 @@ fn pattern(text: &str, value: &Spanned<String>, path: bool, budget: &mut usize) 
     set.add(glob);
     set.build()
         .map_err(|e| error(text, value.span(), "glob", "token", e.to_string()))
+}
+fn app_name(text: &str, value: Spanned<String>) -> Result<(String, std::ops::Range<usize>)> {
+    let span = value.span();
+    let name = value.into_inner();
+    if name.trim().is_empty() {
+        return Err(error(
+            text,
+            span,
+            "schema",
+            "token",
+            "app name must not be blank",
+        ));
+    }
+    Ok((name, span))
+}
+fn app_names(
+    text: &str,
+    values: Spanned<Vec<Spanned<String>>>,
+) -> Result<Vec<(String, std::ops::Range<usize>)>> {
+    let list_span = values.span();
+    let values = values.into_inner();
+    if values.is_empty() {
+        return Err(error(
+            text,
+            list_span,
+            "schema",
+            "token",
+            "apps must name at least one app",
+        ));
+    }
+    if values.len() > COLLECTION_LIMIT {
+        return Err(error(
+            text,
+            values[COLLECTION_LIMIT].span(),
+            "too_large",
+            "token",
+            "apps collection exceeds 1024 entries",
+        ));
+    }
+    let mut names = Vec::with_capacity(values.len());
+    for value in values {
+        let (name, span) = app_name(text, value)?;
+        if names.iter().any(|(seen, _)| *seen == name) {
+            return Err(error(
+                text,
+                span,
+                "schema",
+                "token",
+                format!("app {name} is listed twice"),
+            ));
+        }
+        names.push((name, span));
+    }
+    Ok(names)
 }
 fn external_selectors(
     text: &str,
@@ -483,6 +543,26 @@ pub fn parse(text: &str) -> Result<Config> {
                 }
             })
             .transpose()?;
+        let app = layer.app.map(|v| app_name(text, v)).transpose()?;
+        if let (Some((_, span)), None) = (&app, layer.order) {
+            return Err(error(
+                text,
+                span.clone(),
+                "schema",
+                "token",
+                "app belongs on an ordered layer; a shared layer lists apps",
+            ));
+        }
+        let apps = layer.apps.map(|v| app_names(text, v)).transpose()?;
+        if let (Some(apps), Some(_)) = (&apps, layer.order) {
+            return Err(error(
+                text,
+                apps.first().map_or(span.clone(), |(_, s)| s.clone()),
+                "schema",
+                "token",
+                "apps belongs on a shared layer; an ordered layer names one app",
+            ));
+        }
         let mut globs = layer
             .paths
             .iter()
@@ -515,6 +595,8 @@ pub fn parse(text: &str) -> Result<Config> {
             Layer {
                 order: layer.order,
                 display,
+                app,
+                apps,
                 patterns: globs,
                 external,
                 span,
@@ -777,7 +859,9 @@ fn glob_matches(patterns: &[GlobSet], path: &str) -> bool {
 /// Browser-only authored inventory; does not change the closed rules payload.
 pub fn view_layers(config: &Config) -> Vec<Value> {
     config.layers.iter().map(|(name, layer)| {
-        json!({"name": name, "order": layer.order, "shared": layer.order.is_none(), "display": layer.display})
+        json!({"name": name, "order": layer.order, "shared": layer.order.is_none(), "display": layer.display,
+            "app": layer.app.as_ref().map(|(app, _)| app),
+            "apps": layer.apps.as_ref().map(|apps| apps.iter().map(|(app, _)| app).collect::<Vec<_>>())})
     }).collect()
 }
 
@@ -908,8 +992,138 @@ impl<'a> LayerMatcher<'a> {
     }
 }
 
+/// Which detected apps each layer belongs to (#784).
+pub(crate) struct AppScope<'a> {
+    config: &'a Config,
+    apps: &'a [crate::apps::App],
+}
+impl<'a> AppScope<'a> {
+    pub(crate) fn new(config: &'a Config, apps: &'a [crate::apps::App]) -> Self {
+        Self { config, apps }
+    }
+
+    fn index(&self, name: &str) -> Option<usize> {
+        self.apps.iter().position(|app| app.name == name)
+    }
+
+    /// The apps of layer `name`: an ordered layer's one app, or a shared layer's list.
+    pub(crate) fn layer(&self, name: &str) -> BTreeSet<usize> {
+        let Some(layer) = self.config.layers.get(name) else {
+            return BTreeSet::new();
+        };
+        if layer.order.is_some() {
+            return match &layer.app {
+                Some((app, _)) => self.index(app).into_iter().collect(),
+                None if self.apps.len() == 1 => BTreeSet::from([0]),
+                None => BTreeSet::new(),
+            };
+        }
+        match &layer.apps {
+            Some(apps) => apps.iter().filter_map(|(app, _)| self.index(app)).collect(),
+            None => (0..self.apps.len()).collect(),
+        }
+    }
+
+    /// The name of the app at `index`, as returned by [`AppScope::file`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn name(&self, index: usize) -> Option<&str> {
+        self.apps.get(index).map(|app| app.name.as_str())
+    }
+
+    /// Whether layers `a` and `b` can be compared: always with fewer than two apps.
+    pub(crate) fn share(&self, a: &str, b: &str) -> bool {
+        self.apps.len() < 2 || !self.layer(a).is_disjoint(&self.layer(b))
+    }
+
+    /// The app of `path`: the one app of its `layer`, otherwise the app whose root contains it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn file(&self, path: &str, layer: Option<&str>) -> Option<usize> {
+        if self.apps.is_empty() {
+            return None;
+        }
+        if let Some(layer) = layer {
+            let apps = self.layer(layer);
+            if apps.len() == 1 {
+                return apps.into_iter().next();
+            }
+        }
+        crate::apps::containing(self.apps, path)
+    }
+}
+
+/// Check every layer's `app` and `apps` against the detected apps; the first layer in name
+/// order with a problem wins.
+fn validate_apps(config: &Config, apps: &[crate::apps::App]) -> Result<()> {
+    for (layer_name, layer) in &config.layers {
+        let named: Vec<&(String, std::ops::Range<usize>)> = layer
+            .app
+            .iter()
+            .chain(layer.apps.iter().flatten())
+            .collect();
+        if apps.len() >= 2 && layer.order.is_some() && layer.app.is_none() {
+            return Err(error(
+                &config.text,
+                layer.span.clone(),
+                "schema",
+                "token",
+                format!(
+                    "layer {layer_name} must name its app: {} apps are detected",
+                    apps.len()
+                ),
+            ));
+        }
+        for (name, span) in named {
+            let matching: Vec<&crate::apps::App> =
+                apps.iter().filter(|app| app.name == *name).collect();
+            match matching.as_slice() {
+                [_] => {}
+                [] if apps.is_empty() => {
+                    return Err(error(
+                        &config.text,
+                        span.clone(),
+                        "reference",
+                        "token",
+                        format!("layer {layer_name} names app {name}, but no app is detected"),
+                    ));
+                }
+                [] => {
+                    let detected = apps
+                        .iter()
+                        .map(|app| app.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(error(
+                        &config.text,
+                        span.clone(),
+                        "reference",
+                        "token",
+                        format!(
+                            "layer {layer_name} names app {name}, which is not detected (detected: {detected})"
+                        ),
+                    ));
+                }
+                many => {
+                    let manifests = many
+                        .iter()
+                        .map(|app| app.manifest.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" and ");
+                    return Err(error(
+                        &config.text,
+                        span.clone(),
+                        "ambiguity",
+                        "token",
+                        format!("app {name} is detected by {manifests}"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 fn layer_status(
     config: &Config,
+    scope: &AppScope,
     source: Option<&str>,
     target: Option<&str>,
 ) -> (&'static str, Vec<String>) {
@@ -918,7 +1132,13 @@ fn layer_status(
     };
     let from = &config.layers[s];
     let to = &config.layers[t];
-    if s == t || to.order.is_none() {
+    if s == t {
+        return ("conforms", vec![]);
+    }
+    if !scope.share(s, t) {
+        return ("unknown", vec!["cross_app".into()]);
+    }
+    if to.order.is_none() {
         return ("conforms", vec![]);
     }
     let policy = match (from.order, to.order) {
@@ -1742,6 +1962,15 @@ pub(crate) struct RulesBase {
     declarations: Vec<Value>,
     test_declarations: Vec<Value>,
     work_used: usize,
+    apps: Vec<crate::apps::App>,
+    unread_manifests: usize,
+}
+
+impl RulesBase {
+    /// The apps detected for this snapshot, in manifest-path order.
+    pub(crate) fn apps(&self) -> &[crate::apps::App] {
+        &self.apps
+    }
 }
 
 /// Evaluate every document's declaration rules once; `evaluate_prepared` selects from them.
@@ -1804,6 +2033,23 @@ fn prepare_with_workers(
         );
         documents.push(doc);
     }
+    let detected = {
+        let document_paths: BTreeSet<&str> = snapshot
+            .documents
+            .iter()
+            .map(|doc| doc.key.path.as_str())
+            .collect();
+        let candidates =
+            crate::apps::candidates(&snapshot.manifests, &document_paths, &mut work, check)?;
+        let manifest_paths: Vec<&str> = candidates
+            .manifests
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect();
+        let hidden = hidden_layer_paths(config, &manifest_paths, check)?;
+        crate::apps::detect(&candidates, &hidden)
+    };
+    validate_apps(config, &detected.apps)?;
     let mut targets: Targets<'_> = BTreeMap::new();
     let semantic = snapshot
         .documents
@@ -1834,6 +2080,8 @@ fn prepare_with_workers(
         declarations,
         test_declarations,
         work_used: work.used,
+        apps: detected.apps,
+        unread_manifests: detected.unread,
     })
 }
 
@@ -1864,6 +2112,7 @@ pub(crate) fn evaluate_prepared<'a>(
         work.charge(modules.len().saturating_mul(layer_patterns)),
         "bounded_work: layer assignment pattern budget"
     );
+    let scope = AppScope::new(config, base.apps());
     let mut matcher = LayerMatcher::new(config);
     let mut unassigned = Vec::new();
     let mut unassigned_files = 0usize;
@@ -1965,7 +2214,8 @@ pub(crate) fn evaluate_prepared<'a>(
             }
             let rows = if test { &mut test_only } else { &mut instances };
             if !config.layers.is_empty() {
-                let (status, mut unresolved) = layer_status(config, source_layer, target_layer);
+                let (status, mut unresolved) =
+                    layer_status(config, &scope, source_layer, target_layer);
                 if test {
                     unresolved.push("test_only".into());
                 }
@@ -2081,6 +2331,13 @@ pub(crate) fn evaluate_prepared<'a>(
     check()?;
     let partial_files = &refs.data["partialFiles"];
     let mut limitations = limitations(semantic);
+    if base.unread_manifests > 0 {
+        let n = base.unread_manifests;
+        limitations.push(format!(
+            "{n} build manifest{} could not be read for app detection (malformed or over the size bound); they detect no app.",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
     let partial = partial_files.as_array().map_or(0, Vec::len);
     if partial > 0 {
         limitations.push(crate::syntax_bounds::limitation(partial));
@@ -2558,6 +2815,18 @@ mod display_tests {
     }
 
     #[test]
+    fn view_layers_carry_the_authored_app_and_apps_or_null() {
+        let config = parse("version=1\n[layers.a]\napp='svc'\norder=1\npaths=['a/**']\n[layers.b]\napps=['svc','ui']\nshared=true\npaths=['b/**']\n[layers.c]\norder=2\npaths=['c/**']\n").unwrap();
+        let layers = view_layers(&config);
+        let field = |key: &str| -> Vec<Value> { layers.iter().map(|l| l[key].clone()).collect() };
+        assert_eq!(field("app"), [json!("svc"), Value::Null, Value::Null]);
+        assert_eq!(
+            field("apps"),
+            [Value::Null, json!(["svc", "ui"]), Value::Null]
+        );
+    }
+
+    #[test]
     fn layer_display_hint_leaves_assignment_inputs_unchanged() {
         let plain = parse("version=1\n[layers.a]\norder=1\npaths=['a/**']\n").unwrap();
         let hinted =
@@ -2590,5 +2859,111 @@ mod display_tests {
             panic!("non-string display value must be refused")
         };
         assert_eq!(diagnostic(&error).expect("typed")["code"], "invalid_rules");
+    }
+}
+
+#[cfg(test)]
+mod app_scope_tests {
+    use super::*;
+    use crate::apps::{App, AppKind};
+
+    fn app(name: &str, kind: AppKind, root: &str) -> App {
+        App {
+            name: name.into(),
+            kind,
+            manifest: format!("{root}/manifest"),
+            root: root.into(),
+            entries: vec![],
+        }
+    }
+
+    const TWO_APPS: &str = "version=1\n[layers.up]\napp='svc'\norder=1\npaths=['svc/**']\n[layers.web]\napp='ui'\norder=1\npaths=['ui/**']\n[layers.base]\nshared=true\napps=['svc']\npaths=['base/**']\n";
+
+    #[test]
+    fn a_python_app_validates() {
+        let config = parse(TWO_APPS).unwrap();
+        let apps = [
+            app("svc", AppKind::Python, "svc"),
+            app("ui", AppKind::Npm, "ui"),
+        ];
+        validate_apps(&config, &apps).unwrap();
+    }
+
+    #[test]
+    fn scope_layer_share_and_file() {
+        let config = parse(TWO_APPS).unwrap();
+        let apps = [
+            app("svc", AppKind::Cargo, "svc"),
+            app("ui", AppKind::Npm, "ui"),
+        ];
+        let scope = AppScope::new(&config, &apps);
+        assert_eq!(scope.layer("up"), BTreeSet::from([0]));
+        assert_eq!(scope.layer("base"), BTreeSet::from([0]));
+        assert!(scope.share("up", "base"));
+        assert!(!scope.share("web", "base"));
+        assert!(!scope.share("up", "web"));
+        assert_eq!(scope.file("ui/x.js", Some("up")), Some(0));
+        assert_eq!(scope.file("ui/x.js", None), Some(1));
+        assert_eq!(scope.file("other/x", None), None);
+        let none = AppScope::new(&config, &[]);
+        assert_eq!(none.file("ui/x.js", None), None);
+        assert!(none.share("up", "web"));
+    }
+
+    #[test]
+    fn a_repeated_app_is_located_at_the_repeat() {
+        let text = "version=1\n[layers.s]\nshared=true\napps=[\n'x',\n'x'\n]\npaths=['a']\n";
+        let d = diagnostic(&parse(text).err().unwrap()).unwrap();
+        assert_eq!(d["kind"], "schema");
+        assert_eq!(d["line"], 6);
+    }
+
+    #[test]
+    fn too_many_apps_are_too_large_at_the_extra_entry() {
+        let entries: String = (0..=COLLECTION_LIMIT)
+            .map(|i| format!("'a{i}',\n"))
+            .collect();
+        let text = format!("version=1\n[layers.s]\nshared=true\napps=[\n{entries}]\npaths=['a']\n");
+        let d = diagnostic(&parse(&text).err().unwrap()).unwrap();
+        assert_eq!(d["kind"], "too_large");
+        assert_eq!(d["line"], 5 + COLLECTION_LIMIT);
+    }
+
+    #[test]
+    fn the_first_bad_layer_in_name_order_wins() {
+        let text = "version=1\n[layers.zeta]\napp='nope'\norder=1\npaths=['z']\n[layers.alpha]\napp='nada'\norder=2\npaths=['a']\n";
+        let config = parse(text).unwrap();
+        let apps = [app("svc", AppKind::Cargo, "svc")];
+        let d = diagnostic(&validate_apps(&config, &apps).unwrap_err()).unwrap();
+        assert_eq!(d["kind"], "reference");
+        assert_eq!(d["line"], 7);
+    }
+
+    #[test]
+    fn scope_names_the_app_of_a_file_index() {
+        let config = parse(TWO_APPS).unwrap();
+        let apps = [
+            app("svc", AppKind::Cargo, "svc"),
+            app("ui", AppKind::Npm, "ui"),
+        ];
+        let scope = AppScope::new(&config, &apps);
+        let index = scope.file("ui/x.js", None).unwrap();
+        assert_eq!(scope.name(index), Some("ui"));
+        assert_eq!(scope.name(2), None);
+    }
+
+    #[test]
+    fn app_keys_are_checked_syntactically() {
+        for (extra, line) in [
+            ("[layers.s]\nshared=true\napp='x'\npaths=['a']\n", 4),
+            ("[layers.s]\norder=1\napps=['x']\npaths=['a']\n", 4),
+            ("[layers.s]\norder=1\napp=' '\npaths=['a']\n", 4),
+            ("[layers.s]\nshared=true\napps=[]\npaths=['a']\n", 4),
+        ] {
+            let error = parse(&format!("version=1\n{extra}")).err().unwrap();
+            let d = diagnostic(&error).unwrap();
+            assert_eq!(d["kind"], "schema", "{extra}");
+            assert_eq!(d["line"], line, "{extra}");
+        }
     }
 }

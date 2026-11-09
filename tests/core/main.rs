@@ -12,6 +12,7 @@ mod common;
 #[path = "../common/graph_fixtures.rs"]
 mod graph_fixtures;
 
+mod apps;
 mod architecture_external;
 mod architecture_semantic;
 mod architecture_store;
