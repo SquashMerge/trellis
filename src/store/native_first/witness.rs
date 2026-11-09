@@ -1548,6 +1548,24 @@ pub(crate) fn source_authority(
         "witness target changed"
     );
     if cursor.phase == 0 {
+        // A basis an unavailable S published holds no evidence to copy or witness against
+        // (#826): re-join the whole retained selection through FULL.
+        let unavailable: bool = db
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 \
+                 AND state='failed' AND substr(diagnostic,1,length(?3)+1)=?3||':')",
+            )?
+            .query_row(
+                params![
+                    semantic_pin_key(selection.basis_pin),
+                    selection.producer_id,
+                    super::UNAVAILABLE_DIAGNOSTIC
+                ],
+                |r| r.get(0),
+            )?;
+        if unavailable {
+            return Ok(AuthorityStep::Full("basis_unavailable"));
+        }
         let length: i64 = db
             .prepare_cached(
                 "SELECT length(descriptor_bytes) FROM semantic_raw_batches WHERE batch_id=?1",

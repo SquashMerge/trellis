@@ -969,6 +969,8 @@ pub(crate) fn note_local_witness_outcome(fallback: Option<&str>) {
         Some(reason) => {
             work.full_fallbacks += 1;
             work.fallback_reasons.push(reason.to_owned());
+            // FULL copies nothing: an abandoned witnessed attempt's copies are not published.
+            work.copied_documents.clear();
         }
         None => work.witnessed_rejoins += 1,
     });

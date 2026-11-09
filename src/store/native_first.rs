@@ -49,6 +49,11 @@ pub(crate) enum PreparedOutput {
     },
 }
 
+/// The diagnostic prefix of every coverage tuple an unavailable S publishes as `failed`.
+/// Such a tuple records that S could not rejoin the retained selection, not the producer's
+/// evidence, so a later S never copies it (#826): it re-joins the document instead.
+pub(crate) const UNAVAILABLE_DIAGNOSTIC: &str = "selected raw capture unavailable";
+
 fn parse_pin(key: &str) -> Result<IndexPin> {
     let rest = key
         .strip_prefix("pin:v1:")

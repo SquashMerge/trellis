@@ -9194,6 +9194,188 @@ fn witnessed_local_rejoin_keeps_a_method_direct_in_an_unchanged_document() {
     );
 }
 
+/// #826: a reference rust-analyzer batch where `src/a.rs` depends on `src/b.rs` (so an edit to
+/// B makes A a pending dependent the witness settles) and `src/c.rs` depends on nothing.
+fn issue_826_world() -> (World, (PathBuf, String)) {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+                ("src/c.rs", "fn other() { }\n"),
+            ],
+        )
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g) = (symbol("r()."), symbol("impl#[S]f()."), symbol("g()."));
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 15, 16], &[], &f, 0)
+                .occurrence(&[0, 20, 21], &[], &g, 0)
+                .symbol(&r, 17, &[]),
+            DocSpec::new("src/b.rs")
+                .occurrence(&[1, 12, 13], &[], &f, 1)
+                .occurrence(&[2, 3, 4], &[], &g, 1)
+                .symbol(&f, 26, &[])
+                .symbol(&g, 17, &[]),
+            DocSpec::new("src/c.rs"),
+        ],
+    );
+    let descriptor = world.write(&fixture);
+    drop(world.publish(&descriptor).unwrap());
+    (world, descriptor)
+}
+
+/// The live budget (`unit_expansion_bytes`) for #826's fixture, 192 KiB: FULL completes at
+/// 128 KiB (not at 64 KiB), the witnessed settlement needs more than 256 KiB (it completes
+/// at 512 KiB), as at real size the witness's reservation for a pending dependent does.
+const ISSUE_826_LIMITS: &str = r#"{"unit_expansion_bytes":196608}"#;
+
+fn issue_826_env(counts: &Path, limits: Option<&str>) {
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
+    unsafe {
+        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", counts);
+        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+        match limits {
+            Some(limits) => std::env::set_var("TRELLIS_TEST_SEMANTIC_LIMITS", limits),
+            None => std::env::remove_var("TRELLIS_TEST_SEMANTIC_LIMITS"),
+        }
+    }
+}
+
+fn assert_head_matches_full(world: &World, descriptor: &(PathBuf, String)) {
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_delayed_import_matches_full(world, descriptor);
+}
+
+/// #826: a witnessed S that exceeds a resource limit takes the FULL fallback, so the head
+/// is row-equal to FULL (the in-S oracle is on) with no unavailable coverage. Control: with
+/// production limits the same edit is witnessed, so the reduced limit is what fell back.
+#[test]
+fn witness_limit_falls_back_to_full() {
+    let edit = "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n// edited\n";
+    for limits in [None, Some(ISSUE_826_LIMITS)] {
+        let (world, descriptor) = issue_826_world();
+        let counts = world._state.path().join("work-counts.json");
+        issue_826_env(&counts, limits);
+        let work = local_edit(&world, "src/b.rs", edit, &counts);
+        if limits.is_some() {
+            assert_eq!(work["witnessedRejoins"], 0, "{work}");
+            assert_eq!(work["fullFallbacks"], 1, "{work}");
+            assert_eq!(
+                work["fallbackReasons"],
+                json!(["witness_limit_exceeded"]),
+                "{work}"
+            );
+        } else {
+            assert_eq!(work["witnessedRejoins"], 1, "{work}");
+            assert_eq!(work["fullFallbacks"], 0, "{work}");
+        }
+        assert_head_matches_full(&world, &descriptor);
+    }
+}
+
+/// #826: a head an unavailable S published (every requested tuple `failed`, the raw selection
+/// retained) is repaired by the next S, even for an unrelated edit: the failed tuples are not
+/// copied as basis rows, the selection is re-joined through FULL, and the head equals FULL.
+#[test]
+fn unavailable_basis_is_rejoined_not_copied() {
+    let (world, descriptor) = issue_826_world();
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&counts, None);
+    // SAFETY: as above; the oracle would (rightly) refuse the injected unavailable S.
+    unsafe { std::env::remove_var("TRELLIS_TEST_LOCAL_FULL_ORACLE") };
+    world
+        .store
+        .with_semantic_content_fault_for_tests(|| {
+            Ok(local_edit(
+                &world,
+                "src/b.rs",
+                "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n// edited\n",
+                &counts,
+            ))
+        })
+        .unwrap();
+    assert_eq!(world.rejoin_failures(), 3);
+    assert_eq!(
+        world.count(&format!(
+            "SELECT COUNT(*) FROM semantic_revision_raw_selections WHERE revision_id='{}'",
+            world.head_key()
+        )),
+        1
+    );
+    issue_826_env(&counts, None);
+    let work = local_edit(&world, "src/c.rs", "fn other() { let _ = 1; }\n", &counts);
+    assert_eq!(work["copiedDocuments"], json!([]), "{work}");
+    assert_eq!(
+        work["fallbackReasons"],
+        json!(["basis_unavailable"]),
+        "{work}"
+    );
+    assert_head_matches_full(&world, &descriptor);
+    // The repaired head is an ordinary basis again: the next unrelated edit copies A and B.
+    let work = local_edit(&world, "src/c.rs", "fn other() { let _ = 2; }\n", &counts);
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_head_matches_full(&world, &descriptor);
+}
+
+/// #826: with the oracle on, an S that ends unavailable where the independent FULL rejoin
+/// succeeds is the typed oracle mismatch, and publishes nothing.
+#[test]
+fn oracle_catches_unavailable_when_full_succeeds() {
+    let (world, _) = issue_826_world();
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&counts, None);
+    write_files(&world.root, &[("src/c.rs", "fn other() { let _ = 1; }\n")]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let head = world.store.index_baseline().unwrap();
+    let error = world
+        .store
+        .with_semantic_content_fault_for_tests(|| {
+            world.store.catch_up_semantic_for_tests(&world.cancel)
+        })
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("independent FULL rejoin oracle"),
+        "{error:#}"
+    );
+    assert_eq!(world.store.index_baseline().unwrap(), head);
+    assert!(world.store.semantic_catch_up_pending_for_tests().unwrap());
+}
+
+/// #826 control for the oracle: FULL's own resource bound is a typed unavailable outcome the
+/// unbounded oracle does not flag, so S still publishes it (`failed`, never partial rows).
+#[test]
+fn full_limit_stays_unavailable_under_the_oracle() {
+    let (world, _) = issue_826_world();
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&counts, Some(r#"{"unit_expansion_bytes":4096}"#));
+    local_edit(&world, "src/c.rs", "fn other() { let _ = 1; }\n", &counts);
+    assert_eq!(world.rejoin_failures(), 3);
+    assert_eq!(
+        world.count(&format!(
+            "SELECT COUNT(*) FROM semantic_provenance p JOIN semantic_coverage c ON c.tuple_id=p.tuple_id WHERE c.revision_id='{}'",
+            world.head_key()
+        )),
+        0
+    );
+}
+
 /// A first spill during semantic rejoin must be visible before that rejoin finishes.
 #[test]
 fn witnessed_semantic_spill_marks_readers_before_commit() {
