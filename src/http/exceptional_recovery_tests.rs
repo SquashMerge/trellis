@@ -1,7 +1,16 @@
 use super::*;
 use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
 
-fn startup_queue_fixture(old_schema: bool, changed_device: bool) {
+#[derive(Clone, Copy, PartialEq)]
+enum StoredRoot {
+    Unchanged,
+    /// A reboot renumbered `st_dev` (APFS) while the root inode stayed (#813).
+    OtherDevice,
+    /// The stored root inode differs: a real replacement.
+    OtherInode,
+}
+
+fn startup_queue_fixture(old_schema: bool, stored: StoredRoot) {
     use std::os::unix::fs::MetadataExt;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -25,27 +34,37 @@ fn startup_queue_fixture(old_schema: bool, changed_device: bool) {
 
     let index_path = roots.index_db(&identity);
     let index_inode = std::fs::metadata(&index_path).unwrap().ino();
+    let other_device = (identity.device ^ 1).to_string();
     {
         let db = rusqlite::Connection::open(&index_path).unwrap();
         if old_schema {
             // Only the obsolete format marker is read before discarding this index.
             db.execute_batch("PRAGMA ignore_check_constraints=ON; PRAGMA user_version=10; UPDATE index_metadata SET schema_version=10;").unwrap();
         }
-        if changed_device {
-            // A reboot may change the device ID while the root inode stays the same.
-            db.execute(
-                "UPDATE index_metadata SET root_device=?1 WHERE singleton=1",
-                [(identity.device ^ 1).to_string()],
-            )
-            .unwrap();
-            let inode: String = db
-                .query_row(
-                    "SELECT root_inode FROM index_metadata WHERE singleton=1",
-                    [],
-                    |row| row.get(0),
+        match stored {
+            StoredRoot::Unchanged => {}
+            StoredRoot::OtherDevice => {
+                // Both the index and the queued row were written before the reboot.
+                db.execute(
+                    "UPDATE index_metadata SET root_device=?1 WHERE singleton=1",
+                    [&other_device],
                 )
                 .unwrap();
-            assert_eq!(inode, identity.inode.to_string());
+                let queue = rusqlite::Connection::open(&queue_path).unwrap();
+                queue
+                    .execute(
+                        "UPDATE requests SET root_device=?1 WHERE id=?2",
+                        [&other_device, &accepted.id],
+                    )
+                    .unwrap();
+            }
+            StoredRoot::OtherInode => {
+                db.execute(
+                    "UPDATE index_metadata SET root_inode=?1 WHERE singleton=1",
+                    [(identity.inode ^ 1).to_string()],
+                )
+                .unwrap();
+            }
         }
     }
 
@@ -73,12 +92,32 @@ fn startup_queue_fixture(old_schema: bool, changed_device: bool) {
     assert_eq!(row.id, accepted.id);
     assert_eq!(row.seq, accepted.seq);
     assert_eq!(row.options_json, accepted.options_json);
-    assert_ne!(std::fs::metadata(&index_path).unwrap().ino(), index_inode);
-    assert_ne!(
-        row.revision.unwrap().index_generation,
-        prior.index_generation
-    );
+    assert_eq!(row.root_device, identity.device.to_string());
+    let recreated = old_schema || stored == StoredRoot::OtherInode;
+    let generation = row.revision.unwrap().index_generation;
+    if recreated {
+        assert_ne!(std::fs::metadata(&index_path).unwrap().ino(), index_inode);
+        assert_ne!(generation, prior.index_generation);
+    } else {
+        // Reused in place: same file, same generation, no recreation.
+        assert_eq!(std::fs::metadata(&index_path).unwrap().ino(), index_inode);
+        assert_eq!(generation, prior.index_generation);
+        assert!(!store.is_root_replaced() && !store.is_recreate_pending());
+    }
     assert_eq!(row.revision.unwrap(), store.status().unwrap().revision);
+    let db = rusqlite::Connection::open(&index_path).unwrap();
+    let persisted: (String, String) = db
+        .query_row(
+            "SELECT root_device,root_inode FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    // The writer adopts the current device of the same root, or a recreation records it.
+    assert_eq!(
+        persisted,
+        (identity.device.to_string(), identity.inode.to_string())
+    );
     assert!(store.source_at("a.js", None).unwrap().is_some());
     state.worker_step().unwrap();
     assert_eq!(
@@ -89,17 +128,92 @@ fn startup_queue_fixture(old_schema: bool, changed_device: bool) {
 
 #[test]
 fn old_schema_at_startup_completes_an_existing_queued_request() {
-    startup_queue_fixture(true, false);
+    startup_queue_fixture(true, StoredRoot::Unchanged);
 }
 
 #[test]
-fn changed_root_device_with_same_inode_completes_an_existing_queued_request() {
-    startup_queue_fixture(false, true);
+fn changed_root_device_with_same_inode_reuses_the_index_and_runs_the_queued_request() {
+    startup_queue_fixture(false, StoredRoot::OtherDevice);
 }
 
 #[test]
 fn old_schema_and_changed_root_device_complete_an_existing_queued_request() {
-    startup_queue_fixture(true, true);
+    startup_queue_fixture(true, StoredRoot::OtherDevice);
+}
+
+#[test]
+fn changed_root_inode_recreates_the_index_and_completes_the_queued_request() {
+    startup_queue_fixture(false, StoredRoot::OtherInode);
+}
+
+/// A terminal request written before a reboot stays this checkout's latest job (#813): settlement
+/// leaves terminal rows untouched, so the current-job lookup must not filter on `st_dev`.
+#[test]
+fn a_terminal_request_before_a_device_only_drift_stays_the_current_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let state_root = tmp.path().join("state");
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let addr: std::net::SocketAddr = "127.0.0.1:7331".parse().unwrap();
+    let options = IndexOptions::new(root.clone());
+    let old = crate::testing::retry_admission(|| Store::open_for_tests(&state_root, &root));
+    let accepted = old.enqueue_request(&options, None).unwrap();
+    let before = new(old.clone(), options.clone(), token.into(), addr).unwrap();
+    before.worker_started.store(true, Ordering::Release);
+    before.worker_step().unwrap();
+    let done = old.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(done.state, "done");
+    let queue_path = old.request_db_path();
+    let index_path = queue_path.with_file_name("index.db");
+    let other_device = (WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .device
+        ^ 1)
+    .to_string();
+    drop(before);
+    drop(old);
+    for (path, sql) in [
+        (&index_path, "UPDATE index_metadata SET root_device=?1"),
+        (&queue_path, "UPDATE requests SET root_device=?1"),
+    ] {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute(sql, [&other_device])
+            .unwrap();
+    }
+
+    let store = crate::testing::retry_admission(|| Store::open_for_tests(&state_root, &root));
+    let state = new(store.clone(), options, token.into(), addr).unwrap();
+    state.worker_started.store(true, Ordering::Release);
+    state.worker_step().unwrap();
+    let terminal = store.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(
+        (terminal.state.as_str(), terminal.revision),
+        ("done", done.revision)
+    );
+    assert_eq!(
+        terminal.root_device, other_device,
+        "terminal rows stay immutable"
+    );
+    assert_eq!(
+        store.current_request().unwrap().map(|row| row.id),
+        Some(accepted.id.clone())
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let Json(job) = runtime
+        .block_on(current_job(State(state.clone())))
+        .map_err(|error| error.1)
+        .unwrap();
+    let job = job.expect("GET /api/jobs/current reports the latest job");
+    assert_eq!(
+        (job.id.as_str(), job.state.as_str()),
+        (accepted.id.as_str(), "done")
+    );
 }
 
 pub(super) fn fixture() -> (

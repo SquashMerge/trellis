@@ -1254,7 +1254,10 @@ table by `basisRef`; check accepts a `status` filter, its `limit` counts instanc
 per page and each check instance keeps one evidence entry. Under the
 [#769 amendment](mcp-readonly-pilot-contract.md#amendment-769-rules-tools-point-to-the-next-call),
 a check instance that omits evidence carries `nextCall`, the ready-made
-`trellis_rules_explain` arguments that show the rest.
+`trellis_rules_explain` arguments that show the rest. Under the
+[#714 amendment](mcp-readonly-pilot-contract.md#amendment-714-rules-check-pages-deviations-first),
+MCP check pages each instance array by status, deviations first, then unknowns, then
+conformances.
 
 ### Classified reference evidence (#785)
 

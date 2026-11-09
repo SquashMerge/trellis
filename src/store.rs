@@ -13438,18 +13438,16 @@ impl Store {
             count == 1,
             "incompatible_index: index root identity is not a singleton"
         );
-        let device = self.identity.device.to_string();
+        // The persisted root identity is the spelling and inode, never `st_dev`: APFS
+        // renumbers it across reboots, so a device-only difference is the same root (#813).
+        // `root_device` must still be text; the writer's startup attestation adopts the
+        // current device (`adopt_root_device`).
         let inode = self.identity.inode.to_string();
         for (column, expected, mismatch) in [
             (
                 "root_spelling",
                 self.workspace_root.as_bytes(),
                 "root_key_collision: index belongs to a different spelling",
-            ),
-            (
-                "root_device",
-                device.as_bytes(),
-                "root_changed: index root identity mismatch",
             ),
             (
                 "root_inode",
@@ -13736,8 +13734,9 @@ impl Store {
             row.2 == self.workspace_root,
             "root_key_collision: index belongs to a different spelling"
         );
+        // Spelling and inode are the persisted root identity; `root_device` (row.3) is not (#813).
         ensure!(
-            row.3 == self.identity.device.to_string() && row.4 == self.identity.inode.to_string(),
+            row.4 == self.identity.inode.to_string(),
             "root_changed: index root identity mismatch"
         );
         let pin: IndexPin = serde_json::from_value(
@@ -14114,6 +14113,7 @@ impl Store {
         committed_pin: IndexPin,
     ) -> Result<()> {
         writer.belongs_to(&self.identity)?;
+        self.adopt_root_device(writer)?;
         let db = self.cache()?;
         storage_result(db.execute_batch("BEGIN DEFERRED"))?;
         begin_read_snapshot(
@@ -14130,6 +14130,23 @@ impl Store {
         writer.belongs_to(&self.identity)?;
         *self.reconciled_writer.lock().unwrap() = Some(writer.incarnation);
         self.recovery_required.store(false, Ordering::Release);
+        Ok(())
+    }
+    /// Rewrite a stored `root_device` that differs from the captured root only in device
+    /// (#813). APFS renumbers `st_dev` across reboots; spelling and inode are the persisted
+    /// identity, so the index is the same root's and is kept. One UPDATE, so it is atomic;
+    /// a stored identity of another spelling or inode is left for the root checks to refuse.
+    fn adopt_root_device(&self, writer: &topology::WriterGuard) -> Result<()> {
+        writer.belongs_to(&self.identity)?;
+        let db = self.cache_write()?;
+        storage_result(db.execute(
+            "UPDATE index_metadata SET root_device=?1 WHERE singleton=1 AND root_spelling=?2 AND root_inode=?3 AND root_device<>?1",
+            params![
+                self.identity.device.to_string(),
+                self.workspace_root,
+                self.identity.inode.to_string()
+            ],
+        ))?;
         Ok(())
     }
     /// The public Store::claim_request entry point must refuse pre-COMMIT

@@ -1402,16 +1402,12 @@ impl Store {
         let Some((_guard, db)) = self.existing_request_connection()? else {
             return Ok(Vec::new());
         };
+        // By inode only (#813): the producer state sweep may run before startup settlement
+        // adopts a pending row's drifted `st_dev`, and must still keep its inputs.
         let mut statement = db.prepare(&format!(
-            "SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND request_kind='semanticImport' AND root_device=?1 AND root_inode=?2 ORDER BY seq"
+            "SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND request_kind='semanticImport' AND root_inode=?1 ORDER BY seq"
         ))?;
-        let rows = statement.query_map(
-            params![
-                self.identity.device.to_string(),
-                self.identity.inode.to_string()
-            ],
-            read,
-        )?;
+        let rows = statement.query_map(params![self.identity.inode.to_string()], read)?;
         let mut pending = Vec::new();
         for row in rows {
             if let Ok(SemanticImportJob::Generated(options)) = row?.semantic_job() {
@@ -1614,8 +1610,10 @@ impl Store {
                     return Ok(None);
                 };
                 let row = super::storage_result(db.query_row(
-                    &format!("SELECT {COLUMNS} FROM requests WHERE root_device=?1 AND root_inode=?2 ORDER BY seq DESC LIMIT 1"),
-                    params![self.identity.device.to_string(), self.identity.inode.to_string()],
+                    // By inode only (#813): a terminal row written before a reboot keeps its
+                    // old `st_dev` and stays this root's latest job.
+                    &format!("SELECT {COLUMNS} FROM requests WHERE root_inode=?1 ORDER BY seq DESC LIMIT 1"),
+                    params![self.identity.inode.to_string()],
                     read,
                 ).optional())?;
                 self.verify_request_root(&row)?;
@@ -1636,9 +1634,10 @@ impl Store {
     fn verify_request_root(&self, row: &Option<Request>) -> Result<()> {
         self.identity.verify()?;
         if let Some(row) = row {
+            // A row's persisted root is its inode (#813): one that differs only in `st_dev` is
+            // this root after a reboot, adopted by the next foreign-root settlement.
             ensure!(
-                row.root_device == self.identity.device.to_string()
-                    && row.root_inode == self.identity.inode.to_string(),
+                row.root_inode == self.identity.inode.to_string(),
                 "root_changed: request belongs to another root"
             );
         }
@@ -1854,6 +1853,17 @@ impl Store {
                     db.transaction_with_behavior(TransactionBehavior::Immediate),
                 )?;
                 self.identity.verify()?;
+                // The persisted root identity is the inode within this path-keyed queue, never
+                // `st_dev`: APFS renumbers it across reboots (#813). A pending row that differs
+                // only in device is this root's and is adopted in this transaction; the
+                // existing crash recovery then reclaims a row that was running.
+                super::storage_result(tx.execute(
+                    "UPDATE requests SET root_device=?1 WHERE state IN ('queued','running') AND root_inode=?2 AND root_device<>?1",
+                    params![
+                        self.identity.device.to_string(),
+                        self.identity.inode.to_string()
+                    ],
+                ))?;
                 let affected: Vec<Request> = {
                     let mut statement = super::storage_result(tx.prepare(&format!(
                         "SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND (root_device<>?1 OR root_inode<>?2) ORDER BY seq"
