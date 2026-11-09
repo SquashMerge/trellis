@@ -2356,12 +2356,12 @@ impl EvidenceResponse {
             .map(|((app, counted), (file_count, unassigned, languages))| {
                 serde_json::json!({
                     "name": app.name, "kind": app.kind, "manifest": app.manifest,
-                    "roots": [app.root], "entries": app.entries,
+                    "roots": app.roots, "entries": app.entries,
                     "languages": crate::semantic_evidence::LANGUAGE_ORDER
                         .iter()
                         .filter(|language| languages.contains(**language))
                         .collect::<Vec<_>>(),
-                    "fileCount": file_count, "source": "manifest",
+                    "fileCount": file_count, "source": app.source,
                     "counts": counted["counts"], "unassignedFileCount": unassigned
                 })
             })

@@ -729,3 +729,288 @@ fn the_architecture_summary_lists_a_python_app_with_its_kind_and_entries() {
     assert_eq!(svc["entries"], json!(["svc.main"]));
     assert_eq!(svc["languages"], json!(["python"]));
 }
+
+fn summary(files: &[(&str, &str)]) -> Value {
+    let (_state, _root, store, pin) = publish(files);
+    let response = store.evidence_response().unwrap();
+    let summary = response
+        .architecture_view(
+            &MetricsOptions {
+                pin: Some(pin),
+                aggregate: "max".into(),
+                ..Default::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    response.finish(summary).unwrap()
+}
+
+fn app_named<'a>(apps: &'a Value, name: &str) -> &'a Value {
+    apps.as_array()
+        .unwrap()
+        .iter()
+        .find(|app| app["name"] == name)
+        .unwrap_or_else(|| panic!("no app {name} in {apps}"))
+}
+
+fn module_app<'a>(summary: &'a Value, path: &str) -> &'a Value {
+    &summary["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|module| module["identity"]["path"] == path)
+        .unwrap_or_else(|| panic!("no module {path}"))["app"]
+}
+
+/// U1 (#794): a Node backend and a JavaScript front end in one root `package.json`.
+const MONOLITH_FILES: [(&str, &str); 6] = [
+    ("package.json", "{\"name\":\"monolith\"}\n"),
+    ("server/api.js", "export function handle() {}\n"),
+    (
+        "client/ui.js",
+        "import { core } from './core.js';\nexport function ui() { core(); }\n",
+    ),
+    (
+        "client/core.js",
+        "import { ui } from './ui.js';\nexport function core() { ui(); }\n",
+    ),
+    (
+        "client/net.js",
+        "import { handle } from '../server/api.js';\nexport function net() { handle(); }\n",
+    ),
+    ("client/extra.js", "export const extra = 1;\n"),
+];
+
+const MONOLITH_LAYERS: &str = "[layers.server]\napp = \"api\"\norder = 1\npaths = [\"server/**\"]\n[layers.ui]\napp = \"web\"\norder = 1\npaths = [\"client/ui.js\", \"client/net.js\"]\n[layers.core]\napp = \"web\"\norder = 2\npaths = [\"client/core.js\"]\n";
+
+fn monolith_rules() -> String {
+    format!(
+        "version = 1\n[apps.api]\nroots = [\".\"]\n[apps.web]\nroots = [\"client\"]\n{MONOLITH_LAYERS}"
+    )
+}
+
+/// #794: authored apps split one manifest's checkout. Check, per-app counts, the summary's
+/// inventory and file attribution all follow the authored apps, which win over detection.
+#[test]
+fn an_authored_override_splits_one_package_end_to_end() {
+    let rules_file = monolith_rules();
+    let data = check(&with(&rules_file, &MONOLITH_FILES)).unwrap();
+    let apps = &data["apps"];
+    assert_eq!(apps.as_array().unwrap().len(), 2, "{apps}");
+    assert_eq!(
+        apps[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["counts", "manifest", "name", "source"]
+    );
+    for (index, name) in ["api", "web"].into_iter().enumerate() {
+        assert_eq!(apps[index]["name"], name);
+        assert_eq!(apps[index]["source"], "override");
+        assert_eq!(apps[index]["manifest"], Value::Null);
+    }
+    // core -> ui is upward inside web; net -> api crosses apps and is unknown, under noApp.
+    assert_eq!(apps[1]["counts"]["comparable"], 2);
+    assert_eq!(apps[1]["counts"]["deviates"], 1);
+    assert_eq!(apps[0]["counts"]["comparable"], 0);
+    assert_eq!(data["noApp"]["counts"]["comparable"], 1);
+    assert_eq!(data["noApp"]["counts"]["unknown"], 1);
+    let cross = data["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["target"]["path"] == "client/net.js")
+        .unwrap();
+    assert_eq!(cross["status"], "unknown");
+    assert_eq!(cross["unresolved"], json!(["cross_app"]));
+
+    let summary = summary(&with(&rules_file, &MONOLITH_FILES));
+    let web = app_named(&summary["apps"], "web");
+    assert_eq!(web["source"], "override");
+    assert_eq!(web["kind"], Value::Null);
+    assert_eq!(web["manifest"], Value::Null);
+    assert_eq!(web["roots"], json!(["client"]));
+    assert_eq!(web["entries"], json!([]));
+    assert_eq!(web["fileCount"], 4);
+    assert_eq!(web["unassignedFileCount"], 1);
+    assert_eq!(web["counts"], apps[1]["counts"]);
+    let api = app_named(&summary["apps"], "api");
+    assert_eq!(api["roots"], json!(["."]));
+    assert_eq!(api["fileCount"], 1);
+    assert!(
+        summary["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|app| app["name"] != "monolith"),
+        "the shadowed manifest app is gone"
+    );
+    // The All apps view reads these: the unassigned file goes to the authored app whose root
+    // holds it.
+    assert_eq!(module_app(&summary, "client/extra.js"), "web");
+    assert_eq!(module_app(&summary, "server/api.js"), "api");
+    assert_eq!(summary["noApp"]["counts"], data["noApp"]["counts"]);
+}
+
+/// #794 negative control: the same checkout without `[apps]` is the one detected app of #783.
+#[test]
+fn without_authored_apps_the_package_stays_one_detected_app() {
+    let rules_file = format!(
+        "version = 1\n{}",
+        MONOLITH_LAYERS
+            .replace("\"api\"", "\"monolith\"")
+            .replace("\"web\"", "\"monolith\"")
+    );
+    let data = check(&with(&rules_file, &MONOLITH_FILES)).unwrap();
+    assert_eq!(
+        data["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|app| (
+                app["name"].clone(),
+                app["source"].clone(),
+                app["manifest"].clone()
+            ))
+            .collect::<Vec<_>>(),
+        [(json!("monolith"), json!("manifest"), json!("package.json"))]
+    );
+    // One app: net -> api is a peer reference inside it, so it deviates instead of crossing.
+    assert_eq!(data["noApp"]["counts"]["comparable"], 0);
+    assert_eq!(data["apps"][0]["counts"]["deviates"], 2);
+    // The layers of the override no longer validate: `api` and `web` are not apps.
+    let diagnostic = invalid(&with(
+        &format!("version = 1\n{MONOLITH_LAYERS}"),
+        &MONOLITH_FILES,
+    ));
+    assert_eq!(diagnostic["kind"], "reference");
+    assert!(
+        diagnostic["message"]
+            .as_str()
+            .unwrap()
+            .contains("apps: monolith")
+    );
+}
+
+/// #794: the snapshot-dependent errors of authored apps, located, through the store.
+#[test]
+fn authored_app_snapshot_errors_are_located() {
+    // D6: a root with no indexed document under it.
+    let diagnostic = invalid(&with(
+        "version = 1\n[apps.web]\nroots = [\"client\", \"missing\"]\n",
+        &MONOLITH_FILES,
+    ));
+    assert_eq!(diagnostic["kind"], "reference");
+    assert_eq!(diagnostic["line"], 3);
+    assert!(diagnostic["message"].as_str().unwrap().contains("missing"));
+    // D4: an authored name equal to a detected app that survives.
+    let diagnostic = invalid(&with(
+        "version = 1\n[apps.alpha]\nroots = [\"b\"]\n",
+        &[
+            A_PACKAGE,
+            B_PACKAGE,
+            A_SOURCE,
+            B_SOURCE,
+            ("b/x.js", "export const x = 1;\n"),
+        ],
+    ));
+    assert_eq!(diagnostic["kind"], "ambiguity");
+    assert_eq!(diagnostic["line"], 2);
+    assert!(
+        diagnostic["message"]
+            .as_str()
+            .unwrap()
+            .contains("a/package.json")
+    );
+    // A root outside the checkout is a schema error before any snapshot read.
+    let diagnostic = invalid(&with(
+        "version = 1\n[apps.web]\nroots = [\"../elsewhere\"]\n",
+        &MONOLITH_FILES,
+    ));
+    assert_eq!(diagnostic["kind"], "schema");
+    assert_eq!(diagnostic["line"], 3);
+}
+
+/// mimir (#794 acceptance): a Python service and a Vite front end whose manifests both sit
+/// at the checkout root, plus a Python plugin. Detection alone gives two apps at `.`; the
+/// authored override expresses the real layout.
+const MIMIR_FILES: [(&str, &str); 9] = [
+    (
+        "pyproject.toml",
+        "[project]\nname = \"mimir-agent\"\n[project.scripts]\nmimir = \"mimir.main:main\"\n",
+    ),
+    (
+        "package.json",
+        "{\"name\":\"mimir-frontend\",\"private\":true,\"type\":\"module\"}\n",
+    ),
+    (
+        "plugins/cultivate/pyproject.toml",
+        "[project]\nname = \"mimir-cultivate\"\n",
+    ),
+    ("mimir/__init__.py", ""),
+    ("mimir/main.py", "def main():\n    return 1\n"),
+    ("scripts/run.py", "X = 1\n"),
+    ("frontend/src/main.ts", "export const main = 1;\n"),
+    ("frontend/src/App.ts", "export const app = 2;\n"),
+    ("plugins/cultivate/cultivate/__init__.py", "Y = 1\n"),
+];
+
+const MIMIR_LAYERS: &str = "[layers.agent]\napp = \"mimir-agent\"\norder = 1\npaths = [\"mimir/**\"]\n[layers.ui]\napp = \"mimir-frontend\"\norder = 1\npaths = [\"frontend/**\"]\n[layers.plugin]\napp = \"mimir-cultivate\"\norder = 1\npaths = [\"plugins/cultivate/**\"]\n";
+
+#[test]
+fn mimir_layout_is_expressed_by_an_authored_override() {
+    let rules_file = format!(
+        "version = 1\n[apps.mimir-agent]\nroots = [\".\"]\n[apps.mimir-frontend]\nroots = [\"frontend\"]\n[apps.mimir-cultivate]\nroots = [\"plugins/cultivate\"]\n{MIMIR_LAYERS}"
+    );
+    let data = check(&with(&rules_file, &MIMIR_FILES)).unwrap();
+    assert_eq!(
+        data["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|app| (
+                app["name"].as_str().unwrap(),
+                app["source"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("mimir-agent", "override"),
+            ("mimir-cultivate", "override"),
+            ("mimir-frontend", "override"),
+        ]
+    );
+    let summary = summary(&with(&rules_file, &MIMIR_FILES));
+    assert_eq!(
+        app_named(&summary["apps"], "mimir-frontend")["roots"],
+        json!(["frontend"])
+    );
+    assert_eq!(
+        module_app(&summary, "frontend/src/App.ts"),
+        "mimir-frontend"
+    );
+    assert_eq!(module_app(&summary, "mimir/main.py"), "mimir-agent");
+    // An unassigned root file belongs to the agent, not to whichever root manifest sorts first.
+    assert_eq!(module_app(&summary, "scripts/run.py"), "mimir-agent");
+    assert_eq!(
+        module_app(&summary, "plugins/cultivate/cultivate/__init__.py"),
+        "mimir-cultivate"
+    );
+
+    // Negative control: detection alone puts both root apps at `.`, and the unassigned root
+    // file goes to the first of them in manifest-path order, the front end.
+    let detected = summary_detected();
+    assert_eq!(module_app(&detected, "scripts/run.py"), "mimir-frontend");
+    for name in ["mimir-agent", "mimir-frontend"] {
+        let app = app_named(&detected["apps"], name);
+        assert_eq!(app["source"], "manifest");
+        assert_eq!(app["roots"], json!(["."]));
+    }
+}
+
+fn summary_detected() -> Value {
+    let rules_file = format!("version = 1\n{MIMIR_LAYERS}");
+    summary(&with(&rules_file, &MIMIR_FILES))
+}

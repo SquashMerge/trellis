@@ -141,7 +141,7 @@ test("refresh replaces rules at unchanged code pin and old source callbacks stay
 
 test("missing layers and located invalid rules refuse partial interactive diagrams", async () => {
   const h=harness();h.setResponse(async () => ({payload:{...fixture(),state:"missing_rules",rulesFile:null,layers:[],modules:[],edges:[],references:null,rules:null}}));await h.controller.refresh();
-  assert.equal(h.renders.length,0);assert.match(h.get("architecture-state").textContent,/\.trellis\/rules.toml/);assert.match(h.get("architecture-state").textContent,/trellis_propose_layers/);
+  assert.equal(h.renders.length,0);assert.match(h.get("architecture-state").textContent,/\.trellis\/rules.toml/);assert.match(h.get("architecture-state").textContent,/trellis_propose_rules/);
   h.setResponse(async () => {const error=new Error("invalid");error.diagnostic={path:".trellis/rules.toml",line:8,column:2,kind:"invalid_order",message:"Order must be an integer"};throw error;});await h.controller.refresh();
   assert.match(h.get("architecture-state").textContent,/rules.toml:8:2/);assert.equal(h.get("architecture-diagram").children.length,0);
 });
@@ -1506,7 +1506,7 @@ test("AC8 the app switcher appears only with two or more apps, as a labelled gro
 
 test("the footnote names only the manifests detection reads, and All apps says when no interface was measured", async () => {
   const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
-  assert.match(h.get("architecture-footnote").textContent, /^Apps are detected from build manifests \(Cargo binary packages, package\.json and pyproject\.toml\)\. /);
+  assert.match(h.get("architecture-footnote").textContent, /^Apps are detected from build manifests \(Cargo binary packages, package\.json and pyproject\.toml\) or authored in \.trellis\/rules\.toml\. /);
   assert.doesNotMatch(h.get("architecture-footnote").textContent, /Python/);
   assert.match(text(h.get("architecture-diagram")), /No HTTP interface measured between web, daemon and scripts\. This does not prove absence\./);
   await chooseApp(h, "web · javascript");
@@ -1573,7 +1573,7 @@ test("AC13 an app no ordered layer names shows the setup help and its unassigned
   await chooseApp(h, "scripts · javascript");
   assert.equal(h.renders.length, drawn, "nothing is drawn for an app without layers");
   assert.equal(h.get("architecture-state").dataset.state, "empty");
-  assert.match(h.get("architecture-state").textContent, /scripts has no layers yet\. Its files are listed as unassigned below\..*trellis_propose_layers.*app = "scripts"/);
+  assert.match(h.get("architecture-state").textContent, /scripts has no layers yet\. Its files are listed as unassigned below\..*trellis_propose_rules.*app = "scripts"/);
   const files = descendants(h.get("architecture-diagram")).filter(item => item.tagName === "button").map(item => item.textContent);
   assert.deepEqual(files, ["tools/build.js", "scripts/a.sh"]);
   await descendants(h.get("architecture-diagram")).find(item => item.textContent === "scripts/a.sh").fire("click");
@@ -1771,7 +1771,7 @@ test("AC15 the app inspector names the files, layers and interfaces of an app, a
   await h.button("HTTP: web → daemon").fire("click"); await flush();
   assert.equal(h.get("architecture-inspector-title").textContent, "web → daemon");
   await h.controller.restore(saved("scripts"), () => true);
-  assert.ok(inspectorParagraphs(h).some(line => /^scripts has no layers yet\..*trellis_propose_layers.*app = "scripts"/.test(line)));
+  assert.ok(inspectorParagraphs(h).some(line => /^scripts has no layers yet\..*trellis_propose_rules.*app = "scripts"/.test(line)));
   assert.equal(descendants(h.get("architecture-inspector-content")).some(item => item.textContent.startsWith("HTTP:")), false);
 });
 

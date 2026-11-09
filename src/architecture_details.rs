@@ -606,13 +606,8 @@ mod tests {
     /// share a name answer to one filter value, and a row with no app matches none.
     #[test]
     fn the_app_filter_matches_every_app_of_that_name() {
-        let app = |name: &str, root: &str| crate::apps::App {
-            name: name.into(),
-            kind: crate::apps::AppKind::Npm,
-            manifest: format!("{root}/package.json"),
-            root: root.into(),
-            entries: Vec::new(),
-        };
+        let app =
+            |name: &str, root: &str| crate::apps::App::authored(name.into(), vec![root.into()]);
         let apps = [app("web", "a"), app("web", "b"), app("api", "c")];
         let config = crate::rules::parse("version=1\n[layers.l]\norder=1\npaths=['**']\n").unwrap();
         let row = |path: &str| {

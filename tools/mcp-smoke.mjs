@@ -11,7 +11,7 @@ const names = [
   'trellis_read_source', 'trellis_call_graph', 'trellis_references',
   'trellis_rules_check', 'trellis_rules_explain', 'trellis_show',
 ];
-const promptName = 'trellis_propose_layers';
+const promptName = 'trellis_propose_rules';
 const callableKinds = new Set(['function', 'method', 'constructor']);
 const failureCodes = new Set(['invalid_request', 'range_too_large', 'unsupported_encoding',
   'revision_conflict', 'index_not_ready', 'not_found', 'too_many_requests', 'deadline_exceeded',

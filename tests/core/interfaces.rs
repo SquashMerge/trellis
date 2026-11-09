@@ -351,6 +351,42 @@ fn one_app_and_no_calls_have_no_interfaces() {
     assert_eq!(unmatched.summary["interfaces"], json!([]));
 }
 
+/// #794 (U3): a front end embedded in a Rust crate, with no manifest of its own, is one
+/// detected app; an authored app at its root makes the crate's routes and its calls an
+/// interface between two apps.
+#[test]
+fn an_authored_app_without_a_manifest_has_interfaces() {
+    let files = |rules: &'static str| {
+        publish(&[
+            (".trellis/rules.toml", rules),
+            ("Cargo.toml", "[package]\nname = \"srv\"\n"),
+            ("src/main.rs", SERVER),
+            ("web/app.js", CLIENT),
+        ])
+    };
+    let authored = files(
+        "version = 1\n[apps.web-app]\nroots = ['web']\n\
+        [layers.server]\napp = 'srv'\norder = 1\npaths = ['src/**']\n\
+        [layers.client]\napp = 'web-app'\norder = 1\npaths = ['web/**']\n",
+    );
+    let interfaces = authored.summary["interfaces"].as_array().unwrap();
+    assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
+    assert_eq!(interfaces[0]["client"], "web-app");
+    assert_eq!(interfaces[0]["server"], "srv");
+    assert!(!details(&authored, &[], 100).is_empty());
+    let names: Vec<&Value> = authored.summary["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|app| &app["name"])
+        .collect();
+    assert_eq!(names, [&json!("web-app"), &json!("srv")]);
+    // Negative control: without the authored app the checkout is one app, with no interfaces.
+    let detected = files("version = 1\n[layers.all]\norder = 1\npaths = ['**']\n");
+    assert_eq!(detected.summary["interfaces"], json!([]));
+    assert_eq!(detected.summary["apps"].as_array().unwrap().len(), 1);
+}
+
 /// AC16 and AC21 on Trellis's own router and client. Calls and routes are located by
 /// content, never by line or by total.
 #[test]

@@ -456,7 +456,7 @@
       const refocus = show && !target.hidden && !!target.contains?.(document.activeElement);
       target.hidden = line.hidden = !show; target.replaceChildren(); line.replaceChildren();
       const footnote = get("architecture-footnote"); footnote.hidden = !show;
-      if (show) footnote.textContent = `Apps are detected from build manifests (Cargo binary packages, package.json and pyproject.toml). Layer order is compared within an app. Band and arrow counts are reference sites at ${window.TrellisIndexPin.label(payload)}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
+      if (show) footnote.textContent = `Apps are detected from build manifests (Cargo binary packages, package.json and pyproject.toml) or authored in .trellis/rules.toml. Layer order is compared within an app. Band and arrow counts are reference sites at ${window.TrellisIndexPin.label(payload)}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
       if (!show) return;
       const choose = (name, text) => {
         const button = make("button", text); button.type = "button"; button.setAttribute("aria-pressed", String(scope === name));
@@ -497,7 +497,7 @@
       }
       if (files.length > BOX_CAP) list.append(make("li", `${plural(files.length - BOX_CAP, "file")} not listed here · open the unassigned files chip to list them all`));
       canvas.replaceChildren(list); laidOut = canvas.clientWidth;
-      state(`${group.name} has no layers yet. Its files are listed as unassigned below. The trellis_propose_layers MCP prompt can propose layers per app; this browser does not call it. Review .trellis/rules.toml to add layers with app = "${group.name}".`, "empty");
+      state(`${group.name} has no layers yet. Its files are listed as unassigned below. The trellis_propose_rules MCP prompt can propose layers per app; this browser does not call it. Review .trellis/rules.toml to add layers with app = "${group.name}".`, "empty");
       return true;
     }
     const flip = (set, key) => { if (set.has(key)) set.delete(key); else set.add(key); };
@@ -834,7 +834,7 @@
           if (!current(c)) return;
         }
         if (payload.state === "missing_rules") {
-          state("No reviewed rules file. Create or review .trellis/rules.toml. The trellis_propose_layers MCP prompt can help propose layers; this browser does not call it.", "empty"); return;
+          state("No reviewed rules file. Create or review .trellis/rules.toml. The trellis_propose_rules MCP prompt can help propose apps and layers; this browser does not call it.", "empty"); return;
         }
         view = payload; basis = {...c, rulesHash:payload.rulesFile.contentHash}; settleScope(payload); coverage();
         if (payload.state === "no_layers") { state("No authored layers are configured. Existing authored exceptions can still be edited or removed. Review .trellis/rules.toml to configure layers.", "empty"); overview(); }
@@ -1035,9 +1035,9 @@
       row("Deviations", deviates ? `↑ ${deviates} ${deviates === 1 ? "deviation" : "deviations"}` : "0", deviates ? "error" : null);
       row("Unassigned", unassigned ? `◇ ${unassigned} unassigned` : "0", unassigned ? "warning" : null);
       target.append(grid);
-      paragraph(target, `Detected from ${group.manifests.join(", ")}${group.kinds.length ? ` (${group.kinds.join(", ")})` : ""}`, "detail");
+      const origin = apps.origin(group); if (origin) paragraph(target, origin, "detail");
       if (group.duplicate) paragraph(target, apps.duplicateNotice(group), "architecture-app-notice");
-      if (!ordered) paragraph(target, `${group.name} has no layers yet. The trellis_propose_layers MCP prompt can propose layers per app; this browser does not call it. Review .trellis/rules.toml to add layers with app = "${group.name}".`);
+      if (!ordered) paragraph(target, `${group.name} has no layers yet. The trellis_propose_rules MCP prompt can propose layers per app; this browser does not call it. Review .trellis/rules.toml to add layers with app = "${group.name}".`);
       for (const entry of payload.interfaces) if (entry?.client === group.name || entry?.server === group.name) {
         const button = make("button", `HTTP: ${entry.client} → ${entry.server}`); button.type = "button";
         button.addEventListener("click", () => { if (active()) inspect("interface", entry); }); target.append(button);

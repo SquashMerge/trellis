@@ -1,6 +1,7 @@
 //! App detection from build manifests (#784, #807): which `Cargo.toml`, `package.json` and
-//! `pyproject.toml` files name a runnable application. Pure: it reads manifest bytes and the
-//! snapshot's document paths, and does no I/O.
+//! `pyproject.toml` files name a runnable application, and how apps authored in the rules file
+//! combine with them (#794). Pure: it reads manifest bytes and the snapshot's document paths,
+//! and does no I/O.
 
 use crate::references::external::ManifestInput;
 use crate::references::work::Work;
@@ -17,14 +18,56 @@ pub(crate) enum AppKind {
     Python,
 }
 
+/// Where an app comes from: a build manifest, or an authored `[apps.<name>]` table (#794).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AppSource {
+    Manifest,
+    Override,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct App {
     pub name: String,
-    pub kind: AppKind,
-    pub manifest: String,
-    /// `.` or the checkout-relative directory of the manifest.
-    pub root: String,
+    pub source: AppSource,
+    /// `None` for an authored app, which has no manifest.
+    pub kind: Option<AppKind>,
+    pub manifest: Option<String>,
+    /// `.` or checkout-relative directories. A detected app has exactly one, its manifest's
+    /// directory; an authored app has the roots it lists.
+    pub roots: Vec<String>,
     pub entries: Vec<String>,
+}
+
+impl App {
+    /// A detected app: its root is its manifest's directory.
+    pub(crate) fn detected(
+        name: String,
+        kind: AppKind,
+        manifest: &str,
+        entries: Vec<String>,
+    ) -> Self {
+        Self {
+            name,
+            source: AppSource::Manifest,
+            kind: Some(kind),
+            manifest: Some(manifest.to_owned()),
+            roots: vec![directory(manifest)],
+            entries,
+        }
+    }
+
+    /// An authored app (#794): no kind, manifest or entries.
+    pub(crate) fn authored(name: String, roots: Vec<String>) -> Self {
+        Self {
+            name,
+            source: AppSource::Override,
+            kind: None,
+            manifest: None,
+            roots,
+            entries: Vec::new(),
+        }
+    }
 }
 
 /// What one manifest detects.
@@ -118,24 +161,53 @@ pub(crate) fn detect(candidates: &Candidates, hidden: &BTreeSet<String>) -> Dete
     detected
 }
 
-/// The index of the app with the most specific root containing `path`. `.` contains every
-/// path.
+/// The effective app inventory (#794): the `authored` apps, in name order, then every
+/// `detected` app whose root is not equal to or under an authored root, in manifest-path order.
+pub(crate) fn effective(authored: Vec<App>, detected: Vec<App>) -> Vec<App> {
+    let shadowing: Vec<&str> = authored
+        .iter()
+        .flat_map(|app| app.roots.iter().map(String::as_str))
+        .collect();
+    let surviving: Vec<App> = detected
+        .into_iter()
+        .filter(|app| {
+            !app.roots.iter().any(|root| {
+                shadowing
+                    .iter()
+                    .any(|authored| depth(authored, root).is_some())
+            })
+        })
+        .collect();
+    authored.into_iter().chain(surviving).collect()
+}
+
+/// How specifically `root` contains `path`: `None` when it does not. `.` contains every path.
+fn depth(root: &str, path: &str) -> Option<usize> {
+    if root == "." {
+        Some(0)
+    } else if path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+    {
+        Some(root.len() + 1)
+    } else {
+        None
+    }
+}
+
+/// The index of the app with the most specific root containing `path`; on a tie, the first.
+/// `.` contains every path.
 pub(crate) fn containing(apps: &[App], path: &str) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None;
     for (index, app) in apps.iter().enumerate() {
-        let depth = if app.root == "." {
-            0
-        } else if path == app.root
-            || path
-                .strip_prefix(app.root.as_str())
-                .is_some_and(|rest| rest.starts_with('/'))
-        {
-            app.root.len() + 1
-        } else {
-            continue;
-        };
-        if best.is_none_or(|(_, deepest)| depth > deepest) {
-            best = Some((index, depth));
+        for root in &app.roots {
+            let Some(depth) = depth(root, path) else {
+                continue;
+            };
+            if best.is_none_or(|(_, deepest)| depth > deepest) {
+                best = Some((index, depth));
+            }
         }
     }
     best.map(|(index, _)| index)
@@ -185,18 +257,16 @@ fn npm_outcome(manifest: &ManifestInput, parsed: Option<Parsed>) -> Outcome {
     let Some(Parsed::Json(serde_json::Value::Object(object))) = parsed else {
         return Outcome::Unread;
     };
-    let root = directory(&manifest.path);
     let name = match object.get("name").and_then(|name| name.as_str()) {
         Some(name) if !name.trim().is_empty() => name.to_owned(),
-        _ => root.clone(),
+        _ => directory(&manifest.path),
     };
-    Outcome::App(App {
+    Outcome::App(App::detected(
         name,
-        kind: AppKind::Npm,
-        manifest: manifest.path.clone(),
-        root,
-        entries: Vec::new(),
-    })
+        AppKind::Npm,
+        &manifest.path,
+        Vec::new(),
+    ))
 }
 
 /// A `pyproject.toml` is an app when it declares a project: a `[project]` table with a
@@ -275,13 +345,12 @@ fn python_outcome(manifest: &ManifestInput, parsed: Option<Parsed>) -> Outcome {
             entries.insert(module.to_owned());
         }
     }
-    Outcome::App(App {
+    Outcome::App(App::detected(
         name,
-        kind: AppKind::Python,
-        manifest: manifest.path.clone(),
-        root: directory(&manifest.path),
-        entries: entries.into_iter().collect(),
-    })
+        AppKind::Python,
+        &manifest.path,
+        entries.into_iter().collect(),
+    ))
 }
 
 /// The table at `key`: `Ok(None)` when absent, `Err` when it is not a table.
@@ -362,13 +431,12 @@ fn cargo_outcome(
     if entries.is_empty() {
         return Outcome::NotApp;
     }
-    Outcome::App(App {
-        name: name.to_owned(),
-        kind: AppKind::Cargo,
-        manifest: manifest.path.clone(),
-        root,
-        entries: entries.into_iter().collect(),
-    })
+    Outcome::App(App::detected(
+        name.to_owned(),
+        AppKind::Cargo,
+        &manifest.path,
+        entries.into_iter().collect(),
+    ))
 }
 
 /// Resolve `.` and `..` components of a checkout-relative path.
@@ -477,8 +545,8 @@ mod tests {
         );
         let app = app(&found, "Cargo.toml");
         assert_eq!(app.name, "daemon");
-        assert_eq!(app.kind, AppKind::Cargo);
-        assert_eq!(app.root, ".");
+        assert_eq!(app.kind, Some(AppKind::Cargo));
+        assert_eq!(app.roots, ["."]);
         assert_eq!(app.entries, ["daemon", "tool"]);
     }
 
@@ -546,7 +614,10 @@ mod tests {
             ],
         );
         assert_eq!(outcome(&found, "Cargo.toml"), &Outcome::NotApp);
-        assert_eq!(app(&found, "crates/alpha/Cargo.toml").root, "crates/alpha");
+        assert_eq!(
+            app(&found, "crates/alpha/Cargo.toml").roots,
+            ["crates/alpha"]
+        );
         assert_eq!(app(&found, "tools/one/Cargo.toml").name, "one");
         // Excluded, too deep for `*`, and outside the members: never parsed for identity.
         for path in [
@@ -653,7 +724,11 @@ mod tests {
         );
         let root = app(&found, "package.json");
         assert_eq!(
-            (root.name.as_str(), root.root.as_str(), root.kind),
+            (
+                root.name.as_str(),
+                root.roots[0].as_str(),
+                root.kind.unwrap()
+            ),
             ("web", ".", AppKind::Npm)
         );
         assert!(root.entries.is_empty());
@@ -690,7 +765,11 @@ mod tests {
             .map(String::from)
             .into();
         let detected = detect(&found, &hidden);
-        let manifests: Vec<&str> = detected.apps.iter().map(|a| a.manifest.as_str()).collect();
+        let manifests: Vec<&str> = detected
+            .apps
+            .iter()
+            .map(|a| a.manifest.as_deref().unwrap())
+            .collect();
         assert_eq!(manifests, ["a/package.json", "package.json"]);
         assert_eq!(detected.apps[0].name, detected.apps[1].name);
         assert_eq!(detected.unread, 1);
@@ -698,13 +777,7 @@ mod tests {
 
     #[test]
     fn containing_picks_the_most_specific_root() {
-        let make = |root: &str| App {
-            name: root.into(),
-            kind: AppKind::Npm,
-            manifest: format!("{root}/package.json"),
-            root: root.into(),
-            entries: Vec::new(),
-        };
+        let make = |root: &str| App::authored(root.into(), vec![root.into()]);
         let apps = [make("."), make("web"), make("web/inner"), make("webx")];
         assert_eq!(containing(&apps, "README.md"), Some(0));
         assert_eq!(containing(&apps, "web/app.js"), Some(1));
@@ -713,6 +786,86 @@ mod tests {
         assert_eq!(containing(&apps, "webx/a.js"), Some(3));
         assert_eq!(containing(&apps[1..], "README.md"), None);
         assert_eq!(containing(&[], "a"), None);
+    }
+
+    fn npm(name: &str, root: &str) -> App {
+        let manifest = if root == "." {
+            "package.json".to_owned()
+        } else {
+            format!("{root}/package.json")
+        };
+        App::detected(name.into(), AppKind::Npm, &manifest, Vec::new())
+    }
+
+    fn names(apps: &[App]) -> Vec<&str> {
+        apps.iter().map(|app| app.name.as_str()).collect()
+    }
+
+    /// #794 D2: an authored root shadows detected apps at or under it; the rest survive, and
+    /// authored apps come first.
+    #[test]
+    fn authored_roots_shadow_equal_and_nested_detected_roots_only() {
+        let detected = vec![
+            npm("root", "."),
+            npm("client", "client"),
+            npm("deep", "client/inner"),
+            npm("clientele", "clientele"),
+            npm("other", "other"),
+        ];
+        let shadowed = effective(
+            vec![App::authored("web".into(), vec!["client".into()])],
+            detected.clone(),
+        );
+        assert_eq!(names(&shadowed), ["web", "root", "clientele", "other"]);
+        assert_eq!(shadowed[0].source, AppSource::Override);
+        assert_eq!(shadowed[0].kind, None);
+        assert_eq!(shadowed[0].manifest, None);
+        // `.` shadows every detected app.
+        let all = effective(
+            vec![App::authored("all".into(), vec![".".into()])],
+            detected.clone(),
+        );
+        assert_eq!(names(&all), ["all"]);
+        // Without authored apps the inventory is detection, unchanged.
+        assert_eq!(effective(Vec::new(), detected.clone()), detected);
+    }
+
+    /// #794 D3: authored roots may nest and an app may have several roots; the most specific
+    /// root wins, across apps and detected roots alike.
+    #[test]
+    fn containing_reads_every_root_of_every_app() {
+        let apps = effective(
+            vec![
+                App::authored("backend".into(), vec![".".into()]),
+                App::authored("web".into(), vec!["client".into(), "shared/ui".into()]),
+            ],
+            vec![npm("root", "."), npm("plugin", "plugins/p")],
+        );
+        assert_eq!(names(&apps), ["backend", "web"]);
+        assert_eq!(containing(&apps, "server/main.js"), Some(0));
+        assert_eq!(containing(&apps, "client/app.js"), Some(1));
+        assert_eq!(containing(&apps, "shared/ui/button.js"), Some(1));
+        assert_eq!(containing(&apps, "shared/model.js"), Some(0));
+        let mixed = effective(
+            vec![App::authored("ui".into(), vec!["ui".into()])],
+            vec![App::detected(
+                "daemon".into(),
+                AppKind::Cargo,
+                "Cargo.toml",
+                vec!["daemon".into()],
+            )],
+        );
+        assert_eq!(names(&mixed), ["ui", "daemon"]);
+        assert_eq!(containing(&mixed, "ui/index.js"), Some(0));
+        assert_eq!(containing(&mixed, "src/main.rs"), Some(1));
+    }
+
+    #[test]
+    fn app_source_serializes_as_manifest_or_override() {
+        assert_eq!(
+            serde_json::to_value([AppSource::Manifest, AppSource::Override]).unwrap(),
+            serde_json::json!(["manifest", "override"])
+        );
     }
 
     #[test]
@@ -730,7 +883,7 @@ mimir-gui = "mimir.gui:start"
         let found = run(&[manifest("pyproject.toml", Some(bytes))], &[]);
         let app = app(&found, "pyproject.toml");
         assert_eq!(
-            (app.name.as_str(), app.kind, app.root.as_str()),
+            (app.name.as_str(), app.kind.unwrap(), app.roots[0].as_str()),
             ("mimir-agent", AppKind::Python, ".")
         );
         assert_eq!(app.entries, ["mimir.admin.cli", "mimir.cli", "mimir.gui"]);
@@ -747,7 +900,7 @@ mimir-gui = "mimir.gui:start"
         );
         let app = app(&found, "plugins/cultivate/pyproject.toml");
         assert_eq!(
-            (app.name.as_str(), app.root.as_str()),
+            (app.name.as_str(), app.roots[0].as_str()),
             ("mimir-cultivate", "plugins/cultivate")
         );
         assert!(app.entries.is_empty());
@@ -819,7 +972,11 @@ file = { reference = "bin/tool.sh", type = "file" }
         let found = run(&[manifest("svc/pyproject.toml", Some(bytes))], &[]);
         let legacy = app(&found, "svc/pyproject.toml");
         assert_eq!(
-            (legacy.name.as_str(), legacy.kind, legacy.root.as_str()),
+            (
+                legacy.name.as_str(),
+                legacy.kind.unwrap(),
+                legacy.roots[0].as_str()
+            ),
             ("legacy", AppKind::Python, "svc")
         );
         assert_eq!(legacy.entries, ["legacy.main", "legacy.table"]);
@@ -927,7 +1084,7 @@ exclude = ["packages/skip"]
         let apps: Vec<(&str, AppKind, &str)> = detected
             .apps
             .iter()
-            .map(|a| (a.name.as_str(), a.kind, a.root.as_str()))
+            .map(|a| (a.name.as_str(), a.kind.unwrap(), a.roots[0].as_str()))
             .collect();
         assert_eq!(
             apps,
