@@ -6,6 +6,7 @@ mod find_trigram_tests;
 mod projection;
 pub mod search;
 pub mod session;
+pub mod show;
 pub mod tools;
 pub mod wire;
 
@@ -1167,6 +1168,15 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 .checked_sub(workspace.call_deadline)
                 .unwrap_or(deadline);
             let cancel = &cancel;
+            // The target `trellis_show` checked in its admitted read, recorded once that read
+            // has finished (#818). Each read attempt sets or clears it.
+            let show_target: std::sync::Mutex<
+                Option<(
+                    crate::daemon::view_request::ViewTarget,
+                    crate::model::IndexPin,
+                )>,
+            > = std::sync::Mutex::new(None);
+            let show_target = &show_target;
             let tool_read: Option<EvidenceToolRead> = match (name.as_str(), args) {
                 _ if !tool.valid_arguments || envelope["error"]["code"] != "index_not_ready" => {
                     None
@@ -1774,6 +1784,20 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         .unwrap_or_else(|| tools::failure(id, "range_too_large")))
                     }))
                 }
+                (show::NAME, Some(args)) => {
+                    let request = show::Request::from_arguments(args);
+                    let expected = validated_expected_basis(args);
+                    Some(Box::new(move |_, response, _sampled, _query| {
+                        *show_target.lock().unwrap() = None;
+                        Ok(match show::check(id, &request, expected, response)? {
+                            show::Checked::Answer(envelope) => envelope,
+                            show::Checked::Show(envelope, target, pin) => {
+                                *show_target.lock().unwrap() = Some((target, pin));
+                                envelope
+                            }
+                        })
+                    }))
+                }
                 ("trellis_read_source", Some(args)) => {
                     let path = args["path"].as_str().expect("validated source path");
                     let start = wire::uint(&args["startLine"]).expect("validated source start");
@@ -1864,6 +1888,24 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     Ok((found, sampled)) => {
                         envelope = found;
                         sampled_catching_up = sampled;
+                        // Only a finished read's target is shown: never a partial answer.
+                        let checked = show_target.lock().unwrap().take();
+                        if let Some((target, pin)) = checked
+                            && envelope.get("error").is_none()
+                        {
+                            let runtime = registry.blocking_lock().runtime(key);
+                            let shown = runtime.map_or(
+                                crate::daemon::view_request::Shown::NoViewer,
+                                |runtime| {
+                                    runtime.view_requests().show(
+                                        target,
+                                        pin,
+                                        std::time::Instant::now(),
+                                    )
+                                },
+                            );
+                            envelope = show::record(envelope, shown);
+                        }
                     }
                     Err(error) => {
                         let code = evidence_failure_code(&error);

@@ -68,6 +68,7 @@ function observePinnedHead() {
           // A later response cannot erase a newer same-generation observation.
           if (!observation.head || head.indexGeneration !== observation.head.indexGeneration || head.indexRevision >= observation.head.indexRevision) observation.head = head;
           observation.failed = false;
+          observeViewRequest(data.viewRequest);
         } catch (error) {
           if (!current() || headObservation !== observation || error.name === "AbortError") return;
           observation.failed = true;
@@ -154,18 +155,22 @@ function sequenceHash(id, revision, boundary = null) {
   if (callIds.length >= 1 && callIds.length <= SEQUENCE_LINK_CALL_IDS) for (const callId of callIds) query.append("callId", callId);
   return `#sequence?${query}`;
 }
-async function navigateDiagram(symbol, revision, kind = "sequence", admitted = null, showAll = false, boundary = null, architectureEntry = null) {
-  IndexPin.copy(revision);
-  if (!IndexPin.equal(revision, status?.revision) || !token || !selectedRootKey) throw new Error("Source navigation is stale. Refresh the indexed view.");
-  const context = navigationContext(), ticket = ++navigationSerial;
-  const current = () => ticket === navigationSerial && navigationCurrent(context);
-  diagramSerial++;
+// Replaces the current history entry with what is on screen, so Back returns to it.
+function rememberCurrent(revision, architectureEntry = null, fallback = {kind:"unavailable"}) {
   const source = captureSourceEntry();
   if (architectureEntry) rememberNavigation({kind:"architecture", architecture:architectureEntry}, true, "#architecture");
   else if (source) rememberNavigation(source, true, "#source");
   else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id && IndexPin.equal(diagramSequence.revision, revision)) {
     rememberNavigation({kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked, boundary:sequenceBoundary}, true, sequenceHash(selectedMethod.id, revision, sequenceBoundary));
-  } else if (!window.location?.hash) rememberNavigation({kind:"unavailable"}, true, "");
+  } else if (!window.location?.hash) rememberNavigation(fallback, true, "");
+}
+async function navigateDiagram(symbol, revision, kind = "sequence", admitted = null, showAll = false, boundary = null, architectureEntry = null, fallback = undefined) {
+  IndexPin.copy(revision);
+  if (!IndexPin.equal(revision, status?.revision) || !token || !selectedRootKey) throw new Error("Source navigation is stale. Refresh the indexed view.");
+  const context = navigationContext(), ticket = ++navigationSerial;
+  const current = () => ticket === navigationSerial && navigationCurrent(context);
+  diagramSerial++;
+  rememberCurrent(revision, architectureEntry, fallback);
   rememberNavigation({kind, symbol, admitted, showAll, boundary}, false, kind === "sequence" ? sequenceHash(symbol.id, revision, boundary) : "#classes");
   window.TrellisClasses?.reset();
   clearSource(); diagramSequence = null;
@@ -228,6 +233,7 @@ async function readNavigationLocation(force = false) {
   const signature = navigationSignature();
   if (!force && signature === navigationLocation) return;
   navigationLocation = signature;
+  hideAgentNote();
   const ticket = ++navigationSerial; diagramSerial++; sourceSerial++;
   window.TrellisClasses?.reset();
   // A URL never authenticates or chooses a checkout. Explicit selection retries it.
@@ -241,6 +247,13 @@ async function readNavigationLocation(force = false) {
       if (entry.kind === "unavailable") return navigationError("This history entry has no saved source view. The current diagram remains open; use Forward to return to its link.");
       $("error").hidden = true;
       if (entry.kind === "source") return await restoreSourceEntry(entry, current);
+      if (entry.kind === "view") {
+        // A view with no saved selection (#818): Architecture or Treemap, as it was opened.
+        clearSource(); diagramSequence = null; sequenceBoundary = null;
+        await setSection("diagrams");
+        if (!current()) return;
+        return showNavigationView(entry.view);
+      }
       if (entry.kind === "architecture") {
         clearSource(); diagramSequence = null; sequenceBoundary = null;
         await setSection("diagrams");
@@ -296,6 +309,113 @@ async function readNavigationLocation(force = false) {
 }
 window.addEventListener?.("popstate", () => { void readNavigationLocation(); });
 window.addEventListener?.("hashchange", () => { void readNavigationLocation(); });
+
+// Agent shows (#818). Each status poll carries the checkout's latest `trellis_show` request.
+// The first one seen for a checkout is a baseline; a newer generation navigates this view, the
+// way its deep link would, unless the view is pinned. A pinned view still counts it as seen.
+const FOLLOW_MS = 5000;
+let followTimer = null, followSeen = null, agentShown = null;
+let followPinned = (() => { try { return localStorage.getItem("trellis.followPinned") === "true"; } catch (_) { return false; } })();
+function scheduleFollow() {
+  clearTimeout(followTimer); followTimer = null;
+  if (!token || !selectedRootKey || !status?.revision) return;
+  followTimer = setTimeout(() => { followTimer = null; observePinnedHead(); scheduleFollow(); }, FOLLOW_MS);
+}
+function viewRequestOf(value) {
+  if (!objectValue(value) || !Number.isSafeInteger(value.generation) || value.generation < 1) return null;
+  let revision;
+  try { revision = IndexPin.copy(value.revision); } catch (_) { return null; }
+  if (["sequence", "class"].includes(value.view) && typeof value.symbolId === "string" && value.symbolId)
+    return {generation:value.generation, view:value.view, symbolId:value.symbolId, revision};
+  if (value.view === "source" && typeof value.path === "string" && value.path && Number.isSafeInteger(value.line) && value.line >= 1)
+    return {generation:value.generation, view:"source", path:value.path, line:value.line, revision};
+  return null;
+}
+function observeViewRequest(value) {
+  if (!token || !selectedRootKey) return;
+  const request = value == null ? null : viewRequestOf(value);
+  if (value != null && !request) return;
+  const scope = `${epoch}:${selectedRootKey}`, generation = request?.generation ?? 0;
+  if (!followSeen || followSeen.scope !== scope) { followSeen = {scope, generation}; return; }
+  if (generation <= followSeen.generation) return;
+  followSeen.generation = generation;
+  if (followPinned) return;
+  return perform(() => showAgentView(request));
+}
+function agentLabel(request) {
+  return request.view === "source" ? `${request.path}:${request.line}` : request.view === "class" ? "Class diagram" : "Sequence";
+}
+async function showAgentView(request) {
+  if (!token || !selectedRootKey || !status?.revision) return;
+  const pin = IndexPin.copy(status.revision), context = navigationContext();
+  const current = () => navigationCurrent(context);
+  // The deep link's stale-pin rule: never show a target from another snapshot.
+  if (!IndexPin.equal(request.revision, pin)) {
+    showAgentNote(`The agent showed a ${agentLabel(request)} at index ${IndexPin.label(request.revision)}; this view is at ${IndexPin.label(pin)}.`, request, false);
+    return;
+  }
+  const fallback = ["architecture", "treemap"].includes(currentDiagramView()) && section === "diagrams" ? {kind:"view", view:currentDiagramView()} : undefined;
+  let title = agentLabel(request), pushed = true;
+  if (request.view === "sequence") {
+    const data = await api("/api/sequence", "POST", {seed:request.symbolId, expectedRevision:pin, showAll:false, interactions:true}, current);
+    if (!current()) return;
+    if (!IndexPin.equal(data?.revision, pin) || data?.seed?.id !== request.symbolId) throw new Error("Sequence provenance mismatch. Nothing displayed.");
+    title = `Sequence · ${data.seed.name || data.seed.id}`;
+    await navigateDiagram(data.seed, pin, "sequence", data, false, null, null, fallback);
+  } else if (request.view === "class") {
+    await navigateDiagram({id:request.symbolId}, pin, "class", null, false, null, null, fallback);
+  } else {
+    rememberCurrent(pin, null, fallback);
+    const range = {startLine:request.line, endLine:request.line};
+    if (section === "files") await openFilesLocation({path:request.path, range}, pin);
+    else await showCachedSource(request.path, range, pin, current);
+    if (!current()) return;
+    const entry = captureSourceEntry();
+    pushed = !!entry && !!window.history?.pushState;
+    if (entry) rememberNavigation(entry, false, "#source");
+  }
+  if (current()) showAgentNote(`Shown by agent · ${title}`, null, pushed && !!window.history?.pushState);
+}
+function currentDiagramView() {
+  return ["sequence", "classes", "architecture", "treemap"].find(name => $("view-" + name)?.getAttribute?.("aria-selected") === "true") || "sequence";
+}
+// The note says the agent moved this view. Back returns to what was shown before; a request
+// from another snapshot instead offers to reload at head and show it.
+function showAgentNote(text, staleRequest, backable) {
+  const key = backable ? window.history?.state?.trellisNavigation : null;
+  agentShown = {key, request: staleRequest};
+  $("agent-shown-label").textContent = text;
+  $("agent-shown-back").hidden = !key;
+  $("agent-shown-reload").hidden = !staleRequest;
+  $("agent-shown").hidden = false;
+}
+function hideAgentNote() {
+  agentShown = null;
+  $("agent-shown").hidden = true;
+}
+$("agent-shown-back").addEventListener("click", () => {
+  const shown = agentShown;
+  hideAgentNote();
+  // Only the entry the agent opened goes back; after another navigation, Back is the browser's.
+  if (shown?.key && window.history?.state?.trellisNavigation === shown.key) window.history.go(-1);
+});
+$("agent-shown-reload").addEventListener("click", () => {
+  const request = agentShown?.request;
+  hideAgentNote();
+  if (request) void perform(async () => { await refreshView(); if (IndexPin.equal(request.revision, status?.revision)) await showAgentView(request); }, $("agent-shown-reload"));
+});
+$("agent-shown-close").addEventListener("click", hideAgentNote);
+function renderFollowPin() {
+  $("follow-agent").textContent = followPinned ? "Pinned" : "Following agent";
+  $("follow-agent").title = followPinned ? "Pinned: the agent's trellis_show does not move this view. Select to follow it again."
+    : "Following: the agent's trellis_show moves this view. Select to pin it.";
+}
+$("follow-agent").addEventListener("click", () => {
+  followPinned = !followPinned;
+  try { localStorage.setItem("trellis.followPinned", String(followPinned)); } catch (_) { /* a convenience only */ }
+  renderFollowPin();
+});
+renderFollowPin();
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -469,6 +589,8 @@ async function refreshStatus(followup = false) {
   statusUnavailable = false; indexNotReady = !nextPin;
   status = {...data, revision:nextPin};
   data = status;
+  observeViewRequest(data.viewRequest);
+  scheduleFollow();
   updateFilesBasis();
   const listed = checkouts.find(row => row.rootKey === selectedRootKey);
   if (listed) Object.assign(listed, {revision:nextPin, catchingUp:data.catchingUp, indexError:nextPin ? null : "index_not_ready"});
@@ -579,6 +701,7 @@ function resetCheckout() {
   classSupport = null;
   for (const controller of pendingRequests) controller.abort();
   clearTimeout(pollTimer); pollTimer = null; statusSerial++;
+  clearTimeout(followTimer); followTimer = null; followSeen = null; hideAgentNote();
   pairRefreshPending = false; pairRefreshQueued = null;
   clearDependencyCatalog(); clearExternalSources(); clearBrowse(); clearSource(); sourceCache.clear();
   status = null; statusUnavailable = false; jobUnavailable = false; indexNotReady = false; staleMessage = ""; job = null; waitingForJob = false;

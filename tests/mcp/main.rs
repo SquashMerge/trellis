@@ -20,3 +20,4 @@ mod mcp_protocol;
 mod navigation_resolved;
 mod sequence_columns;
 mod sequence_incidental;
+mod show;

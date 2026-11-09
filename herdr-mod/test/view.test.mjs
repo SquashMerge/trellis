@@ -421,3 +421,66 @@ test("an obsolete method list's rejection sets no error on the reloaded file", a
 });
 
 function TrellisErrorLike(code) { const e = new Error(code); e.code = code; return e; }
+
+// #818: an agent's trellis_show reaches the pane as each status poll's `viewRequest`.
+const flush = async (jobs) => { for (let n = 0; n < jobs.length; n++) await jobs[n]; };
+const request = (generation, extra = {}) => ({ generation, view: "sequence", symbolId: "helper", revision: pin, ...extra });
+function showPane({ pinned = false } = {}) {
+  const { view, cx, jobs } = bare();
+  let status = { revision: pin, workspaceRoot: ROOT, viewRequest: request(3) };
+  const sequences = [];
+  view.client = { status: async () => status, architecture: async (_key, p) => rulesless(p),
+    sequence: async (_key, _pin, id) => { sequences.push(id); return sequenceFor(id); } };
+  view.tab = "architecture"; view.pinned = pinned;
+  const poll = async (viewRequest) => { status = { ...status, viewRequest }; view.refreshStatus(cx); await flush(jobs); };
+  return { view, cx, jobs, sequences, poll, start: async () => { view.select(KEY_A, cx); await flush(jobs); } };
+}
+
+test("#818: a newer view request opens its Sequence with a note and Back; the first one seen is only a baseline", async () => {
+  const { view, cx, sequences, poll, start } = showPane();
+  await start();
+  assert.equal(view.tab, "architecture", "the request there before the pane is a baseline");
+  assert.equal(view.shown, null);
+  assert.deepEqual(sequences, []);
+  await poll(request(4));
+  assert.equal(view.tab, "sequence");
+  assert.deepEqual(sequences, ["helper"], "read at the pane's pin, as the browser's deep link reads it");
+  assert.equal(view.seq.seed.id, "helper");
+  const bar = view.shownBar(state.theme ? state.theme : { surface: "", border: "", muted: "", dim: "", hover: "" })[0];
+  assert.match(bar.text(), /Shown by agent · Sequence/);
+  assert.ok(bar.find("agent-shown-back"));
+  bar.find("agent-shown-back").props.click({}, cx);
+  assert.equal(view.tab, "architecture", "Back returns to the view before the show");
+  assert.equal(view.shown, null);
+});
+
+test("#818 negative controls: an equal or older generation, and a pinned pane, never navigate", async () => {
+  const { view, sequences, poll, start } = showPane({ pinned: true });
+  await start();
+  await poll(request(5));
+  assert.equal(view.tab, "architecture", "pinned: ignored");
+  assert.equal(view.shown, null);
+  view.pinned = false;
+  await poll(request(5));
+  assert.equal(view.tab, "architecture", "seen while pinned, so not replayed on unpinning");
+  await poll(request(4));
+  assert.equal(view.tab, "architecture", "an older generation");
+  assert.deepEqual(sequences, []);
+  await poll(request(6));
+  assert.equal(view.tab, "sequence", "control: the next generation is followed");
+  assert.deepEqual(sequences, ["helper"]);
+});
+
+test("#818: a request at another snapshot, or for a view this pane lacks, is a note only", async () => {
+  const { view, sequences, poll, start } = showPane();
+  await start();
+  await poll(request(4, { revision: { ...pin, indexRevision: 9 } }));
+  assert.match(view.shown.text, /at index 00000000:9; this pane is at 00000000:7/);
+  assert.equal(view.shown.back, null);
+  await poll(request(5, { view: "class", symbolId: "type" }));
+  assert.match(view.shown.text, /no Class view; open it in the browser/);
+  await poll(request(6, { view: "source", symbolId: undefined, path: "src/a.rs", line: 3 }));
+  assert.match(view.shown.text, /src\/a\.rs:3/);
+  assert.equal(view.tab, "architecture");
+  assert.deepEqual(sequences, []);
+});

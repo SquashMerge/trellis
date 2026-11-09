@@ -401,7 +401,7 @@ fn no_trigger_starts_a_producer() {
     });
     fx.assert_no_producer_started("pickup watcher event");
 
-    // The eleven MCP tools.
+    // The twelve MCP tools.
     let mut mcp = Mcp::start(&fx);
     let init = mcp.ask(
         "initialize",
@@ -412,7 +412,7 @@ fn no_trigger_starts_a_producer() {
     mcp.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
     let listed = mcp.ask("tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 12);
     fx.assert_no_producer_started("tools/list");
 
     let found = mcp.call(

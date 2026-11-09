@@ -258,6 +258,10 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 #job:empty, #daemon-state:empty { display: none; }
 .retained-pin-status { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; color: var(--sm-gold); font-size: 14px; }
 .retained-pin-status span { overflow-wrap: anywhere; }
+/* An agent's trellis_show moved this view (#818): a small note with Back. */
+.agent-shown { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; color: var(--secondary); font-size: 14px; }
+.agent-shown span { overflow-wrap: anywhere; }
+.follow-agent { font-size: 12px; }
 /* Three real panes. Only their contents scroll. */
 .workspace-frame { position: relative; display: grid; grid-template-columns: 244px minmax(0, 1fr) 284px; flex: 1; min-height: 0; }
 .file-browser { display: flex; flex-direction: column; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 14px 10px 8px; background: var(--surface); border-right: 1px solid var(--line); }

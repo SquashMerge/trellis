@@ -677,6 +677,7 @@ impl CheckoutRegistry {
             rules_edit_owner: std::sync::Mutex::new(()),
             pickup: crate::producer::pickup::PickupOwner::default(),
             producer: crate::producer::run::ProducerOwner::default(),
+            view_requests: Default::default(),
             search: self.search.clone(),
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
@@ -1856,6 +1857,8 @@ pub struct CheckoutRuntime {
     pickup: crate::producer::pickup::PickupOwner,
     /// The only owner of this checkout's producer runs.
     producer: crate::producer::run::ProducerOwner,
+    /// The latest agent `trellis_show` and whether a viewer is open (#818).
+    view_requests: super::view_request::ViewRequests,
 }
 
 /// Startup reconciliation is due or running (not waiting out a backoff).
@@ -1941,6 +1944,11 @@ impl CheckoutRuntime {
 
     pub fn browser_scheduler(&self) -> anyhow::Result<Arc<http::DaemonState>> {
         Ok(self.resources()?.scheduler.clone())
+    }
+
+    /// This checkout's latest agent view request and viewer presence (#818).
+    pub fn view_requests(&self) -> &super::view_request::ViewRequests {
+        &self.view_requests
     }
 
     pub(crate) fn search_service(&self) -> Option<&Arc<super::search::SearchService>> {
@@ -3416,6 +3424,7 @@ mod selection_tests {
             rules_edit_owner: std::sync::Mutex::new(()),
             pickup: crate::producer::pickup::PickupOwner::default(),
             producer: crate::producer::run::ProducerOwner::default(),
+            view_requests: Default::default(),
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
             search_hash_scans: std::sync::atomic::AtomicUsize::new(0),
             mcp_call_clock_origin: std::sync::Mutex::new(None),

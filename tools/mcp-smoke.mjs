@@ -9,7 +9,7 @@ const names = [
   'trellis_workspace_describe', 'trellis_find_symbols', 'trellis_search_symbols',
   'trellis_declaration', 'trellis_outgoing_calls', 'trellis_incoming_calls',
   'trellis_read_source', 'trellis_call_graph', 'trellis_references',
-  'trellis_rules_check', 'trellis_rules_explain',
+  'trellis_rules_check', 'trellis_rules_explain', 'trellis_show',
 ];
 const promptName = 'trellis_propose_layers';
 const callableKinds = new Set(['function', 'method', 'constructor']);
@@ -226,6 +226,9 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
   } else {
     missing('trellis_rules_explain', 'missing_rule_instance');
   }
+  // #818: a path no checkout indexes, so the live smoke never moves the user's open viewers;
+  // `not_found` is a typed answer, so the call still passes.
+  await call('trellis_show', {...symbolPin, view: 'source', path: '.trellis-smoke/absent', line: 1});
   await prompt();
   return {ok: results.length > 0 && results.every(row => row.status === 'pass'),
     catalogTools: tools.length, calls, distinctToolsCalled: called.size, semanticCapabilities,

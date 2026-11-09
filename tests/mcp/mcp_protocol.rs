@@ -686,7 +686,7 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
     assert_eq!(v["result"]["content"].as_array().unwrap().len(), 1);
 }
 /// Validate actual tool envelopes, not the summary string, with each catalog JSON Schema.
-fn validate_structured_content(pairs: &[Value]) {
+pub(crate) fn validate_structured_content(pairs: &[Value]) {
     let script = r#"
 const {createRequire} = require('node:module');
 const {readFileSync} = require('node:fs');
@@ -1117,7 +1117,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
         let response = peer.ask(list);
         let catalog: Value =
             serde_json::from_str(include_str!("../fixtures/mcp/catalog.json")).unwrap();
-        assert_eq!(catalog.as_array().unwrap().len(), 11);
+        assert_eq!(catalog.as_array().unwrap().len(), 12);
         let expected_list = |id: Value| {
             let result = if legacy {
                 json!({"tools":catalog})
@@ -1300,7 +1300,7 @@ fn framing_ids_negotiation_and_application_validation() {
     for spelling in [r#""\u00e9""#, r#""é""#, r#""\ud83d\ude00""#, r#""😀""#] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{spelling},"method":"tools/list","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
         let v = peer.reply();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 11);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 12);
     }
     for n in ["1e0", "1.0", "-0", "9007199254740991", "-9007199254740991"] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{n},"method":"server/discover","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
@@ -1919,6 +1919,7 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             "trellis_references".to_owned(),
             "trellis_rules_check".to_owned(),
             "trellis_rules_explain".to_owned(),
+            "trellis_show".to_owned(),
         ]);
         assert_eq!(names, expected_names);
         let found = peer.ask(call(
@@ -3073,7 +3074,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
 fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
     let catalog: Value =
         serde_json::from_str(include_str!("../fixtures/mcp/catalog.json")).unwrap();
-    assert_eq!(catalog.as_array().unwrap().len(), 11);
+    assert_eq!(catalog.as_array().unwrap().len(), 12);
     for entry in catalog.as_array().unwrap() {
         let defs = &entry["outputSchema"]["$defs"];
         assert_eq!(

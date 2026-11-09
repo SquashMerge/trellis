@@ -1932,3 +1932,123 @@ test("Files zero-call preview keeps uncertainty and opens full admitted detail e
   assert.equal(opened[2],"sequence");
   assert.equal(opened[4],true,"Show all requests incidental calls as well as non-call detail");
 });
+
+// #818: an agent's trellis_show reaches this view through the status poll's viewRequest.
+const SHOW_PIN = {indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+const shown = (generation, extra = {view:"sequence", symbolId:"agent"}) => ({generation, revision:SHOW_PIN, ...extra});
+async function showHarness() {
+  const browser = historyWindow("#sequence?sid=old"), h = harness(browser), requests = [];
+  h.context.fetch = async (path, options) => { requests.push([path, options]); return response(view(JSON.parse(options.body).seed)); };
+  await h.run("readNavigationLocation()");
+  assert.equal(h.run("selectedMethod.id"), "old");
+  requests.length = 0;
+  await h.run("observeViewRequest(null)");
+  return {browser, h, requests};
+}
+
+test("a newer view request navigates an unpinned view, says so, and Back returns to the previous sequence", async () => {
+  const {browser, h, requests} = await showHarness();
+  await h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+  assert.deepEqual(requests.map(([path]) => path), ["/api/sequence"]);
+  assert.deepEqual(JSON.parse(requests[0][1].body).expectedRevision, SHOW_PIN, "the deep link's pinned read");
+  assert.equal(h.run("selectedMethod.id"), "agent");
+  assert.equal(h.get("agent-shown").hidden, false);
+  assert.match(h.get("agent-shown-label").textContent, /^Shown by agent · Sequence · agent$/);
+  assert.equal(h.get("agent-shown-back").hidden, false);
+  assert.match(browser.location.hash, /^#sequence\?sid=agent&/);
+  h.get("agent-shown-back").listeners.click();
+  assert.equal(h.get("agent-shown").hidden, true);
+  assert.match(browser.location.hash, /^#sequence\?sid=old&rootKey=/, "the entry before the show, as a full link");
+  await h.run("readNavigationLocation()");
+  assert.equal(h.run("selectedMethod.id"), "old", "Back restores what was shown before");
+  assert.equal(requests.length, 1, "the restored entry needs no new read");
+});
+
+test("negative control: the first request seen, an equal and an older generation never navigate", async () => {
+  const h = harness(historyWindow()), requests = [];
+  h.context.fetch = async (path, options) => { requests.push(path); return response(view("agent")); };
+  await h.run(`observeViewRequest(${JSON.stringify(shown(9))})`);
+  assert.equal(requests.length, 0, "a request older than this view is a baseline, not a show");
+  for (const generation of [9, 8]) await h.run(`observeViewRequest(${JSON.stringify(shown(generation))})`);
+  assert.equal(requests.length, 0);
+  assert.equal(h.run("selectedMethod"), null);
+  await h.run(`observeViewRequest(${JSON.stringify(shown(10))})`);
+  assert.equal(requests.length, 1, "the next generation does");
+  // A new checkout session starts a new baseline.
+  h.run("epoch++");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(11))})`);
+  assert.equal(requests.length, 1);
+});
+
+test("a pinned view ignores a newer request, and unpinning does not replay it", async () => {
+  const {h, requests} = await showHarness();
+  h.get("follow-agent").listeners.click();
+  assert.equal(h.get("follow-agent").textContent, "Pinned");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(5))})`);
+  assert.equal(requests.length, 0);
+  assert.equal(h.run("selectedMethod.id"), "old");
+  assert.equal(h.get("agent-shown").hidden, true);
+  h.get("follow-agent").listeners.click();
+  assert.equal(h.get("follow-agent").textContent, "Following agent");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(5))})`);
+  assert.equal(requests.length, 0, "the request seen while pinned stays seen");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(6))})`);
+  assert.equal(h.run("selectedMethod.id"), "agent", "control: unpinned, the next request is followed");
+});
+
+test("a request from another index snapshot is not shown; the note offers Reload and show", async () => {
+  const {h, requests} = await showHarness();
+  const newer = {...shown(5), revision:{...SHOW_PIN, indexRevision:2}};
+  await h.run(`observeViewRequest(${JSON.stringify(newer)})`);
+  assert.equal(requests.length, 0);
+  assert.equal(h.run("selectedMethod.id"), "old");
+  assert.match(h.get("agent-shown-label").textContent, /at index 12345678:2; this view is at 12345678:1/);
+  assert.equal(h.get("agent-shown-back").hidden, true);
+  assert.equal(h.get("agent-shown-reload").hidden, false);
+});
+
+test("a class request opens Classes at that seed through the class route", async () => {
+  const {browser, h} = await showHarness();
+  const opened = [];
+  h.run("window.TrellisClasses = {reset() {}, open(options) { globalThis.openedClass = options; }}");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"class", symbolId:"type"}))})`);
+  opened.push(h.run("globalThis.openedClass"));
+  assert.deepEqual(JSON.parse(JSON.stringify(opened[0])), {seed:"type"});
+  assert.equal(browser.location.hash, "#classes");
+  assert.match(h.get("agent-shown-label").textContent, /Shown by agent · Class diagram/);
+});
+
+test("malformed view requests are ignored", async () => {
+  const {h, requests} = await showHarness();
+  for (const bad of [{generation:5}, {...shown(5), view:"architecture"}, {...shown(5), revision:null}, {...shown(5, {view:"source", path:"a.rs", line:0})}, {...shown(0)}])
+    await h.run(`observeViewRequest(${JSON.stringify(bad)})`);
+  assert.equal(requests.length, 0);
+  assert.equal(h.run("followSeen.generation"), 0);
+});
+
+test("the follow poll reads status/head every 5 s and follows the viewRequest it carries", async () => {
+  const h = harness(historyWindow()), requests = [];
+  h.run("status.workspaceRoot='/synthetic'");
+  await h.run("observeViewRequest(null)");
+  h.context.fetch = async (path, options) => {
+    requests.push(path);
+    if (path === "/api/status/head") return response({workspaceRoot:"/synthetic", revision:SHOW_PIN, catchingUp:false, indexedAt:null, viewRequest:shown(3)});
+    return response(view(JSON.parse(options.body).seed));
+  };
+  h.run("scheduleFollow()");
+  const timers = [...h.timers.values()].filter(timer => timer.delay === 5000);
+  assert.equal(timers.length, 1);
+  timers[0].callback();
+  await settleHead(); await settleHead();
+  // The pinned sequence read observes head again, as every pinned read does; the same
+  // generation is not followed twice.
+  assert.deepEqual(requests.slice(0, 2), ["/api/status/head", "/api/sequence"]);
+  assert.ok(requests.slice(2).every(path => path === "/api/status/head"), requests.join());
+  assert.equal(requests.filter(path => path === "/api/sequence").length, 1);
+  assert.equal(h.run("selectedMethod.id"), "agent");
+  const next = h.run("followTimer");
+  assert.ok(next !== timers[0] && h.timers.get(next)?.delay === 5000, "the poll goes on");
+  h.run("resetCheckout()");
+  assert.equal(h.timers.has(next), false, "a checkout reset stops it");
+  assert.equal(h.run("followTimer"), null);
+});
