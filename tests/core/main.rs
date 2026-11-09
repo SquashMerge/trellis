@@ -24,6 +24,7 @@ mod dependency_declarations;
 mod dependency_links;
 mod file_tree;
 mod files_view_store;
+mod interfaces;
 mod java_behavior;
 mod metrics;
 mod metrics_oracle;

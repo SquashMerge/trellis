@@ -1178,6 +1178,95 @@ async fn architecture_summary_reports_layer_site_coverage_and_exception_count() 
     assert!(missing["payload"]["exceptionCount"].is_null());
 }
 
+/// #788: the summary carries the apps' interfaces, `kind=interfaces` pages them over the real
+/// router, a `confidence` filter is `invalid_request`, and a changed rules file is a conflict.
+#[tokio::test]
+async fn interfaces_summary_counts_and_detail_pages() {
+    let (base, _runtime, browser, key) = fixture_with_sources(
+        false,
+        &[
+            ("Cargo.toml", "[package]\nname = \"srv\"\n"),
+            (
+                "src/main.rs",
+                "async fn health() {}\nasync fn unused() {}\nfn router() -> Router {\n    Router::new().route(\"/health\", get(health)).route(\"/unused\", get(unused))\n}\nfn main() {}\n",
+            ),
+            ("web/package.json", "{\"name\":\"web-app\"}\n"),
+            (
+                "web/app.js",
+                "async function load(api) {\n  await api(\"/health\");\n  await api(\"/missing\");\n}\n",
+            ),
+        ],
+    )
+    .await;
+    let rules = "version=1\n[layers.server]\napp='srv'\norder=1\npaths=['src/**']\n[layers.client]\napp='web-app'\norder=1\npaths=['web/**']";
+    write_rules(&base, rules);
+    let app = browser.router();
+    let (status, summary) = summary(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let summary = &summary["payload"];
+    let interfaces = summary["interfaces"].as_array().unwrap();
+    assert_eq!(interfaces.len(), 1, "{summary}");
+    let counts = &interfaces[0]["counts"];
+    assert_eq!(
+        (
+            counts["matchedRoutes"].as_u64(),
+            counts["serverOnly"].as_u64(),
+            counts["clientOnly"].as_u64()
+        ),
+        (Some(1), Some(1), Some(1))
+    );
+    let hash = summary["rulesFile"]["contentHash"].as_str().unwrap();
+    let pinned = format!(
+        "indexGeneration={}&indexRevision={}&rulesHash={hash}",
+        summary["indexGeneration"].as_str().unwrap(),
+        summary["indexRevision"]
+    );
+    let items = all_details(
+        &app,
+        &key,
+        &format!("kind=interfaces&{pinned}&client=web-app&server=srv"),
+        1,
+    )
+    .await;
+    assert_eq!(items.len(), 3);
+    let lists: Vec<_> = items
+        .iter()
+        .map(|item| item["list"].as_str().unwrap())
+        .collect();
+    assert_eq!(lists, ["matched", "serverOnly", "clientOnly"]);
+    assert_eq!(items[0]["entry"]["callSites"][0]["layer"], "client");
+    assert_eq!(items[0]["entry"]["handler"]["layer"], "server");
+    let only = all_details(
+        &app,
+        &key,
+        &format!("kind=interfaces&{pinned}&list=clientOnly"),
+        5,
+    )
+    .await;
+    assert_eq!(only, items[2..]);
+    for bad in ["confidence=exact", "list=other", "path=src%2Fmain.rs"] {
+        let (status, _) = request(
+            app.clone(),
+            &key,
+            &format!("/details?kind=interfaces&{pinned}&{bad}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    write_rules(
+        &base,
+        &format!("{rules}\n[layers.extra]\norder=2\npaths=['absent/**']"),
+    );
+    let (status, conflict) = request(
+        app.clone(),
+        &key,
+        &format!("/details?kind=interfaces&{pinned}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error"]["code"], "rules_conflict");
+}
+
 fn url_encode(text: &str) -> String {
     text.bytes()
         .map(|byte| match byte {

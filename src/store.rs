@@ -2061,7 +2061,8 @@ impl EvidenceResponse {
             "exceptionCount": config.map(crate::rules::Config::exception_count),
             "aggregate": options.aggregate, "metricsVersion": "metrics:v1",
             "role": options.role, "workbench": options.workbench, "evidenceTier": "syntax", "semanticComplete": false,
-            "layers": layers, "modules": [], "edges": [], "references": null, "rules": null
+            "layers": layers, "modules": [], "edges": [], "references": null, "rules": null,
+            "interfaces": []
         });
         Ok(if payload["state"] == "ready" {
             ArchitectureView::Ready {
@@ -2294,6 +2295,14 @@ impl EvidenceResponse {
                 })
                 .collect::<Vec<_>>()
         );
+        let base = core.rules(config)?;
+        let interfaces = crate::interfaces::project(
+            core.interfaces()?,
+            &crate::rules::AppScope::new(config, base.apps()),
+            &assignments,
+            check,
+        )?
+        .summary();
         drop(assignments);
         for value in [&mut references, &mut rules] {
             value["indexGeneration"] = serde_json::json!(core.pin.index_generation.to_string());
@@ -2303,6 +2312,7 @@ impl EvidenceResponse {
         payload["edges"] = serde_json::json!(summaries.into_values().collect::<Vec<_>>());
         payload["references"] = references;
         payload["rules"] = rules;
+        payload["interfaces"] = serde_json::json!(interfaces);
         check()?;
         Ok(core.remember_summary(key, payload))
     }
@@ -2353,11 +2363,22 @@ impl EvidenceResponse {
         let evaluated =
             crate::rules::evaluate_prepared(config, core.rules(config)?, &references, &[], check)?;
         let layers = crate::architecture_details::Layers::new(&evaluated.layers, &evaluated.data);
+        let interfaces = if query.kind == crate::architecture_details::Kind::Interfaces {
+            Some(crate::interfaces::project(
+                core.interfaces()?,
+                &crate::rules::AppScope::new(config, core.rules(config)?.apps()),
+                &evaluated.layers,
+                check,
+            )?)
+        } else {
+            None
+        };
         let page = crate::architecture_details::page(
             query,
             &references.data,
             &evaluated.data,
             &layers,
+            interfaces.as_ref(),
             check,
         )?;
         check()?;

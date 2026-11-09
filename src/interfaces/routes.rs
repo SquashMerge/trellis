@@ -553,7 +553,8 @@ impl<'a> Document<'a> {
                         let name = inner
                             .child_by_field_name("macro")
                             .map_or("", |name| self.text(name));
-                        answers &= !NON_ANSWERS.contains(&name.trim());
+                        answers &=
+                            !NON_ANSWERS.contains(&name.rsplit("::").next().unwrap_or(name).trim());
                     }
                     Ok(false)
                 })?;
@@ -1159,6 +1160,23 @@ fn f() -> Router {
 "#;
         let found = table(&routes(&[("src/http.rs", source)]));
         assert_eq!(found, ["GET /kept", "GET /other-feature"]);
+    }
+
+    #[test]
+    fn a_path_qualified_panic_macro_arm_does_not_answer() {
+        for macro_call in [
+            "std::panic!(\"x\")",
+            "core::unreachable!(\"x\")",
+            "std::todo!()",
+            "core::unimplemented!()",
+        ] {
+            let source = TABLE.replace("unreachable!(\"git bypasses\")", macro_call);
+            let shot = snapshot(&[("src/http.rs", &source)]);
+            let found = run(&shot);
+            let handler = &find(&found, "GET", "/api/checkouts/{root_key}/git").handler;
+            assert_eq!(handler.kind, HandlerKind::Declaration, "{macro_call}");
+            assert_eq!(handler.variant.as_deref(), Some("Git"));
+        }
     }
 
     #[test]

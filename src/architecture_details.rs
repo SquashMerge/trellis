@@ -21,6 +21,7 @@ pub enum Kind {
     Instances,
     Pairs,
     Unresolved,
+    Interfaces,
 }
 
 impl Kind {
@@ -29,6 +30,7 @@ impl Kind {
             Self::Instances => "instances",
             Self::Pairs => "pairs",
             Self::Unresolved => "unresolved",
+            Self::Interfaces => "interfaces",
         }
     }
 }
@@ -54,6 +56,12 @@ pub struct Query {
     pub source: Option<Value>,
     pub target: Option<Value>,
     pub unlayered: bool,
+    /// `interfaces`: the client app's name.
+    pub client: Option<String>,
+    /// `interfaces`: the server app's name.
+    pub server: Option<String>,
+    /// `interfaces`: `matched`, `serverOnly` or `clientOnly`.
+    pub list: Option<String>,
 }
 
 /// A malformed detail query; the HTTP route answers `invalid_request`.
@@ -76,6 +84,7 @@ impl Query {
             Some("instances") => Kind::Instances,
             Some("pairs") => Kind::Pairs,
             Some("unresolved") => Kind::Unresolved,
+            Some("interfaces") => Kind::Interfaces,
             _ => return Err(InvalidQuery),
         };
         let allowed: &[&str] = match kind {
@@ -92,6 +101,7 @@ impl Query {
             ],
             Kind::Pairs => &["role", "path", "source", "target", "layer", "unlayered"],
             Kind::Unresolved => &["path"],
+            Kind::Interfaces => &["client", "server", "list"],
         };
         let common = [
             "indexGeneration",
@@ -166,6 +176,13 @@ impl Query {
                 _ => Err(InvalidQuery),
             },
         };
+        let list = fields.remove("list");
+        if list
+            .as_deref()
+            .is_some_and(|list| crate::interfaces::List::parse(list).is_none())
+        {
+            return Err(InvalidQuery);
+        }
         let unlayered = match flag(fields.remove("unlayered"))? {
             None => false,
             Some(true) => true,
@@ -189,6 +206,9 @@ impl Query {
             source: identity(fields.remove("source"))?,
             target: identity(fields.remove("target"))?,
             unlayered,
+            client: fields.remove("client"),
+            server: fields.remove("server"),
+            list,
         })
     }
 }
@@ -272,11 +292,12 @@ pub fn summary(references: &Value, rules: &Value, layers: &Layers<'_>) -> Result
 
 /// One page of details. `total` counts every matching item; items keep the
 /// evaluation's order, production before test.
-pub fn page(
+pub(crate) fn page(
     query: &Query,
     references: &Value,
     rules: &Value,
     layers: &Layers<'_>,
+    interfaces: Option<&crate::interfaces::Projection<'_>>,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Value> {
     let path_is = |identity: &Value, path: &Option<String>| {
@@ -398,6 +419,18 @@ pub fn page(
                 }
             }
         }
+        Kind::Interfaces => {
+            let interfaces =
+                interfaces.context("store_unavailable: architecture interfaces part")?;
+            let list = query
+                .list
+                .as_deref()
+                .and_then(crate::interfaces::List::parse);
+            for row in interfaces.rows(query.client.as_deref(), query.server.as_deref(), list) {
+                check()?;
+                admit(&|| interfaces.item(row))?;
+            }
+        }
     }
     ensure!(query.offset <= total, "invalid_request: detail offset");
     Ok(json!({
@@ -449,6 +482,7 @@ mod tests {
                 &references,
                 &rules,
                 &layers,
+                None,
                 &mut || Ok(()),
             )
             .unwrap();
@@ -458,8 +492,26 @@ mod tests {
         }
         // The oversized item alone, then two thirds that fit, then the rest.
         assert_eq!(pages, vec![1, 2, 2]);
-        assert!(page(&query(6, 1), &references, &rules, &layers, &mut || Ok(())).is_err());
-        let end = page(&query(5, 1), &references, &rules, &layers, &mut || Ok(())).unwrap();
+        assert!(
+            page(
+                &query(6, 1),
+                &references,
+                &rules,
+                &layers,
+                None,
+                &mut || Ok(())
+            )
+            .is_err()
+        );
+        let end = page(
+            &query(5, 1),
+            &references,
+            &rules,
+            &layers,
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
         assert_eq!(end["items"], json!([]));
         assert!(end["nextOffset"].is_null());
     }
@@ -487,7 +539,7 @@ mod tests {
         let mut offset = Some(0);
         while let Some(at) = offset {
             query.offset = at;
-            let page = page(&query, &references, &rules, &layers, &mut || Ok(())).unwrap();
+            let page = page(&query, &references, &rules, &layers, None, &mut || Ok(())).unwrap();
             assert_eq!(page["total"], 3);
             items.extend(page["items"].as_array().unwrap().iter().cloned());
             offset = page["nextOffset"].as_u64().map(|next| next as usize);
@@ -515,7 +567,7 @@ mod tests {
         let layers = Layers::new(&native, &rules);
         let mut query = query(0, 1);
         query.kind = Kind::Pairs;
-        let page = page(&query, &references, &rules, &layers, &mut || Ok(())).unwrap();
+        let page = page(&query, &references, &rules, &layers, None, &mut || Ok(())).unwrap();
         assert_eq!(page["items"][0]["pair"], pair);
         assert_eq!(page["items"][0]["pair"]["kindCounts"]["call"], 1);
         assert_eq!(
