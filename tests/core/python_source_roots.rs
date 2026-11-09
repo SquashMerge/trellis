@@ -12,12 +12,16 @@ use trellis::{
 };
 
 const WORKSPACE: &str = "[project]\nname = 'core'\n[tool.uv.workspace]\nmembers = ['plugins/x']\n";
-// The plugin is ordered above core: core must never import it.
+// The plugin is ordered above core: core must never import it. The root and the plugin
+// `pyproject.toml` are both Python apps (#807), so the layers name one app, the root `core`,
+// whose root `.` contains both, and their order is compared.
 const RULES: &str = r#"version = 1
 [layers.plugin]
+app = "core"
 order = 1
 paths = ["plugins/x/**"]
 [layers.core]
+app = "core"
 order = 2
 paths = ["core/**"]
 "#;
