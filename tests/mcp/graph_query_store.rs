@@ -1316,7 +1316,7 @@ fn sequence_corrupt_binding_fails_without_partial_result() {
     };
     sql(
         state.path(),
-        "PRAGMA ignore_check_constraints=ON; UPDATE semantic_provenance SET freshness='bogus'",
+        "PRAGMA ignore_check_constraints=ON; UPDATE semantic_coverage_freshness SET freshness='bogus'",
     );
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     let error = store.sequence_at(&seed, pin, false).unwrap_err();
@@ -1341,7 +1341,7 @@ fn published_freshness_is_trusted_not_recomputed() {
     };
     sql(
         state.path(),
-        "UPDATE semantic_provenance SET freshness='possiblyStale' WHERE freshness='fresh'",
+        "UPDATE semantic_coverage_freshness SET freshness='possiblyStale' WHERE freshness='fresh'",
     );
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     let result = result(run(&store, &query(&root_id, true)).unwrap());
@@ -1414,7 +1414,7 @@ fn corrupt_stored_row_is_typed_without_partial_result() {
     };
     sql(
         state.path(),
-        "PRAGMA ignore_check_constraints=ON; UPDATE semantic_provenance SET freshness='bogus'",
+        "PRAGMA ignore_check_constraints=ON; UPDATE semantic_coverage_freshness SET freshness='bogus'",
     );
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert!(run(&store, &query(&root_id, true)).is_err());
@@ -1607,9 +1607,11 @@ fn non_ambiguous_multi_match_for_one_call_stays_typed_corruption() {
             } else {
                 "PRAGMA foreign_keys=OFF; \
                  DELETE FROM semantic_call_candidates WHERE binding_id IN \
-                   (SELECT binding_id FROM semantic_call_bindings WHERE provenance_id='amb-2'); \
+                   (SELECT binding_id FROM semantic_call_bindings WHERE (payload_id,provenance_ordinal) IN \
+                     (SELECT payload_id,ordinal FROM semantic_provenance WHERE provenance_id='amb-2')); \
                  UPDATE semantic_call_bindings SET resolution='unresolved' \
-                   WHERE provenance_id='amb-2';"
+                   WHERE (payload_id,provenance_ordinal) IN \
+                     (SELECT payload_id,ordinal FROM semantic_provenance WHERE provenance_id='amb-2');"
             },
         );
         for path in ["graph", "sequence"] {

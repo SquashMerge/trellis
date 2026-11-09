@@ -1,0 +1,645 @@
+//! Shared semantic payloads (#680, Decision 0021): the revision-neutral rows of one
+//! `(producer, document)` tuple, written once and named by every revision's manifest row.
+//!
+//! A payload stores the writing revision's native revision as NULL. Reading it as evidence of
+//! revision r goes through [`project_payload`], the single projection, which supplies r's
+//! native revision, r's rejoined provenance IDs and r's freshness.
+use super::*;
+use crate::semantic_evidence as sem;
+use std::cell::RefCell;
+
+/// The provenance IDs of `coverage`'s own tuple: the rows the tuple owns in `publication`.
+pub(in crate::store) fn owned_provenance<'a>(
+    coverage: &sem::Coverage,
+    publication: &'a sem::SemanticPublication,
+) -> BTreeSet<&'a str> {
+    let language = semantic_variant(&coverage.language).unwrap_or_default();
+    publication
+        .provenance
+        .iter()
+        .filter(|p| {
+            p.producer_id == coverage.producer_id
+                && p.document.language == language
+                && p.document.path == coverage.document_path
+        })
+        .map(|p| p.id.as_str())
+        .collect()
+}
+
+/// The documents the tuple's rows name: the union of every internal endpoint, join anchor,
+/// candidate and dispatch document. A change to any of them invalidates the payload.
+pub(in crate::store) fn projection_dependencies(
+    owns: &BTreeSet<&str>,
+    publication: &sem::SemanticPublication,
+) -> BTreeSet<(String, String)> {
+    let mut out = BTreeSet::new();
+    let mut target = |t: &sem::Target| {
+        if let sem::Target::Internal { document, .. } = t {
+            out.insert((document.language.clone(), document.path.clone()));
+        }
+    };
+    for symbol in publication
+        .symbols
+        .iter()
+        .filter(|s| owns.contains(s.provenance_id.as_str()))
+    {
+        symbol.declarations.iter().for_each(&mut target);
+    }
+    let mut anchors = Vec::new();
+    for binding in publication
+        .declaration_bindings
+        .iter()
+        .filter(|b| owns.contains(b.provenance_id.as_str()))
+    {
+        anchors.push((
+            binding.join.anchor.document.language.clone(),
+            binding.join.anchor.document.path.clone(),
+        ));
+    }
+    for reference in publication
+        .references
+        .iter()
+        .filter(|r| owns.contains(r.provenance_id.as_str()))
+    {
+        reference.declared_target.iter().for_each(&mut target);
+        reference.candidates.iter().for_each(&mut target);
+    }
+    for call in publication
+        .call_bindings
+        .iter()
+        .filter(|b| owns.contains(b.provenance_id.as_str()))
+    {
+        call.declared_target.iter().for_each(&mut target);
+        call.candidates.iter().for_each(&mut target);
+        call.possible_dispatch.iter().for_each(&mut target);
+        anchors.push((
+            call.join.anchor.document.language.clone(),
+            call.join.anchor.document.path.clone(),
+        ));
+    }
+    for relationship in publication
+        .type_relationships
+        .iter()
+        .filter(|r| owns.contains(r.provenance_id.as_str()))
+    {
+        target(&relationship.source);
+        target(&relationship.target);
+    }
+    out.extend(anchors);
+    out
+}
+
+/// The input key (B): equal keys name equal payloads.
+pub(in crate::store) fn payload_key(
+    producer: &sem::Producer,
+    descriptor_sha256: &str,
+    captured_revision: &str,
+    language: &str,
+    path: &str,
+    version: &str,
+    dependencies: &[(String, String, String)],
+) -> String {
+    crate::native_ids::digest(
+        b"trellis.semantic-payload.v1\0",
+        &crate::native_ids::canonical(&serde_json::json!({
+            "producer": {"id": producer.id, "version": producer.version, "executableHash": producer.executable_hash},
+            "batch": {"descriptorSha256": descriptor_sha256, "capturedRevision": captured_revision},
+            "document": {"language": language, "path": path, "version": version},
+            "dependencies": dependencies.iter().map(|(l, p, v)| serde_json::json!({"language": l, "path": p, "version": v})).collect::<Vec<_>>(),
+        })),
+    )
+}
+
+/// Where a projection takes provenance freshness from.
+pub(in crate::store) enum FreshnessSource<'a> {
+    /// The freshness rows stored for the reading revision.
+    Stored,
+    /// Freshness a publication supplies before its rows are stored.
+    #[allow(dead_code)]
+    Publication(&'a BTreeMap<i64, sem::Freshness>),
+}
+
+/// What reading a stored target needs from the reading revision.
+#[derive(Clone, Copy)]
+pub(in crate::store) struct TargetScope<'a> {
+    pub source_set: &'a str,
+    pub native: &'a str,
+}
+
+/// How one payload is read as evidence of one revision (C).
+pub(in crate::store) struct PayloadProjection<'a> {
+    db: &'a Connection,
+    native: String,
+    pub(in crate::store) source_set: String,
+    pub(in crate::store) payload_id: Option<i64>,
+    freshness: BTreeMap<i64, sem::Freshness>,
+    ids: RefCell<BTreeMap<i64, String>>,
+}
+
+/// The projection of the payload named by manifest row `tuple_id` of `revision_key`.
+pub(in crate::store) fn project_payload<'a>(
+    db: &'a Connection,
+    revision_key: &str,
+    tuple_id: i64,
+    freshness: FreshnessSource<'a>,
+) -> Result<PayloadProjection<'a>> {
+    let (source_set, native): (String, String) = db
+        .prepare_cached(
+            "SELECT source_set_id,native_revision_id FROM native_revisions WHERE id=?1",
+        )?
+        .query_row([revision_key], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let payload_id: Option<i64> = db
+        .prepare_cached(
+            "SELECT payload_id FROM semantic_coverage WHERE tuple_id=?1 AND revision_id=?2",
+        )?
+        .query_row(params![tuple_id, revision_key], |r| r.get(0))?;
+    let freshness = match freshness {
+        FreshnessSource::Publication(map) => map.clone(),
+        FreshnessSource::Stored => {
+            let mut rows = db.prepare_cached(
+                "SELECT basis_id,freshness FROM semantic_coverage_freshness WHERE revision_id=?1 AND tuple_id=?2",
+            )?;
+            let rows = rows
+                .query_map(params![revision_key, tuple_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut map = BTreeMap::new();
+            for (basis, stored) in rows {
+                map.insert(basis, semantic_enum(stored)?);
+            }
+            map
+        }
+    };
+    Ok(PayloadProjection {
+        db,
+        native,
+        source_set,
+        payload_id,
+        freshness,
+        ids: RefCell::new(BTreeMap::new()),
+    })
+}
+
+impl PayloadProjection<'_> {
+    pub(in crate::store) fn scope(&self) -> TargetScope<'_> {
+        TargetScope {
+            source_set: &self.source_set,
+            native: &self.native,
+        }
+    }
+
+    /// The reading revision's native revision.
+    pub(in crate::store) fn native(&self) -> &str {
+        &self.native
+    }
+
+    /// A stored native-revision column: NULL means the reading revision's.
+    pub(in crate::store) fn revision(&self, stored: Option<String>) -> String {
+        stored.unwrap_or_else(|| self.native.clone())
+    }
+
+    /// The reading revision's provenance ID for the row at `ordinal`.
+    pub(in crate::store) fn provenance_id(&self, ordinal: i64) -> Result<String> {
+        if let Some(id) = self.ids.borrow().get(&ordinal) {
+            return Ok(id.clone());
+        }
+        let payload = self.payload_id.context(SelectedIntegrity(
+            "incompatible_index: payload-less tuple names provenance".into(),
+        ))?;
+        let row: Option<(Option<String>, Option<String>, String)> = self
+            .db
+            .prepare_cached(
+                "SELECT provenance_id,derived_from_provenance_id,evidence_kind FROM semantic_provenance WHERE payload_id=?1 AND ordinal=?2",
+            )?
+            .query_row(params![payload, ordinal], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        let (literal, derived, kind) = row.context(SelectedIntegrity(
+            "incompatible_index: semantic fact without provenance".into(),
+        ))?;
+        let id = match (literal, derived) {
+            (Some(id), None) => id,
+            (None, Some(raw)) => crate::semantic_import::rejoin_provenance_id(
+                &raw,
+                &self.native,
+                semantic_enum(kind)?,
+            ),
+            _ => {
+                return Err(SelectedIntegrity(
+                    "incompatible_index: corrupt semantic provenance ID".into(),
+                )
+                .into());
+            }
+        };
+        self.ids.borrow_mut().insert(ordinal, id.clone());
+        Ok(id)
+    }
+
+    /// The reading revision's freshness for one basis of the payload.
+    pub(in crate::store) fn freshness(&self, basis_id: i64) -> Result<sem::Freshness> {
+        self.freshness
+            .get(&basis_id)
+            .copied()
+            .context(SelectedIntegrity(
+                "incompatible_index: semantic freshness missing".into(),
+            ))
+    }
+}
+
+/// Collects up to 64 journaled payloads of `revision` that no manifest row names. Returns
+/// whether it made progress, which means the caller's unit continues.
+pub(in crate::store) fn cleanup_payload_candidates(
+    tx: &Connection,
+    revision: &str,
+) -> Result<bool> {
+    const CHILDREN: [(&str, &str); 13] = [
+        ("semantic_reference_roles", "payload"),
+        ("semantic_reference_candidates", "payload"),
+        ("semantic_references", "payload"),
+        (
+            "semantic_symbol_targets",
+            "symbol_id IN (SELECT symbol_id FROM semantic_symbols WHERE payload_id=?1)",
+        ),
+        (
+            "semantic_declaration_binding_symbols",
+            "binding_id IN (SELECT binding_id FROM semantic_declaration_bindings WHERE payload_id=?1)",
+        ),
+        (
+            "semantic_declaration_join_candidates",
+            "binding_id IN (SELECT binding_id FROM semantic_declaration_bindings WHERE payload_id=?1)",
+        ),
+        (
+            "semantic_call_candidates",
+            "binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE payload_id=?1)",
+        ),
+        (
+            "semantic_call_possible_dispatch",
+            "binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE payload_id=?1)",
+        ),
+        (
+            "semantic_call_join_candidates",
+            "binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE payload_id=?1)",
+        ),
+        ("semantic_type_relationships", "payload"),
+        ("semantic_symbols", "payload"),
+        ("semantic_declaration_bindings", "payload"),
+        ("semantic_call_bindings", "payload"),
+    ];
+    const TAIL: [(&str, &str); 8] = [
+        ("semantic_provenance", "payload"),
+        (
+            "semantic_basis_lookup_dependencies",
+            "basis_id IN (SELECT basis_id FROM semantic_basis WHERE payload_id=?1)",
+        ),
+        ("semantic_basis", "payload"),
+        ("semantic_projection_dependencies", "payload"),
+        ("semantic_projection_lookup_dependencies", "payload"),
+        ("semantic_projection_contexts", "payload"),
+        ("semantic_coverage_roles", "payload"),
+        ("semantic_coverage_reasons", "payload"),
+    ];
+    let mut progress = false;
+    for _ in 0..64 {
+        let candidate: Option<i64> = tx
+            .query_row(
+                "SELECT payload_id FROM semantic_release_candidate_payloads WHERE revision_id=?1 ORDER BY payload_id LIMIT 1",
+                [revision],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(payload) = candidate else {
+            return Ok(progress);
+        };
+        progress = true;
+        let named: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE payload_id=?1)",
+            [payload],
+            |r| r.get(0),
+        )?;
+        if !named {
+            // The key goes first: once collection starts no writer hit can reach the payload.
+            tx.execute(
+                "UPDATE semantic_payloads SET payload_key=NULL WHERE payload_id=?1 AND payload_key IS NOT NULL",
+                [payload],
+            )?;
+            for (table, filter) in CHILDREN.iter().chain(TAIL.iter()) {
+                let filter = if *filter == "payload" {
+                    "payload_id=?1"
+                } else {
+                    filter
+                };
+                let deleted = tx.execute(
+                    &format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {filter} LIMIT 256)"),
+                    [payload],
+                )?;
+                if deleted == 256 {
+                    return Ok(true);
+                }
+            }
+            tx.execute(
+                "DELETE FROM semantic_payloads WHERE payload_id=?1",
+                [payload],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM semantic_release_candidate_payloads WHERE revision_id=?1 AND payload_id=?2",
+            params![revision, payload],
+        )?;
+    }
+    Ok(progress)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_evidence::{DocumentKey, Range};
+
+    fn document(path: &str) -> DocumentKey {
+        DocumentKey {
+            source_set_id: "set".into(),
+            language: "javascript".into(),
+            path: path.into(),
+        }
+    }
+
+    fn internal(path: &str) -> sem::Target {
+        sem::Target::Internal {
+            syntax_id: format!("sid:v1:{}", "1".repeat(32)),
+            document: document(path),
+            revision_id: "native".into(),
+        }
+    }
+
+    fn anchor(path: &str, kind: sem::JoinKind) -> sem::Join {
+        sem::Join {
+            anchor: sem::MeasuredAnchor {
+                document: document(path),
+                revision_id: "native".into(),
+                content_hash: "h".into(),
+                range: Range { start: 0, end: 1 },
+                kind,
+            },
+            status: sem::JoinStatus::Exact,
+            candidate_ids: vec![],
+            diagnostic: None,
+        }
+    }
+
+    /// A publication whose one document names a different document through every kind of
+    /// endpoint the projection depends on.
+    fn every_endpoint() -> (sem::Coverage, sem::SemanticPublication) {
+        let key = |symbol: &str| sem::SymbolKey {
+            scheme: sem::SymbolScheme::Scip,
+            symbol: symbol.into(),
+            scope: sem::SymbolScope::Global,
+            document: None,
+        };
+        let coverage = sem::Coverage {
+            producer_id: "producer".into(),
+            language: sem::Language::Javascript,
+            source_set_id: "set".into(),
+            document_path: "main.js".into(),
+            revision_id: "native".into(),
+            requested: true,
+            selected: true,
+            state: sem::CoverageState::Complete,
+            supported_roles: vec![],
+            observed_roles: vec![],
+            diagnostic: None,
+            reasons: None,
+        };
+        let provenance = |id: &str| sem::Provenance {
+            id: id.into(),
+            producer_id: "producer".into(),
+            document: document("main.js"),
+            revision_id: "native".into(),
+            content_hash: "h".into(),
+            evidence_kind: sem::EvidenceKind::MeasuredSyntax,
+            basis: Some(sem::SemanticBasis {
+                producer_id: "producer".into(),
+                producer_version: "1".into(),
+                producer_hash: "a".repeat(64),
+                artifact_hash: "b".repeat(64),
+                language: sem::Language::Javascript,
+                source_set_id: "set".into(),
+                revision_id: "native".into(),
+                source_manifest_hash: "c".repeat(64),
+                toolchain_hash: "d".repeat(64),
+                config_hash: "e".repeat(64),
+                dependency_hash: "f".repeat(64),
+                lookup_dependencies: vec![],
+            }),
+            freshness: sem::Freshness::Fresh,
+            derived_from: None,
+        };
+        let publication = sem::SemanticPublication {
+            producers: vec![],
+            coverage: vec![coverage.clone()],
+            provenance: vec![provenance("p")],
+            symbols: vec![sem::Symbol {
+                key: key("s"),
+                display_name: None,
+                declarations: vec![internal("symbol-target.js")],
+                provenance_id: "p".into(),
+            }],
+            declaration_bindings: vec![sem::DeclarationBinding {
+                syntax_id: None,
+                symbols: vec![],
+                join: anchor("declaration-anchor.js", sem::JoinKind::DeclarationName),
+                provenance_id: "p".into(),
+            }],
+            references: vec![sem::Reference {
+                id: "occ:v1:00".into(),
+                owner_syntax_id: "sid:v1:00".into(),
+                ordinal: 0,
+                document: document("main.js"),
+                revision_id: "native".into(),
+                range: Range { start: 0, end: 1 },
+                spelling: "x".into(),
+                lookup_key: "x".into(),
+                site: sem::ReferenceSite::Use,
+                roles: vec![],
+                resolution: sem::Resolution::Resolved,
+                declared_target: Some(internal("reference-declared.js")),
+                candidates: vec![internal("reference-candidate.js")],
+                provenance_id: "p".into(),
+            }],
+            call_bindings: vec![sem::CallBinding {
+                call_id: None,
+                join: anchor("call-anchor.js", sem::JoinKind::Callee),
+                resolution: sem::Resolution::Resolved,
+                declared_target: Some(internal("call-declared.js")),
+                candidates: vec![internal("call-candidate.js")],
+                dispatch: sem::Dispatch::Direct,
+                possible_dispatch: vec![internal("call-dispatch.js")],
+                possible_dispatch_complete: false,
+                stale_target: None,
+                provenance_id: "p".into(),
+            }],
+            type_relationships: vec![sem::TypeRelationship {
+                kind: sem::RelationshipKind::Extends,
+                source: internal("type-source.js"),
+                target: internal("type-target.js"),
+                provenance_id: "p".into(),
+            }],
+        };
+        (coverage, publication)
+    }
+
+    #[test]
+    fn projection_dependencies_covers_every_endpoint_kind() {
+        let (coverage, publication) = every_endpoint();
+        let owns = owned_provenance(&coverage, &publication);
+        let paths: Vec<String> = projection_dependencies(&owns, &publication)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "call-anchor.js",
+                "call-candidate.js",
+                "call-declared.js",
+                "call-dispatch.js",
+                "declaration-anchor.js",
+                "reference-candidate.js",
+                "reference-declared.js",
+                "symbol-target.js",
+                "type-source.js",
+                "type-target.js",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fact_of_another_tuple_adds_no_dependency() {
+        let (coverage, mut publication) = every_endpoint();
+        publication.symbols[0].provenance_id = "other".into();
+        let owns = owned_provenance(&coverage, &publication);
+        assert!(
+            !projection_dependencies(&owns, &publication)
+                .iter()
+                .any(|(_, path)| path == "symbol-target.js")
+        );
+    }
+
+    #[test]
+    fn writer_rejects_dependency_endpoint_missing_from_revision() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(CACHE_SCHEMA_V42).unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
+        let (_, mut publication) = every_endpoint();
+        publication.producers.push(sem::Producer {
+            id: "producer".into(),
+            version: "1".into(),
+            executable_hash: "a".repeat(64),
+            kind: sem::SemanticKind::Semantic,
+            languages: vec![sem::Language::Javascript],
+            position_encoding: sem::PositionEncoding::Utf8,
+        });
+        // The document itself is in the revision; its dependencies are not.
+        db.execute("INSERT INTO document_versions(vid,id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness) VALUES(1,'v','javascript','main.js',?1,?1,'p','1',0,x'',?1)", ["b".repeat(64)]).unwrap();
+        db.execute("INSERT INTO revision_documents VALUES('key','javascript','main.js',1,1,NULL,NULL,1,1,'complete',NULL,0,1)", []).unwrap();
+        let error = write_import_coverage(&db, "key", &publication, None).unwrap_err();
+        assert!(
+            error.is::<SelectedIntegrity>()
+                && format!("{error:#}").contains("semantic dependency endpoint missing"),
+            "{error:#}"
+        );
+    }
+
+    fn payload_with_children(db: &Connection, key: Option<&str>, symbols: usize) {
+        db.execute_batch(CACHE_SCHEMA_V42).unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        db.execute(
+            "INSERT INTO semantic_payloads(payload_id,payload_key,producer_id,producer_version,language,path,version_id,batch_id) VALUES(1,?1,'p','1','javascript','a.js','v',1)",
+            [key],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO semantic_release_candidate_payloads VALUES('rev',1)",
+            [],
+        )
+        .unwrap();
+        for ordinal in 0..symbols {
+            db.execute(
+                "INSERT INTO semantic_symbols VALUES(NULL,1,?1,'scip',?2,'global',NULL,NULL,NULL,0)",
+                params![ordinal as i64, format!("s{ordinal}")],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn collection_clears_key_before_children() {
+        let db = Connection::open_in_memory().unwrap();
+        payload_with_children(&db, Some(&"a".repeat(64)), 600);
+        assert!(cleanup_payload_candidates(&db, "rev").unwrap());
+        let key: Option<String> = db
+            .query_row("SELECT payload_key FROM semantic_payloads", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            key, None,
+            "no writer hit can reach a payload being collected"
+        );
+        let left: i64 = db
+            .query_row("SELECT COUNT(*) FROM semantic_symbols", [], |r| r.get(0))
+            .unwrap();
+        assert!(left > 0, "the children go in later chunks");
+    }
+
+    #[test]
+    fn last_release_collects_payload_in_chunks() {
+        let db = Connection::open_in_memory().unwrap();
+        payload_with_children(&db, Some(&"a".repeat(64)), 600);
+        let mut calls = 0;
+        while cleanup_payload_candidates(&db, "rev").unwrap() {
+            calls += 1;
+            assert!(calls < 20);
+        }
+        assert!(
+            calls >= 3,
+            "600 children take at least three 256-row chunks"
+        );
+        for table in [
+            "semantic_payloads",
+            "semantic_symbols",
+            "semantic_release_candidate_payloads",
+        ] {
+            let rows: i64 = db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn a_payload_a_manifest_row_still_names_is_only_unjournaled() {
+        let db = Connection::open_in_memory().unwrap();
+        payload_with_children(&db, Some(&"a".repeat(64)), 3);
+        db.execute("INSERT INTO semantic_coverage VALUES(1,'other','p','1','javascript','a.js',1,1,'complete',NULL,1)", []).unwrap();
+        cleanup_payload_candidates(&db, "rev").unwrap();
+        let (payloads, symbols, key): (i64, i64, Option<String>) = db
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM semantic_payloads),(SELECT COUNT(*) FROM semantic_symbols),(SELECT payload_key FROM semantic_payloads)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((payloads, symbols), (1, 3));
+        assert!(key.is_some(), "a named payload keeps its reuse key");
+        let journal: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_release_candidate_payloads",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(journal, 0);
+    }
+}

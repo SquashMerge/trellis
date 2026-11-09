@@ -357,8 +357,9 @@ impl Model {
             .store
             .with_index_read_for_tests(|db| {
                 let mut statement = db.prepare(
-                    "SELECT c.path, COALESCE(r.omitted,0) FROM semantic_coverage c \
-                     LEFT JOIN semantic_coverage_reasons r ON r.tuple_id=c.tuple_id \
+                    "SELECT c.path, COALESCE(rp.omitted,rt.omitted,0) FROM semantic_coverage c \
+                     LEFT JOIN semantic_coverage_reasons rp ON rp.payload_id=c.payload_id \
+                     LEFT JOIN semantic_coverage_reasons rt ON rt.tuple_id=c.tuple_id \
                      WHERE c.revision_id=?1 AND c.producer_id=?2",
                 )?;
                 let rows = statement
@@ -1611,7 +1612,8 @@ impl<'w> Harness<'w> {
     }
 
     /// #669 H1: corruption in a basis row S reads while copying is a typed integrity
-    /// failure that schedules a re-index; S publishes nothing.
+    /// failure that schedules a re-index. A corrupt shared payload S copies without reading
+    /// its raw proofs (`write`) is published, and every read of it fails typed instead.
     fn corrupt_copy(&mut self, label: &str, pick: usize, write: bool) -> Result<(), String> {
         let world = self.world;
         if self.model.outstanding.is_none()
@@ -1636,15 +1638,15 @@ impl<'w> Harness<'w> {
                     // No raw capture has this artifact hash: the publisher's capture lookup
                     // for the copied rows is where the corruption is found (#679 re-review).
                     return Ok(db.execute(
-                        "UPDATE semantic_basis SET artifact_hash=?3 WHERE tuple_id IN \
-                         (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path=?2)",
+                        "UPDATE semantic_basis SET artifact_hash=?3 WHERE payload_id IN \
+                         (SELECT payload_id FROM semantic_coverage WHERE revision_id=?1 AND path=?2)",
                         rusqlite::params![key, path, "0".repeat(64)],
                     )?);
                 }
                 db.execute_batch("PRAGMA ignore_check_constraints=ON")?;
                 let changed = db.execute(
-                    "UPDATE semantic_symbols SET key_scope='bogus' WHERE tuple_id IN \
-                     (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path=?2)",
+                    "UPDATE semantic_symbols SET key_scope='bogus' WHERE payload_id IN \
+                     (SELECT payload_id FROM semantic_coverage WHERE revision_id=?1 AND path=?2)",
                     rusqlite::params![key, path],
                 )?;
                 db.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
@@ -1695,6 +1697,28 @@ impl<'w> Harness<'w> {
                 let copied = work_counts(s)?
                     .map(|w| copied_paths(&w))
                     .unwrap_or_default();
+                if write && copied.contains(&path) {
+                    let text = match world.store.semantic_at(s) {
+                        Ok(_) => {
+                            return Err(format!(
+                                "{label}: read of the corrupt shared payload of {path} succeeded"
+                            ));
+                        }
+                        Err(error) => format!("{error:#}"),
+                    };
+                    if !text.contains("incompatible_index") {
+                        return Err(format!(
+                            "{label}: corrupt shared payload of {path} failed untyped: {text}"
+                        ));
+                    }
+                    if !world.store.recovery_pending_for_tests() {
+                        return Err(format!(
+                            "{label}: corrupt shared payload of {path} did not schedule a re-index: {text}"
+                        ));
+                    }
+                    self.stats.corruptions_typed += 1;
+                    return Ok(());
+                }
                 if copied.contains(&path) {
                     return Err(format!(
                         "{label}: S published from corrupt basis rows of {path}"

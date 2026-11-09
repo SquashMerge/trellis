@@ -73,6 +73,9 @@ struct ProducerContinuation {
     /// FULL for a batch with no original import: first join it against its own capture.
     capture_witness: bool,
     capture_join: Option<JoinContinuation>,
+    /// The independent FULL rejoin the pre-commit oracle computed, for the post-commit check.
+    #[cfg(feature = "test-support")]
+    oracle_full: Option<crate::semantic_evidence::SemanticPublication>,
 }
 
 impl SemanticContinuation {
@@ -370,6 +373,23 @@ impl Store {
             };
             if let Some(_published_pin) = published {
                 #[cfg(feature = "test-support")]
+                if super::oracle::enabled() {
+                    let durable = self.cache()?;
+                    for prepared in &state.prepared {
+                        if let Some(full) = &prepared.oracle_full
+                            && let Err(error) = super::oracle::check_published(
+                                &durable,
+                                _published_pin,
+                                &prepared.producer,
+                                full,
+                            )
+                        {
+                            *continuation = None;
+                            return Err(error.context(RejoinOracleMismatch));
+                        }
+                    }
+                }
+                #[cfg(feature = "test-support")]
                 let counts_result = write_semantic_work_counts(_published_pin, &state.target);
                 *continuation = None;
                 #[cfg(feature = "test-support")]
@@ -434,6 +454,8 @@ impl Store {
                             witness_ready: false,
                             capture_witness: false,
                             capture_join: None,
+                            #[cfg(feature = "test-support")]
+                            oracle_full: None,
                         });
                     }
                     let current = state.current.as_mut().unwrap();
@@ -656,7 +678,9 @@ impl Store {
                             );
                             admitted.stage_mut().release_connection();
                             // Oracle failures are test failures, never producer unavailability.
-                            comparison.map_err(|error| error.context(RejoinOracleMismatch))?;
+                            current.oracle_full = Some(
+                                comparison.map_err(|error| error.context(RejoinOracleMismatch))?,
+                            );
                         }
                     }
                     Ok(joined)
@@ -700,6 +724,8 @@ impl Store {
                         joined,
                     },
                     capture_witness: current.capture_witness.then_some(selection.batch_id),
+                    #[cfg(feature = "test-support")]
+                    oracle_full: current.oracle_full,
                 });
                 state.next += 1;
                 Ok(SemanticUnitOutcome::Progress)
@@ -778,6 +804,8 @@ impl Store {
                 state.prepared.push(PreparedSemantic {
                     producer,
                     capture_witness: None,
+                    #[cfg(feature = "test-support")]
+                    oracle_full: None,
                     output: PreparedOutput::Unavailable {
                         diagnostic: format!("{}: {error:#}", super::UNAVAILABLE_DIAGNOSTIC)
                             .chars()

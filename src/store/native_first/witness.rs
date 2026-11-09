@@ -7,6 +7,7 @@ use crate::semantic_batch::{
     descriptor::{Descriptor, SourceManifestHasher},
 };
 use crate::semantic_evidence as sem;
+use crate::store::semantic_payload::TargetScope;
 
 pub(crate) type Reserve<'a> = dyn FnMut(u64) -> Result<()> + 'a;
 
@@ -40,9 +41,18 @@ pub(crate) struct SelectedVersion {
     pub producer_version: String,
 }
 
+impl OriginalSourceWitness {
+    /// The payload id the original fact queries bind; 0 names no payload.
+    fn payload(&self) -> i64 {
+        self.payload_id.unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct OriginalSourceWitness {
     pub tuple_id: i64,
+    /// The payload the original manifest row names; a payload-less original has none.
+    pub payload_id: Option<i64>,
     pub document: DocumentKey,
     pub captured_version: SelectedVersion,
     pub current_version: SelectedVersion,
@@ -276,17 +286,23 @@ pub(crate) struct CurrentDeclaration {
     pub callable: bool,
 }
 
-fn read_join(row: &rusqlite::Row<'_>, offset: usize, source_set: &str) -> Result<OriginalJoin> {
+fn read_join(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+    scope: &TargetScope<'_>,
+) -> Result<OriginalJoin> {
     let start: i64 = row.get(offset + 4)?;
     let end: i64 = row.get(offset + 5)?;
     selected_ensure!(start >= 0 && end >= start, "invalid original join span");
     Ok(OriginalJoin {
         document: DocumentKey {
-            source_set_id: source_set.to_owned(),
+            source_set_id: scope.source_set.to_owned(),
             language: row.get(offset)?,
             path: row.get(offset + 1)?,
         },
-        revision_id: row.get(offset + 2)?,
+        revision_id: row
+            .get::<_, Option<String>>(offset + 2)?
+            .unwrap_or_else(|| scope.native.to_owned()),
         content_hash: row.get(offset + 3)?,
         range: Range {
             start: start as usize,
@@ -621,7 +637,7 @@ struct ChildTable {
     sql: &'static str,
     gap: &'static str,
     bytes_from: usize,
-    decode: fn(&rusqlite::Row<'_>, &str) -> Result<ChildRow>,
+    decode: fn(&rusqlite::Row<'_>, &TargetScope<'_>) -> Result<ChildRow>,
 }
 
 fn row_bytes(row: &rusqlite::Row<'_>, from: usize) -> Result<u64> {
@@ -724,6 +740,27 @@ fn association_unit(
         unit,
         reserve,
     };
+    let key = semantic_pin_key(a.original_pin);
+    let projection = if a.cache {
+        None
+    } else {
+        Some(crate::store::semantic_payload::project_payload(
+            db,
+            &key,
+            w.tuple_id,
+            crate::store::semantic_payload::FreshnessSource::Stored,
+        )?)
+    };
+    let scope = TargetScope {
+        source_set,
+        native: &a.captured_revision_id,
+    };
+    let pid = |ordinal: i64| -> Result<String> {
+        projection
+            .as_ref()
+            .context("original projection")?
+            .provenance_id(ordinal)
+    };
     match c.phase {
         0 => {
             let bytes = std::mem::size_of::<OriginalRow>() as u64
@@ -758,12 +795,13 @@ fn association_unit(
                 let want = emit.room - emit.emitted;
                 let rows = query_rows(
                     db,
-                    "SELECT ordinal,role FROM semantic_coverage_roles WHERE tuple_id=?1 AND kind=?2 AND ordinal>?3 ORDER BY ordinal LIMIT ?4",
+                    "SELECT ordinal,role FROM semantic_coverage_roles WHERE (payload_id=?1 OR tuple_id=?5) AND kind=?2 AND ordinal>?3 ORDER BY ordinal LIMIT ?4",
                     params![
-                        w.tuple_id,
+                        w.payload(),
                         if observed { "observed" } else { "supported" },
                         c.child_ordinal,
-                        i64::try_from(want)?
+                        i64::try_from(want)?,
+                        w.tuple_id
                     ],
                     0,
                     &mut emit,
@@ -800,8 +838,8 @@ fn association_unit(
             } else {
                 query_rows(
                     db,
-                    "SELECT basis_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash FROM semantic_basis WHERE tuple_id=?1 AND basis_id>?2 ORDER BY basis_id LIMIT ?3",
-                    params![w.tuple_id, c.after_id, limit],
+                    "SELECT basis_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash FROM semantic_basis WHERE payload_id=?1 AND basis_id>?2 ORDER BY basis_id LIMIT ?3",
+                    params![w.payload(), c.after_id, limit],
                     0,
                     &mut emit,
                     |row| {
@@ -844,13 +882,13 @@ fn association_unit(
             };
             family(
                 db,
-                w.tuple_id,
-                source_set,
+                w.payload(),
+                &scope,
                 c,
                 &mut emit,
                 parents,
                 &[ChildTable {
-                    sql: "SELECT d.basis_id,d.ordinal,d.lookup_key FROM semantic_basis b JOIN semantic_basis_lookup_dependencies d ON d.basis_id=b.basis_id WHERE b.tuple_id=?1 AND b.basis_id>=?2 AND b.basis_id<=?3 AND (b.basis_id>?2 OR d.ordinal>?4) ORDER BY b.basis_id,d.ordinal LIMIT ?5",
+                    sql: "SELECT d.basis_id,d.ordinal,d.lookup_key FROM semantic_basis b JOIN semantic_basis_lookup_dependencies d ON d.basis_id=b.basis_id WHERE b.payload_id=?1 AND b.basis_id>=?2 AND b.basis_id<=?3 AND (b.basis_id>?2 OR d.ordinal>?4) ORDER BY b.basis_id,d.ordinal LIMIT ?5",
                     gap: "original basis dependency ordinal gap",
                     bytes_from: 1,
                     decode: |row, _| {
@@ -876,10 +914,10 @@ fn association_unit(
             let want = limit;
             let rows = query_rows(
                 db,
-                "SELECT p.provenance_id,p.content_hash,p.evidence_kind,p.freshness,p.basis_id,p.capture_id,p.derived_from_provenance_id,p.derived_from_record_kind,p.derived_from_fact_digest,EXISTS(SELECT 1 FROM semantic_raw_proofs r WHERE r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id AND r.record_kind=p.derived_from_record_kind AND r.fact_digest=p.derived_from_fact_digest AND r.language=?3 AND r.path=?4) FROM semantic_provenance p WHERE p.tuple_id=?1 AND p.provenance_id>?2 ORDER BY p.provenance_id LIMIT ?5",
+                "SELECT p.ordinal,p.content_hash,p.evidence_kind,p.ordinal,p.basis_id,p.capture_id,p.derived_from_provenance_id,p.derived_from_record_kind,p.derived_from_fact_digest,EXISTS(SELECT 1 FROM semantic_raw_proofs r WHERE r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id AND r.record_kind=p.derived_from_record_kind AND r.fact_digest=p.derived_from_fact_digest AND r.language=?3 AND r.path=?4) FROM semantic_provenance p WHERE p.payload_id=?1 AND p.ordinal>?2 ORDER BY p.ordinal LIMIT ?5",
                 params![
-                    w.tuple_id,
-                    c.after_text,
+                    w.payload(),
+                    c.after_id,
                     w.document.language,
                     w.document.path,
                     want
@@ -902,26 +940,30 @@ fn association_unit(
                     );
                     let membership: bool = row.get(9)?;
                     selected_ensure!(membership, "original derivation identity mismatch");
-                    Ok(OriginalProvenance {
-                        id: row.get(0)?,
-                        content_hash: row.get(1)?,
-                        evidence_kind: semantic_enum(row.get(2)?)?,
-                        freshness: semantic_enum(row.get(3)?)?,
-                        basis_id: row.get(4)?,
-                        capture_id,
-                        derived_from: sem::DerivedFrom {
-                            provenance_id: raw,
-                            record_kind: semantic_enum(kind)?,
-                            fact_digest: digest,
+                    let basis_id: i64 = row.get(4)?;
+                    let projection = projection.as_ref().context("original projection")?;
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        OriginalProvenance {
+                            id: projection.provenance_id(row.get(0)?)?,
+                            content_hash: row.get(1)?,
+                            evidence_kind: semantic_enum(row.get(2)?)?,
+                            freshness: projection.freshness(basis_id)?,
+                            basis_id,
+                            capture_id,
+                            derived_from: sem::DerivedFrom {
+                                provenance_id: raw,
+                                record_kind: semantic_enum(kind)?,
+                                fact_digest: digest,
+                            },
                         },
-                    })
+                    ))
                 },
             )?;
             let fetched = rows.len();
-            for proof in rows {
-                let id = proof.id.clone();
+            for (ordinal, proof) in rows {
                 emit.push(OriginalRow::Provenance(proof));
-                c.after_text = id;
+                c.after_id = ordinal;
             }
             if fetched < room {
                 next_parent(c, 4);
@@ -935,8 +977,8 @@ fn association_unit(
                 let mut prior = c.after_id;
                 query_rows(
                     db,
-                    "SELECT symbol_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id FROM semantic_symbols WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
-                    params![w.tuple_id, c.after_id, limit],
+                    "SELECT symbol_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_ordinal FROM semantic_symbols WHERE payload_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
+                    params![w.payload(), c.after_id, limit],
                     0,
                     &mut emit,
                     |row| {
@@ -955,7 +997,7 @@ fn association_unit(
                                 source_set,
                             )?,
                             display_name: row.get(7)?,
-                            provenance_id: row.get(8)?,
+                            provenance_id: pid(row.get(8)?)?,
                         };
                         Ok(ParentRow {
                             id: symbol.row_id,
@@ -968,19 +1010,19 @@ fn association_unit(
             };
             family(
                 db,
-                w.tuple_id,
-                source_set,
+                w.payload(),
+                &scope,
                 c,
                 &mut emit,
                 parents,
                 &[ChildTable {
-                    sql: "SELECT t.* FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND s.ordinal>=?2 AND s.ordinal<=?3 AND (s.ordinal>?2 OR t.ordinal>?4) ORDER BY s.ordinal,t.ordinal LIMIT ?5",
+                    sql: "SELECT t.* FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.payload_id=?1 AND s.ordinal>=?2 AND s.ordinal<=?3 AND (s.ordinal>?2 OR t.ordinal>?4) ORDER BY s.ordinal,t.ordinal LIMIT ?5",
                     gap: "original symbol target ordinal gap",
                     bytes_from: 0,
-                    decode: |row, source_set| {
+                    decode: |row, scope| {
                         let id: i64 = row.get(0)?;
                         let ordinal: i64 = row.get(1)?;
-                        let target = semantic_target_read(row, 2, source_set)?
+                        let target = semantic_target_read(row, 2, scope)?
                             .ok_or_else(|| corrupt("missing symbol target"))?;
                         Ok(ChildRow {
                             id,
@@ -1005,8 +1047,8 @@ fn association_unit(
                 let mut prior = c.after_id;
                 query_rows(
                     db,
-                    "SELECT binding_id,ordinal,syntax_id,provenance_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic FROM semantic_declaration_bindings WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
-                    params![w.tuple_id, c.after_id, limit],
+                    "SELECT binding_id,ordinal,syntax_id,provenance_ordinal,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic FROM semantic_declaration_bindings WHERE payload_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
+                    params![w.payload(), c.after_id, limit],
                     0,
                     &mut emit,
                     |row| {
@@ -1017,8 +1059,8 @@ fn association_unit(
                             row_id: row.get(0)?,
                             ordinal,
                             syntax_id: optional_id(row, 2, false)?,
-                            provenance_id: row.get(3)?,
-                            join: read_join(row, 4, source_set)?,
+                            provenance_id: pid(row.get(3)?)?,
+                            join: read_join(row, 4, &scope)?,
                         };
                         Ok(ParentRow {
                             id: binding.row_id,
@@ -1031,8 +1073,8 @@ fn association_unit(
             };
             family(
                 db,
-                w.tuple_id,
-                source_set,
+                w.payload(),
+                &scope,
                 c,
                 &mut emit,
                 parents,
@@ -1047,8 +1089,8 @@ fn association_unit(
             } else {
                 query_rows(
                     db,
-                    "SELECT * FROM semantic_references WHERE tuple_id=?1 AND reference_id>?2 ORDER BY reference_id LIMIT ?3",
-                    params![w.tuple_id, c.after_blob, limit],
+                    "SELECT * FROM semantic_references WHERE payload_id=?1 AND reference_id>?2 ORDER BY reference_id LIMIT ?3",
+                    params![w.payload(), c.after_blob, limit],
                     0,
                     &mut emit,
                     |row| {
@@ -1070,8 +1112,8 @@ fn association_unit(
                             lookup_key: row.get(7)?,
                             site: semantic_enum(row.get(8)?)?,
                             resolution: semantic_enum(row.get(9)?)?,
-                            declared_target: semantic_target_read(row, 10, source_set)?,
-                            provenance_id: row.get(20)?,
+                            declared_target: semantic_target_read(row, 10, &scope)?,
+                            provenance_id: pid(row.get(20)?)?,
                         };
                         Ok(ParentRow {
                             id: 0,
@@ -1084,14 +1126,14 @@ fn association_unit(
             };
             family(
                 db,
-                w.tuple_id,
-                source_set,
+                w.payload(),
+                &scope,
                 c,
                 &mut emit,
                 parents,
                 &[
                     ChildTable {
-                        sql: "SELECT reference_id,ordinal,role FROM semantic_reference_roles WHERE tuple_id=?1 AND reference_id>=?2 AND reference_id<=?3 AND (reference_id>?2 OR ordinal>?4) ORDER BY reference_id,ordinal LIMIT ?5",
+                        sql: "SELECT reference_id,ordinal,role FROM semantic_reference_roles WHERE payload_id=?1 AND reference_id>=?2 AND reference_id<=?3 AND (reference_id>?2 OR ordinal>?4) ORDER BY reference_id,ordinal LIMIT ?5",
                         gap: "original reference role ordinal gap",
                         bytes_from: 1,
                         decode: |row, _| {
@@ -1111,10 +1153,10 @@ fn association_unit(
                         },
                     },
                     ChildTable {
-                        sql: "SELECT * FROM semantic_reference_candidates WHERE tuple_id=?1 AND reference_id>=?2 AND reference_id<=?3 AND (reference_id>?2 OR ordinal>?4) ORDER BY reference_id,ordinal LIMIT ?5",
+                        sql: "SELECT * FROM semantic_reference_candidates WHERE payload_id=?1 AND reference_id>=?2 AND reference_id<=?3 AND (reference_id>?2 OR ordinal>?4) ORDER BY reference_id,ordinal LIMIT ?5",
                         gap: "original reference candidate ordinal gap",
                         bytes_from: 0,
-                        decode: |row, source_set| {
+                        decode: |row, scope| {
                             let blob: Vec<u8> = row.get(1)?;
                             let ordinal: i64 = row.get(2)?;
                             Ok(ChildRow {
@@ -1122,7 +1164,7 @@ fn association_unit(
                                     reference_id: id_codec::decode_occ(&blob)
                                         .map_err(|_| corrupt("invalid reference child ID"))?,
                                     ordinal,
-                                    target: semantic_target_read(row, 3, source_set)?
+                                    target: semantic_target_read(row, 3, scope)?
                                         .ok_or_else(|| corrupt("missing reference candidate"))?,
                                 },
                                 id: 0,
@@ -1143,8 +1185,8 @@ fn association_unit(
                 let mut prior = c.after_id;
                 query_rows(
                     db,
-                    "SELECT * FROM semantic_call_bindings WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
-                    params![w.tuple_id, c.after_id, limit],
+                    "SELECT * FROM semantic_call_bindings WHERE payload_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
+                    params![w.payload(), c.after_id, limit],
                     0,
                     &mut emit,
                     |row| {
@@ -1155,13 +1197,13 @@ fn association_unit(
                             row_id: row.get(0)?,
                             ordinal,
                             call_id: optional_id(row, 3, true)?,
-                            join: read_join(row, 4, source_set)?,
+                            join: read_join(row, 4, &scope)?,
                             resolution: semantic_enum(row.get(13)?)?,
-                            declared_target: semantic_target_read(row, 14, source_set)?,
+                            declared_target: semantic_target_read(row, 14, &scope)?,
                             dispatch: semantic_enum(row.get(24)?)?,
                             possible_dispatch_complete: row.get(25)?,
                             stale_target: row.get(26)?,
-                            provenance_id: row.get(27)?,
+                            provenance_id: pid(row.get(27)?)?,
                         };
                         Ok(ParentRow {
                             id: binding.row_id,
@@ -1174,12 +1216,12 @@ fn association_unit(
             };
             fn call_target(
                 row: &rusqlite::Row<'_>,
-                source_set: &str,
+                scope: &TargetScope<'_>,
                 dispatch: bool,
             ) -> Result<ChildRow> {
                 let id: i64 = row.get(0)?;
                 let ordinal: i64 = row.get(1)?;
-                let target = semantic_target_read(row, 2, source_set)?
+                let target = semantic_target_read(row, 2, scope)?
                     .ok_or_else(|| corrupt("missing call target"))?;
                 Ok(ChildRow {
                     id,
@@ -1202,14 +1244,14 @@ fn association_unit(
             }
             family(
                 db,
-                w.tuple_id,
-                source_set,
+                w.payload(),
+                &scope,
                 c,
                 &mut emit,
                 parents,
                 &[
                     ChildTable {
-                        sql: "SELECT x.binding_id,x.ordinal,x.candidate_id FROM semantic_call_bindings b JOIN semantic_call_join_candidates x ON x.binding_id=b.binding_id WHERE b.tuple_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
+                        sql: "SELECT x.binding_id,x.ordinal,x.candidate_id FROM semantic_call_bindings b JOIN semantic_call_join_candidates x ON x.binding_id=b.binding_id WHERE b.payload_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
                         gap: "original call join candidate ordinal gap",
                         bytes_from: 1,
                         decode: |row, _| {
@@ -1228,16 +1270,16 @@ fn association_unit(
                         },
                     },
                     ChildTable {
-                        sql: "SELECT x.* FROM semantic_call_bindings b JOIN semantic_call_candidates x ON x.binding_id=b.binding_id WHERE b.tuple_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
+                        sql: "SELECT x.* FROM semantic_call_bindings b JOIN semantic_call_candidates x ON x.binding_id=b.binding_id WHERE b.payload_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
                         gap: "original call target ordinal gap",
                         bytes_from: 0,
-                        decode: |row, source_set| call_target(row, source_set, false),
+                        decode: |row, scope| call_target(row, scope, false),
                     },
                     ChildTable {
-                        sql: "SELECT x.* FROM semantic_call_bindings b JOIN semantic_call_possible_dispatch x ON x.binding_id=b.binding_id WHERE b.tuple_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
+                        sql: "SELECT x.* FROM semantic_call_bindings b JOIN semantic_call_possible_dispatch x ON x.binding_id=b.binding_id WHERE b.payload_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
                         gap: "original call target ordinal gap",
                         bytes_from: 0,
-                        decode: |row, source_set| call_target(row, source_set, true),
+                        decode: |row, scope| call_target(row, scope, true),
                     },
                 ],
                 false,
@@ -1248,8 +1290,8 @@ fn association_unit(
             let mut prior = c.after_id;
             let rows = query_rows(
                 db,
-                "SELECT * FROM semantic_type_relationships WHERE tuple_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
-                params![w.tuple_id, c.after_id, limit],
+                "SELECT * FROM semantic_type_relationships WHERE payload_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
+                params![w.payload(), c.after_id, limit],
                 0,
                 &mut emit,
                 |row| {
@@ -1260,11 +1302,11 @@ fn association_unit(
                         ordinal,
                         sem::TypeRelationship {
                             kind: semantic_enum(row.get(3)?)?,
-                            source: semantic_target_read(row, 4, source_set)?
+                            source: semantic_target_read(row, 4, &scope)?
                                 .ok_or_else(|| corrupt("missing relationship source"))?,
-                            target: semantic_target_read(row, 14, source_set)?
+                            target: semantic_target_read(row, 14, &scope)?
                                 .ok_or_else(|| corrupt("missing relationship target"))?,
-                            provenance_id: row.get(24)?,
+                            provenance_id: pid(row.get(24)?)?,
                         },
                     ))
                 },
@@ -1287,10 +1329,10 @@ fn association_unit(
 fn declaration_children() -> [ChildTable; 2] {
     [
         ChildTable {
-            sql: "SELECT x.binding_id,x.ordinal,x.scheme,x.symbol,x.scope,x.document_language,x.document_path FROM semantic_declaration_bindings b JOIN semantic_declaration_binding_symbols x ON x.binding_id=b.binding_id WHERE b.tuple_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
+            sql: "SELECT x.binding_id,x.ordinal,x.scheme,x.symbol,x.scope,x.document_language,x.document_path FROM semantic_declaration_bindings b JOIN semantic_declaration_binding_symbols x ON x.binding_id=b.binding_id WHERE b.payload_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
             gap: "original declaration symbol ordinal gap",
             bytes_from: 1,
-            decode: |row, source_set| {
+            decode: |row, scope| {
                 let id: i64 = row.get(0)?;
                 let ordinal: i64 = row.get(1)?;
                 Ok(ChildRow {
@@ -1306,14 +1348,14 @@ fn declaration_children() -> [ChildTable; 2] {
                             row.get(4)?,
                             row.get(5)?,
                             row.get(6)?,
-                            source_set,
+                            scope.source_set,
                         )?,
                     },
                 })
             },
         },
         ChildTable {
-            sql: "SELECT x.binding_id,x.ordinal,x.candidate_id FROM semantic_declaration_bindings b JOIN semantic_declaration_join_candidates x ON x.binding_id=b.binding_id WHERE b.tuple_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
+            sql: "SELECT x.binding_id,x.ordinal,x.candidate_id FROM semantic_declaration_bindings b JOIN semantic_declaration_join_candidates x ON x.binding_id=b.binding_id WHERE b.payload_id=?1 AND b.ordinal>=?2 AND b.ordinal<=?3 AND (b.ordinal>?2 OR x.ordinal>?4) ORDER BY b.ordinal,x.ordinal LIMIT ?5",
             gap: "original declaration candidate ordinal gap",
             bytes_from: 1,
             decode: |row, _| {
@@ -1341,7 +1383,7 @@ fn declaration_children() -> [ChildTable; 2] {
 fn family(
     db: &Connection,
     tuple: i64,
-    source_set: &str,
+    scope: &TargetScope<'_>,
     c: &mut OriginalAssociationCursor,
     emit: &mut Emit<'_, '_>,
     parents: Vec<ParentRow>,
@@ -1397,7 +1439,7 @@ fn family(
                     params![tuple, low_blob, high_blob, after_child, want],
                     table.bytes_from,
                     emit,
-                    |row| (table.decode)(row, source_set),
+                    |row| (table.decode)(row, scope),
                 )?
             } else {
                 query_rows(
@@ -1406,7 +1448,7 @@ fn family(
                     params![tuple, low_int, high_int, after_child, want],
                     table.bytes_from,
                     emit,
-                    |row| (table.decode)(row, source_set),
+                    |row| (table.decode)(row, scope),
                 )?
             }
         };
@@ -1779,8 +1821,8 @@ pub(crate) fn source_authority(
     )))
 }
 
-fn has_nonderived_original_provenance(db: &Connection, tuple: i64) -> Result<bool> {
-    db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE tuple_id=?1 AND capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL)")?.query_row([tuple],|row|row.get(0)).map_err(Into::into)
+fn has_nonderived_original_provenance(db: &Connection, payload: Option<i64>) -> Result<bool> {
+    db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE payload_id=?1 AND capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL)")?.query_row([payload],|row|row.get(0)).map_err(Into::into)
 }
 
 pub(crate) fn original_document_begin(
@@ -1852,52 +1894,54 @@ pub(crate) fn original_document_begin(
     if captured != current {
         return Ok(WitnessEligibility::Full("selected_version_changed"));
     }
-    let (tuple_id, requested, selected, state, diagnostic, reasons, cached_authored) = if authority
-        .cache
-    {
-        let Some(snapshot) = crate::store::captured_witness::document(db, authority.batch_id, key)?
-        else {
-            return Ok(WitnessEligibility::Full("original_tuple_missing"));
+    let (tuple_id, payload_id, requested, selected, state, diagnostic, reasons, cached_authored) =
+        if authority.cache {
+            let Some(snapshot) =
+                crate::store::captured_witness::document(db, authority.batch_id, key)?
+            else {
+                return Ok(WitnessEligibility::Full("original_tuple_missing"));
+            };
+            let [coverage] = snapshot.coverage.as_slice() else {
+                return Err(corrupt("capture witness document coverage"));
+            };
+            if snapshot
+                .provenance
+                .iter()
+                .any(|p| p.derived_from.is_none() || p.basis.is_none())
+            {
+                return Ok(WitnessEligibility::Full("original_provenance_not_derived"));
+            }
+            (
+                0,
+                None,
+                coverage.requested,
+                coverage.selected,
+                coverage.state,
+                coverage.diagnostic.clone(),
+                coverage.reasons.clone(),
+                Some(!snapshot.provenance.is_empty()),
+            )
+        } else {
+            type OriginalTuple = (i64, bool, bool, String, Option<String>, Option<i64>);
+            let tuple:Option<OriginalTuple>=db.prepare_cached("SELECT tuple_id,requested,selected,state,diagnostic,payload_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND producer_version=?3 AND language=?4 AND path=?5")?.query_row(params![semantic_pin_key(authority.original_pin),authority.producer.id,authority.producer.version,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+            let Some((tuple_id, requested, selected, state, diagnostic, payload_id)) = tuple else {
+                return Ok(WitnessEligibility::Full("original_tuple_missing"));
+            };
+            context::validate_tuple(
+                db,
+                &semantic_pin_key(authority.original_pin),
+                &authority.producer.id,
+                payload_id,
+            )?;
+            let state: sem::CoverageState = semantic_enum(state)?;
+            let reasons = read_coverage_reasons(db, payload_id, tuple_id)?;
+            if has_nonderived_original_provenance(db, payload_id)? {
+                return Ok(WitnessEligibility::Full("original_provenance_not_derived"));
+            }
+            (
+                tuple_id, payload_id, requested, selected, state, diagnostic, reasons, None,
+            )
         };
-        let [coverage] = snapshot.coverage.as_slice() else {
-            return Err(corrupt("capture witness document coverage"));
-        };
-        if snapshot
-            .provenance
-            .iter()
-            .any(|p| p.derived_from.is_none() || p.basis.is_none())
-        {
-            return Ok(WitnessEligibility::Full("original_provenance_not_derived"));
-        }
-        (
-            0,
-            coverage.requested,
-            coverage.selected,
-            coverage.state,
-            coverage.diagnostic.clone(),
-            coverage.reasons.clone(),
-            Some(!snapshot.provenance.is_empty()),
-        )
-    } else {
-        let tuple:Option<(i64,bool,bool,String,Option<String>)>=db.prepare_cached("SELECT tuple_id,requested,selected,state,diagnostic FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND producer_version=?3 AND language=?4 AND path=?5")?.query_row(params![semantic_pin_key(authority.original_pin),authority.producer.id,authority.producer.version,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-        let Some((tuple_id, requested, selected, state, diagnostic)) = tuple else {
-            return Ok(WitnessEligibility::Full("original_tuple_missing"));
-        };
-        context::validate_tuple(
-            db,
-            &semantic_pin_key(authority.original_pin),
-            &authority.producer.id,
-            tuple_id,
-        )?;
-        let state: sem::CoverageState = semantic_enum(state)?;
-        let reasons = read_coverage_reasons(db, tuple_id)?;
-        if has_nonderived_original_provenance(db, tuple_id)? {
-            return Ok(WitnessEligibility::Full("original_provenance_not_derived"));
-        }
-        (
-            tuple_id, requested, selected, state, diagnostic, reasons, None,
-        )
-    };
     if reasons.as_ref().is_some_and(|r| r.omitted) {
         return Ok(WitnessEligibility::Full("original_associations_omitted"));
     }
@@ -1913,9 +1957,9 @@ pub(crate) fn original_document_begin(
             Some(authored) => authored,
             None => db
                 .prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE tuple_id=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE payload_id=?1)",
                 )?
-                .query_row([tuple_id], |r| r.get(0))?,
+                .query_row([payload_id], |r| r.get(0))?,
         };
         if bearing || claims || authored {
             return Ok(WitnessEligibility::Full("excluded_original_has_facts"));
@@ -1924,6 +1968,7 @@ pub(crate) fn original_document_begin(
     Ok(WitnessEligibility::Witness(Box::new(
         OriginalSourceWitness {
             tuple_id,
+            payload_id,
             document: key.clone(),
             captured_version: captured,
             current_version: current,
@@ -2074,7 +2119,7 @@ pub(crate) fn internal_symbols_page(
                 cursor.symbol_ordinal = -1;
             }
         } else {
-            let row:Option<(i64,i64)>=db.prepare_cached("SELECT binding_id,ordinal FROM semantic_declaration_bindings WHERE tuple_id=?1 AND ordinal>?2 AND syntax_id IS NOT NULL AND join_status='exact' ORDER BY ordinal LIMIT 1")?.query_row(params![cursor.tuple,cursor.binding_ordinal],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let row:Option<(i64,i64)>=db.prepare_cached("SELECT binding_id,ordinal FROM semantic_declaration_bindings WHERE payload_id=(SELECT payload_id FROM semantic_coverage WHERE tuple_id=?1) AND ordinal>?2 AND syntax_id IS NOT NULL AND join_status='exact' ORDER BY ordinal LIMIT 1")?.query_row(params![cursor.tuple,cursor.binding_ordinal],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             if let Some((id, ordinal)) = row {
                 cursor.binding = Some(id);
                 cursor.binding_ordinal = ordinal;
@@ -2129,11 +2174,11 @@ mod tests {
     #[test]
     fn nonderived_original_provenance_requires_full_without_hiding_mixed_links() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE semantic_provenance(tuple_id INTEGER,capture_id INTEGER,derived_from_provenance_id TEXT,derived_from_record_kind TEXT,derived_from_fact_digest TEXT);
+        db.execute_batch("CREATE TABLE semantic_provenance(payload_id INTEGER,capture_id INTEGER,derived_from_provenance_id TEXT,derived_from_record_kind TEXT,derived_from_fact_digest TEXT);
             INSERT INTO semantic_provenance VALUES(1,NULL,NULL,NULL,NULL),(2,9,'proof','occurrence','digest'),(3,9,NULL,NULL,NULL),(4,NULL,'proof',NULL,NULL);").unwrap();
-        assert!(has_nonderived_original_provenance(&db, 1).unwrap());
+        assert!(has_nonderived_original_provenance(&db, Some(1)).unwrap());
         for tuple in [2, 3, 4, 5] {
-            assert!(!has_nonderived_original_provenance(&db, tuple).unwrap());
+            assert!(!has_nonderived_original_provenance(&db, Some(tuple)).unwrap());
         }
     }
 
@@ -2250,7 +2295,10 @@ mod tests {
             family(
                 &db,
                 7,
-                "sources",
+                &TargetScope {
+                    source_set: "sources",
+                    native: "native",
+                },
                 &mut cursor,
                 &mut emit,
                 parents,
@@ -2360,7 +2408,7 @@ mod tests {
     #[test]
     fn declaration_families_page_by_set_and_resume_inside_children() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE semantic_declaration_bindings(binding_id INTEGER PRIMARY KEY,tuple_id INTEGER,ordinal INTEGER,UNIQUE(tuple_id,ordinal));
+        db.execute_batch("CREATE TABLE semantic_declaration_bindings(binding_id INTEGER PRIMARY KEY,payload_id INTEGER,ordinal INTEGER,UNIQUE(payload_id,ordinal));
             CREATE TABLE semantic_declaration_binding_symbols(binding_id INTEGER,ordinal INTEGER,scheme TEXT,symbol TEXT,scope TEXT,document_language TEXT,document_path TEXT,PRIMARY KEY(binding_id,ordinal));
             CREATE TABLE semantic_declaration_join_candidates(binding_id INTEGER,ordinal INTEGER,candidate_id BLOB,PRIMARY KEY(binding_id,ordinal));
             INSERT INTO semantic_declaration_bindings VALUES(1,7,0),(2,7,1),(3,8,0);
@@ -2407,7 +2455,18 @@ mod tests {
             };
             let tables = declaration_children();
             family(
-                &db, 7, "sources", cursor, &mut emit, parents, &tables, false, 6,
+                &db,
+                7,
+                &TargetScope {
+                    source_set: "sources",
+                    native: "native",
+                },
+                cursor,
+                &mut emit,
+                parents,
+                &tables,
+                false,
+                6,
             )?;
             Ok(out.iter().map(label).collect())
         };

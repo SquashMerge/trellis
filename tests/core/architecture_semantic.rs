@@ -609,7 +609,8 @@ fn corrupt_semantic_rows_fail_typed_after_reopen() {
         let changed = db
             .execute(
                 &format!(
-                    "UPDATE semantic_call_bindings SET {column}={value} WHERE provenance_id='call-lower-0'"
+                    "UPDATE semantic_call_bindings SET {column}={value} WHERE (payload_id,provenance_ordinal) IN \
+                     (SELECT payload_id,ordinal FROM semantic_provenance WHERE provenance_id='call-lower-0')"
                 ),
                 [],
             )

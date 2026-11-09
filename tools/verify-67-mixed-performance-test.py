@@ -288,28 +288,34 @@ class SchemaParity(unittest.TestCase):
         for name in ("import", "r2"):
             db.execute("INSERT INTO semantic_revision_raw_selections VALUES(?,'scip-typescript',1,?)",
                        (pins[name], pins["r1"]))
-        db.execute("INSERT INTO semantic_coverage VALUES(?,?,'scip-typescript','1','javascript','js/a.js',1,1,'complete',NULL)",
-                   (tuple_id, pins["r2"]))
+        payload_id = tuple_id
+        db.execute("INSERT INTO semantic_payloads VALUES(?,?,'scip-typescript','1','javascript','js/a.js','version-a',1)",
+                   (payload_id, HEX))
+        db.execute("INSERT INTO semantic_coverage VALUES(?,?,'scip-typescript','1','javascript','js/a.js',1,1,'complete',NULL,?)",
+                   (tuple_id, pins["r2"], payload_id))
         db.execute("INSERT INTO semantic_basis VALUES(1,?,'scip-typescript','1',?,?,'javascript',?,?,?,?,?,?)",
-                   (tuple_id, HEX, artifact, source_set, natives["r1"], header["manifest_hash"], HEX, HEX, HEX))
-        db.execute("INSERT INTO semantic_provenance VALUES(?,'prov',?,'semanticReference','fresh',1,1,'proof','occurrence',?)",
-                   (tuple_id, HEX, HEX))
+                   (payload_id, HEX, artifact, source_set, natives["r1"], header["manifest_hash"], HEX, HEX, HEX))
+        db.execute("INSERT INTO semantic_provenance VALUES(?,0,NULL,?,'semanticReference',1,1,'proof','occurrence',?)",
+                   (payload_id, HEX, HEX))
+        db.execute("INSERT INTO semantic_coverage_freshness VALUES(?,?,1,'fresh')", (pins["r2"], tuple_id))
         db.execute("INSERT INTO semantic_projection_origins VALUES(?,'scip-typescript',?)",
                    (pins["r2"], pins["import"]))
         db.execute("INSERT INTO semantic_projection_documents VALUES(?,'scip-typescript','javascript','js/a.js',0)",
                    (pins["r2"],))
-        db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js')", (tuple_id,))
-        db.execute("INSERT INTO semantic_projection_contexts VALUES(?)", (tuple_id,))
-        db.execute("INSERT INTO semantic_projection_lookup_dependencies VALUES(?,'lookup')", (tuple_id,))
-        db.execute("INSERT INTO semantic_coverage VALUES(?,?,'scip-typescript','1','javascript','js/a.js',1,1,'complete',NULL)",
-                   (tuple_id + 1, pins["r1"]))
+        db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js','version-b')", (payload_id,))
+        db.execute("INSERT INTO semantic_projection_contexts VALUES(?)", (payload_id,))
+        db.execute("INSERT INTO semantic_projection_lookup_dependencies VALUES(?,'lookup')", (payload_id,))
+        db.execute("INSERT INTO semantic_payloads VALUES(?,NULL,'scip-typescript','1','javascript','js/a.js','version-old',1)",
+                   (payload_id + 1,))
+        db.execute("INSERT INTO semantic_coverage VALUES(?,?,'scip-typescript','1','javascript','js/a.js',1,1,'complete',NULL,?)",
+                   (tuple_id + 1, pins["r1"], payload_id + 1))
         db.execute("INSERT INTO semantic_projection_origins VALUES(?,'scip-typescript',?)",
                    (pins["r1"], pins["r1"]))
         db.execute("INSERT INTO semantic_projection_documents VALUES(?,'scip-typescript','javascript','js/a.js',0)",
                    (pins["r1"],))
-        db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js')", (tuple_id + 1,))
-        db.execute("INSERT INTO semantic_projection_contexts VALUES(?)", (tuple_id + 1,))
-        db.execute("INSERT INTO semantic_projection_lookup_dependencies VALUES(?,'old-lookup')", (tuple_id + 1,))
+        db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js','version-old')", (payload_id + 1,))
+        db.execute("INSERT INTO semantic_projection_contexts VALUES(?)", (payload_id + 1,))
+        db.execute("INSERT INTO semantic_projection_lookup_dependencies VALUES(?,'old-lookup')", (payload_id + 1,))
         report = {"producerId": "scip-typescript", "identityKind": "executable",
                   "sourceSetId": source_set, "capturedRevision": natives["r1"],
                   "destinationRevision": natives["r2"], "descriptorSha256": HEX,
@@ -329,7 +335,8 @@ class SchemaParity(unittest.TestCase):
         rows = {}
         for table in ("semantic_raw_batches", "semantic_raw_captures", "semantic_raw_exclusions",
                       "semantic_raw_documents", "semantic_raw_proofs", "semantic_revision_raw_selections",
-                      "semantic_coverage", "semantic_basis", "semantic_provenance",
+                      "semantic_payloads", "semantic_coverage", "semantic_coverage_freshness",
+                      "semantic_basis", "semantic_provenance",
                       "semantic_import_reports", "semantic_reimport", "semantic_projection_origins",
                       "semantic_projection_documents", "semantic_projection_dependencies",
                       "semantic_projection_contexts", "semantic_projection_lookup_dependencies"):

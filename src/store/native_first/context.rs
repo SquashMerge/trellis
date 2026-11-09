@@ -48,12 +48,30 @@ pub(super) fn validate_profiles(db: &Connection, key: &str) -> Result<()> {
 }
 
 pub(in crate::store) fn validate(db: &Connection, key: &str) -> Result<()> {
-    validate_profiles(db, key)?;
+    validate_scoped(db, key, None)
+}
+
+/// [`validate`] without the producer the caller is about to replace.
+pub(in crate::store) fn validate_except(db: &Connection, key: &str, except: &str) -> Result<()> {
+    validate_scoped(db, key, Some(except))
+}
+
+fn validate_scoped(db: &Connection, key: &str, except: Option<&str>) -> Result<()> {
+    let mut statement = db.prepare("SELECT id,context_mode,context_trust,context_input_hash FROM semantic_revision_producers WHERE revision_id=?1 AND (?2 IS NULL OR id<>?2)")?;
+    let mut rows = statement.query(params![key, except])?;
+    while let Some(row) = rows.next()? {
+        profile(
+            &row.get::<_, String>(0)?,
+            &row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?.as_deref(),
+            row.get::<_, Option<String>>(3)?.as_deref(),
+        )?;
+    }
     let missing: bool = db.query_row("SELECT EXISTS(
-        SELECT 1 FROM semantic_basis b JOIN semantic_coverage c ON c.tuple_id=b.tuple_id
-        LEFT JOIN semantic_projection_contexts x ON x.tuple_id=c.tuple_id
+        SELECT 1 FROM semantic_basis b JOIN semantic_coverage c ON c.payload_id=b.payload_id
+        LEFT JOIN semantic_projection_contexts x ON x.payload_id=c.payload_id
         LEFT JOIN semantic_revision_producers p ON p.revision_id=c.revision_id AND p.id=c.producer_id
-        WHERE c.revision_id=?1 AND (x.tuple_id IS NULL OR p.id IS NULL))", [key], |r|r.get(0))?;
+        WHERE c.revision_id=?1 AND (?2 IS NULL OR c.producer_id<>?2) AND (x.payload_id IS NULL OR p.id IS NULL))", params![key, except], |r|r.get(0))?;
     selected_ensure!(
         !missing,
         "incompatible_index: semantic context association missing"
@@ -65,7 +83,7 @@ pub(in crate::store) fn validate_tuple(
     db: &Connection,
     key: &str,
     producer: &str,
-    tuple: i64,
+    payload: Option<i64>,
 ) -> Result<()> {
     let row: Option<(String, Option<String>, Option<String>)> = db.query_row(
         "SELECT context_mode,context_trust,context_input_hash FROM semantic_revision_producers WHERE revision_id=?1 AND id=?2",
@@ -75,9 +93,9 @@ pub(in crate::store) fn validate_tuple(
     ))?;
     profile(producer, &mode, trust.as_deref(), hash.as_deref())?;
     let missing: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM semantic_basis WHERE tuple_id=?1)
-        AND NOT EXISTS(SELECT 1 FROM semantic_projection_contexts WHERE tuple_id=?1)",
-        [tuple],
+        "SELECT EXISTS(SELECT 1 FROM semantic_basis WHERE payload_id=?1)
+        AND NOT EXISTS(SELECT 1 FROM semantic_projection_contexts WHERE payload_id=?1)",
+        [payload],
         |r| r.get(0),
     )?;
     selected_ensure!(
@@ -186,9 +204,9 @@ pub(in crate::store) fn mark_pending(
         "SELECT EXISTS(
         SELECT 1 FROM semantic_projection_origins o
         JOIN semantic_coverage c ON c.revision_id=o.basis_pin AND c.producer_id=o.producer_id
-        JOIN semantic_basis b ON b.tuple_id=c.tuple_id
-        LEFT JOIN semantic_projection_contexts x ON x.tuple_id=c.tuple_id
-        WHERE o.revision_id=?1 AND x.tuple_id IS NULL)",
+        JOIN semantic_basis b ON b.payload_id=c.payload_id
+        LEFT JOIN semantic_projection_contexts x ON x.payload_id=c.payload_id
+        WHERE o.revision_id=?1 AND x.payload_id IS NULL)",
         [key],
         |r| r.get(0),
     )?;
@@ -196,7 +214,7 @@ pub(in crate::store) fn mark_pending(
         !missing,
         "incompatible_index: semantic context association missing"
     );
-    let mut statement = db.prepare("SELECT o.basis_pin,o.producer_id,p.context_mode,p.context_trust,p.context_input_hash FROM semantic_projection_origins o LEFT JOIN semantic_revision_producers p ON p.revision_id=o.basis_pin AND p.id=o.producer_id WHERE o.revision_id=?1 AND EXISTS(SELECT 1 FROM semantic_coverage c JOIN semantic_projection_contexts x ON x.tuple_id=c.tuple_id WHERE c.revision_id=o.basis_pin AND c.producer_id=o.producer_id) ORDER BY o.producer_id")?;
+    let mut statement = db.prepare("SELECT o.basis_pin,o.producer_id,p.context_mode,p.context_trust,p.context_input_hash FROM semantic_projection_origins o LEFT JOIN semantic_revision_producers p ON p.revision_id=o.basis_pin AND p.id=o.producer_id WHERE o.revision_id=?1 AND EXISTS(SELECT 1 FROM semantic_coverage c JOIN semantic_projection_contexts x ON x.payload_id=c.payload_id WHERE c.revision_id=o.basis_pin AND c.producer_id=o.producer_id) ORDER BY o.producer_id")?;
     let scopes = statement
         .query_map([key], |r| {
             Ok((
@@ -222,7 +240,7 @@ pub(in crate::store) fn mark_pending(
         };
         db.execute("UPDATE semantic_projection_documents AS q SET pending=1
             WHERE q.revision_id=?1 AND q.producer_id=?2 AND q.pending=0 AND EXISTS(
-                SELECT 1 FROM semantic_coverage c JOIN semantic_projection_contexts x ON x.tuple_id=c.tuple_id
+                SELECT 1 FROM semantic_coverage c JOIN semantic_projection_contexts x ON x.payload_id=c.payload_id
                 JOIN native_revisions p ON p.id=c.revision_id JOIN native_revisions n ON n.id=?1
                 WHERE c.revision_id=?3 AND c.producer_id=q.producer_id AND c.language=q.language AND c.path=q.path
                   AND (?4 OR p.toolchain_hash<>n.toolchain_hash))",params![key,producer,basis,input_changed])?;
