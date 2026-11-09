@@ -296,21 +296,7 @@ impl ArchitectureCore {
         } else {
             None
         };
-        let app_candidates = {
-            let documents: std::collections::BTreeSet<&str> = snapshot
-                .documents
-                .iter()
-                .map(|document| document.key.path.as_str())
-                .collect();
-            let mut work = crate::references::work::Work::new(
-                crate::references::work::rules_limit(snapshot.documents.len(), 0),
-            );
-            match crate::apps::candidates(&snapshot.manifests, &documents, &mut work, check) {
-                Ok(candidates) => Ok(candidates),
-                Err(error) if CoreFailure::repeats(&error) => Err(CoreFailure::of(&error)),
-                Err(error) => return Err(error),
-            }
-        };
+        let app_candidates = kept(crate::rules::app_candidates(&snapshot, check))?;
         let interfaces = match (config, &app_candidates) {
             (None, _) => None,
             (Some(_), Ok(candidates)) if detected_apps(candidates) >= 2 => {
@@ -323,7 +309,9 @@ impl ArchitectureCore {
                     &snapshot, &mut work, check,
                 ))?)
             }
-            (Some(_), _) => Some(Ok(crate::interfaces::Extraction::default())),
+            (Some(_), Ok(_)) => Some(Ok(crate::interfaces::Extraction::default())),
+            // Failed app detection is the part's failure too, never an empty extraction.
+            (Some(_), Err(failure)) => Some(Err(failure.clone())),
         };
         check()?;
         Ok(Self {

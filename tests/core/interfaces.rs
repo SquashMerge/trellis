@@ -430,3 +430,26 @@ fn trellis_real_router_and_client() {
         "summary counts equal the pages"
     );
 }
+
+/// A valid retained nested manifest of 5.1 MB is within the budget rules evaluation sizes
+/// from the admitted snapshot; app detection for interfaces uses the same budget, so its
+/// interface evidence is published (#843 review).
+#[test]
+fn a_large_nested_manifest_keeps_its_interfaces() {
+    let manifest = format!(
+        "{{\"name\":\"web-app\",\"padding\":\"{}\"}}",
+        "x".repeat(5_100_000)
+    );
+    let published = publish(&[
+        (".trellis/rules.toml", RULES),
+        ("Cargo.toml", "[package]\nname = \"srv\"\n"),
+        ("src/main.rs", SERVER),
+        ("web/package.json", &manifest),
+        ("web/app.js", "function go(api) { api('/health'); }"),
+    ]);
+    assert_eq!(published.summary["state"], "ready");
+    assert_eq!(published.summary["apps"].as_array().unwrap().len(), 2);
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
+    assert_eq!(interfaces[0]["counts"]["callSites"], 1);
+}

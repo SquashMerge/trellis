@@ -865,7 +865,9 @@ pub fn view_layers(config: &Config) -> Vec<Value> {
     }).collect()
 }
 
-/// The outcome of every build manifest in `snapshot`, under its own work budget.
+/// The outcome of every build manifest in `snapshot`, under its own work budget. The budget
+/// is sized like rules preparation's, from the whole admitted snapshot, so a manifest that
+/// rules preparation can parse is parsed here too.
 pub(crate) fn app_candidates(
     snapshot: &Snapshot,
     check: &mut impl FnMut() -> Result<()>,
@@ -875,7 +877,10 @@ pub(crate) fn app_candidates(
         .iter()
         .map(|document| document.key.path.as_str())
         .collect();
-    let mut work = Work::new(work::rules_limit(snapshot.documents.len(), 0));
+    let mut work = Work::new(work::rules_limit(
+        snapshot.documents.len(),
+        work::snapshot_bytes(snapshot, check)?,
+    ));
     crate::apps::candidates(&snapshot.manifests, &documents, &mut work, check)
 }
 

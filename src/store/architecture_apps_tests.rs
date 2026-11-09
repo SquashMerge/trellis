@@ -252,3 +252,34 @@ fn a_core_without_rules_has_no_interfaces_part() {
         "{error:#}"
     );
 }
+
+/// App detection that exhausts its work budget fails the interfaces part with the same
+/// typed failure; it is never a successful, empty extraction (#843 review).
+#[test]
+fn failed_app_detection_fails_the_interfaces_part() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    write(dir, "Cargo.toml", "[package]\nname = \"srv\"\n");
+    write(dir, "src/main.rs", SERVER);
+    let manifest = format!(
+        "{{\"name\":\"web-app\",\"padding\":\"{}\"}}",
+        "x".repeat(8_000_000)
+    );
+    write(dir, "web/package.json", &manifest);
+    write(dir, "web/app.js", CLIENT);
+    let store = publish(&state, dir);
+    let core = core_with_rules(&store).unwrap();
+    let candidates = core.app_candidates().expect_err("detection fails");
+    assert_eq!(
+        candidates.to_string(),
+        "bounded_work: app manifest parsing",
+        "{candidates:#}"
+    );
+    let interfaces = core.interfaces().err().expect("interfaces part fails");
+    assert_eq!(
+        interfaces.to_string(),
+        "bounded_work: app manifest parsing",
+        "{interfaces:#}"
+    );
+}
