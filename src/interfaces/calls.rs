@@ -240,6 +240,14 @@ impl<'a> Document<'a> {
         }
     }
 
+    /// An object member's written name: an identifier, or a string literal without escapes.
+    fn key_name(&self, key: Node<'a>) -> String {
+        match key.kind() {
+            "property_identifier" => self.text(key).to_owned(),
+            _ => self.literal(key).unwrap_or_default(),
+        }
+    }
+
     /// The `method` of an options object literal. An absent object, or one without a method
     /// and without a spread, is `GET`.
     fn options(&self, options: Option<Node<'a>>) -> Option<&'static str> {
@@ -256,17 +264,20 @@ impl<'a> Document<'a> {
             match member.kind() {
                 "pair" => {
                     let key = member.child_by_field_name("key")?;
-                    let name = match key.kind() {
-                        "property_identifier" => self.text(key).to_owned(),
-                        _ => self.literal(key).unwrap_or_default(),
-                    };
-                    if name == "method" {
+                    if self.key_name(key) == "method" {
                         let value = member.child_by_field_name("value")?;
                         method = Some(self.literal(value).and_then(|text| verb(&text)));
                     }
                 }
                 "shorthand_property_identifier" if self.text(member) == "method" => {
                     method = Some(None);
+                }
+                // An accessor or method named `method` is present but not a literal.
+                "method_definition" => {
+                    let name = member.child_by_field_name("name")?;
+                    if self.key_name(name) == "method" {
+                        method = Some(None);
+                    }
                 }
                 "spread_element" => spread = true,
                 _ => {}

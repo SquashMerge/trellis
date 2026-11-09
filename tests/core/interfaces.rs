@@ -484,3 +484,26 @@ fn a_repeated_leading_slash_is_not_the_single_slash_route() {
     assert_eq!(double.len(), 1, "{client_only:#?}");
     assert_eq!(double[0]["entry"]["confidence"], "unresolved");
 }
+
+/// A `method` accessor in the options object is a present, non-literal method: unreadable,
+/// so never matched and `unresolved`, not a default `GET` (#843 review).
+#[test]
+fn a_method_accessor_is_unreadable_not_default_get() {
+    let published = publish(&[
+        (".trellis/rules.toml", RULES),
+        ("Cargo.toml", "[package]\nname = \"srv\"\n"),
+        ("src/main.rs", SERVER),
+        ("web/package.json", "{\"name\":\"web-app\"}\n"),
+        (
+            "web/app.js",
+            "function go(api) { api('/health'); \
+             api.request('/health', { get method() { return 'POST'; } }); }",
+        ),
+    ]);
+    assert_eq!(published.summary["interfaces"][0]["counts"]["callSites"], 1);
+    let client_only = details(&published, &[("list", "clientOnly")], 100);
+    assert_eq!(client_only.len(), 1, "{client_only:#?}");
+    assert_eq!(client_only[0]["entry"]["method"], Value::Null);
+    assert_eq!(client_only[0]["entry"]["pathTemplate"], "/health");
+    assert_eq!(client_only[0]["entry"]["confidence"], "unresolved");
+}
