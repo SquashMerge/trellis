@@ -102,6 +102,11 @@ struct OwnerState {
     demanded: bool,
     shutdown: bool,
     thread_started: bool,
+    /// The owner thread is in a turn: it may take a lease and build.
+    stepping: bool,
+    /// The head and rules file the last worker step saw, so an unchanged step does not wake
+    /// the owner to read them under a lease.
+    stepped: Option<(IndexPin, Option<String>)>,
     running: Option<Running>,
     /// Newest first: the head's core and the one before it, or one a page asked for.
     published: Vec<Published>,
@@ -245,6 +250,7 @@ impl ArchitectureOwner {
                 }
                 state.hinted = false;
                 state.retry_at = None;
+                state.stepping = true;
             }
             let Some(daemon) = daemon.upgrade() else {
                 return;
@@ -268,7 +274,17 @@ impl ArchitectureOwner {
                 drop(state);
                 self.changed.notify_all();
             }
+            self.state.lock().unwrap().stepping = false;
+            self.changed.notify_all();
+            // The turn ended: a settled wait in a test samples the owner again.
+            daemon.note_state_change();
         }
+    }
+
+    /// The owner has a turn running or due: a hint, a contention retry or a build.
+    fn busy(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.hinted || state.stepping || state.retry_at.is_some()
     }
 
     /// A failed build retries on a bound; a later hint or read starts over.
@@ -315,6 +331,37 @@ impl DaemonState {
         self.start_architecture_owner(&mut state);
         drop(state);
         owner.changed.notify_all();
+    }
+
+    /// After a worker step: hint the owner only when the published head or the rules file
+    /// differs from what the last step saw. Building every new head (#798) then adds no read,
+    /// and no lease a retirement would wait for, to a step that changed nothing.
+    /// A runtime that is retiring, closing or closed, or has no readable head, has nothing to
+    /// build, and this reads nothing from it.
+    pub(crate) fn architecture_hint_after_step(self: &Arc<Self>) {
+        use super::RuntimePhase;
+        if matches!(
+            self.runtime_phase(),
+            RuntimePhase::RetireRequested | RuntimePhase::Closing | RuntimePhase::Retired
+        ) {
+            return;
+        }
+        let Ok(head) = self.store.index_baseline() else {
+            return;
+        };
+        let rules = match crate::rules::load(std::path::Path::new(self.store.workspace_root())) {
+            Ok(config) => config.map(|config| config.content_hash),
+            Err(_) => Some("unreadable".into()),
+        };
+        let seen = Some((head, rules));
+        {
+            let mut state = self.architecture.0.state.lock().unwrap();
+            if state.stepped == seen {
+                return;
+            }
+            state.stepped = seen;
+        }
+        self.architecture_hint();
     }
 
     fn start_architecture_owner(self: &Arc<Self>, state: &mut OwnerState) {
@@ -655,6 +702,27 @@ impl DaemonState {
     #[cfg(feature = "test-support")]
     pub fn architecture_builds_for_tests(&self) -> usize {
         self.architecture.0.builds.load(Ordering::Acquire)
+    }
+
+    /// Whether the owner has a turn running or due, for the tests' settled wait.
+    pub(crate) fn architecture_busy(&self) -> bool {
+        self.architecture.0.busy()
+    }
+
+    /// Wait until the owner has no turn running or due.
+    #[cfg(test)]
+    pub(crate) fn await_architecture_idle_for_tests(&self) {
+        let owner = &self.architecture.0;
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
+        let mut state = owner.state.lock().unwrap();
+        while state.hinted || state.stepping || state.retry_at.is_some() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the architecture owner did not settle"
+            );
+            state = owner.changed.wait_timeout(state, remaining).unwrap().0;
+        }
     }
 
     #[cfg(feature = "test-support")]

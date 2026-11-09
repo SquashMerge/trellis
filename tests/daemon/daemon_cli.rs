@@ -3505,6 +3505,8 @@ fn metrics_peer_closes_at_parser_hook_without_poisoning_daemon() {
         .arg("--workspace")
         .arg(&root)
         .env("TRELLIS_TEST_METRICS_PARSE_DELAY_MS", "400")
+        // The metrics read below parses itself, without a core built eagerly (#798).
+        .env("TRELLIS_TEST_ARCHITECTURE_ON_DEMAND", "1")
         .env("TRELLIS_TEST_METRICS_PARSE_HIT_FILE", &hit)
         .output()
         .unwrap();

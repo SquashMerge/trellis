@@ -1471,7 +1471,7 @@ impl DaemonState {
         if let Some(fill) = self.search_fill.lock().unwrap().as_ref() {
             fill.notify();
         }
-        self.architecture_hint();
+        self.architecture_hint_after_step();
         #[cfg(feature = "test-support")]
         if result.is_ok() {
             self.report_causal_startup_ready();

@@ -1334,6 +1334,8 @@ mod missing_index_tests {
     fn missing_index_waits_for_an_enqueue_already_in_flight() {
         let (_tmp, store, state, roots, identity) = fixture();
         state.worker_step().unwrap();
+        // The head's Architecture build reads it under a lease (#798); let it end first.
+        state.await_architecture_idle_for_tests();
         let enqueue = store.enqueue_in_flight();
         let index_dir = roots.index_dir(&identity);
         std::fs::remove_dir_all(&index_dir).unwrap();
@@ -1355,6 +1357,8 @@ mod missing_index_tests {
         for remove_root in [false, true] {
             let (_tmp, _store, state, roots, identity) = fixture();
             state.worker_step().unwrap();
+            // The head's Architecture build reads it under a lease (#798); let it end first.
+            state.await_architecture_idle_for_tests();
             let index_dir = roots.index_dir(&identity);
             std::fs::remove_dir_all(&index_dir).unwrap();
             if remove_root {
@@ -1372,6 +1376,9 @@ mod missing_index_tests {
     fn missing_index_directory_defers_close_until_the_admitted_read_finishes() {
         let (_tmp, _store, state, roots, identity) = fixture();
         state.worker_step().unwrap();
+        // The head's Architecture build takes a lease to read it (#798): only this test's
+        // lease fences the close below.
+        state.await_architecture_idle_for_tests();
         let lease = state.admission_lease().unwrap();
         let index_dir = roots.index_dir(&identity);
         std::fs::remove_dir_all(&index_dir).unwrap();

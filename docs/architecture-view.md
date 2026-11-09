@@ -247,9 +247,9 @@ level)" for file-level code and "(anonymous)" when no name was captured.
 ## One computation per revision (#556)
 
 The daemon computes what Architecture needs once per published revision and rules file, in the
-background, on one per-checkout owner thread. Each worker step hints the owner, which compares
-the head and the rules file's hash with what it last published and starts a build when they
-differ; a newer head stops a build that is under way. The owner builds every active runtime's
+background, on one per-checkout owner thread. A worker step that leaves a different head or
+rules file from the last step hints the owner (#798), which compares the head and the rules
+file's hash with what it last published and starts a build when they differ; a newer head stops a build that is under way. The owner builds every active runtime's
 new head, with or without a rules file, so the first read after an activation or a publication
 usually finds its result published (#798). Reads never compute the head: any number of them wait for
 the same build, and each rechecks the pin and rules hash, so a new revision or an edited rules

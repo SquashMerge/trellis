@@ -26,6 +26,8 @@ pub enum SettleBusy {
     Fifo,
     /// Semantic catch-up (S) still has a pending target.
     Semantic,
+    /// The Architecture owner has a turn running or due (#798).
+    Architecture,
     /// The selected read was refused, for example `index_not_ready` or contention.
     Read(String),
     /// `catchingUp` was set while every component above was idle.
@@ -47,6 +49,7 @@ impl std::fmt::Display for SettleBusy {
             SettleBusy::Watcher => write!(f, "watcher pending"),
             SettleBusy::Fifo => write!(f, "FIFO pending"),
             SettleBusy::Semantic => write!(f, "semantic catch-up pending target"),
+            SettleBusy::Architecture => write!(f, "architecture owner busy"),
             SettleBusy::Read(error) => write!(f, "selected read refused: {error}"),
             SettleBusy::CatchingUp => write!(f, "catchingUp with every component idle"),
             SettleBusy::Changing => write!(f, "state changed during every idle sample"),
@@ -102,7 +105,7 @@ enum Sample {
 
 impl CheckoutRuntime {
     /// Wait until this checkout's startup reconciliation has committed and its
-    /// watcher, FIFO and semantic catch-up (S) are idle, then return the published
+    /// watcher, FIFO, semantic catch-up (S) and Architecture owner are idle, then return the published
     /// head. With `at`, that head must be `at`; an idle checkout at another head
     /// is an error at once, not a wait.
     ///
@@ -227,7 +230,7 @@ impl CheckoutRuntime {
         }
     }
 
-    /// The owner's published pending state: startup, watcher, FIFO and S.
+    /// The owner's published pending state: startup, watcher, FIFO, S and Architecture.
     fn owner_busy(resources: &ActiveResources) -> Option<Sample> {
         let scheduler = &resources.scheduler;
         let busy = |busy| {
@@ -255,10 +258,15 @@ impl CheckoutRuntime {
             return busy(SettleBusy::Fifo);
         }
         match resources.store.pending_semantic_target() {
-            Ok(None) => None,
-            Ok(Some(_)) => busy(SettleBusy::Semantic),
-            Err(error) => Some(read_refused(error)),
+            Ok(None) => {}
+            Ok(Some(_)) => return busy(SettleBusy::Semantic),
+            Err(error) => return Some(read_refused(error)),
         }
+        // The owner builds each new head with no read asking (#798), taking a lease to read it.
+        if scheduler.architecture_busy() {
+            return busy(SettleBusy::Architecture);
+        }
+        None
     }
 }
 
