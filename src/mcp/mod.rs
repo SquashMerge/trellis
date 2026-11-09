@@ -1092,6 +1092,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             let mut tool = tools::prepare(&name, arguments.as_ref(), &id, modern, answering);
             let mut sampled_catching_up = catching_up;
             let mut envelope = tool.response["structuredContent"].clone();
+            let mut pending_coverage = None;
             if name == "trellis_workspace_describe"
                 && tool.valid_arguments
                 && let Some((registry, _)) = &registry
@@ -1146,12 +1147,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                     })),
                                     false,
                                 );
+                                // Paged last, against the final answer (#780).
                                 if let (Some(request), Some(documents)) =
                                     (coverage_request, coverage_documents)
                                 {
-                                    envelope = projection::coverage_documents(
-                                        &id, envelope, documents, request, modern,
-                                    );
+                                    pending_coverage = Some((documents, request));
                                 }
                             }
                             Ok(DescribedSnapshot {
@@ -1961,6 +1961,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled_catching_up));
             envelope["workspace"] = serde_json::json!(answering.root());
             envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
+            if let Some((documents, request)) = pending_coverage
+                && envelope.get("data").is_some()
+            {
+                envelope = projection::coverage_documents(id, envelope, documents, request, modern);
+            }
             tool.response = if architecture::is_tool(&name) || name == architecture::PROMPT_NAME {
                 // Tools page their arrays into the response cap; the prompt never pages.
                 let paging = architecture::is_tool(&name)
