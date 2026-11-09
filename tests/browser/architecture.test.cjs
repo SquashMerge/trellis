@@ -297,7 +297,7 @@ const siteTotal = edges => edges.reduce((sum, edge) => sum + edge.count, 0);
 const summaryKey = edge => JSON.stringify([edge.sourceLayer, edge.destinationLayer, edge.role, edge.status, edge.excepted, edge.exceptionReason]);
 async function ready(page) {
   await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
-  await page.locator("#architecture-diagram svg").waitFor({state:"attached"});
+  await page.locator("#architecture-diagram svg").first().waitFor({state:"attached"});
 }
 // The deviations chip opens the tree; the review panel's rule list is one click further.
 async function openRuleReview(page) {
