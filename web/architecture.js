@@ -69,7 +69,7 @@
     let pressed = null, laidOut = null, inspection = null;
     const apps = window.TrellisArchitectureApps;
     const deviations = window.TrellisDeviations.create({details:(params, active, offset) => details(appFilter(params), active, offset), current:() => usable(),
-      basis:() => basis, view:() => view, targetLabel, eligible, portable, beginDraft:(operation, scope) => beginDraft(operation, scope), reviewChips,
+      basis:() => basis, view:() => deviationsView(), targetLabel, eligible, portable, beginDraft:(operation, scope) => beginDraft(operation, scope), reviewChips,
       edgeText, inspectLine:(record, render) => inspectLine(record, render), overview:() => overview(), openReview:(mode, verdict) => openReview(mode, verdict),
       onConflict:() => onConflict(), refresh:() => refresh(), readSource:(site, pin, active) => readSource(site, pin, active),
       openSequence:(...args) => openSequence(...args), snapshot:() => snapshot()});
@@ -85,7 +85,17 @@
     }
     function usable() { return view && current(basis) && view.rulesFile?.contentHash === basis.rulesHash; }
     // The app group the view is scoped to; null for the whole checkout (and for a name the data no longer has).
-    const scopeGroup = (payload = view) => scope === null || !payload ? null : apps.group(payload, scope);
+    // With fewer than two detected apps there is no switcher, so no scope: the stack is checkout-wide.
+    const scopeGroup = (payload = view) => scope === null || !payload || !(payload.apps?.length >= 2) ? null : apps.group(payload, scope);
+    const settleScope = payload => { if (scope !== null && !scopeGroup(payload)) scope = null; };
+    // The Deviations tree sees the app's slice: its layers and edges, and the group's counts.
+    let treeView = null;
+    function deviationsView() {
+      const group = scopeGroup();
+      if (!group) return view;
+      if (treeView?.of !== view || treeView.scope !== scope) treeView = {of:view, scope, value:{...apps.scoped(view, scope), rules:{...view.rules, counts:group.counts}}};
+      return treeView.value;
+    }
     const model = () => drawn ?? view;
     const unassignedOf = (payload, group) => payload.modules.filter(module => module.layer === null && (!group || module.app === group.name));
     // A one-app scope narrows instance lists to that app; every other list is unchanged.
@@ -622,7 +632,7 @@
         if (payload.state === "missing_rules") {
           state("No reviewed rules file. Create or review .trellis/rules.toml. The trellis_propose_layers MCP prompt can help propose layers; this browser does not call it.", "empty"); return;
         }
-        view = payload; basis = {...c, rulesHash:payload.rulesFile.contentHash}; coverage();
+        view = payload; basis = {...c, rulesHash:payload.rulesFile.contentHash}; settleScope(payload); coverage();
         if (payload.state === "no_layers") { state("No authored layers are configured. Existing authored exceptions can still be edited or removed. Review .trellis/rules.toml to configure layers.", "empty"); overview(); }
         else await render();
         if (options.keepDraft === true) { get("architecture-review-panel").hidden = false; renderReview(); }
@@ -786,7 +796,7 @@
         title.textContent = `${record.sourceLayer} → ${record.destinationLayer}`;
         paragraph(target, `${record.count} exact ${record.role} ${edgeSites(record)} · ${record.status}${record.excepted ? ` · excepted: ${record.exceptionReason}` : " · not excepted"}${record.role === "test" ? " · hypothetical policy only; never a production violation" : ""}.`);
         reviewScope = record; reviewMode = "rules"; get("architecture-review-state").value = "all"; get("architecture-review-panel").hidden = false; renderReview();
-        detailList(target, {kind:"instances", ...edgeFilters(record)}, active, instanceItems(active), "No rule instances match this review scope.");
+        detailList(target, appFilter({kind:"instances", ...edgeFilters(record)}), active, instanceItems(active), "No rule instances match this review scope.");
         pairs(target, record.pairs, active);
       } else if (kind === "layer") {
         title.textContent = record.name; paragraph(target, layerLabel(record));
@@ -798,7 +808,7 @@
         paragraph(target, "Reference pairs from or to this layer", "detail");
         detailList(target, {kind:"pairs", layer:record.name}, active, pairItems(active), NO_PAIRS);
         paragraph(target, "Layer policy and exceptions", "detail");
-        detailList(target, {kind:"instances", layer:record.name}, active, instanceItems(active), "No rule instances name this layer.");
+        detailList(target, appFilter({kind:"instances", layer:record.name}), active, instanceItems(active), "No rule instances name this layer.");
       } else if (kind === "unresolved") {
         title.textContent = "Unresolved structural references";
         paragraph(target, `${references.counts?.unresolvedSites ?? 0} unresolved sites.`);
@@ -993,6 +1003,7 @@
       scope = saved.scope ?? null; scopeRoot = context().rootKey;
       await refresh();
       if (!active() || !usable()) return;
+      settleScope(view);
       if (basis.rulesHash !== saved.rulesHash) throw new Error("Architecture rules changed. Select the boundary again.");
       if (saved.reviewOpen) {
         if (saved.reviewMode === "authored") await showAuthored();

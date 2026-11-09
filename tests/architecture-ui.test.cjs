@@ -1607,3 +1607,43 @@ test("a response without apps and interfaces arrays shows nothing", async () => 
     assert.equal(h.renders.length, 0); assert.equal(h.get("architecture-state").dataset.state, "error");
   }
 });
+
+test("a scope never outlives its switcher: fewer than two apps, no_layers and restore are checkout-wide", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  await chooseApp(h, "web · javascript");
+  const single = appsFixture(); single.apps = single.apps.slice(0, 1); single.indexRevision = 2;
+  h.setContext({rootKey:"checkout-one", session:1, pin:{...pin, indexRevision:2}}); h.setResponse(async () => ({payload:single}));
+  await h.controller.refresh();
+  assert.equal(h.get("architecture-apps").hidden, true);
+  assert.equal(h.renders.at(-1).options.title, undefined, "the single stack keeps its own title");
+  assert.equal(h.renders.at(-1).view.layers.length, 4);
+  assert.deepEqual(descendants(h.get("architecture-inspector-content")).filter(item => item.className === "architecture-chip").map(item => item.textContent),
+    ["4 deviations", "4 unassigned files", "0 exceptions"]);
+  h.setContext({rootKey:"checkout-one", session:1, pin}); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  assert.deepEqual(pressedApps(h), ["All apps"], "the old scope does not return when the apps do");
+  await chooseApp(h, "web · javascript");
+  const empty = {...appsFixture(), state:"no_layers", layers:[], modules:[], edges:[], references:null, rules:null, apps:[], interfaces:[]};
+  h.setResponse(async () => ({payload:empty})); await h.controller.refresh();
+  h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  assert.deepEqual(pressedApps(h), ["All apps"]);
+  await chooseApp(h, "web · javascript");
+  const saved = {inspection:{kind:"unknown", record:null}, pressed:null, rulesHash:"rules-one", aggregate:"max", role:"production", scope:"web", reviewMode:"rules", reviewScope:null, reviewOpen:false,
+    reviewRole:"all", reviewState:"deviates", deviations:null};
+  h.setResponse(async () => ({payload:{...single, indexRevision:1}})); await h.controller.restore(saved, () => true);
+  assert.equal(h.renders.at(-1).options.title, undefined, "a saved scope is dropped when the data has one app");
+});
+
+test("the Deviations tree sees the app's slice: its pair chips and its unknown count", async () => {
+  const dto = appsFixture();
+  const edge = (sourceLayer, destinationLayer, count) => ({sourceLayer, destinationLayer, role:"production", count, status:"deviates", excepted:false, exceptionReason:null, pairs:[]});
+  dto.edges = [edge("UI", "Common", 2), edge("Storage", "Only", 5)];
+  const h = harness(); h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const tree = () => text(h.get("architecture-deviations"));
+  await h.get("architecture-review").fire("click"); await flush(); await flush();
+  assert.match(tree(), /UI → Common/); assert.match(tree(), /Storage → Only/); assert.match(tree(), /3 unknown rule instances are not deviations\./);
+  await chooseApp(h, "web · javascript");
+  await h.get("architecture-review").fire("click"); await flush(); await flush();
+  assert.match(tree(), /UI → Common/); assert.doesNotMatch(tree(), /Storage → Only/, "another app's pair is not a chip");
+  assert.match(tree(), /2 unknown rule instances are not deviations\./, "the app's unknown count, not the checkout's");
+  assert.doesNotMatch(tree(), /3 unknown rule instances/);
+});
