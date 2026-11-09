@@ -111,3 +111,12 @@ test("#449: collapsed bands draw summary chips, width sets chip columns, arrows 
   const raw=pele.render(wide.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
   for(const id of wide.nodes.keys()) assert.equal((raw.match(new RegExp(`data-id="${id}"`,"g"))||[]).length,1);
 });
+test("AC26: a long label wraps to at most twelve lines, keeps its full accessible name, and the title is the stack header",()=>{
+  const {adapter}=setup(), view=fixture(), long="segment/".repeat(240);
+  const display={layers:new Set(view.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[]};
+  const p=adapter.project(view,{display,title:"web · ordered layers",measureText:text=>Array.from(text).length*7,layerLabel:layer=>layer.name==="Store"?`${long}\nOrder 1`:`${layer.name}\nOrder ${layer.order}`});
+  const store=[...p.nodes.values()].find(n=>n.kind==="L"&&n.record.name==="Store");
+  assert.equal(store.display.length,13,"twelve wrapped lines plus the order line");
+  assert.ok(store.display[11].endsWith("…"));assert.ok(store.full.startsWith(long));
+  assert.ok([...p.nodes.values()].some(n=>n.kind==="B"&&n.full==="web · ordered layers"));
+});

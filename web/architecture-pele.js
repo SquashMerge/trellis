@@ -115,7 +115,7 @@
     const COLUMNS = options.display ? options.columns ?? chipColumns(options.width, shownShared) : CHIP_COLUMNS;
     options.display?.reset?.();
     // The stack title reserves no more than one chip, so it never sets the stack's width.
-    const orderedStack = addNode("B",null,"Ordered layers",false,"Ordered layers",options.display ? chip : null);
+    const orderedStack = addNode("B",null,options.title ?? "Ordered layers",false,options.title ?? "Ordered layers",options.display ? chip : null);
     // Optional summary display: the caller chooses drawn layers, expansion and
     // directory entries. Without it every layer is expanded to file chips.
     const display = options.display || null;
@@ -352,7 +352,10 @@
   }
   // Replace each reserved header stat line with one compact chip per non-zero count.
   // Deviations use the error colour and keep their glyph, so colour is never the only cue.
-  function statChips(node, label, item, measure) {
+  // A stat with an `action` that has a callback is its own focusable button, the next sibling
+  // of its band; the returned entries let routing move it with the band.
+  function statChips(node, label, item, measure, handlers = {}) {
+    const actions = [];
     const spans = [...label.querySelectorAll("tspan")];
     for (const {stats, line:index} of item.statLines) {
       const line = spans[index];
@@ -368,9 +371,19 @@
         for (const [name,value] of Object.entries({x:left,y:y-14,width:widths[i],height:18,fill:"#14151D",stroke:color,rx:3})) chip.setAttribute(name,String(value));
         for (const [name,value] of Object.entries({x:left + widths[i] / 2,y,fill:color,"text-anchor":"middle","font-size":"14"})) text.setAttribute(name,String(value));
         text.setAttribute("class","trellis-architecture-stat"); text.setAttribute("data-tone",stat.tone === "error" ? "error" : "neutral");
-        text.textContent = stat.text; node.append(chip,text); left += widths[i] + gap;
+        text.textContent = stat.text; left += widths[i] + gap;
+        const callback = stat.action ? (stat.action.interface !== undefined ? handlers.onSelectInterface : handlers.onOpenDeviation) : null;
+        if (!callback) { node.append(chip,text); return; }
+        const button = document.createElementNS(NS,"g");
+        button.setAttribute("class","trellis-architecture-stat-action"); button.setAttribute("role","button"); button.setAttribute("tabindex","0");
+        button.setAttribute("aria-label",stat.label || stat.text); button.setAttribute("data-trellis-layer-action",item.record.name);
+        button.append(chip,text); actions.push({node:button,stat});
+        const activate = event => { event?.stopPropagation(); if (handlers.isCurrent?.() !== false) callback(stat.action); };
+        button.addEventListener("click",activate);
+        button.addEventListener("keydown",event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); activate(event); } });
       });
     }
+    return actions;
   }
   // Arrow routing (#637). Pele lays out the bands; the adapter then opens a gutter under each
   // band row and routes every arrow orthogonally through gutters, a left side channel (long
@@ -679,6 +692,7 @@
         const layer = typeof item.record?.layerKey === "string" ? item.record.layerKey : null, n = noteCounts.get(layer) || 0;
         noteCounts.set(layer, n + 1); noteIds.set(item.id, JSON.stringify([layer, n]));
       }
+      const actionControls = [];
       for (const {node,label,item,path} of controls.values()) {
         replaceLabel(label,item);
         let callback, expanded = null;
@@ -698,7 +712,13 @@
         else if (item.kind === "L") {
           callback = options.display ? options.onToggleLayer : options.onSelectLayer;
           if (options.display) expanded = item.expanded;
-          if (item.statLines?.length) statChips(node,label,item,measure);
+          if (item.statLines?.length) {
+            const handlers = {onOpenDeviation:options.onOpenDeviation, onSelectInterface:options.onSelectInterface, isCurrent:current};
+            statChips(node,label,item,measure,handlers).reduce((previous,{node:button}) => {
+              previous.after(button); actionControls.push({node:button,label:null,item:{kind:"A",id:`${item.id}.a${actionControls.length}`,host:item.host}});
+              return button;
+            },node);
+          }
         } else if (item.kind === "E") {
           // Deviations are highlighted; allowed (conforming or excepted) arrows are dimmed, not dropped (#449).
           const danger = item.record.role === "production" && item.record.status === "deviates" && !item.record.excepted;
@@ -731,10 +751,13 @@
         };
         node.addEventListener("click",select); node.addEventListener("keydown",event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(event); } });
       }
+      for (const control of actionControls) controls.set(control.item.id,control);
       if (options.display) route(root,controls,projection);
       if (!current()) return {status:"stale"};
+      const bands = new Map();
+      for (const control of controls.values()) if (control.item.kind === "L") bands.set(control.item.record.name,frame(control));
       container.replaceChildren(root);
-      return {status:"ready",projection};
+      return {status:"ready",projection,bands};
     } catch (error) {
       if (!current()) return {status:"stale"};
       const message = document.createElement("p"); message.className = "architecture-render-error";

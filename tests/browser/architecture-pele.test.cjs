@@ -52,3 +52,26 @@ test("Architecture patched Pele admission is atomic, non-positional and CSP-safe
  assert.equal(result.error,undefined,result.error);assert.equal(result.ready,"ready");assert.equal(result.modules,40);assert.equal(result.edges,6);assert.equal(result.selectionCount,2);assert.equal(result.badges,5,"one error chip per drawn band");assert.deepEqual(result.chipTexts.slice(0,2),[["↑78","error"],["↓23456","neutral"]]);assert.ok(result.edgeLabels.some(([drawn,label])=>drawn==="↑7"&&label==="7 production sites · upward\ndeviation"),JSON.stringify(result.edgeLabels));assert.ok(result.edgeLabels.some(([drawn])=>drawn==="↓23 excepted"));assert.equal(result.badgeGeometry,true);for(const [name,rejected]of Object.entries(result.rejected))assert.equal(rejected,true,name);assert.equal(result.reorderedCount,result.expectedControls);assert.equal(result.occurrenceCount,result.expectedControls);assert.equal(result.failure,"error");assert.equal(result.interactiveAfterFailure,0);assert.equal(result.svgAfterFailure,0);assert.deepEqual(result.violations,[]);assert.deepEqual(errors,[]);
  }finally{if(browser)await browser.close();await new Promise(resolve=>server.close(resolve));}
 });
+test("AC9, AC10: an action stat is a focusable sibling of its band, moves with it and activates the callback",async()=>{
+ const routes={"/vendor.js":"web/vendor/pele-1.10.0-trellis.2.js","/adapter.js":"web/architecture-pele.js"};
+ const server=http.createServer((req,res)=>{if(routes[req.url]){res.setHeader("Content-Type","text/javascript; charset=utf-8");res.end(fs.readFileSync(path.join(root,routes[req.url])));}else{res.setHeader("Content-Type","text/html; charset=utf-8");res.end('<!doctype html><div id="canvas"></div><script src="/vendor.js"></script><script src="/adapter.js"></script>');}});
+ await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));let browser;
+ try{browser=await chromium.launch();const page=await browser.newPage({viewport:{width:1440,height:1000}});await page.goto(`http://127.0.0.1:${server.address().port}`);
+ const result=await page.evaluate(async view=>{
+  const canvas=document.querySelector("#canvas"),A=window.TrellisArchitecturePele,opened=[],toggled=[];
+  const options={width:1200,title:"web · ordered layers",display:{layers:new Set(view.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[],summary:()=>[]},
+   layerStats:layer=>layer.name==="Store"?[{text:"↑7 deviation · Core",label:"7 upward production reference sites from Store to Core · deviation · open in Deviations",tone:"error",action:{sourceLayer:"Store",destinationLayer:"Core"}},{text:"↓3",label:"3 downward production sites",tone:"neutral"}]:[],
+   onToggleLayer:layer=>toggled.push(layer.name),onOpenDeviation:action=>opened.push(action)};
+  const ready=await A.render(canvas,view,options);if(ready.status!=="ready")return{error:ready.error?.message};
+  const button=canvas.querySelector('[data-trellis-layer-action="Store"]'),band=canvas.querySelector('[data-trellis-layer-id="Store"]');
+  const bandBox=band.querySelector(":scope > rect").getBoundingClientRect(),box=button.getBoundingClientRect();
+  button.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));button.dispatchEvent(new KeyboardEvent("keydown",{key:" ",bubbles:true}));button.dispatchEvent(new MouseEvent("click",{bubbles:true}));
+  return{sibling:band.nextElementSibling===button,role:button.getAttribute("role"),tabindex:button.getAttribute("tabindex"),label:button.getAttribute("aria-label"),inside:band.contains(button),
+   within:box.left>=bandBox.left-1&&box.right<=bandBox.right+1&&box.top>=bandBox.top-1&&box.bottom<=bandBox.bottom+1,opened,toggled,plainStat:band.querySelectorAll("text.trellis-architecture-stat").length,bands:[...ready.bands.keys()],frame:ready.bands.get("Store")};
+ },fixture());
+ assert.equal(result.error,undefined,result.error);assert.equal(result.sibling,true);assert.equal(result.inside,false);assert.equal(result.role,"button");assert.equal(result.tabindex,"0");
+ assert.match(result.label,/open in Deviations$/);assert.equal(result.within,true,"the badge sits inside its band's frame");
+ assert.deepEqual(result.opened,Array(3).fill({sourceLayer:"Store",destinationLayer:"Core"}));assert.deepEqual(result.toggled,[]);
+ assert.equal(result.plainStat,1,"a stat without an action stays in the band");assert.ok(result.bands.includes("Store"));assert.ok(result.frame.w>0&&result.frame.h>0);
+ }finally{if(browser)await browser.close();await new Promise(resolve=>server.close(resolve));}
+});
