@@ -142,3 +142,32 @@ test("all_apps_long_names_wrap: a 120-character name is not clipped and keeps it
   assert.ok((await page.locator(".architecture-interface-card").getAttribute("aria-label")).includes(longName), "the card's name carries the whole app name");
   assert.ok((await page.locator(`#architecture-apps button`).nth(1).textContent()).includes(longName) || (await page.locator(`#architecture-apps button`).nth(2).textContent()).includes(longName));
 }));
+
+test("app_switcher_narrow: at 760px every app button of a 120-character name stays inside the panel and answers a pointer", {timeout:240000}, async () => published(httpFiles, httpRules, async ({page}) => {
+  await drawn(page);
+  await page.setViewportSize({width:760, height:1000});
+  await page.waitForFunction(() => document.querySelector(".architecture-apps-grid")?.dataset.layout === "stacked");
+  const geometry = () => page.evaluate(() => {
+    const panel = document.getElementById("architecture-panel"), box = panel.getBoundingClientRect();
+    return {
+      panel:{left:box.left, right:box.right, scrollLeft:panel.scrollLeft, scrollWidth:panel.scrollWidth, clientWidth:panel.clientWidth},
+      buttons:[...document.querySelectorAll("#architecture-apps button")].map(node => {
+        const r = node.getBoundingClientRect();
+        return {text:node.textContent, left:r.left, right:r.right, top:r.top, bottom:r.bottom};
+      }),
+    };
+  });
+  const measured = await geometry();
+  assert.equal(measured.buttons.length, 3, "All apps and both apps");
+  assert.ok(measured.buttons.some(button => button.text.includes(longName)), "the long name is a choice");
+  assert.ok(measured.panel.scrollWidth <= measured.panel.clientWidth + 1, `the toolbar fits the panel: ${JSON.stringify(measured.panel)}`);
+  for (const button of measured.buttons) {
+    assert.ok(button.left >= measured.panel.left - 0.5 && button.right <= measured.panel.right + 0.5, `${button.text.slice(0, 20)} lies within the panel: ${JSON.stringify(button)} in ${JSON.stringify(measured.panel)}`);
+  }
+  for (let at = measured.buttons.length - 1; at >= 0; at -= 1) {
+    const now = (await geometry()).buttons[at];
+    await page.mouse.click((now.left + now.right) / 2, (now.top + now.bottom) / 2);
+    await page.waitForFunction(index => document.querySelectorAll("#architecture-apps button")[index]?.getAttribute("aria-pressed") === "true", at);
+    assert.equal((await geometry()).panel.scrollLeft, 0, "no button was reached by scrolling the hidden overflow");
+  }
+}));

@@ -51,7 +51,8 @@
 .architecture-display-footer span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #architecture-panel .architecture-toolbar { padding: 8px 18px 4px; row-gap: 4px; }
 #architecture-panel .architecture-toolbar h2 { margin-right: 4px; }
-.architecture-toolbar .architecture-controls { padding: 0; }
+/* AC26: the toolbar controls and app switcher never grow past the panel, so long app names wrap. */
+.architecture-toolbar .architecture-controls { padding: 0; min-width: 0; max-width: 100%; }
 .architecture-status { display: flex; flex: none; flex-wrap: wrap; column-gap: 12px; }
 .architecture-status p { margin-right: 0; }
 #architecture-legend p { margin: 0; }
@@ -97,7 +98,7 @@
 .architecture-caller-unavailable { overflow-wrap:anywhere; }
 
 /* #789: the app switcher and source line open the toolbar; one pressed button is the drawn scope. */
-.architecture-apps { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.architecture-apps { display: flex; flex-wrap: wrap; gap: var(--sp-2); min-width: 0; max-width: 100%; }
 .architecture-apps[hidden], .architecture-source-line[hidden] { display: none; }
 .architecture-apps button { font-size: var(--type-label); white-space: normal; overflow-wrap: anywhere; text-align: left; }
 .architecture-apps button:focus-visible, .architecture-app-files button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
