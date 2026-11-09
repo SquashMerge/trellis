@@ -4616,7 +4616,7 @@ impl World {
     /// `(document path, artifact hash)` of every stored basis at the head.
     fn basis_artifacts(&self) -> Vec<(String, String)> {
         self.db()
-            .prepare("SELECT DISTINCT c.path,b.artifact_hash FROM semantic_basis b JOIN semantic_coverage c ON c.tuple_id=b.tuple_id WHERE c.revision_id=?1 ORDER BY c.path")
+            .prepare("SELECT DISTINCT c.path,b.artifact_hash FROM semantic_basis b JOIN semantic_coverage c ON c.payload_id=b.payload_id WHERE c.revision_id=?1 ORDER BY c.path")
             .unwrap()
             .query_map([self.head_key()], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
@@ -5158,8 +5158,8 @@ fn corruption_read_while_copying_schedules_a_rebuild() {
         .unwrap();
     let corrupted = db
         .execute(
-            "UPDATE semantic_symbols SET key_scope='bogus' WHERE tuple_id IN \
-             (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
+            "UPDATE semantic_symbols SET key_scope='bogus' WHERE payload_id IN \
+             (SELECT payload_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
             [&import],
         )
         .unwrap();
@@ -5185,9 +5185,10 @@ fn corruption_read_while_copying_schedules_a_rebuild() {
     assert!(world.store.recovery_pending_for_tests());
 }
 
-/// A corrupt copied basis is first consumed by the publisher's capture lookup.
+/// A copied document names the basis payload without reading its raw proofs, so a corrupt
+/// capture binding publishes; every revision that names the payload then fails typed on read.
 #[test]
-fn corruption_found_while_writing_copied_rows_schedules_a_rebuild() {
+fn corrupt_copied_basis_publishes_then_fails_typed_on_read() {
     let world = definitions_world();
     let (a, b) = definitions_docs();
     let mut fixture = world.fixture().reference("scip-typescript");
@@ -5195,6 +5196,7 @@ fn corruption_found_while_writing_copied_rows_schedules_a_rebuild() {
     let descriptor = world.write(&fixture);
     world.publish(&descriptor).unwrap();
     let import = world.head_key();
+    let import_pin = world.store.index_baseline().unwrap();
     write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
     let options = IndexOptions::new(world.root.clone());
     let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
@@ -5208,8 +5210,8 @@ fn corruption_found_while_writing_copied_rows_schedules_a_rebuild() {
     let db = rusqlite::Connection::open(&world.index_db).unwrap();
     let corrupted = db
         .execute(
-            "UPDATE semantic_basis SET artifact_hash=?2 WHERE tuple_id IN \
-             (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
+            "UPDATE semantic_basis SET artifact_hash=?2 WHERE payload_id IN \
+             (SELECT payload_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
             rusqlite::params![import, "0".repeat(64)],
         )
         .unwrap();
@@ -5219,19 +5221,25 @@ fn corruption_found_while_writing_copied_rows_schedules_a_rebuild() {
         world.count("SELECT COUNT(*) FROM semantic_raw_captures WHERE artifact_hash='0000000000000000000000000000000000000000000000000000000000000000'"),
         0
     );
-    let error = world
+    world
         .store
         .catch_up_semantic_for_tests(&world.cancel)
-        .unwrap_err();
+        .unwrap();
+    let head = world.store.index_baseline().unwrap();
+    assert_ne!(head, native, "the catch-up publication advanced the head");
+    let error = world.store.semantic_at(head).unwrap_err();
     assert!(
-        matches!(
-            error.downcast_ref::<rusqlite::Error>(),
-            Some(rusqlite::Error::QueryReturnedNoRows)
-        ),
+        format!("{error:#}").contains("incompatible_index: corrupt raw proof binding"),
         "{error:#}"
     );
-    assert_eq!(world.store.index_baseline().unwrap(), native);
-    assert!(world.store.recovery_pending_for_tests(), "{error:#}");
+    // The first failure latches the index as invalid, so the import revision, which names the
+    // same payload, now reports the typed reconciliation failure.
+    let error = world.store.semantic_at(import_pin).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("incompatible_index:"),
+        "{error:#}"
+    );
+    assert!(world.store.recovery_pending_for_tests());
 }
 
 /// Runs the due revision maintenance until nothing is left to do.
@@ -5904,7 +5912,7 @@ fn gc_keeps_proofs_referenced_by_retained_provenance() {
         .store
         .with_index_sql_for_tests(|db| {
             let changed = db.execute(
-                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=?2,derived_from_record_kind=(SELECT record_kind FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2),derived_from_fact_digest=(SELECT fact_digest FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.tuple_id=v.tuple_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
+                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=?2,derived_from_record_kind=(SELECT record_kind FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2),derived_from_fact_digest=(SELECT fact_digest FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.payload_id=v.payload_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
                 rusqlite::params![capture_id, proof_id, format!("pin:v1:{}:{}", head.index_generation, head.index_revision)],
             )?;
             assert_eq!(changed, 1);
@@ -9463,7 +9471,7 @@ fn full_limit_stays_unavailable_under_the_oracle() {
     assert_eq!(world.rejoin_failures(), 3);
     assert_eq!(
         world.count(&format!(
-            "SELECT COUNT(*) FROM semantic_provenance p JOIN semantic_coverage c ON c.tuple_id=p.tuple_id WHERE c.revision_id='{}'",
+            "SELECT COUNT(*) FROM semantic_provenance p JOIN semantic_coverage c ON c.payload_id=p.payload_id WHERE c.revision_id='{}'",
             world.head_key()
         )),
         0
@@ -10595,40 +10603,43 @@ fn gaps_doc() -> DocSpec {
 #[test]
 fn partial_document_records_a_native_gap_and_the_cap_together() {
     use trellis::semantic_evidence::{CoverageReasons, CoverageState};
-    let world = world(|root| {
-        write_files(
-            root,
-            &[
-                (
-                    "Cargo.toml",
-                    "[package]\nname = \"gaps\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-                ),
-                ("src/lib.rs", GAPS_RS),
-            ],
-        )
-    });
-    let mut fixture = world.fixture();
-    fixture.artifact("rust", vec![gaps_doc()]);
-    let descriptor = world.write(&fixture);
     let capped_limits = BatchLimits {
         document_occurrences: 5,
         ..BatchLimits::PRODUCTION
     };
     let cases = [
         (
-            BatchLimits::PRODUCTION,
-            "uncapped",
-            CoverageReasons::new([2, 1, 0, 0], false, false, false),
-            "partial: 1 · native macro/attribute gaps only",
-        ),
-        (
             capped_limits,
             "capped",
             CoverageReasons::new([1, 0, 0, 0], true, false, false),
             "partial: 1 · native gaps 1, document cap 1",
         ),
+        (
+            BatchLimits::PRODUCTION,
+            "uncapped",
+            CoverageReasons::new([2, 1, 0, 0], false, false, false),
+            "partial: 1 · native macro/attribute gaps only",
+        ),
     ];
+    let mut last_world = None;
     for (limits, case, expected, summary) in cases {
+        // The same descriptor settles differently under other limits, which only a test can
+        // vary, so each case has a store of its own and shares no payload with another.
+        let world = world(|root| {
+            write_files(
+                root,
+                &[
+                    (
+                        "Cargo.toml",
+                        "[package]\nname = \"gaps\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                    ),
+                    ("src/lib.rs", GAPS_RS),
+                ],
+            )
+        });
+        let mut fixture = world.fixture();
+        fixture.artifact("rust", vec![gaps_doc()]);
+        let descriptor = world.write(&fixture);
         let (mut admitted, joined, _) = world
             .join_with(&descriptor, &limits, DestinationMutations::default())
             .unwrap();
@@ -10711,7 +10722,9 @@ fn partial_document_records_a_native_gap_and_the_cap_together() {
             expected.macro_invocation,
             "{case}"
         );
+        last_world = Some(world);
     }
+    let world = last_world.unwrap();
     // A later native revision rejoins the selected batch, under production limits, and records
     // the rejoined tuple's reasons again.
     write_files(&world.root, &[("src/other.rs", "pub fn other() {}\n")]);

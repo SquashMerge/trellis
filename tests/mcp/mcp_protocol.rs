@@ -16869,7 +16869,7 @@ fn malformed_semantic_freshness_or_state_fails_language_tiers() {
         None
     }
     for corruption in [
-        "UPDATE semantic_provenance SET freshness='garbage'",
+        "UPDATE semantic_coverage_freshness SET freshness='garbage'",
         "UPDATE semantic_coverage SET state='garbage'",
     ] {
         let state = tempfile::tempdir().unwrap();

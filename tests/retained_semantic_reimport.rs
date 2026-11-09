@@ -244,7 +244,7 @@ impl World {
         let version: u32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 41);
+        assert_eq!(version, 42);
         db.pragma_update(None, "user_version", version - 1).unwrap();
         drop(db);
         // The real daemon establishes the new native head and owns retained FIFO work.
@@ -390,7 +390,7 @@ impl World {
         let db =
             Connection::open_with_flags(&self.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let (proofs, conservative, changed): (i64, i64, i64) = db.query_row(
-            "SELECT COUNT(*),SUM(p.freshness='possiblyStale'),SUM(p.freshness='stale') FROM semantic_provenance p JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.selected=1",
+            "SELECT COUNT(*),SUM(f.freshness='possiblyStale'),SUM(f.freshness='stale') FROM semantic_coverage c JOIN semantic_provenance p ON p.payload_id=c.payload_id JOIN semantic_coverage_freshness f ON f.revision_id=c.revision_id AND f.tuple_id=c.tuple_id AND f.basis_id=p.basis_id WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.selected=1",
             rusqlite::params![key, PRODUCER], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
         assert!(
@@ -400,7 +400,7 @@ impl World {
         assert_eq!(proofs, conservative);
         assert_eq!(changed, 0);
         let basis_revisions: Vec<String> = db.prepare(
-            "SELECT DISTINCT b.captured_native_revision_id FROM semantic_basis b JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.selected=1",
+            "SELECT DISTINCT b.captured_native_revision_id FROM semantic_basis b JOIN semantic_coverage c ON c.payload_id=b.payload_id WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.selected=1",
         ).unwrap().query_map(rusqlite::params![key, PRODUCER], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
         assert_eq!(
             basis_revisions,
@@ -686,7 +686,7 @@ fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, 
     let original_proofs = || {
         let db =
             Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        db.prepare("SELECT p.provenance_id,p.freshness,p.derived_from_provenance_id,p.derived_from_fact_digest FROM semantic_provenance p JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.selected=1 ORDER BY p.provenance_id")
+        db.prepare("SELECT COALESCE(p.provenance_id,p.derived_from_provenance_id||'/'||p.evidence_kind) AS id,f.freshness,p.derived_from_provenance_id,p.derived_from_fact_digest FROM semantic_coverage c JOIN semantic_provenance p ON p.payload_id=c.payload_id JOIN semantic_coverage_freshness f ON f.revision_id=c.revision_id AND f.tuple_id=c.tuple_id AND f.basis_id=p.basis_id WHERE c.revision_id=?1 AND c.selected=1 ORDER BY id")
             .unwrap().query_map([&original_key], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,Option<String>>(2)?,row.get::<_,Option<String>>(3)?)))
             .unwrap().map(Result::unwrap).collect::<Vec<_>>()
     };
@@ -910,7 +910,7 @@ fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, 
         ).unwrap();
         assert!(pending, "{path}: retained N must record semantic catch-up");
         let basis_revisions: Vec<String> = db.prepare(
-            "SELECT DISTINCT b.captured_native_revision_id FROM semantic_basis b JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.selected=1 AND c.producer_id=?2",
+            "SELECT DISTINCT b.captured_native_revision_id FROM semantic_basis b JOIN semantic_coverage c ON c.payload_id=b.payload_id WHERE c.revision_id=?1 AND c.selected=1 AND c.producer_id=?2",
         ).unwrap().query_map(rusqlite::params![basis_pin, PRODUCER], |row| row.get(0))
             .unwrap().map(Result::unwrap).collect();
         assert_eq!(
@@ -975,7 +975,7 @@ fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, 
             "catch-up must retain the original raw selection"
         );
         let (proofs, conservative): (i64, i64) = db.query_row(
-            "SELECT count(*),COALESCE(sum(p.freshness<>'fresh' AND p.capture_id IS NOT NULL AND p.derived_from_provenance_id IS NOT NULL AND p.derived_from_record_kind IS NOT NULL AND p.derived_from_fact_digest IS NOT NULL),0) FROM semantic_provenance p JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.selected=1 AND c.producer_id=?2",
+            "SELECT count(*),COALESCE(sum(f.freshness<>'fresh' AND p.capture_id IS NOT NULL AND p.derived_from_provenance_id IS NOT NULL AND p.derived_from_record_kind IS NOT NULL AND p.derived_from_fact_digest IS NOT NULL),0) FROM semantic_coverage c JOIN semantic_provenance p ON p.payload_id=c.payload_id JOIN semantic_coverage_freshness f ON f.revision_id=c.revision_id AND f.tuple_id=c.tuple_id AND f.basis_id=p.basis_id WHERE c.revision_id=?1 AND c.selected=1 AND c.producer_id=?2",
             rusqlite::params![completed, PRODUCER], |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
         let coverage: Vec<(String, String, bool, bool, String, Option<String>)> = db.prepare(
@@ -1028,7 +1028,7 @@ fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, 
         [], |row| row.get::<_, String>(0),
     ).unwrap());
     let basis_revisions: Vec<String> = db.prepare(
-        "SELECT DISTINCT b.captured_native_revision_id FROM semantic_basis b JOIN semantic_coverage c USING(tuple_id) WHERE c.revision_id=?1 AND c.selected=1 AND c.producer_id=?2",
+        "SELECT DISTINCT b.captured_native_revision_id FROM semantic_basis b JOIN semantic_coverage c ON c.payload_id=b.payload_id WHERE c.revision_id=?1 AND c.selected=1 AND c.producer_id=?2",
     ).unwrap().query_map(rusqlite::params![basis_pin, PRODUCER], |row| row.get(0))
         .unwrap().map(Result::unwrap).collect();
     assert_eq!(

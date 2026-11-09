@@ -27,7 +27,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 41
+SCHEMA_VERSION = 42
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -670,7 +670,7 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# schema-41 tables, immutable surrogate keys, and current pin normalization.
+# schema-42 tables, immutable surrogate keys, and current pin normalization.
 # Match tests/daemon/cli.rs: check FTS shadow inventory, compare logical corpus cells.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
@@ -687,7 +687,8 @@ native_version_calls native_version_control_regions native_version_call_regions
 native_revision_release_debt native_release_candidate_versions native_release_candidate_graphs
 native_release_candidate_classes semantic_producers semantic_producer_languages
 semantic_revision_producers semantic_requested_producers semantic_requested_producer_languages
-semantic_coverage semantic_coverage_roles semantic_coverage_reasons semantic_basis
+semantic_payloads semantic_coverage semantic_coverage_roles semantic_coverage_reasons
+semantic_coverage_freshness semantic_release_candidate_payloads semantic_basis
 semantic_basis_lookup_dependencies semantic_provenance semantic_symbols
 semantic_symbol_targets semantic_declaration_bindings semantic_declaration_binding_symbols
 semantic_declaration_join_candidates semantic_references semantic_reference_roles
@@ -720,7 +721,9 @@ def typed_cells(value):
 
 def selected_where(table):
     """The per-table scope of the selected pin; every schema table must be classified."""
-    selected = "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?"
+    # ?1: the same bind serves every scope that names a payload and a manifest row.
+    payloads = "SELECT payload_id FROM semantic_coverage WHERE revision_id=?1"
+    tuples = "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1"
     if table == "native_revisions":
         return "id=?"
     elif table == "head_search_fts":
@@ -728,7 +731,9 @@ def selected_where(table):
         return "? IS NOT NULL"
     elif table in {"revision_capture_inputs", "revision_documents", "semantic_revision_producers",
                    "semantic_requested_producers", "semantic_requested_producer_languages",
-                   "semantic_coverage", "semantic_revision_raw_selections", "semantic_reimport",
+                   "semantic_coverage", "semantic_coverage_freshness",
+                   "semantic_release_candidate_payloads",
+                   "semantic_revision_raw_selections", "semantic_reimport",
                    "semantic_projection_origins", "semantic_projection_documents",
                    "semantic_pending_target", "semantic_pending_selections", "semantic_catchup_commits"}:
         return "revision_id=?"
@@ -753,23 +758,24 @@ def selected_where(table):
         return "gid IN (SELECT gid FROM revision_documents WHERE revision_id=?)"
     elif table in {"class_projections", "classes", "class_relations"}:
         return "cid IN (SELECT cid FROM revision_documents WHERE revision_id=?)"
-    elif table in {"semantic_coverage_roles", "semantic_coverage_reasons", "semantic_basis",
-                   "semantic_provenance",
+    elif table in {"semantic_coverage_roles", "semantic_coverage_reasons"}:
+        # Payload-owned rows, plus the manifest-owned rows of payload-less tuples.
+        return f"payload_id IN ({payloads}) OR tuple_id IN ({tuples})"
+    elif table in {"semantic_payloads", "semantic_basis", "semantic_provenance",
                    "semantic_symbols", "semantic_declaration_bindings", "semantic_references",
                    "semantic_call_bindings", "semantic_type_relationships",
                    "semantic_projection_dependencies", "semantic_projection_contexts",
-                   "semantic_projection_lookup_dependencies"}:
-        return f"tuple_id IN ({selected})"
+                   "semantic_projection_lookup_dependencies",
+                   "semantic_reference_roles", "semantic_reference_candidates"}:
+        return f"payload_id IN ({payloads})"
     elif table in {"semantic_basis_lookup_dependencies"}:
-        return f"basis_id IN (SELECT basis_id FROM semantic_basis WHERE tuple_id IN ({selected}))"
+        return f"basis_id IN (SELECT basis_id FROM semantic_basis WHERE payload_id IN ({payloads}))"
     elif table in {"semantic_symbol_targets"}:
-        return f"symbol_id IN (SELECT symbol_id FROM semantic_symbols WHERE tuple_id IN ({selected}))"
+        return f"symbol_id IN (SELECT symbol_id FROM semantic_symbols WHERE payload_id IN ({payloads}))"
     elif table in {"semantic_declaration_binding_symbols", "semantic_declaration_join_candidates"}:
-        return f"binding_id IN (SELECT binding_id FROM semantic_declaration_bindings WHERE tuple_id IN ({selected}))"
-    elif table in {"semantic_reference_roles", "semantic_reference_candidates"}:
-        return f"tuple_id IN ({selected})"
+        return f"binding_id IN (SELECT binding_id FROM semantic_declaration_bindings WHERE payload_id IN ({payloads}))"
     elif table in {"semantic_call_candidates", "semantic_call_possible_dispatch", "semantic_call_join_candidates"}:
-        return f"binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id IN ({selected}))"
+        return f"binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE payload_id IN ({payloads}))"
     elif table in {"semantic_raw_batches", "semantic_raw_captures", "semantic_raw_exclusions"}:
         return "batch_id IN (SELECT batch_id FROM semantic_revision_raw_selections WHERE revision_id=?)"
     elif table in {"semantic_raw_documents", "semantic_raw_proofs"}:
@@ -939,9 +945,9 @@ def selected_proof(db, revision, anchor_path, artifact_hash):
         JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id AND p.path=?
         JOIN semantic_coverage cov ON cov.revision_id=s.revision_id AND cov.producer_id=s.producer_id
             AND cov.path=p.path AND cov.language=p.language
-        JOIN semantic_provenance v ON v.tuple_id=cov.tuple_id AND v.capture_id=c.capture_id
+        JOIN semantic_provenance v ON v.payload_id=cov.payload_id AND v.capture_id=c.capture_id
             AND v.derived_from_provenance_id=p.proof_id AND v.derived_from_fact_digest=p.fact_digest
-        JOIN semantic_basis b ON b.basis_id=v.basis_id AND b.tuple_id=cov.tuple_id
+        JOIN semantic_basis b ON b.basis_id=v.basis_id AND b.payload_id=cov.payload_id
         JOIN native_revisions r ON r.id=s.revision_id
         WHERE s.revision_id=?""", (anchor_path, revision)).fetchall()
     require(rows and all(row[0] == "scip-typescript" and row[1] == artifact_hash
@@ -1093,7 +1099,7 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
 
 
 class SelectedView:
-    """Closed schema-41 view retaining all selected columns plus input-closure digests."""
+    """Closed schema-42 view retaining all selected columns plus input-closure digests."""
     def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
         self.physical_root = physical_root.resolve(strict=True)
@@ -1110,7 +1116,7 @@ class SelectedView:
                     "vid": {}, "gid": {}, "cid": {}, "syntax": {}, "occurrence": {},
                     "region": {}, "class": {}, "class-ref": {}, "graph-node": {},
                     "tuple": {}, "basis": {}, "batch": {}, "capture": {}, "proof": {},
-                    "provenance": {}, "symbol": {}, "binding": {}}
+                    "provenance": {}, "payload": {}, "symbol": {}, "binding": {}}
         # A native-first semantic S names the native N it caught up; both runs have one.
         for (target,) in db.execute(
                 "SELECT target_revision_id FROM semantic_catchup_commits WHERE revision_id=?", (revision,)):
@@ -1230,30 +1236,35 @@ class SelectedView:
                     "FROM semantic_raw_proofs WHERE capture_id=?", (capture,)):
                 self.ids["proof"][raw] = (self.ids["capture"][capture], kind, language,
                                            path, fact, canonical_bytes.hex())
-        for raw, tuple_id, producer, artifact, language, source_revision, source_hash in db.execute(
-                "SELECT basis_id,tuple_id,producer_id,artifact_hash,language,"
+        # A payload is identified by the first manifest row of the selected revision that names it.
+        for raw, tuple_id in db.execute(
+                "SELECT payload_id,min(tuple_id) FROM semantic_coverage "
+                "WHERE revision_id=? AND payload_id IS NOT NULL GROUP BY payload_id", (revision,)):
+            self.ids["payload"][raw] = self.ids["tuple"][tuple_id]
+        for raw, payload_id, producer, artifact, language, source_revision, source_hash in db.execute(
+                "SELECT basis_id,payload_id,producer_id,artifact_hash,language,"
                 "captured_native_revision_id,source_manifest_hash FROM semantic_basis "
-                "WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
+                "WHERE payload_id IN (SELECT payload_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
             require(source_revision == self.r1 and source_hash == self.capture_descriptor["sourceManifestHash"],
                     "basis not bound to admitted r1")
-            self.ids["basis"][raw] = (self.ids["tuple"][tuple_id], producer, artifact, language,
+            self.ids["basis"][raw] = (self.ids["payload"][payload_id], producer, artifact, language,
                                        tuple(self.r1_docs))
-        for tuple_id, raw, evidence, basis, proof in db.execute(
-                "SELECT tuple_id,provenance_id,evidence_kind,basis_id,derived_from_provenance_id "
-                "FROM semantic_provenance WHERE tuple_id IN "
-                "(SELECT tuple_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
+        for payload_id, ordinal, evidence, basis, proof in db.execute(
+                "SELECT payload_id,ordinal,evidence_kind,basis_id,derived_from_provenance_id "
+                "FROM semantic_provenance WHERE payload_id IN "
+                "(SELECT payload_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
             require(proof in self.ids["proof"], "provenance not linked to selected raw proof")
-            self.ids["provenance"][raw] = (self.ids["tuple"][tuple_id], evidence,
-                                            self.ids["basis"][basis], self.ids["proof"][proof])
-        for raw, tuple_id, ordinal, scheme, symbol, scope in db.execute(
-                "SELECT symbol_id,tuple_id,ordinal,key_scheme,key_symbol,key_scope FROM semantic_symbols "
-                "WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
-            self.ids["symbol"][raw] = (self.ids["tuple"][tuple_id], ordinal, scheme, symbol, scope)
+            self.ids["provenance"][(payload_id, ordinal)] = (self.ids["payload"][payload_id], evidence,
+                                                              self.ids["basis"][basis], self.ids["proof"][proof])
+        for raw, payload_id, ordinal, scheme, symbol, scope in db.execute(
+                "SELECT symbol_id,payload_id,ordinal,key_scheme,key_symbol,key_scope FROM semantic_symbols "
+                "WHERE payload_id IN (SELECT payload_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
+            self.ids["symbol"][raw] = (self.ids["payload"][payload_id], ordinal, scheme, symbol, scope)
         for table in ("semantic_declaration_bindings", "semantic_call_bindings"):
-            for raw, tuple_id, ordinal in db.execute(
-                    f"SELECT binding_id,tuple_id,ordinal FROM {table} WHERE tuple_id IN "
-                    "(SELECT tuple_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
-                self.ids["binding"][raw] = (table, self.ids["tuple"][tuple_id], ordinal)
+            for raw, payload_id, ordinal in db.execute(
+                    f"SELECT binding_id,payload_id,ordinal FROM {table} WHERE payload_id IN "
+                    "(SELECT payload_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
+                self.ids["binding"][raw] = (table, self.ids["payload"][payload_id], ordinal)
 
     def map(self, family, value, where=None):
         if value is None:
@@ -1359,6 +1370,14 @@ class SelectedView:
             cells["report_json"] = report
         if table == "semantic_basis":
             cells["source_manifest_hash"] = self.descriptor()["sourceManifestHash"]
+        if table == "semantic_payloads":
+            # The key digests root-derived document version IDs and the descriptor digest.
+            cells["payload_key"] = None if cells["payload_key"] is None else "<payload-key>"
+            cells["version_id"] = "<document-version>"
+        if table == "semantic_projection_dependencies":
+            cells["version_id"] = "<document-version>"
+        if table == "semantic_provenance" and cells["provenance_id"] is not None:
+            cells["provenance_id"] = ("literal-provenance", cells["provenance_id"])
         if table in {"graph_projections", "classes", "class_relations"}:
             for column in ("class_extraction_payload", "class_summary_payload", "payload"):
                 if column in cells and cells[column] is not None:
@@ -1378,8 +1397,8 @@ class SelectedView:
             if value is None:
                 continue
             family = None
-            if column in ("vid", "gid", "cid", "tuple_id", "basis_id", "batch_id", "capture_id", "symbol_id",
-                          "binding_id"):
+            if column in ("vid", "gid", "cid", "tuple_id", "payload_id", "basis_id", "batch_id", "capture_id",
+                          "symbol_id", "binding_id"):
                 family = column.removesuffix("_id") if column.endswith("_id") else column
             elif column == "source_set_id":
                 family = "source-set"
@@ -1397,8 +1416,8 @@ class SelectedView:
             elif column in ("reference_id", "call_id", "region_id", "parent_id", "owner_id"):
                 family = ("occurrence" if column in ("reference_id", "call_id") else
                           "syntax" if column == "owner_id" else "region")
-            elif column in ("provenance_id", "derived_from_provenance_id"):
-                family = "proof" if column == "derived_from_provenance_id" else "provenance"
+            elif column == "derived_from_provenance_id":
+                family = "proof"
             elif column == "proof_id":
                 family = "proof"
             elif table in ("native_version_references", "native_version_calls", "native_version_control_regions") and column == "id":

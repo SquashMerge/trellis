@@ -1288,7 +1288,7 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         // Lone rows without their parents; this test is about the triggers.
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        db.execute_batch(super::super::CACHE_SCHEMA_V41).unwrap();
+        db.execute_batch(super::super::CACHE_SCHEMA_V42).unwrap();
         let insert = |n: i64, name: Option<&str>| {
             let id = format!("sid:v1:{n:032x}");
             let end = name.map(|_| 1);

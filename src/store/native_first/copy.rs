@@ -96,7 +96,7 @@ pub(crate) fn copy_source(
     // (#826): it is no producer evidence, and the retained selection can still be re-joined.
     let row: Option<(bool, String, Option<i64>)> = db
         .prepare_cached(
-            "SELECT d.pending OR EXISTS(SELECT 1 FROM semantic_coverage_reasons r WHERE r.tuple_id=c.tuple_id AND r.omitted=1) \
+            "SELECT d.pending OR EXISTS(SELECT 1 FROM semantic_coverage_reasons r WHERE (r.payload_id=c.payload_id OR r.tuple_id=c.tuple_id) AND r.omitted=1) \
              OR COALESCE(c.state='failed' AND substr(c.diagnostic,1,length(?5)+1)=?5||':',0),\
              o.basis_pin,c.tuple_id FROM semantic_projection_documents d \
              JOIN semantic_projection_origins o ON o.revision_id=d.revision_id AND o.producer_id=d.producer_id \
@@ -164,7 +164,12 @@ pub(crate) fn copied_document(
         coverage.producer_id == producer.id,
         "incompatible_index: copied tuple producer differs"
     );
-    coverage.reasons = read_coverage_reasons(db, tuple)?;
+    let payload: Option<i64> = db.query_row(
+        "SELECT payload_id FROM semantic_coverage WHERE tuple_id=?1",
+        [tuple],
+        |row| row.get(0),
+    )?;
+    coverage.reasons = read_coverage_reasons(db, payload, tuple)?;
     let old = std::mem::replace(
         &mut coverage.revision_id,
         destination.native_revision_id.clone(),
