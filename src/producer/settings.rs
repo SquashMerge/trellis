@@ -726,6 +726,17 @@ fn pyproject_value(
     Ok(None)
 }
 
+/// One scip-python setting read from `pyproject.toml`.
+struct PythonKey<'a> {
+    key: &'static str,
+    flag: &'static str,
+    name: &'static str,
+    overridden: Option<&'a String>,
+    default: &'static str,
+    valid: fn(&str) -> bool,
+    what: &'static str,
+}
+
 /// scip-python's settings: `python.projectName` and `python.projectVersion`, passed as
 /// `--project-name` and `--project-version`. Only the trusted worktree holds the root
 /// `pyproject.toml`; the restricted profile omits it, so there it is not read and the
@@ -745,37 +756,37 @@ pub fn python(
         }
         _ => None,
     };
-    type Valid = fn(&str) -> bool;
-    let keys: [(
-        &str,
-        &'static str,
-        &'static str,
-        Option<&String>,
-        &str,
-        Valid,
-        &str,
-    ); 2] = [
-        (
-            "name",
-            "--project-name",
-            "python.projectName",
-            overrides.python_project_name.as_ref(),
-            PYTHON_PROJECT_NAME,
-            valid_python_name,
-            "a Python project name",
-        ),
-        (
-            "version",
-            "--project-version",
-            "python.projectVersion",
-            overrides.python_project_version.as_ref(),
-            PYTHON_PROJECT_VERSION,
-            valid_python_version,
-            "a PEP 440 version",
-        ),
+    let keys = [
+        PythonKey {
+            key: "name",
+            flag: "--project-name",
+            name: "python.projectName",
+            overridden: overrides.python_project_name.as_ref(),
+            default: PYTHON_PROJECT_NAME,
+            valid: valid_python_name,
+            what: "a Python project name",
+        },
+        PythonKey {
+            key: "version",
+            flag: "--project-version",
+            name: "python.projectVersion",
+            overridden: overrides.python_project_version.as_ref(),
+            default: PYTHON_PROJECT_VERSION,
+            valid: valid_python_version,
+            what: "a PEP 440 version",
+        },
     ];
     let mut settings = Vec::new();
-    for (key, flag, name, overridden, default, valid, what) in keys {
+    for PythonKey {
+        key,
+        flag,
+        name,
+        overridden,
+        default,
+        valid,
+        what,
+    } in keys
+    {
         let derived = match (overridden, &manifest) {
             (None, Some((input, manifest))) => pyproject_value(manifest, key, valid, what)?
                 .map(|(value, section)| (value, section, *input)),
