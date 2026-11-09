@@ -281,12 +281,6 @@ impl ArchitectureOwner {
         }
     }
 
-    /// The owner has a turn running or due: a hint, a contention retry or a build.
-    fn busy(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        state.hinted || state.stepping || state.retry_at.is_some()
-    }
-
     /// A failed build retries on a bound; a later hint or read starts over.
     fn retry_later(&self) {
         let mut state = self.state.lock().unwrap();
@@ -321,16 +315,20 @@ impl DaemonState {
     /// active runtime's owner builds each new head, rules file or not, so the first read after
     /// an activation or a publication usually finds its core published (#798).
     pub fn architecture_hint(self: &Arc<Self>) {
+        let mut state = self.architecture.0.state.lock().unwrap();
+        self.hint_locked(&mut state);
+        drop(state);
+        self.architecture.0.changed.notify_all();
+    }
+
+    fn hint_locked(self: &Arc<Self>, state: &mut OwnerState) {
         let owner = &self.architecture.0;
-        let mut state = owner.state.lock().unwrap();
-        if !state.thread_started && !owner.wanted(&state) {
+        if !state.thread_started && !owner.wanted(state) {
             return;
         }
         owner.head_may_have_moved.store(true, Ordering::Release);
         state.ask();
-        self.start_architecture_owner(&mut state);
-        drop(state);
-        owner.changed.notify_all();
+        self.start_architecture_owner(state);
     }
 
     /// After a worker step: hint the owner only when the published head or the rules file
@@ -354,14 +352,16 @@ impl DaemonState {
             Err(_) => Some("unreadable".into()),
         };
         let seen = Some((head, rules));
-        {
-            let mut state = self.architecture.0.state.lock().unwrap();
-            if state.stepped == seen {
-                return;
-            }
-            state.stepped = seen;
+        // The head is recorded and its turn submitted under one lock, so the settled wait
+        // never sees the head stepped with no turn due.
+        let mut state = self.architecture.0.state.lock().unwrap();
+        if state.stepped == seen {
+            return;
         }
-        self.architecture_hint();
+        state.stepped = seen;
+        self.hint_locked(&mut state);
+        drop(state);
+        self.architecture.0.changed.notify_all();
     }
 
     fn start_architecture_owner(self: &Arc<Self>, state: &mut OwnerState) {
@@ -704,9 +704,16 @@ impl DaemonState {
         self.architecture.0.builds.load(Ordering::Acquire)
     }
 
-    /// Whether the owner has a turn running or due, for the tests' settled wait.
-    pub(crate) fn architecture_busy(&self) -> bool {
-        self.architecture.0.busy()
+    /// Whether the owner still owes work for the published head `pin`, for the tests' settled
+    /// wait: a turn is running or due, or no worker step has submitted `pin` yet. A head that
+    /// semantic catch-up or maintenance published is submitted by the worker's next step, so
+    /// until then the owner owes its build (#798).
+    pub(crate) fn architecture_owes(&self, pin: IndexPin) -> bool {
+        let state = self.architecture.0.state.lock().unwrap();
+        state.hinted
+            || state.stepping
+            || state.retry_at.is_some()
+            || state.stepped.as_ref().is_none_or(|(head, _)| *head != pin)
     }
 
     /// Wait until the owner has no turn running or due.

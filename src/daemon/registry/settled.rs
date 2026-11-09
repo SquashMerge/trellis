@@ -221,6 +221,12 @@ impl CheckoutRuntime {
             return busy;
         }
         match resources.store.index_baseline() {
+            // The owner builds each new head with no read asking (#798), and owes that build
+            // until the worker has submitted this head and the owner's turn has ended.
+            Ok(head) if head == pin && resources.scheduler.architecture_owes(pin) => Sample::Busy {
+                busy: SettleBusy::Architecture,
+                contended: false,
+            },
             Ok(head) if head == pin => Sample::Idle(pin),
             Ok(_) => Sample::Busy {
                 busy: SettleBusy::Changing,
@@ -230,7 +236,7 @@ impl CheckoutRuntime {
         }
     }
 
-    /// The owner's published pending state: startup, watcher, FIFO, S and Architecture.
+    /// The owner's published pending state: startup, watcher, FIFO and S.
     fn owner_busy(resources: &ActiveResources) -> Option<Sample> {
         let scheduler = &resources.scheduler;
         let busy = |busy| {
@@ -261,10 +267,6 @@ impl CheckoutRuntime {
             Ok(None) => {}
             Ok(Some(_)) => return busy(SettleBusy::Semantic),
             Err(error) => return Some(read_refused(error)),
-        }
-        // The owner builds each new head with no read asking (#798), taking a lease to read it.
-        if scheduler.architecture_busy() {
-            return busy(SettleBusy::Architecture);
         }
         None
     }

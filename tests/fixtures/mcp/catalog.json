@@ -15580,24 +15580,10 @@
                   "const": "building"
                 },
                 "currentBasis": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Basis"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "$ref": "#/$defs/Basis"
                 },
                 "currentContentHash": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Hash"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "message": {
                   "$ref": "#/$defs/Text"
@@ -18283,24 +18269,10 @@
                   "const": "building"
                 },
                 "currentBasis": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Basis"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "$ref": "#/$defs/Basis"
                 },
                 "currentContentHash": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Hash"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "message": {
                   "$ref": "#/$defs/Text"
@@ -21191,24 +21163,10 @@
                   "const": "building"
                 },
                 "currentBasis": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Basis"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "$ref": "#/$defs/Basis"
                 },
                 "currentContentHash": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Hash"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "message": {
                   "$ref": "#/$defs/Text"

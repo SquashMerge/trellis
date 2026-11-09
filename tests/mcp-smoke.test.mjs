@@ -328,6 +328,15 @@ function building(name) {
   }};
 }
 const architectureTools = ['trellis_references', 'trellis_rules_check', 'trellis_rules_explain'];
+// Each architecture tool's checked-in schema plus the live success branch, so a building
+// answer is validated against the real `BuildingFailure` branch and the mock success still
+// passes.
+const buildingTools = liveTools.map(tool => {
+  if (!architectureTools.includes(tool.name)) return tool;
+  const real = tools.find(entry => entry.name === tool.name).outputSchema;
+  const {$schema, ...live} = tool.outputSchema;
+  return {...tool, outputSchema: {...real, oneOf: [...real.oneOf, live]}};
+});
 
 test('architecture tools and the prompt that answer building are retried until they answer', async () => {
   const left = new Map([...architectureTools, promptName].map(name => [name, 2]));
@@ -337,7 +346,7 @@ test('architecture tools and the prompt that answer building are retried until t
     return result;
   });
   const slept = [];
-  const report = await exercise(client, liveTools, '/fixture', 'main', {...dependencies(), sleep: async ms => { slept.push(ms); }});
+  const report = await exercise(client, buildingTools, '/fixture', 'main', {...dependencies(), sleep: async ms => { slept.push(ms); }});
   assert.equal(report.ok, true, JSON.stringify(report));
   for (const name of [...architectureTools, promptName]) {
     assert.equal(report.results.find(row => row.tool === name).buildingRetries, 2, name);
@@ -347,12 +356,57 @@ test('architecture tools and the prompt that answer building are retried until t
   assert.ok(!JSON.stringify(report).includes('SECRET'));
 });
 
+test('a malformed building answer fails the call even when a retry would pass', async () => {
+  for (const damage of [
+    error => { delete error.progress; },
+    error => { error.currentBasis = null; },
+    error => { error.currentContentHash = 'a'.repeat(64); },
+  ]) {
+    let first = true;
+    const client = clientFor((name, result) => {
+      if (name !== 'trellis_rules_check' || !first) return result;
+      first = false;
+      const reply = building(name);
+      damage(reply.structuredContent.error);
+      return reply;
+    });
+    const report = await exercise(client, buildingTools, '/fixture', 'main', {...dependencies(), sleep: async () => {}});
+    const row = report.results.find(item => item.tool === 'trellis_rules_check');
+    assert.equal(row.reason, 'output_schema_mismatch', JSON.stringify(row));
+    assert.equal(client.calls.filter(call => call.name === 'trellis_rules_check').length, 1);
+  }
+});
+
+test('no building retry starts once its wait would end past the budget', async () => {
+  let clock = 0;
+  const starts = [];
+  const timeouts = [];
+  const client = clientFor((name, result) => name === 'trellis_rules_check' ? building(name) : result);
+  const request = client.request;
+  client.request = async (req, schema, options) => {
+    if (req.params.name === 'trellis_rules_check') {
+      starts.push(clock);
+      if (options) timeouts.push(options.timeout);
+      clock += 4_000; // each call waits for the owner
+    }
+    return request(req, schema, options);
+  };
+  const report = await exercise(client, buildingTools, '/fixture', 'main', {
+    ...dependencies(), buildingBudgetMs: 10_000, now: () => clock, sleep: async ms => { clock += ms; },
+  });
+  const row = report.results.find(item => item.tool === 'trellis_rules_check');
+  assert.deepEqual([row.reason, row.code], ['tool_error', 'building']);
+  // Calls start at 0 and 4007; a third would start at 8014 and run past 10000 only through
+  // its bounded timeout, which is what is left of the budget.
+  assert.deepEqual(starts, [0, 4_007, 8_014]);
+  assert.deepEqual(timeouts, [5_993, 1_986]);
+  assert.ok(starts.every(at => at < 10_000));
+  assert.equal(row.buildingRetries, 2);
+});
+
 test('a building answer that outlasts the retry budget stays a typed failure', async () => {
   const client = clientFor((name, result) => name === 'trellis_rules_check' ? building(name) : result);
-  // The checked-in schema for the tool that answers building, so its envelope is validated too.
-  const mixed = liveTools.map(tool => tool.name === 'trellis_rules_check'
-    ? tools.find(entry => entry.name === tool.name) : tool);
-  const report = await exercise(client, mixed, '/fixture', 'main', {...dependencies(), sleep: async () => {}, buildingBudgetMs: 0});
+  const report = await exercise(client, buildingTools, '/fixture', 'main', {...dependencies(), sleep: async () => {}, buildingBudgetMs: 0});
   assert.equal(report.ok, false);
   const failed = report.results.filter(row => row.status === 'fail');
   assert.deepEqual(failed.map(row => [row.tool, row.reason, row.code]),

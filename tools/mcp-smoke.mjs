@@ -44,6 +44,13 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
   const ajv = new deps.Ajv2020({strict: false, allErrors: true});
   const sleep = deps.sleep ?? defaultSleep;
   const buildingBudget = deps.buildingBudgetMs ?? buildingBudgetMs;
+  const now = deps.now ?? (() => performance.now());
+  // A retry starts only if its wait ends inside the budget, and its request is bounded by
+  // what is left, so a call that answers building never runs past the budget.
+  function retryFits(started, delay) {
+    return now() - started + delay < buildingBudget;
+  }
+  const remaining = started => ({timeout: Math.max(1, Math.floor(buildingBudget - (now() - started)))});
   const results = [];
   let calls = 0;
   const called = new Set();
@@ -77,7 +84,7 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
     const schema = catalog.get(name);
     if (!schema) return null;
     const input = {schemaVersion: 1, workspace, ...args};
-    const started = performance.now();
+    const started = now();
     const row = {tool: name, status: 'fail', reason: 'transport_error', elapsedMs: 0};
     results.push(row);
     try {
@@ -91,9 +98,13 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
       let result;
       for (;;) {
         result = await client.request({method: 'tools/call', params: {name, arguments: input}},
-          deps.CallToolResultSchema);
+          deps.CallToolResultSchema, ...(row.buildingRetries ? [remaining(started)] : []));
+        // #798: a building answer is checked like any other before the retry decision, so a
+        // malformed or oversized one fails even when a later attempt would pass.
+        if (!schema.output(result.structuredContent)) break;
+        if (Buffer.byteLength(JSON.stringify(result)) > 65_536) break;
         const error = result.structuredContent?.error;
-        if (error?.code !== 'building' || performance.now() - started >= buildingBudget) break;
+        if (error?.code !== 'building' || !retryFits(started, retryAfter(error))) break;
         row.buildingRetries = (row.buildingRetries ?? 0) + 1;
         await sleep(retryAfter(error));
       }
@@ -139,12 +150,12 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
       if (error?.code === -32001) row.reason = 'client_timeout';
       return null;
     } finally {
-      row.elapsedMs = Math.round((performance.now() - started) * 100) / 100;
+      row.elapsedMs = Math.round((now() - started) * 100) / 100;
     }
   }
   // #770: the no-argument proposal prompt must fit the frame on a real checkout.
   async function prompt() {
-    const started = performance.now();
+    const started = now();
     const row = {tool: promptName, kind: 'prompt', status: 'fail', reason: 'transport_error', elapsedMs: 0};
     results.push(row);
     try {
@@ -152,11 +163,11 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
       for (;;) {
         try {
           result = await client.request({method: 'prompts/get', params: {name: promptName, arguments: {}}},
-            deps.GetPromptResultSchema);
+            deps.GetPromptResultSchema, ...(row.buildingRetries ? [remaining(started)] : []));
           break;
         } catch (error) {
           if (error?.code !== -32603 || error.data?.code !== 'building'
-            || performance.now() - started >= buildingBudget) throw error;
+            || !retryFits(started, retryAfter(error.data))) throw error;
           row.buildingRetries = (row.buildingRetries ?? 0) + 1;
           await sleep(retryAfter(error.data));
         }
@@ -178,7 +189,7 @@ export async function exercise(client, tools, workspace, query, deps = dependenc
         row.code = failureCodes.has(code) ? code : 'other';
       }
     } finally {
-      row.elapsedMs = Math.round((performance.now() - started) * 100) / 100;
+      row.elapsedMs = Math.round((now() - started) * 100) / 100;
     }
   }
   const describe = await call('trellis_workspace_describe', {});

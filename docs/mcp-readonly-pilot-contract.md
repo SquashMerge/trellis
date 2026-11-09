@@ -574,7 +574,7 @@ changes, only the order of rows within two arrays. This section wins over the #7
 - **No duplicate compute.** A read with `paths` waits like one without, and answers `building` while the owner builds its revision. It no longer starts its own whole-revision read beside the build. It still computes its own scope when the revision fails `bounded_work`.
 - **Progress.** `measuring` advances per measured document, as `reading` already did, so a retried read sees the count move.
 - **Eager build.** The owner builds every active runtime's new head after each publication and at activation, with or without `.trellis/rules.toml`, so most first calls after a restart are hits. A worker step hints the owner only when the head or the rules file differs from the last step's, so an unchanged step takes no extra read lease.
-- **Catalog.** Each of the three tools' output schemas gains a `BuildingFailure` `$defs` entry and a `oneOf` branch for it. `building` is not in `ResolvedFailureCode`, so the plain `Failure` branch never matches it. The compact catalog grows from 230,217 to 233,334 bytes, under the 245,760-byte named headroom limit.
+- **Catalog.** Each of the three tools' output schemas gains a `BuildingFailure` `$defs` entry and a `oneOf` branch for it. `building` is not in `ResolvedFailureCode`, so the plain `Failure` branch never matches it. The compact catalog grows from 230,217 to 233,139 bytes, under the 245,760-byte named headroom limit.
 - **Clients.** `tools/mcp-smoke` reads a `building` tool call or prompt again after `retryAfterMs`, for at most 60 s per call, and reports the count as `buildingRetries`.
 
 ## Tool catalog
