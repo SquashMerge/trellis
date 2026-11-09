@@ -23,11 +23,16 @@ import { drawSequence, helpers as sequenceHelpers, targetOf } from "./sequence.j
 // Polls are gentler for another machine: each one is a command run there.
 const STATUS_MS = 5000, REMOTE_STATUS_MS = 10000, LIST_MS = 30000, BUILDING_MS = 250, MAX_BUILDING_MS = 5000;
 const MAX_STEP_ROWS = 300, MAX_HISTORY = 20;
+// A drawing yields to the host between phases (the runtime ends a task whose one synchronous
+// run is too long, without an error), and one that hasn't finished by then is a typed error.
+const DRAW_TIMEOUT_MS = 15000;
 // Re-lay out only for a width change worth a new drawing (the browser's RESIZE_SLACK).
 const WIDTH_SLACK = 8, PAD = 12;
 const SELECTED_FILE = "trellis.selectedFile";
 const HEAT_NAMES = ["low", "moderate", "high", "very high"];
 
+const yieldTo = (cx) => () => cx.sleep(0);
+const drawTimeout = (what) => new TrellisError("draw_timeout", `The ${what} drawing didn't finish within ${DRAW_TIMEOUT_MS / 1000} s, so the Herdr runtime may have ended it. It is tried again when the data, width or theme changes.`);
 const fail = (error) => (error instanceof TrellisError ? error : new TrellisError(error?.code || "unexpected", error?.message || String(error)));
 const basename = (path) => path.replace(/\/+$/, "").split("/").pop() || path;
 // FNV-1a: a short name for one drawing's file.
@@ -193,20 +198,34 @@ export default class Trellis extends View {
     const tried = this.tried && this.tried.key === key && Math.abs(this.tried.width - width) <= WIDTH_SLACK;
     if (tried || this.drawing) return;
     this.drawing = true; this.tried = { key, width };
-    const view = this.view, serial = this.serial;
+    const view = this.view, serial = this.serial, run = {};
+    this.drawRun = run;
+    // A task the runtime ends runs no `finally`: the watchdog frees the slot and says so.
+    const watchdog = cx.timer.after(DRAW_TIMEOUT_MS, (cx) => {
+      if (this.drawRun !== run) return;
+      this.drawRun = null; this.drawing = false;
+      if (serial === this.serial && view === this.view) { this.drawn = null; this.drawError = drawTimeout("Architecture"); }
+      cx.notify();
+    });
+    const live = () => this.drawRun === run && serial === this.serial && view === this.view;
     cx.spawn(async (cx) => {
       try {
-        const out = await draw(view, { width, open: this.open, theme: t, highlight });
-        if (serial !== this.serial || view !== this.view) return;
+        // The task's first run is inside render(), which has the shortest cap: leave it first.
+        const pause = yieldTo(cx);
+        await pause();
+        if (!live()) return;
+        const out = await draw(view, { width, open: this.open, theme: t, highlight, pause });
+        if (!live()) return;
         const asset = await this.saveDrawing("architecture", out.svg);
-        if (serial !== this.serial || view !== this.view) return;
+        if (!live()) return;
         this.drawn = { ...out, view, asset };
         this.drawError = null;
       } catch (error) {
-        if (serial !== this.serial) return;
+        if (!live()) return;
         this.drawn = null; this.drawError = fail(error);
       } finally {
-        this.drawing = false;
+        watchdog.cancel();
+        if (this.drawRun === run) { this.drawRun = null; this.drawing = false; }
         cx.notify();
       }
     });
@@ -322,17 +341,34 @@ export default class Trellis extends View {
     const key = JSON.stringify([data.revision, data.seed.id, seq.selected, [...seq.expanded], t.background, t.foreground, t.accent, t.selected]);
     if (this.seqTried === key) return;
     this.seqDrawing = true; this.seqTried = key;
-    const serial = this.serial;
+    const serial = this.serial, run = {};
+    this.seqRun = run;
+    const watchdog = cx.timer.after(DRAW_TIMEOUT_MS, (cx) => {
+      if (this.seqRun !== run) return;
+      this.seqRun = null; this.seqDrawing = false;
+      if (serial === this.serial && seq === this.seq && data === seq.data) { seq.drawn = null; seq.drawError = drawTimeout("Sequence"); }
+      cx.notify();
+    });
+    const live = () => this.seqRun === run && serial === this.serial && seq === this.seq && data === seq.data;
     cx.spawn(async (cx) => {
       try {
-        const out = await drawSequence(data, { theme: t, selectedId: seq.selected, expanded: seq.expanded });
-        if (serial !== this.serial || seq !== this.seq || data !== seq.data) return;
-        seq.drawn = out.svg ? { ...out, data, asset: await this.saveDrawing("sequence", out.svg) } : { ...out, data };
+        const pause = yieldTo(cx);
+        await pause();
+        if (!live()) return;
+        const out = await drawSequence(data, { theme: t, selectedId: seq.selected, expanded: seq.expanded, pause });
+        if (!live()) return;
+        const asset = out.svg ? await this.saveDrawing("sequence", out.svg) : null;
+        if (!live()) return;
+        seq.drawn = asset ? { ...out, data, asset } : { ...out, data };
         seq.drawError = null;
       } catch (error) {
-        if (serial !== this.serial || seq !== this.seq) return;
+        if (!live()) return;
         seq.drawn = null; seq.drawError = fail(error);
-      } finally { this.seqDrawing = false; cx.notify(); }
+      } finally {
+        watchdog.cancel();
+        if (this.seqRun === run) { this.seqRun = null; this.seqDrawing = false; }
+        cx.notify();
+      }
     });
   }
 

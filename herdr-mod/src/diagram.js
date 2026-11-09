@@ -183,10 +183,12 @@ function palette(t) {
  * Throws a typed Error (`code`) when the payload or the drawing is invalid; never a partial
  * drawing.
  */
-export async function draw(view, { width, open, theme, highlight }) {
+export async function draw(view, { width, open, theme, highlight, pause }) {
   const summary = summarize(view, open);
   const container = document.createElement("div");
-  const outcome = await adapter.render(container, view, { ...summary.options, width });
+  // `pause` yields to the host between heavy phases: the Herdr runtime silently ends a task
+  // whose one synchronous run is too long (see DESIGN-NOTES, "The synchronous-run cap").
+  const outcome = await adapter.render(container, view, { ...summary.options, width, pause });
   if (outcome?.status !== "ready") {
     const error = new Error(outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
     error.code = outcome?.error?.code || "render_failed";
@@ -213,7 +215,9 @@ export async function draw(view, { width, open, theme, highlight }) {
     }
     return out;
   };
+  if (pause) await pause();
   const svg = serialize(root, override);
+  if (pause) await pause();
   const size = { width: Number(root.getAttribute("width")), height: Number(root.getAttribute("height")) };
   return { svg, ...size, summary, projection: outcome.projection, boxes: boxes(root, outcome.projection) };
 }

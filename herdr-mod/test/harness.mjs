@@ -31,7 +31,11 @@ const view = new Trellis();
 let tasks = 0, renders = 0, last;
 const cx = {
   spawn(fn) { tasks++; Promise.resolve().then(() => fn(cx)).catch((e) => console.error("task failed", e)).finally(() => tasks--); return { cancel() {} }; },
-  timer: { every() { return { cancel() {} }; }, after(ms, fn) { tasks++; setTimeout(() => { tasks--; fn(cx); }, ms); return { cancel() {} }; } },
+  timer: { every() { return { cancel() {} }; }, after(ms, fn) {
+    tasks++; let done = false; const end = () => { if (!done) { done = true; tasks--; } };
+    const id = setTimeout(() => { end(); fn(cx); }, ms); return { cancel() { clearTimeout(id); end(); } };
+  } },
+  sleep(ms = 0) { return new Promise((r) => setTimeout(r, ms)); },
   notify() {},
 };
 const settle = async () => { for (let quiet = 0; quiet < 3;) { await new Promise((r) => setTimeout(r, 50)); last = view.render(cx); renders++; quiet = tasks ? 0 : quiet + 1; } };

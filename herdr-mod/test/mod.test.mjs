@@ -4,7 +4,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { DOMParser, serialize } from "../src/dom.js";
+import { readFileSync } from "node:fs";
 import { draw, hit, measure, summarize } from "../src/diagram.js";
+import { drawSequence } from "../src/sequence.js";
 import { TrellisError, architecturePayload, createClient, indexLabel, pinOf } from "../src/client.js";
 import { state } from "./stubs/herdr.js";
 
@@ -94,4 +96,21 @@ test("Architecture answers are checked against the pin, as the browser checks th
   assert.equal(architecturePayload({ payload: { state: "building", indexGeneration: pin.indexGeneration, indexRevision: 1 } }, pin).state, "building");
   assert.equal(indexLabel({ state: "available", revision: pin, catchingUp: false }).text, "Fresh · rev 12345678:1");
   assert.equal(indexLabel({ state: "unavailable", indexError: "root_changed" }).text, "Unavailable · root_changed");
+});
+
+test("yielding between drawing phases changes nothing in either drawing", async () => {
+  let pauses = 0;
+  const pause = async () => { pauses++; await new Promise((r) => setTimeout(r, 0)); };
+  const plain = await draw(view(), { width: 900, open: new Map(), theme, highlight: null });
+  const yielded = await draw(view(), { width: 900, open: new Map(), theme, highlight: null, pause });
+  assert.equal(yielded.svg, plain.svg);
+  assert.deepEqual(yielded.boxes, plain.boxes);
+  assert.ok(pauses >= 6, `Architecture yields between fit attempts and phases (${pauses})`);
+  const sequence = () => JSON.parse(readFileSync(new URL("../../tests/fixtures/sequence-pele/rust.json", import.meta.url), "utf8"));
+  const before = pauses;
+  const flat = await drawSequence(sequence(), { theme });
+  const stepped = await drawSequence(sequence(), { theme, pause });
+  assert.ok(flat.svg && stepped.svg === flat.svg);
+  assert.deepEqual(stepped.boxes, flat.boxes);
+  assert.ok(pauses - before >= 4, `Sequence yields between phases (${pauses - before})`);
 });

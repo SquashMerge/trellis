@@ -19,9 +19,8 @@ This cut is the shell plus two views, Architecture and Sequence. The daemon can 
 | Clicks | Pressing a band in the diagram, or its row in the list, opens or folds it, as the band header does in the browser. Pressing an arrow's count, a file or a note shows its full label above the drawing. | Harness (`--press L`, `--press E`, `--click layer-web`). |
 | Files follow | `trellis-files` publishes `trellis.selectedFile`. The mod switches to the checkout that holds the file. It shows the file's layer, the layer's counts, the file's module chip (name, file count, max cognitive, heat, rank in the band, whether it's drawn or in "+N more"), and the file's own metric. A drawn chip gets an accent outline. | Harness (`--select src/http.rs`, `--select web/architecture.js`). `trellis-files` passes `herdr-app check`. |
 | Theme | Every fill and stroke in the SVG is mapped from the browser's brand palette to `theme()` colours. Native text is 13 px body, 12 px secondary and 14 px headings. | A unit test asserts that no unthemed colour remains. |
-| Tests | `test/mod.test.mjs` covers the DOM, the measure, drawing, hit-testing, the client and payload checks. It needs no install, and it runs in `tools/verify`'s `checks` lane. | `node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs` |
-
-**Not yet seen in the window.** See [SVG fidelity](#svg-fidelity). The owner views through the laptop, so the mini's window draws no frames unless someone screen-shares into the mini.
+| Drawing in the app | Both drawings yield to the host between phases, and a watchdog turns a drawing that never finishes into a typed `draw_timeout`. See [The synchronous-run cap](#the-synchronous-run-cap). | In the live app (2026-11-08), against the owner's daemon: Architecture of the trellis checkout drew, and so did Sequence of `src/daemon/mod.rs` (with the Files selection stood in for; see [Open problems](#open-problems)). Screenshots are in `trellis-evidence/707/`. Unit tests check that yielding changes no byte of either drawing; `view.test.mjs` checks the watchdog in both views. |
+| Tests | `test/mod.test.mjs` covers the DOM, the measure, drawing, hit-testing, the client and payload checks. `test/view.test.mjs` drives the pane. They need no install, and they run in `tools/verify`'s `checks` lane. | `node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs` |
 
 ## How the diagram is drawn
 
@@ -33,7 +32,31 @@ This cut is the shell plus two views, Architecture and Sequence. The daemon can 
 
 The browser scripts are wrapped at build time, by `web-scripts.mjs`, in `export default function (<globals>) {…}`, so the mod never touches the runtime's real `globalThis`. That matters: the runtime has frozen intrinsics. `linkedom` failed to load there with "'constructor' is read-only", which is why the mod has its own small DOM.
 
-In Node, a drawing of the trellis repository (8 layers, 676 modules, 29 edges) takes about 40 ms. The time in the Herdr runtime isn't measured yet. The pane only redraws when the payload, the open bands, the theme, the followed chip or the width (by more than 8 px) changes.
+In Node, a drawing of the trellis repository (8 layers, 676 modules, 29 edges) takes about 40 ms. In the Herdr runtime one `project()` takes 31–42 ms, and the whole drawing about 0.5 s, so it has to yield (next section). The pane only redraws when the payload, the open bands, the theme, the followed chip or the width (by more than 8 px) changes.
+
+## The synchronous-run cap
+
+**The Herdr runtime silently ends a mod's task when one synchronous run takes too long.** It raises no error, rejects no promise, runs no `finally`, and writes nothing to `herdr-app status`. The app stays idle, and later renders and tasks carry on. Herdr doesn't document it. The pane used to sit on "Drawing the layer stack…" for ever because of it.
+
+Measured on 2026-11-08 with a timed probe in the live app (Herdr app on this Mac mini; the probe logged to a file under `~/.config/herdr-app/` and was then deleted). A "run" is the code between two awaits. Each case below is a busy loop of that length:
+
+| Where the run is | Survived | Ended | Cap |
+|---|---|---|---|
+| The first run of a `cx.spawn` body started from `render()` (the body runs at once, inside the render call) | 50 ms (twice) | 55 ms (twice) | about 50 ms |
+| A `cx.spawn` body started from a timer, or any run after an await | 450 ms (twice) | 520 ms (twice) | about 500 ms |
+
+What resets the budget: **any await**, including `await Promise.resolve()`. Ten 40 ms runs with a microtask await between them finished, 400 ms in all, even from a task started in `render()`. `cx.sleep(0)` also resets it and takes 0–4 ms. So the cap is per run, not per task.
+
+The pane starts its drawings from `render()`, which is why they died: the whole `draw()` was one run inside the 50 ms render cap. The fix:
+
+1. **Leave `render()` first.** Each drawing task awaits `cx.sleep(0)` before any work.
+2. **Yield between phases.** `web/architecture-pele.js` and `web/sequence-pele.js` take an optional `options.pause`, an async function awaited between their heavy phases: Architecture's channel reserve, each fit attempt's `project()` and `pele.render`, the re-projection, `validatedSvg`, the label and control pass and routing; Sequence's projection, Pele, `validatedSvg` and the row pass. When `pause` is absent, nothing new is awaited, so the browser behaves as before. The mod's `draw()` and `drawSequence()` also yield around `serialize()`. The mod passes `() => cx.sleep(0)`, a host await that also lets the window draw a frame. A resolved promise would reset the cap too, but wouldn't let anything else run.
+3. **A watchdog.** A drawing that hasn't finished after 15 s becomes a typed `draw_timeout` error, and the drawing slot is freed. A task the runtime ended never runs its `finally`, so without it the pane would wait for ever. The same inputs aren't retried; new data, a new width or a theme change try again.
+
+Slices measured in the app on the trellis checkout, at the pane's width (ms, in order):
+
+- Architecture: `1, 33, 32, 2, 32, 2, 5, 2, 9, 4, 0`. That's the summary, the channel-reserve projection, then two fit attempts of `project()` and Pele, then `validatedSvg`, the label pass, routing, `serialize()` and the boxes. The slowest is `project()` at 31–42 ms over several runs. That's within the 40 ms target, but only just. It is far below the roughly 500 ms cap that applies after the first yield. Splitting `project()` itself would mean making the projection async, which isn't needed now.
+- Sequence (`src/daemon/mod.rs`, `new`): `0, 1, 2, 6, 0, 2, 0`.
 
 ## SVG fidelity
 
@@ -58,7 +81,7 @@ The layout comes from the same adapter code, the same patched Pele build and the
 3. **No hover, focus or pressed states.** The image is static.
 4. **The browser's resize fit uses the canvas's inner width.** The mod uses the pane width less 24 px of padding.
 
-**Screenshot: not taken yet.** The mini's window draws frames only while someone views it locally; the owner views through the laptop. For the whole session, Herdr's window drew no new frame. `herdr-app shot` returned the same frame each time, so the window is most likely minimized or on another Space. The Trellis pane was opened with `pane.split`, but it never laid out: its `.render/` folder was never created. So nobody has looked at the SVG text in Herdr's renderer yet. That's the main open risk, because the renderer may lack system fonts for SVG `<text>`. To check it, bring the window to the front, open the pane, then run `herdr-app shot /Users/jcarreira/projects/squashmerge/trellis-evidence/707/architecture.png`.
+**Screenshots** (2026-11-08) are in `/Users/jcarreira/projects/squashmerge/trellis-evidence/707/`: `architecture-in-app-final.png` and `sequence-in-app-daemon-mod-rs.png`. Herdr's renderer draws the SVG `<text>` in the system Helvetica.
 
 ## How clicks on the diagram work, and how they can grow
 
@@ -153,9 +176,9 @@ Mods run in the app that draws them. When the owner views the mini from the lapt
 
 ## Open problems
 
-1. **Visual check.** See [SVG fidelity](#svg-fidelity).
+1. **The synchronous-run cap** is undocumented. The numbers above are measurements, and Herdr could change them. A drawing that grows past it shows `draw_timeout` instead of hanging. Feedback asking Herdr to document the cap and report it was drafted for the owner on 2026-11-08.
 2. **No proven call targets on syntax-only indexes.** Re-centering follows the browser's proof rule (resolved, direct, fresh evidence). The isolated daemon has no semantic producer, so its views have no proven targets; it is tested with a resolved fixture.
-3. **The owner's daemon.** Its checkouts report `unavailable · root_changed` or `index_not_ready` ("Storage is unavailable"). The pane shows that as a typed state. Nothing listens on 8877 now: the listener came from a `trellis serve` started for this work and since stopped, so the pane shows `daemon_unreachable` until `trellis serve --token-file ~/.config/trellis/serve.token` runs. A diagram was verified only against an isolated daemon: `HOME=<scratch> trellis serve --bind 127.0.0.1:8878` on this worktree.
+3. **Driving the Files panel from a script.** Nothing but a real click sets `trellis.selectedFile`. Posted mouse events need Accessibility permission, which the agent's shell doesn't have. So the in-app Sequence check used a temporary build that stood in for the selection (`src/daemon/mod.rs`) and opened the Sequence tab. The selection path itself is covered by `view.test.mjs` and the harness (`--select src/daemon/mod.rs --click tab-sequence`, against the owner's daemon on 8877).
 4. **No request timeout on this computer.** The remote path has curl's `--max-time`. Local `fetch` has none; `transport: "exec"` is the workaround.
 5. **Ported summary options.** They must follow `web/architecture.js`. The real fix is for the web app to export them as a pure function both sides bundle. That edit touches `web/architecture.js`, which runs 802 and 803 are changing, so it waits.
 6. **No drilled-in directories.** Only band open and fold is supported, so a directory module stays one chip.

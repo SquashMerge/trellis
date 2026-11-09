@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import { state } from "./stubs/herdr.js";
 import Trellis from "../src/main.js";
@@ -29,7 +30,16 @@ function sequenceFor(seed) {
   return view;
 }
 
-function fakeDaemon() {
+// The browser's own Architecture fixture, as the daemon serves a ready answer.
+const architecture = () => {
+  const { fixture: make } = createRequire(import.meta.url)("../../tests/fixtures/pele-1.10.0-trellis.2/architecture-fixture.cjs");
+  const v = make();
+  for (const m of v.modules) m.declarationCount = 1;
+  return { ...v, ...pin, aggregate: "max", role: "production", workbench: true, metricsVersion: "metrics:v1", evidenceTier: "syntax",
+    semanticComplete: false, rulesFile: { contentHash: "abc" }, references: { coverage: [] } };
+};
+
+function fakeDaemon({ ready = false } = {}) {
   const seen = [];
   const server = createServer((req, res) => {
     let body = "";
@@ -41,6 +51,7 @@ function fakeDaemon() {
       const path = req.url.split("?")[0], base = `/api/checkouts/${KEY}/`;
       if (path === "/api/checkouts") return send(200, { checkouts: [{ rootKey: KEY, state: "available", workspaceRoot: ROOT, revision: pin, catchingUp: false }] });
       if (path === `${base}status`) return send(200, { workspaceRoot: ROOT, revision: pin, catchingUp: false });
+      if (path === `${base}architecture` && ready) return send(200, { payload: architecture() });
       if (path === `${base}architecture`) return send(200, { payload: { ...pin, state: "missing_rules", aggregate: "max", role: "production", workbench: true,
         metricsVersion: "metrics:v1", evidenceTier: "syntax", semanticComplete: false, layers: [], modules: [], edges: [] } });
       if (path === `${base}methods`) return send(200, { items: [{ consequential: true, symbol: { id: "fixture-seed", name: "run", kind: "function", path: "fixture.rs" } }] });
@@ -55,12 +66,18 @@ function fakeDaemon() {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ server, seen, port: server.address().port })));
 }
 
-function mount(props) {
+// `hang` stands for a task the Herdr runtime ended over its synchronous-run cap: the drawing's
+// first yield never returns, and the watchdog's 15 s are 40 ms.
+function mount(props, { hang = false } = {}) {
   const view = new Trellis();
   let tasks = 0, last;
   const cx = {
     spawn(fn) { tasks++; Promise.resolve().then(() => fn(cx)).catch((e) => { throw e; }).finally(() => tasks--); return { cancel() {} }; },
-    timer: { every() { return { cancel() {} }; }, after(ms, fn) { tasks++; setTimeout(() => { tasks--; fn(cx); }, ms); return { cancel() {} }; } },
+    timer: { every() { return { cancel() {} }; }, after(ms, fn) {
+      tasks++; let done = false; const end = () => { if (!done) { done = true; tasks--; } };
+      const id = setTimeout(() => { end(); fn(cx); }, hang && ms >= 15000 ? 40 : ms); return { cancel() { clearTimeout(id); end(); } };
+    } },
+    sleep(ms = 0) { return hang ? new Promise(() => {}) : new Promise((r) => setTimeout(r, ms)); },
     notify() {},
   };
   const settle = async () => {
@@ -70,9 +87,17 @@ function mount(props) {
     }
     return last;
   };
+  // Renders until the pane shows `pattern` (a hung task never lets the view settle).
+  const until = async (pattern) => {
+    for (let rounds = 0; rounds < 200; rounds++) {
+      await new Promise((r) => setTimeout(r, 20)); last = view.render(cx);
+      if (pattern.test(last.text())) return last;
+    }
+    throw new Error(`the pane never showed ${pattern}: ${last.text().slice(0, 400)}`);
+  };
   state.props = props;
   view.init(props, cx);
-  return { view, cx, settle, el: () => last };
+  return { view, cx, settle, until, el: () => last };
 }
 
 test("Sequence follows the Files selection, draws, and re-centers on a proven call, all through exec + curl", async () => {
@@ -121,5 +146,26 @@ test("the exec transport types a missing token, a stopped daemon and a rejected 
     const stopped = await run({ url: `http://127.0.0.1:${port}`, tokenFile: join(dir, "token") });
     assert.match(stopped, /daemon_unreachable/);
     assert.ok(!stopped.includes(TOKEN) && !stopped.includes("c".repeat(64)));
+  } finally { server.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a drawing the runtime ends is a typed timeout, not Drawing… for ever, in both views", async () => {
+  const { server, port } = await fakeDaemon({ ready: true });
+  const dir = mkdtempSync(join(tmpdir(), "trellis-view-")), tokenFile = join(dir, "token");
+  writeFileSync(tokenFile, `${TOKEN}\n`);
+  Object.assign(state, { appHome: dir, focused: { cwd: ROOT }, shared: {}, spaces: [] });
+  try {
+    const { view, cx, until } = mount({ url: `http://127.0.0.1:${port}`, tokenFile, transport: "exec" }, { hang: true });
+    let root = await until(/Drawing the layer stack/);
+    root.find("root").props.size({ width: 900, height: 700 }, cx);
+    root = await until(/draw_timeout/);
+    assert.match(root.text(), /Architecture drawing didn't finish within 15 s/);
+    assert.equal(view.drawing, false, "the watchdog frees the drawing slot");
+    root.find("tab-sequence").props.click({}, cx);
+    state.shared["trellis.selectedFile"] = { root: ROOT, path: "fixture.rs", on: null };
+    root = await until(/Sequence drawing didn't finish/);
+    assert.match(root.text(), /draw_timeout/);
+    assert.equal(view.seqDrawing, false);
+    await view.close();
   } finally { server.close(); rmSync(dir, { recursive: true, force: true }); }
 });

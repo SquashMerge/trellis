@@ -24,11 +24,12 @@ function slots(t) {
  * Draws one sequence view. Returns {empty} when the view has nothing to draw, else the themed
  * SVG, its size and a box per step (for clicks). Throws a typed error when Pele can't draw it.
  */
-export async function drawSequence(view, { theme, selectedId = null, expanded = new Set() }) {
+export async function drawSequence(view, { theme, selectedId = null, expanded = new Set(), pause }) {
   const empty = helpers.emptySummary(view, OPTIONS);
   if (empty && !helpers.display(view, OPTIONS).visible.size) return { empty };
   const container = document.createElement("div");
-  const outcome = await adapter.render(container, view, null, expanded, { ...OPTIONS, selectedId, onSelect() {}, onOpenTarget() {} });
+  // `pause` yields to the host between heavy phases, as Architecture's draw() does.
+  const outcome = await adapter.render(container, view, null, expanded, { ...OPTIONS, selectedId, pause, onSelect() {}, onOpenTarget() {} });
   if (outcome?.status !== "rendered") {
     const error = new Error(`Pele could not draw this sequence: ${outcome?.reason || outcome?.status}`);
     error.code = "unsupported";
@@ -50,7 +51,9 @@ export async function drawSequence(view, { theme, selectedId = null, expanded = 
     if (pressed && el.localName === "rect") { out.fill = theme.selected; out.stroke = theme.accent; out["stroke-width"] = 2; }
     return out;
   };
+  if (pause) await pause();
   const svg = serialize(root, override);
+  if (pause) await pause();
   const box = (root.getAttribute("viewBox") || "").split(/\s+/).map(Number);
   return { svg, width: Number(root.getAttribute("width")) || box[2], height: Number(root.getAttribute("height")) || box[3], boxes: boxes(root), empty };
 }
