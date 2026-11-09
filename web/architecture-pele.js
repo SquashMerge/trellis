@@ -64,12 +64,15 @@
     kept[maxLines - 1] = `${last.join("")}…`;
     return kept;
   }
+  // A chip's drawn width. A stat with a `tag` (the visible "Selected" word, shown by CSS while the
+  // chip is pressed) always reserves room for it, so selecting never changes the layout.
+  const statWidth = (stat, measure) => Math.ceil(measure(stat.text)) + STAT_PAD + (stat.tag ? Math.ceil(measure(stat.tag)) + STAT_PAD : 0);
   // Stat chips grouped into header lines no wider than `width` once drawn.
   function statLines(stats, width, measure) {
     const lines = [];
     let line = [], used = 0;
     for (const stat of stats) {
-      const drawn = Math.ceil(measure(stat.text)) + STAT_PAD;
+      const drawn = statWidth(stat, measure);
       if (line.length && used + STAT_SPACING + drawn > width) { lines.push(line); line = []; used = 0; }
       used += (line.length ? STAT_SPACING : 0) + drawn; line.push(stat);
     }
@@ -138,7 +141,7 @@
       const header = options.layerLabel?.(layer) ?? `${layer.name}\n${layer.shared ? "Shared" : `Order ${layer.order}`}`;
       // Non-zero reference counts become compact chips on their own header lines.
       const stats = display ? (options.layerStats?.(layer) || []).filter(stat => typeof stat?.text === "string" && stat.text) : [];
-      const widest = stats.reduce((most, stat) => Math.max(most, Math.ceil(measure(stat.text)) + STAT_PAD), 0);
+      const widest = stats.reduce((most, stat) => Math.max(most, statWidth(stat, measure)), 0);
       const lineWidth = Math.max(headerWidth(layer) ?? 380, widest), groups = statLines(stats, lineWidth, measure);
       const item = addNode("L",layer,stats.length ? `${header}\n${stats.map(stat => stat.label || stat.text).join(" · ")}` : header,
         false,[header, ...groups.map(group => group.map(stat => stat.text).join(STAT_GAP))].join("\n"),lineWidth);
@@ -361,7 +364,7 @@
       const line = spans[index];
       const x = Number(line?.getAttribute("x")), y = Number(line?.getAttribute("y"));
       if (!line || !Number.isFinite(x) || !Number.isFinite(y)) unsupported("Invalid Architecture header geometry");
-      const widths = stats.map(stat => Math.ceil(measure(stat.text)) + STAT_PAD), gap = STAT_SPACING;
+      const widths = stats.map(stat => statWidth(stat, measure)), gap = STAT_SPACING;
       const total = widths.reduce((sum, width) => sum + width, 0) + gap * (widths.length - 1);
       const anchor = line.getAttribute("text-anchor") || label.getAttribute("text-anchor");
       let left = anchor === "middle" ? x - total / 2 : anchor === "end" ? x - total : x;
@@ -371,13 +374,24 @@
         for (const [name,value] of Object.entries({x:left,y:y-14,width:widths[i],height:18,fill:"#14151D",stroke:color,rx:3})) chip.setAttribute(name,String(value));
         for (const [name,value] of Object.entries({x:left + widths[i] / 2,y,fill:color,"text-anchor":"middle","font-size":"14"})) text.setAttribute(name,String(value));
         text.setAttribute("class","trellis-architecture-stat"); text.setAttribute("data-tone",stat.tone === "error" ? "error" : "neutral");
-        text.textContent = stat.text; left += widths[i] + gap;
+        text.textContent = stat.text; const origin = left; left += widths[i] + gap;
+        if (stat.tag) text.setAttribute("x",String(origin + (Math.ceil(measure(stat.text)) + STAT_PAD) / 2));
         const callback = stat.action ? (stat.action.interface !== undefined ? handlers.onSelectInterface : handlers.onOpenDeviation) : null;
         if (!callback) { node.append(chip,text); return; }
         const button = document.createElementNS(NS,"g");
         button.setAttribute("class","trellis-architecture-stat-action"); button.setAttribute("role","button"); button.setAttribute("tabindex","0");
         button.setAttribute("aria-label",stat.label || stat.text); button.setAttribute("data-trellis-layer-action",item.record.name);
         button.append(chip,text); actions.push({node:button,stat});
+        if (typeof stat.id === "string") button.setAttribute("data-trellis-action-id",stat.id);
+        if (stat.tag) {
+          // Pressed chips show the word through CSS; the chip's name and aria-pressed carry the state for assistive technology.
+          const tagLeft = origin + Math.ceil(measure(stat.text)) + STAT_PAD, tagWidth = widths[i] - (tagLeft - origin) - 2;
+          const back = document.createElementNS(NS,"rect"), tag = document.createElementNS(NS,"text");
+          for (const [name,value] of Object.entries({x:tagLeft,y:y-12,width:tagWidth,height:14,rx:3,"class":"trellis-architecture-stat-tag-back","aria-hidden":"true"})) back.setAttribute(name,String(value));
+          for (const [name,value] of Object.entries({x:tagLeft + tagWidth / 2,y,"text-anchor":"middle","font-size":"14","aria-hidden":"true","class":"trellis-architecture-stat-tag"})) tag.setAttribute(name,String(value));
+          tag.textContent = stat.tag;
+          button.setAttribute("aria-pressed","false"); button.append(back,tag);
+        }
         const activate = event => { event?.stopPropagation(); if (handlers.isCurrent?.() !== false) callback(stat.action); };
         button.addEventListener("click",activate);
         button.addEventListener("keydown",event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); activate(event); } });

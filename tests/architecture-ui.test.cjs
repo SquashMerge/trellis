@@ -47,6 +47,8 @@ function emulateDetails(full, url) {
         is(JSON.stringify(item.pair.source), "source") && is(JSON.stringify(item.pair.target), "target") &&
         (!query.has("layer") || [item.sourceLayer, item.targetLayer].includes(query.get("layer"))) &&
         (!query.has("unlayered") || item.sourceLayer === null || item.targetLayer === null || item.sourceLayer === item.targetLayer));
+  } else if (kind === "interfaces") {
+    items = (full.interfaceRows || []).filter(item => is(item.client, "client") && is(item.server, "server") && is(item.list, "list"));
   } else items = full.references.unresolved.filter(item => is(item.source.path, "path"));
   const offset = Number(query.get("offset")), limit = Number(query.get("limit") || 100);
   return {payload:{indexGeneration:query.get("indexGeneration"), indexRevision:Number(query.get("indexRevision")),
@@ -55,7 +57,7 @@ function emulateDetails(full, url) {
 }
 function harness() {
   const elements = new Map(), calls = [], detailCalls = [], renders = [], reads = [], conflicts = [], timers = [];
-  let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null, detailError = null;
+  let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null, detailError = null, detailGate = null;
   // Created nodes with an id (the inspector's review chips, #449) resolve by that id; the newest wins.
   const created = [];
   const document = {querySelector:() => null,getElementById:id => {
@@ -78,7 +80,7 @@ function harness() {
   }};
   vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-apps.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
   const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
-    if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; return emulateDetails(full, url); }
+    if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; if (detailGate) await detailGate; return emulateDetails(full, url); }
     calls.push({url,current,options}); const data = await response(url,options);
     if (!url.startsWith("/api/architecture?") || !data?.payload?.references) return data;
     // The daemon sends the summary; only the detail emulation sees the full arrays.
@@ -89,7 +91,7 @@ function harness() {
   },context:() => context,
     readSource:(site,revision,current) => reads.push({site,revision,current}),onConflict:() => conflicts.push(true)});
   const button = label => {const found = descendants(get("architecture-inspector-content")).find(item => item.tagName === "button" && item.textContent === label);assert.ok(found, `Missing ${label}`);return found;};
-  return {timers,window,controller,calls,detailCalls,renders,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;},setDetailError:error => {detailError=error;}};
+  return {timers,window,controller,calls,detailCalls,renders,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;},setDetailError:error => {detailError=error;},setDetailGate:gate => {detailGate=gate;}};
 }
 
 test("init is inert; one owned pin/digest supplies metric values and explicit sampled source actions", async () => {
@@ -575,11 +577,11 @@ test("layer stats chip only non-zero production counts by verdict, with deviatio
     {layer:"Shared",role:"production",sites:2,mappedSites:2,unresolvedSites:0}];
   h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
   const {options} = h.renders[0], stats = name => JSON.parse(JSON.stringify(options.layerStats(dto.layers.find(layer => layer.name === name)).map(stat => [stat.text, stat.tone])));
-  assert.deepEqual(stats("Storage"), [["↑≥56","error"],["⇄≥3","error"],["→shared ≥9","neutral"],["excepted ≥4","neutral"]], "test-only sites never count; excepted sites are not deviations");
+  assert.deepEqual(stats("Storage"), [["↑≥56 deviation · UI","error"],["⇄≥3","error"],["→shared ≥9","neutral"],["excepted ≥4","neutral"]], "test-only sites never count; excepted sites are not deviations");
   assert.deepEqual(stats("UI"), [["↓7","neutral"]]);
   assert.deepEqual(stats("Shared"), [["⇄2","error"]], "shared outbound is a deviation, not upward");
   assert.deepEqual(stats("Peer"), [], "a layer without outgoing references has no chips");
-  assert.match(options.layerStats(dto.layers[1])[0].label, /^at least 56 outgoing production reference sites · upward deviation$/);
+  assert.equal(options.layerStats(dto.layers[1])[0].label, "at least 56 upward production reference sites from Storage to UI · deviation · open in Deviations");
   // Arrows: deviations highlighted with the source layer's measured coverage; allowed arrows dimmed.
   const up = dto.edges[1], down = dto.edges[0];
   assert.equal(options.edgeTone(up), "deviation"); assert.equal(options.edgeTone(down), "allowed");
@@ -1646,4 +1648,195 @@ test("the Deviations tree sees the app's slice: its pair chips and its unknown c
   assert.match(tree(), /UI → Common/); assert.doesNotMatch(tree(), /Storage → Only/, "another app's pair is not a chip");
   assert.match(tree(), /2 unknown rule instances are not deviations\./, "the app's unknown count, not the checkout's");
   assert.doesNotMatch(tree(), /3 unknown rule instances/);
+});
+
+// Badges, stubs and the interface and app inspectors (#789, AC9, AC10, AC15, AC25).
+function interfacesFixture(hash = "rules-one") {
+  const dto = appsFixture(hash), handler = {kind:"declaration", syntaxId:"s1", stableLookupKey:"k1", path:"src/http.rs", lines:{start:10, end:20}, variant:null, layer:"Storage"};
+  const site = {document:{sourceSetId:"workspace", language:"javascript", path:"web/app.js"}, range:{start:5, end:9}, lines:{start:3, end:3}, callId:null, caller:null, confidence:"exact", layer:"UI"};
+  dto.interfaces = [{client:"web", server:"daemon", kind:"http",
+    ends:[{clientLayer:"UI", serverLayer:"Storage", routes:3, callSites:5}, {clientLayer:null, serverLayer:"Storage", routes:1, callSites:1}],
+    wrappers:{callees:["api", "request"], prefix:{client:"/api/", server:"/api/checkouts/{root}/"}},
+    counts:{matchedRoutes:4, callSites:6, serverOnly:2, clientOnly:1, confidence:{exact:4, template:1, wrapperInferred:1, unresolved:0}}}];
+  dto.interfaceRows = [
+    {client:"web", server:"daemon", list:"matched", entry:{method:"GET", pathTemplate:"/api/<b>x</b>", confidence:"template", handler, callSites:[site]}},
+    {client:"web", server:"daemon", list:"serverOnly", entry:{method:"POST", pathTemplate:"/api/only", handler}},
+    {client:"web", server:"daemon", list:"clientOnly", entry:{method:null, pathTemplate:null, confidence:"unresolved", callSite:site}}];
+  return dto;
+}
+const statsOf = (h, name, render = h.renders.at(-1)) => render.options.layerStats(render.view.layers.find(layer => layer.name === name));
+const plainStats = stats => JSON.parse(JSON.stringify(stats));
+const inspectorParagraphs = h => descendants(h.get("architecture-inspector-content")).filter(item => item.tagName === "p").map(item => item.textContent);
+const treeChips = h => h.get("architecture-deviations-edges").children;
+
+test("AC15 stubs come from ends: a client end names the server, a server end the client, and only in a one-app stack", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:interfacesFixture()})); await h.controller.refresh();
+  assert.deepEqual(plainStats(statsOf(h, "UI")).filter(stat => stat.key === "interface"), [], "All apps has no stubs until its columns");
+  await chooseApp(h, "web · javascript");
+  const [stub] = plainStats(statsOf(h, "UI"));
+  assert.equal(stub.text, "→ daemon · 3 routes · 5 call sites", "the end with no layer has no band, so it adds nothing");
+  assert.equal(stub.label, "HTTP interface to daemon: 3 routes, 5 call sites");
+  assert.equal(stub.tag, "Selected"); assert.deepEqual(stub.action.interface, {client:"web", server:"daemon"});
+  assert.equal(stub.action.side, "client"); assert.equal(typeof stub.action.id, "string", "an interface action always carries `interface`");
+  await chooseApp(h, "daemon · rust");
+  const [server] = plainStats(statsOf(h, "Storage"));
+  assert.equal(server.text, "← web · ≥3 routes", "two ends on one server band share routes, so the count is a lower bound");
+  assert.equal(server.label, "HTTP interface from web: ≥3 routes");
+  assert.deepEqual(plainStats(statsOf(h, "Common")), [], "a band with no end has no stub");
+});
+
+test("AC15 selecting a stub opens the interface inspector from the ends and the detail lists", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:interfacesFixture()})); await h.controller.refresh();
+  await chooseApp(h, "web · javascript");
+  const {options} = h.renders.at(-1), [stub] = statsOf(h, "UI");
+  const calls = h.calls.length;
+  options.onSelectInterface(stub.action); await flush();
+  assert.equal(h.calls.length, calls, "selecting never re-reads the summary");
+  assert.equal(h.get("architecture-inspector-title").textContent, "web → daemon");
+  const paragraphs = inspectorParagraphs(h);
+  assert.ok(paragraphs.includes("HTTP · method and path match · structural evidence, not proof"));
+  assert.ok(paragraphs.includes("Client end: web · UI, no layer")); assert.ok(paragraphs.includes("Server end: daemon · Storage"));
+  assert.ok(paragraphs.includes("Wrappers: api, request · Client prefix: /api/ → /api/checkouts/{root}/"));
+  const grid = descendants(h.get("architecture-inspector-content")).find(item => item.className === "metric-inspector-values");
+  assert.deepEqual(grid.children.map(item => item.textContent), ["Matched routes", "4", "Client call sites", "6", "◆ Server-only routes", "2", "◆ Client-only calls", "1",
+    "exact", "4", "template", "1", "wrapper-inferred", "1", "unresolved", "0"]);
+  assert.equal(grid.children[5].dataset.tone, "warning");
+  const lists = h.detailCalls.map(call => Object.fromEntries(new URL(call.url, "http://local").searchParams)).filter(query => query.kind === "interfaces");
+  assert.deepEqual(lists.map(query => [query.client, query.server, query.list]), [["web", "daemon", "serverOnly"], ["web", "daemon", "clientOnly"]], "matched waits for Open endpoints");
+  assert.ok(paragraphs.includes("POST /api/only")); assert.ok(paragraphs.includes("Handler src/http.rs:10"));
+  assert.ok(paragraphs.includes("unresolved method (unresolved path)"));
+  await h.button("Open endpoints").fire("click"); await flush();
+  const matched = h.detailCalls.map(call => Object.fromEntries(new URL(call.url, "http://local").searchParams)).filter(query => query.list === "matched");
+  assert.equal(matched.length, 1); assert.equal(matched[0].client, "web");
+  const after = inspectorParagraphs(h);
+  assert.ok(after.includes("GET /api/<b>x</b> · template · 1 call site"), "route text is literal, never markup");
+  assert.equal(h.button("Open endpoints").disabled, true);
+  await h.button("Read call-site source").fire("click");
+  assert.deepEqual(plainStats(h.reads.at(-1).site), {path:"web/app.js", range:{startLine:3, endLine:3, startByte:5, endByte:9}});
+  const sources = descendants(h.get("architecture-inspector-content")).filter(item => item.tagName === "button" && item.textContent === "Read handler source");
+  await sources.at(-1).fire("click");
+  assert.deepEqual(plainStats(h.reads.at(-1).site), {path:"src/http.rs", range:{startLine:10, endLine:20}});
+});
+
+test("an interface with no matched routes says so, and a missing interface falls back to the overview", async () => {
+  const dto = interfacesFixture(); dto.interfaceRows = [];
+  const h = harness(); h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  await chooseApp(h, "web · javascript");
+  h.renders.at(-1).options.onSelectInterface(statsOf(h, "UI")[0].action); await flush();
+  await h.button("Open endpoints").fire("click"); await flush();
+  const text = inspectorParagraphs(h);
+  assert.ok(text.includes("No matched routes at this pin.")); assert.ok(text.includes("No server-only routes.")); assert.ok(text.includes("No client-only calls."));
+  const saved = {inspection:{kind:"interface", record:{client:"web", server:"nobody"}}, pressed:null, rulesHash:"rules-one", aggregate:"max", role:"production", scope:"web", reviewMode:"rules", reviewScope:null,
+    reviewOpen:false, reviewRole:"all", reviewState:"deviates", deviations:null};
+  await h.controller.restore(saved, () => true);
+  assert.equal(h.get("architecture-inspector-title").textContent, "Architecture review");
+});
+
+test("AC15 the app inspector names the files, layers and interfaces of an app, and helps one with no layers", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:interfacesFixture()})); await h.controller.refresh();
+  const saved = name => ({inspection:{kind:"app", record:{name}}, pressed:null, rulesHash:"rules-one", aggregate:"max", role:"production", scope:null, reviewMode:"rules", reviewScope:null,
+    reviewOpen:false, reviewRole:"all", reviewState:"deviates", deviations:null});
+  await h.controller.restore(saved("web"), () => true);
+  assert.equal(h.get("architecture-inspector-title").textContent, "web");
+  const paragraphs = inspectorParagraphs(h);
+  assert.ok(paragraphs.includes("javascript · web")); assert.ok(paragraphs.includes("Detected from web/package.json (npm)"));
+  const grid = descendants(h.get("architecture-inspector-content")).find(item => item.className === "metric-inspector-values");
+  assert.deepEqual(grid.children.map(item => item.textContent), ["Files", "2", "Layers", "1 + 1 shared", "Unassigned files", "1"]);
+  await h.button("HTTP: web → daemon").fire("click"); await flush();
+  assert.equal(h.get("architecture-inspector-title").textContent, "web → daemon");
+  await h.controller.restore(saved("scripts"), () => true);
+  assert.ok(inspectorParagraphs(h).some(line => /^scripts has no layers yet\..*trellis_propose_layers.*app = "scripts"/.test(line)));
+  assert.equal(descendants(h.get("architecture-inspector-content")).some(item => item.textContent.startsWith("HTTP:")), false);
+});
+
+test("AC9 an upward deviation chip per destination, in every stack, each an action that opens its edge", async () => {
+  const h = harness(), dto = fixture();
+  dto.layers.push({name:"Core",order:0,shared:false});
+  dto.edges = [edge("Storage","UI",5,"deviates"), edge("Storage","Core",2,"deviates"), edge("Storage","Core",9,"deviates",{excepted:true,exceptionReason:"ok"}), edge("UI","Storage",4)];
+  dto.references.coverage = [{layer:"Storage",role:"production",sites:7,mappedSites:7,unresolvedSites:0}];
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const ups = plainStats(statsOf(h, "Storage")).filter(stat => stat.key === "up");
+  assert.deepEqual(ups.map(stat => stat.text), ["↑5 deviation · UI", "↑2 deviation · Core"]);
+  assert.deepEqual(ups.map(stat => stat.action), [{sourceLayer:"Storage", destinationLayer:"UI"}, {sourceLayer:"Storage", destinationLayer:"Core"}]);
+  assert.equal(ups[0].label, "5 upward production reference sites from Storage to UI · deviation · open in Deviations");
+  assert.equal(ups[0].tone, "error"); assert.equal(new Set(ups.map(stat => stat.id)).size, 2, "each badge has its own identity");
+  assert.deepEqual(plainStats(statsOf(h, "UI")).map(stat => stat.text), ["↓≥4"], "the downward total stays display-only (UI has unresolved sites)");
+  h.renders.at(-1).options.onOpenDeviation(ups[1].action); await flush(); await flush();
+  assert.equal(h.get("architecture-deviations").hidden, false);
+  assert.deepEqual(treeChips(h).filter(chip => chip.attrs["aria-pressed"] === "true").map(chip => chip.dataset.key), ["Storage→Core"], "the badge's chip is pressed");
+  assert.equal(h.get("architecture-deviations-calls").checked, false);
+});
+
+test("AC10 a badge opens the tree on its edge even after another edge or Calls only was left set", async () => {
+  const h = harness(), dto = fixture();
+  dto.edges = [edge("Storage","UI",5,"deviates")];
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const badge = statsOf(h, "Storage")[0].action;
+  h.renders.at(-1).options.onOpenDeviation(badge); await flush(); await flush();
+  await h.get("architecture-deviations-calls").fire("change");
+  h.renders.at(-1).options.onOpenDeviation(badge); await flush(); await flush();
+  assert.deepEqual(treeChips(h).filter(chip => chip.attrs["aria-pressed"] === "true").map(chip => chip.dataset.key), ["Storage→UI"]);
+  assert.equal(h.get("architecture-deviations-calls").checked, false, "Calls only is off");
+  h.renders.at(-1).options.onOpenDeviation({sourceLayer:"Nowhere", destinationLayer:"UI"}); await flush();
+  assert.deepEqual(treeChips(h).filter(chip => chip.attrs["aria-pressed"] === "true").map(chip => chip.dataset.key), ["Storage→UI"], "an action naming no drawn layer does nothing");
+});
+
+test("a badge or stub of a stale drawing is inert: a refresh in flight, a changed scope and a suspended tab", async () => {
+  const h = harness(), dto = interfacesFixture(); dto.edges = [edge("Storage","UI",5,"deviates")];
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  await chooseApp(h, "web · javascript");
+  const old = h.renders.at(-1), stub = statsOf(h, "UI", old)[0].action;
+  const pending = deferred(); h.setResponse(() => pending.promise);
+  const reading = h.controller.refresh();
+  old.options.onSelectInterface(stub); old.options.onOpenDeviation({sourceLayer:"Storage", destinationLayer:"UI"}); await flush();
+  assert.equal(h.get("architecture-inspector").hidden, true, "a stub click during a pending read selects nothing");
+  assert.equal(h.get("architecture-deviations").children.length, 0, "and opens no tree");
+  pending.resolve({payload:dto}); await reading; await flush();
+  old.options.onSelectInterface(stub); await flush();
+  assert.equal(h.get("architecture-inspector-title").textContent, "Architecture review", "the finished read does not revive the old drawing");
+  const drawn = h.renders.at(-1);
+  h.controller.suspend(); drawn.options.onSelectInterface(stub); drawn.options.onOpenDeviation({sourceLayer:"Storage", destinationLayer:"UI"}); await flush();
+  assert.equal(h.get("architecture-inspector").hidden, true);
+});
+
+test("an inspector open while the scope or the revision changes never fills with late detail rows", async () => {
+  const h = harness(), saved = {rootKey:"checkout-one", session:1, pin, rulesEpoch:0}; h.setContext(saved);
+  h.setResponse(async () => ({payload:interfacesFixture()})); await h.controller.refresh();
+  await chooseApp(h, "web · javascript");
+  const gate = deferred(); h.setDetailGate(gate.promise);
+  h.renders.at(-1).options.onSelectInterface(statsOf(h, "UI")[0].action); await flush();
+  assert.equal(h.get("architecture-inspector-title").textContent, "web → daemon");
+  await chooseApp(h, "daemon · rust");
+  assert.equal(h.get("architecture-inspector-title").textContent, "Architecture review", "the scope change clears the selection");
+  gate.resolve(); h.setDetailGate(null); await flush(); await flush();
+  assert.equal(inspectorParagraphs(h).some(line => line.includes("POST /api/only")), false, "late rows from the old selection are dropped");
+
+  await chooseApp(h, "web · javascript");
+  const second = deferred(); h.setDetailGate(second.promise);
+  h.renders.at(-1).options.onSelectInterface(statsOf(h, "UI")[0].action); await flush();
+  h.setContext({...saved, pin:{...pin, indexRevision:2}}); h.setResponse(async () => ({payload:{...interfacesFixture(), indexRevision:2}}));
+  await h.controller.refresh();
+  second.resolve(); h.setDetailGate(null); await flush(); await flush();
+  assert.equal(inspectorParagraphs(h).some(line => line.includes("POST /api/only")), false, "a new revision drops the old selection's rows");
+  assert.equal(h.get("architecture-inspector-title").textContent, "Architecture review");
+});
+
+test("a late Deviations read for a badge never paints after the scope changed", async () => {
+  const h = harness(), dto = interfacesFixture(); dto.edges = [edge("Storage","UI",5,"deviates")];
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const gate = deferred(); h.setDetailGate(gate.promise);
+  h.renders.at(-1).options.onOpenDeviation({sourceLayer:"Storage", destinationLayer:"UI"}); await flush();
+  await chooseApp(h, "daemon · rust");
+  gate.resolve(); h.setDetailGate(null); await flush(); await flush();
+  assert.equal(h.get("architecture-deviations").hidden, true, "the scope change closed the tree and the late pages found nobody");
+  assert.equal(h.get("architecture-deviations").children.length, 0);
+});
+
+test("a scope needs a ready snapshot: apps sent with no_layers never keep a scope alive", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  await chooseApp(h, "web · javascript");
+  const waiting = {...appsFixture(), state:"no_layers", layers:[], modules:[], edges:[], references:null, rules:null};
+  h.setResponse(async () => ({payload:waiting})); await h.controller.refresh();
+  h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  assert.deepEqual(pressedApps(h), ["All apps"], "the old scope did not survive a snapshot that could not show it");
 });

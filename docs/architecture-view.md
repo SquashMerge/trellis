@@ -278,9 +278,9 @@ Chips show the module's maximum (minimum for Maintainability) displayed metric a
 measured file count; files without selected callables remain counted in a note.
 
 Band headers show only the **non-zero** outgoing production reference-site counts as
-compact chips: `↑` upward deviation and `⇄` peer or shared-outbound deviation in the
-error colour, then `↓` downward, `→shared`, `allowed` (by `layer_policy`), `excepted`
-and `unknown`. Arrows between bands carry the same counts (`↑52`, `↓8 excepted`), with
+compact chips: `↑` upward deviation (one chip per destination layer, see below) and `⇄`
+peer or shared-outbound deviation in the error colour, then `↓` downward, `→shared`,
+`allowed` (by `layer_policy`), `excepted` and `unknown`. Arrows between bands carry the same counts (`↑52`, `↓8 excepted`), with
 the direction and verdict in their accessible names. These are sums of the summary
 edges, so they equal the `$layers` instances' `referenceCount` from
 `trellis rules check --format json` on the same pin and rules.
@@ -313,6 +313,25 @@ view re-reads when a new revision is selected or the rules change, not every tim
 is opened (see the note below). A detail list
 that fails with `rules_conflict` offers **Reload Architecture**. On narrow screens the
 overview does not open the inspector drawer.
+
+**Per-destination `↑` badges and interface stubs (#789, proposed (owner-delegated, run 803)).**
+This amends the single `↑` chip above, in every stack. A band has one `↑` badge for each
+destination layer it reaches upward: production `$layers` edges with the `deviates` verdict,
+not excepted, to a layer with a smaller `order`. It reads `↑12 deviation · entry` (`↑≥12` for a
+lower bound) and sums the summary edges, so the badges of a band add up to its former `↑`
+chip. Each badge is its own focusable control, the next sibling of its band, and opens the
+Deviations tree with that edge's chip pressed, no line selected and Calls only off. The `↓`
+chip stays display-only.
+
+In a one-app stack, a band that holds this app's end of an HTTP interface also carries a stub
+read from `interfaces[].ends`: `→ <server> · N routes · M call sites` on the client end,
+`← <client> · N routes` on the server end. Ends with no layer have no band and no stub. Several ends on
+one server band can share a route, so that stub reads `≥N routes`. A stub is a button with
+`aria-pressed`; selecting it opens the interface inspector (the ends, the counts, the wrappers,
+the server-only and client-only lists, and **Open endpoints** for the matched routes, each
+with **Read handler source** and **Read call-site source**) and shows the word `Selected` on the stub. The app
+inspector (name, languages and roots, files, layers, unassigned files and the interfaces
+the app takes part in) is selected from an app column header in All apps (#790).
 
 **Opening the tab again (#789, proposed (owner-delegated, run 803)).** This supersedes
 "re-reads when the tab is opened again". Leaving the Architecture tab keeps the loaded

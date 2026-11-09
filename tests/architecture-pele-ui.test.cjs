@@ -132,3 +132,13 @@ test("AC26: a label within the twelve-line cap wraps whole, with nothing dropped
   assert.equal(lines.join(""),label);
   assert.equal(store.full,`${label}\nOrder 1`);
 });
+test("AC25: a stat with a tag always reserves room for it, so selecting an interface stub never moves the layout",()=>{
+  const {adapter}=setup(), view=fixture();
+  const display={layers:new Set(view.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[]};
+  const stats=tag=>layer=>layer.name==="Store"?[{text:"→ daemon · 3 routes · 5 call sites".padEnd(33,"."),label:"to daemon",tone:"neutral",tag,action:{interface:{client:"web",server:"daemon"}}},
+    {text:"↑2 deviation · Core".padEnd(33,"."),label:"up",tone:"error"}]:[];
+  const lines=tag=>[...adapter.project(view,{display,measureText:text=>Array.from(text).length*9,layerStats:stats(tag)}).nodes.values()].find(n=>n.kind==="L"&&n.record.name==="Store").statLines.map(line=>line.stats.length);
+  const plain=lines(undefined), tagged=lines("Selected");
+  assert.deepEqual([...plain],[2],"both chips fit one header line without the tag");
+  assert.deepEqual([...tagged],[1,1],"the reserved tag takes room the chips would otherwise share");
+});

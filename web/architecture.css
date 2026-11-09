@@ -107,3 +107,15 @@
 .architecture-app-files { margin: 0; padding: 0; list-style: none; font-size: var(--type-code); }
 .architecture-app-files li { padding: var(--sp-1) 0; overflow-wrap: anywhere; }
 .architecture-app-files button { white-space: normal; overflow-wrap: anywhere; text-align: left; }
+
+/* #789: stub and badge controls drawn inside the SVG, the interface inspector's counts and mono lines. */
+.trellis-architecture-stat-action { cursor: pointer; }
+.trellis-architecture-stat-action:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.trellis-architecture-stat-action[aria-pressed="true"] rect { stroke: var(--link); stroke-width: 2; }
+.trellis-architecture-stat-action .trellis-architecture-stat-tag-back { visibility: hidden; fill: var(--selected); stroke: none; }
+.trellis-architecture-stat-action .trellis-architecture-stat-tag { visibility: hidden; fill: var(--on-selected); }
+.trellis-architecture-stat-action[aria-pressed="true"] .trellis-architecture-stat-tag-back, .trellis-architecture-stat-action[aria-pressed="true"] .trellis-architecture-stat-tag { visibility: visible; }
+.metric-inspector-values dd[data-tone="warning"] { color: var(--warning); }
+.architecture-mono { font-family: var(--mono); overflow-wrap: anywhere; }
+.architecture-endpoints { overflow-wrap: anywhere; }
+.architecture-open-endpoints { min-height: 44px; background: var(--primary); color: var(--sm-ink); }
