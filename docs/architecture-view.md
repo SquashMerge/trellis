@@ -409,10 +409,15 @@ header leads back with "← Architecture", or "← <app>" in a one-app stack.
 - **Function names (#845).** A function row is the owner's stable lookup key without the
   file's `path::` prefix (`EvidenceResponse::architecture_config` under `src/store.rs`). A
   site whose smallest enclosing declaration is a closure (no name and no stable key) is
-  listed under its nearest named enclosing callable, read from the Files outline (`GET
-  symbols`) at the view's pin, and its line panel says "(in a closure)". A method reads
-  `Type::name` from its `impl` block. At most 50 files are named per tree; a file whose
-  outline cannot be read keeps "(anonymous)". "(module level)" is only for file-level code.
+  listed under its nearest enclosing callable, read from the Files outline (`GET symbols`) at
+  the view's pin, and its line panel says "(in a closure)". A callable is a named function,
+  method or constructor, or a binding whose whole initializer is a function
+  (`callableInitializer`); named variables, fields and types on the way are skipped (#860). A
+  method reads `Type::name` from its `impl` block. A closure with no enclosing callable up to
+  its file's root is "(module level)". At most 50 files are named per tree; a file whose
+  outline cannot be read keeps "(anonymous)", but an outline read that answers
+  `revision_conflict`, `pin_expired` or `root_changed` is the tree's conflict, handled as below,
+  and shows no tree.
 - **Filters.** The chips are **All upward** (or **All deviations** when a peer or shared
   edge is listed) and one per edge, with `⇄` before a peer or shared edge. When a listed
   edge's source layer has unresolved sites, the chip still shows the mapped count and one

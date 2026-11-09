@@ -2006,16 +2006,17 @@ test("#845 a closure owner is named after its nearest named callable from the Fi
   rows[0].instance.evidence[3].owner = closure;
   deq([...model.unnamedOwners(rows)].map(([path, ids]) => [path, [...ids]]), [["src/store.rs", ["c1"]]]);
   const outline = [{symbol:{id:"impl",name:"<implementation@1>",parent:null},implTarget:"Store"},
-    {symbol:{id:"m1",name:"publish",parent:"impl"}}, {symbol:{id:"c0",name:"<anonymousFunction@9>",parent:"m1"}}, {symbol:{id:"c1",name:"<anonymousFunction@12>",parent:"c0"}}];
+    {symbol:{id:"m1",name:"publish",kind:"method",parent:"impl"}}, {symbol:{id:"c0",name:"<anonymousFunction@9>",kind:"function",parent:"m1"}}, {symbol:{id:"c1",name:"<anonymousFunction@12>",kind:"function",parent:"c0"}}];
   const names = model.closureNames(rows, ["c1"], outline);
   deq(plain(names.get("c1")), {syntaxId:"m1",name:"Store::publish",stableLookupKey:null}, "a method reads Type::name from its impl block");
   const tree = model.build(rows, deviationView().layers, names);
   assert.equal(tree.files[0].functions.some(fn => fn.label === "(anonymous)"), false);
   const line = tree.files[0].functions.find(fn => fn.label === "Store::publish").lines[0];
   assert.equal(line.closure, true);
-  const known = model.closureNames(rows, ["c1"], [{symbol:{id:"o1",name:"enqueue",parent:null}}, {symbol:{id:"c1",name:"<anonymousFunction@3>",parent:"o1"}}]);
+  const known = model.closureNames(rows, ["c1"], [{symbol:{id:"o1",name:"enqueue",kind:"function",parent:null}}, {symbol:{id:"c1",name:"<anonymousFunction@3>",kind:"function",parent:"o1"}}]);
   assert.equal(known.get("c1").stableLookupKey, "S::enqueue", "a callable already listed lends its stable key, so the lines join its row");
-  assert.equal(model.closureNames(rows, ["c1"], [{symbol:{id:"c1",name:"<anonymousFunction@3>",parent:null}}]).has("c1"), false, "no named ancestor stays anonymous");
+  assert.equal(model.closureNames(rows, ["c1"], [{symbol:{id:"c1",name:"<anonymousFunction@3>",kind:"function",parent:null}}]).get("c1")?.moduleLevel, true,
+    "a top-level closure with no enclosing callable is module level (#860)");
 
   const h = deviationsHarness({rows}), pages = [];
   h.deps.outline = async (path, offset) => { pages.push([path, offset]); return offset === 0 ? {items:outline.slice(0, 2), nextOffset:2} : {items:outline.slice(2), nextOffset:4}; };
@@ -2032,4 +2033,78 @@ test("#845 a closure owner is named after its nearest named callable from the Fi
   const degraded = failing.sandbox.window.TrellisDeviations.create(failing.deps);
   await degraded.open(failing.trigger); await failing.expandAll();
   assert.ok(failing.byLabel("(anonymous)"), "an unreadable outline keeps the row, unnamed");
+});
+
+// ---- #860 review: closure naming takes the nearest named *callable*, and typed stale outline errors are conflicts. ----
+// Items as the native daemon's `GET symbols` returned them for
+//   export function outer() { const options = { cb: () => require("./top.js") }; return options; }
+//   export class Box { items = wrap(() => require("./top.js")); }
+//   function wrap(value) { return value; }
+// (Prime's native probe, trellis-evidence/845/prime-review/outline/native/outline.json; header fields dropped).
+const nativeOutline = () => [
+  {symbol:{id:"sid:v1:3e25cc994fe13db1cda63bbdab8e1b18", name:"low.js", kind:"module", parent:null}, nativeKind:"module"},
+  {symbol:{id:"sid:v1:802c69f799f5e06cfc0303b36108ab3b", name:"outer", kind:"function", parent:null}, nativeKind:"function"},
+  {symbol:{id:"sid:v1:e1b8bc92f79beec6d937b58c339fc36f", name:"options", kind:"variable", parent:"sid:v1:802c69f799f5e06cfc0303b36108ab3b"}, nativeKind:"variable"},
+  {symbol:{id:"sid:v1:8ccddd375d2f00a586d6524e09ef5b3f", name:"<anonymousFunction@48>", kind:"function", parent:"sid:v1:e1b8bc92f79beec6d937b58c339fc36f"}, nativeKind:"anonymousFunction"},
+  {symbol:{id:"sid:v1:1b84dd217b5566d26dc066f698cceb5e", name:"Box", kind:"class", parent:null}, nativeKind:"type"},
+  {symbol:{id:"sid:v1:878cce7893c330b76b4cdedc52cf856a", name:"items", kind:"field", parent:"sid:v1:1b84dd217b5566d26dc066f698cceb5e"}, nativeKind:"field"},
+  {symbol:{id:"sid:v1:16a4aed73143eb2ef229a58e13afdf82", name:"<anonymousFunction@127>", kind:"function", parent:"sid:v1:878cce7893c330b76b4cdedc52cf856a"}, nativeKind:"anonymousFunction"},
+  {symbol:{id:"sid:v1:be8215a927ccad8734f4e0f23d860d13", name:"wrap", kind:"function", parent:null}, nativeKind:"function"},
+];
+const OPTIONS_CLOSURE = "sid:v1:8ccddd375d2f00a586d6524e09ef5b3f", ITEMS_CLOSURE = "sid:v1:16a4aed73143eb2ef229a58e13afdf82";
+
+test("#860 a closure is named after its nearest enclosing callable, skipping named variables, fields and types", () => {
+  const {model} = deviationsHarness().sandbox.window.TrellisDeviations, rows = deviationRows();
+  rows[0].instance.evidence[3].owner = {syntaxId:OPTIONS_CLOSURE, name:null, stableLookupKey:null};
+  rows[0].instance.evidence[1].owner = {syntaxId:ITEMS_CLOSURE, name:null, stableLookupKey:null};
+  const names = model.closureNames(rows, [OPTIONS_CLOSURE, ITEMS_CLOSURE], nativeOutline());
+  assert.equal(names.get(OPTIONS_CLOSURE)?.name, "outer", "an object-initializer callback belongs to the function around the `options` variable");
+  assert.equal(names.get(ITEMS_CLOSURE)?.moduleLevel, true, "a field-initializer callback with no enclosing callable is module level, never the `items` field");
+  const tree = model.build(rows, deviationView().layers, names), labels = tree.files[0].functions.map(fn => fn.label);
+  assert.ok(labels.includes("outer")); assert.ok(labels.includes("(module level)"));
+  for (const wrong of ["options", "items", "Box", "(anonymous)"]) assert.equal(labels.includes(wrong), false, `no ${wrong} row`);
+  // A binding whose whole initializer is a function is callable by the outline's own fact (#526).
+  const bound = model.closureNames(rows, ["c9"], [{symbol:{id:"h", name:"handler", kind:"variable", parent:null}, nativeKind:"variable", callableInitializer:true},
+    {symbol:{id:"c9", name:"<anonymousFunction@5>", kind:"function", parent:"h"}, nativeKind:"anonymousFunction"}]);
+  assert.equal(bound.get("c9")?.name, "handler");
+  // Rust: a method inside an impl block, under a nested closure, keeps `Type::name`.
+  const rust = model.closureNames(rows, ["c2"], [{symbol:{id:"impl", name:"<implementation@1>", kind:"class", parent:null}, implTarget:"Store"},
+    {symbol:{id:"m", name:"publish", kind:"method", parent:"impl"}}, {symbol:{id:"c1", name:"<anonymousFunction@3>", kind:"function", parent:"m"}},
+    {symbol:{id:"c2", name:"<anonymousFunction@9>", kind:"function", parent:"c1"}}]);
+  assert.equal(rust.get("c2")?.name, "Store::publish");
+  const broken = model.closureNames(rows, ["c3"], [{symbol:{id:"c3", name:"<anonymousFunction@3>", kind:"function", parent:"missing"}}]);
+  assert.equal(broken.has("c3"), false, "a chain that breaks before the root stays anonymous");
+});
+
+async function staleOutlineHarness(fail) {
+  const h = harness(), dto = authoringFixture();
+  dto.rules.instances[0].evidence[0].owner = {syntaxId:OPTIONS_CLOSURE, name:null, stableLookupKey:null};
+  h.setResponse(async url => { if (url.startsWith("/api/symbols?")) return fail(); return {payload:dto}; });
+  await h.controller.refresh();
+  await h.get("architecture-review").fire("click"); for (let i = 0; i < 4; i++) await flush();
+  return h;
+}
+test("#860 a typed stale outline answer is an Architecture conflict, never a ready tree with anonymous names", async () => {
+  for (const code of ["revision_conflict", "pin_expired", "root_changed"]) {
+    const h = await staleOutlineHarness(() => { throw Object.assign(new Error(`stale: ${code}`), {status:409, code}); });
+    assert.equal(h.calls.filter(call => call.url.startsWith("/api/symbols?")).length, 1, `${code}: the outline was read at the local pin`);
+    assert.equal(h.conflicts.length, 1, `${code} reaches onConflict like the tree's own details read`);
+    assert.equal(deviationTreeRows(h).length, 0, `${code}: no partial or anonymous tree`);
+    assert.match(text(h.get("architecture-deviations-notices")), /The index moved to a newer revision\. Reload deviations\./);
+  }
+  const ordinary = await staleOutlineHarness(() => { throw Object.assign(new Error("Outline unavailable"), {status:503, code:"storage_busy"}); });
+  assert.equal(ordinary.conflicts.length, 0, "an ordinary unavailable outline is not a conflict");
+  assert.ok(deviationTreeRows(ordinary).length > 0, "and the tree shows, with the closure unnamed");
+});
+test("#860 a late outline answer after the context moved paints nothing", async () => {
+  const gate = deferred(), h = harness(), dto = authoringFixture(), saved = {rootKey:"checkout-one", session:1, pin, rulesEpoch:0};
+  dto.rules.instances[0].evidence[0].owner = {syntaxId:OPTIONS_CLOSURE, name:null, stableLookupKey:null};
+  h.setContext(saved); h.setResponse(async url => url.startsWith("/api/symbols?") ? gate.promise : {payload:dto});
+  await h.controller.refresh();
+  const opening = h.get("architecture-review").fire("click"); await flush(); await flush();
+  assert.equal(h.calls.filter(call => call.url.startsWith("/api/symbols?")).length, 1, "the outline read is pending");
+  h.setContext({...saved, session:2});
+  gate.resolve({revision:pin, items:nativeOutline(), nextOffset:null}); await opening; for (let i = 0; i < 4; i++) await flush();
+  assert.equal(deviationTreeRows(h).length, 0, "the late outline found nobody to paint for");
+  assert.equal(h.conflicts.length, 0);
 });

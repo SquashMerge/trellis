@@ -25,6 +25,13 @@
   // read for at most this many files, and pages of 200 symbols per file, per tree (#845).
   const CLOSURE_FILES = 50, OUTLINE_PAGES = 50;
   const unnamed = name => typeof name !== "string" || !name || name.startsWith("<");
+  // A closure belongs to the nearest enclosing *callable*: a named function, method or constructor, or a binding
+  // whose whole initializer is a function (the outline's `callableInitializer`, #526). Variables, fields and
+  // types are lexical parents, not owners (#860).
+  const CALLABLE = new Set(["function", "method", "constructor"]);
+  const callable = item => !unnamed(item.symbol.name) && (CALLABLE.has(item.symbol.kind) || CALLABLE.has(item.nativeKind) || item.callableInitializer === true);
+  // A closure with no enclosing callable, read to the root of its file's outline, is module-level code.
+  const MODULE_LEVEL = Object.freeze({syntaxId:"(module)", moduleLevel:true});
   const num = value => value.toLocaleString("en-US");
   const plural = (value, one, many = `${one}s`) => `${num(value)} ${value === 1 ? one : many}`;
   const basename = path => path.slice(path.lastIndexOf("/") + 1);
@@ -59,7 +66,7 @@
     };
     // A function row sits under its file row, so its label drops the `path::` prefix of the stable key.
     const labelOf = (owner, instance) => {
-      if (!owner || owner.syntaxId === instance.target.sid) return "(module level)";
+      if (!owner || owner.moduleLevel || owner.syntaxId === instance.target.sid) return "(module level)";
       const key = owner.stableLookupKey, prefix = `${instance.target.path}::`;
       return (typeof key === "string" && key.startsWith(prefix) ? key.slice(prefix.length) : key) ?? owner.name ?? "(anonymous)";
     };
@@ -88,7 +95,7 @@
           file.listed[kind]++;
           if (callsOnly && kind !== "call") continue;
           const enclosing = evidence.owner && names?.get(evidence.owner.syntaxId), owner = enclosing || evidence.owner;
-          const id = owner ? owner.syntaxId : MODULE;
+          const id = owner && !owner.moduleLevel ? owner.syntaxId : MODULE;
           if (!file.functions.has(id)) file.functions.set(id, {key:id, id:JSON.stringify(["fn", key, id]), label:labelOf(owner, i), lines:[], callsExact:true, refsExact:true});
           const fn = file.functions.get(id);
           fn.callsExact &&= callsExact; fn.refsExact &&= refsExact;
@@ -125,18 +132,27 @@
       }
       return files;
     }
-    // Walks each unnamed owner's `parent` chain in one file's outline items to the first named symbol. A
-    // named owner seen elsewhere in the rows supplies its stable key, so the row joins that function's row;
-    // otherwise a method reads `Type::name` from its Rust impl block, as stable keys do.
+    // Walks each unnamed owner's `parent` chain in one file's outline items to the first callable. A named
+    // owner seen elsewhere in the rows supplies its stable key, so the row joins that function's row;
+    // otherwise a method reads `Type::name` from its Rust impl block, as stable keys do. A chain that reaches
+    // the root without a callable is module level; one that breaks (a missing parent, the hop limit) stays unnamed.
     function closureNames(rows, ids, outline, names = new Map()) {
       const known = new Map();
       for (const {instance:i} of rows) for (const evidence of i.evidence) if (evidence.owner && (evidence.owner.stableLookupKey || evidence.owner.name)) known.set(evidence.owner.syntaxId, evidence.owner);
       const byId = new Map();
       for (const item of Array.isArray(outline) ? outline : []) if (record(item?.symbol) && typeof item.symbol.id === "string") byId.set(item.symbol.id, item);
       for (const id of ids) {
-        let item = byId.get(id);
-        for (let hops = 0; item && unnamed(item.symbol.name) && hops < 64; hops++) item = byId.get(item.symbol.parent);
-        if (!item || unnamed(item.symbol.name)) continue;
+        let item = byId.get(id), hops = 0;
+        if (!item) continue;
+        for (item = byId.get(item.symbol.parent); item && !callable(item) && hops < 64; hops++) item = byId.get(item.symbol.parent);
+        if (!item) {
+          // The walk left the outline: at the root (`parent: null`) it is module level, otherwise unknown.
+          let last = byId.get(id), steps = 0;
+          while (last && last.symbol.parent != null && byId.has(last.symbol.parent) && steps++ < 64) last = byId.get(last.symbol.parent);
+          if (last && last.symbol.parent == null) names.set(id, MODULE_LEVEL);
+          continue;
+        }
+        if (!callable(item)) continue;
         const parent = byId.get(item.symbol.parent), type = typeof parent?.implTarget === "string" && parent.implTarget ? parent.implTarget : null;
         names.set(id, known.get(item.symbol.id) ?? {syntaxId:item.symbol.id, name:type ? `${type}::${item.symbol.name}` : item.symbol.name, stableLookupKey:null});
       }
@@ -285,7 +301,10 @@
             for (const item of page.items) { items.push(item); wanted.delete(item?.symbol?.id); }
             offset = page.nextOffset;
           }
-        } catch (error) { if (!active() || error?.name === "AbortError") throw error; }
+        } catch (error) {
+          // A typed stale answer means the pin is gone: it is the tree's conflict, never an unnamed tree (#860).
+          if (!active() || error?.name === "AbortError" || (error?.status === 409 && CONFLICTS.includes(error.code))) throw error;
+        }
         model.closureNames(rows, ids, items, names);
       }
       return names;
