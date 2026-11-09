@@ -2,6 +2,7 @@
 //! `node_modules`, replaced by the generated tsconfig when the package is not there, and a
 //! typed refusal otherwise.
 use super::profiles::{self, Generated, Rules, Target};
+use super::settings::{Source, TsProject};
 use super::tsconfig::{self, CONFIG_UNRESOLVED, MAX_CHAIN_FILES, MAX_FILE_BYTES};
 use super::worktree::{self, RetainedInputs, RetainedSource, RootInput};
 use super::{ProducerName, TrustProfile};
@@ -44,7 +45,7 @@ fn write(workspace: &Path, path: &str, bytes: &[u8]) {
 
 fn apply(root: &str, workspace: &Path) -> Result<Rules> {
     let mut rules = ts_rules();
-    tsconfig::apply(&mut rules, &inputs(root), workspace)?;
+    tsconfig::apply(&mut rules, &inputs(root), workspace, None)?;
     Ok(rules)
 }
 
@@ -315,15 +316,13 @@ fn roots_without_a_package_extends_are_left_alone() {
         r#"{"compilerOptions": {}}"#,
         r#"{"extends": "./base.json"}"#,
         r#"{"extends": ["../outside.json", "/abs.json"]}"#,
-        // Unreadable JSONC is left to TypeScript to report.
-        "{ not json",
     ] {
         let rules = apply(root, dir.path()).unwrap();
         assert_eq!(rules, ts_rules(), "{root}");
     }
     // No root tsconfig.json: nothing to do.
     let mut rules = ts_rules();
-    tsconfig::apply(&mut rules, &RetainedInputs::default(), dir.path()).unwrap();
+    tsconfig::apply(&mut rules, &RetainedInputs::default(), dir.path(), None).unwrap();
     assert_eq!(rules, ts_rules());
 }
 
@@ -515,4 +514,115 @@ fn lookup_continues_past_a_package_with_no_config() {
     );
     let rules = apply(r#"{"extends":"a"}"#, dir.path()).unwrap();
     assert_eq!(rules.generated, ts_rules().generated, "fell back");
+}
+
+fn retained(files: &[(&str, &[u8])]) -> RetainedInputs {
+    RetainedInputs {
+        config: files
+            .iter()
+            .map(|(path, bytes)| RootInput {
+                path: (*path).into(),
+                bytes: bytes.to_vec(),
+            })
+            .collect(),
+        dependencies: vec![],
+    }
+}
+
+fn choose(
+    files: &[(&str, &[u8])],
+    project: Option<TsProject>,
+) -> Result<(Rules, super::settings::Setting)> {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rules = ts_rules();
+    let setting = tsconfig::apply(&mut rules, &retained(files), dir.path(), project)?;
+    Ok((rules, setting))
+}
+
+/// #717: an unparseable root config is the typed refusal, not left to TypeScript.
+#[test]
+fn an_unparseable_root_config_is_refused() {
+    let placeholder = crate::skipped_config::PLACEHOLDER;
+    for (path, bytes, expected) in [
+        (
+            "tsconfig.json",
+            &b"{ not json"[..],
+            "tsconfig.json is not a JSON object",
+        ),
+        (
+            "tsconfig.json",
+            b"[1]",
+            "tsconfig.json is not a JSON object",
+        ),
+        ("jsconfig.json", b"{,", "jsconfig.json is not a JSON object"),
+        ("tsconfig.json", placeholder, "over the config input cap"),
+    ] {
+        let error = choose(&[(path, bytes)], None).unwrap_err().to_string();
+        assert!(error.starts_with(CONFIG_UNRESOLVED), "{error}");
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+    // The override sidesteps a root config it does not use.
+    let (rules, setting) = choose(
+        &[("tsconfig.json", b"{ not json")],
+        Some(TsProject::Generated),
+    )
+    .unwrap();
+    assert_eq!(setting.value, "generated");
+    assert_eq!(rules.omit[0].path, "tsconfig.json");
+}
+
+/// #717: a root `jsconfig.json` with no `tsconfig.json` is the project, through a generated
+/// tsconfig that extends it; a root `tsconfig.json` wins over it.
+#[test]
+fn a_root_jsconfig_is_the_project_unless_a_tsconfig_is_there() {
+    let js: &[u8] = br#"{"compilerOptions": {"checkJs": true}}"#;
+    let (rules, setting) = choose(&[("jsconfig.json", js)], None).unwrap();
+    assert_eq!(setting.value, "jsconfig.json");
+    assert_eq!(setting.source, Source::Project);
+    let project = generated(&rules, "worktree/tsconfig.json");
+    assert_eq!(project.bytes, tsconfig::JSCONFIG_PROJECT);
+    assert!(!project.default_only);
+    assert!(rules.omit.is_empty());
+    // The worktree holds the checkout's jsconfig.json and the generated tsconfig.json.
+    let layout = worktree::layout(&retained(&[("jsconfig.json", js)]), &rules);
+    assert_eq!(layout.config[0].path, "jsconfig.json");
+    assert_eq!(layout.generated[0].path, "worktree/tsconfig.json");
+
+    let ts: &[u8] = br#"{"compilerOptions": {}}"#;
+    let (rules, setting) = choose(&[("tsconfig.json", ts), ("jsconfig.json", js)], None).unwrap();
+    assert_eq!(setting.value, "tsconfig.json");
+    assert_eq!(rules, ts_rules());
+}
+
+/// #717: `--ts-project` replaces the chosen config, and naming an absent one is refused.
+#[test]
+fn the_project_override_wins() {
+    let js: &[u8] = b"{}";
+    let ts: &[u8] = b"{}";
+    let both = [("tsconfig.json", ts), ("jsconfig.json", js)];
+    let (rules, setting) = choose(&both, Some(TsProject::Jsconfig)).unwrap();
+    assert_eq!(setting.value, "jsconfig.json");
+    assert_eq!(setting.source, Source::Override);
+    assert_eq!(rules.omit[0].path, "tsconfig.json");
+    assert_eq!(
+        generated(&rules, "worktree/tsconfig.json").bytes,
+        tsconfig::JSCONFIG_PROJECT
+    );
+    let layout = worktree::layout(&retained(&both), &rules);
+    assert_eq!(layout.omitted[0].0, "tsconfig.json");
+
+    let (rules, setting) = choose(&both, Some(TsProject::Generated)).unwrap();
+    assert_eq!(setting.value, "generated");
+    let layout = worktree::layout(&retained(&both), &rules);
+    assert_eq!(layout.generated[0].path, "worktree/tsconfig.json");
+    assert_eq!(
+        generated(&rules, "worktree/tsconfig.json").bytes,
+        profiles::SCIP_TYPESCRIPT_TSCONFIG
+    );
+
+    let error = choose(&[("jsconfig.json", js)], Some(TsProject::Tsconfig))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with(CONFIG_UNRESOLVED), "{error}");
+    assert!(error.contains("no root tsconfig.json"), "{error}");
 }

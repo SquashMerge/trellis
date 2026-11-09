@@ -499,6 +499,7 @@ impl Run<'_> {
             &prepared.declared,
             self.ctx.stub,
             &prepared.pin,
+            &prepared.rules,
             &dir_text,
         );
         let rules = &prepared.rules;

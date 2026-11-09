@@ -49,7 +49,15 @@ fn spec(row: &Row) -> profiles::CommandSpec {
         args: vec!["--mode-file".into(), "/mode.json".into()],
     };
     let pin = row.target.pin().unwrap();
-    profiles::command(row, &resolution(), &declared(), Some(&stub), &pin, RUN)
+    profiles::command(
+        row,
+        &resolution(),
+        &declared(),
+        Some(&stub),
+        &pin,
+        &profiles::rules(row),
+        RUN,
+    )
 }
 
 fn keys(row: &Row) -> Vec<String> {
