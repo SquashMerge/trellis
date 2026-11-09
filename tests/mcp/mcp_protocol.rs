@@ -782,7 +782,7 @@ fn rules_envelopes_accept_classified_evidence_and_kind_counts() {
             "data":{"rulesVersion":"rules:v2","indexGeneration":"g","indexRevision":1,
                 "rulesFile":{"path":".trellis/rules.toml","source":"checkout-config","contentHash":"0".repeat(64)},
                 "instances":[instance],"testOnly":[],"counts":counts,"testCounts":counts,
-                "apps":[{"name":"trellis","manifest":"Cargo.toml","counts":counts}],"noApp":{"counts":counts},
+                "apps":[{"name":"trellis","source":"manifest","manifest":"Cargo.toml","counts":counts}],"noApp":{"counts":counts},
                 "unassignedFileCount":0,"unassigned":[],"partialFiles":[],"limitations":[],
                 "externalPackages":[],"page":page,"semanticBases":[]},
             "warnings":[],"partial":false,"truncated":false,"truncationReason":null,

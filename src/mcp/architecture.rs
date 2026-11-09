@@ -1761,7 +1761,7 @@ mod tests {
                 "rulesFile":{"path":".trellis/rules.toml","source":"checkout-config","contentHash":"h"},
                 "externalPackages":[],"instances":instances,"testOnly":test_only,
                 "counts":counts,"testCounts":counts,
-                "apps":[{"name":"a","manifest":"Cargo.toml","counts":counts}],"noApp":{"counts":counts},
+                "apps":[{"name":"a","source":"manifest","manifest":"Cargo.toml","counts":counts}],"noApp":{"counts":counts},
                 "unassigned":[{"path":"loose.rs"}],
                 "unassignedFileCount":1,"partialFiles":[],"limitations":[]}),
         );
