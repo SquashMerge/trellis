@@ -143,7 +143,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":17,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":18,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
@@ -151,6 +151,63 @@ pub fn describe(
         "hintWorkMs":1000,"deadlineMs":deadline_ms,"concurrency":super::MAX_CONNECTION_CALLS}},
       "warnings":[],"partial":partial,"truncated":false,"truncationReason":null})
 }
+
+/// Describe's page of failed and partial semantic documents (#780): from the sorted
+/// `documents`, the items at `offset` up to the request's `limit` (default 20) that keep the
+/// whole envelope inside the architecture page target, at least one. `page` continues it as
+/// architecture paging does; an offset past the end fails `range_too_large`.
+pub fn coverage_documents(
+    id: &Value,
+    mut envelope: Value,
+    documents: Vec<crate::store::CoverageDocument>,
+    request: &Value,
+    modern: bool,
+) -> Value {
+    let uint = |field: &str| request.get(field).and_then(super::wire::uint);
+    let offset = uint("offset").unwrap_or(0);
+    let limit = uint("limit").map_or(COVERAGE_DOCUMENTS_DEFAULT, |limit| limit as usize);
+    let total = documents.len() as u64;
+    if offset > total {
+        let mut failure = super::tools::failure(id, "range_too_large");
+        failure["error"]["currentBasis"] = envelope["evidenceBasis"].clone();
+        return failure;
+    }
+    let frame = |envelope: &Value| {
+        serde_json::to_vec(&super::tools::result(
+            "trellis_workspace_describe",
+            envelope.clone(),
+            modern,
+        ))
+        .map_or(usize::MAX, |bytes| bytes.len())
+    };
+    envelope["data"]["coverageDocuments"] =
+        json!({"items":[],"page":{"offset":offset,"nextOffset":null,"total":total}});
+    // Headroom for the next offset's digits, the search index and the outer JSON-RPC line.
+    let budget = super::architecture::PAGE_BYTES
+        .saturating_sub(frame(&envelope))
+        .saturating_sub(1024);
+    let mut items = Vec::new();
+    let mut used = 0usize;
+    for document in documents.into_iter().skip(offset as usize).take(limit) {
+        let item = json!({"language":document.language,"path":document.path,
+            "state":if document.failed { "failed" } else { "partial" },
+            "reasons":document.reasons});
+        let size = item.to_string().len() + 1;
+        if !items.is_empty() && used + size > budget {
+            break;
+        }
+        used += size;
+        items.push(item);
+    }
+    let next = offset + items.len() as u64;
+    let page = &mut envelope["data"]["coverageDocuments"];
+    page["page"]["nextOffset"] = json!((next < total).then_some(next));
+    page["items"] = Value::Array(items);
+    envelope
+}
+
+/// Documents on one describe coverage page without a `limit` (#780).
+pub const COVERAGE_DOCUMENTS_DEFAULT: usize = 20;
 
 #[cfg(test)]
 mod tests {
@@ -229,7 +286,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 17);
+        assert_eq!(ready["data"]["toolVersion"], 18);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -5525,5 +5582,118 @@ for (const output of outputs) {
             eprintln!("#724 graph compact={compact}: before {before} B, after {after} B");
             assert_eq!(after + 512, before + r#","spellingTruncated":true"#.len());
         }
+    }
+
+    fn coverage_document(
+        language: &'static str,
+        path: String,
+        failed: bool,
+    ) -> crate::store::CoverageDocument {
+        crate::store::CoverageDocument {
+            language,
+            path,
+            failed,
+            reasons: vec![if failed {
+                "notInProducerOutput"
+            } else {
+                "nativeGaps"
+            }],
+        }
+    }
+
+    fn ready_describe(id: &Value) -> Value {
+        let basis =
+            json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":4});
+        describe(
+            id,
+            "project",
+            "ready",
+            None,
+            Some(([[0; 5]; 5], Tiers::default())),
+            Some(basis),
+            false,
+        )
+    }
+
+    /// #780: describe's coverage document pages concatenate to the whole sorted list exactly
+    /// once, honour `limit` (default 20) and the page target, and an offset past the end is
+    /// `range_too_large` with the admitted basis.
+    #[test]
+    fn coverage_document_pages_concatenate_within_limit_and_page_target() {
+        let id = json!(7);
+        let documents: Vec<_> = (0..45)
+            .map(|n| coverage_document("rust", format!("src/f{n:02}.rs"), n < 5))
+            .collect();
+        let read = |request: Value| {
+            coverage_documents(&id, ready_describe(&id), documents.clone(), &request, true)
+        };
+        let first = read(json!({}));
+        let page = &first["data"]["coverageDocuments"];
+        assert_eq!(page["page"], json!({"offset":0,"nextOffset":20,"total":45}));
+        assert_eq!(page["items"].as_array().unwrap().len(), 20);
+        assert_eq!(
+            page["items"][0],
+            json!({"language":"rust","path":"src/f00.rs","state":"failed","reasons":["notInProducerOutput"]})
+        );
+        assert_eq!(page["items"][5]["state"], "partial");
+        let mut offset = 0;
+        let mut seen = Vec::new();
+        loop {
+            let answer = read(json!({"limit":7,"offset":offset}));
+            let page = &answer["data"]["coverageDocuments"];
+            assert!(page["items"].as_array().unwrap().len() <= 7);
+            assert_eq!(page["page"]["total"], 45);
+            seen.extend(
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["path"].clone()),
+            );
+            match page["page"]["nextOffset"].as_u64() {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        let whole: Vec<_> = documents
+            .iter()
+            .map(|document| json!(document.path))
+            .collect();
+        assert_eq!(seen, whole);
+        // The end itself is an empty last page; one past it is typed.
+        let end = read(json!({"offset":45}));
+        assert_eq!(end["data"]["coverageDocuments"]["items"], json!([]));
+        assert_eq!(
+            end["data"]["coverageDocuments"]["page"]["nextOffset"],
+            Value::Null
+        );
+        let past = read(json!({"offset":46}));
+        assert_eq!(past["error"]["code"], "range_too_large");
+        assert_eq!(
+            past["error"]["currentBasis"],
+            ready_describe(&id)["evidenceBasis"]
+        );
+        // Long paths stop a page at the page target, never before its first document.
+        let long: Vec<_> = (0..50)
+            .map(|n| coverage_document("python", format!("{n:02}/{}", "p".repeat(3000)), false))
+            .collect();
+        let answer = coverage_documents(&id, ready_describe(&id), long, &json!({"limit":50}), true);
+        let shown = answer["data"]["coverageDocuments"]["items"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert!((1..50).contains(&shown), "{shown}");
+        let bytes = serde_json::to_vec(&super::super::tools::result(
+            "trellis_workspace_describe",
+            answer.clone(),
+            true,
+        ))
+        .unwrap()
+        .len();
+        assert!(bytes <= super::super::architecture::PAGE_BYTES, "{bytes}");
+        assert_eq!(
+            answer["data"]["coverageDocuments"]["page"]["nextOffset"],
+            shown
+        );
     }
 }

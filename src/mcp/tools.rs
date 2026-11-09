@@ -77,6 +77,23 @@ fn offset(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
         _ => Ok(()),
     }
 }
+/// A references aggregation (#775): `groupBy` is `file`, `directory` or `package`, and
+/// `depth` (1–32 leading directory segments) is accepted only with `directory`.
+fn group_by(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
+    let by = match o.get("groupBy") {
+        None => "file",
+        Some(value) => match value.as_str() {
+            Some(by @ ("file" | "directory" | "package")) => by,
+            _ => return Err("invalid_request"),
+        },
+    };
+    match o.get("depth").map(|depth| (by, wire::uint(depth))) {
+        None => Ok(()),
+        Some(("directory", Some(1..=32))) => Ok(()),
+        Some(("directory", Some(_))) => Err("range_too_large"),
+        Some(_) => Err("invalid_request"),
+    }
+}
 /// A rules check `status` filter (#725): absent, or 1–3 distinct instance statuses.
 fn status_filter(o: &serde_json::Map<String, Value>) -> bool {
     o.get("status").is_none_or(|status| {
@@ -108,7 +125,10 @@ const UNKNOWN_FIELD: &str = "Invalid tool arguments: a field is not in this tool
 /// The accepted and required argument fields of each known tool.
 fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
     match name {
-        "trellis_workspace_describe" => (&["schemaVersion", "workspace"], &["schemaVersion"]),
+        "trellis_workspace_describe" => (
+            &["schemaVersion", "workspace", "coverageDocuments"],
+            &["schemaVersion"],
+        ),
         "trellis_references" => (
             &[
                 "schemaVersion",
@@ -117,6 +137,8 @@ fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
                 "paths",
                 "limit",
                 "offset",
+                "groupBy",
+                "depth",
             ],
             &["schemaVersion"],
         ),
@@ -315,6 +337,14 @@ fn field_message(name: &str, field: &str) -> &'static str {
             "`semanticProducerId` must be a producer ID string of 1 to 512 bytes"
         }
         (_, "compact") => "`compact` must be true or false",
+        (_, "coverageDocuments") => {
+            "`coverageDocuments` must be an object with optional `language` (a language name), \
+             `limit` (1 to 50) and `offset`"
+        }
+        (_, "groupBy") => {
+            "`groupBy` must be \"file\", \"directory\" or \"package\"; `depth` (1 to 32) \
+             goes only with \"directory\""
+        }
         (_, "includeExternal") => "`includeExternal` must be true or false",
         (_, "includeTests") => "`includeTests` must be true or false",
         (_, "depth") => "`depth` must be an integer from 0 to 5",
@@ -400,8 +430,28 @@ pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
         return Err(bad("compact"));
     }
     match name {
-        "trellis_workspace_describe" => {}
+        "trellis_workspace_describe" => {
+            if let Some(request) = o.get("coverageDocuments") {
+                let request = request
+                    .as_object()
+                    .ok_or_else(|| bad("coverageDocuments"))?;
+                if !request
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "language" | "limit" | "offset"))
+                    || !request.get("language").is_none_or(|language| {
+                        language.as_str().is_some_and(|language| {
+                            crate::semantic_evidence::LANGUAGE_ORDER.contains(&language)
+                        })
+                    })
+                {
+                    return Err(bad("coverageDocuments"));
+                }
+                limit(request).map_err(coded("coverageDocuments"))?;
+                offset(request).map_err(coded("coverageDocuments"))?;
+            }
+        }
         "trellis_references" | "trellis_rules_check" => {
+            group_by(o).map_err(coded("groupBy"))?;
             if !o.get("paths").is_none_or(|value| {
                 value.as_array().is_some_and(|paths| {
                     paths.iter().all(|path| {
@@ -1418,7 +1468,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":17,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":18,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
@@ -1995,6 +2045,101 @@ mod tests {
         assert_eq!(
             result(n, envelope, false)["content"][0]["text"],
             "trellis_show: no_viewer class; full result in structuredContent."
+        );
+    }
+
+    /// #780: describe's `coverageDocuments` is an optional closed object; its bounds are
+    /// typed, and a bad request never falls back to a plain describe.
+    #[test]
+    fn describe_coverage_documents_request_is_closed_and_bounded() {
+        let n = "trellis_workspace_describe";
+        let with = |request: Value| json!({"schemaVersion":1,"coverageDocuments":request});
+        for request in [
+            json!({}),
+            json!({"language":"rust"}),
+            json!({"language":"typescript","limit":50,"offset":9007199254740991_u64}),
+            json!({"limit":1,"offset":0}),
+        ] {
+            assert_eq!(
+                validate(n, Some(&with(request.clone()))),
+                Ok(()),
+                "{request}"
+            );
+        }
+        for (request, code) in [
+            (json!(null), "invalid_request"),
+            (json!(true), "invalid_request"),
+            (json!("rust"), "invalid_request"),
+            (json!({"language":"go"}), "invalid_request"),
+            (json!({"language":null}), "invalid_request"),
+            (json!({"state":"failed"}), "invalid_request"),
+            (json!({"limit":"5"}), "invalid_request"),
+            (json!({"offset":-1}), "invalid_request"),
+            (json!({"limit":0}), "range_too_large"),
+            (json!({"limit":51}), "range_too_large"),
+        ] {
+            assert_eq!(
+                validate(n, Some(&with(request.clone()))),
+                Err(code),
+                "{request}"
+            );
+        }
+        assert!(
+            super::check(n, Some(&with(json!({"language":"go"}))))
+                .unwrap_err()
+                .message
+                .unwrap()
+                .contains("coverageDocuments")
+        );
+    }
+
+    /// #775: references `groupBy` is closed, and `depth` is bounded and only for
+    /// `directory`. Check takes neither.
+    #[test]
+    fn references_group_by_is_closed_and_depth_needs_directory() {
+        let n = "trellis_references";
+        let with = |extra: Value| {
+            let mut arguments = json!({"schemaVersion":1});
+            for (key, value) in extra.as_object().unwrap() {
+                arguments[key] = value.clone();
+            }
+            arguments
+        };
+        for ok in [
+            json!({"groupBy":"file"}),
+            json!({"groupBy":"directory"}),
+            json!({"groupBy":"directory","depth":1}),
+            json!({"groupBy":"directory","depth":32,"limit":50,"offset":3}),
+            json!({"groupBy":"package","paths":["src/**"]}),
+        ] {
+            assert_eq!(validate(n, Some(&with(ok.clone()))), Ok(()), "{ok}");
+        }
+        for (bad, code) in [
+            (json!({"groupBy":"module"}), "invalid_request"),
+            (json!({"groupBy":null}), "invalid_request"),
+            (json!({"groupBy":["directory"]}), "invalid_request"),
+            (json!({"depth":2}), "invalid_request"),
+            (json!({"groupBy":"file","depth":2}), "invalid_request"),
+            (json!({"groupBy":"package","depth":2}), "invalid_request"),
+            (
+                json!({"groupBy":"directory","depth":"2"}),
+                "invalid_request",
+            ),
+            (
+                json!({"groupBy":"directory","depth":1.5}),
+                "invalid_request",
+            ),
+            (json!({"groupBy":"directory","depth":0}), "range_too_large"),
+            (json!({"groupBy":"directory","depth":33}), "range_too_large"),
+        ] {
+            assert_eq!(validate(n, Some(&with(bad.clone()))), Err(code), "{bad}");
+        }
+        assert_eq!(
+            validate(
+                "trellis_rules_check",
+                Some(&json!({"schemaVersion":1,"groupBy":"directory"}))
+            ),
+            Err("invalid_request")
         );
     }
 }

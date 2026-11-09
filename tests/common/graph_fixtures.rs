@@ -51,6 +51,8 @@ pub struct Spec {
     /// Version of the requested producer; anything but "v1" makes bindings possiblyStale.
     pub requested_version: String,
     pub states: BTreeMap<String, s::CoverageState>,
+    /// Coverage diagnostics by path, in place of the default `<state> fixture`.
+    pub diagnostics: BTreeMap<String, String>,
     pub bindings: Vec<Bind>,
     /// Declarations that get a declaration binding (history provenance).
     pub declaration_bindings: Vec<String>,
@@ -71,6 +73,7 @@ impl Spec {
             languages: vec![s::Language::Rust],
             requested_version: "v1".into(),
             states: BTreeMap::new(),
+            diagnostics: BTreeMap::new(),
             bindings: vec![],
             declaration_bindings: vec![],
             declaration_proofs: BTreeMap::new(),
@@ -479,8 +482,12 @@ fn evidence(
             state,
             supported_roles: vec![s::Role::Definition, s::Role::Call],
             observed_roles,
-            diagnostic: (!matches!(state, s::CoverageState::Complete))
-                .then(|| format!("{state:?} fixture")),
+            diagnostic: (!matches!(state, s::CoverageState::Complete)).then(|| {
+                spec.diagnostics
+                    .get(&document.key.path)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{state:?} fixture"))
+            }),
             reasons: None,
         });
     }

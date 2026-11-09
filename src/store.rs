@@ -26,8 +26,8 @@ pub use search_startup::RecentSearchCheckout;
 #[cfg(feature = "test-support")]
 pub(crate) use semantic_display::status_semantic_projections_on_thread_for_tests;
 pub use semantic_display::{
-    CallSemantic, LANGUAGE_NOTE, LanguageTier, McpSemantic, NO_PRODUCER_NOTE, ProducerNotPublished,
-    ProducerSelection, multiple_producers_note,
+    CallSemantic, CoverageDocument, LANGUAGE_NOTE, LanguageTier, McpSemantic, NO_PRODUCER_NOTE,
+    ProducerNotPublished, ProducerSelection, multiple_producers_note,
 };
 pub(crate) mod symbol_trigrams;
 pub mod topology;

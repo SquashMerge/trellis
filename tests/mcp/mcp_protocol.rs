@@ -7092,7 +7092,9 @@ fn published_inactive_checkout(
     };
     let root = checkout(temp);
     for (path, text) in files {
-        fs::write(root.join(path), text).unwrap();
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
     }
     let identity = WorkspaceIdentity::discover(Some(&root), &root)
         .unwrap()
@@ -11294,6 +11296,133 @@ async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_i
     }));
     validate_structured_content(&structured);
     drop(ask);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #775: `groupBy` directory and package rows sum the file answer's edges and unresolved
+/// sites at the same pin, through MCP, and every answer fits the catalog schema.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn references_group_by_directory_and_package_sum_the_file_answer() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            (
+                "src/app/main.js",
+                "import '../lib/util.js'; import '../lib/util.js'; import './side.js'; import 'missing';\n",
+            ),
+            ("src/app/side.js", "export const s = 1;\n"),
+            ("src/lib/util.js", "import 'absent'; export const u = 1;\n"),
+        ],
+    );
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(775, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 775, None);
+    let mut ask = |id: i32, arguments: Value| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":"trellis_references","arguments":arguments})
+            )
+        )
+        .unwrap();
+        next_reply(&mut reader)
+    };
+    let file = ask(1, json!({"schemaVersion":1}));
+    tool(&file, None, true);
+    let file = file["result"]["structuredContent"].clone();
+    let basis = file["evidenceBasis"].clone();
+    let data = &file["data"];
+    assert_eq!(data["groupBy"], "file");
+    assert_eq!(data["groups"], json!([]), "file mode emits no groups");
+    let production: u64 = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| edge["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(production, 3);
+    assert_eq!(data["counts"]["unresolvedSites"], 2);
+    let mut structured = vec![json!({"name":"trellis_references","structuredContent":file})];
+    let mut grouped = |id: i32, arguments: Value| {
+        let reply = ask(id, arguments);
+        tool(&reply, None, true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        assert_eq!(envelope["evidenceBasis"], basis, "same pin");
+        structured.push(json!({"name":"trellis_references","structuredContent":envelope}));
+        envelope["data"].clone()
+    };
+    let directory = grouped(
+        2,
+        json!({"schemaVersion":1,"expectedBasis":basis,"groupBy":"directory"}),
+    );
+    assert_eq!(directory["groupBy"], "directory");
+    for field in ["modules", "production", "tests", "unresolved"] {
+        assert_eq!(directory[field], json!([]), "{field}");
+    }
+    assert_eq!(
+        directory["counts"], data["counts"],
+        "counts are the file answer's"
+    );
+    assert_eq!(
+        directory["groups"],
+        json!([
+            {"source":"src/app","target":"src/lib","sites":2,"production":2,"test":0},
+            {"source":"src/app","target":"src/app","sites":1,"production":1,"test":0},
+            {"source":"src/app","target":null,"sites":1,"production":1,"test":0},
+            {"source":"src/lib","target":null,"sites":1,"production":1,"test":0},
+        ])
+    );
+    let top = grouped(
+        3,
+        json!({"schemaVersion":1,"expectedBasis":basis,"groupBy":"directory","depth":1}),
+    );
+    assert_eq!(
+        top["groups"],
+        json!([
+            {"source":"src","target":"src","sites":3,"production":3,"test":0},
+            {"source":"src","target":null,"sites":2,"production":2,"test":0},
+        ])
+    );
+    let package = grouped(4, json!({"schemaVersion":1,"groupBy":"package"}));
+    let source_set = data["modules"][0]["identity"]["sourceSetId"].clone();
+    assert_eq!(package["groups"][0]["source"], source_set);
+    assert_eq!(package["groups"][0]["target"], source_set);
+    assert_eq!(package["groups"][0]["sites"], 3);
+    // A row limit pages the same rows.
+    let first = grouped(
+        5,
+        json!({"schemaVersion":1,"groupBy":"directory","limit":3}),
+    );
+    assert_eq!(first["groups"].as_array().unwrap().len(), 3);
+    let next = first["page"]["nextOffset"].clone();
+    assert!(next.is_u64(), "{first}");
+    let rest = grouped(
+        6,
+        json!({"schemaVersion":1,"groupBy":"directory","limit":3,"offset":next}),
+    );
+    let mut paged = first["groups"].as_array().unwrap().clone();
+    paged.extend(rest["groups"].as_array().unwrap().iter().cloned());
+    assert_eq!(json!(paged), directory["groups"]);
+    // Negative control: an unknown grouping is a typed invalid request, not a file answer.
+    let bad = ask(7, json!({"schemaVersion":1,"groupBy":"module"}));
+    tool(&bad, Some("invalid_request"), true);
+    let bad_depth = ask(8, json!({"schemaVersion":1,"groupBy":"package","depth":1}));
+    tool(&bad_depth, Some("invalid_request"), true);
+    for reply in [&bad, &bad_depth] {
+        structured.push(json!({"name":"trellis_references",
+            "structuredContent":reply["result"]["structuredContent"]}));
+    }
+    drop(ask);
+    validate_structured_content(&structured);
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
@@ -18105,4 +18234,103 @@ fn rules_explain_accepts_typescript_targets_and_npm_destinations() {
 /// module's tests `<module>::<test>`.
 fn child_test_name(test: &str) -> String {
     format!("{}::{test}", module_path!().split_once("::").unwrap().1)
+}
+
+/// #780: describe pages the documents behind each language's semantic failed and partial
+/// counts, with typed reasons, and omits the list unless asked. Every answer, including the
+/// typed failures, fits the catalog schema.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_pages_failed_and_partial_semantic_documents() {
+    use trellis::semantic_evidence::CoverageState;
+    let mut spec = graph_fixtures::Spec::new(&[
+        ("src/a.rs", "fn a() {}\n"),
+        ("src/b.rs", "fn b() {}\n"),
+        ("src/c.rs", "fn c() {}\n"),
+        ("src/d.rs", "fn d() {}\n"),
+    ]);
+    for (path, state) in [
+        ("src/b.rs", CoverageState::Failed),
+        ("src/c.rs", CoverageState::Failed),
+        ("src/d.rs", CoverageState::Partial),
+    ] {
+        spec.states.insert(path.into(), state);
+    }
+    spec.diagnostics
+        .insert("src/c.rs".into(), "excluded_failed_by_producer".into());
+    let mut mcp = GraphMcp::start(780, &[spec], Default::default()).await;
+    let describe = |mcp: &mut GraphMcp, request: Option<Value>| {
+        let mut arguments = json!({"schemaVersion":1});
+        if let Some(request) = request {
+            arguments["coverageDocuments"] = request;
+        }
+        mcp.call_tool("trellis_workspace_describe", arguments)
+    };
+    // Negative control: a plain describe carries no document list.
+    let plain = describe(&mut mcp, None);
+    assert!(plain["data"].get("coverageDocuments").is_none(), "{plain}");
+    let rust = plain["data"]["languages"][1]["semantic"]["coverage"].clone();
+    assert_eq!(
+        (rust["failed"].as_u64(), rust["partial"].as_u64()),
+        (Some(2), Some(1))
+    );
+    let all = describe(&mut mcp, Some(json!({})));
+    assert_eq!(all["data"]["languages"], plain["data"]["languages"]);
+    assert_eq!(
+        all["data"]["coverageDocuments"],
+        json!({"items":[
+            {"language":"rust","path":"src/b.rs","state":"failed","reasons":["other"]},
+            {"language":"rust","path":"src/c.rs","state":"failed","reasons":["notInProducerOutput"]},
+            {"language":"rust","path":"src/d.rs","state":"partial","reasons":["unrecorded"]},
+        ],"page":{"offset":0,"nextOffset":null,"total":3}})
+    );
+    // One document per page concatenates to the same list.
+    let mut offset = json!(0);
+    let mut paged = Vec::new();
+    loop {
+        let page = describe(
+            &mut mcp,
+            Some(json!({"language":"rust","limit":1,"offset":offset})),
+        );
+        let documents = &page["data"]["coverageDocuments"];
+        assert_eq!(documents["items"].as_array().unwrap().len(), 1);
+        paged.extend(documents["items"].as_array().unwrap().iter().cloned());
+        offset = documents["page"]["nextOffset"].clone();
+        if offset.is_null() {
+            break;
+        }
+    }
+    assert_eq!(json!(paged), all["data"]["coverageDocuments"]["items"]);
+    let python = describe(&mut mcp, Some(json!({"language":"python"})));
+    assert_eq!(
+        python["data"]["coverageDocuments"],
+        json!({"items":[],"page":{"offset":0,"nextOffset":null,"total":0}})
+    );
+    for (request, code) in [
+        (json!({"offset":4}), "range_too_large"),
+        (json!({"language":"go"}), "invalid_request"),
+        (json!({"limit":51}), "range_too_large"),
+    ] {
+        mcp.next_id += 1;
+        let id = mcp.next_id;
+        writeln!(
+            mcp.client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":"trellis_workspace_describe",
+                    "arguments":{"schemaVersion":1,"coverageDocuments":request}})
+            )
+        )
+        .unwrap();
+        let reply = next_reply(&mut mcp.reader);
+        tool(&reply, Some(code), true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        if code == "range_too_large" && request.get("offset").is_some() {
+            assert_eq!(envelope["error"]["currentBasis"], all["evidenceBasis"]);
+        }
+        mcp.pairs
+            .push(json!({"name":"trellis_workspace_describe","structuredContent":envelope}));
+    }
+    mcp.finish();
 }

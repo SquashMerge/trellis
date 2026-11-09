@@ -17,6 +17,34 @@
         "workspace": {
           "type": "string",
           "maxLength": 4096
+        },
+        "coverageDocuments": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "language": {
+              "enum": [
+                "java",
+                "rust",
+                "python",
+                "javascript",
+                "typescript"
+              ]
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50,
+              "default": 20
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "default": 0
+            }
+          },
+          "required": []
         }
       },
       "required": [
@@ -992,7 +1020,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 17
+                  "const": 18
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1002,6 +1030,87 @@
                 },
                 "searchIndex": {
                   "$ref": "#/$defs/SearchAvailability"
+                },
+                "coverageDocuments": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                          "language": {
+                            "$ref": "#/$defs/Language"
+                          },
+                          "path": {
+                            "$ref": "#/$defs/Text"
+                          },
+                          "state": {
+                            "enum": [
+                              "failed",
+                              "partial"
+                            ]
+                          },
+                          "reasons": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                              "enum": [
+                                "notInProducerOutput",
+                                "unmeasurableSourceAnchor",
+                                "rawCaptureUnavailable",
+                                "other",
+                                "nativeGaps",
+                                "capped",
+                                "omitted",
+                                "capturedDiagnostics",
+                                "unrecorded"
+                              ]
+                            }
+                          }
+                        },
+                        "required": [
+                          "language",
+                          "path",
+                          "state",
+                          "reasons"
+                        ]
+                      }
+                    },
+                    "page": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "offset": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "nextOffset": {
+                          "anyOf": [
+                            {
+                              "$ref": "#/$defs/UInt"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "total": {
+                          "$ref": "#/$defs/UInt"
+                        }
+                      },
+                      "required": [
+                        "offset",
+                        "nextOffset",
+                        "total"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "page"
+                  ]
                 }
               },
               "required": [
@@ -1098,7 +1207,7 @@
       ],
       "type": "object"
     },
-    "description": "Index status and limits. Per language, `coverage` counts native syntax tuples and `semantic` reports the selected imported producer (for example rust-analyzer or scip-typescript SCIP): `available` is true when it is fresh and covers documents, with its own tuple counts, so partial coverage of either stays visible. Call this first."
+    "description": "Index status and limits. Per language, `coverage` counts native syntax tuples and `semantic` reports the selected imported producer (for example rust-analyzer or scip-typescript SCIP): `available` is true when it is fresh and covers documents, with its own tuple counts, so partial coverage of either stays visible. Call this first. Pass `coverageDocuments:{}` (optional `language`, `limit` 1-50, default 20, `offset`) to page the failed and partial semantic documents with reason codes."
   },
   {
     "annotations": {
@@ -13546,6 +13655,19 @@
           "minimum": 0,
           "maximum": 9007199254740991,
           "default": 0
+        },
+        "groupBy": {
+          "enum": [
+            "file",
+            "directory",
+            "package"
+          ],
+          "default": "file"
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32
         }
       },
       "required": [
@@ -15808,6 +15930,54 @@
                 },
                 "partial": {
                   "type": "boolean"
+                },
+                "groupBy": {
+                  "enum": [
+                    "file",
+                    "directory",
+                    "package"
+                  ]
+                },
+                "groups": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "source": {
+                        "$ref": "#/$defs/Text"
+                      },
+                      "target": {
+                        "anyOf": [
+                          {
+                            "$ref": "#/$defs/Text"
+                          },
+                          {
+                            "$ref": "#/$defs/ExternalIdentity"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "sites": {
+                        "$ref": "#/$defs/UInt"
+                      },
+                      "production": {
+                        "$ref": "#/$defs/UInt"
+                      },
+                      "test": {
+                        "$ref": "#/$defs/UInt"
+                      }
+                    },
+                    "required": [
+                      "source",
+                      "target",
+                      "sites",
+                      "production",
+                      "test"
+                    ]
+                  }
                 }
               },
               "required": [
@@ -15825,7 +15995,9 @@
                 "partialFiles",
                 "limitations",
                 "externalPackages",
-                "page"
+                "page",
+                "groupBy",
+                "groups"
               ]
             },
             "evidenceBasis": {
@@ -15912,7 +16084,7 @@
       ],
       "type": "object"
     },
-    "description": "Read pinned native-module and external-package references: structural syntax sites, plus fresh semantic call and type bindings where a producer is selected. Production and test sites are separate. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
+    "description": "Read pinned native-module and external-package references: structural syntax sites, plus fresh semantic call and type bindings where a producer is selected. Production and test sites are separate. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null. `groupBy:\"directory\"` (optional `depth`) or `\"package\"` instead pages `groups` rows of summed sites per source and target group, largest first; `limit` then caps rows per page."
   },
   {
     "annotations": {
