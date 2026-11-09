@@ -29,6 +29,9 @@ const CONTENTION_RETRY: Duration = Duration::from_secs(1);
 /// Then contention waits for the next hint or read, and any other fault is reported.
 const CONTENTION_RETRIES: u32 = 5;
 
+/// How long a `building` answer asks its caller to wait before it reads again.
+pub(crate) const RETRY_AFTER_MS: u64 = 250;
+
 /// The read arrived while its core is still being computed. Retryable, never partial.
 #[derive(Debug)]
 pub struct ArchitectureBuilding {
@@ -59,7 +62,7 @@ impl ArchitectureBuilding {
             "indexGeneration": self.pin.index_generation.to_string(),
             "indexRevision": self.pin.index_revision,
             "progress": self.progress,
-            "retryAfterMs": 250,
+            "retryAfterMs": RETRY_AFTER_MS,
         })
     }
 }
@@ -94,10 +97,16 @@ struct Running {
 struct OwnerState {
     /// Something may have changed; the owner compares head and rules with what it published.
     hinted: bool,
-    /// A read asked for a core, so the owner builds even without a rules file.
+    /// A read asked for a core. Only a test's on-demand owner waits for this.
+    #[cfg(feature = "test-support")]
     demanded: bool,
     shutdown: bool,
     thread_started: bool,
+    /// The owner thread is in a turn: it may take a lease and build.
+    stepping: bool,
+    /// The head and rules file the last worker step saw, so an unchanged step does not wake
+    /// the owner to read them under a lease.
+    stepped: Option<(IndexPin, Option<String>)>,
     running: Option<Running>,
     /// Newest first: the head's core and the one before it, or one a page asked for.
     published: Vec<Published>,
@@ -166,6 +175,9 @@ pub(crate) struct ArchitectureOwner {
     builds: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-support")]
     browser_wait: Mutex<Option<Duration>>,
+    /// Build only once a read asks, as before #798.
+    #[cfg(feature = "test-support")]
+    on_demand: AtomicBool,
 }
 
 impl ArchitectureOwner {
@@ -181,7 +193,18 @@ impl ArchitectureOwner {
             builds: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-support")]
             browser_wait: Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            on_demand: AtomicBool::new(false),
         })
+    }
+
+    /// Whether the owner builds `state`'s head now. In production it always does (#798).
+    fn wanted(&self, _state: &OwnerState) -> bool {
+        #[cfg(feature = "test-support")]
+        if self.on_demand.load(Ordering::Acquire) {
+            return _state.demanded;
+        }
+        true
     }
 
     pub(super) fn shut_down(&self) {
@@ -227,6 +250,7 @@ impl ArchitectureOwner {
                 }
                 state.hinted = false;
                 state.retry_at = None;
+                state.stepping = true;
             }
             let Some(daemon) = daemon.upgrade() else {
                 return;
@@ -250,6 +274,10 @@ impl ArchitectureOwner {
                 drop(state);
                 self.changed.notify_all();
             }
+            self.state.lock().unwrap().stepping = false;
+            self.changed.notify_all();
+            // The turn ended: a settled wait in a test samples the owner again.
+            daemon.note_state_change();
         }
     }
 
@@ -283,24 +311,57 @@ fn contention(error: &anyhow::Error) -> bool {
 }
 
 impl DaemonState {
-    /// A coalescing hint after a worker step or a rules edit: no SQLite and no wait.
+    /// A coalescing hint after a worker step or a rules edit: no SQLite and no wait. Every
+    /// active runtime's owner builds each new head, rules file or not, so the first read after
+    /// an activation or a publication usually finds its core published (#798).
     pub fn architecture_hint(self: &Arc<Self>) {
+        let mut state = self.architecture.0.state.lock().unwrap();
+        self.hint_locked(&mut state);
+        drop(state);
+        self.architecture.0.changed.notify_all();
+    }
+
+    fn hint_locked(self: &Arc<Self>, state: &mut OwnerState) {
         let owner = &self.architecture.0;
-        let mut state = owner.state.lock().unwrap();
-        if !state.demanded && !state.thread_started && !self.rules_file_present() {
+        if !state.thread_started && !owner.wanted(state) {
             return;
         }
         owner.head_may_have_moved.store(true, Ordering::Release);
         state.ask();
-        self.start_architecture_owner(&mut state);
-        drop(state);
-        owner.changed.notify_all();
+        self.start_architecture_owner(state);
     }
 
-    fn rules_file_present(&self) -> bool {
-        std::path::Path::new(self.store.workspace_root())
-            .join(crate::rules::RULES_PATH)
-            .exists()
+    /// After a worker step: hint the owner only when the published head or the rules file
+    /// differs from what the last step saw. Building every new head (#798) then adds no read,
+    /// and no lease a retirement would wait for, to a step that changed nothing.
+    /// A runtime that is retiring, closing or closed, or has no readable head, has nothing to
+    /// build, and this reads nothing from it.
+    pub(crate) fn architecture_hint_after_step(self: &Arc<Self>) {
+        use super::RuntimePhase;
+        if matches!(
+            self.runtime_phase(),
+            RuntimePhase::RetireRequested | RuntimePhase::Closing | RuntimePhase::Retired
+        ) {
+            return;
+        }
+        let Ok(head) = self.store.index_baseline() else {
+            return;
+        };
+        let rules = match crate::rules::load(std::path::Path::new(self.store.workspace_root())) {
+            Ok(config) => config.map(|config| config.content_hash),
+            Err(_) => Some("unreadable".into()),
+        };
+        let seen = Some((head, rules));
+        // The head is recorded and its turn submitted under one lock, so the settled wait
+        // never sees the head stepped with no turn due.
+        let mut state = self.architecture.0.state.lock().unwrap();
+        if state.stepped == seen {
+            return;
+        }
+        state.stepped = seen;
+        self.hint_locked(&mut state);
+        drop(state);
+        self.architecture.0.changed.notify_all();
     }
 
     fn start_architecture_owner(self: &Arc<Self>, state: &mut OwnerState) {
@@ -368,7 +429,10 @@ impl DaemonState {
         let owner = &self.architecture.0;
         let deadline = Instant::now() + wait;
         let mut state = owner.state.lock().unwrap();
-        state.demanded = true;
+        #[cfg(feature = "test-support")]
+        {
+            state.demanded = true;
+        }
         let mut submitted = false;
         let mut waiting = false;
         loop {
@@ -511,8 +575,7 @@ impl DaemonState {
                 .filter(|older| older.pin != head)
                 .filter(|older| !state.published.iter().any(|p| p.key == *older));
             state.older = older;
-            let wanted = state.demanded || config.is_some();
-            let key = if !head_done && wanted {
+            let key = if !head_done && owner.wanted(&state) {
                 head_key
             } else if let Some(older) = state.older.clone() {
                 older
@@ -641,6 +704,39 @@ impl DaemonState {
         self.architecture.0.builds.load(Ordering::Acquire)
     }
 
+    /// Whether the owner still owes work for the published head `pin`, for the tests' settled
+    /// wait: a turn is running or due, or no worker step has submitted `pin` yet. A head that
+    /// semantic catch-up or maintenance published is submitted by the worker's next step, so
+    /// until then the owner owes its build (#798).
+    pub(crate) fn architecture_owes(&self, pin: IndexPin) -> bool {
+        let state = self.architecture.0.state.lock().unwrap();
+        state.hinted
+            || state.stepping
+            || state.retry_at.is_some()
+            || state.stepped.as_ref().is_none_or(|(head, _)| *head != pin)
+    }
+
+    /// Wait until the owner has no turn running or due.
+    #[cfg(test)]
+    pub(crate) fn await_architecture_idle_for_tests(&self) {
+        let owner = &self.architecture.0;
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
+        let mut state = owner.state.lock().unwrap();
+        while state.hinted || state.stepping || state.retry_at.is_some() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the architecture owner did not settle"
+            );
+            state = owner.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_architecture_on_demand_for_tests(&self) {
+        self.architecture.0.on_demand.store(true, Ordering::Release);
+    }
+
     #[cfg(feature = "test-support")]
     pub fn set_architecture_browser_wait_for_tests(&self, wait: Duration) {
         *self.architecture.0.browser_wait.lock().unwrap() = Some(wait);
@@ -653,24 +749,18 @@ mod tests {
     use crate::http::RetireOutcome;
     use std::sync::mpsc;
 
-    /// Only a build's read holds a lease: retirement goes ahead while it computes, and the
-    /// owner's next turn never cancels a requested retirement.
-    #[test]
-    fn retirement_does_not_wait_for_a_build_to_compute() {
-        let (_tmp, _store, state, _roots, identity) =
-            crate::http::exceptional_recovery_tests::fixture();
-        state.worker_step().unwrap();
-        std::fs::create_dir_all(identity.root.join(".trellis")).unwrap();
-        std::fs::write(
-            identity.root.join(crate::rules::RULES_PATH),
-            "version=1\n[layers.app]\norder=1\npaths=['**/*.js']",
-        )
-        .unwrap();
+    /// Holds the owner's build at the `nth` time it reaches `point` until the sender drops.
+    fn hold_at(
+        state: &Arc<DaemonState>,
+        point: &'static str,
+        nth: usize,
+    ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (entered, reached) = mpsc::channel();
         let (release, held) = mpsc::channel::<()>();
         let held = Mutex::new(held);
-        state.set_architecture_hook_for_tests(Arc::new(move |point| {
-            if point == "resolving" {
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        state.set_architecture_hook_for_tests(Arc::new(move |at| {
+            if at == point && seen.fetch_add(1, Ordering::AcqRel) == nth {
                 let _ = entered.send(());
                 let _ = held
                     .lock()
@@ -678,7 +768,26 @@ mod tests {
                     .recv_timeout(crate::testing::HANG_BACKSTOP);
             }
         }));
-        state.architecture_hint();
+        (reached, release)
+    }
+
+    fn head(state: &DaemonState) -> IndexPin {
+        state
+            .store
+            .evidence_response_daemon_local()
+            .and_then(|response| response.selected_pin(None))
+            .unwrap()
+    }
+
+    /// Only a build's read holds a lease: retirement goes ahead while it computes, and the
+    /// owner's next turn never cancels a requested retirement.
+    #[test]
+    fn retirement_does_not_wait_for_a_build_to_compute() {
+        let (_tmp, _store, state, _roots, _identity) =
+            crate::http::exceptional_recovery_tests::fixture();
+        let (reached, release) = hold_at(&state, "resolving", 0);
+        // The publication's own hint starts the build (#798).
+        state.worker_step().unwrap();
         reached.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
         assert_eq!(state.leases(), 0);
         assert!(matches!(
@@ -692,6 +801,97 @@ mod tests {
             RetireOutcome::Requested
         ));
         drop(release);
+        assert_eq!(state.architecture_builds_for_tests(), 1);
+    }
+
+    /// #798: a retirement asked for while the head's eager build is reading it declines, as for
+    /// any admitted read, and is requested once that read has ended. Retirement is retried, so
+    /// the warm read delays it and never starves it.
+    #[test]
+    fn a_retirement_during_the_build_read_declines_then_is_requested() {
+        let (_tmp, _store, state, _roots, _identity) =
+            crate::http::exceptional_recovery_tests::fixture();
+        let (reached, release) = hold_at(&state, "reading", 0);
+        state.worker_step().unwrap();
+        reached.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        assert_eq!(state.leases(), 1);
+        assert!(matches!(
+            state.request_retire(|_| true),
+            RetireOutcome::Declined
+        ));
+        drop(release);
+        state.await_architecture_idle_for_tests();
+        assert_eq!(state.leases(), 0);
+        assert!(matches!(
+            state.request_retire(|_| true),
+            RetireOutcome::Requested
+        ));
+    }
+
+    /// #798: a publication builds the new head with no rules file and no read asking, so the
+    /// first read finds its core published.
+    #[test]
+    fn a_publication_builds_the_head_without_rules_or_a_read() {
+        let (_tmp, _store, state, _roots, identity) =
+            crate::http::exceptional_recovery_tests::fixture();
+        assert!(!identity.root.join(crate::rules::RULES_PATH).exists());
+        let (reached, release) = hold_at(&state, "architecture_build_finished", 0);
+        state.worker_step().unwrap();
+        reached
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .expect("the publication started a build");
+        drop(release);
+        // Waits only while that build publishes; this never asks for a build.
+        let core = state.architecture_core_if_available(
+            head(&state),
+            crate::testing::HANG_BACKSTOP,
+            &mut || Ok(()),
+        );
+        assert!(core.is_some());
+        assert!(
+            state
+                .architecture_core(head(&state), None, Duration::ZERO, &mut || Ok(()))
+                .is_ok()
+        );
+        assert_eq!(state.architecture_builds_for_tests(), 1);
+    }
+
+    /// #798: measuring reports each measured document, so a read during it sees the count
+    /// move, and its `building` answer carries that progress.
+    #[test]
+    fn measuring_reports_each_measured_document() {
+        let (_tmp, _store, state, _roots, identity) =
+            crate::http::exceptional_recovery_tests::fixture();
+        std::fs::write(identity.root.join("b.js"), "function b() {}\n").unwrap();
+        std::fs::write(identity.root.join("c.js"), "function c() {}\n").unwrap();
+        // The first report is the phase's start; the second is the first measured document.
+        let (reached, release) = hold_at(&state, "measuring", 1);
+        state.worker_step().unwrap();
+        reached.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        let pin = head(&state);
+        let error = state
+            .architecture_core(pin, None, Duration::ZERO, &mut || Ok(()))
+            .err()
+            .expect("the core is still building");
+        let building = error.downcast_ref::<ArchitectureBuilding>().unwrap();
+        assert_eq!(
+            building.progress,
+            Some(ArchitectureProgress {
+                phase: "measuring",
+                completed: 1,
+                total: 3,
+            })
+        );
+        assert_eq!(
+            building.message(),
+            "Architecture is being computed for this revision (measuring 1 of 3); retry shortly"
+        );
+        drop(release);
+        assert!(
+            state
+                .architecture_core(pin, None, crate::testing::HANG_BACKSTOP, &mut || Ok(()))
+                .is_ok()
+        );
         assert_eq!(state.architecture_builds_for_tests(), 1);
     }
 }

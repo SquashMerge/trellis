@@ -992,7 +992,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 15
+                  "const": 16
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -15569,6 +15569,96 @@
             "name",
             "document"
           ]
+        },
+        "BuildingFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "building"
+                },
+                "currentBasis": {
+                  "$ref": "#/$defs/Basis"
+                },
+                "currentContentHash": {
+                  "const": null
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": true
+                },
+                "progress": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "phase": {
+                          "enum": [
+                            "reading",
+                            "resolving",
+                            "evaluating",
+                            "measuring"
+                          ]
+                        },
+                        "completed": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "total": {
+                          "$ref": "#/$defs/UInt"
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "completed",
+                        "total"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "retryAfterMs": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash",
+                "progress",
+                "retryAfterMs"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error",
+            "workspace",
+            "catchingUp"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -15815,6 +15905,9 @@
         },
         {
           "$ref": "#/$defs/ArgumentFailure"
+        },
+        {
+          "$ref": "#/$defs/BuildingFailure"
         }
       ],
       "type": "object"
@@ -18165,6 +18258,96 @@
             "lookupDependencies"
           ],
           "type": "object"
+        },
+        "BuildingFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "building"
+                },
+                "currentBasis": {
+                  "$ref": "#/$defs/Basis"
+                },
+                "currentContentHash": {
+                  "const": null
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": true
+                },
+                "progress": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "phase": {
+                          "enum": [
+                            "reading",
+                            "resolving",
+                            "evaluating",
+                            "measuring"
+                          ]
+                        },
+                        "completed": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "total": {
+                          "$ref": "#/$defs/UInt"
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "completed",
+                        "total"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "retryAfterMs": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash",
+                "progress",
+                "retryAfterMs"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error",
+            "workspace",
+            "catchingUp"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -18392,6 +18575,9 @@
         },
         {
           "$ref": "#/$defs/LocatedRuleFailure"
+        },
+        {
+          "$ref": "#/$defs/BuildingFailure"
         }
       ],
       "type": "object"
@@ -20966,6 +21152,96 @@
             "lookupDependencies"
           ],
           "type": "object"
+        },
+        "BuildingFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "building"
+                },
+                "currentBasis": {
+                  "$ref": "#/$defs/Basis"
+                },
+                "currentContentHash": {
+                  "const": null
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": true
+                },
+                "progress": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "phase": {
+                          "enum": [
+                            "reading",
+                            "resolving",
+                            "evaluating",
+                            "measuring"
+                          ]
+                        },
+                        "completed": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "total": {
+                          "$ref": "#/$defs/UInt"
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "completed",
+                        "total"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "retryAfterMs": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash",
+                "progress",
+                "retryAfterMs"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error",
+            "workspace",
+            "catchingUp"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -21175,6 +21451,9 @@
         },
         {
           "$ref": "#/$defs/LocatedRuleFailure"
+        },
+        {
+          "$ref": "#/$defs/BuildingFailure"
         }
       ],
       "type": "object"

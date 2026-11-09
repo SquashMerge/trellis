@@ -3997,3 +3997,67 @@ async fn settled_sample_sees_a_replaced_watcher_before_its_status() {
     let moved = runtime.settled_for_tests(None).await.unwrap();
     assert!(moved.index_revision > head.index_revision, "{moved:?}");
 }
+
+/// #798: a head that no worker step has submitted to the Architecture owner yet, as after a
+/// semantic catch-up publication before the worker's next step, is not settled: the owner
+/// still owes its build. The worker is idle, so nothing submits the head until the test wakes
+/// it, and the settled wait then returns only once that build has run.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn settled_waits_for_the_architecture_build_owed_for_a_new_head() {
+    use trellis::daemon::registry::{NotSettled, SettleBusy};
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let runtime = idle_without_periodic_inventory(&mut registry, &id).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let before = runtime.sample_settled_for_tests(None).unwrap();
+    let builds = scheduler.architecture_builds_for_tests();
+    // A publication outside a worker step, with the worker asleep.
+    fs::write(checkout.join("b.js"), "function b() {}\n").unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(checkout.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    let head = store.index_baseline().unwrap();
+    assert_ne!(head, before);
+    assert_eq!(
+        runtime.sample_settled_for_tests(None),
+        Err(NotSettled::Hang(SettleBusy::Architecture))
+    );
+    assert_eq!(scheduler.architecture_builds_for_tests(), builds);
+    // The worker's next step submits the head; the wait returns after its build.
+    assert!(
+        scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Any
+        ))
+        .add_path(checkout.join("b.js"))))
+    );
+    let settled = runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(settled, head);
+    assert_eq!(scheduler.architecture_builds_for_tests(), builds + 1);
+}
