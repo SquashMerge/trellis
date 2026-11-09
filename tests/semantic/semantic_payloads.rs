@@ -400,6 +400,19 @@ fn restored_noncaptured_version_hits_retained_payload() {
     assert_eq!(freshness(v3).1, freshness(v1).1);
 }
 
+/// AC4: a document whose bytes changed has another version, so another key, and writes a
+/// payload of its own.
+#[test]
+fn edited_document_does_not_hit_the_retained_payload() {
+    let (world, import, counts) = payload_world();
+    local_edit(&world, "src/C.js", "function c(){ }\n// edited\n", &counts);
+    let head = world.store.index_baseline().unwrap();
+    assert_ne!(
+        payload_of(&world, head, "src/C.js"),
+        payload_of(&world, import, "src/C.js")
+    );
+}
+
 /// AC4: an unchanged document whose dependency changed does not reuse the payload.
 #[test]
 fn dependency_version_change_misses() {
