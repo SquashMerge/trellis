@@ -44,6 +44,55 @@ fn settles_queued_and_running_foreign_rows_without_touching_current_fifo() {
     assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
 }
 
+/// APFS renumbers `st_dev` across reboots (#813): a pending row of the same root inode
+/// is adopted, not settled as `root_changed`; a row of another inode still is.
+#[test]
+fn adopts_device_only_rows_and_settles_other_inodes() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let options = IndexOptions::new(root.path().to_owned());
+    let rebooted_queued = store.enqueue_request(&options, None).unwrap();
+    let rebooted_running = store.enqueue_request(&options, None).unwrap();
+    let replaced = store.enqueue_request(&options, None).unwrap();
+    let other_device = (store.identity.device ^ 1).to_string();
+    let db = Connection::open(store.request_db_path()).unwrap();
+    db.execute(
+        "UPDATE requests SET root_device=?1 WHERE id IN (?2,?3,?4)",
+        params![
+            other_device,
+            rebooted_queued.id,
+            rebooted_running.id,
+            replaced.id
+        ],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE requests SET state='running',claim_incarnation='prior',started_at='1' WHERE id=?1",
+        [&rebooted_running.id],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE requests SET root_inode='old' WHERE id=?1",
+        [&replaced.id],
+    )
+    .unwrap();
+    drop(db);
+    assert_eq!(store.settle_foreign_root_requests().unwrap(), 1);
+    let replaced = store.request_by_id(&replaced.id).unwrap_err();
+    assert!(replaced.to_string().contains("root_changed"));
+    for (accepted, state) in [(&rebooted_queued, "queued"), (&rebooted_running, "running")] {
+        let row = store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!((row.seq, row.state.as_str()), (accepted.seq, state));
+        assert_eq!(row.root_device, store.identity.device.to_string());
+        assert_eq!(row.error_code, None);
+    }
+    // The prior incarnation's running row stays claimable by crash recovery.
+    let pending = store.earliest_unfinished_request().unwrap().unwrap();
+    assert_eq!(pending.id, rebooted_queued.id);
+    assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
+}
+
 #[test]
 fn ambiguous_commit_reopens_and_confirms_terminal_rows() {
     let state = tempfile::tempdir().unwrap();

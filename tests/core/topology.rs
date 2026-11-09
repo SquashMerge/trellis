@@ -1188,6 +1188,74 @@ fn gc_report_accepts_current_schema_but_rejects_bad_inventory() {
     assert_eq!(inspect().reason, "recent_open");
 }
 
+/// APFS renumbers `st_dev` across reboots (#813): GC keeps an index whose recorded root
+/// differs only in device, and still deletes one whose root inode was replaced.
+#[cfg(feature = "test-support")]
+#[test]
+fn automatic_gc_keeps_device_only_drift_and_deletes_a_replaced_root() {
+    let (temp, roots) = common::fixture();
+    let now = 1_800_000_000_i64;
+    let mut checkouts = Vec::new();
+    for name in ["rebooted", "replaced"] {
+        let workspace = temp.path().join(name);
+        fs::create_dir(&workspace).unwrap();
+        drop(common::open_store(temp.path(), &workspace).unwrap());
+        let identity = WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap();
+        let db = rusqlite::Connection::open(roots.index_db(&identity)).unwrap();
+        db.execute("UPDATE index_metadata SET last_opened_at=?1", [now])
+            .unwrap();
+        let column = if name == "rebooted" {
+            "root_device"
+        } else {
+            "root_inode"
+        };
+        let stored: String = db
+            .query_row(
+                &format!("SELECT {column} FROM index_metadata WHERE singleton=1"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let drifted = (stored.parse::<u64>().unwrap() ^ 1).to_string();
+        db.execute(
+            &format!("UPDATE index_metadata SET {column}=?1 WHERE singleton=1"),
+            [drifted],
+        )
+        .unwrap();
+        checkouts.push(identity);
+    }
+    let reason = |identity: &WorkspaceIdentity| {
+        let entry = roots
+            .gc_report_at(now)
+            .unwrap()
+            .derived
+            .into_iter()
+            .find(|entry| entry.root_key == identity.root_key)
+            .unwrap();
+        (entry.status, entry.reason)
+    };
+    assert_eq!(reason(&checkouts[0]), ("unknown", "recent_open"));
+    assert_eq!(reason(&checkouts[1]), ("eligible", "root_replaced"));
+    let current_root = temp.path().join("current-gc");
+    fs::create_dir(&current_root).unwrap();
+    drop(common::open_store(temp.path(), &current_root).unwrap());
+    let current = WorkspaceIdentity::discover(Some(&current_root), &current_root).unwrap();
+    let writer = roots
+        .writer(std::sync::Arc::new(
+            current.verified_clone_for_tests().unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(roots.automatic_gc_at(&current, &writer, now).unwrap(), 1);
+    assert!(
+        roots.index_db(&checkouts[0]).exists(),
+        "device-only drift is kept"
+    );
+    assert!(
+        !roots.index_dir(&checkouts[1]).exists(),
+        "a replaced root is removed"
+    );
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn automatic_gc_deletes_old_schema_indexes_unless_in_use_or_unreadable() {

@@ -1307,11 +1307,10 @@ fn inspect_index_with_open_hook(
     }
     match fs::symlink_metadata(&spelling) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(("eligible", "root_missing")),
-        Ok(m)
-            if m.is_dir()
-                && !m.file_type().is_symlink()
-                && (m.dev(), m.ino()) == (device, inode) =>
-        {
+        // The spelling is proven by the key; the inode completes the root identity. `st_dev`
+        // is not compared: APFS renumbers it across reboots, so a device-only difference is
+        // the same root, never `root_replaced` (#813).
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() && m.ino() == inode => {
             Ok(classify_index_age(now_secs, age))
         }
         Ok(m) if !m.file_type().is_symlink() => Ok(("eligible", "root_replaced")),

@@ -1636,9 +1636,10 @@ impl Store {
     fn verify_request_root(&self, row: &Option<Request>) -> Result<()> {
         self.identity.verify()?;
         if let Some(row) = row {
+            // A row's persisted root is its inode (#813): one that differs only in `st_dev` is
+            // this root after a reboot, adopted by the next foreign-root settlement.
             ensure!(
-                row.root_device == self.identity.device.to_string()
-                    && row.root_inode == self.identity.inode.to_string(),
+                row.root_inode == self.identity.inode.to_string(),
                 "root_changed: request belongs to another root"
             );
         }
@@ -1854,6 +1855,17 @@ impl Store {
                     db.transaction_with_behavior(TransactionBehavior::Immediate),
                 )?;
                 self.identity.verify()?;
+                // The persisted root identity is the inode within this path-keyed queue, never
+                // `st_dev`: APFS renumbers it across reboots (#813). A pending row that differs
+                // only in device is this root's and is adopted in this transaction; the
+                // existing crash recovery then reclaims a row that was running.
+                super::storage_result(tx.execute(
+                    "UPDATE requests SET root_device=?1 WHERE state IN ('queued','running') AND root_inode=?2 AND root_device<>?1",
+                    params![
+                        self.identity.device.to_string(),
+                        self.identity.inode.to_string()
+                    ],
+                ))?;
                 let affected: Vec<Request> = {
                     let mut statement = super::storage_result(tx.prepare(&format!(
                         "SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND (root_device<>?1 OR root_inode<>?2) ORDER BY seq"
