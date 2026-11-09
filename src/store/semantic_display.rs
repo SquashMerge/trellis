@@ -999,6 +999,46 @@ impl LanguageTier {
     }
 }
 
+/// One failed or partial semantic document of a language's selected producer (#780).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageDocument {
+    pub language: &'static str,
+    pub path: String,
+    /// Failed, else partial.
+    pub failed: bool,
+    /// Typed reason codes: one for a failed tuple, one or more for a partial one.
+    pub reasons: Vec<&'static str>,
+}
+
+/// The reason code of a failed tuple, from its stored diagnostic (the buckets of the #520
+/// summary).
+pub(crate) fn failed_reason(diagnostic: Option<&str>) -> &'static str {
+    match diagnostic {
+        Some("excluded_failed_by_producer") => "notInProducerOutput",
+        Some("unmeasurable_source_anchor") => "unmeasurableSourceAnchor",
+        Some(text) if text.starts_with(native_first::UNAVAILABLE_DIAGNOSTIC) => {
+            "rawCaptureUnavailable"
+        }
+        _ => "other",
+    }
+}
+
+/// The reason codes of a partial tuple, named as the #520 `partialReasons` counts, from its
+/// recorded reasons `[nativeGaps, capped, omitted, capturedDiagnostics]`; `unrecorded` when
+/// the import recorded none.
+pub(crate) fn partial_reasons(reasons: [Option<bool>; 4]) -> Vec<&'static str> {
+    let named: Vec<&'static str> = ["nativeGaps", "capped", "omitted", "capturedDiagnostics"]
+        .into_iter()
+        .zip(reasons)
+        .filter_map(|(name, set)| set.unwrap_or(false).then_some(name))
+        .collect();
+    if named.is_empty() {
+        vec!["unrecorded"]
+    } else {
+        named
+    }
+}
+
 /// The five MCP languages in #22 order.
 pub const MCP_LANGUAGES: [&str; 5] = crate::semantic_evidence::LANGUAGE_ORDER;
 
@@ -1155,6 +1195,85 @@ impl EvidenceResponse {
             }
         }
         Ok(tiers)
+    }
+
+    /// The documents behind each language's `semantic.coverage.failed` and `partial` counts
+    /// (#780): the selected failed or partial tuples of the language's default producer at
+    /// the admitted head, plus older-basis projected documents (#620) whose basis tuple is
+    /// failed or partial, as `tiers` counts them. Sorted by #22 language order, failed
+    /// before partial, then path bytes. `language` keeps one language.
+    pub fn mcp_coverage_documents(
+        &self,
+        tiers: &[LanguageTier; 5],
+        language: Option<&str>,
+    ) -> Result<Vec<CoverageDocument>> {
+        let selected = self.selected(None)?;
+        let mut documents = Vec::new();
+        for (tier, name) in tiers.iter().zip(MCP_LANGUAGES) {
+            if language.is_some_and(|wanted| wanted != name) {
+                continue;
+            }
+            let Some(producer) = tier.producer_id.as_deref() else {
+                continue;
+            };
+            let mut statement = self.db.prepare_cached(
+                "SELECT c.path,c.state,c.diagnostic,
+                        r.macro_invocation+r.attribute_item+r.macro_definition+r.other>0,
+                        r.capped,r.omitted,r.captured_diagnostics
+                 FROM semantic_coverage c LEFT JOIN semantic_coverage_reasons r ON r.tuple_id=c.tuple_id
+                 WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
+                   AND c.state IN ('failed','partial') AND (?4 IS NULL OR c.path=?4)",
+            )?;
+            let mut read = |key: &str, path: Option<&str>| -> Result<()> {
+                for row in statement.query_map(params![key, producer, name, path], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        [
+                            row.get::<_, Option<bool>>(3)?,
+                            row.get::<_, Option<bool>>(4)?,
+                            row.get::<_, Option<bool>>(5)?,
+                            row.get::<_, Option<bool>>(6)?,
+                        ],
+                    ))
+                })? {
+                    let (path, state, diagnostic, reasons) = row?;
+                    let failed = state == "failed";
+                    documents.push(CoverageDocument {
+                        language: name,
+                        failed,
+                        reasons: if failed {
+                            vec![failed_reason(diagnostic.as_deref())]
+                        } else {
+                            partial_reasons(reasons)
+                        },
+                        path,
+                    });
+                }
+                Ok(())
+            };
+            read(&selected.key, None)?;
+            for document in &tier.documents {
+                if document.projection.semantic_status == crate::model::SemanticStatus::OlderBasis {
+                    let basis = semantic_pin_key(document.projection.semantic_basis_pin);
+                    read(&basis, Some(&document.path))?;
+                }
+            }
+        }
+        documents.sort_by(|a, b| {
+            (
+                crate::semantic_evidence::language_order(a.language),
+                !a.failed,
+                &a.path,
+            )
+                .cmp(&(
+                    crate::semantic_evidence::language_order(b.language),
+                    !b.failed,
+                    &b.path,
+                ))
+        });
+        Ok(documents)
     }
 
     /// Bindings for measured calls of the admitted head, each under its document language's
@@ -1889,6 +2008,38 @@ mod mcp_languages_tests {
         assert_eq!(
             super::MCP_LANGUAGES,
             crate::semantic_evidence::LANGUAGE_ORDER
+        );
+    }
+
+    /// #780: each stored failure diagnostic and recorded partial reason has its typed code,
+    /// in the #520 summary's buckets; anything else is `other` or `unrecorded`.
+    #[test]
+    fn coverage_document_reason_codes() {
+        use super::{failed_reason, partial_reasons};
+        for (diagnostic, code) in [
+            (Some("excluded_failed_by_producer"), "notInProducerOutput"),
+            (
+                Some("unmeasurable_source_anchor"),
+                "unmeasurableSourceAnchor",
+            ),
+            (
+                Some("selected raw capture unavailable: batch 3 missing"),
+                "rawCaptureUnavailable",
+            ),
+            (Some("Failed fixture"), "other"),
+            (None, "other"),
+        ] {
+            assert_eq!(failed_reason(diagnostic), code, "{diagnostic:?}");
+        }
+        assert_eq!(partial_reasons([None; 4]), ["unrecorded"]);
+        assert_eq!(partial_reasons([Some(false); 4]), ["unrecorded"]);
+        assert_eq!(
+            partial_reasons([Some(true), Some(false), Some(false), Some(false)]),
+            ["nativeGaps"]
+        );
+        assert_eq!(
+            partial_reasons([Some(false), Some(true), Some(true), Some(true)]),
+            ["capped", "omitted", "capturedDiagnostics"]
         );
     }
 }

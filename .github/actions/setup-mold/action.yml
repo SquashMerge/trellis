@@ -1,0 +1,71 @@
+name: Set up mold
+description: >-
+  Install mold 2.42.1 on Linux and make Rust link with it. The release tarball
+  is checksummed and cached, so a warm cache needs no network. If it cannot be
+  fetched, the job links with the system linker instead and says so (#829).
+outputs:
+  linker:
+    description: "`mold`, or `system` when mold could not be fetched."
+    value: ${{ steps.install.outputs.linker }}
+runs:
+  using: composite
+  steps:
+    # The version in both cache keys must match MOLD_VERSION in mold.sh.
+    - name: Restore the mold tarball
+      id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cache/trellis-ci/mold
+        key: mold-2.42.1-${{ runner.os }}-${{ runner.arch }}
+    - name: Download mold
+      id: download
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        # A first try, then three retries after 10, 30 and 60 s. A download
+        # that fails or does not match the release's checksum counts as failed.
+        . "$GITHUB_ACTION_PATH/mold.sh"
+        mkdir -p "$MOLD_DIR"
+        for delay in 0 10 30 60; do
+          if [ "$delay" -gt 0 ]; then
+            echo "mold download failed; retrying in ${delay}s"
+            sleep "$delay"
+          fi
+          if curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 300 -o "$MOLD_TARBALL.part" "$MOLD_URL" &&
+            mold_verify "$MOLD_TARBALL.part"; then
+            mv "$MOLD_TARBALL.part" "$MOLD_TARBALL"
+            echo "fetched=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        done
+        rm -f "$MOLD_TARBALL.part"
+    - name: Cache the mold tarball
+      if: steps.download.outputs.fetched == 'true'
+      continue-on-error: true
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cache/trellis-ci/mold
+        key: mold-2.42.1-${{ runner.os }}-${{ runner.arch }}
+    - name: Install mold, or fall back to the system linker
+      id: install
+      shell: bash
+      run: |
+        . "$GITHUB_ACTION_PATH/mold.sh"
+        if [ ! -f "$MOLD_TARBALL" ] || ! mold_verify "$MOLD_TARBALL"; then
+          echo "::warning title=mold unavailable::Could not fetch mold $MOLD_VERSION; this job links with the system linker (slower, still correct)."
+          echo "linker=system" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        # As rui314/setup-mold does: unpack into /usr/local and make mold the
+        # default `ld`.
+        sudo tar -C /usr/local --strip-components=1 --no-overwrite-dir -xzf "$MOLD_TARBALL"
+        if [ "$(realpath /usr/bin/ld)" != /usr/local/bin/mold ]; then
+          sudo ln -sf /usr/local/bin/mold "$(realpath /usr/bin/ld)"
+        fi
+        mold --version
+        # Rust on x86_64 Linux links with its bundled rust-lld by default,
+        # which bypasses the system `ld`. Turn that off and ask the C compiler
+        # driver for mold explicitly. Workflows run this before rust-cache, so
+        # it is part of their Linux cache keys.
+        echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+        echo "linker=mold" >> "$GITHUB_OUTPUT"

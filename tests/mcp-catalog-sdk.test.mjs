@@ -62,7 +62,7 @@ test("the twelve-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain", "trellis_show",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 18);
+  assert.equal(describe.toolVersion.const, 19);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
@@ -289,5 +289,57 @@ test("architecture building failures require a basis and a null content hash", (
     ]) {
       assert.equal(validate(variant(change)), false, `${name} accepted ${label}`);
     }
+  }
+});
+
+// #780: describe's opt-in coverage document request and page are closed.
+test("describe coverage documents are an opt-in closed request and page", () => {
+  const describe = tools[0];
+  const input = ajv.compile(describe.inputSchema);
+  for (const coverageDocuments of [{}, { language: "rust" }, { language: "typescript", limit: 50, offset: 7 }]) {
+    assert.ok(input({ schemaVersion: 1, coverageDocuments }), JSON.stringify(input.errors));
+  }
+  for (const coverageDocuments of [null, true, { language: "go" }, { limit: 0 }, { limit: 51 },
+    { offset: -1 }, { state: "failed" }]) {
+    assert.equal(input({ schemaVersion: 1, coverageDocuments }), false, JSON.stringify(coverageDocuments));
+  }
+  const data = describe.outputSchema.oneOf[0].properties.data;
+  assert.ok(!data.required.includes("coverageDocuments"));
+  const page = ajv.compile({ $schema: describe.outputSchema.$schema, $defs: describe.outputSchema.$defs,
+    ...data.properties.coverageDocuments });
+  const item = { language: "rust", path: "src/b.rs", state: "failed", reasons: ["notInProducerOutput"] };
+  const valid = { items: [item, { ...item, state: "partial", reasons: ["nativeGaps", "capped"] }],
+    page: { offset: 0, nextOffset: null, total: 2 } };
+  assert.ok(page(valid), JSON.stringify(page.errors));
+  for (const invalid of [
+    { ...valid, items: [{ ...item, state: "complete" }] },
+    { ...valid, items: [{ ...item, reasons: [] }] },
+    { ...valid, items: [{ ...item, reasons: ["excluded_failed_by_producer"] }] },
+    { ...valid, items: [{ ...item, diagnostic: "x" }] },
+    { items: [] },
+  ]) assert.equal(page(invalid), false, JSON.stringify(invalid));
+});
+
+// #775: references groupBy is closed, depth is bounded, and group rows are closed.
+test("references groupBy input and group rows are closed", () => {
+  const references = tools.find(tool => tool.name === "trellis_references");
+  const input = ajv.compile(references.inputSchema);
+  for (const ok of [{ groupBy: "file" }, { groupBy: "directory", depth: 1 }, { groupBy: "package", limit: 50 }]) {
+    assert.ok(input({ schemaVersion: 1, ...ok }), JSON.stringify(input.errors));
+  }
+  for (const bad of [{ groupBy: "module" }, { groupBy: null }, { groupBy: "directory", depth: 0 },
+    { groupBy: "directory", depth: 33 }, { groupBy: "directory", depth: "2" }]) {
+    assert.equal(input({ schemaVersion: 1, ...bad }), false, JSON.stringify(bad));
+  }
+  const data = references.outputSchema.oneOf[0].properties.data;
+  assert.ok(data.required.includes("groups") && data.required.includes("groupBy"));
+  const rows = ajv.compile({ $schema: references.outputSchema.$schema, $defs: references.outputSchema.$defs,
+    ...data.properties.groups });
+  const serde = { kind: "externalPackage", sourceSetId: "s", language: "rust", package: "serde", standardLibrary: false };
+  const row = { source: "src/app", target: "src/lib", sites: 3, production: 2, test: 1 };
+  assert.ok(rows([row, { ...row, target: serde }, { ...row, target: null }]), JSON.stringify(rows.errors));
+  for (const invalid of [{ ...row, target: { ...serde, extra: 1 } }, { ...row, kindCounts: {} },
+    (({ test, ...rest }) => rest)(row)]) {
+    assert.equal(rows([invalid]), false, JSON.stringify(invalid));
   }
 });

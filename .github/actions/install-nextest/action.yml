@@ -1,0 +1,70 @@
+name: Install cargo-nextest
+description: >-
+  Install cargo-nextest 0.9.150 with the pinned taiki-e/install-action, which
+  verifies its SHA-256. The installed binary is cached, so a warm cache needs
+  no network; on a miss the install is retried after 10, 30 and 60 s, and only
+  the last failure fails the job (#829).
+runs:
+  using: composite
+  steps:
+    # The version in both cache keys must match every `tool:` below.
+    - name: Restore cargo-nextest
+      id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cache/trellis-ci/nextest
+        key: cargo-nextest-0.9.150-${{ runner.os }}-${{ runner.arch }}
+    - name: Use the cached cargo-nextest
+      if: steps.cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        echo "$HOME/.cache/trellis-ci/nextest" >> "$GITHUB_PATH"
+        "$HOME/.cache/trellis-ci/nextest/cargo-nextest" nextest --version
+    - id: try1
+      if: steps.cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      with:
+        tool: cargo-nextest@0.9.150
+    - if: steps.try1.outcome == 'failure'
+      shell: bash
+      run: echo "cargo-nextest install failed; retrying in 10s"; sleep 10
+    - id: try2
+      if: steps.try1.outcome == 'failure'
+      continue-on-error: true
+      uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      with:
+        tool: cargo-nextest@0.9.150
+    - if: steps.try2.outcome == 'failure'
+      shell: bash
+      run: echo "cargo-nextest install failed; retrying in 30s"; sleep 30
+    - id: try3
+      if: steps.try2.outcome == 'failure'
+      continue-on-error: true
+      uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      with:
+        tool: cargo-nextest@0.9.150
+    - if: steps.try3.outcome == 'failure'
+      shell: bash
+      run: echo "cargo-nextest install failed; retrying in 60s"; sleep 60
+    # The last try fails the job if it fails.
+    - id: try4
+      if: steps.try3.outcome == 'failure'
+      uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      with:
+        tool: cargo-nextest@0.9.150
+    - name: Stage cargo-nextest for the cache
+      id: stage
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.cache/trellis-ci/nextest"
+        cp "$(command -v cargo-nextest)" "$HOME/.cache/trellis-ci/nextest/cargo-nextest"
+        "$HOME/.cache/trellis-ci/nextest/cargo-nextest" nextest --version
+    - name: Cache cargo-nextest
+      if: steps.stage.outcome == 'success'
+      continue-on-error: true
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cache/trellis-ci/nextest
+        key: cargo-nextest-0.9.150-${{ runner.os }}-${{ runner.arch }}
