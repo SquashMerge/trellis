@@ -291,6 +291,12 @@ impl DaemonState {
                 hook();
             }
         }
+        // Every startup attempt of a test-support daemon fails, so its
+        // recovery blocks after the failure limit (#842).
+        #[cfg(feature = "test-support")]
+        if std::env::var_os("TRELLIS_TEST_DAEMON_STARTUP_FAIL").is_some() {
+            anyhow::bail!("injected startup reconciliation failure");
+        }
         if let RuntimeState::Reconciling { attempts, .. } = &mut *self.runtime.lock().unwrap() {
             *attempts += 1;
         }

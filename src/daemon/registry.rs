@@ -2526,6 +2526,14 @@ impl CheckoutRuntime {
         }
     }
 
+    /// The typed `recovery_blocked: <reason>` of a startup recovery that hit
+    /// its failure limit, as `cli_status` reports it (#768).
+    pub fn recovery_blocker(&self) -> Option<String> {
+        self.resources()
+            .ok()
+            .and_then(|resources| resources.scheduler.recovery_blocker())
+    }
+
     /// The first error of the current startup reconciliation run.
     pub fn reconciliation_error(&self) -> Option<String> {
         self.resources()
