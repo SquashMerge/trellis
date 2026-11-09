@@ -782,16 +782,20 @@ fn rules_envelopes_accept_classified_evidence_and_kind_counts() {
             "data":{"rulesVersion":"rules:v2","indexGeneration":"g","indexRevision":1,
                 "rulesFile":{"path":".trellis/rules.toml","source":"checkout-config","contentHash":"0".repeat(64)},
                 "instances":[instance],"testOnly":[],"counts":counts,"testCounts":counts,
+                "apps":[{"name":"trellis","manifest":"Cargo.toml","counts":counts}],"noApp":{"counts":counts},
                 "unassignedFileCount":0,"unassigned":[],"partialFiles":[],"limitations":[],
                 "externalPackages":[],"page":page,"semanticBases":[]},
             "warnings":[],"partial":false,"truncated":false,"truncationReason":null,
             "workspace":"/selected","catchingUp":false})
     };
+    // #784: explain does not carry the per-app counts.
+    let mut explain = envelope(json!({"offset":0,"nextOffset":null,"total":1}));
+    explain["data"].as_object_mut().unwrap().remove("apps");
+    explain["data"].as_object_mut().unwrap().remove("noApp");
     validate_structured_content(&[
         json!({"name":"trellis_rules_check","structuredContent":
             envelope(json!({"offset":0,"nextOffset":null,"total":1,"status":null}))}),
-        json!({"name":"trellis_rules_explain","structuredContent":
-            envelope(json!({"offset":0,"nextOffset":null,"total":1}))}),
+        json!({"name":"trellis_rules_explain","structuredContent":explain}),
     ]);
 }
 
@@ -11575,6 +11579,9 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
     assert_eq!(witness["targetReason"], "structural_only");
     assert!(witness["target"].is_null());
     assert_eq!(data["page"]["offset"], 0);
+    // #784: with no detected app the check carries `apps: []` and `noApp` holds every count.
+    assert_eq!(data["apps"], json!([]));
+    assert_eq!(data["noApp"]["counts"], data["counts"]);
     structured.push(json!({"name":"trellis_rules_check","structuredContent":envelope.clone()}));
     // The unscoped check pages too; its concatenated instances keep every row.
     let mut offset = 0;
@@ -11595,6 +11602,8 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
             data["counts"], *whole,
             "every page carries the whole-result counts"
         );
+        assert_eq!(data["apps"], json!([]));
+        assert_eq!(data["noApp"]["counts"], *whole);
         instances += data["instances"].as_array().unwrap().len();
         for row in data["instances"].as_array().unwrap() {
             if row["rule"] == "$layers" || row["rule"] == "$external" {
@@ -11628,7 +11637,10 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
         json!({"schemaVersion":1,"expectedBasis":basis,"rule":"$layers","target":unknown["target"],"limit":2}),
     );
     tool(&explained, None, true);
-    let row = &explained["result"]["structuredContent"]["data"]["instances"][0];
+    let explained_data = &explained["result"]["structuredContent"]["data"];
+    assert!(explained_data.get("apps").is_none(), "{explained_data}");
+    assert!(explained_data.get("noApp").is_none(), "{explained_data}");
+    let row = &explained_data["instances"][0];
     assert_eq!(row["evidence"].as_array().unwrap().len(), 2);
     assert_eq!(row["omittedEvidence"], 298);
     assert_eq!(row["kindCounts"]["import"], 300, "{row}");

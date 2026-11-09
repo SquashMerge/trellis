@@ -1025,7 +1025,6 @@ impl<'a> AppScope<'a> {
     }
 
     /// The name of the app at `index`, as returned by [`AppScope::file`].
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn name(&self, index: usize) -> Option<&str> {
         self.apps.get(index).map(|app| app.name.as_str())
     }
@@ -1036,7 +1035,6 @@ impl<'a> AppScope<'a> {
     }
 
     /// The app of `path`: the one app of its `layer`, otherwise the app whose root contains it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn file(&self, path: &str, layer: Option<&str>) -> Option<usize> {
         if self.apps.is_empty() {
             return None;
@@ -1048,6 +1046,27 @@ impl<'a> AppScope<'a> {
             }
         }
         crate::apps::containing(self.apps, path)
+    }
+
+    /// The one app a rule row counts under; `None` is "no app" (#784). A `$layers` row between
+    /// two layers belongs to their single common app. Every other row follows its target file,
+    /// through the row's source layer or, when that is null, the file's own assigned layer.
+    fn bucket(&self, assignments: &BTreeMap<&str, Option<&str>>, row: &Value) -> Option<usize> {
+        if self.apps.is_empty() {
+            return None;
+        }
+        let source = row["sourceLayer"].as_str();
+        if let (Some(source), Some(destination)) = (source, row["destinationLayer"].as_str()) {
+            let (from, to) = (self.layer(source), self.layer(destination));
+            let mut common = from.intersection(&to).copied();
+            return match (common.next(), common.next()) {
+                (Some(app), None) => Some(app),
+                _ => None,
+            };
+        }
+        let path = row["target"]["path"].as_str()?;
+        let layer = source.or_else(|| assignments.get(path).copied().flatten());
+        self.file(path, layer)
     }
 }
 
@@ -1228,12 +1247,14 @@ fn decorate(config: &Config, source_set: Option<&str>, row: &mut Value) {
         row["exceptionReason"] = json!(e.reason);
     }
 }
-fn counts(rows: &[Value]) -> Value {
+fn counts<'a>(rows: impl IntoIterator<Item = &'a Value>) -> Value {
+    let mut comparable = 0;
     let mut conforms = 0;
     let mut deviates = 0;
     let mut unknown = 0;
     let mut excepted = 0;
     for row in rows {
+        comparable += 1;
         if row["excepted"] == true {
             excepted += 1;
         } else {
@@ -1244,7 +1265,7 @@ fn counts(rows: &[Value]) -> Value {
             }
         }
     }
-    json!({"comparable":rows.len(),"conforms":conforms,"deviates":deviates,"unknown":unknown,"excepted":excepted})
+    json!({"comparable":comparable,"conforms":conforms,"deviates":deviates,"unknown":unknown,"excepted":excepted})
 }
 /// A reference site as rule evidence: a semantic site carries its binding's proof (#523).
 /// Every reference site also carries its call-site `lines`, `relationKind`, `spelling`,
@@ -2342,9 +2363,25 @@ pub(crate) fn evaluate_prepared<'a>(
     if partial > 0 {
         limitations.push(crate::syntax_bounds::limitation(partial));
     }
+    let app_counts: Vec<Value> = base
+        .apps()
+        .iter()
+        .enumerate()
+        .map(|(index, app)| {
+            let rows = instances
+                .iter()
+                .filter(|row| scope.bucket(&assignments, row) == Some(index));
+            json!({"name":scope.name(index),"manifest":app.manifest,"counts":counts(rows)})
+        })
+        .collect();
+    let no_app = counts(
+        instances
+            .iter()
+            .filter(|row| scope.bucket(&assignments, row).is_none()),
+    );
     Ok(Evaluation {
         data: json!({"rulesVersion":"rules:v2","indexGeneration":refs.data["indexGeneration"],"indexRevision":refs.data["indexRevision"],"rulesFile":descriptor(config),
-        "counts":counts(&instances),"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"unassignedFileCount":unassigned_files,"externalPackages":external_packages,
+        "counts":counts(&instances),"apps":app_counts,"noApp":{"counts":no_app},"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"unassignedFileCount":unassigned_files,"externalPackages":external_packages,
         "partialFiles":partial_files,"limitations":limitations,"semanticDocuments":refs.data["semanticDocuments"],"partial":refs.data["partial"]}),
         layers: assignments,
     })
@@ -2389,6 +2426,10 @@ pub fn explain(
         );
     }
     let mut found = false;
+    if let Some(fields) = payload.as_object_mut() {
+        fields.remove("apps");
+        fields.remove("noApp");
+    }
     for (field, count_field) in [("instances", "counts"), ("testOnly", "testCounts")] {
         let rows = payload[field]
             .as_array_mut()
@@ -2399,7 +2440,7 @@ pub fn explain(
                 && destination.map_or(row["destination"].is_null(), |d| row["destination"] == *d)
         });
         found |= !rows.is_empty();
-        let count = counts(rows);
+        let count = counts(&*rows);
         payload[count_field] = count;
     }
     ensure!(found, "not_found: rule instance");

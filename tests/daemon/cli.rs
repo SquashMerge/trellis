@@ -3678,6 +3678,9 @@ paths = ["src/low.rs"]
     assert_eq!(payload["indexGeneration"], basis["indexGeneration"]);
     assert_eq!(payload["indexRevision"], basis["indexRevision"]);
     assert_eq!(payload["counts"]["deviates"], 1);
+    // #784: no app is detected here, so `apps` is empty and `noApp` holds the whole count.
+    assert_eq!(payload["apps"], serde_json::json!([]));
+    assert_eq!(payload["noApp"]["counts"], payload["counts"]);
     assert_eq!(payload["instances"].as_array().unwrap().len(), 1);
     let violation = &payload["instances"][0];
     assert_eq!(violation["rule"], "$layers");
@@ -3869,6 +3872,59 @@ require = [{ calls = "destination" }]
             .iter()
             .any(|evidence| evidence["kind"] == "call" && evidence["callId"].is_string())
     );
+}
+
+#[test]
+fn architecture_cli_prints_per_app_counts_and_a_cross_app_pair_exits_zero() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    fs::create_dir(root.join(".trellis")).unwrap();
+    fs::write(root.join("a/package.json"), "{\"name\":\"alpha\"}\n").unwrap();
+    fs::write(root.join("b/package.json"), "{\"name\":\"beta\"}\n").unwrap();
+    fs::write(
+        root.join("a/main.js"),
+        "import { g } from '../b/lib.js';\nexport function f() { g(); }\n",
+    )
+    .unwrap();
+    fs::write(root.join("b/lib.js"), "export function g() {}\n").unwrap();
+    fs::write(
+        root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.low]\napp = \"alpha\"\norder = 2\npaths = [\"a/**\"]\n[layers.high]\napp = \"beta\"\norder = 1\npaths = [\"b/**\"]\n",
+    )
+    .unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    crate::child::assert_cli_success(&indexed, "indexed");
+    let checked = isolated_command(&home)
+        .args(["rules", "check", "--format", "json", "--workspace"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    crate::child::assert_cli_success(&checked, "a cross-app pair is not a deviation");
+    let checked: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    let payload = &checked["payload"];
+    assert_eq!(payload["counts"]["deviates"], 0);
+    assert_eq!(payload["counts"]["unknown"], 1);
+    let apps = payload["apps"].as_array().unwrap();
+    let names: Vec<_> = apps
+        .iter()
+        .map(|app| {
+            (
+                app["name"].as_str().unwrap(),
+                app["manifest"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [("alpha", "a/package.json"), ("beta", "b/package.json")]
+    );
+    assert_eq!(apps[0]["counts"]["comparable"], 0);
+    assert_eq!(apps[1]["counts"]["comparable"], 0);
+    assert_eq!(payload["noApp"]["counts"], payload["counts"]);
 }
 
 #[test]

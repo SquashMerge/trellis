@@ -135,6 +135,29 @@ fn trellis_layout_detects_daemon_and_web_apps() {
     ];
     let data = check(&files).expect("the Trellis layout validates");
     assert_eq!(limitation_count(&data), 0);
+    let apps: Vec<(&str, &str)> = data["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|app| {
+            (
+                app["name"].as_str().unwrap(),
+                app["manifest"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        apps,
+        [
+            ("trellis", "Cargo.toml"),
+            ("trellis-web", "web/package.json")
+        ]
+    );
+    // The stubs carry no references, so the inventory has no rule instances to count. The
+    // expected storage -> query deviations from src/store/architecture_core.rs to src/apps.rs and
+    // src/interfaces.rs are not asserted: inline `crate::` paths are unresolved (#828).
+    assert_eq!(data["counts"]["comparable"], 0);
+    assert_eq!(data["noApp"]["counts"], data["counts"]);
 }
 
 #[test]
@@ -323,4 +346,196 @@ fn the_first_bad_layer_in_name_order_wins() {
     ));
     assert_eq!(diagnostic["kind"], "reference");
     assert_eq!(diagnostic["line"], 7);
+}
+
+/// A root manifest that declares the denied package. It is hidden, so it detects no app.
+const EXTERNAL_MANIFEST: (&str, &str) = (
+    "package.json",
+    "{\"name\":\"scratch\",\"dependencies\":{\"widget\":\"^1.0.0\"}}\n",
+);
+
+const COUNTING_RULES: &str = r#"version = 1
+[external_policy]
+deny = [{ language = "javascript", package = "widget", stdlib = false }]
+[roles.decl]
+select = { name = "Decl*" }
+[roles.any]
+select = { paths = ["**"] }
+[[rules]]
+id = "decl-calls"
+for_each = "decl"
+require = [{ calls = "any" }]
+[layers.root-manifest]
+app = "alpha"
+display = "hidden"
+order = 9
+paths = ["package.json"]
+[layers.alpha-low]
+app = "alpha"
+order = 2
+paths = ["a/low.js", "a/cross.js"]
+[layers.alpha-high]
+app = "alpha"
+order = 1
+paths = ["a/high.js"]
+[layers.alpha-ext]
+app = "alpha"
+order = 3
+paths = ["a/ext.js"]
+[layers.alpha-only]
+shared = true
+apps = ["alpha"]
+paths = ["a/shared/**"]
+[layers.beta-top]
+app = "beta"
+order = 1
+paths = ["b/top.js"]
+[layers.beta-scripts]
+app = "beta"
+order = 2
+paths = ["scripts/b_owned.js"]
+[layers.common]
+shared = true
+paths = ["common/**"]
+"#;
+
+const COUNTING_FILES: [(&str, &str); 13] = [
+    EXTERNAL_MANIFEST,
+    A_PACKAGE,
+    B_PACKAGE,
+    (
+        "a/low.js",
+        "import { hi } from './high.js';\nexport function lo() { hi(); }\n",
+    ),
+    ("a/high.js", "export function hi() {}\n"),
+    (
+        "a/cross.js",
+        "import { top } from '../b/top.js';\nexport function cross() { top(); }\n",
+    ),
+    ("b/top.js", "export function top() {}\n"),
+    (
+        "a/shared/s.js",
+        "import { hi } from '../high.js';\nexport function s() { hi(); }\n",
+    ),
+    (
+        "common/s.js",
+        "import { top } from '../b/top.js';\nexport function c() { top(); }\n",
+    ),
+    ("a/ext.js", "import 'widget';\nexport class DeclA {}\n"),
+    (
+        "a/loose.js",
+        "import 'widget';\nexport class DeclLoose {}\n",
+    ),
+    (
+        "scripts/b_owned.js",
+        "import 'widget';\nexport class DeclB {}\n",
+    ),
+    ("scripts/x.js", "import 'widget';\nexport class DeclX {}\n"),
+];
+
+/// Where each production rule row must count, keyed by rule and the file the row targets.
+fn expected_app(row: &Value) -> &'static str {
+    match (
+        row["rule"].as_str().unwrap(),
+        row["target"]["path"].as_str().unwrap(),
+    ) {
+        ("$layers", "a/low.js") => "alpha",
+        ("$layers", "a/cross.js") => "noApp",
+        ("$layers", "a/shared/s.js") => "alpha",
+        ("$layers", "common/s.js") => "beta",
+        (_, "a/ext.js" | "a/loose.js") => "alpha",
+        (_, "scripts/b_owned.js") => "beta",
+        (_, "scripts/x.js") => "noApp",
+        other => panic!("unexpected rule row {other:?}"),
+    }
+}
+
+fn tally(rows: &[&Value]) -> Value {
+    let mut tally = [0u64; 5];
+    for row in rows {
+        tally[0] += 1;
+        if row["excepted"] == true {
+            tally[4] += 1;
+        } else {
+            match row["status"].as_str().unwrap() {
+                "conforms" => tally[1] += 1,
+                "deviates" => tally[2] += 1,
+                _ => tally[3] += 1,
+            }
+        }
+    }
+    serde_json::json!({"comparable":tally[0],"conforms":tally[1],"deviates":tally[2],"unknown":tally[3],"excepted":tally[4]})
+}
+
+#[test]
+fn apps_plus_no_app_equal_rules_counts() {
+    let data = check(&with(COUNTING_RULES, &COUNTING_FILES)).unwrap();
+    let rows: Vec<&Value> = data["instances"].as_array().unwrap().iter().collect();
+    let by_app = |name: &str| -> Vec<&Value> {
+        rows.iter()
+            .copied()
+            .filter(|row| expected_app(row) == name)
+            .collect()
+    };
+    let apps = data["apps"].as_array().unwrap();
+    assert_eq!(apps.len(), 2);
+    for app in apps {
+        let name = app["name"].as_str().unwrap();
+        assert_eq!(app["counts"], tally(&by_app(name)), "{name}");
+    }
+    assert_eq!(data["noApp"]["counts"], tally(&by_app("noApp")));
+    // Every row of the table counts where it should: 8 under alpha, 4 under beta, 4 under none.
+    assert_eq!(apps[0]["counts"]["comparable"], 8);
+    assert_eq!(apps[1]["counts"]["comparable"], 4);
+    assert_eq!(data["noApp"]["counts"]["comparable"], 4);
+    assert_eq!(data["noApp"]["counts"]["unknown"], 3);
+    assert_eq!(data["noApp"]["counts"]["deviates"], 1);
+    for field in ["comparable", "conforms", "deviates", "unknown", "excepted"] {
+        let sum: u64 = apps
+            .iter()
+            .map(|app| &app["counts"])
+            .chain([&data["noApp"]["counts"]])
+            .map(|counts| counts[field].as_u64().unwrap())
+            .sum();
+        assert_eq!(sum, data["counts"][field].as_u64().unwrap(), "{field}");
+    }
+}
+
+#[test]
+fn with_no_detected_app_no_app_holds_every_count() {
+    let rules_file = "version = 1\n[layers.top]\norder = 1\npaths = [\"b/**\"]\n[layers.bottom]\norder = 2\npaths = [\"a/**\"]\n";
+    let data = check(&with(rules_file, &[A_SOURCE, B_SOURCE])).unwrap();
+    assert_eq!(data["apps"], serde_json::json!([]));
+    assert_eq!(data["counts"]["deviates"], 1);
+    assert_eq!(data["noApp"]["counts"], data["counts"]);
+}
+
+#[test]
+fn a_single_app_counts_unassigned_files_outside_its_root_under_no_app() {
+    let rules_file = "version = 1\n[layers.top]\norder = 1\npaths = [\"b/**\"]\n[layers.bottom]\norder = 2\npaths = [\"a/**\"]\n";
+    let data = check(&with(
+        rules_file,
+        &[
+            A_PACKAGE,
+            A_SOURCE,
+            B_SOURCE,
+            ("scripts/x.js", "import { g } from '../b/lib.js';\n"),
+        ],
+    ))
+    .unwrap();
+    let apps = data["apps"].as_array().unwrap();
+    assert_eq!(apps.len(), 1);
+    assert_eq!(apps[0]["name"], "alpha");
+    assert_eq!(apps[0]["manifest"], "a/package.json");
+    let row = data["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["target"]["path"] == "scripts/x.js")
+        .expect("the unassigned file's row");
+    assert_eq!(row["status"], "unknown");
+    assert_eq!(apps[0]["counts"]["comparable"], 1);
+    assert_eq!(apps[0]["counts"]["deviates"], 1);
+    assert_eq!(data["noApp"]["counts"]["comparable"], 1);
+    assert_eq!(data["counts"]["comparable"], 2);
 }
