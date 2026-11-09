@@ -1405,7 +1405,7 @@ fn legacy_title_recovery_max_id_and_root_selection() {
             .as_array()
             .unwrap()
             .len(),
-        11
+        12
     );
     peer.assert_success("trellis mcp");
     // Topology overlap is refused before marker attachment.
@@ -12086,7 +12086,7 @@ fn object_valued_input_refs_declare_type_object() {
     assert!(checked.contains(&"trellis_rules_explain.target".to_owned()));
     assert!(checked.contains(&"trellis_rules_explain.destination".to_owned()));
     assert!(checked.contains(&"trellis_find_symbols.expectedBasis".to_owned()));
-    assert_eq!(checked.len(), 12, "{checked:?}");
+    assert_eq!(checked.len(), 13, "{checked:?}");
     // Nested: the explain destination union and each of its branches say so too.
     let explain = list["result"]["tools"]
         .as_array()

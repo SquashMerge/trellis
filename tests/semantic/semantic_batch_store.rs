@@ -8551,6 +8551,18 @@ forbid = [{{ calls = "helper" }}]
                     );
                     assert_eq!(reply["data"]["text"], source);
                 }
+                // #818: no viewer reads status in this fixture, so a checked target is
+                // `no_viewer`; a missing path is `not_found`. Both are typed answers.
+                "trellis_show" => {
+                    let reply =
+                        mcp.success(name, pinned(json!({"view":"source","path":path,"line":1})));
+                    assert_eq!(reply["data"]["outcome"], "no_viewer", "{reply}");
+                    let reply = mcp.success(
+                        name,
+                        pinned(json!({"view":"source","path":"absent.rs","line":1})),
+                    );
+                    assert_eq!(reply["data"]["outcome"], "not_found", "{reply}");
+                }
                 "trellis_call_graph" => {
                     // #665: the compact graph keeps the full graph's nodes and edge
                     // identities and drops proofs; both modes validate against the catalog.
