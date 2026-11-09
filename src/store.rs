@@ -906,7 +906,7 @@ CREATE TABLE semantic_producer_languages(id TEXT NOT NULL,version TEXT NOT NULL,
 CREATE TABLE semantic_revision_producers(revision_id TEXT NOT NULL REFERENCES native_revisions(id),id TEXT NOT NULL,version TEXT NOT NULL,context_mode TEXT NOT NULL CHECK(context_mode IN ('fullCaptured','controlledProfile')),context_trust TEXT,context_input_hash TEXT,CHECK((context_mode='fullCaptured' AND context_trust IS NULL AND context_input_hash IS NULL) OR (context_mode='controlledProfile' AND context_trust IS NOT NULL AND context_trust IN ('restricted','trusted') AND context_input_hash IS NOT NULL AND length(context_input_hash)=64)),PRIMARY KEY(revision_id,id),UNIQUE(revision_id,id,version),FOREIGN KEY(id,version) REFERENCES semantic_producers(id,version));
 CREATE TABLE semantic_requested_producers(revision_id TEXT NOT NULL REFERENCES native_revisions(id),id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),PRIMARY KEY(revision_id,id));
 CREATE TABLE semantic_requested_producer_languages(revision_id TEXT NOT NULL,id TEXT NOT NULL,language TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),PRIMARY KEY(revision_id,id,language),UNIQUE(revision_id,id,ordinal),FOREIGN KEY(revision_id,id) REFERENCES semantic_requested_producers(revision_id,id));
-CREATE TABLE semantic_payloads(payload_id INTEGER PRIMARY KEY,payload_key TEXT UNIQUE CHECK(payload_key IS NULL OR length(payload_key)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,version_id TEXT NOT NULL,batch_id INTEGER REFERENCES semantic_raw_batches(batch_id),CHECK(payload_key IS NULL OR batch_id IS NOT NULL),FOREIGN KEY(producer_id,producer_version,language) REFERENCES semantic_producer_languages(id,version,language));
+CREATE TABLE semantic_payloads(payload_id INTEGER PRIMARY KEY,payload_key TEXT UNIQUE CHECK(payload_key IS NULL OR length(payload_key)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,version_id TEXT NOT NULL,batch_id INTEGER REFERENCES semantic_raw_batches(batch_id),join_inputs TEXT,CHECK(payload_key IS NULL OR batch_id IS NOT NULL),FOREIGN KEY(producer_id,producer_version,language) REFERENCES semantic_producer_languages(id,version,language));
 CREATE INDEX semantic_payloads_reuse ON semantic_payloads(batch_id,language,path,version_id);
 CREATE TABLE semantic_coverage(tuple_id INTEGER PRIMARY KEY,revision_id TEXT NOT NULL,producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,requested INTEGER NOT NULL CHECK(requested IN (0,1)),selected INTEGER NOT NULL CHECK(selected IN (0,1)),state TEXT NOT NULL CHECK(state IN ('notRequested','omitted','unsupported','failed','partial','complete')),diagnostic TEXT,payload_id INTEGER REFERENCES semantic_payloads(payload_id),UNIQUE(revision_id,producer_id,language,path),UNIQUE(tuple_id,revision_id),FOREIGN KEY(revision_id) REFERENCES native_revisions(id),FOREIGN KEY(producer_id,producer_version,language) REFERENCES semantic_producer_languages(id,version,language),FOREIGN KEY(revision_id,producer_id,producer_version) REFERENCES semantic_revision_producers(revision_id,id,version),FOREIGN KEY(revision_id,language,path) REFERENCES revision_documents(revision_id,language,path));
 CREATE INDEX semantic_coverage_history ON semantic_coverage(producer_id,language,path,revision_id);
@@ -8376,7 +8376,7 @@ fn write_import_coverage(
         } else {
             execute_cached(
                 db,
-                "INSERT INTO semantic_payloads(payload_key,producer_id,producer_version,language,path,version_id,batch_id) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO semantic_payloads(payload_key,producer_id,producer_version,language,path,version_id,batch_id,join_inputs) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     payload_key,
                     coverage.producer_id,
@@ -8384,7 +8384,8 @@ fn write_import_coverage(
                     language,
                     coverage.document_path,
                     own_version,
-                    batch
+                    batch,
+                    payload_key.as_ref().map(|_| inputs.join_inputs())
                 ],
             )?;
             let payload = db.last_insert_rowid();

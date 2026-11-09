@@ -54,6 +54,7 @@ pub(super) fn check(
                     selection,
                     producer,
                     &destination,
+                    store.payload_key_inputs().join_inputs(),
                     document,
                 )?;
                 actual.coverage.extend(copy.coverage);

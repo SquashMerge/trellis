@@ -293,6 +293,114 @@ fn crate_paths(code: &str) -> BTreeSet<String> {
     out
 }
 
+/// Items of the unlisted `src/store.rs` that listed `src/store/**` modules reach through
+/// `use super::*`, each with the reason it cannot change a settled payload row for unchanged
+/// inputs. `store.rs` is the row writer: its stored encoding is the schema, which a change
+/// bumps.
+const NON_OUTPUT_STORE_ITEMS: &[(&str, &str)] = &[
+    (
+        "CACHE_SCHEMA_V42",
+        "the schema text; a change bumps the schema version",
+    ),
+    (
+        "CanonicalInventoryCursor",
+        "a paging cursor over the native inventory",
+    ),
+    ("IndexConnection", "a database handle"),
+    ("NativeReader", "a reader of stored native rows"),
+    ("PUBLICATION_CACHE_KIB", "a page-cache size"),
+    (
+        "ReadAs",
+        "names the destination revision a basis tuple is read as",
+    ),
+    ("ReadRevision", "a reader's revision scope"),
+    ("ReadersBlockedWatch", "reader wake-up signalling"),
+    ("RecoveryDisposition", "re-index scheduling"),
+    ("RejoinOracleMismatch", "a test oracle's failure type"),
+    (
+        "SelectedIntegrity",
+        "a typed read failure; it can only abort",
+    ),
+    ("SemanticPublicationStage", "a test observer's stage names"),
+    (
+        "Store",
+        "the handle commits are issued through; it carries no row content",
+    ),
+    (
+        "authenticate_stored_batch",
+        "authenticates stored raw bytes; it can only reject",
+    ),
+    (
+        "batch_publication_limits",
+        "disk-growth limits; they can only abort",
+    ),
+    ("begin_read_snapshot", "a read transaction"),
+    ("captured_artifacts", "reads the stored artifact list"),
+    (
+        "check_cancel",
+        "cooperative cancellation; it can only abort",
+    ),
+    (
+        "copy_semantic_manifest",
+        "copies manifest rows by name; payload rows are never read or written",
+    ),
+    ("decoded_selected_inventory", "decodes the stored inventory"),
+    ("json", "the `serde_json::json!` macro"),
+    ("publication_gate", "writer admission"),
+    (
+        "read_semantic_tuple",
+        "the reader of stored rows; its projection is `store/semantic_payload.rs`",
+    ),
+    (
+        "read_semantic_tuple_with_reasons",
+        "the reader of stored rows; its projection is `store/semantic_payload.rs`",
+    ),
+    (
+        "read_coverage_reasons",
+        "the reader of stored coverage reasons",
+    ),
+    (
+        "rejoin_storage_error",
+        "typed storage failure classification",
+    ),
+    (
+        "rejoin_storage_failure",
+        "typed storage failure classification",
+    ),
+    (
+        "release_semantic_tuple",
+        "garbage collection of unreferenced rows",
+    ),
+    (
+        "revision_producer_binding",
+        "the producer binding digest of a revision",
+    ),
+    (
+        "selected_ensure",
+        "a typed failure macro; it can only abort",
+    ),
+    ("semantic_enum", "decodes a stored enum text"),
+    ("semantic_ordered", "reads an ordered stored list"),
+    ("semantic_pin_key", "the text form of an index pin"),
+    ("semantic_symbol_key_read", "decodes a stored symbol key"),
+    ("semantic_target_read", "decodes a stored target"),
+    ("semantic_variant", "encodes an enum as its stored text"),
+    (
+        "sorted_publication_rows",
+        "the test oracle's row comparison",
+    ),
+    (
+        "stamp_predecessor",
+        "retention bookkeeping of the predecessor revision",
+    ),
+    ("storage_result", "typed storage failure classification"),
+    (
+        "write_import_coverage",
+        "the row writer; which rows a document owns is decided in `semantic_payload.rs`, \
+         and the stored encoding is the schema",
+    ),
+];
+
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
@@ -411,6 +519,108 @@ fn join_modules_use_only_listed_modules_or_declared_non_output_items() {
         unlisted.is_empty(),
         "join code reaches modules outside build/semantic_join_inputs.rs; list them \
          (and justify the addition) or name a non-output item: {unlisted:#?}"
+    );
+}
+
+/// Names defined at the top level of `src/store.rs`: what `use super::*` in a listed store
+/// module can reach.
+fn store_items(source: &str) -> BTreeSet<String> {
+    let mut items = BTreeSet::new();
+    for line in source.lines() {
+        let mut rest = line;
+        if let Some(after) = rest.strip_prefix("pub") {
+            rest = match after.strip_prefix('(') {
+                Some(restricted) => restricted.split_once(')').map_or("", |(_, tail)| tail),
+                None => after,
+            }
+            .trim_start();
+        }
+        for modifier in ["async ", "unsafe "] {
+            rest = rest.strip_prefix(modifier).unwrap_or(rest);
+        }
+        for keyword in [
+            "fn ",
+            "struct ",
+            "enum ",
+            "const ",
+            "static ",
+            "type ",
+            "trait ",
+            "macro_rules! ",
+        ] {
+            if let Some(name) = rest.strip_prefix(keyword) {
+                let name: String = name
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    items.insert(name);
+                }
+            }
+        }
+    }
+    items
+}
+
+/// `store.rs` items that non-test code in a listed `src/store/**` module names without
+/// defining them, which is how `use super::*` reaches them, unless declared non-output.
+fn unlisted_store_uses(items: &BTreeSet<String>, path: &str, source: &str) -> Vec<String> {
+    let code = without_test_modules(&code_only(source));
+    let tokens = tokens(&code);
+    let defines = |name: &str| {
+        tokens.windows(2).any(|pair| {
+            pair[1] == name
+                && [
+                    "fn", "struct", "enum", "const", "static", "type", "trait", "mod",
+                ]
+                .contains(&pair[0].as_str())
+        })
+    };
+    tokens
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|token| items.contains(token.as_str()))
+        .filter(|token| !defines(token))
+        .filter(|token| !NON_OUTPUT_STORE_ITEMS.iter().any(|(item, _)| item == token))
+        .map(|token| format!("{path} uses super::{token}"))
+        .collect()
+}
+
+#[test]
+fn listed_store_modules_reach_store_rs_only_through_declared_non_output_items() {
+    let items = store_items(&String::from_utf8(read("src/store.rs")).unwrap());
+    let mut undeclared = Vec::new();
+    for path in join_modules(root())
+        .iter()
+        .filter(|path| path.starts_with("src/store/"))
+    {
+        let source = String::from_utf8(read(path)).unwrap();
+        undeclared.extend(unlisted_store_uses(&items, path, &source));
+    }
+    assert!(
+        undeclared.is_empty(),
+        "listed store modules glob-import `store.rs`, which is not hashed; name the item \
+         in NON_OUTPUT_STORE_ITEMS with a reason, or move its code into a listed module: \
+         {undeclared:#?}"
+    );
+}
+
+#[test]
+fn the_store_guard_catches_an_undeclared_store_item() {
+    let items = store_items(
+        "pub(crate) fn settle_rows() {}\nconst SKIPPED: u8 = 1;\nfn check_cancel() {}\n",
+    );
+    let source =
+        "fn f() { settle_rows(); check_cancel(); let s = \"SKIPPED\"; }\nfn settle_rows() {}\n";
+    assert_eq!(
+        unlisted_store_uses(&items, "src/store/x.rs", source),
+        Vec::<String>::new()
+    );
+    let source = "fn f() { settle_rows(); check_cancel(); }\n";
+    assert_eq!(
+        unlisted_store_uses(&items, "src/store/x.rs", source),
+        ["src/store/x.rs uses super::settle_rows"]
     );
 }
 

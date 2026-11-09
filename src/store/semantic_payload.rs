@@ -99,6 +99,11 @@ pub(in crate::store) struct KeyInputs {
 }
 
 impl KeyInputs {
+    /// The digest a keyed payload records, so a copy can tell which build wrote it.
+    pub(in crate::store) fn join_inputs(&self) -> &str {
+        &self.join_inputs
+    }
+
     /// The running build's digest: the hash of its join modules (`build/semantic_join_inputs.rs`)
     /// and of the join limits this operation applies.
     pub(in crate::store) fn current() -> Self {

@@ -632,6 +632,7 @@ impl Store {
                                     target,
                                     &producer.id,
                                     selection.batch_id,
+                                    inputs.join_inputs(),
                                     document,
                                 )?
                                 .context(SelectedIntegrity(

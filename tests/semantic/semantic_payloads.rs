@@ -672,6 +672,58 @@ fn payload_written_under_another_join_digest_is_not_reused() {
     );
 }
 
+/// Owner ruling 2026-11-09: a build that changes join output rotates every payload, copies
+/// included. An S under another join-inputs digest names no payload the import wrote, even for
+/// unchanged documents, and still equals FULL (the oracle is on); under the real digest again
+/// the import's payloads are reused and copies resume.
+#[test]
+fn copy_does_not_name_a_payload_another_join_digest_wrote() {
+    let (world, import, counts) = payload_world();
+    let unchanged = &PATHS[2..];
+    let max_before = world.count("SELECT MAX(payload_id) FROM semantic_payloads");
+    world
+        .store
+        .set_payload_join_inputs_for_tests(Some("another build of the join"));
+    let other = edit_b(&world, &counts, "return 1;");
+    for path in PATHS {
+        let payload = payload_of(&world, other, path).unwrap();
+        assert!(
+            payload > max_before,
+            "{path} names the import's payload {payload}"
+        );
+    }
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_payloads"),
+        max_before + PATHS.len() as i64,
+        "every document, changed or not, wrote a payload"
+    );
+    // The real digest again: the documents key as they did at the import and hit its payloads.
+    world.store.set_payload_join_inputs_for_tests(None);
+    let rotated = edit_b(&world, &counts, "return 2;");
+    for path in unchanged {
+        assert_eq!(
+            payload_of(&world, rotated, path),
+            payload_of(&world, import, path),
+            "{path}"
+        );
+    }
+    // And the next S copies them: no payload of theirs is written.
+    let payloads = world.count("SELECT COUNT(*) FROM semantic_payloads");
+    let copied = edit_b(&world, &counts, "return 3;");
+    for path in unchanged {
+        assert_eq!(
+            payload_of(&world, copied, path),
+            payload_of(&world, import, path),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_payloads"),
+        payloads + 2,
+        "only A and B wrote payloads"
+    );
+}
+
 /// With `value` set in the environment for one catch-up, as the forced-FULL reference runs it.
 fn full_edit(world: &World, path: &str, text: &str, counts: &std::path::Path) {
     // SAFETY: each test runs in its own process under nextest, and no other thread reads it.

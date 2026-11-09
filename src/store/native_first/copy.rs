@@ -85,13 +85,15 @@ impl CopyDestination {
 /// The basis pin key and tuple of `document` when S copies it for `producer`: the
 /// older-basis projection serves it at the pending target (not pending), the basis pin
 /// published a tuple for it, that tuple omitted no association and is no unavailable S's
-/// failure, and any payload it names is a keyed payload of `batch_id` (D4: the payload's key
-/// is then the key the document has at the pending target).
+/// failure, and any payload it names is a keyed payload of `batch_id` that the running build's
+/// `join_inputs` wrote (D4: the payload's key is then the key the document has at the pending
+/// target, and a build that changes join output rotates every payload, copies included).
 pub(crate) fn copy_source(
     db: &Connection,
     target: &PendingSemanticTarget,
     producer: &str,
     batch_id: i64,
+    join_inputs: &str,
     document: &DocumentKey,
 ) -> Result<Option<(String, i64)>> {
     // A basis tuple that omitted rows for an absent target is not copied: the target can
@@ -102,7 +104,7 @@ pub(crate) fn copy_source(
         .prepare_cached(
             "SELECT d.pending OR EXISTS(SELECT 1 FROM semantic_coverage_reasons r WHERE (r.payload_id=c.payload_id OR r.tuple_id=c.tuple_id) AND r.omitted=1) \
              OR COALESCE(c.state='failed' AND substr(c.diagnostic,1,length(?5)+1)=?5||':',0) \
-             OR COALESCE(c.payload_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM semantic_payloads p WHERE p.payload_id=c.payload_id AND p.payload_key IS NOT NULL AND p.batch_id=?6),0),\
+             OR COALESCE(c.payload_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM semantic_payloads p WHERE p.payload_id=c.payload_id AND p.payload_key IS NOT NULL AND p.batch_id=?6 AND p.join_inputs=?7),0),\
              o.basis_pin,c.tuple_id FROM semantic_projection_documents d \
              JOIN semantic_projection_origins o ON o.revision_id=d.revision_id AND o.producer_id=d.producer_id \
              LEFT JOIN semantic_coverage c ON c.revision_id=o.basis_pin AND c.producer_id=o.producer_id \
@@ -116,7 +118,8 @@ pub(crate) fn copy_source(
                 document.language,
                 document.path,
                 UNAVAILABLE_DIAGNOSTIC,
-                batch_id
+                batch_id,
+                join_inputs
             ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -137,6 +140,7 @@ pub(crate) struct CopyFilter {
     pub(crate) captured_pin: IndexPin,
     pub(crate) producer: String,
     pub(crate) batch_id: i64,
+    pub(crate) join_inputs: String,
 }
 
 impl CopyFilter {
@@ -144,7 +148,16 @@ impl CopyFilter {
     /// and current versions are the same (the witness's reuse condition), so the copied rows
     /// are exactly what re-settling it would emit.
     pub(crate) fn copies(&self, db: &Connection, document: &DocumentKey) -> Result<bool> {
-        if copy_source(db, &self.target, &self.producer, self.batch_id, document)?.is_none() {
+        if copy_source(
+            db,
+            &self.target,
+            &self.producer,
+            self.batch_id,
+            &self.join_inputs,
+            document,
+        )?
+        .is_none()
+        {
             return Ok(false);
         }
         let current = witness::selected_version(db, self.target.pin, document)?;
@@ -243,12 +256,20 @@ pub(crate) fn copied_document(
     selection: &PendingSemanticSelection,
     producer: &sem::Producer,
     destination: &CopyDestination,
+    join_inputs: &str,
     document: &DocumentKey,
 ) -> Result<sem::SemanticPublication> {
-    let (basis, tuple) = copy_source(db, target, &producer.id, selection.batch_id, document)?
-        .context(SelectedIntegrity(
-            "incompatible_index: copied document lost its basis".into(),
-        ))?;
+    let (basis, tuple) = copy_source(
+        db,
+        target,
+        &producer.id,
+        selection.batch_id,
+        join_inputs,
+        document,
+    )?
+    .context(SelectedIntegrity(
+        "incompatible_index: copied document lost its basis".into(),
+    ))?;
     let payload: Option<i64> = db.query_row(
         "SELECT payload_id FROM semantic_coverage WHERE tuple_id=?1",
         [tuple],
