@@ -233,6 +233,9 @@ pub struct SearchService {
     admission: Mutex<Admission>,
     model_changed: Condvar,
     cache_epoch: AtomicU64,
+    /// Completed writer sessions on the vector cache (#806). Coverage counted
+    /// from the cache stays current while this and the epoch are unchanged.
+    vector_writes: AtomicU64,
     status: SearchModelStatus,
     vectors: Mutex<Option<VectorCacheWriter>>,
     roots: TopologyRoots,
@@ -282,6 +285,7 @@ impl SearchService {
             admission: Mutex::new(Admission::default()),
             model_changed: Condvar::new(),
             cache_epoch: AtomicU64::new(0),
+            vector_writes: AtomicU64::new(0),
             status,
             vectors: Mutex::new(None),
             roots,
@@ -818,6 +822,12 @@ impl SearchService {
         self.cache_epoch.load(Ordering::Acquire)
     }
 
+    /// The vector-cache write generation (#806): it advances after every
+    /// writer session, including the fill's committed batches.
+    pub(crate) fn vector_writes(&self) -> u64 {
+        self.vector_writes.load(Ordering::Acquire)
+    }
+
     pub(crate) fn fill_reader(&self) -> Result<Option<VectorCacheReader>> {
         VectorCacheReader::open_existing(&self.roots.vectors_db())
     }
@@ -850,6 +860,9 @@ impl SearchService {
         // eviction does not change their validity. Only cache replacement or
         // corruption advances the epoch.
         let result = operation(writer.as_mut().expect("vector writer initialized"));
+        // Published after the operation committed (or failed), still under
+        // the writer lock, so a reader that sampled the old value rescans.
+        self.vector_writes.fetch_add(1, Ordering::AcqRel);
         if result.as_ref().is_err_and(is_corrupt_cache) {
             // Reopen/recreate on the next job, not within a failed operation.
             *writer = None;
