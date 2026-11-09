@@ -295,20 +295,72 @@ pub fn valid_path_glob(path: &str) -> bool {
             .is_ok()
 }
 
+/// A references `prefix` (#837): a checkout-relative directory of at most 4096 bytes with
+/// `/` separators and an optional trailing `/`, and no empty, `.` or `..` segment,
+/// backslash, `:` or NUL. Returns it normalized, without the trailing `/`.
+pub fn directory_prefix(prefix: &str) -> Option<&str> {
+    let normalized = prefix.strip_suffix('/').unwrap_or(prefix);
+    (prefix.len() <= 4096
+        && !normalized.is_empty()
+        && !normalized.starts_with('/')
+        && !normalized.contains(['\\', ':', '\0'])
+        && normalized
+            .split('/')
+            .all(|part| !matches!(part, "" | "." | "..")))
+    .then_some(normalized)
+}
+
 pub fn project(
     snapshot: &Snapshot,
     paths: &[String],
     sample_limit: usize,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Projection> {
+    project_under(snapshot, paths, None, sample_limit, check)
+}
+
+/// [`project`] of only the sources under the directory `prefix` (#837): a normalized
+/// checkout-relative directory without a trailing `/`.
+pub fn project_under(
+    snapshot: &Snapshot,
+    paths: &[String],
+    prefix: Option<&str>,
+    sample_limit: usize,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<Projection> {
     project_configured(
         snapshot,
-        paths,
+        Sources { paths, prefix },
         sample_limit,
         crate::parallel::default_workers(),
         check,
     )
     .map(|(projection, _)| projection)
+}
+
+/// The sources a read selects: those any `paths` glob matches (every source without one),
+/// and only under the directory `prefix` when it is given (#837).
+#[derive(Clone, Copy)]
+struct Sources<'a> {
+    paths: &'a [String],
+    prefix: Option<&'a str>,
+}
+
+impl Sources<'_> {
+    fn all() -> Self {
+        Sources {
+            paths: &[],
+            prefix: None,
+        }
+    }
+
+    fn selects(&self, globs: &globset::GlobSet, path: &str) -> bool {
+        (self.paths.is_empty() || globs.is_match(path))
+            && self.prefix.is_none_or(|prefix| {
+                path.strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -319,8 +371,17 @@ pub fn project_with_workers(
     workers: usize,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Projection> {
-    project_configured(snapshot, paths, sample_limit, workers, check)
-        .map(|(projection, _)| projection)
+    project_configured(
+        snapshot,
+        Sources {
+            paths,
+            prefix: None,
+        },
+        sample_limit,
+        workers,
+        check,
+    )
+    .map(|(projection, _)| projection)
 }
 
 #[cfg(feature = "test-support")]
@@ -349,21 +410,27 @@ pub fn resolve_all(
 ) -> Result<ReferenceBase> {
     let request = parallel_check::RequestCheck::new(check);
     let workers = crate::parallel::default_workers().clamp(1, crate::parallel::MAX_WORKERS);
-    let result = resolve(snapshot, &[], MAX_SAMPLE_LIMIT, workers, &request);
+    let result = resolve(
+        snapshot,
+        Sources::all(),
+        MAX_SAMPLE_LIMIT,
+        workers,
+        &request,
+    );
     request.result(result)
 }
 
 fn project_configured(
     snapshot: &Snapshot,
-    paths: &[String],
+    sources: Sources<'_>,
     sample_limit: usize,
     workers: usize,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<(Projection, usize)> {
     let request = parallel_check::RequestCheck::new(check);
     let workers = workers.clamp(1, crate::parallel::MAX_WORKERS);
-    let result = resolve(snapshot, paths, sample_limit, workers, &request).and_then(|base| {
-        let projection = base.select_inner(paths, sample_limit, &mut request.worker())?;
+    let result = resolve(snapshot, sources, sample_limit, workers, &request).and_then(|base| {
+        let projection = base.select_inner(sources, sample_limit, &mut request.worker())?;
         Ok((projection, base.work_used))
     });
     request.result(result)
@@ -393,7 +460,7 @@ fn path_globs(
 
 fn resolve(
     snapshot: &Snapshot,
-    paths: &[String],
+    sources: Sources<'_>,
     sample_limit: usize,
     workers: usize,
     request: &parallel_check::RequestCheck<'_>,
@@ -403,7 +470,7 @@ fn resolve(
         (1..=MAX_SAMPLE_LIMIT).contains(&sample_limit),
         "invalid_request: reference sample limit"
     );
-    let globs = path_globs(paths, check)?;
+    let globs = path_globs(sources.paths, check)?;
     let mut order: Vec<usize> = (0..snapshot.documents.len()).collect();
     order.sort_by(|&a, &b| snapshot.documents[a].key.cmp(&snapshot.documents[b].key));
     let docs: Vec<_> = order.iter().map(|&i| &snapshot.documents[i]).collect();
@@ -501,7 +568,7 @@ fn resolve(
         .enumerate()
         .filter_map(|(i, doc)| {
             // A document with no evidence has no sites either: only `partialFiles` names it.
-            ((paths.is_empty() || globs.is_match(&doc.key.path))
+            (sources.selects(&globs, &doc.key.path)
                 && !snapshot.evidence_gaps.contains_key(&doc.key))
             .then_some(i)
         })
@@ -823,12 +890,24 @@ impl ReferenceBase {
         sample_limit: usize,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<Projection> {
-        self.select_inner(paths, sample_limit, check)
+        self.select_under(paths, None, sample_limit, check)
+    }
+
+    /// [`Self::select`] of only the sources under the directory `prefix` (#837): what
+    /// [`project_under`] returns for the same arguments.
+    pub fn select_under(
+        &self,
+        paths: &[String],
+        prefix: Option<&str>,
+        sample_limit: usize,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<Projection> {
+        self.select_inner(Sources { paths, prefix }, sample_limit, check)
     }
 
     fn select_inner(
         &self,
-        paths: &[String],
+        sources: Sources<'_>,
         sample_limit: usize,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Projection> {
@@ -836,7 +915,7 @@ impl ReferenceBase {
             (1..=self.sample_limit).contains(&sample_limit),
             "invalid_request: reference sample limit"
         );
-        let globs = path_globs(paths, check)?;
+        let globs = path_globs(sources.paths, check)?;
         let identities = &self.identities;
         let mut emitted_modules = BTreeSet::new();
         let mut external_packages: BTreeMap<_, external::ExternalPackage> = BTreeMap::new();
@@ -849,7 +928,7 @@ impl ReferenceBase {
             check()?;
             let Some(found) = found else { continue };
             let path = &identities[source].path;
-            if !paths.is_empty() && !globs.is_match(path) {
+            if !sources.selects(&globs, path) {
                 continue;
             }
             scanned += 1;
@@ -1862,16 +1941,95 @@ mod parallel_tests {
         }
     }
 
+    /// #837: a `prefix` selects the sources under a directory, with or without `paths`, and
+    /// the scoped projection and the base's selection agree.
+    #[test]
+    fn a_prefix_selects_sources_under_a_directory() {
+        let snapshot = snapshot();
+        let base = resolve_all(&snapshot, &mut || Ok(())).unwrap();
+        let sources = |data: &Value| -> BTreeSet<String> {
+            ["production", "tests", "unresolved"]
+                .iter()
+                .flat_map(|field| data[*field].as_array().unwrap().clone())
+                .map(|row| row["source"]["path"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        for (paths, prefix, scanned) in [
+            (vec![], "src", 2),
+            (vec!["**/lib.rs".to_owned()], "src", 1),
+            (vec!["use.js".to_owned()], "src", 0),
+            (vec![], "sr", 0),
+            (vec![], "src/lib.rs", 0),
+        ] {
+            let scoped = project_under(&snapshot, &paths, Some(prefix), 5, &mut || Ok(())).unwrap();
+            let selected = base
+                .select_under(&paths, Some(prefix), 5, &mut || Ok(()))
+                .unwrap();
+            assert_eq!(scoped.data, selected.data, "{paths:?} {prefix}");
+            assert_eq!(
+                scoped.data["counts"]["scannedDocuments"], scanned,
+                "{paths:?} {prefix}"
+            );
+            assert!(
+                sources(&scoped.data)
+                    .iter()
+                    .all(|path| path.starts_with("src/")),
+                "{paths:?} {prefix}"
+            );
+        }
+        assert!(
+            !sources(
+                &project_under(&snapshot, &[], Some("src"), 5, &mut || Ok(()))
+                    .unwrap()
+                    .data
+            )
+            .is_empty()
+        );
+        for (prefix, normalized) in [
+            ("src", Some("src")),
+            ("src/", Some("src")),
+            ("a/b c/", Some("a/b c")),
+            ("src//", None),
+            ("/", None),
+            ("", None),
+            ("..", None),
+            ("a/./b", None),
+            ("a\\b", None),
+            ("a:b", None),
+            ("a\0", None),
+        ] {
+            assert_eq!(directory_prefix(prefix), normalized, "{prefix:?}");
+        }
+    }
+
     #[test]
     fn serial_and_parallel_keep_payload_and_exact_work_counts() {
         let snapshot = snapshot();
         for paths in [vec![], vec!["src/lib.rs".into(), "use.*".into()]] {
-            let (serial, used) =
-                project_configured(&snapshot, &paths, 1, 1, &mut || Ok(())).unwrap();
+            let (serial, used) = project_configured(
+                &snapshot,
+                Sources {
+                    paths: &paths,
+                    prefix: None,
+                },
+                1,
+                1,
+                &mut || Ok(()),
+            )
+            .unwrap();
             assert!(used > 0);
             for workers in [2, 8] {
-                let (parallel, parallel_used) =
-                    project_configured(&snapshot, &paths, 1, workers, &mut || Ok(())).unwrap();
+                let (parallel, parallel_used) = project_configured(
+                    &snapshot,
+                    Sources {
+                        paths: &paths,
+                        prefix: None,
+                    },
+                    1,
+                    workers,
+                    &mut || Ok(()),
+                )
+                .unwrap();
                 assert_eq!(parallel_used, used);
                 assert_eq!(
                     serde_json::to_vec(&parallel.data).unwrap(),

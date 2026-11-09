@@ -11516,11 +11516,15 @@ async fn references_group_by_directory_and_package_sum_the_file_answer() {
             {"source":"src","target":null,"sites":2,"production":2,"test":0},
         ])
     );
+    // #837: with no build manifest every file is in no app.
     let package = grouped(4, json!({"schemaVersion":1,"groupBy":"package"}));
-    let source_set = data["modules"][0]["identity"]["sourceSetId"].clone();
-    assert_eq!(package["groups"][0]["source"], source_set);
-    assert_eq!(package["groups"][0]["target"], source_set);
-    assert_eq!(package["groups"][0]["sites"], 3);
+    assert_eq!(
+        package["groups"],
+        json!([
+            {"source":"noApp","target":"noApp","sites":3,"production":3,"test":0},
+            {"source":"noApp","target":null,"sites":2,"production":2,"test":0},
+        ])
+    );
     // A row limit pages the same rows.
     let first = grouped(
         5,
@@ -11546,6 +11550,280 @@ async fn references_group_by_directory_and_package_sum_the_file_answer() {
             "structuredContent":reply["result"]["structuredContent"]}));
     }
     drop(ask);
+    validate_structured_content(&structured);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #837: `groupBy:"package"` groups by the #784 app (its manifest path), with `noApp` for a
+/// file in no app, by the rules check's file assignment: a hidden layer's manifest is no
+/// app, a single-app layer's file is that app's, and a shared layer's file falls back to the
+/// app root that contains it. `prefix` keeps only the sources under a directory with every
+/// `groupBy`, `depth` counts below it, and a bad prefix is a typed `invalid_request`. Every
+/// answer fits the catalog schema.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn references_group_by_app_and_select_sources_under_a_prefix() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            ("web/package.json", "{\"name\":\"web\"}\n"),
+            (
+                "web/src/main.js",
+                "import '../../lib/util.js'; import './view.js';\n",
+            ),
+            (
+                "web/src/view.js",
+                "import '../shared/s.js'; export const v = 1;\n",
+            ),
+            ("web/shared/s.js", "export const s = 1;\n"),
+            ("admin/package.json", "{\"name\":\"admin\"}\n"),
+            (
+                "admin/main.js",
+                "import '../lib/util.js'; import '../web/src/view.js';\n",
+            ),
+            ("lib/util.js", "export const u = 1;\n"),
+            ("tools/fixture/package.json", "{\"name\":\"fixture\"}\n"),
+            ("tools/fixture/run.js", "import '../../lib/util.js';\n"),
+        ],
+    );
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(837, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 837, None);
+    let mut structured = Vec::new();
+    let mut ask = |id: i32, arguments: Value, code: Option<&str>| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":"trellis_references","arguments":arguments})
+            )
+        )
+        .unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, code, true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        structured.push(json!({"name":"trellis_references","structuredContent":envelope}));
+        envelope
+    };
+    let row = |source: &str, target: &str, sites: u64| json!({"source":source,"target":target,"sites":sites,"production":sites,"test":0});
+    // Without a rules file every manifest is an app, and a file belongs to the app whose
+    // root most specifically contains it.
+    let package = ask(1, json!({"schemaVersion":1,"groupBy":"package"}), None);
+    let data = &package["data"];
+    assert_eq!(data["groupBy"], "package");
+    assert!(
+        data.get("_pathApps").is_none(),
+        "the file apps stay private"
+    );
+    assert_eq!(
+        data["groups"],
+        json!([
+            row("web/package.json", "web/package.json", 2),
+            row("admin/package.json", "noApp", 1),
+            row("admin/package.json", "web/package.json", 1),
+            row("tools/fixture/package.json", "noApp", 1),
+            row("web/package.json", "noApp", 1),
+        ])
+    );
+    let basis = package["evidenceBasis"].clone();
+    let file = ask(2, json!({"schemaVersion":1,"expectedBasis":basis}), None);
+    let mapped: u64 = file["data"]["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| edge["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(mapped, 6, "the app rows sum the file answer");
+    assert_eq!(package["data"]["counts"], file["data"]["counts"]);
+
+    // A prefix selects sources with every grouping; `depth` counts below it.
+    let web = ask(
+        3,
+        json!({"schemaVersion":1,"expectedBasis":basis,"prefix":"web/"}),
+        None,
+    );
+    let sources: std::collections::BTreeSet<_> = web["data"]["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| edge["source"]["path"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        sources.into_iter().collect::<Vec<_>>(),
+        ["web/src/main.js", "web/src/view.js"]
+    );
+    assert_eq!(web["data"]["counts"]["scannedDocuments"], 3);
+    let both = ask(
+        4,
+        json!({"schemaVersion":1,"expectedBasis":basis,"prefix":"web","paths":["**/main.js"]}),
+        None,
+    );
+    let edges = both["data"]["production"].as_array().unwrap();
+    assert_eq!(edges.len(), 2);
+    assert!(
+        edges
+            .iter()
+            .all(|edge| edge["source"]["path"] == "web/src/main.js"),
+        "paths and prefix both select"
+    );
+    let below = ask(
+        5,
+        json!({"schemaVersion":1,"expectedBasis":basis,"prefix":"web","groupBy":"directory","depth":1}),
+        None,
+    );
+    assert_eq!(
+        below["data"]["groups"],
+        json!([
+            row("web/src", "lib", 1),
+            row("web/src", "web/shared", 1),
+            row("web/src", "web/src", 1),
+        ])
+    );
+    let admin = ask(
+        6,
+        json!({"schemaVersion":1,"expectedBasis":basis,"prefix":"admin","groupBy":"directory"}),
+        None,
+    );
+    assert_eq!(
+        admin["data"]["groups"],
+        json!([row("admin", "lib", 1), row("admin", "web/src", 1)])
+    );
+    let admin_apps = ask(
+        7,
+        json!({"schemaVersion":1,"expectedBasis":basis,"prefix":"admin/","groupBy":"package"}),
+        None,
+    );
+    assert_eq!(
+        admin_apps["data"]["groups"],
+        json!([
+            row("admin/package.json", "noApp", 1),
+            row("admin/package.json", "web/package.json", 1),
+        ])
+    );
+    let nowhere = ask(
+        8,
+        json!({"schemaVersion":1,"expectedBasis":basis,"prefix":"nowhere","groupBy":"directory"}),
+        None,
+    );
+    assert_eq!(nowhere["data"]["groups"], json!([]));
+    assert_eq!(nowhere["data"]["counts"]["scannedDocuments"], 0);
+    // A prefix is not a glob or a file: `web/src/main.js` has no source under it.
+    let not_a_directory = ask(
+        9,
+        json!({"schemaVersion":1,"expectedBasis":basis,"prefix":"web/src/main.js"}),
+        None,
+    );
+    assert_eq!(not_a_directory["data"]["production"], json!([]));
+
+    // Invalid prefixes are typed invalid requests that name the field.
+    for (id, prefix) in [
+        (10, json!("../web")),
+        (11, json!("/web")),
+        (12, json!("web\\src")),
+        (13, json!("web\u{0}")),
+        (14, json!("")),
+        (15, json!("web//src")),
+        (16, json!("./web")),
+        (17, json!(7)),
+        (18, json!("a".repeat(4097))),
+    ] {
+        let failed = ask(
+            id,
+            json!({"schemaVersion":1,"groupBy":"directory","prefix":prefix}),
+            Some("invalid_request"),
+        );
+        assert!(failed.get("data").is_none());
+    }
+
+    // The rules file's assignment: the hidden `tools` layer drops its manifest and gives its
+    // file to `web`; the shared `lib` layer serves both apps, so `lib/util.js` falls back to
+    // its root (none) and `web/shared/s.js` to `web`.
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n\
+         [layers.web]\napp = \"web\"\norder = 1\npaths = [\"web/**\"]\n\
+         [layers.admin]\napp = \"admin\"\norder = 1\npaths = [\"admin/**\"]\n\
+         [layers.lib]\nshared = true\napps = [\"web\", \"admin\"]\n\
+         paths = [\"lib/**\", \"web/shared/**\"]\n\
+         [layers.fixture]\napp = \"web\"\norder = 2\ndisplay = \"hidden\"\n\
+         paths = [\"tools/**\"]\n",
+    )
+    .unwrap();
+    let ruled = ask(
+        19,
+        json!({"schemaVersion":1,"expectedBasis":basis,"groupBy":"package"}),
+        None,
+    );
+    assert_eq!(
+        ruled["data"]["groups"],
+        json!([
+            row("web/package.json", "noApp", 2),
+            row("web/package.json", "web/package.json", 2),
+            row("admin/package.json", "noApp", 1),
+            row("admin/package.json", "web/package.json", 1),
+        ])
+    );
+    // A rules file that check rejects fails app grouping as a typed `invalid_rules`, whose
+    // location check reports; the other groupings never read it.
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.web]\norder = \"first\"\npaths = [\"web/**\"]\n",
+    )
+    .unwrap();
+    let broken = ask(
+        21,
+        json!({"schemaVersion":1,"expectedBasis":basis,"groupBy":"package"}),
+        Some("invalid_rules"),
+    );
+    assert!(broken["error"].get("diagnostic").is_none());
+    ask(
+        22,
+        json!({"schemaVersion":1,"expectedBasis":basis,"groupBy":"directory","prefix":"admin"}),
+        None,
+    );
+    drop(ask);
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n\
+         [layers.web]\napp = \"web\"\norder = 1\npaths = [\"web/**\"]\n\
+         [layers.admin]\napp = \"admin\"\norder = 1\npaths = [\"admin/**\"]\n\
+         [layers.lib]\nshared = true\napps = [\"web\", \"admin\"]\n\
+         paths = [\"lib/**\", \"web/shared/**\"]\n\
+         [layers.fixture]\napp = \"web\"\norder = 2\ndisplay = \"hidden\"\n\
+         paths = [\"tools/**\"]\n",
+    )
+    .unwrap();
+    // The rules check counts the same apps: the hidden manifest is not one of them.
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(20),
+            "tools/call",
+            json!({"name":"trellis_rules_check","arguments":{"schemaVersion":1}})
+        )
+    )
+    .unwrap();
+    let check = next_reply(&mut reader);
+    tool(&check, None, true);
+    let manifests: Vec<_> = check["result"]["structuredContent"]["data"]["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|app| app["manifest"].clone())
+        .collect();
+    assert_eq!(
+        manifests,
+        [json!("admin/package.json"), json!("web/package.json")]
+    );
     validate_structured_content(&structured);
     drop(reader);
     drop(client);

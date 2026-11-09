@@ -912,6 +912,83 @@ pub(crate) fn prompt_apps(
         .collect())
 }
 
+/// The private payload field that carries [`path_apps`] to the MCP aggregation (#837). The
+/// MCP layer removes it before it answers.
+pub(crate) const PATH_APPS: &str = "_pathApps";
+
+/// The app of every module that `references` emits, for `trellis_references`
+/// `groupBy:"package"` (#837): `{path: manifest|null}`, null for a file in no app. It is the
+/// rules check's and the Architecture summary's file assignment: the apps detected against
+/// `config` (a manifest a hidden layer selects is no app), and each file's app by
+/// [`AppScope::file`] through the file's own layer. Without a rules file every manifest is
+/// a candidate and a file's app is the one whose root most specifically contains it.
+pub(crate) fn path_apps(
+    config: Option<&Config>,
+    candidates: &crate::apps::Candidates,
+    references: &Projection,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Value> {
+    let paths: Vec<&str> = references.data["modules"]
+        .as_array()
+        .context("store_unavailable: reference modules absent")?
+        .iter()
+        .map(|module| {
+            module["identity"]["path"]
+                .as_str()
+                .context("store_unavailable: module path absent")
+        })
+        .collect::<Result<_>>()?;
+    let apps = match config {
+        Some(config) => {
+            let manifests: Vec<&str> = candidates
+                .manifests
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect();
+            let hidden = hidden_layer_paths(config, &manifests, check)?;
+            let apps = crate::apps::detect(candidates, &hidden).apps;
+            validate_apps(config, &apps)?;
+            apps
+        }
+        None => crate::apps::detect(candidates, &BTreeSet::new()).apps,
+    };
+    let mut out = serde_json::Map::new();
+    let mut assign = |path: &str, app: Option<usize>| {
+        out.insert(
+            path.to_owned(),
+            json!(app.map(|index| apps[index].manifest.as_str())),
+        );
+    };
+    match config {
+        Some(config) => {
+            let mut work = Work::new(work::rules_limit(paths.len(), 0));
+            let patterns: usize = config
+                .layers
+                .values()
+                .map(|layer| layer.patterns.len())
+                .sum();
+            ensure!(
+                work.charge(paths.len().saturating_mul(patterns)),
+                "bounded_work: layer assignment pattern budget"
+            );
+            let scope = AppScope::new(config, &apps);
+            let mut matcher = LayerMatcher::new(config);
+            for path in paths {
+                check()?;
+                let layer = matcher.select(path, &mut work, check)?;
+                assign(path, scope.file(path, layer));
+            }
+        }
+        None => {
+            for path in paths {
+                check()?;
+                assign(path, crate::apps::containing(&apps, path));
+            }
+        }
+    }
+    Ok(Value::Object(out))
+}
+
 /// Resolve authored hidden membership for the explicit workbench metrics population.
 /// Uses the same exact-match, specificity and ambiguity rules as architecture policy.
 pub(crate) fn hidden_layer_paths(

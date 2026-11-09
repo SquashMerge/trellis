@@ -3119,7 +3119,7 @@ impl CheckoutRuntime {
     ) -> anyhow::Result<serde_json::Value> {
         let parsed = crate::store::EvidenceResponse::architecture_arguments(kind, arguments)?;
         check()?;
-        let config = response.architecture_config(kind)?;
+        let config = response.architecture_config(kind, &parsed)?;
         let pin = response.selected_pin(parsed.pin())?;
         let needs = CoreNeeds {
             rules: matches!(kind, "check" | "explain"),

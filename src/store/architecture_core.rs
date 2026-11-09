@@ -22,6 +22,10 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct ArchitectureArguments {
     pub(super) pin: Option<IndexPin>,
     pub(super) paths: Vec<String>,
+    /// References only (#837): the normalized directory every source lies under.
+    pub(super) prefix: Option<String>,
+    /// References only (#837): `groupBy:"package"`, which needs each file's app.
+    pub(super) apps: bool,
     pub(super) sample_limit: usize,
 }
 
@@ -30,7 +34,7 @@ impl ArchitectureArguments {
         self.pin
     }
     pub(crate) fn scoped(&self) -> bool {
-        !self.paths.is_empty()
+        !self.paths.is_empty() || self.prefix.is_some()
     }
 }
 
@@ -148,6 +152,19 @@ impl ArchitectureCore {
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<Projection> {
         self.references.select(paths, sample_limit, check)
+    }
+    /// The references of one read's sources: its `paths` under its `prefix` (#837).
+    pub(crate) fn references_for(
+        &self,
+        parsed: &ArchitectureArguments,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<Projection> {
+        self.references.select_under(
+            &parsed.paths,
+            parsed.prefix.as_deref(),
+            parsed.sample_limit,
+            check,
+        )
     }
     /// The rules part for exactly this file.
     pub(crate) fn rules(&self, config: &Config) -> Result<&RulesBase> {
