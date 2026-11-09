@@ -1,5 +1,6 @@
 //! #680, Decision 0021: shared semantic payloads. A payload holds the revision-neutral rows of
 //! one document; a revision's manifest row is what makes it evidence of that revision.
+#![cfg(feature = "test-support")]
 
 use crate::semantic_batch_store::{
     DEFINITIONS_A, DEFINITIONS_B, World, local_edit, world, write_files,

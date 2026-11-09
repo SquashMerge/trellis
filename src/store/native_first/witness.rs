@@ -1164,7 +1164,7 @@ fn association_unit(
                                     reference_id: id_codec::decode_occ(&blob)
                                         .map_err(|_| corrupt("invalid reference child ID"))?,
                                     ordinal,
-                                    target: semantic_target_read(row, 3, &scope)?
+                                    target: semantic_target_read(row, 3, scope)?
                                         .ok_or_else(|| corrupt("missing reference candidate"))?,
                                 },
                                 id: 0,
@@ -1922,7 +1922,8 @@ pub(crate) fn original_document_begin(
                 Some(!snapshot.provenance.is_empty()),
             )
         } else {
-            let tuple:Option<(i64,bool,bool,String,Option<String>,Option<i64>)>=db.prepare_cached("SELECT tuple_id,requested,selected,state,diagnostic,payload_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND producer_version=?3 AND language=?4 AND path=?5")?.query_row(params![semantic_pin_key(authority.original_pin),authority.producer.id,authority.producer.version,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+            type OriginalTuple = (i64, bool, bool, String, Option<String>, Option<i64>);
+            let tuple:Option<OriginalTuple>=db.prepare_cached("SELECT tuple_id,requested,selected,state,diagnostic,payload_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND producer_version=?3 AND language=?4 AND path=?5")?.query_row(params![semantic_pin_key(authority.original_pin),authority.producer.id,authority.producer.version,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
             let Some((tuple_id, requested, selected, state, diagnostic, payload_id)) = tuple else {
                 return Ok(WitnessEligibility::Full("original_tuple_missing"));
             };
