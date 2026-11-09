@@ -9414,6 +9414,10 @@ fn a_later_producer_fallback_keeps_earlier_producer_copies() {
             DocSpec::new("src/c.rs"),
         ],
     );
+    // The import runs under the same limits as S: a payload keyed under other limits is not
+    // copied (owner ruling 2026-11-09).
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&counts, Some(ISSUE_826_LIMITS));
     let rust = world.write(&rust);
     drop(world.publish(&rust).unwrap());
     let (a, b) = definitions_docs();
@@ -9421,8 +9425,6 @@ fn a_later_producer_fallback_keeps_earlier_producer_copies() {
     js.artifact("javascript", vec![a, b]);
     let js = world.write(&js);
     drop(world.publish(&js).unwrap());
-    let counts = world._state.path().join("work-counts.json");
-    issue_826_env(&counts, Some(ISSUE_826_LIMITS));
     // One native publication: C changes (Rust A and B are copied); JavaScript B changes, so
     // JavaScript A is a pending dependent the witness settles, over the limit.
     write_files(&world.root, &[("src/c.rs", "fn other() { let _ = 1; }\n")]);

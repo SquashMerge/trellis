@@ -658,8 +658,8 @@ fn payload_written_under_another_join_digest_is_not_reused() {
     }
     assert_eq!(
         world.count("SELECT COUNT(*) FROM semantic_payloads"),
-        payloads + 2,
-        "the restored documents wrote payloads of their own"
+        payloads + PATHS.len() as i64,
+        "every document wrote a payload of its own, the unchanged ones included"
     );
     // Back on this build's digest the same restore names the payloads it wrote.
     world.store.set_payload_join_inputs_for_tests(None);
