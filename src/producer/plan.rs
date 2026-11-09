@@ -84,7 +84,9 @@ impl PlanRequest {
             );
         }
         request.environment.validate()?;
-        request.settings.validate(&request.producer)?;
+        request
+            .settings
+            .validate(&request.producer, request.trust_profile)?;
         Ok(request)
     }
 }
@@ -367,14 +369,14 @@ impl Prepared {
 /// The producer's settings, read from the retained root inputs (and, for a scip-typescript
 /// package `extends`, the checkout's `node_modules`), with `overrides` replacing them.
 pub(crate) fn settings_for(
-    target: Target,
+    row: Row,
     rules: &mut Rules,
     inputs: &RetainedInputs,
     workspace: &Path,
     overrides: &Overrides,
 ) -> Result<Vec<Setting>> {
-    use super::ProducerName::{RustAnalyzer, ScipTypescript};
-    match target {
+    use super::ProducerName::{RustAnalyzer, ScipJava, ScipPython, ScipTypescript};
+    match row.target {
         Target::Real(ScipTypescript) => Ok(vec![super::tsconfig::apply(
             rules,
             inputs,
@@ -384,7 +386,11 @@ pub(crate) fn settings_for(
         Target::Real(RustAnalyzer) => {
             super::settings::rust(rules, inputs, overrides.cargo_features.as_deref())
         }
-        _ => Ok(Vec::new()),
+        Target::Real(ScipPython) => super::settings::python(rules, inputs, row.trust, overrides),
+        Target::Real(ScipJava) => {
+            super::settings::java(rules, inputs, row.trust, overrides.java_build_tool)
+        }
+        Target::Stub => Ok(Vec::new()),
     }
 }
 
@@ -404,7 +410,7 @@ pub fn prepare(store: &Store, request: &PlanRequest, stub: Option<&Stub>) -> Res
         store.with_native_reader(baseline, |reader| read_basis(reader, target.languages()))?;
     let mut rules = profiles::rules(&row);
     let settings = settings_for(
-        target,
+        row,
         &mut rules,
         &basis.inputs,
         Path::new(store.workspace_root()),

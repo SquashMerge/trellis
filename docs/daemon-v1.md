@@ -310,7 +310,8 @@ classes. Aggregate limits fail without publishing. These are guardrails, not a p
 | --- | --- | --- |
 | GET | `/healthz` | Public `ok`, version; no workspace details |
 | GET | `/api/status` | Current `IndexStatus` (paired revision, numeric part 0 if empty) |
-| GET | `/api/checkouts/{rootKey}/status/head` | Fixed-size digest of the same status: `{workspaceRoot, revision, catchingUp, indexedAt}`. The browser polls this to compare the shown revision with the head (#527). It skips the full status's semantic projection, carries a strong `ETag` over the digest bytes, and answers `304 Not Modified` with no body when `If-None-Match` names the current digest (#666). |
+| GET | `/api/checkouts/{rootKey}/status` | The selected checkout's status, with `searchIndex` and `viewRequest`. `viewRequest` (#818) is `null` or the checkout's latest `trellis_show` target, `{generation,view,symbolId|path+line,revision}` ([MCP Amendment (#818)](mcp-readonly-pilot-contract.md#amendment-818-trellis_show-takes-the-users-viewers-to-a-target)). A `status` or `status/head` read marks an open viewer of the checkout for 90 s. |
+| GET | `/api/checkouts/{rootKey}/status/head` | Fixed-size digest of the same status: `{workspaceRoot, revision, catchingUp, indexedAt, viewRequest}`. The browser polls this to compare the shown revision with the head (#527), and every 5 s to follow an agent's `trellis_show` (#818). It skips the full status's semantic projection, carries a strong `ETag` over the digest bytes, and answers `304 Not Modified` with no body when `If-None-Match` names the current digest (#666). |
 | POST | `/api/index` | Empty body or `{expectedRevision:{indexGeneration,indexRevision}}`; 202 background job |
 | GET | `/api/jobs/current` | Latest job or null |
 | GET | `/api/jobs/{id}` | Job, or 404 |

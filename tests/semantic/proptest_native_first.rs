@@ -557,7 +557,11 @@ fn clear_work_counts() {
 }
 
 fn copied_paths(work: &serde_json::Value) -> BTreeSet<String> {
-    work["copiedDocuments"]
+    paths_of(work, "copiedDocuments")
+}
+
+fn paths_of(work: &serde_json::Value, field: &str) -> BTreeSet<String> {
+    work[field]
         .as_array()
         .map(|docs| {
             docs.iter()
@@ -969,6 +973,8 @@ struct Stats {
     excluded_captured: usize,
     corruptions_typed: usize,
     corruptions_unreached: usize,
+    /// S units that exceeded a resource limit on the witnessed path and took FULL (#826).
+    limit_fallbacks: usize,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1531,8 +1537,32 @@ impl<'w> Harness<'w> {
             .store
             .semantic_at(s)
             .map_err(|e| format!("{label}: S semantic read failed: {e:#}"))?;
+        // #826: these histories have no corrupt selection, so S never ends unavailable.
+        if let Some(coverage) = published.coverage.iter().find(|c| {
+            c.diagnostic
+                .as_deref()
+                .is_some_and(|d| d.starts_with("selected raw capture unavailable"))
+        }) {
+            return Err(format!(
+                "{label}: S published unavailable coverage: {coverage:?}"
+            ));
+        }
         if let Some(work) = work_counts(s)? {
+            self.stats.limit_fallbacks += work["fallbackReasons"].as_array().map_or(0, |reasons| {
+                reasons
+                    .iter()
+                    .filter(|reason| *reason == "witness_limit_exceeded")
+                    .count()
+            });
             let copied = copied_paths(&work);
+            // #826: the report names exactly the documents the publisher wrote as copies, in
+            // both directions, so a later check cannot pass on a report missing real copies.
+            let published_copies = paths_of(&work, "publishedCopies");
+            if copied != published_copies {
+                return Err(format!(
+                    "{label}: S reported copies {copied:?} but published copies {published_copies:?}"
+                ));
+            }
             if std::env::var_os("TRELLIS_PROPTEST_TRACE").is_some() {
                 eprintln!(
                     "{label}: S {s:?} eligible {eligible:?} copied {copied:?} P omitted {:?} reused {}",
@@ -1838,6 +1868,11 @@ fn cases() -> u32 {
 
 /// The FULL oracle is process-wide: run in a child with it enabled.
 fn isolated(test: &str) -> bool {
+    isolated_with(test, &[])
+}
+
+/// [`isolated`], with `env` also set in the child.
+fn isolated_with(test: &str, env: &[(&str, &str)]) -> bool {
     const CHILD: &str = "TRELLIS_PROPTEST_NATIVE_FIRST_CHILD";
     if std::env::var_os(CHILD).is_some() {
         return true;
@@ -1857,6 +1892,8 @@ fn isolated(test: &str) -> bool {
             dir.path().join("counts.json"),
         )
         .env_remove("TRELLIS_TEST_FORCE_FULL_REJOIN")
+        .env_remove("TRELLIS_TEST_SEMANTIC_LIMITS")
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2107,6 +2144,7 @@ fn native_first_generated_histories() {
                     t.excluded_captured += stats.excluded_captured;
                     t.corruptions_typed += stats.corruptions_typed;
                     t.corruptions_unreached += stats.corruptions_unreached;
+                    t.limit_fallbacks += stats.limit_fallbacks;
                 }
                 Err(error) => prop_assert!(false, "{error}"),
             }
@@ -2117,5 +2155,65 @@ fn native_first_generated_histories() {
         "native-first coverage over {} cases: {:?}",
         cases(),
         totals.borrow()
+    );
+}
+
+/// #826: the live budget (`unit_expansion_bytes`) of the reduced-limit histories, 160 KiB.
+/// Every FULL (import or S) of this corpus fits in 128 KiB (not in 64 KiB); the witnessed
+/// settlement of a pending dependent needs more than 192 KiB (it fits in 256 KiB).
+const REDUCED_LIMITS: &str = r#"{"unit_expansion_bytes":163840}"#;
+
+/// #826: under a live budget FULL fits but the witness does not, every S still ends caught
+/// up and equal to FULL (the in-S oracle is on) with no unavailable coverage, because the
+/// witnessed attempt falls back to FULL. The deterministic history first proves the
+/// fallback is reached; generated histories then explore the rest under the same limit.
+#[test]
+fn native_first_reduced_limit_histories() {
+    let name = "proptest_native_first::native_first_reduced_limit_histories";
+    if !isolated_with(name, &[("TRELLIS_TEST_SEMANTIC_LIMITS", REDUCED_LIMITS)]) {
+        return;
+    }
+    // B (target) changes, so A (run calls target) is a pending dependent the witness settles.
+    let control = run_history(&[
+        Op::Edit {
+            path: 1,
+            choice: 1,
+            defer: false,
+        },
+        Op::Edit {
+            path: 2,
+            choice: 1,
+            defer: false,
+        },
+    ])
+    .unwrap();
+    eprintln!("reduced-limit control stats: {control:?}");
+    assert!(
+        control.limit_fallbacks > 0 && control.catch_ups > 0,
+        "{control:?}"
+    );
+    let config = ProptestConfig {
+        cases: cases(),
+        source_file: Some(file!()),
+        test_name: Some(name),
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        ..ProptestConfig::default()
+    };
+    let fallbacks = std::cell::Cell::new(0);
+    proptest::test_runner::TestRunner::new(config)
+        .run(&arb_history(), |history| {
+            match run_history(&history) {
+                Ok(stats) => fallbacks.set(fallbacks.get() + stats.limit_fallbacks),
+                Err(error) => prop_assert!(false, "{error}"),
+            }
+            Ok(())
+        })
+        .unwrap();
+    eprintln!(
+        "reduced-limit histories over {} cases: {} limit fallbacks",
+        cases(),
+        fallbacks.get()
     );
 }

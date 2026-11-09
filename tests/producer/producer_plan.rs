@@ -188,6 +188,43 @@ fn plan_lists_every_inspectable_field() {
         "allow"
     );
     assert!(trusted["inputs"]["omitted"].as_array().unwrap().is_empty());
+    // #717: only the trusted plan reads the project name from pyproject.toml.
+    let name = |plan: &Value| plan["settings"][0].clone();
+    assert_eq!(name(&trusted)["name"], "python.projectName");
+    assert_eq!(name(&trusted)["value"], "fixture");
+    assert_eq!(name(&trusted)["source"], "project");
+    assert_eq!(name(&restricted)["value"], "trellis-workspace");
+    assert_eq!(name(&restricted)["source"], "default");
+
+    let overridden = json_out(&with_path(
+        &checkout,
+        &[&py],
+        &[
+            "producer",
+            "plan",
+            "--producer",
+            "scip-python",
+            "--python-project-name",
+            "given",
+        ],
+    ));
+    assert_eq!(name(&overridden)["value"], "given");
+    assert_eq!(name(&overridden)["source"], "override");
+    for wrong in [
+        &["--python-project-version", "not a version"][..],
+        &["--java-build-tool", "gradle"][..],
+    ] {
+        let error = stderr(&with_path(
+            &checkout,
+            &[&py],
+            &[
+                &["producer", "plan", "--producer", "scip-python"][..],
+                wrong,
+            ]
+            .concat(),
+        ));
+        assert!(error.contains("invalid_request"), "{wrong:?}: {error}");
+    }
 }
 
 /// #799: a root `tsconfig.json` whose `extends` names an npm package. The plan supplies the

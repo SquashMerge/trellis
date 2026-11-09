@@ -375,7 +375,11 @@ mod omitted_python_context {
         store::Store,
     };
 
-    fn publish_native(store: &Store, options: &IndexOptions, cancel: &CancelFlag) -> IndexPin {
+    pub(super) fn publish_native(
+        store: &Store,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+    ) -> IndexPin {
         let expected = store.index_baseline().unwrap();
         let (graph, native, capture) =
             index_workspace_bundle(options, store.root_id(), cancel, |_| {}).unwrap();
@@ -774,5 +778,180 @@ mod omitted_python_context {
     #[ignore = "strict real-producer evidence: fails when the producer is unavailable"]
     fn scip_python_restricted_omitted_context_keeps_older_basis_strict() {
         assert!(run(Availability::Required).is_some());
+    }
+}
+
+/// #717: in the trusted profile the plan reads scip-python's `--project-name` and
+/// `--project-version` from the fixture's `pyproject.toml`, and the pinned scip-python names
+/// the fixture's own symbols with them. An override replaces the derived name.
+mod python_project_settings {
+    use super::{Availability, omitted_python_context::publish_native, real};
+    use protobuf::Message;
+    use serde_json::{Value, json};
+    use std::{
+        ffi::OsString,
+        fs,
+        os::unix::fs::DirBuilderExt,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        indexer::IndexOptions,
+        producer::{
+            TrustProfile, batch, exec, plan, profiles, settings::Overrides, state::StateDir,
+            worktree,
+        },
+        store::Store,
+    };
+
+    /// The package prefix of the symbols scip-python gives the fixture's `pkg/a.py`, with the
+    /// plan's settings, or `None` after the typed skip.
+    fn package(availability: Availability, overrides: Overrides) -> Option<(String, Value)> {
+        let temp = tempfile::Builder::new()
+            .prefix("python-project-settings-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = temp.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        real::copy_tree(&real::fixture_dir("python"), &root);
+        let store = Store::open_for_tests(&temp.path().join("state"), &root).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let captured = publish_native(&store, &IndexOptions::new(root.clone()), &cancel);
+        let mut environment = serde_json::Map::new();
+        for (name, value) in real::real_producer_env() {
+            environment.insert(name, json!(value));
+        }
+        environment.insert("HOME".into(), json!(std::env::var("HOME").unwrap()));
+        let request = plan::PlanRequest {
+            version: 1,
+            producer: "scip-python".into(),
+            trust_profile: TrustProfile::Trusted,
+            limits: plan::LimitsRequest {
+                timeout_secs: plan::DEFAULT_TIMEOUT_SECS,
+                memory_mib: plan::DEFAULT_MEMORY_MIB,
+            },
+            executable: None,
+            environment: serde_json::from_value(Value::Object(environment)).unwrap(),
+            settings: overrides,
+        };
+        let prepared = match plan::prepare(&store, &request, None) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let error = format!("{error:#}");
+                let (_, reason) = error
+                    .split_once("producer_unavailable: ")
+                    .unwrap_or_else(|| panic!("plan failed without typed unavailability: {error}"));
+                availability.resolve("scip-python", Err(reason.to_owned()))?;
+                unreachable!("an unavailable required producer must fail, not continue");
+            }
+        };
+        let (roots, identity) = store.state_topology();
+        let state = StateDir::open(roots, identity).unwrap();
+        let run_id = "0123456789abcdef0123456789abcde7";
+        let dir = fs::canonicalize(state.create_run_dir(run_id).unwrap()).unwrap();
+        let run_path = dir.to_str().unwrap();
+        let planned = prepared.build(&store, None, run_path);
+        store
+            .with_native_reader(captured, |reader| {
+                worktree::materialize(reader, &prepared.rules, &dir, &cancel)
+            })
+            .unwrap();
+        for name in ["home", "tmp", "out", "logs"] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(dir.join(name))
+                .unwrap();
+        }
+        let command = profiles::command(
+            &prepared.row,
+            &prepared.resolution,
+            &prepared.declared,
+            None,
+            &prepared.pin,
+            &prepared.rules,
+            run_path,
+        );
+        worktree::write_bin_links(&dir, &command.bin_links).unwrap();
+        let outcome = exec::spawn_producer(
+            &exec::ProducerSpec {
+                argv: command.argv.iter().map(OsString::from).collect(),
+                cwd: dir.join("worktree"),
+                env: command.env,
+                artifact: dir.join(batch::ARTIFACT_PATH),
+                log_dir: Some(dir.join("logs")),
+            },
+            &plan::effective_limits(prepared.limits),
+            &cancel,
+            &mut exec::Hooks::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.ending, exec::Ending::Exited, "{outcome:?}");
+        assert_eq!(outcome.diagnostics.exit.code, Some(0), "{outcome:?}");
+        let index = scip::types::Index::parse_from_bytes(
+            &fs::read(dir.join(batch::ARTIFACT_PATH)).unwrap(),
+        )
+        .unwrap();
+        let document = index
+            .documents
+            .iter()
+            .find(|document| document.relative_path == "pkg/a.py")
+            .expect("pkg/a.py is indexed");
+        let symbol = document
+            .occurrences
+            .iter()
+            .map(|occurrence| occurrence.symbol.as_str())
+            .find(|symbol| symbol.contains("`pkg.a`/"))
+            .expect("a pkg.a symbol");
+        let package = symbol.split(' ').take(4).collect::<Vec<_>>().join(" ");
+        Some((package, planned))
+    }
+
+    fn setting<'a>(plan: &'a Value, name: &str) -> &'a Value {
+        plan["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|setting| setting["name"] == name)
+            .unwrap()
+    }
+
+    fn check(availability: Availability) -> Option<String> {
+        let (derived, plan) = package(availability, Overrides::default())?;
+        assert_eq!(setting(&plan, "python.projectName")["source"], "project");
+        assert_eq!(
+            setting(&plan, "python.projectName")["value"],
+            "trellis-producer-fixture-py"
+        );
+        assert_eq!(setting(&plan, "python.projectVersion")["value"], "1.0.0");
+        assert_eq!(
+            derived,
+            "scip-python python trellis-producer-fixture-py 1.0.0"
+        );
+        // Negative control: the override, not the file, names the package.
+        let (overridden, plan) = package(
+            availability,
+            Overrides {
+                python_project_name: Some("given-name".into()),
+                ..Overrides::default()
+            },
+        )?;
+        assert_eq!(setting(&plan, "python.projectName")["source"], "override");
+        assert_eq!(overridden, "scip-python python given-name 1.0.0");
+        let line = format!(
+            "E2E-EVIDENCE producer=scip-python trustProfile=trusted derivedPackage={derived:?} overriddenPackage={overridden:?}"
+        );
+        println!("{line}");
+        Some(line)
+    }
+
+    #[test]
+    fn scip_python_trusted_uses_the_pyproject_project() {
+        check(Availability::SkipIfUnavailable);
+    }
+
+    #[test]
+    #[ignore = "strict real-producer evidence: fails when the producer is unavailable"]
+    fn scip_python_trusted_uses_the_pyproject_project_strict() {
+        assert!(check(Availability::Required).is_some());
     }
 }

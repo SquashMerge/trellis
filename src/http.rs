@@ -5401,6 +5401,10 @@ async fn provisioned_core_answer(
             }
             let head = matches!(route, BrowserCoreRoute::StatusHead);
             let search = runtime.search_availability();
+            // A status poll is an open viewer of this checkout (#818); its answer carries the
+            // latest agent view request, so a viewer follows it.
+            runtime.view_requests().note_viewer(Instant::now());
+            let view_request = runtime.view_requests().status_json();
             let runtime = runtime.clone();
             let (status, catching_up) = tokio::task::spawn_blocking(move || {
                 let (response, catching_up) = runtime.evidence_response()?;
@@ -5440,6 +5444,7 @@ async fn provisioned_core_answer(
                     "revision": status.revision,
                     "catchingUp": status.catching_up,
                     "indexedAt": status.indexed_at,
+                    "viewRequest": view_request,
                 });
                 status_head_response(&digest, if_none_match)
             } else {
@@ -5457,6 +5462,7 @@ async fn provisioned_core_answer(
                         "Operation failed",
                     )
                 })?;
+                body["viewRequest"] = view_request;
                 Json(body).into_response()
             };
             Ok((body, catching_up))

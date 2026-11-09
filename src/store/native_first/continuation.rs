@@ -390,6 +390,11 @@ impl Store {
             state.batch_stage_connections();
             loop {
                 let step = (|| {
+                    #[cfg(feature = "test-support")]
+                    anyhow::ensure!(
+                        !TEST_SEMANTIC_CONTENT_FAULT.get(),
+                        "test-support semantic content fault"
+                    );
                     let captured_read = ReadRevision::new(
                         selection.captured_pin,
                         semantic_pin_key(selection.captured_pin),
@@ -406,6 +411,8 @@ impl Store {
                     };
                     if state.current.is_none() {
                         let producer = pending_producer(db, &target, &selection.producer_id)?;
+                        #[cfg(feature = "test-support")]
+                        crate::semantic_import::note_producer_attempt();
                         state.current = Some(ProducerContinuation {
                             producer,
                             admission: None,
@@ -716,9 +723,15 @@ impl Store {
                     *continuation = None;
                     return Err(error);
                 }
-                if let Some(_fallback) =
-                    error.downcast_ref::<crate::semantic_batch::staging::WitnessFallback>()
-                {
+                // A witnessed attempt that cannot complete within its bounds (#826: the
+                // witness's conservative reservation for a large pending dependent) takes the
+                // FULL fallback, as an ineligible witness does. Only FULL's own failure is the
+                // producer's terminal unavailable disposition below.
+                let fallback = error
+                    .downcast_ref::<crate::semantic_batch::staging::WitnessFallback>()
+                    .map(|fallback| fallback.0)
+                    .or_else(|| resource_limit(&error).then_some(WITNESS_LIMIT_FALLBACK));
+                if let Some(_reason) = fallback {
                     let current = state
                         .current
                         .as_mut()
@@ -729,13 +742,16 @@ impl Store {
                         current.join = None;
                         current.authority = None;
                         current.full = true;
+                        // FULL is bounded as a fresh attempt, not by the witness's spent steps.
+                        current.budget = LookupBudget::new(&limits);
                         #[cfg(feature = "test-support")]
-                        crate::semantic_import::note_local_witness_outcome(Some(_fallback.0));
+                        crate::semantic_import::note_local_witness_outcome(Some(_reason));
                         return Ok(SemanticUnitOutcome::Progress);
                     }
                 }
                 // Content failures have a terminal, explicit unavailable disposition; they
                 // do not create an endless background retry of the same selected artifact.
+                let _full = state.current.as_ref().is_some_and(|current| current.full);
                 let producer = if let Some(current) = state.current.take() {
                     current.producer
                 } else {
@@ -743,11 +759,27 @@ impl Store {
                         pending_producer(db, &target, &selection.producer_id)
                     })?
                 };
+                // FULL's own resource bound is the contract's typed outcome, which the
+                // unbounded in-memory oracle cannot model; every other unavailable S must
+                // be one the independent FULL rejoin also fails (#826).
+                #[cfg(feature = "test-support")]
+                if super::oracle::enabled() && !(_full && resource_limit(&error)) {
+                    let checked = self.with_pending_semantic_inputs(&target, &held, |db, _| {
+                        super::oracle::check_unavailable(
+                            self, db, &target, &selection, &producer, cancel,
+                        )
+                    });
+                    // A mismatch, cancellation or storage failure ends the continuation.
+                    if let Err(error) = checked {
+                        *continuation = None;
+                        return Err(error);
+                    }
+                }
                 state.prepared.push(PreparedSemantic {
                     producer,
                     capture_witness: None,
                     output: PreparedOutput::Unavailable {
-                        diagnostic: format!("selected raw capture unavailable: {error:#}")
+                        diagnostic: format!("{}: {error:#}", super::UNAVAILABLE_DIAGNOSTIC)
                             .chars()
                             .take(512)
                             .collect(),
@@ -758,6 +790,19 @@ impl Store {
             }
         }
     }
+}
+
+/// The fallback reason a witnessed S records when a resource limit stopped it.
+const WITNESS_LIMIT_FALLBACK: &str = "witness_limit_exceeded";
+
+/// Whether `error` is a bounded-resource failure (a `LimitExceeded` anywhere in its chain).
+fn resource_limit(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::scip_raw::ScipCaptureError>(),
+            Some(crate::scip_raw::ScipCaptureError::LimitExceeded(_))
+        )
+    })
 }
 
 #[cfg(feature = "test-support")]

@@ -45,7 +45,7 @@ test("architecture prompt messages and catalog use SDK prompt shapes", () => {
   for (const result of [{messages}, {resultType: "complete", messages}]) {
     assert.ok(GetPromptResultSchema.safeParse(result).success);
   }
-  assert.equal(tools.length, 11);
+  assert.equal(tools.length, 12);
   assert.ok(!tools.some(tool => tool.name === "trellis_propose_layers"));
 });
 
@@ -54,12 +54,12 @@ const Ajv2020 = require("ajv/dist/2020.js").default;
 const ajv = new Ajv2020({ strict: false });
 const search = tools.find(tool => tool.name === "trellis_search_symbols");
 
-test("the eleven-tool order and unchanged schemas are explicit", () => {
+test("the twelve-tool order and unchanged schemas are explicit", () => {
   assert.deepEqual(tools.map(tool => tool.name), [
     "trellis_workspace_describe", "trellis_find_symbols", "trellis_search_symbols",
     "trellis_declaration", "trellis_outgoing_calls", "trellis_incoming_calls",
     "trellis_read_source", "trellis_call_graph", "trellis_references", "trellis_rules_check",
-    "trellis_rules_explain",
+    "trellis_rules_explain", "trellis_show",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
   assert.equal(describe.toolVersion.const, 18);
@@ -225,6 +225,38 @@ test("outgoing calls accept a closed includeExternal; incoming calls do not", ()
   }
   for (const includeExternal of [null, 1, "true"]) assert.equal(outgoing({ ...valid, includeExternal }), false);
   assert.equal(incoming({ ...valid, includeExternal: true }), false);
+});
+
+// #818: the advertised input schema admits exactly the per-view argument shapes the server does.
+test("trellis_show input admits one target per view, and its outcomes are closed", () => {
+  const show = tools.find(tool => tool.name === "trellis_show");
+  assert.deepEqual(show.annotations, { destructiveHint: false, idempotentHint: false, openWorldHint: false, readOnlyHint: true });
+  const input = ajv.compile(show.inputSchema);
+  const sid = `sid:v1:${"a".repeat(32)}`;
+  for (const ok of [
+    { schemaVersion: 1, view: "sequence", symbolId: sid },
+    { schemaVersion: 1, view: "class", lookupKey: "src/a.rs::A" },
+    { schemaVersion: 1, view: "source", path: "src/a.rs", line: 1, workspace: "/repo" },
+  ]) assert.ok(input(ok), JSON.stringify([ok, input.errors]));
+  for (const bad of [
+    { schemaVersion: 1, view: "sequence" },
+    { schemaVersion: 1, view: "sequence", symbolId: sid, lookupKey: "k" },
+    { schemaVersion: 1, view: "class", symbolId: sid, line: 2 },
+    { schemaVersion: 1, view: "source", path: "src/a.rs" },
+    { schemaVersion: 1, view: "source", path: "src/a.rs", line: 0 },
+    { schemaVersion: 1, view: "source", path: "src/a.rs", line: 1, symbolId: sid },
+    { schemaVersion: 1, view: "architecture", symbolId: sid },
+    { schemaVersion: 1, view: "sequence", symbolId: sid, other: true },
+  ]) assert.ok(!input(bad), JSON.stringify(bad));
+  const output = ajv.compile(show.outputSchema);
+  const envelope = (data) => ({ schemaVersion: 1, requestId: 1, workspace: "/repo", catchingUp: false,
+    evidenceBasis: { indexGeneration: "12345678-1234-4123-8123-123456789abc", indexRevision: 1 },
+    data: { view: "sequence", message: "m", ...data }, warnings: [], partial: false, truncated: false, truncationReason: null });
+  assert.ok(output(envelope({ outcome: "shown", generation: 7 })), JSON.stringify(output.errors));
+  for (const outcome of ["no_viewer", "not_found", "stale", "invalid"]) assert.ok(output(envelope({ outcome, generation: null })), outcome);
+  assert.ok(!output(envelope({ outcome: "shown", generation: null })), "shown carries its generation");
+  assert.ok(!output(envelope({ outcome: "stale", generation: 7 })), "only shown has a generation");
+  assert.ok(!output(envelope({ outcome: "partial", generation: null })));
 });
 
 // #798: the BuildingFailure branch of each architecture tool takes exactly the ratified shape,

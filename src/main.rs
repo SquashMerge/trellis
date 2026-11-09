@@ -296,6 +296,15 @@ struct ProducerPlanArgs {
     /// scip-typescript: the project config to use instead of the one the plan chooses.
     #[arg(long, value_parser = ["tsconfig.json", "jsconfig.json", "generated"])]
     ts_project: Option<String>,
+    /// scip-python: the `--project-name` to pass instead of the `pyproject.toml` name.
+    #[arg(long)]
+    python_project_name: Option<String>,
+    /// scip-python: the `--project-version` to pass instead of the `pyproject.toml` version.
+    #[arg(long)]
+    python_project_version: Option<String>,
+    /// scip-java, trusted profile: the build tool to run instead of the one the plan detects.
+    #[arg(long, value_parser = ["maven", "gradle"])]
+    java_build_tool: Option<String>,
 }
 #[derive(Args)]
 struct ProducerRunArgs {
@@ -1005,6 +1014,15 @@ fn producer_plan_payload(args: &ProducerPlanArgs) -> Result<serde_json::Value> {
     }
     if let Some(project) = &args.ts_project {
         settings.insert("typescriptProject".into(), serde_json::json!(project));
+    }
+    if let Some(name) = &args.python_project_name {
+        settings.insert("pythonProjectName".into(), serde_json::json!(name));
+    }
+    if let Some(version) = &args.python_project_version {
+        settings.insert("pythonProjectVersion".into(), serde_json::json!(version));
+    }
+    if let Some(tool) = &args.java_build_tool {
+        settings.insert("javaBuildTool".into(), serde_json::json!(tool));
     }
     Ok(serde_json::json!({
         "version": 1,
