@@ -3875,7 +3875,7 @@ require = [{ calls = "destination" }]
 }
 
 #[test]
-fn architecture_cli_prints_per_app_counts_and_a_cross_app_pair_exits_zero() {
+fn rules_check_json_per_app_and_cross_app_exit_zero() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");

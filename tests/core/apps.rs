@@ -539,3 +539,52 @@ fn a_single_app_counts_unassigned_files_outside_its_root_under_no_app() {
     assert_eq!(data["noApp"]["counts"]["comparable"], 1);
     assert_eq!(data["counts"]["comparable"], 2);
 }
+
+#[test]
+fn a_denied_package_assigned_to_another_apps_layer_counts_under_the_importing_file() {
+    let rules_file = r#"version = 1
+[external_policy]
+deny = [{ language = "javascript", package = "widget", stdlib = false }]
+[layers.root-manifest]
+app = "alpha"
+display = "hidden"
+order = 9
+paths = ["package.json"]
+[layers.alpha-ext]
+app = "alpha"
+order = 2
+paths = ["a/ext.js"]
+[layers.beta-packages]
+app = "beta"
+order = 1
+external = [{ language = "javascript", package = "widget", stdlib = false }]
+"#;
+    let files = [
+        EXTERNAL_MANIFEST,
+        A_PACKAGE,
+        B_PACKAGE,
+        B_SOURCE,
+        ("a/ext.js", "import 'widget';\n"),
+    ];
+    let data = check(&with(rules_file, &files)).unwrap();
+    let rows = data["instances"].as_array().unwrap();
+    let ban = rows
+        .iter()
+        .find(|row| row["rule"] == "$external")
+        .expect("the ban row");
+    assert_eq!(ban["status"], "deviates");
+    let apps = data["apps"].as_array().unwrap();
+    let alpha = &apps[0]["counts"];
+    assert_eq!(apps[0]["name"], "alpha");
+    assert_eq!(alpha["deviates"], 1, "{data}");
+    assert_eq!(data["noApp"]["counts"]["deviates"], 0, "{data}");
+    for field in ["comparable", "conforms", "deviates", "unknown", "excepted"] {
+        let sum: u64 = apps
+            .iter()
+            .map(|app| &app["counts"])
+            .chain([&data["noApp"]["counts"]])
+            .map(|counts| counts[field].as_u64().unwrap())
+            .sum();
+        assert_eq!(sum, data["counts"][field].as_u64().unwrap(), "{field}");
+    }
+}

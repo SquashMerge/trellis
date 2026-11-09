@@ -1056,7 +1056,9 @@ impl<'a> AppScope<'a> {
             return None;
         }
         let source = row["sourceLayer"].as_str();
-        if let (Some(source), Some(destination)) = (source, row["destinationLayer"].as_str()) {
+        if row["rule"] == "$layers"
+            && let (Some(source), Some(destination)) = (source, row["destinationLayer"].as_str())
+        {
             let (from, to) = (self.layer(source), self.layer(destination));
             let mut common = from.intersection(&to).copied();
             return match (common.next(), common.next()) {
