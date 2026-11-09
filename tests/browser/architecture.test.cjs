@@ -683,16 +683,18 @@ function expectedChips(check, layers) {
   for (const row of check.instances) {
     if (row.rule !== "$layers" || !row.sourceLayer || !row.destinationLayer || row.sourceLayer === row.destinationLayer) continue;
     const source = byName.get(row.sourceLayer), destination = byName.get(row.destinationLayer), ordered = !source.shared && !destination.shared;
-    const key = row.excepted ? "excepted" : row.status === "deviates" ? (ordered && destination.order < source.order ? "↑" : "⇄") :
+    const key = row.excepted ? "excepted" : row.status === "deviates" ? (ordered && destination.order < source.order ? `↑ ${row.destinationLayer}` : "⇄") :
       row.status !== "conforms" ? "unknown" : destination.shared ? "→shared" : ordered && destination.order > source.order ? "↓" : "allowed";
     const counts = totals.get(row.sourceLayer) || new Map();
     counts.set(key, (counts.get(key) || 0) + row.referenceCount); totals.set(row.sourceLayer, counts);
   }
-  const order = ["↑", "⇄", "↓", "→shared", "allowed", "excepted", "unknown"];
-  return new Map([...totals].map(([layer, counts]) => [layer, order.filter(key => counts.get(key)).map(key => `${key}${/^[↑⇄↓]$/.test(key) ? "" : " "}${counts.get(key)}`)]));
+  const order = ["⇄", "↓", "→shared", "allowed", "excepted", "unknown"];
+  const text = (key, count) => key.startsWith("↑ ") ? `↑${count} deviation · ${key.slice(2)}` : `${key}${/^[⇄↓]$/.test(key) ? "" : " "}${count}`;
+  // Upward deviations are one chip per destination, each a control that follows its band.
+  return new Map([...totals].map(([layer, counts]) => [layer, [...[...counts.keys()].filter(key => key.startsWith("↑ ")).sort(), ...order.filter(key => counts.get(key))].map(key => text(key, counts.get(key)))]));
 }
-const chipTexts = (page, layer) => page.locator(`#architecture-diagram [data-trellis-layer-id="${layer}"] > text.trellis-architecture-stat`)
-  .evaluateAll(nodes => nodes.map(node => [node.textContent, node.getAttribute("data-tone")]));
+const chipTexts = (page, layer) => page.locator(`#architecture-diagram [data-trellis-layer-id="${layer}"] > text.trellis-architecture-stat, #architecture-diagram [data-trellis-layer-action="${layer}"] text.trellis-architecture-stat`)
+  .evaluateAll(nodes => nodes.map(node => [node.textContent, node.getAttribute("data-tone")]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
 
 // #449: the full stack with allowed arrows dimmed, collapsed bands as metric-coloured chips,
 // lower-bound counts with measured coverage, a compact arrow key and counted review chips.
@@ -733,10 +735,10 @@ test("Architecture draws the full stack, module chips per band, lower-bound coun
   const share = `${Math.round(lowCoverage.mappedSites / lowCoverage.sites * 100)}%`;
   const bound = layer => (dto.references.coverage.find(row => row.layer === layer && row.role === "production")?.unresolvedSites ?? 1) > 0;
   const chips = expectedChips(check, dto.layers);
-  assert.deepEqual(chips.get("low"), ["↑2"], "the fixture's low layer has a 2-site upward deviation");
+  assert.deepEqual(chips.get("low"), ["↑2 deviation · top"], "the fixture's low layer has a 2-site upward deviation, named by its destination");
   for (const layer of ["low", "mid", "peer", "shared", "top"]) {
     const drawn = await chipTexts(page, layer);
-    const expected = (chips.get(layer) || []).map(text => bound(layer) ? text.replace(/(\d+)$/, "≥$1") : text);
+    const expected = (chips.get(layer) || []).map(text => bound(layer) ? text.replace(/^(\D*)(\d+)/, "$1≥$2") : text).sort();
     assert.deepEqual(drawn.map(([text]) => text), expected, `${layer} chips match rules check, as lower bounds where sites stayed unresolved`);
     for (const [text, tone] of drawn) assert.equal(tone, /^[↑⇄]/.test(text) ? "error" : "neutral", text);
   }
@@ -787,7 +789,7 @@ test("Architecture draws the full stack, module chips per band, lower-bound coun
   await page.locator(low).focus();
   await rerendered(page, () => page.keyboard.press("Enter"));
   assert.equal(await page.locator(low).getAttribute("aria-expanded"), "false");
-  assert.deepEqual((await chipTexts(page, "low")).map(([text]) => text), ["↑≥2"], "a folded band keeps its count chips");
+  assert.deepEqual((await chipTexts(page, "low")).map(([text]) => text), ["↑≥2 deviation · top"], "a folded band keeps its count chips");
   await rerendered(page, () => page.keyboard.press("Enter"));
   assert.equal(await page.locator(low).getAttribute("aria-expanded"), "true");
   const stored = await displayStore(selected);
@@ -1448,11 +1450,11 @@ test("Architecture re-lays out on a panel width change, keeping the selection an
   const wide = await widthOf();
   const requests = selected.requests.length;
   await tag.focus();
-  await laidOutAt(page, 1100);
+  await laidOutAt(page, 1200);
   assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("data-trellis-edge-id")), edgeId, "keyboard focus returns to the same arrow");
   const narrow = await widthOf();
   assert.ok(narrow < wide, `the drawing narrows with the window (${narrow} < ${wide})`);
-  assertLayout(await page.evaluate(layoutBounds, await page.evaluate(arrowGeometry, "#architecture-diagram svg")), "1100px");
+  assertLayout(await page.evaluate(layoutBounds, await page.evaluate(arrowGeometry, "#architecture-diagram svg")), "1200px");
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), title, "the inspection survives the re-layout");
   const pressed = await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll((nodes, id) => nodes.filter(node => node.getAttribute("data-trellis-edge-id") === id).map(node => node.getAttribute("aria-pressed")), edgeId);
   assert.deepEqual(pressed, ["true"], "the selected arrow stays selected");
@@ -1985,3 +1987,76 @@ test("switching tabs and apps re-draws the held snapshot without reading again",
   assert.equal(await page.locator("#architecture-apps").getByRole("button", {name:"alpha · javascript"}).getAttribute("aria-pressed"), "true", "the scope survives the tab switch");
   assert.equal(architectureReads(requests), before, "no Architecture request after the first read");
 }, new Map(), twoApps));
+
+// Badges, stubs and the interface inspector (#789, AC10, AC15, AC25). A Rust server and a JavaScript
+// client: `/health` is matched, `/unused` is server-only and `/missing` is client-only.
+const httpApps = new Map([
+  ["Cargo.toml", '[package]\nname = "srv"\n'],
+  ["src/main.rs", 'async fn health() {}\nasync fn unused() {}\nfn router() -> Router {\n    Router::new().route("/health", get(health)).route("/unused", get(unused))\n}\nfn main() {}\n'],
+  ["web/package.json", '{"name":"web-app"}\n'],
+  ["web/app.js", 'async function load(api) {\n  await api("/health");\n  await api("/missing");\n}\n'],
+]);
+const httpRules = "version=1\n[layers.server]\napp='srv'\norder=1\npaths=['src/**']\n[layers.client]\napp='web-app'\norder=1\npaths=['web/**']\n";
+
+test("a stub selects its interface with a visible Selected word, opens the inspector and keeps both through a resize", {timeout:240000}, async () => published(httpRules, async ({page}) => {
+  await ready(page);
+  await page.locator("#architecture-apps").getByRole("button", {name:/^web-app/}).click();
+  await page.locator('#architecture-diagram [data-trellis-layer-action="client"]').waitFor({state:"attached"});
+  const stub = page.getByRole("button", {name:"HTTP interface to srv: 1 route, 1 call site", exact:true});
+  assert.equal(await stub.locator("text.trellis-architecture-stat").textContent(), "→ srv · 1 route · 1 call site");
+  assert.equal(await stub.getAttribute("aria-pressed"), "false");
+  const tag = stub.locator("text.architecture-selected-tag");
+  assert.equal(await tag.evaluate(node => getComputedStyle(node).visibility), "hidden", "no word before a selection");
+  await stub.focus(); await page.keyboard.press("Enter"); await settled(page);
+  assert.equal(await stub.getAttribute("aria-pressed"), "true");
+  assert.equal(await tag.textContent(), "Selected");
+  assert.equal(await tag.evaluate(node => getComputedStyle(node).visibility), "visible", "the word marks the selection, not only the colour");
+  assert.equal(await page.locator("#architecture-inspector-title").textContent(), "web-app → srv");
+  const band = page.locator('#architecture-diagram [data-trellis-layer-id="client"]');
+  await page.waitForFunction(() => document.querySelector('#architecture-diagram [data-trellis-layer-id="client"]')?.getAttribute("aria-label")?.includes("client end"));
+  assert.match(await band.getAttribute("aria-label"), /client end/, "the selected stub's band says which end it is");
+  const content = page.locator("#architecture-inspector-content");
+  assert.match(await content.textContent(), /Client end: web-app · client/); assert.match(await content.textContent(), /Server end: srv · server/);
+  await content.getByRole("button", {name:"Open endpoints"}).click(); await settled(page);
+  assert.match(await content.textContent(), /GET \/health · exact · 1 call site/);
+  assert.match(await content.textContent(), /GET \/unused/); assert.match(await content.textContent(), /unresolved method|\/missing/);
+  await content.getByRole("button", {name:"Read handler source"}).first().click();
+  await laidOutAt(page, 1100);
+  const kept = await page.evaluate(() => ({pressed:[...document.querySelectorAll("#architecture-diagram [aria-pressed=true]")].map(node => node.getAttribute("data-trellis-action-id")),
+    focus:document.activeElement?.getAttribute("data-trellis-action-id")}));
+  assert.equal(kept.pressed.length, 1); assert.match(kept.pressed[0], /^\["interface","web-app","srv","client","client"\]$/);
+  await page.locator('#architecture-diagram [data-trellis-layer-id="client"]').click();
+  assert.equal(await stub.getAttribute("aria-pressed"), "false", "selecting another node clears the stub");
+  await page.waitForFunction(() => !document.querySelector('#architecture-diagram [data-trellis-layer-id="client"]')?.getAttribute("aria-label")?.includes("client end"));
+  await page.locator("#architecture-apps").getByRole("button", {name:/^srv/}).click();
+  await page.locator('#architecture-diagram [data-trellis-layer-action="server"]').waitFor({state:"attached"});
+  assert.equal(await page.getByRole("button", {name:"HTTP interface from web-app: 1 route", exact:true}).locator("text.trellis-architecture-stat").textContent(), "← web-app · 1 route");
+}, new Map(), httpApps));
+
+test("a ↑ badge opens the Deviations tree on its edge with the chip pressed and nothing selected", {timeout:240000}, async () => published(rules, async ({page}) => {
+  await ready(page);
+  const badge = page.getByRole("button", {name:/^2 upward production reference sites from low to top · deviation · open in Deviations$|^at least 2 upward production reference sites from low to top/});
+  assert.equal(await badge.locator("text.trellis-architecture-stat").textContent(), "↑≥2 deviation · top");
+  assert.equal(await badge.evaluate(node => node.previousElementSibling?.getAttribute("data-trellis-layer-id")), "low", "the badge follows its band");
+  await badge.focus(); await page.keyboard.press("Enter");
+  await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
+  const pressed = await page.locator("#architecture-deviations-edges button[aria-pressed=true]").allTextContents();
+  assert.equal(pressed.length, 1); assert.match(pressed[0], /^↑ low → top/);
+  assert.equal(await page.locator("#architecture-deviations-calls").isChecked(), false);
+  assert.equal(await page.locator("#architecture-deviations-tree .deviation-row[aria-selected=true]").count(), 0, "no line is selected");
+}));
+
+test("returning from the Deviations tree leaves no stub marked Selected", {timeout:240000}, async () => published(httpRules, async ({page}) => {
+  await ready(page);
+  await page.locator("#architecture-apps").getByRole("button", {name:/^web-app/}).click();
+  const stub = page.getByRole("button", {name:"HTTP interface to srv: 1 route, 1 call site", exact:true});
+  await stub.waitFor({state:"attached"});
+  await stub.focus(); await page.keyboard.press("Enter"); await settled(page);
+  await page.waitForFunction(() => document.querySelector('#architecture-diagram [aria-pressed=true] .architecture-selected-tag'));
+  await page.locator("#architecture-review").click();
+  await page.locator("#architecture-deviations-back").click();
+  assert.equal(await page.locator("#architecture-inspector-title").textContent(), "Architecture review");
+  await page.waitForFunction(() => !document.querySelector('#architecture-diagram [aria-pressed=true]'));
+  assert.equal(await stub.getAttribute("aria-pressed"), "false");
+  assert.equal(await stub.locator("text.architecture-selected-tag").evaluate(node => getComputedStyle(node).visibility), "hidden");
+}, new Map(), httpApps));

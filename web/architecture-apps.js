@@ -43,6 +43,29 @@
       modules:view.modules.filter(module => names.has(module.layer) || (module.layer === null && module.app === name)),
       edges:view.edges.filter(edge => names.has(edge.sourceLayer) && names.has(edge.destinationLayer))};
   }
+  const count = value => Number.isSafeInteger(value) && value > 0 ? value : 0;
+  // The interface between two apps, by their names.
+  const link = (view, client, server) => (Array.isArray(view?.interfaces) ? view.interfaces : []).find(item => record(item) && item.client === client && item.server === server) || null;
+  // The stubs of one band of app `name`: an end of an interface it is the client or server of, whose
+  // end layer is that band. A client's routes add up across its ends (a route has one handler layer).
+  // A server band's ends may share a route, so several ends give an upper-bounded maximum.
+  function stubs(view, name, layer) {
+    const found = [];
+    for (const item of Array.isArray(view?.interfaces) ? view.interfaces : []) {
+      if (!record(item)) continue;
+      const ends = Array.isArray(item.ends) ? item.ends.filter(record) : [];
+      for (const side of ["client", "server"]) {
+        if (item[side] !== name) continue;
+        const own = ends.filter(end => end[`${side}Layer`] === layer);
+        if (!own.length) continue;
+        const routes = own.map(end => count(end.routes));
+        found.push({side, client:item.client, server:item.server, atLeast:side === "server" && own.length > 1,
+          routes:side === "client" ? routes.reduce((sum, value) => sum + value, 0) : Math.max(...routes),
+          callSites:own.reduce((sum, end) => sum + count(end.callSites), 0)});
+      }
+    }
+    return found;
+  }
   const label = item => item.languages.length ? `${item.name} · ${item.languages.join(", ")}` : item.name;
   const manifestList = item => item.manifests.join(", ");
   const rootList = item => item.roots.map(root => root || "./").join(", ");
@@ -53,5 +76,5 @@
   }
   const duplicateNotice = item =>
     `${item.apps.length} detected apps share the name ${item.name} (${manifestList(item)}). A layer cannot name them; rules.md Amendment (#783).`;
-  window.TrellisArchitectureApps = {groups, group, scoped, sumCounts, label, sourceLine, duplicateNotice};
+  window.TrellisArchitectureApps = {groups, group, scoped, link, stubs, sumCounts, label, sourceLine, duplicateNotice};
 })();

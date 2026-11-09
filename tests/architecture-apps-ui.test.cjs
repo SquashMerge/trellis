@@ -105,3 +105,17 @@ test("T00 markup in an app name is text: no element is created from it", async (
   assert.ok(h.get("architecture-state").textContent.includes(name));
   assert.equal(h.get("architecture-diagram").children.length > 0, true);
 });
+
+test("stubs sum a client's ends, bound a server's shared routes, skip other layers and tolerate hostile shapes", () => {
+  const apps = appsModule(), end = (clientLayer, serverLayer, routes, callSites) => ({clientLayer, serverLayer, routes, callSites});
+  const view = {interfaces:[{client:"web", server:"api", ends:[end("UI", "Http", 2, 3), end("UI", "Rpc", 1, 4), end(null, "Http", 5, 5), end("Other", "Http", 9, 9)]},
+    null, {client:"web", server:"api", ends:"nope"}, {client:"api", server:"web", ends:[end("Http", "UI", Infinity, -1), "x"]}]};
+  const flat = list => JSON.parse(JSON.stringify(list));
+  assert.deepEqual(flat(apps.stubs(view, "web", "UI")), [{side:"client", client:"web", server:"api", atLeast:false, routes:3, callSites:7},
+    {side:"server", client:"api", server:"web", atLeast:false, routes:0, callSites:0}]);
+  assert.deepEqual(flat(apps.stubs(view, "api", "Http")), [{side:"server", client:"web", server:"api", atLeast:true, routes:9, callSites:17},
+    {side:"client", client:"api", server:"web", atLeast:false, routes:0, callSites:0}]);
+  assert.deepEqual(flat(apps.stubs(view, "api", "Nothing")), []);
+  assert.deepEqual(flat(apps.stubs({}, "web", "UI")), []);
+  assert.equal(apps.link(view, "web", "api"), view.interfaces[0]); assert.equal(apps.link(view, "api", "nobody"), null);
+});

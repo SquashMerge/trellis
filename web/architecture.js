@@ -60,6 +60,8 @@
     // The app whose stack is drawn: null for all apps, else an app name (never compared with a literal). Memory only; a new checkout starts at "all".
     // `drawn` is the view the last render laid out (the scoped slice, or `view` itself).
     let scope = null, scopeRoot = null, drawn = null;
+    // The band that holds the selected stub's end, so its label can say `client end` / `server end` (AC25).
+    let endMark = null;
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
     const callables = () => role === "all" ? "indexed callables" : "production callables";
     const population = () => role === "all" ? "all indexed callables" : callables();
@@ -86,7 +88,7 @@
     function usable() { return view && current(basis) && view.rulesFile?.contentHash === basis.rulesHash; }
     // The app group the view is scoped to; null for the whole checkout (and for a name the data no longer has).
     // With fewer than two detected apps there is no switcher, so no scope: the stack is checkout-wide.
-    const scopeGroup = (payload = view) => scope === null || !payload || !(payload.apps?.length >= 2) ? null : apps.group(payload, scope);
+    const scopeGroup = (payload = view) => scope === null || payload?.state !== "ready" || !(payload.apps?.length >= 2) ? null : apps.group(payload, scope);
     const settleScope = payload => { if (scope !== null && !scopeGroup(payload)) scope = null; };
     // The Deviations tree sees the app's slice: its layers and edges, and the group's counts.
     let treeView = null;
@@ -103,6 +105,8 @@
     function clearInspection() {
       selectionSerial++; pressed = null; inspection = null;
       window.TrellisShell?.clearArchitectureInspector();
+      // Leaving a stub drops its band's word; the drawing is swapped in place, keeping what else is selected.
+      if (endMark) { endMark = null; if (usable() && view.state === "ready") void render({keepSelection:true}); }
     }
     function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false, keepReopen = false) {
       drawn = null; get("architecture-apps").hidden = true; get("architecture-source-line").hidden = true;
@@ -216,28 +220,52 @@
       // The narrow shared box stacks its header; ordered bands keep one line.
       const parts = [`${layer.shared ? "Shared" : layer.order} · ${layer.name}`, `${plural(modules.length, "file")}${packages.length ? ` · ${packages.length} external packages` : ""}`];
       if (metric !== "layer") parts.push(`max ${max}`);
+      if (endMark?.layer === layer.name) parts.push(`${endMark.side} end`);
       return parts.join(layer.shared ? "\n" : " · ");
     }
     // Outgoing production reference sites by verdict: the same summary edges the arrows draw.
     function layerCounts(layer) {
       const byName = new Map(model().layers.map(item => [item.name, item]));
-      const counts = {up:0, cross:0, down:0, shared:0, allowed:0, excepted:0, unknown:0};
+      const counts = {up:0, cross:0, down:0, shared:0, allowed:0, excepted:0, unknown:0}, upTo = new Map();
       for (const edge of model().edges) {
         if (edge.sourceLayer !== layer.name || edge.role !== "production") continue;
         const destination = byName.get(edge.destinationLayer), ordered = !layer.shared && destination && !destination.shared;
         if (edge.excepted) counts.excepted += edge.count;
-        else if (edge.status === "deviates") counts[ordered && destination.order < layer.order ? "up" : "cross"] += edge.count;
+        else if (edge.status === "deviates") {
+          const up = ordered && destination.order < layer.order;
+          counts[up ? "up" : "cross"] += edge.count;
+          if (up) upTo.set(destination.name, (upTo.get(destination.name) || 0) + edge.count);
+        }
         else if (edge.status !== "conforms") counts.unknown += edge.count;
         else if (destination?.shared) counts.shared += edge.count;
         else counts[ordered && destination.order > layer.order ? "down" : "allowed"] += edge.count;
       }
-      return counts;
+      return {...counts, upTo};
     }
-    // Only non-zero counts become chips; deviations carry the error tone and a glyph.
+    // Only non-zero counts become chips; deviations carry the error tone and a glyph. Upward deviations
+    // get one chip per destination layer, each a control that opens the Deviations tree on that edge
+    // (AC10), in every stack.
     function layerStats(layer) {
       const counts = layerCounts(layer), bound = lowerBound(layer.name, "production") ? "≥" : "";
-      return STATS.filter(([key]) => counts[key] > 0).map(([key, glyph, words, error]) =>
+      const stats = STATS.filter(([key]) => key !== "up" && counts[key] > 0).map(([key, glyph, words, error]) =>
         ({key, count:counts[key], text:`${glyph}${bound}${counts[key]}`, label:`${bound ? "at least " : ""}${counts[key]} outgoing production reference sites · ${words}`, tone:error ? "error" : "neutral"}));
+      const up = [...counts.upTo].map(([destination, count]) => ({key:"up", count, text:`↑${bound}${count} deviation · ${destination}`, tone:"error",
+        label:`${bound ? "at least " : ""}${count} upward production reference sites from ${layer.name} to ${destination} · deviation · open in Deviations`,
+        id:JSON.stringify(["up", layer.name, destination]), action:{sourceLayer:layer.name, destinationLayer:destination}}));
+      return [...up, ...stats, ...interfaceStats(layer)];
+    }
+    // The stubs of a one-app stack: this layer's end of an HTTP interface of the scoped app (AC15). The
+    // action carries `interface`, which routes the control to the interface inspector.
+    function interfaceStats(layer) {
+      const group = scopeGroup();
+      return !group ? [] : apps.stubs(model(), group.name, layer.name).map(stub => {
+        const count = `${stub.atLeast ? "≥" : ""}${plural(stub.routes, "route")}`, client = stub.side === "client";
+        const id = JSON.stringify(["interface", stub.client, stub.server, stub.side, layer.name]);
+        return {key:"interface", tone:"neutral", tag:"Selected", id,
+          text:client ? `→ ${stub.server} · ${count} · ${plural(stub.callSites, "call site")}` : `← ${stub.client} · ${count}`,
+          label:client ? `HTTP interface to ${stub.server}: ${count}, ${plural(stub.callSites, "call site")}` : `HTTP interface from ${stub.client}: ${count}`,
+          action:{id, interface:{client:stub.client, server:stub.server}, side:stub.side, layer:layer.name}};
+      });
     }
     // Summary-first display (#391): presentation state only, remembered per checkout.
     let shown = null, shownRoot = null;
@@ -388,7 +416,7 @@
       hiddenNames.textContent = layout.hidden.map(layer => layout.tests.has(layer.name) ? `${layer.name} (tests/fixtures; include them to show)` : layer.name).join(", ");
     }
     // A drawn node's stable identity (its data attribute), so a new drawing can find it again.
-    const NODE_KEYS = ["data-trellis-module-id", "data-trellis-edge-id", "data-trellis-layer-id", "data-trellis-directory-id", "data-trellis-unassigned", "data-trellis-note-id"];
+    const NODE_KEYS = ["data-trellis-module-id", "data-trellis-edge-id", "data-trellis-layer-id", "data-trellis-directory-id", "data-trellis-unassigned", "data-trellis-note-id", "data-trellis-action-id"];
     function nodeKey(node) {
       if (!node) return null;
       if (node === hiddenToggle) return ["id", hiddenToggle.id];
@@ -438,6 +466,11 @@
       const group = scopeGroup(payload);
       line.append(make("span", apps.sourceLine(group, payload.apps.length)));
       if (group?.duplicate) line.append(make("span", apps.duplicateNotice(group), "architecture-app-notice"));
+    }
+    // A `↑` badge opens 802's Deviations tree on its edge, unselected and with Calls only off (AC10).
+    function openDeviations(action) {
+      if (!usable() || view.state !== "ready" || editBusy) return;
+      return deviations.openEdge(action.sourceLayer, action.destinationLayer);
     }
     function setScope(next) {
       if (!usable() || view.state !== "ready" || editBusy || next === scope) return;
@@ -497,6 +530,7 @@
       if (!usable() || view.state !== "ready") return false;
       // `full` is the snapshot; `payload` is what this drawing shows: the whole stack, or one app's slice of it.
       const c = basis, full = view, ticket = ++renderSerial;
+      if (!keepSelection) endMark = null;
       if (scope !== null && !scopeGroup(full)) scope = null;
       const payload = scope === null ? full : apps.scoped(full, scope);
       const active = () => current(c) && view === full && ticket === renderSerial && full.rulesFile.contentHash === c.rulesHash;
@@ -532,6 +566,19 @@
             summary:(key, modules, columns) => summaryChips(key, modules, columns, scale, budget),
             edge:() => true,
             unassigned:{label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, get expanded() { return shown.unassigned && budget.left > 0; }}},
+          onOpenDeviation:action => {
+            const named = name => payload.layers.some(layer => layer.name === name);
+            if (active() && named(action?.sourceLayer) && named(action?.destinationLayer)) return openDeviations(action);
+          },
+          onSelectInterface:action => {
+            const entry = apps.link(payload, action?.interface?.client, action?.interface?.server);
+            if (!active() || !entry) return;
+            inspect("interface", entry);
+            const stub = typeof action.id === "string" ? findNode(["data-trellis-action-id", action.id]) : null;
+            for (const node of get("architecture-diagram").querySelectorAll?.("[aria-pressed]") || []) node.setAttribute("aria-pressed", String(node === stub));
+            pressed = nodeKey(stub);
+            endMark = {layer:action.layer, side:action.side}; void render({keepSelection:true});
+          },
           onSelectModule:module => { if (active() && payload.modules.includes(module)) { inspect("module", module); pressed = nodeKey(pressedNode()); } },
           onSelectEdge:edge => { if (active() && payload.edges.includes(edge)) { inspect("edge", edge); pressed = nodeKey(pressedNode()); } },
           onSelectLayer:layer => { if (active() && payload.layers.includes(layer)) inspect("layer", layer); },
@@ -648,12 +695,12 @@
       }
     }
     function same(a, b) { return moduleKey(a) === moduleKey(b); }
-    function inspectorSource(target, identity, site, active) {
+    function inspectorSource(target, identity, site, active, label = "Read indexed reference source") {
       const lines = site?.lines;
       const range = lines && Number.isSafeInteger(lines.start) && lines.start > 0 && Number.isSafeInteger(lines.end) && lines.end >= lines.start
         ? {startLine:lines.start, endLine:lines.end, startByte:site.range?.start, endByte:site.range?.end} : null;
       if (!range) return;
-      const button = make("button", "Read indexed reference source"); button.type = "button";
+      const button = make("button", label); button.type = "button";
       button.addEventListener("click", () => { if (active()) return readSource({path:identity.path, range}, basis.pin, active); }); target.append(button);
     }
     const NO_PAIRS = "No mapped pairs in this scope. This does not prove absence.";
@@ -740,6 +787,8 @@
     function overview() {
       if (!usable() || !["ready", "no_layers"].includes(view.state)) return;
       clearInspection(); window.TrellisShell?.showArchitectureInspector({drawer:false});
+      // Nothing is selected any more, so no drawn node may say it is (a stub shows the word Selected).
+      for (const node of get("architecture-diagram").querySelectorAll?.('[aria-pressed="true"]') || []) node.setAttribute("aria-pressed", "false");
       get("architecture-inspector-title").textContent = "Architecture review";
       const target = get("architecture-inspector-content"); target.replaceChildren();
       reviewChips(target);
@@ -762,6 +811,79 @@
       return semantic
         ? "Semantic evidence names a fresh producer binding and its proof; structural spelling and source-owner identities remain syntax evidence."
         : "Captured spelling and source-owner identities are syntax evidence, not destination symbol bindings.";
+    }
+    const str = value => typeof value === "string" ? value : "";
+    // One interface row of a detail list: the route, its confidence, and a source read for the handler and each call site.
+    const endpointRows = active => (list, items) => {
+      for (const item of items) {
+        const entry = item?.entry, row = make("div", undefined, "architecture-rule-row");
+        if (!entry || typeof entry !== "object") continue;
+        const handler = entry.handler, sites = item.list === "clientOnly" ? [entry.callSite] : Array.isArray(entry.callSites) ? entry.callSites : [];
+        const route = `${str(entry.method) || "unresolved method"} ${str(entry.pathTemplate) || "(unresolved path)"}`;
+        row.dataset.list = str(item.list);
+        const tail = item.list === "matched" ? ` · ${str(entry.confidence)} · ${plural(sites.length, "call site")}` : "";
+        paragraph(row, `${route}${tail}`);
+        if (handler?.path && handler.lines) {
+          paragraph(row, `Handler ${handler.path}:${handler.lines.start}`, "detail");
+          inspectorSource(row, {path:handler.path}, {lines:handler.lines}, active, "Read handler source");
+        }
+        for (const site of sites) if (site?.document?.path) {
+          paragraph(row, `Call site ${site.document.path}:${site.lines?.start}`, "detail");
+          inspectorSource(row, {path:site.document.path}, site, active, "Read call-site source");
+        }
+        list.append(row);
+      }
+    };
+    // The interface inspector (AC15): its ends, counts and wrappers, the one-sided routes and calls, and Open endpoints for the matched ones.
+    function inspectInterface(target, title, entry, active) {
+      title.textContent = `${entry.client} → ${entry.server}`;
+      const ends = Array.isArray(entry.ends) ? entry.ends : [], counts = entry.counts || {}, confidence = counts.confidence || {};
+      const layers = key => [...new Set(ends.map(end => end?.[key]))].map(name => typeof name === "string" ? name : "no layer").join(", ") || "no layer";
+      paragraph(target, "HTTP · method and path match · structural evidence, not proof", "detail");
+      paragraph(target, `Client end: ${entry.client} · ${layers("clientLayer")}`);
+      paragraph(target, `Server end: ${entry.server} · ${layers("serverLayer")}`);
+      const grid = make("dl", undefined, "metric-inspector-values");
+      const row = (name, value, tone) => { const item = make("dd", display(value)); if (tone) item.dataset.tone = tone; grid.append(make("dt", name), item); };
+      row("Matched routes", counts.matchedRoutes); row("Client call sites", counts.callSites);
+      row("◆ Server-only routes", counts.serverOnly, "warning"); row("◆ Client-only calls", counts.clientOnly, "warning");
+      row("exact", confidence.exact); row("template", confidence.template); row("wrapper-inferred", confidence.wrapperInferred); row("unresolved", confidence.unresolved);
+      target.append(grid);
+      const wrappers = entry.wrappers, prefix = wrappers?.prefix;
+      if (Array.isArray(wrappers?.callees)) paragraph(target, `Wrappers: ${wrappers.callees.filter(name => typeof name === "string").join(", ")}${prefix ? ` · Client prefix: ${str(prefix.client)} → ${str(prefix.server)}` : ""}`, "detail architecture-mono");
+      const params = list => ({kind:"interfaces", client:entry.client, server:entry.server, list});
+      const matched = make("div", undefined, "architecture-endpoints"), open = make("button", "Open endpoints", "architecture-open-endpoints"); open.type = "button";
+      open.addEventListener("click", () => {
+        if (!active() || open.disabled) return;
+        open.disabled = true; open.setAttribute("aria-expanded", "true");
+        detailList(matched, params("matched"), active, endpointRows(active), "No matched routes at this pin.");
+      });
+      target.append(open, matched);
+      paragraph(target, "◆ Server-only routes: no call matched them", "detail");
+      detailList(target, params("serverOnly"), active, endpointRows(active), "No server-only routes.");
+      paragraph(target, "◆ Client-only calls: no route matched them. This does not prove absence.", "detail");
+      detailList(target, params("clientOnly"), active, endpointRows(active), "No client-only calls.");
+    }
+    // The app inspector: what was detected, how much of it has layers, and the interfaces it takes part in.
+    function inspectApp(target, title, group, payload, active) {
+      title.textContent = group.name;
+      paragraph(target, `${group.languages.join(", ") || "no languages"} · ${group.roots.map(root => root || "./").join(", ") || "no roots"}`, "detail");
+      const ordered = payload.layers.filter(layer => !layer.shared && layer.app === group.name).length;
+      const shared = payload.layers.filter(layer => layer.shared && (layer.apps == null || layer.apps.includes(group.name))).length;
+      const grid = make("dl", undefined, "metric-inspector-values");
+      const row = (name, value, tone) => { const item = make("dd", value); if (tone) item.dataset.tone = tone; grid.append(make("dt", name), item); };
+      const unassigned = unassignedOf(payload, group).length, deviates = Number.isSafeInteger(group.counts?.deviates) ? group.counts.deviates : 0;
+      row("Files", String(group.fileCount)); row("Layers", `${ordered} + ${shared} shared`);
+      for (const entry of payload.interfaces) if (entry?.client === group.name) row(`Calls to ${entry.server}`, display(entry.counts?.callSites));
+      row("Deviations", deviates ? `↑ ${deviates} ${deviates === 1 ? "deviation" : "deviations"}` : "0", deviates ? "error" : null);
+      row("Unassigned", unassigned ? `◇ ${unassigned} unassigned` : "0", unassigned ? "warning" : null);
+      target.append(grid);
+      paragraph(target, `Detected from ${group.manifests.join(", ")}${group.kinds.length ? ` (${group.kinds.join(", ")})` : ""}`, "detail");
+      if (group.duplicate) paragraph(target, apps.duplicateNotice(group), "architecture-app-notice");
+      if (!ordered) paragraph(target, `${group.name} has no layers yet. The trellis_propose_layers MCP prompt can propose layers per app; this browser does not call it. Review .trellis/rules.toml to add layers with app = "${group.name}".`);
+      for (const entry of payload.interfaces) if (entry?.client === group.name || entry?.server === group.name) {
+        const button = make("button", `HTTP: ${entry.client} → ${entry.server}`); button.type = "button";
+        button.addEventListener("click", () => { if (active()) inspect("interface", entry); }); target.append(button);
+      }
     }
     function inspect(kind, record) {
       if (!usable() || view.state !== "ready") return;
@@ -809,6 +931,10 @@
         detailList(target, {kind:"pairs", layer:record.name}, active, pairItems(active), NO_PAIRS);
         paragraph(target, "Layer policy and exceptions", "detail");
         detailList(target, appFilter({kind:"instances", layer:record.name}), active, instanceItems(active), "No rule instances name this layer.");
+      } else if (kind === "interface" || kind === "app") {
+        const found = kind === "interface" ? apps.link(payload, record?.client, record?.server) : apps.group(payload, record?.name);
+        if (!found) { overview(); return; }
+        if (kind === "interface") inspectInterface(target, title, found, active); else inspectApp(target, title, found, payload, active);
       } else if (kind === "unresolved") {
         title.textContent = "Unresolved structural references";
         paragraph(target, `${references.counts?.unresolvedSites ?? 0} unresolved sites.`);
