@@ -10,6 +10,7 @@ mod common;
 
 mod build_identity;
 mod cli;
+mod cli_activation;
 mod daemon_checkout;
 mod daemon_cli;
 mod daemon_crash_recovery;

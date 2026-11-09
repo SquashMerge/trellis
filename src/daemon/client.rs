@@ -212,6 +212,22 @@ fn read_reply_until(
             "daemon reply ID mismatch",
         ));
     }
+    // Progress of a CLI read's wait for the first index precedes its reply
+    // (#842). It goes to stderr; a closed stderr cannot fail the read.
+    while let Some(progress) = reply.payload.get("progress") {
+        {
+            use std::io::Write;
+            let _ = writeln!(io::stderr(), "{}", progress.as_str().unwrap_or_default());
+        }
+        reply = read(stream)?;
+        check()?;
+        if reply.id != id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon reply ID mismatch",
+            ));
+        }
+    }
     if reply.payload.get("chunk").is_none() {
         return Ok(reply);
     }
