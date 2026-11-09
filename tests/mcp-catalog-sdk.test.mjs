@@ -62,7 +62,7 @@ test("the twelve-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain", "trellis_show",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 20);
+  assert.equal(describe.toolVersion.const, 21);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
@@ -259,7 +259,7 @@ test("trellis_show input admits one target per view, and its outcomes are closed
   assert.ok(!output(envelope({ outcome: "partial", generation: null })));
 });
 
-// #798: the BuildingFailure branch of each architecture tool takes exactly the ratified shape,
+// #798: the building error of each architecture tool takes exactly the ratified shape,
 // with the admitted basis and a null content hash.
 test("architecture building failures require a basis and a null content hash", () => {
   const basis = { indexGeneration: "123e4567-e89b-42d3-a456-426614174000", indexRevision: 7 };
@@ -342,4 +342,72 @@ test("references groupBy input and group rows are closed", () => {
     (({ test, ...rest }) => rest)(row)]) {
     assert.equal(rows([invalid]), false, JSON.stringify(invalid));
   }
+});
+
+// #836: the compacted failure schemas accept exactly the failures the four separate
+// no-workspace shapes and the resolved, located and building shapes accepted before. The
+// oracle below restates those shapes from the contract, independently of the catalog.
+test("compacted failure schemas keep every failure shape exact", () => {
+  const { AjvJsonSchemaValidator } = require("@modelcontextprotocol/sdk/validation/ajv");
+  const sdk = new AjvJsonSchemaValidator();
+  const basis = { indexGeneration: "123e4567-e89b-42d3-a456-426614174000", indexRevision: 7 };
+  const resolved = ["invalid_request", "range_too_large", "unsupported_encoding", "revision_conflict",
+    "index_not_ready", "not_found", "too_many_requests", "deadline_exceeded", "rebuild_in_progress",
+    "root_changed", "store_unavailable", "checkout_capacity", "daemon_unavailable", "outcome_unknown"];
+  const reasons = ["not_absolute", "not_checkout", "identity_changed", "unavailable"];
+  const architecture = ["trellis_references", "trellis_rules_check", "trellis_rules_explain"];
+  const keys = (object, allowed) => Object.keys(object).every((key) => allowed.includes(key));
+  const common = ["code", "message", "retryable", "currentBasis", "currentContentHash"];
+  const expected = (name, failure) => {
+    const { error } = failure;
+    if (!common.every((key) => key in error) || typeof error.message !== "string") return false;
+    if ("workspace" in failure) {
+      if (!keys(failure, ["schemaVersion", "requestId", "error", "workspace", "catchingUp"])) return false;
+      if (typeof error.retryable !== "boolean" || error.currentContentHash !== null && typeof error.currentContentHash !== "string") return false;
+      if (error.code === "building")
+        return architecture.includes(name) && keys(error, [...common, "progress", "retryAfterMs"])
+          && "progress" in error && "retryAfterMs" in error && error.retryable === true
+          && error.currentBasis !== null && error.currentContentHash === null;
+      const codes = architecture.includes(name) ? [...resolved, "building", "invalid_rules"] : resolved;
+      return codes.includes(error.code) && error.code !== "building" && keys(error, common);
+    }
+    if (!keys(failure, ["schemaVersion", "requestId", "error"])) return false;
+    if (error.currentBasis !== null || error.currentContentHash !== null) return false;
+    const attempted = "attemptedWorkspace" in error;
+    if (error.code === "workspace_selection_failed")
+      return attempted && reasons.includes(error.reason) && keys(error, [...common, "attemptedWorkspace", "reason"])
+        && error.retryable === (error.reason === "unavailable");
+    if ("reason" in error) return false;
+    if (error.code === "invalid_request" && attempted)
+      return error.retryable === false && keys(error, [...common, "attemptedWorkspace"]);
+    if (["too_many_requests", "deadline_exceeded"].includes(error.code))
+      return attempted && error.retryable === true && keys(error, [...common, "attemptedWorkspace"]);
+    return ["invalid_request", "range_too_large"].includes(error.code) && !attempted
+      && error.retryable === false && keys(error, common);
+  };
+  const failures = [];
+  for (const code of [...resolved, "workspace_selection_failed", "building", "bogus"])
+    for (const retryable of [true, false])
+      for (const reason of [undefined, "unavailable", "not_checkout", "different_repository"])
+        for (const attemptedWorkspace of [undefined, { kind: "invalid_type", jsonType: "array" }])
+          for (const currentBasis of [null, basis])
+            for (const extra of [{}, { progress: null, retryAfterMs: 250 }, { junk: 1 }])
+              for (const workspace of [false, true]) {
+                const error = { code, message: "m", retryable, currentBasis, currentContentHash: null, ...extra };
+                if (reason !== undefined) error.reason = reason;
+                if (attemptedWorkspace !== undefined) error.attemptedWorkspace = attemptedWorkspace;
+                const failure = { schemaVersion: 1, requestId: "r", error };
+                if (workspace) Object.assign(failure, { workspace: "/w", catchingUp: false });
+                failures.push(failure);
+              }
+  let accepted = 0;
+  for (const tool of tools) {
+    const validate = sdk.getValidator(tool.outputSchema);
+    for (const failure of failures) {
+      const want = expected(tool.name, failure);
+      accepted += want;
+      assert.equal(validate(failure).valid, want, `${tool.name} ${JSON.stringify(failure)}`);
+    }
+  }
+  assert.ok(accepted > 500, `${accepted} accepted failures`);
 });

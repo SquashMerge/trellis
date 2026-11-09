@@ -634,6 +634,31 @@ changes, only the order of rows within two arrays. This section wins over the #7
 - **Limitation.** When manifests are unread, `limitations` gains the one-line unread-manifest entry described in rules.md.
 - **Unchanged:** paging, `omittedEvidence`, `nextCall`, every bound, the check input, and the `trellis_propose_layers` payload of [Amendment (#783)](#amendment-783-per-app-layers-in-the-proposal-prompt). `trellis rules check --format json` prints the same two fields and its exit rule is unchanged.
 
+## Amendment (#836): catalog compaction
+
+**Status: owner-ratified 2026-11-09 under the owner's delegation on [#836](https://github.com/SquashMerge/trellis/issues/836): “Let's compact the MCP tools list, you can amend the contract.”** `toolVersion` is **21** (previously 20, #784), because the catalog text changes. No tool accepts or emits anything different: every input and output schema accepts exactly the instances it accepted at `toolVersion` 20. Only the schema text changes. This section wins over the #798 catalog text (the `BuildingFailure` definition and branch) and over any definition name in earlier sections where they differ.
+
+- **Why.** At `toolVersion` 20 the modern `tools/list` frame was 243,767 bytes (legacy 243,710) against the 245,760-byte named headroom limit (Decision 0011 item 6: the 262,144-byte catalog cap minus 16,384), leaving under 2 KB for the next change.
+- **Self-contained schemas.** Each `inputSchema` and `outputSchema` stays one self-contained JSON Schema whose every `$ref` is local (`#/$defs/…`). The catalog has no shared, cross-tool or remote definitions: MCP clients compile each tool's schema on its own (the pinned TypeScript SDK passes each `outputSchema` to Ajv separately), and the 2026-07-28 basic specification forbids dereferencing a network `$ref` by default. Deduplication is therefore within one schema only.
+- **Compaction rules.** Each preserves meaning on its own:
+  1. **No `$schema`.** Schemas omit `$schema`. MCP fixes JSON Schema 2020-12 as the dialect of a schema without one, which is the dialect they declared.
+  2. **One failure without a workspace.** The four failures that carry no `workspace` (workspace selection, invalid workspace, admission, arguments) share one closed `NoWorkspaceFailure` envelope `{schemaVersion,requestId,error}`. Its closed `error` lists the union of their fields and a `oneOf` of the four shapes:
+     - `workspace_selection_failed` with `attemptedWorkspace` and `reason`, `retryable` true exactly for `unavailable`;
+     - `invalid_request` with `attemptedWorkspace`, not retryable;
+     - `too_many_requests`|`deadline_exceeded` with `attemptedWorkspace`, retryable;
+     - `invalid_request`|`range_too_large` without `attemptedWorkspace`, not retryable.
+
+     `SelectionFailure`, `InvalidWorkspaceFailure`, `AdmissionFailure` and `ArgumentFailure` leave `$defs`. Every tool's root `oneOf` names `NoWorkspaceFailure` once, last.
+  3. **Nested resolved failures.** On the three architecture tools, the located `invalid_rules` and the #798 `building` errors share the resolved `Failure` envelope: `Failure.error` is a `oneOf` of the resolved error, `LocatedRuleError` and `BuildingError`. `LocatedRuleFailure` and `BuildingFailure` leave `$defs` and the root `oneOf`.
+  4. **Shared fragments.** A subschema repeated within one schema moves to a `$defs` entry when that saves bytes: `TextOrNull`, `UIntOrNull` and `RangeOrNull` (a definition or null), `CoverageCounts` (the five `LanguageStatus` coverage counts), `Texts`, `Freshness` and `EvidenceKind`. An inline `{start,end}` object is a `$ref` to the identical `Range` (or `LineSpan` where there is no `Range`), and `LineSpan` is `{$ref:Range}` where both exist.
+  5. **Null folded into the type.** `anyOf:[{enum:E},{type:"null"}]` becomes `{enum:E+[null]}`, `anyOf:[{const:c},{type:"null"}]` becomes `{enum:[c,null]}`, and a nullable string with only string keywords becomes `{type:["string","null"],…}`.
+  6. **Shorter Basis pattern.** `indexGeneration` uses the equivalent `^(?!0{8}-0{4}-0{4}-0{4}-0{12}$)[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![\s\S])`.
+
+  Descriptions are unchanged.
+- **Sizes.** The compact catalog is 243,410 bytes before and 220,646 after. The modern `tools/list` frame is 221,003 bytes (legacy 220,946), 22,764 bytes smaller. By rule: failures 15,867, `$schema` 1,368, fragments 1,760, `Range` 1,512, nullable definitions 846, null folding 767, pattern 644. A test keeps the frame at most 225,280 bytes: the named headroom plus 20,480 bytes of the recovered space. A change that needs more amends this budget.
+- **Checks.** Tests check that every schema is self-contained and has no `$schema`. They also check that the compacted failure schemas of all twelve tools accept exactly the failures the earlier shapes accepted, using an independent oracle over a matrix of codes, reasons, flags and fields, through the SDK's own validator. As before, real responses validate.
+- **Unchanged:** every tool, input, output, bound and description, every definition not named above, and the catalog's order.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)

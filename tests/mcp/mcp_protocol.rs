@@ -707,15 +707,15 @@ for (const {name, structuredContent} of inputs) {
         const withAttempt = {...structuredContent,
             error: {...structuredContent.error, attemptedWorkspace: {kind: 'invalid_type', jsonType: 'array'}}};
         if (validate(withWorkspaceOnly))
-            throw Error(`${name}: ArgumentFailure must not accept half-resolved workspace`);
+            throw Error(`${name}: argument failure must not accept half-resolved workspace`);
         if (!validate(withAttempt))
-            throw Error(`${name}: closed InvalidWorkspaceFailure branch missing`);
+            throw Error(`${name}: closed invalid-workspace failure shape missing`);
         const resolved = {...structuredContent, workspace: '/selected', catchingUp: false};
         if (!validate(resolved)) throw Error(`${name}: resolved Failure branch missing`);
         if (validate({...resolved, error: withAttempt.error}))
             throw Error(`${name}: resolved Failure must exclude attemptedWorkspace`);
         if (validate({...withAttempt, workspace: '/selected'}))
-            throw Error(`${name}: InvalidWorkspaceFailure must exclude workspace`);
+            throw Error(`${name}: invalid-workspace failure must exclude workspace`);
     }
 }
 "#;
@@ -3191,8 +3191,12 @@ fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
     assert_eq!(catalog.as_array().unwrap().len(), 12);
     for entry in catalog.as_array().unwrap() {
         let defs = &entry["outputSchema"]["$defs"];
+        // #836: the architecture tools nest their located and building errors beside the
+        // resolved one under `Failure.error.oneOf`; the resolved error is its first shape.
+        let resolved = &defs["Failure"]["properties"]["error"];
+        let resolved = resolved["oneOf"].get(0).unwrap_or(resolved);
         assert_eq!(
-            defs["Failure"]["properties"]["error"]["properties"]["code"],
+            resolved["properties"]["code"],
             json!({"$ref":"#/$defs/ResolvedFailureCode"})
         );
         assert!(
@@ -3201,21 +3205,27 @@ fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
                 .unwrap()
                 .contains(&json!("workspace_selection_failed"))
         );
-        for kind in ["SelectionFailure", "InvalidWorkspaceFailure"] {
-            let error = &defs[kind]["properties"]["error"]["properties"];
-            assert_eq!(error["currentBasis"], json!({"const":null}));
-            assert_eq!(error["currentContentHash"], json!({"const":null}));
-        }
+        // The four failures without a workspace share `NoWorkspaceFailure`.
+        let error = &defs["NoWorkspaceFailure"]["properties"]["error"];
+        assert_eq!(error["properties"]["currentBasis"], json!({"const":null}));
         assert_eq!(
-            defs["InvalidWorkspaceFailure"]["properties"]["error"]["properties"]["retryable"],
+            error["properties"]["currentContentHash"],
+            json!({"const":null})
+        );
+        let [selection, invalid_workspace, _, _] = error["oneOf"].as_array().unwrap().as_slice()
+        else {
+            panic!("four NoWorkspaceFailure error shapes")
+        };
+        assert_eq!(
+            invalid_workspace["properties"]["retryable"],
             json!({"const":false})
         );
         assert_eq!(
-            defs["SelectionFailure"]["properties"]["error"]["allOf"][0]["then"]["properties"]["retryable"],
+            selection["then"]["properties"]["retryable"],
             json!({"const":true})
         );
         assert_eq!(
-            defs["SelectionFailure"]["properties"]["error"]["allOf"][0]["else"]["properties"]["retryable"],
+            selection["else"]["properties"]["retryable"],
             json!({"const":false})
         );
     }
