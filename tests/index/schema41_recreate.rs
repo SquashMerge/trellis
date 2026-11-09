@@ -152,7 +152,7 @@ fn schema41_marker_recreates_exclusively_and_imports_into_payload_tables() {
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     // Start with a real durable request queue. Recreate must preserve its
     // accepted rows; a missing queue is not a virgin startup after this point.
-    let initial = Store::open_for_tests(state.path(), &root).unwrap();
+    let initial = trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
     let queued = initial
         .enqueue_request(&IndexOptions::new(root.clone()), None)
         .unwrap();
@@ -197,7 +197,7 @@ fn schema41_marker_recreates_exclusively_and_imports_into_payload_tables() {
         "a GC report must not mutate an obsolete index"
     );
 
-    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    let store = trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
     assert_eq!(
         fs::metadata(&path).unwrap().ino(),
         old_inode,

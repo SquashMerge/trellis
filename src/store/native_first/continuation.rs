@@ -376,16 +376,16 @@ impl Store {
                 if super::oracle::enabled() {
                     let durable = self.cache()?;
                     for prepared in &state.prepared {
-                        if let Some(full) = &prepared.oracle_full {
-                            if let Err(error) = super::oracle::check_published(
+                        if let Some(full) = &prepared.oracle_full
+                            && let Err(error) = super::oracle::check_published(
                                 &durable,
                                 _published_pin,
                                 &prepared.producer,
                                 full,
-                            ) {
-                                *continuation = None;
-                                return Err(error.context(RejoinOracleMismatch));
-                            }
+                            )
+                        {
+                            *continuation = None;
+                            return Err(error.context(RejoinOracleMismatch));
                         }
                     }
                 }
