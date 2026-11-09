@@ -350,3 +350,296 @@ pub(in crate::store) fn cleanup_payload_candidates(
     }
     Ok(progress)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_evidence::{DocumentKey, Range};
+
+    fn document(path: &str) -> DocumentKey {
+        DocumentKey {
+            source_set_id: "set".into(),
+            language: "javascript".into(),
+            path: path.into(),
+        }
+    }
+
+    fn internal(path: &str) -> sem::Target {
+        sem::Target::Internal {
+            syntax_id: format!("sid:v1:{}", "1".repeat(32)),
+            document: document(path),
+            revision_id: "native".into(),
+        }
+    }
+
+    fn anchor(path: &str, kind: sem::JoinKind) -> sem::Join {
+        sem::Join {
+            anchor: sem::MeasuredAnchor {
+                document: document(path),
+                revision_id: "native".into(),
+                content_hash: "h".into(),
+                range: Range { start: 0, end: 1 },
+                kind,
+            },
+            status: sem::JoinStatus::Exact,
+            candidate_ids: vec![],
+            diagnostic: None,
+        }
+    }
+
+    /// A publication whose one document names a different document through every kind of
+    /// endpoint the projection depends on.
+    fn every_endpoint() -> (sem::Coverage, sem::SemanticPublication) {
+        let key = |symbol: &str| sem::SymbolKey {
+            scheme: sem::SymbolScheme::Scip,
+            symbol: symbol.into(),
+            scope: sem::SymbolScope::Global,
+            document: None,
+        };
+        let coverage = sem::Coverage {
+            producer_id: "producer".into(),
+            language: sem::Language::Javascript,
+            source_set_id: "set".into(),
+            document_path: "main.js".into(),
+            revision_id: "native".into(),
+            requested: true,
+            selected: true,
+            state: sem::CoverageState::Complete,
+            supported_roles: vec![],
+            observed_roles: vec![],
+            diagnostic: None,
+            reasons: None,
+        };
+        let provenance = |id: &str| sem::Provenance {
+            id: id.into(),
+            producer_id: "producer".into(),
+            document: document("main.js"),
+            revision_id: "native".into(),
+            content_hash: "h".into(),
+            evidence_kind: sem::EvidenceKind::MeasuredSyntax,
+            basis: Some(sem::SemanticBasis {
+                producer_id: "producer".into(),
+                producer_version: "1".into(),
+                producer_hash: "a".repeat(64),
+                artifact_hash: "b".repeat(64),
+                language: sem::Language::Javascript,
+                source_set_id: "set".into(),
+                revision_id: "native".into(),
+                source_manifest_hash: "c".repeat(64),
+                toolchain_hash: "d".repeat(64),
+                config_hash: "e".repeat(64),
+                dependency_hash: "f".repeat(64),
+                lookup_dependencies: vec![],
+            }),
+            freshness: sem::Freshness::Fresh,
+            derived_from: None,
+        };
+        let publication = sem::SemanticPublication {
+            producers: vec![],
+            coverage: vec![coverage.clone()],
+            provenance: vec![provenance("p")],
+            symbols: vec![sem::Symbol {
+                key: key("s"),
+                display_name: None,
+                declarations: vec![internal("symbol-target.js")],
+                provenance_id: "p".into(),
+            }],
+            declaration_bindings: vec![sem::DeclarationBinding {
+                syntax_id: None,
+                symbols: vec![],
+                join: anchor("declaration-anchor.js", sem::JoinKind::DeclarationName),
+                provenance_id: "p".into(),
+            }],
+            references: vec![sem::Reference {
+                id: "occ:v1:00".into(),
+                owner_syntax_id: "sid:v1:00".into(),
+                ordinal: 0,
+                document: document("main.js"),
+                revision_id: "native".into(),
+                range: Range { start: 0, end: 1 },
+                spelling: "x".into(),
+                lookup_key: "x".into(),
+                site: sem::ReferenceSite::Use,
+                roles: vec![],
+                resolution: sem::Resolution::Resolved,
+                declared_target: Some(internal("reference-declared.js")),
+                candidates: vec![internal("reference-candidate.js")],
+                provenance_id: "p".into(),
+            }],
+            call_bindings: vec![sem::CallBinding {
+                call_id: None,
+                join: anchor("call-anchor.js", sem::JoinKind::Callee),
+                resolution: sem::Resolution::Resolved,
+                declared_target: Some(internal("call-declared.js")),
+                candidates: vec![internal("call-candidate.js")],
+                dispatch: sem::Dispatch::Direct,
+                possible_dispatch: vec![internal("call-dispatch.js")],
+                possible_dispatch_complete: false,
+                stale_target: None,
+                provenance_id: "p".into(),
+            }],
+            type_relationships: vec![sem::TypeRelationship {
+                kind: sem::RelationshipKind::Extends,
+                source: internal("type-source.js"),
+                target: internal("type-target.js"),
+                provenance_id: "p".into(),
+            }],
+        };
+        (coverage, publication)
+    }
+
+    #[test]
+    fn projection_dependencies_covers_every_endpoint_kind() {
+        let (coverage, publication) = every_endpoint();
+        let owns = owned_provenance(&coverage, &publication);
+        let paths: Vec<String> = projection_dependencies(&owns, &publication)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "call-anchor.js",
+                "call-candidate.js",
+                "call-declared.js",
+                "call-dispatch.js",
+                "declaration-anchor.js",
+                "reference-candidate.js",
+                "reference-declared.js",
+                "symbol-target.js",
+                "type-source.js",
+                "type-target.js",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fact_of_another_tuple_adds_no_dependency() {
+        let (coverage, mut publication) = every_endpoint();
+        publication.symbols[0].provenance_id = "other".into();
+        let owns = owned_provenance(&coverage, &publication);
+        assert!(
+            !projection_dependencies(&owns, &publication)
+                .iter()
+                .any(|(_, path)| path == "symbol-target.js")
+        );
+    }
+
+    #[test]
+    fn writer_rejects_dependency_endpoint_missing_from_revision() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(CACHE_SCHEMA_V42).unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
+        let (_, mut publication) = every_endpoint();
+        publication.producers.push(sem::Producer {
+            id: "producer".into(),
+            version: "1".into(),
+            executable_hash: "a".repeat(64),
+            kind: sem::SemanticKind::Semantic,
+            languages: vec![sem::Language::Javascript],
+            position_encoding: sem::PositionEncoding::Utf8,
+        });
+        // The document itself is in the revision; its dependencies are not.
+        db.execute("INSERT INTO document_versions(vid,id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness) VALUES(1,'v','javascript','main.js',?1,?1,'p','1',0,x'',?1)", ["b".repeat(64)]).unwrap();
+        db.execute("INSERT INTO revision_documents VALUES('key','javascript','main.js',1,1,NULL,NULL,1,1,'complete',NULL,0,1)", []).unwrap();
+        let error = write_import_coverage(&db, "key", &publication, None).unwrap_err();
+        assert!(
+            error.is::<SelectedIntegrity>()
+                && format!("{error:#}").contains("semantic dependency endpoint missing"),
+            "{error:#}"
+        );
+    }
+
+    fn payload_with_children(db: &Connection, key: Option<&str>, symbols: usize) {
+        db.execute_batch(CACHE_SCHEMA_V42).unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        db.execute(
+            "INSERT INTO semantic_payloads(payload_id,payload_key,producer_id,producer_version,language,path,version_id,batch_id) VALUES(1,?1,'p','1','javascript','a.js','v',1)",
+            [key],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO semantic_release_candidate_payloads VALUES('rev',1)",
+            [],
+        )
+        .unwrap();
+        for ordinal in 0..symbols {
+            db.execute(
+                "INSERT INTO semantic_symbols VALUES(NULL,1,?1,'scip',?2,'global',NULL,NULL,NULL,0)",
+                params![ordinal as i64, format!("s{ordinal}")],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn collection_clears_key_before_children() {
+        let db = Connection::open_in_memory().unwrap();
+        payload_with_children(&db, Some(&"a".repeat(64)), 600);
+        assert!(cleanup_payload_candidates(&db, "rev").unwrap());
+        let key: Option<String> = db
+            .query_row("SELECT payload_key FROM semantic_payloads", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            key, None,
+            "no writer hit can reach a payload being collected"
+        );
+        let left: i64 = db
+            .query_row("SELECT COUNT(*) FROM semantic_symbols", [], |r| r.get(0))
+            .unwrap();
+        assert!(left > 0, "the children go in later chunks");
+    }
+
+    #[test]
+    fn last_release_collects_payload_in_chunks() {
+        let db = Connection::open_in_memory().unwrap();
+        payload_with_children(&db, Some(&"a".repeat(64)), 600);
+        let mut calls = 0;
+        while cleanup_payload_candidates(&db, "rev").unwrap() {
+            calls += 1;
+            assert!(calls < 20);
+        }
+        assert!(
+            calls >= 3,
+            "600 children take at least three 256-row chunks"
+        );
+        for table in [
+            "semantic_payloads",
+            "semantic_symbols",
+            "semantic_release_candidate_payloads",
+        ] {
+            let rows: i64 = db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn a_payload_a_manifest_row_still_names_is_only_unjournaled() {
+        let db = Connection::open_in_memory().unwrap();
+        payload_with_children(&db, Some(&"a".repeat(64)), 3);
+        db.execute("INSERT INTO semantic_coverage VALUES(1,'other','p','1','javascript','a.js',1,1,'complete',NULL,1)", []).unwrap();
+        cleanup_payload_candidates(&db, "rev").unwrap();
+        let (payloads, symbols, key): (i64, i64, Option<String>) = db
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM semantic_payloads),(SELECT COUNT(*) FROM semantic_symbols),(SELECT payload_key FROM semantic_payloads)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((payloads, symbols), (1, 3));
+        assert!(key.is_some(), "a named payload keeps its reuse key");
+        let journal: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_release_candidate_payloads",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(journal, 0);
+    }
+}
