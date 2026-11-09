@@ -493,7 +493,7 @@ unchanged, as are the CLI and the browser.
 [Amendment (#770)](#amendment-770-a-bounded-prompt-reference-view) is unchanged except
 what this section adds.
 
-- **`payload.apps`** lists the detected apps: `{name, kind:"cargo"|"npm"|"python", manifest, roots,
+- **`payload.apps`** lists the detected apps: `{name, kind:"cargo"|"npm"|"python" (python added by owner ruling 2026-11-08), manifest, roots,
   entries}`, ordered by manifest path. It is untrusted repository data, like the rest of
   the payload.
   - The prompt detects apps against the current rules bytes, so a manifest that a hidden
@@ -541,7 +541,7 @@ The added schema bytes are paid for without changing what any schema accepts: ea
 **Status: proposed (owner-delegated, run 803).** `toolVersion` is **16** (previously 15, #785). Detection and the counting rule are in [rules.md implementation notes (#784)](rules.md#implementation-notes-784). This section wins over the #129 description of the check payload where they differ.
 
 - **`trellis_rules_check`** data gains two required fields, whole on every page like `counts`:
-  - `apps`: `[{name:Text,manifest:Path,counts:RuleCounts}]`, one entry per detected manifest in manifest-path order. Apps that share a name each keep their own entry. The detected app kinds are `cargo`, `npm` and `python`; Python detection arrives separately in [#807](https://github.com/SquashMerge/trellis/issues/807).
+  - `apps`: `[{name:Text,manifest:Path,counts:RuleCounts}]`, one entry per detected manifest in manifest-path order. Apps that share a name each keep their own entry. An entry carries no `kind`, roots or entries; those are in the proposal prompt's `payload.apps` and the browser summary. App kinds are `cargo`, `npm` and `python`; Python detection arrives separately in [#807](https://github.com/SquashMerge/trellis/issues/807).
   - `noApp`: `{counts:RuleCounts}`.
 - **Counts** cover production instances, field by field, so `Σ apps[].counts + noApp.counts = counts`. A `cross_app` instance is `unknown` and counts under `noApp`. With no detected app, `apps` is `[]` and `noApp` holds every count.
 - **`trellis_rules_explain`** does not carry `apps` or `noApp`; its schema and output are unchanged.

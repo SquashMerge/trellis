@@ -52,7 +52,7 @@ switcher and the drawing are [#789](https://github.com/SquashMerge/trellis/issue
 [#784](https://github.com/SquashMerge/trellis/issues/784).
 
 - **Apps are detected, never guessed or proposed.** The summary lists the detected apps,
-  each with its name, its kind (`cargo`, `npm` or `python`), its manifest path, its roots and its
+  each with its name, its kind (`cargo`, `npm` or `python`; python added by owner ruling 2026-11-08), its manifest path, its roots and its
   entries. It also gives each layer its app: `layers[].app` for an ordered layer, the served
   apps for a shared layer. #784 fixes the exact fields. The view never draws a layer or an
   app that `rules.toml` and the manifests don't define. It has no function-level layers:
@@ -98,15 +98,34 @@ separately in [#807](https://github.com/SquashMerge/trellis/issues/807).
   the modules whose app is this one.
 - `modules[].app`: the app name of the module's file, or null.
 - `layers[].app` and `layers[].apps`: the authored values, or null.
-- `noApp`: `{counts, unassignedFileCount}`, or null when there is no app. The two numbers
-  count different things:
+- `noApp`: `{counts, unassignedFileCount}`. It is null only in the summary head, before the
+  rules are ready. With no detected app it holds every count. The two numbers count different
+  things:
   - `counts` counts production **rule instances** that belong to no app. They are `cross_app`
     pairs, pairs between layers that share more than one app, rows attributed by a file that
-    is in no single-app layer and outside every app root.
+    is in no single-app layer and outside every app root, and every instance when no app is
+    detected.
   - `unassignedFileCount` counts **files** with no layer that lie outside every app root.
   - With every app's counts, `counts` sums to `rules.counts`, field by field.
 - `interfaces[]`: one entry per ordered pair of apps `(client, server)` with at least one
-  matched call. With fewer than two apps it is empty.
+  matched call, ordered by the client's inventory index, then the server's. With fewer than
+  two apps it is empty. Each entry is:
+
+  ```text
+  {client,server,kind:"http",
+   ends:[{clientLayer:string|null,serverLayer:string|null,routes:UInt,callSites:UInt}],
+   wrappers:{callees:["api","request","api.request","owner.request"],
+             prefix:{client:"/api/",server:"/api/checkouts/{root}/"}},
+   counts:{matchedRoutes,callSites,serverOnly,clientOnly,
+           confidence:{exact,template,wrapperInferred,unresolved}}}
+  ```
+
+  `client` and `server` are app names. An end's app is the app of its file and layer under
+  the `bucket` rule's file attribution. `ends[]` groups matched pairs by the layer of the call
+  site and the layer of the handler (null sorts last): `routes` counts distinct routes and
+  `callSites` counts call sites. `counts.confidence` counts call sites, matched and
+  client-only. `serverOnly` is the number of the server's routes that no call matched, and
+  `clientOnly` the number of the client's unmatched calls.
 - Summary `edges` omit `cross_app` instances. They stay in `rules.counts.unknown` and in the
   review list.
 - A single-app checkout whose app root is a subdirectory, and which has unassigned files
@@ -120,32 +139,86 @@ separately in [#807](https://github.com/SquashMerge/trellis/issues/807).
 - `kind=interfaces` pages the interface rows. Its filters are `client`, `server` and `list`
   (`matched`, `serverOnly` or `clientOnly`); any other value fails `invalid_request`. A reader
   passes `client` and `server` with every `list`. Paging, the pin and the `rulesHash` work
-  as for the other kinds.
+  as for the other kinds. The three item shapes are:
+
+  ```text
+  {client,server,list:"matched",
+   entry:{method,pathTemplate,confidence,handler:H,callSites:[C]}}
+  {client,server,list:"serverOnly",entry:{method,pathTemplate,handler:H}}
+  {client,server,list:"clientOnly",
+   entry:{method:string|null,pathTemplate:string|null,confidence:"unresolved",callSite:C}}
+  H = {kind:"declaration"|"closure"|"dispatchArm",syntaxId:string|null,
+       stableLookupKey:string|null,path,lines:{start,end},variant:string|null,
+       layer:string|null}
+  C = {document:{sourceSetId,language,path},range:{start,end},lines:{start,end},
+       callId:string|null,caller:Caller|null,confidence,layer:string|null}
+  ```
+
+  `H.layer` is the layer that owns the handler's file and `C.layer` the layer that owns the
+  call site's file; both are null when the file is unassigned. `lines` are 1-based and
+  inclusive. `caller` is the measured caller of the call, as in rule evidence.
 - Where two apps share a name, they are one group in the browser: one chip and one `app`
   filter value, with every manifest path listed.
 
 **Extraction (#788).** Interface evidence is structural and read from the same admitted
-snapshot as the rules. It is extracted only when two or more apps are detected.
+snapshot as the rules. It is extracted only when two or more apps are detected. Documents
+with an evidence gap are skipped. Work is bounded; over the bound the read fails
+`bounded_work`.
 
-- **Server routes.** Rust axum `.route("/literal", get(handler))` registrations, with
-  `:name` read as `{name}` and `*name` as `{*name}`, and the method dispatch table of a
-  `match` on a method and path tuple. Each route records a `handler.kind`: `declaration`
-  (one same-document function), `closure`, or `dispatchArm`. Routes are one per method and
-  path template.
-- **Client calls.** Calls to the built-in wrappers `api(path, method?)`, `request(path, ..,
-  {method})` and `api.request(path, {method})`, in JavaScript and TypeScript. A string or
-  template literal gives the path, with `{}` for each `${...}`; a path that does not start
-  with `/` is not a client call. A path or method that cannot be read statically is
-  `unresolved`.
-- **Prefix.** A call that matches no route as written is matched again as assembled by the
-  wrapper's prefix (`/api/` becomes `/api/checkouts/{root}/`); such a match is
-  `wrapperInferred`.
-- **Matching and confidence.** The most literal match wins, and a tie is no match. The values
-  are `exact`, `template`, `wrapperInferred` and `unresolved`, defined in the contract-v1
-  amendment. A route takes its best call site.
-- **Exclusions.** Test-role files and declarations, items under the `test-support` feature,
-  and routes that serve static assets (`include_str!` or `include_bytes!` handlers) are not
-  extracted.
+- **Server routes.** Rust axum `<expr>.route("/literal", <method-router>)` registrations
+  with exactly two arguments. A method router is `get`, `post`, `put`, `delete`, `patch`,
+  `head` or `options` applied to a handler, optionally path-qualified and chained; each
+  (method, handler) pair is one route. `:name` is read as `{name}` and `*name` as `{*name}`.
+  Routes are one per method and path template; the first by path and position wins.
+- **Dispatch table.** A `match` on a two-element tuple inside `impl T { fn f(..) }`, with an
+  arm of the form `(Method::M, "literal")`, is a dispatch table. The arm's variant `V` is the
+  first `Self::V` or `T::V` in it, and arms nested inside the `_` arm give `<literal>/{*}`.
+  An axum literal ending in `{*name}` whose named handler `F` calls `T::f(..)` is replaced
+  by the table's routes: the literal's prefix plus the arm's suffix, with the arm's method
+  (kept only if the registration includes it). Such routes are marked as coming from the
+  table, which makes their matches `template`.
+- **Handler identity.** `handler.kind` is `declaration` when the handler names exactly one
+  same-document function (the function's span), `closure` otherwise (the span of the handler
+  expression), or `dispatchArm` for a table route answered by an arm that does not call
+  exactly one same-document function (the arm's span). The answering arm is the first arm
+  outside `f` that names `T::V` and does not use `unreachable!`, `panic!`, `todo!` or
+  `unimplemented!`. If no arm answers, the handler is the declaration `F`. `variant` is the
+  table variant `V` for every table route and null otherwise.
+- **`syntaxId` and `stableLookupKey`.** They come from the innermost named callable that
+  contains the handler (or the named function, for `declaration`), with keys from the
+  declaration lookup keys. They are null when no named callable exists.
+- **Client calls.** JavaScript and TypeScript calls to the built-in wrappers (there is no
+  rules-file key):
+
+  | Callee | Path | Method | Default |
+  | --- | --- | --- | --- |
+  | `api` | argument 0 | argument 1, a string literal | `GET` |
+  | `request` | argument 0 | `method` in the object literal at argument 2 | `GET` |
+  | `api.request` or `owner.request` | argument 0 | `method` in the object literal at argument 1 | `GET` |
+
+  A string literal gives the path. A template literal gives its fragments with `{}` in place
+  of each `${...}`. An escape sequence or any other expression makes the path unreadable. A
+  readable path that does not start with `/` is not a client call. The path is cut at `?` or
+  `#` and split on `/`; a segment containing `{}` is a substitution segment; a trailing empty
+  segment is dropped. A method is unreadable when it is not a literal, when the options object
+  has a top-level spread and no `method`, or when it is not one of `GET`, `POST`, `PUT`,
+  `DELETE`, `PATCH`, `HEAD` or `OPTIONS` (after uppercasing). An unreadable path or method
+  never matches and is `unresolved`.
+- **Segment matching.** Methods must be equal. A literal segment must equal a literal
+  segment. A server `{name}` matches exactly one segment, and `{*name}` matches the rest.
+  A client substitution segment matches only a server `{name}` or `{*name}`. If nothing
+  matches as written, the call is matched again as assembled by the wrapper's prefix:
+  `/api/` becomes `/api/checkouts/{root}/`, with `{root}` a substitution segment. Among the
+  matches the one with the most literal segments wins, and a tie is no match.
+- **Confidence.** `wrapperInferred` when the prefix was needed. Otherwise `template` when the
+  call used a client substitution, or the route has a server `{name}` or `{*name}`, or came
+  from the dispatch table. Otherwise `exact`. A call with no match is `unresolved`. A route
+  takes its best call site: `exact`, then `template`, then `wrapperInferred`. The values are
+  defined in the contract-v1 amendment.
+- **Exclusions.** Documents whose file module has the `test` role, routes and calls whose
+  innermost declaration has the `test` role, items under a `test-support` feature attribute,
+  and routes that serve static assets (a handler that contains `include_str!` or
+  `include_bytes!`) are not extracted.
 - **Evidence, never proof.** Interfaces are never an input to `$layers`. A pair of layers in
   different apps stays `unknown` with reason `cross_app`, and the view makes no claim that one
   app calls another. Absence of a match proves nothing.
