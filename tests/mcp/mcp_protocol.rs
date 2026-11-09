@@ -12974,6 +12974,15 @@ impl SearchMcpFixture {
     }
 
     fn seed_vectors(&self, service: &trellis::daemon::search::SearchService) {
+        self.seed_vectors_at(service, self.current);
+    }
+
+    /// Cache a vector for every head card at `pin`.
+    fn seed_vectors_at(
+        &self,
+        service: &trellis::daemon::search::SearchService,
+        pin: trellis::model::IndexPin,
+    ) {
         let store = trellis::testing::retry_admission(|| {
             trellis::store::Store::open_for_tests(self._temp.path(), &self.identity.root)
         });
@@ -12981,7 +12990,7 @@ impl SearchMcpFixture {
         let mut after = None;
         loop {
             let page = store
-                .head_search_cards(Some(self.current), after.as_deref(), 16)
+                .head_search_cards(Some(pin), after.as_deref(), 16)
                 .unwrap();
             if page.cards.is_empty() {
                 break;
@@ -12989,6 +12998,7 @@ impl SearchMcpFixture {
             after = Some(page.cards.last().unwrap().syntax_id.clone());
             cards.extend(page.cards);
         }
+        drop(store);
         let model_id = service
             .with_model_job(&std::sync::atomic::AtomicBool::new(false), |_| {
                 Ok(service
@@ -14789,6 +14799,222 @@ async fn mcp_search_reports_building_with_counts_before_owner_builds_new_head() 
     drop(client);
     session.join().unwrap().unwrap();
     validate_structured_content(&pairs);
+}
+
+/// A held owner with no matrix for the new head, as #777's building test sets
+/// it up: three declarations, two of them cached.
+async fn held_building_head() -> (
+    SearchMcpFixture,
+    std::sync::Arc<trellis::daemon::search::SearchService>,
+    std::sync::Arc<trellis::daemon::search_fill::SearchFill>,
+    std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
+    ReadGate,
+) {
+    let first_batch = ReadGate::default();
+    let second_batch = ReadGate::default();
+    first_batch.open();
+    second_batch.open();
+    let factory = std::sync::Arc::new(McpFillEmbedderFactory {
+        before_load: None,
+        first_batch,
+        second_batch,
+        loads: Default::default(),
+        batches: Default::default(),
+        queries: Default::default(),
+    });
+    let (fixture, service, fill) = SearchMcpFixture::with_search(
+        &[("a.js", "function orchard() {}\nfunction unrelated() {}\n")],
+        |roots| {
+            std::sync::Arc::new(
+                trellis::daemon::search::SearchService::with_embedder_for_tests(
+                    roots.clone(),
+                    factory.clone(),
+                )
+                .unwrap(),
+            )
+        },
+        true,
+    )
+    .await;
+    fixture.seed_vectors(&service);
+    let build = ReadGate::default();
+    fixture
+        .head()
+        .await
+        .set_before_build_hook_for_tests(build.hook());
+    let runtime = fixture
+        .registry
+        .lock()
+        .await
+        .runtime(&fixture.identity.root_key)
+        .unwrap();
+    fs::write(
+        fixture.identity.root.join("a.js"),
+        "function orchard() {}\nfunction unrelated() {}\nfunction orchardnew() {}\n",
+    )
+    .unwrap();
+    fixture.startup.open();
+    let waiter = build.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    (fixture, service, fill.unwrap(), runtime, build)
+}
+
+fn describe_search_index(
+    client: &mut std::os::unix::net::UnixStream,
+    reader: &mut BufReader<std::os::unix::net::UnixStream>,
+    id: u64,
+) -> (Value, Value) {
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(id),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1})
+        )
+    )
+    .unwrap();
+    let describe = next_reply(reader);
+    let envelope = &describe["result"]["structuredContent"];
+    (
+        envelope["data"]["searchIndex"].clone(),
+        envelope["evidenceBasis"].clone(),
+    )
+}
+
+/// #806: while the owner has no matrix for the admitted head, describe and CLI
+/// status count the head's cached vectors once, not on every call. A cache
+/// write is the owner's signal that the count may have changed: the next call
+/// measures again and reports the new count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_describe_counts_pending_head_cache_once_per_cache_write() {
+    let (fixture, service, fill, runtime, build) = held_building_head().await;
+    let _release_on_failure = McpFillRelease([build.clone(), ReadGate::default()]);
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    let building = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"building","declarations":3,"embedded":2
+    });
+    let mut pin = None;
+    for id in 1..=3 {
+        let (index, basis) = describe_search_index(&mut client, &mut reader, id);
+        assert_eq!(index, building, "describe {id}");
+        pin.get_or_insert(basis);
+    }
+    let status_runtime = runtime.clone();
+    let status = tokio::task::spawn_blocking(move || status_runtime.cli_status().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status["searchIndex"], building, "{status}");
+    assert_eq!(runtime.search_coverage_scans_for_tests(), 1);
+    // Cache the new head's third card while the owner is still held.
+    let basis = pin.unwrap();
+    let pin = trellis::model::IndexPin {
+        index_generation: basis["indexGeneration"].as_str().unwrap().parse().unwrap(),
+        index_revision: basis["indexRevision"].as_u64().unwrap(),
+    };
+    fixture.seed_vectors_at(&service, pin);
+    let (index, _) = describe_search_index(&mut client, &mut reader, 4);
+    assert_eq!(
+        index,
+        json!({
+            "backend":"cpu","unavailableReason":null,
+            "state":"building","declarations":3,"embedded":3
+        })
+    );
+    let (again, _) = describe_search_index(&mut client, &mut reader, 5);
+    assert_eq!(again, index);
+    assert_eq!(runtime.search_coverage_scans_for_tests(), 2);
+    build.open();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    let (index, _) = describe_search_index(&mut client, &mut reader, 6);
+    assert_eq!(
+        index,
+        json!({
+            "backend":"cpu","unavailableReason":null,
+            "state":"complete","declarations":3,"embedded":3
+        })
+    );
+    assert_eq!(runtime.search_coverage_scans_for_tests(), 2);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #806: the remembered coverage belongs to one admitted head. When the head
+/// advances while the owner is still held, describe counts the new head
+/// (declarations and cached vectors) instead of reusing the old count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_describe_pending_coverage_follows_an_advanced_head() {
+    let (fixture, _service, fill, runtime, build) = held_building_head().await;
+    let _release_on_failure = McpFillRelease([build.clone(), ReadGate::default()]);
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    let (index, first) = describe_search_index(&mut client, &mut reader, 1);
+    assert_eq!(
+        index,
+        json!({
+            "backend":"cpu","unavailableReason":null,
+            "state":"building","declarations":3,"embedded":2
+        })
+    );
+    assert_eq!(runtime.search_coverage_scans_for_tests(), 1);
+    fs::write(
+        fixture.identity.root.join("a.js"),
+        "function orchard() {}\nfunction unrelated() {}\nfunction orchardnew() {}\n\
+         function orchardlater() {}\n",
+    )
+    .unwrap();
+    let indexing = runtime.clone();
+    let root = fixture.identity.root.clone();
+    tokio::task::spawn_blocking(move || {
+        indexing.cli_index(&trellis::indexer::IndexOptions::new(root))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let advanced = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"building","declarations":4,"embedded":2
+    });
+    for id in 2..=3 {
+        let (index, basis) = describe_search_index(&mut client, &mut reader, id);
+        assert!(
+            basis["indexRevision"].as_u64().unwrap() > first["indexRevision"].as_u64().unwrap(),
+            "{basis}"
+        );
+        assert_eq!(index, advanced, "describe {id}");
+    }
+    assert_eq!(runtime.search_coverage_scans_for_tests(), 2);
+    // The publishing worker step hints the owner as it ends: wait for that
+    // step, so the owner has the newer head queued before it is released.
+    let scheduler = runtime.browser_scheduler().unwrap();
+    tokio::task::spawn_blocking(move || drop(scheduler.hold_worker_for_tests()))
+        .await
+        .unwrap();
+    build.open();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    let (index, _) = describe_search_index(&mut client, &mut reader, 4);
+    assert_eq!(
+        index,
+        json!({
+            "backend":"cpu","unavailableReason":null,
+            "state":"complete","declarations":4,"embedded":4
+        })
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
 }
 
 /// #777 owner ruling (2026-11-07): describe and CLI status never fail on the
