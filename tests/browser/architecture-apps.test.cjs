@@ -40,7 +40,11 @@ async function published(files, rules, callback) {
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
     server = await H.startDaemon(paths, indexed.json().status.revision.indexRevision);
     browser = await chromium.launch();
-    context = await browser.newContext({viewport:{width:1440, height:1000}});
+    // Two columns need a canvas of 2·352 + 176 = 880px plus its 24px padding. At 1440 the canvas
+    // was 912px with overlay scrollbars but 897px where Chromium draws a classic 15px scrollbar in
+    // the stable gutter (Linux, and CI Macs without a trackpad), which stacks the columns. 1600
+    // leaves a margin no scrollbar or font takes away; the stacked layout is asserted at 760.
+    context = await browser.newContext({viewport:{width:1600, height:1000}});
     const page = await context.newPage(), errors = [];
     page.on("pageerror", error => errors.push(error.message));
     await H.connect(page, server, paths.token);
@@ -65,6 +69,18 @@ test("markup_in_app_name_is_text", {timeout:240000}, async () => published(hosti
   assert.equal(await page.evaluate(() => window.__pwned), undefined);
 }));
 
+// What decides the All apps layout, for a failure message.
+const layoutInputs = page => page.evaluate(() => {
+  const canvas = document.getElementById("architecture-diagram"), width = node => node ? Math.round(node.getBoundingClientRect().width) : null;
+  const name = document.querySelector(".architecture-app-name");
+  return {viewport:innerWidth, devicePixelRatio, canvasClientWidth:canvas.clientWidth, scrollbar:canvas.offsetWidth - canvas.clientWidth,
+    layout:document.querySelector(".architecture-apps-grid")?.dataset.layout, columns:[...document.querySelectorAll(".architecture-app-column")].map(width),
+    rail:width(document.querySelector(".workspace-frame > aside")), inspector:width(document.getElementById("architecture-inspector")), font:name && getComputedStyle(name).font};
+});
+const columnsDrawn = async page => {
+  const inputs = await layoutInputs(page);
+  assert.equal(inputs.layout, "columns", `the columns fit side by side: ${JSON.stringify(inputs)}`);
+};
 const drawn = async page => {
   await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
   await page.locator(".architecture-apps-grid .architecture-interface-card").waitFor({state:"attached"});
@@ -73,6 +89,7 @@ const drawn = async page => {
 test("all_apps_layout: columns side by side with a gutter card and a hidden overlay line, stacked when narrow", {timeout:240000}, async () => published(httpFiles, httpRules, async ({page}) => {
   await drawn(page);
   const grid = page.locator("#architecture-diagram .architecture-apps-grid");
+  await columnsDrawn(page);
   assert.equal(await grid.getAttribute("data-layout"), "columns");
   const heads = page.locator(".architecture-app-header");
   assert.equal(await heads.count(), 2);
@@ -103,6 +120,7 @@ test("all_apps_layout: columns side by side with a gutter card and a hidden over
 
 test("all_apps_selected_word: a selected header or card says Selected, and is pressed", {timeout:240000}, async () => published(httpFiles, httpRules, async ({page}) => {
   await drawn(page);
+  await columnsDrawn(page);
   const card = page.locator(".architecture-interface-card"), tag = card.locator(".architecture-selected-tag");
   assert.equal(await card.getAttribute("aria-pressed"), "false");
   assert.equal(await tag.isVisible(), false, "no word before a selection");
@@ -122,6 +140,7 @@ test("all_apps_selected_word: a selected header or card says Selected, and is pr
 
 test("all_apps_long_names_wrap: a 120-character name is not clipped and keeps its full accessible name", {timeout:240000}, async () => published(httpFiles, httpRules, async ({page}) => {
   await drawn(page);
+  await columnsDrawn(page);
   const head = page.locator(".architecture-app-header", {hasText:longName});
   assert.equal((await head.locator(".architecture-app-name").textContent()), longName, "the whole name is on the page");
   const measure = await page.evaluate(() => {
