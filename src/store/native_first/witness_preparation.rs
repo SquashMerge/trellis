@@ -114,6 +114,7 @@ impl WitnessPreparation {
                         target: target.clone(),
                         captured_pin: authority.captured_pin,
                         producer: authority.producer.id.clone(),
+                        batch_id: authority.batch_id,
                     })
                     .copies(db, &document)? =>
                 {

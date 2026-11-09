@@ -509,6 +509,13 @@ pub struct Store {
     #[cfg(feature = "test-support")]
     #[cfg(feature = "test-support")]
     semantic_publication_observer: Arc<Mutex<Option<SemanticPublicationObserver>>>,
+    /// Test seam: whether writers may key payloads for reuse. Per store, so one process can
+    /// hold a reusing store and a non-reusing reference.
+    #[cfg(feature = "test-support")]
+    payload_reuse_disabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam: the join-inputs digest payload keys carry instead of the build's.
+    #[cfg(feature = "test-support")]
+    payload_join_inputs: Arc<Mutex<Option<String>>>,
     #[cfg(test)]
     test_stream_before_preflight_hook: Arc<Mutex<Option<TestStreamPreflightHook>>>,
     /// The publication page cache in KiB; only tests lower it.
@@ -7367,7 +7374,16 @@ fn read_semantic_tuple_for_call(
         call_id,
         selected_tuple.is_none(),
         source_set,
+        None,
     )
+}
+
+/// A tuple of one revision read as evidence of another (#680 T1): the other revision's native
+/// revision, and the freshness its manifest row will carry.
+#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+struct ReadAs<'a> {
+    native: &'a str,
+    freshness: &'a BTreeMap<i64, crate::semantic_evidence::Freshness>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7380,6 +7396,7 @@ fn read_semantic_tuple_with_reasons(
     call_id: Option<&[u8]>,
     with_reasons: bool,
     source_set: String,
+    read_as: Option<ReadAs<'_>>,
 ) -> Result<crate::semantic_evidence::SemanticSnapshot> {
     use crate::native_evidence::DocumentKey;
     use crate::semantic_evidence as sem;
@@ -7424,12 +7441,21 @@ fn read_semantic_tuple_with_reasons(
     ) in tuples
     {
         native_first::context::validate_tuple(db, key, &producer_id, payload)?;
-        let projection = semantic_payload::project_payload(
-            db,
-            key,
-            tuple,
-            semantic_payload::FreshnessSource::Stored,
-        )?;
+        let projection = match &read_as {
+            Some(read_as) => semantic_payload::project_payload(
+                db,
+                key,
+                tuple,
+                semantic_payload::FreshnessSource::Publication(read_as.freshness),
+            )?
+            .at_native(read_as.native),
+            None => semantic_payload::project_payload(
+                db,
+                key,
+                tuple,
+                semantic_payload::FreshnessSource::Stored,
+            )?,
+        };
         let supported_roles = semantic_ordered(
             db,
             "SELECT ordinal,role FROM semantic_coverage_roles WHERE kind='supported' AND (payload_id=?1 OR tuple_id=?2) ORDER BY ordinal",
@@ -8199,6 +8225,7 @@ fn write_import_coverage(
     key: &str,
     publication: &crate::semantic_evidence::SemanticPublication,
     batch: Option<i64>,
+    inputs: &semantic_payload::KeyInputs,
 ) -> Result<()> {
     use crate::semantic_evidence as sem;
     let native: String = query_row_cached(
@@ -8294,7 +8321,8 @@ fn write_import_coverage(
                     [batch],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
-                Some(semantic_payload::payload_key(
+                semantic_payload::payload_key(
+                    inputs,
                     producer,
                     &descriptor,
                     &captured,
@@ -8302,7 +8330,7 @@ fn write_import_coverage(
                     &coverage.document_path,
                     &own_version,
                     &versions,
-                ))
+                )
             }
             _ => None,
         };
@@ -8602,13 +8630,14 @@ fn write_staged_semantic(
     key: &str,
     producer: &crate::semantic_evidence::Producer,
     batch: i64,
+    inputs: &semantic_payload::KeyInputs,
     gate: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
     // The tuple writers' statements, each target table's included, stay prepared.
     db.set_prepared_statement_cache_capacity(64);
     let mut index = 0u64;
     crate::semantic_import::read_staged_documents(db, "stage.", producer, &mut |publication| {
-        write_import_coverage(db, key, &publication, Some(batch))?;
+        write_import_coverage(db, key, &publication, Some(batch), inputs)?;
         if index % 1000 == 999 {
             gate()?;
         }
@@ -8861,7 +8890,13 @@ fn write_semantic(
                 )?;
             }
         }
-        write_import_coverage(db, &key, publication, None)?;
+        write_import_coverage(
+            db,
+            &key,
+            publication,
+            None,
+            &semantic_payload::KeyInputs::current(),
+        )?;
     }
     if let Some(previous) = prior_key {
         db.execute(
@@ -12409,6 +12444,10 @@ impl Store {
             #[cfg(feature = "test-support")]
             #[cfg(feature = "test-support")]
             semantic_publication_observer: Arc::default(),
+            #[cfg(feature = "test-support")]
+            payload_reuse_disabled: Arc::default(),
+            #[cfg(feature = "test-support")]
+            payload_join_inputs: Arc::default(),
             #[cfg(test)]
             test_stream_before_preflight_hook: Arc::new(Mutex::new(None)),
             publication_cache_kib: Arc::new(std::sync::atomic::AtomicI64::new(
@@ -14791,7 +14830,14 @@ impl Store {
             &gate,
         )?;
         gate()?;
-        write_staged_semantic(&tx, &next_key, &producer, batch_id, &gate)?;
+        write_staged_semantic(
+            &tx,
+            &next_key,
+            &producer,
+            batch_id,
+            &self.payload_key_inputs(),
+            &gate,
+        )?;
         tx.execute(
             "INSERT INTO semantic_revision_raw_selections VALUES(?1,?2,?3,?4)",
             params![next_key, producer.id, batch_id, captured_key],
@@ -19131,6 +19177,44 @@ impl Store {
     #[doc(hidden)]
     pub fn set_before_spill_wait_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
         self.publication_gate.test_before_spill_wait.set(hook);
+    }
+
+    /// With `false`, this store's writers key no payload, so no later write can name a stored
+    /// one: an independent reference for the shared-payload path.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_payload_reuse_for_tests(&self, enabled: bool) {
+        self.payload_reuse_disabled
+            .store(!enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Replaces the join-inputs digest this store's payload keys carry, as a build of
+    /// different join code would; `None` restores this build's.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_payload_join_inputs_for_tests(&self, digest: Option<&str>) {
+        *self.payload_join_inputs.lock().unwrap() = digest.map(str::to_owned);
+    }
+
+    /// What this store's payload keys hash besides the document (owner ruling 2026-11-09).
+    fn payload_key_inputs(&self) -> semantic_payload::KeyInputs {
+        let inputs = semantic_payload::KeyInputs::current();
+        #[cfg(feature = "test-support")]
+        {
+            let inputs = match self.payload_join_inputs.lock().unwrap().as_deref() {
+                Some(digest) => inputs.with_join_inputs(digest),
+                None => inputs,
+            };
+            if self
+                .payload_reuse_disabled
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return inputs.without_reuse();
+            }
+            inputs
+        }
+        #[cfg(not(feature = "test-support"))]
+        inputs
     }
 
     #[cfg(feature = "test-support")]

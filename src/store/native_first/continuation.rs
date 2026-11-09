@@ -553,6 +553,7 @@ impl Store {
                                 target: target.clone(),
                                 captured_pin: selection.captured_pin,
                                 producer: selection.producer_id.clone(),
+                                batch_id: selection.batch_id,
                             })
                         });
                         return Ok(None);

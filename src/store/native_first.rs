@@ -603,43 +603,63 @@ impl Store {
                         destination = Some(copy::CopyDestination::read(self, &tx, target)?);
                     }
                     let producer = &output.producer;
-                    let batch_id = target
+                    let selection = target
                         .selections
                         .iter()
                         .find(|selection| selection.producer_id == producer.id)
-                        .map(|selection| selection.batch_id)
                         .context("selected semantic batch missing")?;
+                    let inputs = self.payload_key_inputs();
                     // Copied and staged documents are written in canonical key order, as one
-                    // settlement of every document would have written them.
-                    let mut write = |document: &crate::semantic_evidence::SemanticPublication| {
+                    // settlement of every document would have written them. Corruption read or
+                    // written while publishing is reported, so it schedules a re-index as a
+                    // read would; the publication transaction is not committed.
+                    let mut write = |next: CommitDocument<'_>| {
                         check_cancel(cancel)?;
-                        write_import_coverage(&tx, &key, document, Some(batch_id))?;
+                        match next {
+                            CommitDocument::Staged(document) => write_import_coverage(
+                                &tx,
+                                &key,
+                                document,
+                                Some(selection.batch_id),
+                                &inputs,
+                            )?,
+                            // A copied document names its basis row's payload: its manifest
+                            // row and freshness are all S writes for it, and the payload's
+                            // rows are never read or written.
+                            CommitDocument::Copied(document) => {
+                                let (_, basis_tuple) = copy::copy_source(
+                                    &tx,
+                                    target,
+                                    &producer.id,
+                                    selection.batch_id,
+                                    document,
+                                )?
+                                .context(SelectedIntegrity(
+                                    "incompatible_index: copied document lost its basis".into(),
+                                ))?;
+                                let payload: Option<i64> = tx.query_row(
+                                    "SELECT payload_id FROM semantic_coverage WHERE tuple_id=?1",
+                                    [basis_tuple],
+                                    |row| row.get(0),
+                                )?;
+                                let freshness = match payload {
+                                    Some(payload) => copy::reuse_freshness(
+                                        &tx,
+                                        payload,
+                                        producer,
+                                        destination.as_ref().context("copy destination")?,
+                                    )?,
+                                    None => BTreeMap::new(),
+                                };
+                                copy::publish_copy(&tx, &key, basis_tuple, &freshness)?;
+                            }
+                        }
                         blocked.check(&tx);
                         #[cfg(feature = "test-support")]
                         if let Some(observer) = observer.as_mut() {
                             observer(crate::store::SemanticPublicationStage::AfterDocument, &tx);
                         }
                         anyhow::Ok(())
-                    };
-                    // Corruption read or written while copying is reported, so it schedules a
-                    // re-index as a read would; the publication transaction is not committed.
-                    let copy_one = |document: &crate::native_evidence::DocumentKey| {
-                        (|| {
-                            let (basis, tuple) =
-                                copy::copy_source(&tx, target, &producer.id, document)?.context(
-                                    SelectedIntegrity(
-                                        "incompatible_index: copied document lost its basis".into(),
-                                    ),
-                                )?;
-                            copy::copied_document(
-                                &tx,
-                                &basis,
-                                tuple,
-                                producer,
-                                destination.as_ref().context("copy destination")?,
-                            )
-                        })()
-                        .map_err(|error| self.report_index_failure(error))
                     };
                     crate::semantic_import::read_staged_documents(
                         parts.conn,
@@ -656,16 +676,16 @@ impl Store {
                                         < (staged.0.as_str(), staged.1.as_str())
                                 }) {
                                     let doc = copied.pop_front().expect("front checked");
-                                    // Writing a copied row can be where its corruption is found.
-                                    write(&copy_one(&doc)?)
+                                    write(CommitDocument::Copied(&doc))
                                         .map_err(|error| self.report_index_failure(error))?;
                                 }
                             }
-                            write(&document).map_err(|error| self.report_index_failure(error))
+                            write(CommitDocument::Staged(&document))
+                                .map_err(|error| self.report_index_failure(error))
                         },
                     )?;
                     while let Some(doc) = copied.pop_front() {
-                        write(&copy_one(&doc)?)
+                        write(CommitDocument::Copied(&doc))
                             .map_err(|error| self.report_index_failure(error))?;
                     }
                     context::publish(
@@ -731,6 +751,12 @@ impl Store {
             }
         }
     }
+}
+
+/// A document S publishes at commit: settled and staged, or copied from its basis row.
+enum CommitDocument<'a> {
+    Staged(&'a crate::semantic_evidence::SemanticPublication),
+    Copied(&'a crate::native_evidence::DocumentKey),
 }
 
 /// A bounded one-document overlay read. The tuple and every target retain P authority.

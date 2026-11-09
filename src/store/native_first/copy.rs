@@ -7,8 +7,10 @@
 //! S or an import validated and published; this trusts them as reads do (#261). The copy
 //! re-keys exactly what the witnessed settlement derives from the destination: the native
 //! revision named by coverage, references, join anchors and kept internal targets, the
-//! rejoined provenance IDs and the provenance freshness. Corruption read while copying is
-//! the read path's typed integrity failure, so it schedules a re-index as reads do.
+//! rejoined provenance IDs and the provenance freshness. Since #680 (Decision 0021) the copy
+//! names the basis tuple's shared payload from a new manifest row, which reads back as exactly
+//! that re-keying, so S neither reads nor writes the payload's rows; corruption in them is found
+//! by the read path as a typed integrity failure that schedules a re-index.
 use super::*;
 use crate::native_evidence::DocumentKey;
 use crate::semantic_evidence as sem;
@@ -82,12 +84,14 @@ impl CopyDestination {
 
 /// The basis pin key and tuple of `document` when S copies it for `producer`: the
 /// older-basis projection serves it at the pending target (not pending), the basis pin
-/// published a tuple for it, and that tuple omitted no association and is no unavailable S's
-/// failure.
+/// published a tuple for it, that tuple omitted no association and is no unavailable S's
+/// failure, and any payload it names is a keyed payload of `batch_id` (D4: the payload's key
+/// is then the key the document has at the pending target).
 pub(crate) fn copy_source(
     db: &Connection,
     target: &PendingSemanticTarget,
     producer: &str,
+    batch_id: i64,
     document: &DocumentKey,
 ) -> Result<Option<(String, i64)>> {
     // A basis tuple that omitted rows for an absent target is not copied: the target can
@@ -97,7 +101,8 @@ pub(crate) fn copy_source(
     let row: Option<(bool, String, Option<i64>)> = db
         .prepare_cached(
             "SELECT d.pending OR EXISTS(SELECT 1 FROM semantic_coverage_reasons r WHERE (r.payload_id=c.payload_id OR r.tuple_id=c.tuple_id) AND r.omitted=1) \
-             OR COALESCE(c.state='failed' AND substr(c.diagnostic,1,length(?5)+1)=?5||':',0),\
+             OR COALESCE(c.state='failed' AND substr(c.diagnostic,1,length(?5)+1)=?5||':',0) \
+             OR COALESCE(c.payload_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM semantic_payloads p WHERE p.payload_id=c.payload_id AND p.payload_key IS NOT NULL AND p.batch_id=?6),0),\
              o.basis_pin,c.tuple_id FROM semantic_projection_documents d \
              JOIN semantic_projection_origins o ON o.revision_id=d.revision_id AND o.producer_id=d.producer_id \
              LEFT JOIN semantic_coverage c ON c.revision_id=o.basis_pin AND c.producer_id=o.producer_id \
@@ -110,7 +115,8 @@ pub(crate) fn copy_source(
                 producer,
                 document.language,
                 document.path,
-                UNAVAILABLE_DIAGNOSTIC
+                UNAVAILABLE_DIAGNOSTIC,
+                batch_id
             ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -121,14 +127,16 @@ pub(crate) fn copy_source(
     })
 }
 
-/// What decides, per document, whether S copies it for one producer: the pending target and
-/// the producer's captured pin. Admission (which then stages none of the document's proof
-/// identities) and witness preparation (which stages it as copied) ask the same question.
+/// What decides, per document, whether S copies it for one producer: the pending target, the
+/// producer's captured pin and the selected batch. Admission (which then stages none of the
+/// document's proof identities) and witness preparation (which stages it as copied) ask the
+/// same question.
 #[derive(Clone)]
 pub(crate) struct CopyFilter {
     pub(crate) target: PendingSemanticTarget,
     pub(crate) captured_pin: IndexPin,
     pub(crate) producer: String,
+    pub(crate) batch_id: i64,
 }
 
 impl CopyFilter {
@@ -136,7 +144,7 @@ impl CopyFilter {
     /// and current versions are the same (the witness's reuse condition), so the copied rows
     /// are exactly what re-settling it would emit.
     pub(crate) fn copies(&self, db: &Connection, document: &DocumentKey) -> Result<bool> {
-        if copy_source(db, &self.target, &self.producer, document)?.is_none() {
+        if copy_source(db, &self.target, &self.producer, self.batch_id, document)?.is_none() {
             return Ok(false);
         }
         let current = witness::selected_version(db, self.target.pin, document)?;
@@ -145,17 +153,131 @@ impl CopyFilter {
     }
 }
 
-/// The publication S writes for a copied document: the basis tuple re-keyed to the
-/// destination, exactly as the witnessed settlement would emit it.
-pub(crate) fn copied_document(
+/// The freshness each basis of a copied payload has at the destination, exactly as the
+/// witnessed settlement would emit it for an unchanged document: its captured and destination
+/// bytes agree (which the witness checked before choosing the copy), so only a basis the
+/// destination no longer shares is possibly stale. Keyed by `basis_id`: a copy shares the
+/// basis payload's bases.
+pub(crate) fn reuse_freshness(
     db: &Connection,
-    basis: &str,
-    tuple: i64,
+    payload: i64,
     producer: &sem::Producer,
     destination: &CopyDestination,
+) -> Result<BTreeMap<i64, sem::Freshness>> {
+    let mut rows = db.prepare_cached(
+        "SELECT basis_id,captured_native_revision_id,toolchain_hash,source_manifest_hash,config_hash,dependency_hash,producer_version,producer_hash,language FROM semantic_basis WHERE payload_id=?1",
+    )?;
+    let mut rows = rows.query([payload])?;
+    let mut out = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let language: sem::Language = semantic_enum(row.get::<_, String>(8)?)?;
+        let fresh = row.get::<_, String>(1)? == destination.native_revision_id
+            && row.get::<_, String>(2)? == destination.toolchain_hash
+            && row.get::<_, String>(3)? == destination.manifest_hash
+            && row.get::<_, String>(4)? == destination.config_hash
+            && row.get::<_, String>(5)? == destination.dependency_hash
+            && row.get::<_, String>(6)? == producer.version
+            && row.get::<_, String>(7)? == producer.executable_hash
+            && producer.languages.contains(&language);
+        out.insert(
+            row.get(0)?,
+            if fresh {
+                sem::Freshness::Fresh
+            } else {
+                sem::Freshness::PossiblyStale
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// What S writes for a copied document: a manifest row that names the basis row's payload
+/// (or, for a payload-less row, copies its manifest-owned roles and reasons), plus one
+/// freshness row per payload basis. The payload's rows are not read or written.
+pub(crate) fn publish_copy(
+    db: &Connection,
+    key: &str,
+    basis_tuple: i64,
+    freshness: &BTreeMap<i64, sem::Freshness>,
+) -> Result<()> {
+    let copied = db
+        .prepare_cached(
+            "INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic,payload_id) \
+             SELECT ?1,producer_id,producer_version,language,path,requested,selected,state,diagnostic,payload_id FROM semantic_coverage WHERE tuple_id=?2",
+        )?
+        .execute(params![key, basis_tuple])?;
+    selected_ensure!(
+        copied == 1,
+        "incompatible_index: copied document lost its basis"
+    );
+    let tuple = db.last_insert_rowid();
+    let payload: Option<i64> = db
+        .prepare_cached("SELECT payload_id FROM semantic_coverage WHERE tuple_id=?1")?
+        .query_row([tuple], |r| r.get(0))?;
+    if payload.is_none() {
+        db.prepare_cached(
+            "INSERT INTO semantic_coverage_roles(payload_id,tuple_id,kind,ordinal,role) SELECT NULL,?1,kind,ordinal,role FROM semantic_coverage_roles WHERE tuple_id=?2",
+        )?
+        .execute(params![tuple, basis_tuple])?;
+        db.prepare_cached(
+            "INSERT INTO semantic_coverage_reasons(payload_id,tuple_id,macro_invocation,attribute_item,macro_definition,other,capped,omitted,captured_diagnostics) SELECT NULL,?1,macro_invocation,attribute_item,macro_definition,other,capped,omitted,captured_diagnostics FROM semantic_coverage_reasons WHERE tuple_id=?2",
+        )?
+        .execute(params![tuple, basis_tuple])?;
+    }
+    for (basis, freshness) in freshness {
+        db.prepare_cached(
+            "INSERT INTO semantic_coverage_freshness(revision_id,tuple_id,basis_id,freshness) VALUES(?1,?2,?3,?4)",
+        )?
+        .execute(params![key, tuple, basis, semantic_variant(freshness)?])?;
+    }
+    Ok(())
+}
+
+/// The publication S writes for a copied document, as the oracle compares it: the basis
+/// payload read as evidence of the destination, with the freshness [`reuse_freshness`] gives.
+/// This is the projection the committed manifest row will read back; only the oracle reads it.
+#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+pub(crate) fn copied_document(
+    db: &Connection,
+    target: &PendingSemanticTarget,
+    selection: &PendingSemanticSelection,
+    producer: &sem::Producer,
+    destination: &CopyDestination,
+    document: &DocumentKey,
 ) -> Result<sem::SemanticPublication> {
-    let mut snapshot = read_semantic_tuple(db, basis, Some(tuple), None, true)?;
-    let [coverage] = snapshot.coverage.as_mut_slice() else {
+    let (basis, tuple) = copy_source(db, target, &producer.id, selection.batch_id, document)?
+        .context(SelectedIntegrity(
+            "incompatible_index: copied document lost its basis".into(),
+        ))?;
+    let payload: Option<i64> = db.query_row(
+        "SELECT payload_id FROM semantic_coverage WHERE tuple_id=?1",
+        [tuple],
+        |row| row.get(0),
+    )?;
+    let freshness = match payload {
+        Some(payload) => reuse_freshness(db, payload, producer, destination)?,
+        None => BTreeMap::new(),
+    };
+    let source_set: String = db.query_row(
+        "SELECT source_set_id FROM native_revisions WHERE id=?1",
+        [&basis],
+        |r| r.get(0),
+    )?;
+    let snapshot = read_semantic_tuple_with_reasons(
+        db,
+        &basis,
+        Some(tuple),
+        None,
+        true,
+        None,
+        true,
+        source_set,
+        Some(ReadAs {
+            native: &destination.native_revision_id,
+            freshness: &freshness,
+        }),
+    )?;
+    let [coverage] = snapshot.coverage.as_slice() else {
         return Err(
             SelectedIntegrity("incompatible_index: copied tuple coverage missing".into()).into(),
         );
@@ -164,95 +286,6 @@ pub(crate) fn copied_document(
         coverage.producer_id == producer.id,
         "incompatible_index: copied tuple producer differs"
     );
-    let payload: Option<i64> = db.query_row(
-        "SELECT payload_id FROM semantic_coverage WHERE tuple_id=?1",
-        [tuple],
-        |row| row.get(0),
-    )?;
-    coverage.reasons = read_coverage_reasons(db, payload, tuple)?;
-    let old = std::mem::replace(
-        &mut coverage.revision_id,
-        destination.native_revision_id.clone(),
-    );
-    let new = &destination.native_revision_id;
-    let revision = |id: &mut String| {
-        if *id == old {
-            *id = new.clone();
-        }
-    };
-    let target = |target: &mut sem::Target| {
-        if let sem::Target::Internal { revision_id, .. } = target
-            && *revision_id == old
-        {
-            *revision_id = new.clone();
-        }
-    };
-    let mut ids = BTreeMap::new();
-    for provenance in &mut snapshot.provenance {
-        let derived = provenance.derived_from.as_ref().context(SelectedIntegrity(
-            "incompatible_index: copied provenance is not derived".into(),
-        ))?;
-        let basis = provenance.basis.as_ref().context(SelectedIntegrity(
-            "incompatible_index: copied provenance has no basis".into(),
-        ))?;
-        let id = crate::semantic_import::rejoin_provenance_id(
-            &derived.provenance_id,
-            new,
-            provenance.evidence_kind,
-        );
-        // The settlement's freshness rule for an unchanged document (its captured and
-        // destination bytes agree, which the witness checked before choosing the copy).
-        provenance.freshness = if basis.revision_id != *new
-            || basis.toolchain_hash != destination.toolchain_hash
-            || basis.source_manifest_hash != destination.manifest_hash
-            || basis.config_hash != destination.config_hash
-            || basis.dependency_hash != destination.dependency_hash
-            || basis.producer_version != producer.version
-            || basis.producer_hash != producer.executable_hash
-            || !producer.languages.contains(&basis.language)
-        {
-            sem::Freshness::PossiblyStale
-        } else {
-            sem::Freshness::Fresh
-        };
-        revision(&mut provenance.revision_id);
-        ids.insert(std::mem::replace(&mut provenance.id, id.clone()), id);
-    }
-    let rekey = |id: &mut String| -> Result<()> {
-        *id = ids
-            .get(id.as_str())
-            .context(SelectedIntegrity(
-                "incompatible_index: copied fact without provenance".into(),
-            ))?
-            .clone();
-        Ok(())
-    };
-    for symbol in &mut snapshot.symbols {
-        symbol.declarations.iter_mut().for_each(target);
-        rekey(&mut symbol.provenance_id)?;
-    }
-    for binding in &mut snapshot.declaration_bindings {
-        revision(&mut binding.join.anchor.revision_id);
-        rekey(&mut binding.provenance_id)?;
-    }
-    for reference in &mut snapshot.references {
-        revision(&mut reference.revision_id);
-        reference.declared_target.iter_mut().for_each(target);
-        reference.candidates.iter_mut().for_each(target);
-        rekey(&mut reference.provenance_id)?;
-    }
-    for call in &mut snapshot.call_bindings {
-        revision(&mut call.join.anchor.revision_id);
-        call.declared_target.iter_mut().for_each(target);
-        call.candidates.iter_mut().for_each(target);
-        call.possible_dispatch.iter_mut().for_each(target);
-        rekey(&mut call.provenance_id)?;
-    }
-    for relationship in &mut snapshot.type_relationships {
-        target(&mut relationship.source);
-        target(&mut relationship.target);
-        rekey(&mut relationship.provenance_id)?;
-    }
     Ok(sem::SemanticPublication {
         producers: vec![producer.clone()],
         coverage: snapshot.coverage,

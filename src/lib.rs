@@ -67,6 +67,8 @@ pub mod search_vectors;
 pub mod semantic_batch;
 pub mod semantic_evidence;
 pub mod semantic_import;
+#[cfg(test)]
+mod semantic_join_inputs_tests;
 pub mod skipped_config;
 pub(crate) mod skipped_source;
 pub mod sqlite_config;

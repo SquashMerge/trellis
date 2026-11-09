@@ -119,6 +119,28 @@ pub(crate) fn world_with(populate: impl FnOnce(&Path), mcp: bool) -> World {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     populate(&root);
+    world_over(state, temp, root, mcp)
+}
+
+/// A fresh index in a state directory of its own over the same checkout: the independent
+/// reference for a history `world` ran. Its native revisions equal `world`'s while the
+/// checkout is unchanged.
+pub(crate) fn reference_world(world: &World) -> World {
+    world_over(
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        world.root.clone(),
+        false,
+    )
+}
+
+/// `_root` only keeps its directory alive; `root` is where the checkout lives.
+fn world_over(
+    state: tempfile::TempDir,
+    temp: tempfile::TempDir,
+    root: PathBuf,
+    mcp: bool,
+) -> World {
     let store = trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
     if mcp {
         store.mcp_prepare_virgin_queue_for_tests().unwrap();
@@ -5142,10 +5164,11 @@ fn below_head_import_recovers_dependent_rows_when_target_returns() {
     assert_delayed_import_matches_full(&world, &descriptor);
 }
 
-/// #669 H1: S copies an unchanged document's published rows. Corruption read while copying
-/// fails typed and schedules a re-index, as a read of those rows would.
+/// #669 H1, #680: S copies an unchanged document by naming its basis payload, without reading
+/// the payload's rows, so a corrupt row publishes. Every read of it then fails typed and
+/// schedules a re-index.
 #[test]
-fn corruption_read_while_copying_schedules_a_rebuild() {
+fn corrupt_copied_symbol_publishes_then_fails_typed_on_read() {
     let world = definitions_world();
     let (a, b) = definitions_docs();
     let mut fixture = world.fixture().reference("scip-typescript");
@@ -5174,10 +5197,14 @@ fn corruption_read_while_copying_schedules_a_rebuild() {
         .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
         .unwrap();
     drop(leader);
-    let error = world
+    let native = world.store.index_baseline().unwrap();
+    world
         .store
         .catch_up_semantic_for_tests(&world.cancel)
-        .unwrap_err();
+        .unwrap();
+    let head = world.store.index_baseline().unwrap();
+    assert_ne!(head, native, "the catch-up publication advanced the head");
+    let error = world.store.semantic_at(head).unwrap_err();
     assert!(
         format!("{error:#}").contains("invalid semantic enum"),
         "{error:#}"
@@ -7008,7 +7035,7 @@ fn publish_real_fixture(world: &World, fixture: &str, files: &[&str]) -> (IndexP
     (pin, producer)
 }
 
-fn declaration_ids(world: &World) -> std::collections::BTreeMap<String, String> {
+pub(crate) fn declaration_ids(world: &World) -> std::collections::BTreeMap<String, String> {
     let (_, native, _) = index_workspace_bundle(
         &IndexOptions::new(world.root.clone()),
         world.store.root_id(),
@@ -7024,7 +7051,7 @@ fn declaration_ids(world: &World) -> std::collections::BTreeMap<String, String> 
 }
 
 /// The query the CLI daemon builds for `trellis query --seed ... [--semantic-producer-id ...]`.
-fn view_query(seed: &str, producer: Option<&str>) -> trellis::model::ViewQuery {
+pub(crate) fn view_query(seed: &str, producer: Option<&str>) -> trellis::model::ViewQuery {
     let mut query = json!({"seed": seed});
     if let Some(producer) = producer {
         query["semanticProducerId"] = json!(producer);
