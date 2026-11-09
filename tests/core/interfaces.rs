@@ -453,3 +453,34 @@ fn a_large_nested_manifest_keeps_its_interfaces() {
     assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
     assert_eq!(interfaces[0]["counts"]["callSites"], 1);
 }
+
+/// `//health` keeps its empty leading segment, so it is not the literal route `/health`
+/// (#843 review): it matches nothing and is `unresolved`.
+#[test]
+fn a_repeated_leading_slash_is_not_the_single_slash_route() {
+    let published = publish(&[
+        (".trellis/rules.toml", RULES),
+        ("Cargo.toml", "[package]\nname = \"srv\"\n"),
+        ("src/main.rs", SERVER),
+        ("web/package.json", "{\"name\":\"web-app\"}\n"),
+        (
+            "web/app.js",
+            "function go(api) { api('/health'); api('//health'); }",
+        ),
+    ]);
+    assert_eq!(published.summary["interfaces"][0]["counts"]["callSites"], 1);
+    let matched = details(&published, &[("list", "matched")], 100);
+    let health = matched
+        .iter()
+        .find(|item| item["entry"]["pathTemplate"] == "/health")
+        .unwrap();
+    assert_eq!(health["entry"]["confidence"], "exact");
+    assert_eq!(health["entry"]["callSites"].as_array().unwrap().len(), 1);
+    let client_only = details(&published, &[("list", "clientOnly")], 100);
+    let double: Vec<&Value> = client_only
+        .iter()
+        .filter(|item| item["entry"]["pathTemplate"] == "//health")
+        .collect();
+    assert_eq!(double.len(), 1, "{client_only:#?}");
+    assert_eq!(double[0]["entry"]["confidence"], "unresolved");
+}

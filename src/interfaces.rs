@@ -426,9 +426,14 @@ impl Projection<'_> {
     }
 }
 
-/// Splits a `/`-rooted template into segments. A trailing empty segment is dropped.
+/// Splits a `/`-rooted template into segments. Only the one leading `/` is removed, so a
+/// repeated slash keeps its empty segment. A trailing empty segment is dropped.
 pub(crate) fn segments(template: &str) -> Vec<Seg> {
-    let mut parts: Vec<&str> = template.trim_start_matches('/').split('/').collect();
+    let mut parts: Vec<&str> = template
+        .strip_prefix('/')
+        .unwrap_or(template)
+        .split('/')
+        .collect();
     if parts.last().is_some_and(|last| last.is_empty()) {
         parts.pop();
     }

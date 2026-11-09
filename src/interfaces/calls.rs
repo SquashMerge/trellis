@@ -285,9 +285,14 @@ fn verb(text: &str) -> Option<&'static str> {
     VERBS.iter().copied().find(|verb| *verb == upper)
 }
 
-/// A client path as segments. A segment with a substitution is a `Param`.
+/// A client path as segments. A segment with a substitution is a `Param`. Only the one
+/// leading `/` is structural: `//health` keeps its empty first segment.
 fn client_segments(template: &str) -> Vec<Seg> {
-    let mut parts: Vec<&str> = template.trim_start_matches('/').split('/').collect();
+    let mut parts: Vec<&str> = template
+        .strip_prefix('/')
+        .unwrap_or(template)
+        .split('/')
+        .collect();
     if parts.last().is_some_and(|last| last.is_empty()) {
         parts.pop();
     }
