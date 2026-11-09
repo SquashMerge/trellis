@@ -60,7 +60,7 @@
         },
         "watcherDegraded": false,
         "languages": [],
-        "toolVersion": 19,
+        "toolVersion": 20,
         "schemaVersion": 1,
         "limits": {
           "requestBytes": 16384,
@@ -475,7 +475,6 @@
     "reasons": [
       "not_absolute",
       "not_checkout",
-      "different_repository",
       "identity_changed",
       "unavailable"
     ]

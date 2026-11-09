@@ -737,7 +737,7 @@ fn reconnect_handshake_skips_a_replaced_selection_and_keeps_launch_usable() {
 }
 
 #[test]
-fn reconnect_skips_changed_membership_but_restores_another_selection() {
+fn reconnect_restores_a_selection_whose_repository_changed() {
     use trellis::store::topology::WorkspaceIdentity;
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
@@ -794,8 +794,8 @@ fn reconnect_skips_changed_membership_but_restores_another_selection() {
     let other = home.path().join("other");
     fs::create_dir(&other).unwrap();
     git(&other, &["init", "--quiet"]);
-    // Keep root inode, Git directory and UUID unchanged; only repository
-    // membership changes, which the relay's identity filter cannot detect.
+    // Keep root inode, Git directory and UUID unchanged; only the repository
+    // changes. Any verified checkout may be selected (#839), so it restores.
     let pointer = fs::read_to_string(changed.join(".git")).unwrap();
     let admin = Path::new(pointer.trim().strip_prefix("gitdir: ").unwrap());
     fs::write(
@@ -855,8 +855,8 @@ fn reconnect_skips_changed_membership_but_restores_another_selection() {
     );
     assert_eq!(
         active_checkout_count(home.path(), &root),
-        2,
-        "invalid membership blocked launch or the other valid attachment"
+        3,
+        "a checkout of another repository is a valid selection to restore"
     );
     drop(stream);
     daemon.kill().unwrap();
