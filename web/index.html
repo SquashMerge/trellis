@@ -20,6 +20,7 @@
   <script src="/viewer-metrics.js" defer></script>
   <script src="/files.js" defer></script>
   <script src="/architecture-pele.js" defer></script>
+  <script src="/architecture-apps.js" defer></script>
   <script src="/architecture-deviations.js" defer></script>
   <script src="/architecture.js" defer></script>
   <link rel="stylesheet" href="/treemap.css">
@@ -152,6 +153,8 @@
           <section id="architecture-panel" class="view-panel" role="tabpanel" aria-labelledby="view-architecture" hidden>
             <div class="sequence-toolbar architecture-toolbar"><h2 class="sr-only">Architecture</h2>
               <div class="architecture-controls view-toolbar">
+                <div id="architecture-apps" class="architecture-apps" role="group" aria-label="App" hidden></div>
+                <div id="architecture-source-line" class="architecture-source-line" hidden></div>
                 <label for="architecture-color">Color by</label><select id="architecture-color"><option value="layer">Layer</option><option value="cyclomatic">Cyclomatic</option><option value="cognitive" selected>Cognitive</option><option value="maxNesting">Max nesting</option><option value="maintainabilityIndex">Maintainability (inverted heat)</option><option value="halstead.volume">Halstead volume</option><option value="fanOut">Fan-out</option></select>
                 <label for="architecture-aggregate">Aggregation</label><select id="architecture-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
                 <details class="popover view-options"><summary>Options</summary><div class="popover-body">

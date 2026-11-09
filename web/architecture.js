@@ -57,6 +57,9 @@
   function create({request, context, readSource, openTreemap, openSequence, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, reviewSerial = 0, view = null, basis = null, buildingTimer = null, buildingWake = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
+    // The app whose stack is drawn: null for all apps, else an app name (never compared with a literal). Memory only; a new checkout starts at "all".
+    // `drawn` is the view the last render laid out (the scoped slice, or `view` itself).
+    let scope = null, scopeRoot = null, drawn = null;
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
     const callables = () => role === "all" ? "indexed callables" : "production callables";
     const population = () => role === "all" ? "all indexed callables" : callables();
@@ -64,15 +67,16 @@
     const hiddenNote = get("architecture-hidden"), hiddenToggle = get("architecture-hidden-toggle"), hiddenNames = get("architecture-hidden-names");
     // The selected node's identity, re-pressed after a resize re-layout; the width last laid out.
     let pressed = null, laidOut = null, inspection = null;
-    const deviations = window.TrellisDeviations.create({details:(params, active, offset) => details(params, active, offset), current:() => usable(),
-      basis:() => basis, view:() => view, targetLabel, eligible, portable, beginDraft:(operation, scope) => beginDraft(operation, scope), reviewChips,
+    const apps = window.TrellisArchitectureApps;
+    const deviations = window.TrellisDeviations.create({details:(params, active, offset) => details(appFilter(params), active, offset), current:() => usable(),
+      basis:() => basis, view:() => deviationsView(), targetLabel, eligible, portable, beginDraft:(operation, scope) => beginDraft(operation, scope), reviewChips,
       edgeText, inspectLine:(record, render) => inspectLine(record, render), overview:() => overview(), openReview:(mode, verdict) => openReview(mode, verdict),
       onConflict:() => onConflict(), refresh:() => refresh(), readSource:(site, pin, active) => readSource(site, pin, active),
       openSequence:(...args) => openSequence(...args), snapshot:() => snapshot()});
     const state = (message, kind = "ready") => { get("architecture-state").textContent = message; get("architecture-state").dataset.state = kind; };
     function capture() {
       const c = context();
-      return {rootKey:c.rootKey, session:c.session, pin:c.pin && window.TrellisIndexPin.copy(c.pin), aggregate, role, serial};
+      return {rootKey:c.rootKey, session:c.session, pin:c.pin && window.TrellisIndexPin.copy(c.pin), aggregate, role, serial, rulesEpoch:c.rulesEpoch};
     }
     function current(c) {
       const now = context();
@@ -80,11 +84,28 @@
         !!c.pin && window.TrellisIndexPin.equal(c.pin, now.pin);
     }
     function usable() { return view && current(basis) && view.rulesFile?.contentHash === basis.rulesHash; }
+    // The app group the view is scoped to; null for the whole checkout (and for a name the data no longer has).
+    // With fewer than two detected apps there is no switcher, so no scope: the stack is checkout-wide.
+    const scopeGroup = (payload = view) => scope === null || !payload || !(payload.apps?.length >= 2) ? null : apps.group(payload, scope);
+    const settleScope = payload => { if (scope !== null && !scopeGroup(payload)) scope = null; };
+    // The Deviations tree sees the app's slice: its layers and edges, and the group's counts.
+    let treeView = null;
+    function deviationsView() {
+      const group = scopeGroup();
+      if (!group) return view;
+      if (treeView?.of !== view || treeView.scope !== scope) treeView = {of:view, scope, value:{...apps.scoped(view, scope), rules:{...view.rules, counts:group.counts}}};
+      return treeView.value;
+    }
+    const model = () => drawn ?? view;
+    const unassignedOf = (payload, group) => payload.modules.filter(module => module.layer === null && (!group || module.app === group.name));
+    // A one-app scope narrows instance lists to that app; every other list is unchanged.
+    const appFilter = params => { const group = scopeGroup(); return group && params.kind === "instances" ? {...params, app:group.name} : params; };
     function clearInspection() {
       selectionSerial++; pressed = null; inspection = null;
       window.TrellisShell?.clearArchitectureInspector();
     }
     function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false, keepReopen = false) {
+      drawn = null; get("architecture-apps").hidden = true; get("architecture-source-line").hidden = true;
       editSerial++; preview = null; selected.clear();
       if (!keepDraft) setBusy(false);
       if (!keepDraft) { draft = null; get("architecture-review-panel").hidden = true; get("architecture-editor").hidden = true; }
@@ -103,7 +124,7 @@
         const error = new Error("Architecture snapshot changed. Refresh status."); error.code = "revision_conflict"; error.status = 409; throw error;
       }
       if (payload.state === "building") return payload;
-      if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || payload.aggregate !== c.aggregate || payload.role !== c.role ||
+      if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || !Array.isArray(payload.apps) || !Array.isArray(payload.interfaces) || payload.aggregate !== c.aggregate || payload.role !== c.role ||
           payload.workbench !== true || payload.metricsVersion !== "metrics:v1" ||
           !["syntax", "mixed"].includes(payload.evidenceTier) || payload.semanticComplete !== false ||
           !Array.isArray(payload.layers) || !Array.isArray(payload.modules) || !Array.isArray(payload.edges) ||
@@ -123,9 +144,9 @@
       paragraph(target, `${references?.counts?.mappedSites ?? 0} mapped reference sites · ${references?.counts?.semanticSites ?? 0} bound by semantic evidence · ${references?.counts?.unresolvedSites ?? 0} unresolved. Missing sites do not prove absence.`);
       if (ruleCounts(view)) paragraph(target, ruleCounts(view));
       for (const limitation of references?.limitations || []) paragraph(target, limitation);
-      const unassigned = view.modules.filter(module => module.layer === null);
-      paragraph(target, view.state === "no_layers" ? "No layer graph or file assignment inventory is available until layers are configured." : `${unassigned.length} unassigned native file modules remain unknown.`);
-      if (view.state === "ready" && Number.isSafeInteger(view.rules?.unassignedCount)) paragraph(target, `${view.rules.unassignedCount} unassigned identities (native files and external packages) in the rule-check catalog.`);
+      const group = scopeGroup(), unassigned = unassignedOf(view, group);
+      paragraph(target, view.state === "no_layers" ? "No layer graph or file assignment inventory is available until layers are configured." : `${unassigned.length} unassigned native file modules remain unknown${group ? ` in ${group.name}` : ""}.`);
+      if (view.state === "ready" && Number.isSafeInteger(view.rules?.unassignedCount)) paragraph(target, `${view.rules.unassignedCount} unassigned identities (native files and external packages) in the rule-check catalog${group ? " (whole checkout)" : ""}.`);
       if (references?.externalPackages?.length) disclosure(target, "External packages and captured evidence", references.externalPackages);
       const choose = (label, action) => { const button = make("button", label); button.type = "button"; button.addEventListener("click", action); target.append(button); };
       const c = basis;
@@ -188,7 +209,7 @@
         excepted:String(!!edge.excepted), ...(edge.exceptionReason ? {exceptionReason:edge.exceptionReason} : {})};
     }
     function layerLabel(layer) {
-      const modules = view.modules.filter(module => module.layer === layer.name);
+      const modules = model().modules.filter(module => module.layer === layer.name);
       const values = modules.map(module => metricValue(module.metrics, metric)).filter(finite);
       const packages = (view.references?.externalPackages || []).filter(item => layerOf(item.identity) === layer.name);
       const max = values.length ? String(values.reduce((most, value) => Math.max(most, value), -Infinity)) : "—";
@@ -199,9 +220,9 @@
     }
     // Outgoing production reference sites by verdict: the same summary edges the arrows draw.
     function layerCounts(layer) {
-      const byName = new Map(view.layers.map(item => [item.name, item]));
+      const byName = new Map(model().layers.map(item => [item.name, item]));
       const counts = {up:0, cross:0, down:0, shared:0, allowed:0, excepted:0, unknown:0};
-      for (const edge of view.edges) {
+      for (const edge of model().edges) {
         if (edge.sourceLayer !== layer.name || edge.role !== "production") continue;
         const destination = byName.get(edge.destinationLayer), ordered = !layer.shared && destination && !destination.shared;
         if (edge.excepted) counts.excepted += edge.count;
@@ -399,6 +420,51 @@
       if (!await render() || !usable() || !current(c)) return;
       after?.(); refocus(target);
     }
+    // The switcher and source line (#789): shown only with two or more detected apps. Choosing a
+    // button re-draws the held snapshot and never reads.
+    function switcher(payload) {
+      const target = get("architecture-apps"), line = get("architecture-source-line"), groups = apps.groups(payload);
+      const show = payload.state === "ready" && payload.apps.length >= 2 && groups.length > 0;
+      const refocus = show && !target.hidden && !!target.contains?.(document.activeElement);
+      target.hidden = line.hidden = !show; target.replaceChildren(); line.replaceChildren();
+      if (!show) return;
+      const choose = (name, text) => {
+        const button = make("button", text); button.type = "button"; button.setAttribute("aria-pressed", String(scope === name));
+        button.addEventListener("click", () => { void setScope(name); }); target.append(button);
+        if (refocus && scope === name) button.focus?.();
+      };
+      choose(null, "All apps");
+      for (const item of groups) choose(item.name, apps.label(item));
+      const group = scopeGroup(payload);
+      line.append(make("span", apps.sourceLine(group, payload.apps.length)));
+      if (group?.duplicate) line.append(make("span", apps.duplicateNotice(group), "architecture-app-notice"));
+    }
+    function setScope(next) {
+      if (!usable() || view.state !== "ready" || editBusy || next === scope) return;
+      if (next !== null && !apps.group(view, next)) return;
+      scope = next; reviewScope = null; deviations.reset(); coverage();
+      if (!get("architecture-review-panel").hidden) renderReview();
+      return render();
+    }
+    // AC13: an app that no ordered layer names has nothing to draw. It gets the setup help and its
+    // unassigned files, so none is dropped. The list is bounded like a drawing; the chip lists all.
+    function noLayers(full) {
+      const group = scopeGroup(full), files = unassignedOf(full, group), canvas = get("architecture-diagram"), ticket = renderSerial;
+      get("architecture-legend").replaceChildren(); hiddenNote.hidden = true;
+      get("architecture-coverage").textContent = coverageSummary(full);
+      get("architecture-summary").textContent = `${plural(files.length, "unassigned file")} in ${group.name} · no layers yet.`;
+      get("architecture-exclusions").textContent = "";
+      const list = make("ul", undefined, "architecture-app-files");
+      for (const module of files.slice(0, BOX_CAP)) {
+        const item = make("li"), button = make("button", module.identity.path); button.type = "button";
+        button.addEventListener("click", () => { if (ticket === renderSerial) inspect("module", module); });
+        item.append(button); list.append(item);
+      }
+      if (files.length > BOX_CAP) list.append(make("li", `${plural(files.length - BOX_CAP, "file")} not listed here · open the unassigned files chip to list them all`));
+      canvas.replaceChildren(list); laidOut = canvas.clientWidth;
+      state(`${group.name} has no layers yet. Its files are listed as unassigned below. The trellis_propose_layers MCP prompt can propose layers per app; this browser does not call it. Review .trellis/rules.toml to add layers with app = "${group.name}".`, "empty");
+      return true;
+    }
     const flip = (set, key) => { if (set.has(key)) set.delete(key); else set.add(key); };
     function legend(scale) {
       const target = get("architecture-legend"); target.replaceChildren();
@@ -419,19 +485,25 @@
       if (rows.some(row => row.unresolvedSites > 0)) parts.push("≥ counts are lower bounds");
       return parts.join(" · ");
     }
+    // One app: the name's summed counts, as the CLI reports them per app; otherwise the checkout's.
     function ruleCounts(payload) {
-      const counts = payload.rules?.counts;
+      const group = scopeGroup(payload), counts = group ? group.counts : payload.rules?.counts;
       return counts && Number.isSafeInteger(counts.unknown) && Number.isSafeInteger(counts.comparable)
-        ? `${counts.unknown.toLocaleString("en-US")} of ${counts.comparable.toLocaleString("en-US")} production rule instances unknown.` : "";
+        ? `${counts.unknown.toLocaleString("en-US")} of ${counts.comparable.toLocaleString("en-US")} production rule instances unknown${group ? ` in ${group.name}` : ""}.` : "";
     }
     // `keepSelection` re-lays out the same view for a new panel width (#515, #525): the
     // inspector and the selected node stay; the drawing is swapped in place.
     async function render({keepSelection = false} = {}) {
       if (!usable() || view.state !== "ready") return false;
-      const c = basis, payload = view, ticket = ++renderSerial;
-      const active = () => current(c) && view === payload && ticket === renderSerial && payload.rulesFile.contentHash === c.rulesHash;
+      // `full` is the snapshot; `payload` is what this drawing shows: the whole stack, or one app's slice of it.
+      const c = basis, full = view, ticket = ++renderSerial;
+      if (scope !== null && !scopeGroup(full)) scope = null;
+      const payload = scope === null ? full : apps.scoped(full, scope);
+      const active = () => current(c) && view === full && ticket === renderSerial && full.rulesFile.contentHash === c.rulesHash;
+      drawn = payload; switcher(full);
       // The inspector's review overview opens before measuring, so the drawing fits the width it gets.
       if (!keepSelection) { clearInspection(); overview(); get("architecture-diagram").replaceChildren(); }
+      if (scope !== null && !payload.layers.some(layer => !layer.shared)) return noLayers(full);
       const layout = summary(payload);
       // Collapsing layers or directories changes representation, not their module population. The
       // unassigned row is always drawn (as metric chips when collapsed, #449), so it is always in the scale.
@@ -441,7 +513,7 @@
       const scale = createScale(metric, aggregate, values, relative);
       legend(scale);
       displayState(payload, layout);
-      get("architecture-coverage").textContent = coverageSummary(payload);
+      get("architecture-coverage").textContent = coverageSummary(full);
       const unassigned = payload.modules.filter(module => module.layer === null).length, budget = {left:BOX_CAP, truncated:0};
       // The canvas's inner width; the adapter fits that many chip columns. A re-layout
       // returns keyboard focus to the same band, chip, arrow or toggle afterwards.
@@ -452,6 +524,7 @@
         if (!window.TrellisArchitecturePele) throw new Error("Architecture renderer unavailable. Nothing displayed.");
         const outcome = await window.TrellisArchitecturePele.render(canvas, payload, {
           showTests, metric, aggregate, isCurrent:active, width:canvas.clientWidth - (padding || 0),
+          ...(scope === null ? {} : {title:`${scope} · ordered layers`}),
           moduleValue:module => metric === "layer" ? undefined : metricValue(module.metrics, metric),
           moduleBand:module => metric === "layer" ? null : scale.band(metricValue(module.metrics, metric)),
           layerLabel, layerStats, edgeText, edgeTone,
@@ -516,9 +589,28 @@
       reset(undefined, options.keepDraft === true, true);
       const c = capture();
       if (!c.rootKey || !c.pin) { state("Choose an indexed checkout, then open Architecture.", "empty"); return; }
+      if (c.rootKey !== scopeRoot) { scope = null; scopeRoot = c.rootKey; }
       loadDisplay(c.rootKey);
       state("Reading indexed architecture and reviewed rules…", "loading"); get("architecture-diagram").setAttribute("aria-busy", "true");
       return read(c, options);
+    }
+    // Opening the tab again draws the held snapshot when nothing it rests on changed: the checkout,
+    // session, pin, aggregate, role and the rules epoch (a rules edit or conflict advances it).
+    // Anything else reads again. A stale serial never revives: `suspend` bumped it, and the held
+    // basis only adopts the current one here.
+    function reopen() {
+      const now = context();
+      const same = !!view && view.state === "ready" && !!basis && basis.rootKey === now.rootKey && basis.session === now.session &&
+        !!now.pin && window.TrellisIndexPin.equal(basis.pin, now.pin) && basis.aggregate === aggregate && basis.role === role &&
+        basis.rulesEpoch === now.rulesEpoch;
+      if (!same) return refresh();
+      basis = {...basis, serial}; coverage();
+      return render();
+    }
+    function suspend() {
+      const held = {view, basis};
+      reset(undefined, false, false);
+      view = held.view; basis = held.basis;
     }
     function pause(delay) {
       return new Promise(resolve => { buildingWake = resolve; buildingTimer = setTimeout(resolve, delay); });
@@ -540,7 +632,7 @@
         if (payload.state === "missing_rules") {
           state("No reviewed rules file. Create or review .trellis/rules.toml. The trellis_propose_layers MCP prompt can help propose layers; this browser does not call it.", "empty"); return;
         }
-        view = payload; basis = {...c, rulesHash:payload.rulesFile.contentHash}; coverage();
+        view = payload; basis = {...c, rulesHash:payload.rulesFile.contentHash}; settleScope(payload); coverage();
         if (payload.state === "no_layers") { state("No authored layers are configured. Existing authored exceptions can still be edited or removed. Review .trellis/rules.toml to configure layers.", "empty"); overview(); }
         else await render();
         if (options.keepDraft === true) { get("architecture-review-panel").hidden = false; renderReview(); }
@@ -628,7 +720,7 @@
     // Counted review chips head every Architecture inspection (#449); each opens its list.
     // File assignments count native modules; the rule-check catalog also includes external identities.
     function reviewChips(target) {
-      const chips = make("div", undefined, "architecture-review-chips"), counts = view.rules?.counts;
+      const group = scopeGroup(), chips = make("div", undefined, "architecture-review-chips"), counts = group ? group.counts : view.rules?.counts;
       chips.setAttribute("role", "group"); chips.setAttribute("aria-label", "Review counts");
       const chip = (id, count, word, open, tone) => {
         const button = make("button", `${count.toLocaleString("en-US")} ${word}`, "architecture-chip"); button.type = "button"; button.id = id;
@@ -637,7 +729,7 @@
       };
       if (view.state === "ready" && Number.isSafeInteger(counts?.deviates)) chip("architecture-review", counts.deviates, counts.deviates === 1 ? "deviation" : "deviations", button => deviations.open(button), counts.deviates ? "error" : null);
       if (view.state === "ready") {
-        const unassigned = view.modules.filter(module => module.layer === null).length;
+        const unassigned = unassignedOf(view, group).length;
         chip("architecture-unassigned", unassigned, unassigned === 1 ? "unassigned file" : "unassigned files", () => openReview("unassigned"));
       }
       if (Number.isSafeInteger(view.exceptionCount)) chip("architecture-authored", view.exceptionCount, view.exceptionCount === 1 ? "exception" : "exceptions", showAuthored);
@@ -704,7 +796,7 @@
         title.textContent = `${record.sourceLayer} → ${record.destinationLayer}`;
         paragraph(target, `${record.count} exact ${record.role} ${edgeSites(record)} · ${record.status}${record.excepted ? ` · excepted: ${record.exceptionReason}` : " · not excepted"}${record.role === "test" ? " · hypothetical policy only; never a production violation" : ""}.`);
         reviewScope = record; reviewMode = "rules"; get("architecture-review-state").value = "all"; get("architecture-review-panel").hidden = false; renderReview();
-        detailList(target, {kind:"instances", ...edgeFilters(record)}, active, instanceItems(active), "No rule instances match this review scope.");
+        detailList(target, appFilter({kind:"instances", ...edgeFilters(record)}), active, instanceItems(active), "No rule instances match this review scope.");
         pairs(target, record.pairs, active);
       } else if (kind === "layer") {
         title.textContent = record.name; paragraph(target, layerLabel(record));
@@ -716,7 +808,7 @@
         paragraph(target, "Reference pairs from or to this layer", "detail");
         detailList(target, {kind:"pairs", layer:record.name}, active, pairItems(active), NO_PAIRS);
         paragraph(target, "Layer policy and exceptions", "detail");
-        detailList(target, {kind:"instances", layer:record.name}, active, instanceItems(active), "No rule instances name this layer.");
+        detailList(target, appFilter({kind:"instances", layer:record.name}), active, instanceItems(active), "No rule instances name this layer.");
       } else if (kind === "unresolved") {
         title.textContent = "Unresolved structural references";
         paragraph(target, `${references.counts?.unresolvedSites ?? 0} unresolved sites.`);
@@ -740,7 +832,7 @@
     // Review filters as one exact detail scope; null when the role/verdict selects
     // contradict the chosen edge, so nothing can match.
     function reviewFilters(roleFilter, verdict) {
-      const params = {kind:"instances", ...(reviewScope ? edgeFilters(reviewScope) : {})};
+      const params = {kind:"instances", ...(reviewScope ? edgeFilters(reviewScope) : appFilter({kind:"instances"}))};
       const set = (key, value) => { if (key in params && params[key] !== value) return false; params[key] = value; return true; };
       if (roleFilter !== "all" && !set("role", roleFilter)) return null;
       if (verdict === "excepted" && !set("excepted", "true")) return null;
@@ -808,15 +900,16 @@
     function renderReview() {
       if (!usable()) return;
       const target = get("architecture-review-list"); target.replaceChildren();
-      get("architecture-review-scope").textContent = reviewMode === "unassigned" ? "Unassigned files (including files without edges)" :
-        reviewMode === "authored" ? "Authored exceptions" : reviewScope ? `${reviewScope.sourceLayer} → ${reviewScope.destinationLayer} · ${reviewScope.role}` : "All rule instances";
+      const inApp = scopeGroup() ? ` in ${scopeGroup().name}` : "";
+      get("architecture-review-scope").textContent = reviewMode === "unassigned" ? `Unassigned files${inApp} (including files without edges)` :
+        reviewMode === "authored" ? "Authored exceptions" : reviewScope ? `${reviewScope.sourceLayer} → ${reviewScope.destinationLayer} · ${reviewScope.role}` : `All rule instances${inApp}`;
       get("architecture-exceptions").hidden = reviewMode !== "authored";
       const c = basis, ticket = ++reviewSerial, active = () => usable() && current(c);
       const listed = () => active() && ticket === reviewSerial;
       if (reviewMode === "unassigned" && view.state === "no_layers") {
         paragraph(target, "No layers configured. File assignment inventory is unavailable until layers are configured; authored exceptions remain editable.");
       } else if (reviewMode === "unassigned") {
-        for (const module of view.modules.filter(item => item.layer === null)) {
+        for (const module of unassignedOf(view, scopeGroup())) {
           const row = make("div", undefined, "architecture-rule-row"); row.dataset.source = module.identity.path;
           action(row, module.identity.path, () => inspect("module", module), active);
           const label = make("label", "Assign to layer "), select = make("select");
@@ -900,14 +993,17 @@
     }
     function snapshot() {
       return usable() && inspection ? {inspection, pressed:nodeKey(pressedNode()), rulesHash:basis.rulesHash,
-        aggregate, role, reviewMode, reviewScope, reviewOpen:!get("architecture-review-panel").hidden,
+        aggregate, role, scope, reviewMode, reviewScope, reviewOpen:!get("architecture-review-panel").hidden,
         reviewRole:get("architecture-review-role").value, reviewState:get("architecture-review-state").value, deviations:deviations.snapshot()} : null;
     }
     async function restore(saved, active) {
       aggregate = saved.aggregate; role = saved.role;
       get("architecture-aggregate").value = aggregate;
+      // The saved scope applies to this checkout; refresh keeps it because the root key matches.
+      scope = saved.scope ?? null; scopeRoot = context().rootKey;
       await refresh();
       if (!active() || !usable()) return;
+      settleScope(view);
       if (basis.rulesHash !== saved.rulesHash) throw new Error("Architecture rules changed. Select the boundary again.");
       if (saved.reviewOpen) {
         if (saved.reviewMode === "authored") await showAuthored();
@@ -1117,7 +1213,7 @@
       if (!["max", "sum", "mean"].includes(event.target.value) || event.target.value === aggregate) return;
       aggregate = event.target.value; return refresh();
     });
-    return {refresh, reset, clearInspection, restore};
+    return {refresh, reset, clearInspection, restore, reopen, suspend};
   }
   window.TrellisArchitecture = {create, moduleKey, quartiles, band, metricValue, commonDirectory, groupModules};
 })();

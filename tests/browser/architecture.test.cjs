@@ -1935,3 +1935,53 @@ test("Deviations notice counts unknown instances and opens them in the review pa
     assert.equal(await page.locator("#architecture-review-state").inputValue(), "unknown");
   }, new Map(), base);
 });
+
+// One app (#789): two npm apps, only `alpha` has an authored layer.
+const twoApps = new Map([
+  ["a/package.json", '{"name":"alpha"}\n'], ["b/package.json", '{"name":"beta"}\n'],
+  ["a/main.js", "export function run() { return 1; }\n"],
+  ["b/lib.js", "export function lib() { return 2; }\n"], ["b/extra.js", "export function extra() { return 3; }\n"],
+]);
+const twoAppRules = `version = 1
+[layers.ui]
+order = 1
+app = "alpha"
+paths = ["a/main.js"]
+`;
+const architectureReads = requests => requests.filter(row => /\/api\/checkouts\/[^/]+\/architecture(?:\/|$)/.test(row.url.pathname)).length;
+
+test("an app with no layers shows the setup help and its unassigned files", {timeout:240000}, async () => published(twoAppRules, async selected => {
+  const {page} = selected;
+  await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
+  const switcher = page.locator("#architecture-apps");
+  assert.equal(await switcher.getAttribute("role"), "group"); assert.equal(await switcher.getAttribute("aria-label"), "App");
+  assert.deepEqual(await switcher.locator("button").allTextContents(), ["All apps", "alpha · javascript", "beta · javascript"]);
+  await switcher.getByRole("button", {name:"alpha · javascript"}).click();
+  await page.locator("#architecture-diagram svg").waitFor({state:"attached"});
+  assert.equal(await switcher.getByRole("button", {name:"alpha · javascript"}).getAttribute("aria-pressed"), "true");
+  await switcher.getByRole("button", {name:"beta · javascript"}).click();
+  const state = page.locator("#architecture-state[data-state=empty]");
+  await state.waitFor({state:"visible"});
+  const message = await state.textContent();
+  assert.match(message, /beta has no layers yet/); assert.match(message, /trellis_propose_layers/); assert.match(message, /app = "beta"/);
+  const files = await page.locator("#architecture-diagram .architecture-app-files button").allTextContents();
+  assert.deepEqual(files.sort(), ["b/extra.js", "b/lib.js"], "its unassigned files are listed, not dropped");
+}, new Map(), twoApps));
+
+test("switching tabs and apps re-draws the held snapshot without reading again", {timeout:240000}, async () => published(twoAppRules, async selected => {
+  const {page, requests} = selected;
+  await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
+  await page.locator("#architecture-diagram svg").waitFor({state:"attached"});
+  const before = architectureReads(requests);
+  assert.ok(before > 0);
+  await page.locator("#view-sequence").click();
+  assert.equal(await page.locator("#architecture-panel").isHidden(), true);
+  await page.locator("#view-architecture").click();
+  await page.locator("#architecture-diagram svg").waitFor({state:"attached"});
+  await page.locator("#architecture-apps").getByRole("button", {name:"alpha · javascript"}).click();
+  await page.locator("#architecture-diagram svg").waitFor({state:"attached"});
+  await page.locator("#view-sequence").click(); await page.locator("#view-architecture").click();
+  await page.locator("#architecture-diagram svg").waitFor({state:"attached"});
+  assert.equal(await page.locator("#architecture-apps").getByRole("button", {name:"alpha · javascript"}).getAttribute("aria-pressed"), "true", "the scope survives the tab switch");
+  assert.equal(architectureReads(requests), before, "no Architecture request after the first read");
+}, new Map(), twoApps));
