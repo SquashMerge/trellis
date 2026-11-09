@@ -233,28 +233,42 @@ fn python_outcome(manifest: &ManifestInput, parsed: Option<Parsed>) -> Outcome {
         _ => return Outcome::Unread,
     };
     let mut entries = BTreeSet::new();
+    // Standard `[project]` scripts are `module:attr` strings only; table targets are Poetry's.
     let tables = [
-        (project, "scripts"),
-        (project, "gui-scripts"),
-        (poetry, "scripts"),
+        (project, "scripts", false),
+        (project, "gui-scripts", false),
+        (poetry, "scripts", true),
     ];
-    for (parent, key) in tables {
+    for (parent, key, is_poetry) in tables {
         let Ok(scripts) = parent.map_or(Ok(None), |parent| subtable(parent, key)) else {
             return Outcome::Unread;
         };
         for target in scripts.into_iter().flat_map(|scripts| scripts.values()) {
-            let reference = match target {
-                toml::Value::String(reference) => reference.as_str(),
+            let module = match (target, is_poetry) {
+                (toml::Value::String(reference), false) => {
+                    // `module:attr [extra]`: both sides of the colon are required.
+                    match reference.split_once(':') {
+                        Some((module, attr))
+                            if !module.trim().is_empty() && !attr.trim().is_empty() =>
+                        {
+                            module.trim()
+                        }
+                        _ => return Outcome::Unread,
+                    }
+                }
+                (toml::Value::String(reference), true) => {
+                    reference.split(':').next().unwrap_or_default().trim()
+                }
                 // Poetry's `{ callable = "module:function" }`; a file script has no module.
-                toml::Value::Table(script) => match script.get("callable") {
-                    Some(toml::Value::String(reference)) => reference.as_str(),
+                (toml::Value::Table(script), true) => match script.get("callable") {
+                    Some(toml::Value::String(reference)) => {
+                        reference.split(':').next().unwrap_or_default().trim()
+                    }
                     Some(_) => return Outcome::Unread,
                     None => continue,
                 },
                 _ => return Outcome::Unread,
             };
-            // `module:function [extra]`: the module is everything before the colon.
-            let module = reference.split(':').next().unwrap_or_default().trim();
             if module.is_empty() {
                 return Outcome::Unread;
             }
@@ -710,7 +724,6 @@ name = "mimir-agent"
 mimir = "mimir.cli:main"
 mimir-admin = "mimir.admin.cli:run [extra]"
 also = "mimir.cli:other"
-bare = "mimir_tool"
 [project.gui-scripts]
 mimir-gui = "mimir.gui:start"
 "#;
@@ -720,10 +733,7 @@ mimir-gui = "mimir.gui:start"
             (app.name.as_str(), app.kind, app.root.as_str()),
             ("mimir-agent", AppKind::Python, ".")
         );
-        assert_eq!(
-            app.entries,
-            ["mimir.admin.cli", "mimir.cli", "mimir.gui", "mimir_tool"]
-        );
+        assert_eq!(app.entries, ["mimir.admin.cli", "mimir.cli", "mimir.gui"]);
     }
 
     #[test]
@@ -776,6 +786,15 @@ mimir-gui = "mimir.gui:start"
             b"[project]\nname = \"a\"\nscripts = 1\n",
             b"[project]\nname = \"a\"\n[project.scripts]\nx = 1\n",
             b"[project]\nname = \"a\"\n[project.gui-scripts]\nx = \":main\"\n",
+            // Table targets are Poetry's; a standard project script is a string (#849).
+            b"[project]\nname = \"a\"\n[project.scripts]\ncli = { callable = \"fake.module:run\" }\n",
+            b"[project]\nname = \"a\"\n[project.scripts]\ncli = {}\n",
+            b"[project]\nname = \"a\"\n[project.gui-scripts]\ncli = { callable = \"fake.module:run\" }\n",
+            b"[project]\nname = \"a\"\n[project.gui-scripts]\ncli = {}\n",
+            b"[project]\nname = \"a\"\n[project.scripts]\ncli = [\"m:f\"]\n",
+            b"[project]\nname = \"a\"\n[project.scripts]\ncli = \"\"\n",
+            b"[project]\nname = \"a\"\n[project.scripts]\ncli = \"module_only\"\n",
+            b"[project]\nname = \"a\"\n[project.scripts]\ncli = \"m:\"\n",
             b"[tool]\npoetry = 1\n",
             b"[tool.poetry]\nname = 4\n",
             b"[tool.poetry]\nname = \"a\"\n[tool.poetry.scripts]\nx = { callable = 1 }\n",

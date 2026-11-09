@@ -415,7 +415,7 @@ the total bound. A manifest that is absent from the snapshot is not an app and i
 | Nested `Cargo.toml` that is not a workspace member | no app; never parsed for identity |
 | `package.json` that is not a JSON object, or is over the size bound | unread |
 | `package.json` that is a JSON object | app (`npm`) |
-| `pyproject.toml`: invalid TOML, over the size bound, `project` or `tool` or `tool.poetry` not a table, or a scripts table or target of the wrong type | unread |
+| `pyproject.toml`: invalid TOML, over the size bound, `project` or `tool` or `tool.poetry` not a table, a scripts table or target of the wrong type, or a `[project.scripts]` or `[project.gui-scripts]` target that is not a `module:attr` string | unread |
 | `pyproject.toml` with neither `[project]` nor a `[tool.poetry]` that has `name` | no app |
 | `pyproject.toml` whose `[project].name` (or, without `[project]`, `[tool.poetry].name`) is not a nonblank string | unread |
 | `pyproject.toml` with `[project]` or a named `[tool.poetry]` | app (`python`) |
@@ -436,7 +436,9 @@ An unread manifest detects no app. A manifest that a hidden layer selects (see
   (`.` at the checkout root). Its entries are empty.
 - **Python** name is `[project].name`, or `[tool.poetry].name` without `[project]`. Its
   entries are the modules (the text before `:`, trimmed) of the `[project.scripts]`,
-  `[project.gui-scripts]` and `[tool.poetry.scripts]` targets; a Poetry table target uses
+  `[project.gui-scripts]` and `[tool.poetry.scripts]` targets. A `[project]` script target
+  must be a `module:attr` string with both sides nonblank; anything else, including a table,
+  makes the manifest unread. Only `[tool.poetry.scripts]` accepts a table target: it uses
   its `callable`, and one without `callable` (a file script) adds nothing. Entries are sorted
   and deduplicated, and may be empty. A uv `[tool.uv.workspace]` changes nothing: each
   `pyproject.toml` is judged alone.
