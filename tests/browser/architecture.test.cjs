@@ -692,7 +692,7 @@ function expectedChips(check, layers) {
     counts.set(key, (counts.get(key) || 0) + row.referenceCount); totals.set(row.sourceLayer, counts);
   }
   const order = ["⇄", "↓", "→shared", "allowed", "excepted", "unknown"];
-  const text = (key, count) => key.startsWith("↑ ") ? `↑${count} deviation · ${key.slice(2)}` : `${key}${/^[⇄↓]$/.test(key) ? "" : " "}${count}`;
+  const text = (key, count) => key.startsWith("↑ ") ? `↑${count} ${/^≥?1$/.test(String(count)) ? "reference" : "references"} · ${key.slice(2)}` : `${key}${/^[⇄↓]$/.test(key) ? "" : " "}${count}`;
   // Upward deviations are one chip per destination, each a control that follows its band.
   return new Map([...totals].map(([layer, counts]) => [layer, [...[...counts.keys()].filter(key => key.startsWith("↑ ")).sort(), ...order.filter(key => counts.get(key))].map(key => text(key, counts.get(key)))]));
 }
@@ -738,7 +738,7 @@ test("Architecture draws the full stack, module chips per band, lower-bound coun
   const share = `${Math.round(lowCoverage.mappedSites / lowCoverage.sites * 100)}%`;
   const bound = layer => (dto.references.coverage.find(row => row.layer === layer && row.role === "production")?.unresolvedSites ?? 1) > 0;
   const chips = expectedChips(check, dto.layers);
-  assert.deepEqual(chips.get("low"), ["↑2 deviation · top"], "the fixture's low layer has a 2-site upward deviation, named by its destination");
+  assert.deepEqual(chips.get("low"), ["↑2 references · top"], "the fixture's low layer has a 2-site upward deviation, named by its destination");
   for (const layer of ["low", "mid", "peer", "shared", "top"]) {
     const drawn = await chipTexts(page, layer);
     const expected = (chips.get(layer) || []).map(text => bound(layer) ? text.replace(/^(\D*)(\d+)/, "$1≥$2") : text).sort();
@@ -795,7 +795,7 @@ test("Architecture draws the full stack, module chips per band, lower-bound coun
   await page.locator(low).focus();
   await rerendered(page, () => page.keyboard.press("Enter"));
   assert.equal(await page.locator(low).getAttribute("aria-expanded"), "false");
-  assert.deepEqual((await chipTexts(page, "low")).map(([text]) => text), ["↑≥2 deviation · top"], "a folded band keeps its count chips");
+  assert.deepEqual((await chipTexts(page, "low")).map(([text]) => text), ["↑≥2 references · top"], "a folded band keeps its count chips");
   await rerendered(page, () => page.keyboard.press("Enter"));
   assert.equal(await page.locator(low).getAttribute("aria-expanded"), "true");
   const stored = await displayStore(selected);
@@ -2023,8 +2023,8 @@ test("a stub selects its interface with a visible Selected word, opens the inspe
 
 test("a ↑ badge opens the Deviations tree on its edge with the chip pressed and nothing selected", {timeout:240000}, async () => published(rules, async ({page}) => {
   await ready(page);
-  const badge = page.getByRole("button", {name:/^2 upward production reference sites from low to top · deviation · open in Deviations$|^at least 2 upward production reference sites from low to top/});
-  assert.equal(await badge.locator("text.trellis-architecture-stat").textContent(), "↑≥2 deviation · top");
+  const badge = page.getByRole("button", {name:/^(?:at least )?2 upward production references from low to top · deviation · open in Deviations$/});
+  assert.equal(await badge.locator("text.trellis-architecture-stat").textContent(), "↑≥2 references · top");
   assert.equal(await badge.evaluate(node => node.previousElementSibling?.getAttribute("data-trellis-layer-id")), "low", "the badge follows its band");
   await badge.focus(); await page.keyboard.press("Enter");
   await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});

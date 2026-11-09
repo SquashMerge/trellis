@@ -316,8 +316,9 @@ overview does not open the inspector drawer.
 **Per-destination `↑` badges and interface stubs (#789, proposed (owner-delegated, run 803)).**
 This amends the single `↑` chip above, in every stack. A band has one `↑` badge for each
 destination layer it reaches upward: production `$layers` edges with the `deviates` verdict,
-not excepted, to a layer with a smaller `order`. It reads `↑12 deviation · entry` (`↑≥12` for a
-lower bound) and sums the summary edges, so the badges of a band add up to its former `↑`
+not excepted, to a layer with a smaller `order`. It reads `↑12 references · entry` (`↑≥12` for a
+lower bound, `↑1 reference · entry` for one): the count is reference sites, the tree's unit after
+#846 (owner ruling 2026-11-09, #845). It sums the summary edges, so the badges of a band add up to its former `↑`
 chip. Each badge is its own focusable control, the next sibling of its band, and opens the
 Deviations tree with that edge's chip pressed, no line selected and Calls only off. The `↓`
 chip stays display-only.

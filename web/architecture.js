@@ -255,8 +255,9 @@
       const counts = layerCounts(layer, source), bound = lowerBound(layer.name, "production") ? "≥" : "";
       const stats = STATS.filter(([key]) => key !== "up" && counts[key] > 0).map(([key, glyph, words, error]) =>
         ({key, count:counts[key], text:`${glyph}${bound}${counts[key]}`, label:`${bound ? "at least " : ""}${counts[key]} outgoing production reference sites · ${words}`, tone:error ? "error" : "neutral"}));
-      const up = [...counts.upTo].map(([destination, count]) => ({key:"up", count, text:`↑${bound}${count} deviation · ${destination}`, tone:"error",
-        label:`${bound ? "at least " : ""}${count} upward production reference sites from ${layer.name} to ${destination} · deviation · open in Deviations`,
+      // The count is reference sites, the tree's unit after #846: `↑12 references · entry` (owner ruling 2026-11-09).
+      const up = [...counts.upTo].map(([destination, count]) => ({key:"up", count, text:`↑${bound}${count} ${count === 1 ? "reference" : "references"} · ${destination}`, tone:"error",
+        label:`${bound ? "at least " : ""}${plural(count, "upward production reference")} from ${layer.name} to ${destination} · deviation · open in Deviations`,
         id:JSON.stringify(["up", layer.name, destination]), action:{sourceLayer:layer.name, destinationLayer:destination}}));
       return [...up, ...stats, ...interfaceStats(layer, appName)];
     }

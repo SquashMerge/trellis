@@ -570,11 +570,11 @@ test("layer stats chip only non-zero production counts by verdict, with deviatio
     {layer:"Shared",role:"production",sites:2,mappedSites:2,unresolvedSites:0}];
   h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
   const {options} = h.renders[0], stats = name => JSON.parse(JSON.stringify(options.layerStats(dto.layers.find(layer => layer.name === name)).map(stat => [stat.text, stat.tone])));
-  assert.deepEqual(stats("Storage"), [["↑≥56 deviation · UI","error"],["⇄≥3","error"],["→shared ≥9","neutral"],["excepted ≥4","neutral"]], "test-only sites never count; excepted sites are not deviations");
+  assert.deepEqual(stats("Storage"), [["↑≥56 references · UI","error"],["⇄≥3","error"],["→shared ≥9","neutral"],["excepted ≥4","neutral"]], "test-only sites never count; excepted sites are not deviations");
   assert.deepEqual(stats("UI"), [["↓7","neutral"]]);
   assert.deepEqual(stats("Shared"), [["⇄2","error"]], "shared outbound is a deviation, not upward");
   assert.deepEqual(stats("Peer"), [], "a layer without outgoing references has no chips");
-  assert.equal(options.layerStats(dto.layers[1])[0].label, "at least 56 upward production reference sites from Storage to UI · deviation · open in Deviations");
+  assert.equal(options.layerStats(dto.layers[1])[0].label, "at least 56 upward production references from Storage to UI · deviation · open in Deviations");
   // Arrows: deviations highlighted with the source layer's measured coverage; allowed arrows dimmed.
   const up = dto.edges[1], down = dto.edges[0];
   assert.equal(options.edgeTone(up), "deviation"); assert.equal(options.edgeTone(down), "allowed");
@@ -1780,9 +1780,9 @@ test("AC9 an upward deviation chip per destination, in every stack, each an acti
   dto.references.coverage = [{layer:"Storage",role:"production",sites:7,mappedSites:7,unresolvedSites:0}];
   h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
   const ups = plainStats(statsOf(h, "Storage")).filter(stat => stat.key === "up");
-  assert.deepEqual(ups.map(stat => stat.text), ["↑5 deviation · UI", "↑2 deviation · Core"]);
+  assert.deepEqual(ups.map(stat => stat.text), ["↑5 references · UI", "↑2 references · Core"]);
   assert.deepEqual(ups.map(stat => stat.action), [{sourceLayer:"Storage", destinationLayer:"UI"}, {sourceLayer:"Storage", destinationLayer:"Core"}]);
-  assert.equal(ups[0].label, "5 upward production reference sites from Storage to UI · deviation · open in Deviations");
+  assert.equal(ups[0].label, "5 upward production references from Storage to UI · deviation · open in Deviations");
   assert.equal(ups[0].tone, "error"); assert.equal(new Set(ups.map(stat => stat.id)).size, 2, "each badge has its own identity");
   assert.deepEqual(plainStats(statsOf(h, "UI")).map(stat => stat.text), ["↓≥4"], "the downward total stays display-only (UI has unresolved sites)");
   h.renders.at(-1).options.onOpenDeviation(ups[1].action); await flush(); await flush();
